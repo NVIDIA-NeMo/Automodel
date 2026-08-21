@@ -16,9 +16,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import pickle
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from math import prod
 from typing import Any, TypeVar
 
 import torch
@@ -47,6 +50,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+from nemo_automodel.engine.outputs import LossFnOutputBatch, PerTokenOutput
 
 CollateFn = Callable[
     [list[Datum]],
@@ -56,14 +60,22 @@ LossInputValue = torch.Tensor | tuple[torch.Tensor, ...]
 LossInputs = dict[str, LossInputValue]
 LossFn = Callable[
     [Any, LossInputs],
-    torch.Tensor | tuple[torch.Tensor, Sequence[Mapping[str, Any]]],
+    torch.Tensor | tuple[torch.Tensor, Sequence[Mapping[str, Any]] | LossFnOutputBatch],
 ]
+ParsedLossOutputs = list[dict[str, Any]] | LossFnOutputBatch | None
 
 _LOSS_FIELD_PREFIX = "__engine_loss__"
 _LOSS_METADATA = ("cu_seqlens", "cu_seqlens_padded", "max_seqlen", "padding_mask")
 _T = TypeVar("_T")
 
-__all__ = ["Engine", "ForwardResult", "OptimStepResult", "collate_prebatched"]
+__all__ = [
+    "Engine",
+    "ForwardResult",
+    "LossFnOutputBatch",
+    "OptimStepResult",
+    "PerTokenOutput",
+    "collate_prebatched",
+]
 
 
 def _nullcontext_for_batch(_model_inputs: dict[str, Any]) -> AbstractContextManager[Any]:
@@ -83,7 +95,10 @@ def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], CollatedLos
 
     The Datum represents the whole prebatched item. Consequently, one
     optional ``loss_fn_output`` mapping also describes that whole batch, not
-    each sample inside it.
+    each sample inside it. A typed token output likewise remains one record
+    containing the full inner ``[B, S, ...]`` (or flat THD) tensor; the Engine
+    cannot split hidden inner samples. Output records are rejected when PP
+    divides that prebatched Datum into multiple inner microbatches.
 
     Args:
         datums: A one-item list whose model and loss tensor fields already have
@@ -120,6 +135,18 @@ class _LossBatchLayout:
 
 
 @dataclass(frozen=True)
+class _OutputRestorePlan:
+    """How to turn one CP-local callback token stream back into Datums."""
+
+    sharder: ContextParallelSharder
+    is_thd: bool
+    item_to_datum: tuple[int, ...] | None
+    real_lengths: tuple[int, ...] | None
+    padded_lengths: tuple[int, ...] | None
+    token_mask: torch.Tensor | None
+
+
+@dataclass(frozen=True)
 class ForwardResult:
     """Forward-only loss statistics and per-Datum outputs.
 
@@ -129,8 +156,10 @@ class ForwardResult:
     at the end of an evaluation epoch. Distributed model wrappers may still
     communicate during forward and therefore retain their own call-alignment
     requirements. ``loss_fn_outputs`` remains local to the replica's input
-    Datums; PP stages receive identical detached copies, while any CP-local
-    tensor layout inside those mappings remains caller defined.
+    Datums. PP stages receive identical detached copies. Legacy output mappings
+    remain opaque and therefore CP-local; fields declared through
+    :class:`LossFnOutputBatch` are restored to full token order across CP before
+    being split back into per-Datum records.
 
     Attributes:
         loss_sum: Detached weighted numerator for this Datum window.
@@ -287,12 +316,16 @@ class Engine:
             datums: Flat sequence of Datum items for this forward-only window.
             loss_fn: Computes a per-element loss tensor or scalar local
                 weighted numerator from the raw model output and CP-local loss
-                inputs. It may additionally return one output mapping per
-                Datum.
+                inputs. It may additionally return opaque mappings per Datum,
+                or a :class:`LossFnOutputBatch` whose explicitly typed token
+                streams the Engine restores across CP.
 
         Returns:
             Detached model-parallel-complete loss statistics and per-Datum
-            outputs. The sums are local to one data-parallel replica.
+            outputs. The sums and outputs are local to one data-parallel
+            replica. A prebatched Datum produces one outer record, not one
+            record per hidden inner sample, and cannot produce records when PP
+            splits it into multiple inner microbatches.
         """
         microbatches = self._group_datums(datums)
         self._validate_execution_parallelism()
@@ -310,11 +343,11 @@ class Engine:
         returns_outputs: bool | None = None
 
         for batch_datums in microbatches:
-            cp_context, model_inputs, loss_inputs, loss_batch_layout = self._prepare_batch(
+            cp_context, model_inputs, loss_inputs, loss_batch_layout, output_restore_plan = self._prepare_batch(
                 batch_datums, inner_microbatches
             )
             if self.pipeline is not None:
-                batch_returns_outputs, batch_outputs = self._pipeline_execute(
+                batch_returns_outputs, batch_outputs, batch_error = self._pipeline_execute(
                     model_inputs,
                     loss_inputs,
                     batch_datums,
@@ -322,9 +355,12 @@ class Engine:
                     local_loss_sum,
                     cp_context,
                     loss_batch_layout,
+                    output_restore_plan,
                     backward_scale=None,
                     zero_weight_sum=zero_weight_sum,
                 )
+                if batch_error is not None:
+                    raise batch_error
                 if batch_returns_outputs is not None:
                     if returns_outputs is None:
                         returns_outputs = batch_returns_outputs
@@ -337,14 +373,31 @@ class Engine:
             with self.context_fn(model_inputs), cp_context():
                 forward_inputs = filter_forward_kwargs(self.model, model_inputs)
                 output = self.model(**forward_inputs)
-                numerator, outputs = _parse_loss_result(loss_fn(output, loss_inputs), loss_inputs["weights"])
-                returns_outputs = _update_output_mode(returns_outputs, outputs)
-                if outputs is not None:
-                    if len(outputs) != len(batch_datums):
-                        raise ValueError("loss_fn outputs must contain one mapping per Datum")
-                    loss_fn_outputs.extend(outputs)
+                numerator, parsed_outputs, output_parse_error = _parse_loss_result(
+                    loss_fn(output, loss_inputs), loss_inputs["weights"]
+                )
+                self._validate_loss_fn_outputs_across_cp(
+                    parsed_outputs,
+                    loss_inputs.get("weights"),
+                    expected_records=len(batch_datums),
+                    local_error=output_parse_error,
+                    restore_plan=output_restore_plan,
+                    datum_indices=tuple(range(len(batch_datums))),
+                )
+                returns_outputs = _update_output_mode(returns_outputs, parsed_outputs)
                 if zero_weight_sum:
                     numerator = numerator * 0
+            if parsed_outputs is not None:
+                outputs = self._restore_loss_fn_outputs(
+                    parsed_outputs,
+                    loss_inputs,
+                    output_restore_plan,
+                    datum_indices=tuple(range(len(batch_datums))),
+                    chunk_index=None,
+                )
+                if len(outputs) != len(batch_datums):
+                    raise ValueError("loss_fn outputs must contain one mapping per Datum")
+                loss_fn_outputs.extend(outputs)
             local_loss_sum.add_(numerator.detach().to(torch.float64))
 
         if cp_size > 1:
@@ -379,11 +432,14 @@ class Engine:
         ``loss_fn_inputs["weights"]``, or a scalar local weighted-sum
         numerator. For a scalar, the callback must apply weights and masks;
         the Engine will only apply global normalization. The callback may
-        also return one output mapping per Datum.
-        Those mappings are detached and preserved in input order; the Engine
-        deliberately does not interpret or reduce them. Under pipeline
-        parallelism the last stage computes the mappings and broadcasts them
-        to every stage in the pipeline group.
+        also return one opaque output mapping per Datum, or a
+        :class:`LossFnOutputBatch`. Explicit token streams in that envelope are
+        detached, restored from CP-local to full token order, and then split
+        back into per-Datum records; ordinary mappings remain opaque. Under
+        pipeline parallelism the last stage performs CP restoration before it
+        broadcasts the records to every stage in the pipeline group.
+        Values in pipeline output records must therefore be pickle-compatible;
+        large records also incur CPU serialization and PP broadcast cost.
 
         A prebatched Datum intentionally hides its inner sample boundaries.
         It can therefore return a single output mapping only when a pipeline
@@ -403,10 +459,11 @@ class Engine:
             ``(loss, loss_fn_outputs)``. ``loss`` is a detached scalar reduced
             over the DP-CP gradient group and, for pipeline execution,
             synchronized across PP stages. ``loss_fn_outputs`` contains
-            per-Datum mappings in window order; pipeline execution returns the
-            same mappings on every physical stage rank. Model parameters are
-            unchanged, but their gradients contain the complete window's
-            globally normalized backward result.
+            mappings for this DP replica's outer Datums in window order;
+            pipeline execution returns the same mappings on every physical
+            stage rank in that replica. Model parameters are unchanged, but
+            their gradients contain the complete window's globally normalized
+            backward result.
         """
         microbatches = self._group_datums(datums)
         self._validate_parallelism()
@@ -430,13 +487,16 @@ class Engine:
         local_loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
         loss_fn_outputs: list[dict[str, Any]] = []
         returns_outputs: bool | None = None
+        output_error: Exception | None = None
 
         for index, datums in enumerate(microbatches):
             is_last = index == len(microbatches) - 1
             if is_last:
                 prepare_for_final_backward(self.model_parts, pp_enabled=pp_enabled)
 
-            cp_context, model_inputs, loss_inputs, loss_batch_layout = self._prepare_batch(datums, inner_microbatches)
+            cp_context, model_inputs, loss_inputs, loss_batch_layout, output_restore_plan = self._prepare_batch(
+                datums, inner_microbatches
+            )
 
             if self.pipeline is not None:
                 backward_scale = (
@@ -444,7 +504,7 @@ class Engine:
                     if zero_denominator
                     else safe_denominator.new_tensor(grad_group_size) / safe_denominator
                 )
-                batch_returns_outputs, batch_outputs = self._pipeline_execute(
+                batch_returns_outputs, batch_outputs, batch_error = self._pipeline_execute(
                     model_inputs,
                     loss_inputs,
                     datums,
@@ -452,15 +512,25 @@ class Engine:
                     local_loss_sum,
                     cp_context,
                     loss_batch_layout,
+                    output_restore_plan,
                     backward_scale=backward_scale,
                     zero_weight_sum=zero_denominator,
                 )
-                if batch_returns_outputs is not None:
-                    if returns_outputs is None:
-                        returns_outputs = batch_returns_outputs
-                    elif returns_outputs != batch_returns_outputs:
-                        raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
-                    loss_fn_outputs.extend(batch_outputs)
+                if output_error is None:
+                    if batch_error is not None:
+                        output_error = batch_error
+                    else:
+                        try:
+                            if batch_returns_outputs is not None:
+                                if returns_outputs is None:
+                                    returns_outputs = batch_returns_outputs
+                                elif returns_outputs != batch_returns_outputs:
+                                    raise ValueError(
+                                        "loss_fn must return per-Datum outputs for every microbatch or none of them"
+                                    )
+                                loss_fn_outputs.extend(batch_outputs)
+                        except Exception as error:
+                            output_error = error
             else:
                 loss_inputs = _with_loss_metadata(model_inputs, loss_inputs)
                 with (
@@ -470,27 +540,67 @@ class Engine:
                 ):
                     forward_inputs = filter_forward_kwargs(self.model, model_inputs)
                     output = self.model(**forward_inputs)
-                    numerator, outputs = _parse_loss_result(loss_fn(output, loss_inputs), loss_inputs["weights"])
-                    returns_outputs = _update_output_mode(returns_outputs, outputs)
-                    if outputs is not None:
-                        if len(outputs) != len(datums):
-                            raise ValueError("loss_fn outputs must contain one mapping per Datum")
-                        loss_fn_outputs.extend(outputs)
+                    numerator, parsed_outputs, output_parse_error = _parse_loss_result(
+                        loss_fn(output, loss_inputs), loss_inputs["weights"]
+                    )
+                    if output_error is None and dp_size <= 1:
+                        self._validate_loss_fn_outputs_across_cp(
+                            parsed_outputs,
+                            loss_inputs.get("weights"),
+                            expected_records=len(datums),
+                            local_error=output_parse_error,
+                            restore_plan=output_restore_plan,
+                            datum_indices=tuple(range(len(datums))),
+                        )
+                        returns_outputs = _update_output_mode(returns_outputs, parsed_outputs)
                     if zero_denominator:
                         numerator = numerator * 0
                     (numerator * (grad_group_size / safe_denominator)).backward()
 
+                if output_error is None:
+                    try:
+                        if dp_size > 1:
+                            self._validate_loss_fn_outputs_across_cp(
+                                parsed_outputs,
+                                loss_inputs.get("weights"),
+                                expected_records=len(datums),
+                                local_error=output_parse_error,
+                                restore_plan=output_restore_plan,
+                                datum_indices=tuple(range(len(datums))),
+                            )
+                            returns_outputs = _update_output_mode(returns_outputs, parsed_outputs)
+                        if parsed_outputs is not None:
+                            outputs = self._restore_loss_fn_outputs(
+                                parsed_outputs,
+                                loss_inputs,
+                                output_restore_plan,
+                                datum_indices=tuple(range(len(datums))),
+                                chunk_index=None,
+                            )
+                            if len(outputs) != len(datums):
+                                raise ValueError("loss_fn outputs must contain one mapping per Datum")
+                            loss_fn_outputs.extend(outputs)
+                    except Exception as error:
+                        output_error = error
                 local_loss_sum.add_(numerator.detach().to(torch.float64))
             if index == 0:
                 prepare_after_first_microbatch()
 
+        # Piggyback the output-error bit on the existing end-of-window loss
+        # reductions. Every gradient rank therefore finishes backward before
+        # any replica raises a data-local output-routing error.
+        step_state = torch.stack((local_loss_sum, local_loss_sum.new_tensor(int(output_error is not None))))
         if grad_group_size > 1:
-            dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM, group=grad_group)
+            dist.all_reduce(step_state, op=dist.ReduceOp.SUM, group=grad_group)
         pp_group, pp_size = self._pp_group_and_size()
         if pp_size > 1:
-            dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM, group=pp_group)
+            dist.all_reduce(step_state, op=dist.ReduceOp.SUM, group=pp_group)
+        if bool(step_state[1] > 0):
+            if output_error is not None:
+                raise output_error
+            raise RuntimeError("another data-parallel replica failed while restoring loss_fn outputs")
 
-        loss = (local_loss_sum / safe_denominator).detach()
+        loss = (step_state[0] / safe_denominator).detach()
         return loss, loss_fn_outputs
 
     @torch.no_grad()
@@ -659,7 +769,13 @@ class Engine:
         self,
         datums: list[Datum],
         num_pipeline_microbatches: int,
-    ) -> tuple[Callable[[], AbstractContextManager[Any]], dict[str, Any], LossInputs, _LossBatchLayout]:
+    ) -> tuple[
+        Callable[[], AbstractContextManager[Any]],
+        dict[str, Any],
+        LossInputs,
+        _LossBatchLayout,
+        _OutputRestorePlan,
+    ]:
         """Collate, move, and CP-shard one outer batch.
 
         Args:
@@ -670,7 +786,8 @@ class Engine:
 
         Returns:
             The CP context factory, CP-local model inputs, CP-local loss
-            inputs, and collated field-layout metadata. Token-aligned model
+            inputs, collated field-layout metadata, and an internal plan for
+            restoring explicitly declared token outputs. Token-aligned model
             and loss tensors use the same padded, packed THD, Magi, or
             model-owned local sequence layout.
         """
@@ -690,6 +807,17 @@ class Engine:
             model_inputs,
             loss_inputs,
             loss_batch_layout.fields,
+        )
+        output_routing = (
+            _output_sequence_lengths(
+                datums,
+                model_inputs,
+                loss_inputs,
+                loss_batch_layout.item_to_datum,
+                is_thd=model_inputs.get("qkv_format") == "thd",
+            )
+            if loss_seq_dim is not None and weight_layout is LossInputLayout.PER_TOKEN
+            else (None, None, None)
         )
         model_inputs = _to_device(model_inputs, self.device)
         loss_inputs = _to_device(loss_inputs, self.device)
@@ -801,7 +929,21 @@ class Engine:
                 item_to_datum=loss_batch_layout.item_to_datum,
                 unresolved_fields=loss_batch_layout.unresolved_fields,
             )
-        return cp_context, model_inputs, loss_inputs, loss_batch_layout
+        real_lengths, padded_lengths, token_mask = output_routing
+        return (
+            cp_context,
+            model_inputs,
+            loss_inputs,
+            loss_batch_layout,
+            _OutputRestorePlan(
+                sharder=sharder,
+                is_thd=is_thd,
+                item_to_datum=loss_batch_layout.item_to_datum,
+                real_lengths=real_lengths,
+                padded_lengths=padded_lengths,
+                token_mask=token_mask,
+            ),
+        )
 
     def _prepare_mtp_cp_inputs(self, batch: dict[str, Any]) -> MTPContextParallelInputs | None:
         """Prepare global MTP future-token tensors before CP shards the batch.
@@ -893,10 +1035,11 @@ class Engine:
         local_loss_sum: torch.Tensor,
         cp_context: Callable[[], AbstractContextManager[Any]],
         loss_batch_layout: _LossBatchLayout,
+        output_restore_plan: _OutputRestorePlan,
         *,
         backward_scale: torch.Tensor | None,
         zero_weight_sum: bool,
-    ) -> tuple[bool | None, list[dict[str, Any]]]:
+    ) -> tuple[bool | None, list[dict[str, Any]], Exception | None]:
         """Run prepared pipeline microbatches in training or forward-only mode.
 
         Args:
@@ -908,17 +1051,23 @@ class Engine:
             cp_context: Context covering the complete pipeline schedule.
             loss_batch_layout: Semantic layout of every loss field plus the
                 collater's logical item-to-Datum routing, when available.
+            output_restore_plan: Captured full-token routing and CP sharder for
+                explicit per-token callback outputs.
             backward_scale: Multiplier returned to the training schedule for
                 backward, or ``None`` to run the forward-only schedule.
             zero_weight_sum: Whether reporting numerators must be forced to
                 graph-connected zero.
 
         Returns:
-            Whether the callback returned outputs, and its detached outputs in
-            logical Datum order.
+            Whether the callback returned outputs, its detached outputs in
+            logical Datum order, and any post-schedule output-restoration
+            error synchronized across PP stages.
         """
         outputs_by_microbatch: list[list[dict[str, Any]] | None] = [None] * self.pipeline.num_microbatches
         outputs_by_datum: list[dict[str, Any] | None] = [None] * len(datums)
+        parsed_outputs_by_microbatch: list[ParsedLossOutputs] = [None] * self.pipeline.num_microbatches
+        output_parse_errors_by_microbatch: list[Exception | None] = [None] * self.pipeline.num_microbatches
+        loss_called_by_microbatch = [False] * self.pipeline.num_microbatches
         returns_outputs: bool | None = None
 
         with cp_context():
@@ -952,37 +1101,15 @@ class Engine:
                 )
 
                 def pipeline_loss(output: Any, microbatch_index: int) -> torch.Tensor:
-                    nonlocal returns_outputs
                     loss_inputs_mb = loss_microbatches[microbatch_index]
-                    numerator, batch_outputs = _parse_loss_result(
+                    numerator, batch_outputs, output_parse_error = _parse_loss_result(
                         loss_fn(output, loss_inputs_mb), loss_inputs_mb["weights"]
                     )
-                    returns_outputs = _update_output_mode(returns_outputs, batch_outputs)
-                    if batch_outputs is not None:
-                        datum_indices = (
-                            None
-                            if datum_indices_by_microbatch is None
-                            else datum_indices_by_microbatch[microbatch_index]
-                        )
-                        if datum_indices is None and len(datums) == 1 and self.pipeline.num_microbatches > 1:
-                            raise ValueError(
-                                "a prebatched Datum may return outputs only when num_microbatches=1 because "
-                                "its inner sample boundaries are not part of the Datum contract"
-                            )
-                        if datum_indices is not None:
-                            if len(batch_outputs) != len(datum_indices):
-                                raise ValueError(
-                                    f"pipeline loss_fn returned {len(batch_outputs)} outputs for microbatch "
-                                    f"{microbatch_index}, expected {len(datum_indices)} from its Datum mapping"
-                                )
-                            for datum_index, item in zip(datum_indices, batch_outputs):
-                                if outputs_by_datum[datum_index] is not None:
-                                    raise RuntimeError(
-                                        f"pipeline returned more than one output for Datum {datum_index}"
-                                    )
-                                outputs_by_datum[datum_index] = item
-                        else:
-                            outputs_by_microbatch[microbatch_index] = batch_outputs
+                    if loss_called_by_microbatch[microbatch_index]:
+                        raise RuntimeError(f"pipeline evaluated loss_fn twice for microbatch {microbatch_index}")
+                    loss_called_by_microbatch[microbatch_index] = True
+                    parsed_outputs_by_microbatch[microbatch_index] = batch_outputs
+                    output_parse_errors_by_microbatch[microbatch_index] = output_parse_error
                     if zero_weight_sum:
                         numerator = numerator * 0
                     local_loss_sum.add_(numerator.detach().to(torch.float64))
@@ -1000,24 +1127,261 @@ class Engine:
                 )
 
         outputs: list[dict[str, Any]] = []
-        if self.pipeline.info.has_last_stage and returns_outputs:
-            if datum_indices_by_microbatch is not None:
-                if any(item is None for item in outputs_by_datum):
-                    raise RuntimeError("pipeline schedule did not return exactly one output for every Datum")
-                outputs = [item for item in outputs_by_datum if item is not None]
-            else:
-                if any(items is None for items in outputs_by_microbatch):
-                    raise RuntimeError("pipeline schedule did not evaluate loss_fn for every logical microbatch")
-                outputs = [item for items in outputs_by_microbatch if items is not None for item in items]
-                if len(outputs) != len(datums):
-                    raise ValueError(
-                        f"pipeline loss_fn returned {len(outputs)} outputs across the outer batch, "
-                        f"expected one for each of its {len(datums)} Datums"
+        serialized_outputs: bytes | None = None
+        output_error: Exception | None = None
+        if self.pipeline.info.has_last_stage:
+            try:
+                for microbatch_index, batch_outputs in enumerate(parsed_outputs_by_microbatch):
+                    local_error = output_parse_errors_by_microbatch[microbatch_index]
+                    if not loss_called_by_microbatch[microbatch_index]:
+                        local_error = RuntimeError(
+                            f"pipeline did not evaluate loss_fn for microbatch {microbatch_index}"
+                        )
+                    weights = loss_microbatches[microbatch_index].get("weights")
+                    datum_indices = (
+                        None if datum_indices_by_microbatch is None else datum_indices_by_microbatch[microbatch_index]
                     )
-        outputs = self._broadcast_pipeline_outputs(outputs)
-        return bool(outputs), outputs
+                    expected_records = (
+                        len(datum_indices)
+                        if datum_indices is not None
+                        else (1 if len(datums) == 1 and self.pipeline.num_microbatches == 1 else None)
+                    )
+                    self._validate_loss_fn_outputs_across_cp(
+                        batch_outputs,
+                        weights,
+                        expected_records=expected_records,
+                        microbatch_index=microbatch_index,
+                        local_error=local_error,
+                        restore_plan=output_restore_plan,
+                        datum_indices=datum_indices,
+                        chunk_index=(microbatch_index if is_thd and self.pipeline.num_microbatches > 1 else None),
+                    )
+                    returns_outputs = _update_output_mode(returns_outputs, batch_outputs)
+                    if batch_outputs is None:
+                        continue
+                    restored = (
+                        batch_outputs
+                        if isinstance(batch_outputs, list)
+                        else self._restore_loss_fn_outputs(
+                            batch_outputs,
+                            loss_microbatches[microbatch_index],
+                            output_restore_plan,
+                            datum_indices=datum_indices,
+                            chunk_index=(microbatch_index if is_thd and self.pipeline.num_microbatches > 1 else None),
+                        )
+                    )
+                    if datum_indices is None:
+                        outputs_by_microbatch[microbatch_index] = restored
+                        continue
+                    if len(restored) != len(datum_indices):
+                        raise RuntimeError("restored token outputs do not match their pipeline Datum routing")
+                    for datum_index, item in zip(datum_indices, restored):
+                        if outputs_by_datum[datum_index] is not None:
+                            raise RuntimeError(f"pipeline returned more than one output for Datum {datum_index}")
+                        outputs_by_datum[datum_index] = item
+                if returns_outputs:
+                    if datum_indices_by_microbatch is not None:
+                        if any(item is None for item in outputs_by_datum):
+                            raise RuntimeError("pipeline schedule did not return exactly one output for every Datum")
+                        outputs = [item for item in outputs_by_datum if item is not None]
+                    else:
+                        if any(items is None for items in outputs_by_microbatch):
+                            raise RuntimeError(
+                                "pipeline schedule did not evaluate loss_fn for every logical microbatch"
+                            )
+                        outputs = [item for items in outputs_by_microbatch if items is not None for item in items]
+                        if len(outputs) != len(datums):
+                            raise ValueError(
+                                f"pipeline loss_fn returned {len(outputs)} outputs across the outer batch, "
+                                f"expected one for each of its {len(datums)} Datums"
+                            )
+                if outputs:
+                    # broadcast_object_list serializes only on the source
+                    # stage. Preflight while errors can still be propagated to
+                    # every PP stage instead of leaving peers in the broadcast.
+                    # Broadcast these already validated bytes so arbitrary
+                    # record objects are never pickled again inside a PP
+                    # collective.
+                    serialized_outputs = pickle.dumps(_to_device(outputs, torch.device("cpu")))
+            except Exception as error:
+                output_error = error
+        output_error = self._synchronize_pipeline_output_error(output_error)
+        if output_error is None:
+            outputs = self._broadcast_pipeline_outputs(outputs, serialized_outputs=serialized_outputs)
+        return bool(outputs), outputs, output_error
 
-    def _broadcast_pipeline_outputs(self, outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _restore_loss_fn_outputs(
+        self,
+        outputs: list[dict[str, Any]] | LossFnOutputBatch,
+        loss_inputs: LossInputs,
+        plan: _OutputRestorePlan,
+        *,
+        datum_indices: tuple[int, ...] | None,
+        chunk_index: int | None,
+    ) -> list[dict[str, Any]]:
+        """Restore explicitly typed token streams and merge per-Datum records."""
+        weights = loss_inputs.get("weights")
+        if not isinstance(weights, torch.Tensor):
+            raise ValueError("loss_fn token outputs require Tensor loss weights")
+        if isinstance(outputs, list):
+            return outputs
+
+        if datum_indices is None:
+            if plan.item_to_datum is not None:
+                raise RuntimeError("loss_fn output routing is missing the collater's Datum mapping")
+            if chunk_index is not None:
+                raise NotImplementedError(
+                    "a prebatched Datum cannot restore token outputs across multiple pipeline microbatches"
+                )
+            datum_indices = (0,)
+
+        source_records = ({},) * len(datum_indices) if outputs.per_datum is None else outputs.per_datum
+        records = [dict(record) for record in source_records]
+        if len(records) != len(datum_indices):
+            raise ValueError(
+                f"LossFnOutputBatch.per_datum contains {len(records)} records, expected {len(datum_indices)}"
+            )
+        record_keys = {key for record in records for key in record}
+        collisions = record_keys & set(outputs.per_token)
+        if collisions:
+            raise ValueError(f"per-token output keys collide with per-Datum records: {sorted(collisions)}")
+
+        restored_fields: list[tuple[str, torch.Tensor, int]] = []
+        for name in sorted(outputs.per_token):
+            spec = outputs.per_token[name]
+            tensor = spec.tensor.detach()
+            if tensor.shape[: weights.ndim] != weights.shape:
+                raise ValueError(
+                    f"per-token output {name!r} must start with the loss weight shape {tuple(weights.shape)}, "
+                    f"got {tuple(tensor.shape)}"
+                )
+            if tensor.device != weights.device:
+                raise ValueError(
+                    f"per-token output {name!r} must be on the loss weight device {weights.device}, got {tensor.device}"
+                )
+            seq_dim = _loss_sequence_dim_from_weights(weights)
+            shard_layout = plan.sharder.shard_layout
+            selected_layout = shard_layout
+            if chunk_index is not None:
+                if shard_layout is None or shard_layout.chunk_layouts is None:
+                    if self._cp_size() > 1:
+                        raise NotImplementedError(
+                            "the active context-parallel backend does not report reversible per-pipeline-chunk "
+                            "token layouts; typed per-token outputs are unavailable for this packed PP+CP batch"
+                        )
+                    selected_layout = None
+                else:
+                    if chunk_index < 0 or chunk_index >= len(shard_layout.chunk_layouts):
+                        raise IndexError(
+                            f"pipeline chunk {chunk_index} is out of range for "
+                            f"{len(shard_layout.chunk_layouts)} reported CP layouts"
+                        )
+                    selected_layout = shard_layout.chunk_layouts[chunk_index]
+            if self._cp_size() > 1 and selected_layout is None:
+                raise NotImplementedError(
+                    "the active context-parallel backend does not report a reversible token layout; "
+                    "typed per-token outputs are unavailable for this batch"
+                )
+            if selected_layout is not None:
+                tensor = plan.sharder.gather_token_tensor(
+                    tensor,
+                    seq_dim=seq_dim,
+                    trim=True,
+                    fill=spec.fill_value,
+                    chunk_index=chunk_index,
+                )
+                if selected_layout.input_row_shape is not None:
+                    seq_dim = len(selected_layout.input_row_shape) - 1
+            restored_fields.append((name, tensor, seq_dim))
+
+        # Complete every field's CP collective before Datum-local splitting.
+        # A routing error can then no longer leave a peer entering the next
+        # field gather while this rank exits early.
+        for name, tensor, seq_dim in restored_fields:
+            pieces = _split_restored_token_output(
+                tensor,
+                plan,
+                datum_indices=datum_indices,
+                seq_dim=seq_dim,
+            )
+            if len(pieces) != len(records):
+                raise RuntimeError(f"restored per-token output {name!r} does not match its Datum records")
+            for record, piece in zip(records, pieces):
+                record[name] = piece.detach()
+        return records
+
+    def _validate_loss_fn_outputs_across_cp(
+        self,
+        outputs: ParsedLossOutputs,
+        weights: Any,
+        *,
+        expected_records: int | None,
+        microbatch_index: int | None = None,
+        local_error: Exception | None = None,
+        restore_plan: _OutputRestorePlan | None = None,
+        datum_indices: tuple[int, ...] | None = None,
+        chunk_index: int | None = None,
+    ) -> None:
+        """Validate output routing and reach CP consensus before token gathers."""
+        if local_error is None:
+            error, schema = _loss_fn_output_contract(
+                outputs,
+                weights,
+                expected_records=expected_records,
+                microbatch_index=microbatch_index,
+            )
+        else:
+            error, schema = str(local_error), ("invalid-output", type(local_error).__name__)
+        if error is None and isinstance(outputs, LossFnOutputBatch) and restore_plan is not None:
+            restore_error, restore_schema = _loss_fn_output_restore_contract(
+                outputs,
+                weights,
+                restore_plan,
+                datum_indices=datum_indices,
+                chunk_index=chunk_index,
+                cp_size=self._cp_size(),
+            )
+            error = restore_error
+            schema = (*schema, restore_schema)
+        cp_group, cp_size = self._cp_group_and_size()
+        if cp_size <= 1 or not (dist.is_available() and dist.is_initialized()):
+            if error is not None:
+                raise ValueError(error)
+            return
+        digest = int.from_bytes(hashlib.sha256(repr(schema).encode()).digest()[:8], "little") & ((1 << 63) - 1)
+        local = torch.tensor([int(error is not None), digest], dtype=torch.int64, device=self.device)
+        gathered = torch.empty(cp_size * 2, dtype=torch.int64, device=self.device)
+        dist.all_gather_into_tensor(gathered, local, group=cp_group)
+        gathered = gathered.view(cp_size, 2)
+        if bool((gathered[:, 0] != 0).any()):
+            detail = f": {error}" if error is not None else ""
+            raise ValueError(f"invalid loss_fn outputs on one or more context-parallel ranks{detail}")
+        if not bool((gathered[:, 1] == gathered[0, 1]).all()):
+            raise ValueError("context-parallel ranks returned different loss output schemas")
+
+    def _synchronize_pipeline_output_error(self, error: Exception | None) -> Exception | None:
+        """Propagate output failures across CP lanes and then PP stages."""
+        failed = torch.tensor(int(error is not None), dtype=torch.int64, device=self.device)
+        cp_group, cp_size = self._cp_group_and_size()
+        if cp_size > 1:
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=cp_group)
+            if bool(failed.item()) and error is None:
+                error = RuntimeError("another context-parallel rank failed while restoring loss_fn outputs")
+
+        pp_group, pp_size = self._pp_group_and_size()
+        if pp_size <= 1:
+            return error
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=pp_group)
+        if not bool(failed.item()):
+            return None
+        return error or RuntimeError("pipeline last stage failed while restoring loss_fn outputs")
+
+    def _broadcast_pipeline_outputs(
+        self,
+        outputs: list[dict[str, Any]],
+        *,
+        serialized_outputs: bytes | None,
+    ) -> list[dict[str, Any]]:
         """Broadcast last-stage per-Datum outputs to every pipeline stage."""
         pp_group, pp_size = self._pp_group_and_size()
         if pp_size <= 1:
@@ -1038,11 +1402,14 @@ class Engine:
         if not bool(stage_states[source_group_rank, 1]):
             return []
         source_global_rank = dist.get_global_rank(pp_group, source_group_rank)
-        object_list: list[Any] = [
-            _to_device(outputs, torch.device("cpu")) if dist.get_rank(group=pp_group) == source_group_rank else None
-        ]
+        object_list: list[Any] = [serialized_outputs if dist.get_rank(group=pp_group) == source_group_rank else None]
         dist.broadcast_object_list(object_list, src=source_global_rank, group=pp_group, device=self.device)
-        received = object_list[0]
+        payload = object_list[0]
+        if not isinstance(payload, bytes):
+            raise RuntimeError("pipeline output synchronization received an invalid serialized payload")
+        # The payload was serialized by this Engine's trusted PP source rank
+        # immediately above; this is not an external deserialization boundary.
+        received = pickle.loads(payload)  # noqa: S301
         if not isinstance(received, list) or not all(isinstance(item, dict) for item in received):
             raise RuntimeError("pipeline output synchronization received invalid per-Datum outputs")
         return _to_device(received, self.device)
@@ -1718,24 +2085,440 @@ def _weighted_numerator(losses: Any, weights: torch.Tensor) -> torch.Tensor:
     return numerator
 
 
-def _parse_loss_result(
-    result: torch.Tensor | tuple[torch.Tensor, Sequence[Mapping[str, Any]]],
-    weights: torch.Tensor,
-) -> tuple[torch.Tensor, list[dict[str, Any]] | None]:
-    """Normalize one loss callback result without applying Datum routing."""
-    if not isinstance(result, tuple):
-        return _weighted_numerator(result, weights), None
-    losses, outputs = result
+def _output_sequence_lengths(
+    datums: Sequence[Datum],
+    model_inputs: Mapping[str, Any],
+    loss_inputs: Mapping[str, LossInputValue],
+    item_to_datum: tuple[int, ...] | None,
+    *,
+    is_thd: bool,
+) -> tuple[
+    tuple[int, ...] | None,
+    tuple[int, ...] | None,
+    torch.Tensor | None,
+]:
+    """Capture real and padded sequence lengths before CP mutates the batch."""
+    if item_to_datum is None:
+        return None, None, None
+    if item_to_datum != tuple(range(len(datums))):
+        raise ValueError("token output restoration requires collater items to preserve Datum order")
+
+    weights = loss_inputs.get("weights")
+    if not isinstance(weights, torch.Tensor):
+        raise ValueError("token output restoration requires Tensor loss weights")
+    if is_thd:
+        if isinstance(model_inputs.get("seq_lens"), torch.Tensor):
+            real_lengths = _valid_row_values(model_inputs["seq_lens"])
+            padded_source = model_inputs.get("seq_lens_padded", model_inputs["seq_lens"])
+            if not isinstance(padded_source, torch.Tensor):
+                raise ValueError("packed THD seq_lens_padded must be a Tensor")
+            padded_lengths = _valid_row_values(padded_source)
+        else:
+            cu_seqlens = model_inputs.get("cu_seqlens")
+            if not isinstance(cu_seqlens, torch.Tensor):
+                raise ValueError("packed token outputs require seq_lens or cu_seqlens metadata")
+            real_lengths = _lengths_from_cu_seqlens(cu_seqlens)
+            padded_cu = model_inputs.get("cu_seqlens_padded", cu_seqlens)
+            if not isinstance(padded_cu, torch.Tensor):
+                raise ValueError("packed THD cu_seqlens_padded must be a Tensor")
+            padded_lengths = _lengths_from_cu_seqlens(padded_cu)
+        if len(real_lengths) != len(item_to_datum) or len(padded_lengths) != len(item_to_datum):
+            raise ValueError(
+                "collater item_to_datum does not match packed token metadata; expected one real and padded "
+                "length per Datum, "
+                f"got real={real_lengths}, padded={padded_lengths}, Datums={len(item_to_datum)}"
+            )
+        if any(real < 0 or padded < 0 or real > padded for real, padded in zip(real_lengths, padded_lengths)):
+            raise ValueError(
+                "packed token metadata requires 0 <= real_length <= padded_length for every Datum; "
+                f"got real={real_lengths}, padded={padded_lengths}"
+            )
+        if sum(padded_lengths) != weights.numel():
+            raise ValueError(
+                f"packed padded lengths sum to {sum(padded_lengths)}, but loss weights have token width "
+                f"{weights.numel()}"
+            )
+        return real_lengths, padded_lengths, None
+
+    if weights.ndim < 2 or weights.shape[0] != len(item_to_datum):
+        raise ValueError("padded token outputs require weights with one row per Datum")
+    width = int(weights.shape[1])
+    attention_mask = model_inputs.get("attention_mask")
     if (
-        not isinstance(outputs, Sequence)
-        or isinstance(outputs, (str, bytes))
-        or not all(isinstance(item, Mapping) for item in outputs)
+        isinstance(attention_mask, torch.Tensor)
+        and attention_mask.ndim == 2
+        and tuple(attention_mask.shape) == tuple(weights.shape[:2])
     ):
-        raise ValueError("loss_fn outputs must be a sequence of mappings")
-    return _weighted_numerator(losses, weights), [_detach(dict(item)) for item in outputs]
+        token_mask = attention_mask.to(torch.bool)
+        # Keep token routing compact. Turning every active position into a
+        # Python int is prohibitively expensive for long-context batches and
+        # would penalize ordinary training that never returns token outputs.
+        real_lengths = tuple(int(length) for length in token_mask.sum(dim=1).tolist())
+    else:
+        inferred: list[int] = []
+        for datum in datums:
+            try:
+                inferred.append(datum.seq_len)
+            except ValueError:
+                inferred.append(width)
+        real_lengths = tuple(inferred)
+        token_mask = None
+    if any(length < 0 or length > width for length in real_lengths):
+        raise ValueError(f"Datum token lengths must be within padded width {width}; got {real_lengths}")
+    return real_lengths, (width,) * len(item_to_datum), token_mask
 
 
-def _update_output_mode(previous: bool | None, outputs: list[dict[str, Any]] | None) -> bool:
+def _valid_row_values(values: torch.Tensor, sentinel: int = -1000) -> tuple[int, ...]:
+    rows = values.reshape(1, -1) if values.ndim == 1 else values.reshape(values.shape[0], -1)
+    result: list[int] = []
+    for row in rows:
+        result.extend(int(value) for value in row.tolist() if int(value) != sentinel)
+    return tuple(result)
+
+
+def _lengths_from_cu_seqlens(cu_seqlens: torch.Tensor, sentinel: int = -1000) -> tuple[int, ...]:
+    rows = cu_seqlens.reshape(1, -1) if cu_seqlens.ndim == 1 else cu_seqlens.reshape(cu_seqlens.shape[0], -1)
+    result: list[int] = []
+    for row in rows:
+        valid = row[row != sentinel]
+        if valid.numel() < 2:
+            continue
+        lengths = valid[1:] - valid[:-1]
+        if bool((lengths < 0).any()):
+            raise ValueError("cu_seqlens must be monotonically non-decreasing within each row")
+        result.extend(int(value) for value in lengths.tolist())
+    return tuple(result)
+
+
+def _loss_sequence_dim_from_weights(weights: torch.Tensor) -> int:
+    if weights.ndim == 1:
+        return 0
+    if weights.ndim == 2:
+        return 1
+    raise ValueError(f"per-token output weights must be one- or two-dimensional, got {tuple(weights.shape)}")
+
+
+def _split_restored_token_output(
+    tensor: torch.Tensor,
+    plan: _OutputRestorePlan,
+    *,
+    datum_indices: tuple[int, ...],
+    seq_dim: int,
+) -> list[torch.Tensor]:
+    """Split one restored collated token tensor into input-Datum coordinates."""
+    if plan.item_to_datum is None:
+        if datum_indices != (0,):
+            raise NotImplementedError("prebatched token outputs can only produce their single outer Datum record")
+        return [tensor]
+    if plan.real_lengths is None or plan.padded_lengths is None:
+        raise RuntimeError("token output routing metadata is incomplete")
+
+    if plan.is_thd:
+        expected_width = sum(plan.padded_lengths[index] for index in datum_indices)
+        if tensor.shape[seq_dim] != expected_width and seq_dim == 1 and tensor.ndim >= 2:
+            # Some THD backends restore the caller's pre-flatten [B, S]
+            # coordinates. Sequence metadata is a row-major flat stream, so
+            # collapse those two token axes before routing individual Datums.
+            if tensor.shape[0] * tensor.shape[1] == expected_width:
+                tensor = tensor.flatten(0, 1)
+                seq_dim = 0
+        if tensor.shape[seq_dim] != expected_width:
+            raise ValueError(
+                f"restored packed token output has width {tensor.shape[seq_dim]}, expected {expected_width}"
+            )
+        pieces: list[torch.Tensor] = []
+        start = 0
+        for datum_index in datum_indices:
+            real_length = plan.real_lengths[datum_index]
+            padded_length = plan.padded_lengths[datum_index]
+            piece = tensor.narrow(seq_dim, start, real_length)
+            if seq_dim == 1 and piece.shape[0] == 1:
+                piece = piece.squeeze(0)
+            pieces.append(piece.contiguous())
+            start += padded_length
+        return pieces
+
+    if tensor.ndim < 2 or tensor.shape[0] != len(datum_indices):
+        raise ValueError(f"restored padded token output must have {len(datum_indices)} rows, got {tuple(tensor.shape)}")
+    pieces = []
+    for row_index, datum_index in enumerate(datum_indices):
+        row = tensor.select(0, row_index)
+        if plan.token_mask is not None:
+            mask = plan.token_mask[datum_index].to(device=row.device)
+            pieces.append(row[mask].contiguous())
+        else:
+            pieces.append(row.narrow(0, 0, plan.real_lengths[datum_index]).contiguous())
+    return pieces
+
+
+def _loss_fn_output_contract(
+    outputs: ParsedLossOutputs,
+    weights: Any,
+    *,
+    expected_records: int | None,
+    microbatch_index: int | None,
+) -> tuple[str | None, tuple[Any, ...]]:
+    """Return a local validation error and a rank-comparable output schema."""
+    if outputs is None:
+        return None, ("none",)
+    if expected_records is None:
+        return (
+            "a prebatched Datum may return outputs only when num_microbatches=1 because its inner sample "
+            "boundaries are not part of the Datum contract",
+            ("unsupported", type(outputs).__name__),
+        )
+    if not isinstance(weights, torch.Tensor):
+        return "loss_fn outputs require Tensor loss weights", ("invalid-weights", type(weights).__name__)
+
+    if isinstance(outputs, list):
+        error = None
+        if len(outputs) != expected_records:
+            error = (
+                f"pipeline loss_fn returned {len(outputs)} outputs for microbatch {microbatch_index}, "
+                f"expected {expected_records} from its Datum mapping"
+                if microbatch_index is not None
+                else f"loss_fn outputs must contain one mapping per Datum; got {len(outputs)} for {expected_records}"
+            )
+        # Legacy records are deliberately opaque and may contain rank-local
+        # fields. Only their presence and routing count participate in CP
+        # consensus; typed outputs opt into stronger schema agreement.
+        return error, ("legacy", len(outputs))
+
+    error = None
+    if weights.ndim not in (1, 2):
+        error = f"per-token output weights must be one- or two-dimensional, got {tuple(weights.shape)}"
+    records = outputs.per_datum
+    if records is not None and len(records) != expected_records:
+        error = (
+            f"LossFnOutputBatch.per_datum contains {len(records)} records, expected {expected_records}"
+            if error is None
+            else error
+        )
+    record_keys = () if records is None else tuple(tuple(sorted(record)) for record in records)
+    field_schema: list[tuple[Any, ...]] = []
+    for name, spec in sorted(outputs.per_token.items()):
+        tensor = spec.tensor
+        if tensor.shape[: weights.ndim] != weights.shape and error is None:
+            error = (
+                f"per-token output {name!r} must start with the loss weight shape {tuple(weights.shape)}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if tensor.device != weights.device and error is None:
+            error = f"per-token output {name!r} must be on the loss weight device {weights.device}, got {tensor.device}"
+        field_schema.append(
+            (
+                name,
+                str(tensor.dtype),
+                tensor.device.type,
+                tuple(tensor.shape),
+                type(spec.fill_value).__name__,
+                repr(spec.fill_value),
+            )
+        )
+    return error, ("typed", len(records) if records is not None else None, record_keys, tuple(field_schema))
+
+
+def _token_mask_schema(token_mask: torch.Tensor | None) -> tuple[tuple[int, ...], str] | None:
+    """Return compact, rank-comparable routing metadata for a padded token mask."""
+    if token_mask is None:
+        return None
+    compact = token_mask.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    digest = hashlib.sha256(compact.numpy().tobytes()).hexdigest()
+    return tuple(compact.shape), digest
+
+
+def _loss_fn_output_restore_contract(
+    outputs: LossFnOutputBatch,
+    weights: Any,
+    plan: _OutputRestorePlan,
+    *,
+    datum_indices: tuple[int, ...] | None,
+    chunk_index: int | None,
+    cp_size: int,
+) -> tuple[str | None, tuple[Any, ...]]:
+    """Preflight one typed restore before any field enters a CP collective."""
+    try:
+        if not isinstance(weights, torch.Tensor):
+            raise ValueError("loss_fn token outputs require Tensor loss weights")
+        seq_dim = _loss_sequence_dim_from_weights(weights)
+        if datum_indices is None:
+            if plan.item_to_datum is not None:
+                raise RuntimeError("loss_fn output routing is missing the collater's Datum mapping")
+            if chunk_index is not None:
+                raise NotImplementedError(
+                    "a prebatched Datum cannot restore token outputs across multiple pipeline microbatches"
+                )
+            datum_indices = (0,)
+
+        if any(index < 0 for index in datum_indices):
+            raise ValueError(f"loss_fn output Datum indices must be non-negative, got {datum_indices}")
+        if plan.item_to_datum is not None:
+            if plan.real_lengths is None or plan.padded_lengths is None:
+                raise RuntimeError("token output routing metadata is incomplete")
+            if any(index >= len(plan.real_lengths) or index >= len(plan.padded_lengths) for index in datum_indices):
+                raise ValueError(f"loss_fn output Datum indices are out of range: {datum_indices}")
+
+        layout = plan.sharder.shard_layout
+        selected_layout = layout
+        if chunk_index is not None:
+            if layout is None or layout.chunk_layouts is None:
+                if cp_size > 1:
+                    raise NotImplementedError(
+                        "the active context-parallel backend does not report reversible per-pipeline-chunk "
+                        "token layouts; typed per-token outputs are unavailable for this packed PP+CP batch"
+                    )
+                selected_layout = None
+            else:
+                if chunk_index < 0 or chunk_index >= len(layout.chunk_layouts):
+                    raise IndexError(
+                        f"pipeline chunk {chunk_index} is out of range for {len(layout.chunk_layouts)} reported CP layouts"
+                    )
+                selected_layout = layout.chunk_layouts[chunk_index]
+        if cp_size > 1 and selected_layout is None:
+            raise NotImplementedError(
+                "the active context-parallel backend does not report a reversible token layout; "
+                "typed per-token outputs are unavailable for this batch"
+            )
+
+        local_width = int(weights.shape[seq_dim])
+        global_width = local_width * cp_size
+        if selected_layout is not None:
+            captured = selected_layout.local_token_global_indices
+            if captured is not None and captured.numel() != local_width:
+                raise ValueError(
+                    f"the reported CP layout has {captured.numel()} local token indices, "
+                    f"but loss outputs have local width {local_width}"
+                )
+            if selected_layout.padded_seq_len is not None and selected_layout.padded_seq_len != global_width:
+                raise ValueError(
+                    f"the reported CP layout has padded width {selected_layout.padded_seq_len}, "
+                    f"but loss outputs imply global width {global_width}"
+                )
+
+        restored_width = global_width
+        if selected_layout is not None:
+            if selected_layout.input_token_stream_positions is not None:
+                positions = selected_layout.input_token_stream_positions
+                if bool((positions < -1).any()) or bool((positions >= global_width).any()):
+                    raise ValueError(f"the reported CP position map must contain -1 or indices below {global_width}")
+                restored_width = positions.numel() if plan.is_thd else int(positions.shape[1])
+            elif selected_layout.input_row_shape is not None:
+                restored_width = prod(selected_layout.input_row_shape)
+            elif selected_layout.original_seq_len is not None:
+                restored_width = selected_layout.original_seq_len
+        if (
+            plan.is_thd
+            and weights.ndim == 2
+            and (
+                selected_layout is None
+                or (selected_layout.input_token_stream_positions is None and selected_layout.input_row_shape is None)
+            )
+        ):
+            # Some model-owned THD paths retain caller [B, S] rows instead of
+            # reporting an explicit input_row_shape. Routing flattens those
+            # token axes row-major after restoration.
+            restored_width *= int(weights.shape[0])
+
+        if plan.item_to_datum is not None:
+            assert plan.real_lengths is not None and plan.padded_lengths is not None
+            if plan.is_thd:
+                expected_width = sum(plan.padded_lengths[index] for index in datum_indices)
+                if restored_width != expected_width:
+                    raise ValueError(
+                        f"restored packed token output has width {restored_width}, expected {expected_width}"
+                    )
+            else:
+                if weights.ndim != 2 or weights.shape[0] != len(datum_indices):
+                    raise ValueError(
+                        f"restored padded token output must have {len(datum_indices)} rows, "
+                        f"got local loss weights {tuple(weights.shape)}"
+                    )
+                expected_widths = {plan.padded_lengths[index] for index in datum_indices}
+                if expected_widths != {restored_width}:
+                    raise ValueError(
+                        f"restored padded token output has width {restored_width}, expected {sorted(expected_widths)}"
+                    )
+                positions = selected_layout.input_token_stream_positions if selected_layout is not None else None
+                if positions is not None and positions.shape[0] != len(datum_indices):
+                    raise ValueError(
+                        f"the reported CP position map has {positions.shape[0]} rows, expected {len(datum_indices)}"
+                    )
+
+        layout_schema = None
+        if selected_layout is not None:
+            layout_schema = (
+                selected_layout.original_seq_len,
+                selected_layout.padded_seq_len,
+                selected_layout.input_row_shape,
+                (
+                    None
+                    if selected_layout.input_token_stream_positions is None
+                    else tuple(selected_layout.input_token_stream_positions.shape)
+                ),
+                (
+                    None
+                    if selected_layout.local_token_global_indices is None
+                    else selected_layout.local_token_global_indices.numel()
+                ),
+            )
+        schema = (
+            "restore",
+            plan.is_thd,
+            datum_indices,
+            plan.real_lengths,
+            plan.padded_lengths,
+            _token_mask_schema(plan.token_mask),
+            seq_dim,
+            tuple(weights.shape),
+            layout_schema,
+            tuple(sorted(outputs.per_token)),
+        )
+        return None, schema
+    except Exception as error:
+        return str(error), ("invalid-restore", type(error).__name__)
+
+
+def _parse_loss_result(
+    result: torch.Tensor | tuple[torch.Tensor, Sequence[Mapping[str, Any]] | LossFnOutputBatch],
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, ParsedLossOutputs, Exception | None]:
+    """Normalize one loss callback result without applying Datum routing.
+
+    Output-only contract errors are returned separately so distributed peers
+    can finish the same backward schedule and reach a common error decision.
+    Loss-tensor errors still raise immediately because no valid backward value
+    exists in that case.
+    """
+    if not isinstance(result, tuple):
+        return _weighted_numerator(result, weights), None, None
+    if not result:
+        raise ValueError("loss_fn returned an empty tuple instead of a loss Tensor")
+    numerator = _weighted_numerator(result[0], weights)
+    if len(result) != 2:
+        return numerator, None, ValueError("loss_fn must return a loss Tensor or a two-item (loss, outputs) tuple")
+    outputs = result[1]
+    try:
+        if isinstance(outputs, LossFnOutputBatch):
+            detached = LossFnOutputBatch(
+                per_token={
+                    name: PerTokenOutput(spec.tensor.detach(), fill_value=spec.fill_value)
+                    for name, spec in outputs.per_token.items()
+                },
+                per_datum=(None if outputs.per_datum is None else [_detach(record) for record in outputs.per_datum]),
+            )
+            return numerator, detached, None
+        if (
+            not isinstance(outputs, Sequence)
+            or isinstance(outputs, (str, bytes))
+            or not all(isinstance(item, Mapping) for item in outputs)
+        ):
+            raise ValueError("loss_fn outputs must be a sequence of mappings")
+        return numerator, [_detach(dict(item)) for item in outputs], None
+    except Exception as error:
+        return numerator, None, error
+
+
+def _update_output_mode(previous: bool | None, outputs: ParsedLossOutputs) -> bool:
     current = outputs is not None
     if previous is not None and previous != current:
         raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")

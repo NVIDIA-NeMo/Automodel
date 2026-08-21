@@ -208,6 +208,13 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     )
     out = gather_sharder.gather_token_tensor(full_rows, trim=True, fill=-5.0)
     assert torch.equal(out, torch.tensor([[10.0, 20.0, -5.0]]))
+
+    full_features = torch.tensor([[[10.0, 110.0], [20.0, 120.0], [7.0, 8.0], [9.0, 10.0]]])
+    feature_out = gather_sharder.gather_token_tensor(full_features, trim=True, fill=-5.0)
+    assert torch.equal(
+        feature_out,
+        torch.tensor([[[10.0, 110.0], [20.0, 120.0], [-5.0, -5.0]]]),
+    )
     with pytest.raises(ValueError, match="fill"):
         gather_sharder.gather_token_tensor(full_rows, trim=True)
 
@@ -220,6 +227,65 @@ def test_gather_trim_raises_without_captured_facts():
     )
     with pytest.raises(NotImplementedError, match="no shard layout to trim to"):
         sharder.gather_token_tensor(torch.zeros(1, 4), trim=True)
+
+
+def test_gather_token_tensor_selects_one_chunk_layout(monkeypatch):
+    chunk_layouts = (
+        cs.ShardLayout(
+            local_token_global_indices=torch.tensor([0, 3]),
+            original_seq_len=4,
+            padded_seq_len=4,
+        ),
+        cs.ShardLayout(
+            local_token_global_indices=torch.tensor([1, 2]),
+            original_seq_len=4,
+            padded_seq_len=4,
+        ),
+    )
+    sharder = cs.ContextParallelSharder(
+        device_mesh=_FakeDeviceMesh(_FakeMesh(2)),
+        shard_batch=cs.shard_batch_identity,
+        shard_layout=cs.ShardLayout(chunk_layouts=chunk_layouts),
+    )
+    seen_indices = []
+
+    def fake_gather(_mesh, _tensor, local_indices, seq_dim=1):
+        assert seq_dim == 0
+        seen_indices.append(local_indices.clone())
+        return torch.arange(4.0)
+
+    monkeypatch.setattr(cs, "gather_token_tensor_by_indices", fake_gather)
+
+    gathered = sharder.gather_token_tensor(
+        torch.tensor([10.0, 40.0]),
+        seq_dim=0,
+        trim=True,
+        chunk_index=0,
+    )
+
+    assert torch.equal(gathered, torch.arange(4.0))
+    assert len(seen_indices) == 1
+    assert torch.equal(seen_indices[0], torch.tensor([0, 3]))
+
+
+def test_gather_token_tensor_requires_a_valid_chunk_index():
+    sharder = cs.ContextParallelSharder(
+        device_mesh=_FakeDeviceMesh(_FakeMesh(1)),
+        shard_batch=cs.shard_batch_identity,
+        local_token_global_indices=cs.identity_local_indices,
+        shard_layout=cs.ShardLayout(
+            chunk_layouts=(cs.ShardLayout(original_seq_len=2, padded_seq_len=2),),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="chunk_index is required"):
+        sharder.gather_token_tensor(torch.zeros(2), seq_dim=0)
+    with pytest.raises(IndexError, match="out of range"):
+        sharder.gather_token_tensor(torch.zeros(2), seq_dim=0, chunk_index=1)
+
+    sharder.shard_layout = cs.ShardLayout(original_seq_len=2, padded_seq_len=2)
+    with pytest.raises(ValueError, match="only valid for a chunked"):
+        sharder.gather_token_tensor(torch.zeros(2), seq_dim=0, chunk_index=0)
 
 
 def test_reported_indices_validate_stream_length():

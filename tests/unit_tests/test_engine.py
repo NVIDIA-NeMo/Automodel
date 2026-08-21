@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import pickle
 import sys
 from contextlib import contextmanager
+from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
 
@@ -50,6 +52,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.models.common.mtp import prepare_mtp_context_parallel_inputs
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.engine import Engine, ForwardResult, OptimStepResult, collate_prebatched
+from nemo_automodel.engine.outputs import LossFnOutputBatch, PerTokenOutput
 
 
 class ScaleModel(nn.Module):
@@ -855,6 +858,248 @@ def test_loss_fn_outputs_follow_datum_order_and_are_detached():
     assert all(not item["model_value"].requires_grad for item in outputs)
 
 
+@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+def test_typed_batch_outputs_split_token_fields_into_datum_records(execution):
+    """The callback describes one collated token tensor; Engine owns Datum splitting."""
+    datums = [_datum([1, 2]), _datum([3, 4, 5])]
+
+    def loss_with_outputs(output, _loss_inputs):
+        token_probe = torch.stack((output, output + 100), dim=-1)
+        return output, LossFnOutputBatch(
+            per_token={"token_probe": PerTokenOutput(token_probe, fill_value=-1.0)},
+            per_datum=[{"sample_id": torch.tensor(11)}, {"sample_id": torch.tensor(22)}],
+        )
+
+    result = getattr(Engine(ScaleModel(), device="cpu", microbatch_size=2), execution)(datums, loss_with_outputs)
+    outputs = result.loss_fn_outputs if execution == "forward" else result[1]
+
+    assert [item["sample_id"].item() for item in outputs] == [11, 22]
+    torch.testing.assert_close(outputs[0]["token_probe"], torch.tensor([[1.0, 101.0], [2.0, 102.0]]))
+    torch.testing.assert_close(
+        outputs[1]["token_probe"],
+        torch.tensor([[3.0, 103.0], [4.0, 104.0], [5.0, 105.0]]),
+    )
+    assert all(not item["token_probe"].requires_grad for item in outputs)
+
+
+def test_raw_thd_multirow_outputs_restore_trailing_features_in_datum_order():
+    """Raw [B, S] THD coordinates flatten back to one routed token stream."""
+    datums = [_datum([1, 2, 3]), _datum([4, 5])]
+
+    def raw_thd_collate(_datums):
+        token_rows = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+        weights = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
+        return (
+            {
+                "input_ids": token_rows,
+                "position_ids": torch.arange(4).expand(2, -1),
+                "seq_lens": torch.tensor([[3], [2]], dtype=torch.int32),
+                "seq_lens_padded": torch.tensor([[4], [4]], dtype=torch.int32),
+                "qkv_format": "thd",
+            },
+            CollatedLossInputs(
+                {"weights": weights},
+                layouts={"weights": LossInputLayout.PER_TOKEN},
+                item_to_datum=(0, 1),
+            ),
+        )
+
+    def loss_with_outputs(output, loss_inputs):
+        assert output.shape == loss_inputs["weights"].shape == (8,)
+        probe = torch.stack((output, output + 100), dim=-1)
+        return output, LossFnOutputBatch(per_token={"probe": PerTokenOutput(probe)})
+
+    model = ScaleModel()
+    model.backend = SimpleNamespace(attn="te")
+    result = Engine(
+        model,
+        device="cpu",
+        microbatch_size=2,
+        collate_fn=raw_thd_collate,
+    ).forward(datums, loss_with_outputs)
+
+    torch.testing.assert_close(
+        result.loss_fn_outputs[0]["probe"], torch.tensor([[1.0, 101.0], [2.0, 102.0], [3.0, 103.0]])
+    )
+    torch.testing.assert_close(result.loss_fn_outputs[1]["probe"], torch.tensor([[4.0, 104.0], [5.0, 105.0]]))
+
+
+def test_typed_batch_outputs_follow_left_and_noncontiguous_attention_masks():
+    datums = [_datum([10, 11]), _datum([20, 21, 22])]
+
+    def masked_collate(_datums):
+        input_ids = torch.tensor(
+            [
+                [99, 99, 10, 11, 99],
+                [20, 99, 21, 99, 22],
+            ]
+        )
+        attention_mask = torch.tensor(
+            [
+                [False, False, True, True, False],
+                [True, False, True, False, True],
+            ]
+        )
+        return (
+            {"input_ids": input_ids, "attention_mask": attention_mask},
+            CollatedLossInputs(
+                {"weights": attention_mask.to(torch.float32)},
+                layouts={"weights": LossInputLayout.PER_TOKEN},
+                item_to_datum=(0, 1),
+            ),
+        )
+
+    def loss_with_outputs(output, _loss_inputs):
+        probe = torch.stack((output, output + 100), dim=-1)
+        return output, LossFnOutputBatch(per_token={"probe": PerTokenOutput(probe)})
+
+    result = Engine(
+        ScaleModel(),
+        device="cpu",
+        microbatch_size=2,
+        collate_fn=masked_collate,
+    ).forward(datums, loss_with_outputs)
+
+    torch.testing.assert_close(result.loss_fn_outputs[0]["probe"], torch.tensor([[10.0, 110.0], [11.0, 111.0]]))
+    torch.testing.assert_close(
+        result.loss_fn_outputs[1]["probe"],
+        torch.tensor([[20.0, 120.0], [21.0, 121.0], [22.0, 122.0]]),
+    )
+
+
+def test_padded_output_routing_keeps_attention_mask_compact():
+    mask = torch.tensor([[False, True, True], [True, False, True]])
+    real_lengths, padded_lengths, token_mask = engine_module._output_sequence_lengths(
+        [_datum([1, 2]), _datum([3, 4])],
+        {"attention_mask": mask},
+        {"weights": mask.to(torch.float32)},
+        (0, 1),
+        is_thd=False,
+    )
+
+    assert real_lengths == (2, 2)
+    assert padded_lengths == (3, 3)
+    assert isinstance(token_mask, torch.Tensor)
+    assert token_mask.dtype is torch.bool
+    torch.testing.assert_close(token_mask, mask)
+
+
+def test_legacy_per_datum_output_tensors_remain_opaque():
+    """A vector whose length resembles a token axis must not opt into restoration by shape."""
+    opaque = torch.tensor([91.0, 92.0, 93.0])
+
+    result = Engine(ScaleModel(), device="cpu", microbatch_size=2).forward(
+        [_datum([1, 2]), _datum([3, 4, 5])],
+        lambda output, _inputs: (output, [{"opaque": opaque.clone()} for _ in output]),
+    )
+
+    assert len(result.loss_fn_outputs[0]["opaque"]) == 3
+    assert len(result.loss_fn_outputs[1]["opaque"]) == 3
+    assert all(torch.equal(item["opaque"], opaque) for item in result.loss_fn_outputs)
+
+
+def test_typed_batch_output_rejects_a_mismatched_token_shape():
+    def loss_with_bad_shape(output, _loss_inputs):
+        return output, LossFnOutputBatch(
+            per_token={"bad_probe": PerTokenOutput(output[:, :-1])},
+            per_datum=[{}, {}],
+        )
+
+    with pytest.raises(ValueError, match=r"bad_probe.*shape|shape.*bad_probe"):
+        Engine(ScaleModel(), device="cpu", microbatch_size=2).forward(
+            [_datum([1, 2]), _datum([3, 4])],
+            loss_with_bad_shape,
+        )
+
+
+def test_output_only_parse_error_is_reported_before_single_rank_backward():
+    model = ScaleModel()
+
+    with pytest.raises(ValueError, match="outputs must be a sequence of mappings"):
+        Engine(model, device="cpu").forward_backward(
+            [_datum([1, 2])],
+            lambda output, _inputs: (output, "not-records"),
+        )
+
+    assert model.weight.grad is None
+
+
+def test_typed_batch_output_rejects_explicit_empty_per_datum_records():
+    def loss_with_empty_records(output, _loss_inputs):
+        return output, LossFnOutputBatch(
+            per_token={"probe": PerTokenOutput(output)},
+            per_datum=[],
+        )
+
+    with pytest.raises(ValueError, match=r"per_datum contains 0 records, expected 2"):
+        Engine(ScaleModel(), device="cpu", microbatch_size=2).forward(
+            [_datum([1]), _datum([2])],
+            loss_with_empty_records,
+        )
+
+
+@pytest.mark.parametrize(
+    ("cu_seqlens", "cu_seqlens_padded", "match"),
+    [
+        (
+            torch.tensor([0, 4], dtype=torch.int32),
+            torch.tensor([0, 3], dtype=torch.int32),
+            "0 <= real_length <= padded_length",
+        ),
+        (
+            torch.tensor([0, 4], dtype=torch.int32),
+            torch.tensor([0, 5], dtype=torch.int32),
+            r"padded lengths sum to 5.*loss weights.*4",
+        ),
+    ],
+    ids=("real-exceeds-padded", "padded-sum-mismatch"),
+)
+def test_typed_batch_output_rejects_invalid_final_thd_lengths_before_forward(
+    cu_seqlens,
+    cu_seqlens_padded,
+    match,
+):
+    model = ScaleModel()
+
+    def bad_thd_collate(_datums):
+        return (
+            {
+                "input_ids": torch.tensor([1, 2, 3, 4]),
+                "position_ids": torch.arange(4),
+                "cu_seqlens": cu_seqlens,
+                "cu_seqlens_padded": cu_seqlens_padded,
+                "max_seqlen": torch.tensor(4, dtype=torch.int32),
+                "qkv_format": "thd",
+            },
+            CollatedLossInputs(
+                {"weights": torch.ones(4)},
+                layouts={"weights": LossInputLayout.PER_TOKEN},
+                item_to_datum=(0,),
+            ),
+        )
+
+    with pytest.raises(ValueError, match=match):
+        Engine(model, device="cpu", collate_fn=bad_thd_collate).forward(
+            [_datum([1, 2, 3, 4])],
+            _identity_loss,
+        )
+    assert model.forward_calls == 0
+
+
+def test_typed_batch_output_rejects_per_token_and_per_datum_key_collision():
+    def loss_with_duplicate_key(output, _loss_inputs):
+        return output, LossFnOutputBatch(
+            per_token={"score": PerTokenOutput(output)},
+            per_datum=[{"score": torch.tensor(1.0)}, {"score": torch.tensor(2.0)}],
+        )
+
+    with pytest.raises(ValueError, match=r"score.*(?:both|conflict|duplicate)|(?:both|conflict|duplicate).*score"):
+        Engine(ScaleModel(), device="cpu", microbatch_size=2).forward(
+            [_datum([1, 2]), _datum([3, 4])],
+            loss_with_duplicate_key,
+        )
+
+
 def test_loss_fn_outputs_must_align_with_datums():
     model = ScaleModel()
     with pytest.raises(ValueError, match="one mapping per Datum"):
@@ -1259,6 +1504,50 @@ def _final_thd_layout_collate(datums: list[Datum]):
 
 
 @pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+@pytest.mark.parametrize(
+    ("lengths", "collate_fn"),
+    [
+        pytest.param([2, 2, 2, 2], partial(collate_datums, packed=True), id="raw-thd-2-plus-2"),
+        pytest.param([1, 1, 2, 4], _final_thd_layout_collate, id="final-thd-3-plus-1"),
+    ],
+)
+def test_pipeline_typed_batch_outputs_split_packed_stream_in_datum_order(execution, lengths, collate_fn):
+    """Packed callbacks return one stream; Engine restores records after logical PP ordering."""
+    model = ScaleModel()
+    model.backend = SimpleNamespace(attn="te")
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
+    datums = _packed_layout_datums(lengths)
+
+    def loss_with_outputs(output, loss_inputs):
+        probe = torch.stack((loss_inputs["advantages"], loss_inputs["old_logprobs"]), dim=-1)
+        return output, LossFnOutputBatch(
+            per_token={"rl_probe": PerTokenOutput(probe, fill_value=-999.0)},
+            per_datum=[{"sample_id": sample_id} for sample_id in loss_inputs["sample_id"]],
+        )
+
+    result = getattr(
+        Engine(
+            pipeline,
+            device="cpu",
+            mesh_context=_pipeline_mesh_context(),
+            microbatch_size=4,
+            collate_fn=collate_fn,
+        ),
+        execution,
+    )(datums, loss_with_outputs)
+    outputs = result.loss_fn_outputs if execution == "forward" else result[1]
+
+    assert [item["sample_id"].item() for item in outputs] == [11, 22, 33, 44]
+    for datum, item in zip(datums, outputs):
+        expected = torch.stack(
+            (datum.loss_fn_inputs["advantages"], datum.loss_fn_inputs["old_logprobs"]),
+            dim=-1,
+        )
+        torch.testing.assert_close(item["rl_probe"], expected)
+        assert not item["rl_probe"].requires_grad
+
+
+@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
 def test_pipeline_raw_thd_routes_explicit_loss_layouts_and_outputs_in_datum_order(execution):
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
@@ -1361,7 +1650,7 @@ def test_pipeline_final_thd_rejects_wrong_outputs_even_when_window_total_matches
     pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
     datums = _packed_layout_datums([1, 1, 2, 4])
 
-    with pytest.raises(ValueError, match="returned 2 outputs for microbatch 1, expected 1"):
+    with pytest.raises(ValueError, match="returned 2 outputs for microbatch 0, expected 3"):
         Engine(
             pipeline,
             device="cpu",
@@ -1453,14 +1742,14 @@ def test_pipeline_output_sync_finds_last_stage_on_physical_rank_zero(monkeypatch
         assert src == 11
         assert group is pp_group
         assert device == torch.device("cpu")
-        objects[0] = expected
+        objects[0] = pickle.dumps(expected)
 
     monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather_into_tensor)
     monkeypatch.setattr(dist, "get_rank", lambda *, group: 1)
     monkeypatch.setattr(dist, "get_global_rank", lambda group, group_rank: 11 if group_rank == 0 else 12)
     monkeypatch.setattr(dist, "broadcast_object_list", fake_broadcast_object_list)
 
-    result = engine._broadcast_pipeline_outputs([])
+    result = engine._broadcast_pipeline_outputs([], serialized_outputs=None)
 
     assert result == expected
 
@@ -1483,7 +1772,7 @@ def test_pipeline_output_sync_skips_object_broadcast_without_outputs(monkeypatch
         lambda *_args, **_kwargs: pytest.fail("empty pipeline outputs must not use an object collective"),
     )
 
-    assert engine._broadcast_pipeline_outputs([]) == []
+    assert engine._broadcast_pipeline_outputs([], serialized_outputs=None) == []
 
 
 def test_pipeline_prebatched_outputs_require_one_inner_microbatch():
@@ -1974,6 +2263,100 @@ def _mismatched_context_parallel_weights_worker(rank: int, world_size: int, init
         dist.destroy_process_group()
 
 
+def _context_parallel_output_consensus_worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        engine = Engine(
+            ScaleModel(),
+            device="cpu",
+            mesh_context=SimpleNamespace(
+                pp_size=1,
+                cp_size=world_size,
+                device_mesh=_CPMesh(size=world_size, rank=rank),
+                process_group=None,
+            ),
+        )
+        weights = torch.ones(2)
+        valid = LossFnOutputBatch(
+            per_token={"probe": PerTokenOutput(torch.tensor([1.0, 2.0]))},
+            per_datum=[{}],
+        )
+        cases = [
+            (None if rank == 0 else valid, "different loss output schemas"),
+            (
+                valid
+                if rank == 0
+                else LossFnOutputBatch(
+                    per_token={"probe": PerTokenOutput(torch.tensor([1.0]))},
+                    per_datum=[{}],
+                ),
+                "invalid loss_fn outputs",
+            ),
+            (
+                valid
+                if rank == 0
+                else LossFnOutputBatch(
+                    per_token={"probe": PerTokenOutput(torch.tensor([1.0, 2.0]))},
+                    per_datum=[{}, {}],
+                ),
+                "invalid loss_fn outputs",
+            ),
+        ]
+        for outputs, match in cases:
+            with pytest.raises(ValueError, match=match):
+                engine._validate_loss_fn_outputs_across_cp(
+                    outputs,
+                    weights,
+                    expected_records=1,
+                )
+            dist.barrier()
+
+        with pytest.raises(ValueError, match="invalid loss_fn outputs"):
+            engine._validate_loss_fn_outputs_across_cp(
+                valid,
+                weights,
+                expected_records=1,
+                local_error=ValueError("rank-local output parse failure") if rank == 0 else None,
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def _data_parallel_output_error_worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        model = nn.parallel.DistributedDataParallel(ScaleModel())
+
+        def loss_with_rank_local_output_error(output, _loss_inputs):
+            records = [{}, {}] if rank == 0 else [{}]
+            return output, LossFnOutputBatch(
+                per_token={"probe": PerTokenOutput(output)},
+                per_datum=records,
+            )
+
+        expected = "per_datum contains 2 records" if rank == 0 else "another data-parallel replica"
+        with pytest.raises((ValueError, RuntimeError), match=expected):
+            Engine(model, device="cpu").forward_backward(
+                [_datum([1, 2])],
+                loss_with_rank_local_output_error,
+            )
+        assert model.module.weight.grad is not None
+    finally:
+        dist.destroy_process_group()
+
+
 def test_data_parallel_window_uses_global_numerator_and_denominator(tmp_path):
     mp.spawn(
         _distributed_worker,
@@ -2005,6 +2388,24 @@ def test_context_parallel_replicas_require_the_same_full_sequence_weights(tmp_pa
     mp.spawn(
         _mismatched_context_parallel_weights_worker,
         args=(2, str(tmp_path / "engine_cp_mismatch_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_context_parallel_output_consensus_rejects_rank_local_contracts_without_hanging(tmp_path):
+    mp.spawn(
+        _context_parallel_output_consensus_worker,
+        args=(2, str(tmp_path / "engine_cp_output_consensus_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_data_parallel_output_errors_propagate_after_backward_without_hanging(tmp_path):
+    mp.spawn(
+        _data_parallel_output_error_worker,
+        args=(2, str(tmp_path / "engine_dp_output_error_init")),
         nprocs=2,
         join=True,
     )

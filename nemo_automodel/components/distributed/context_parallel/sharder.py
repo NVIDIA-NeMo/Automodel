@@ -228,6 +228,10 @@ class ShardLayout:
         input_token_stream_positions: For layouts that reposition tokens (DSV4
             packed repad), the per-row map from input position to padded output
             column (-1 = an input pad slot whose token was dropped).
+        chunk_layouts: Per-chunk layouts when a backend prepares multiple
+            independent token streams for pipeline microbatches. Each child
+            uses its own token coordinate space; callers select one explicitly
+            with ``gather_token_tensor(..., chunk_index=index)``.
     """
 
     local_token_global_indices: torch.Tensor | None = None
@@ -235,6 +239,7 @@ class ShardLayout:
     padded_seq_len: int | None = None
     input_row_shape: tuple[int, ...] | None = None
     input_token_stream_positions: torch.Tensor | None = None
+    chunk_layouts: tuple["ShardLayout", ...] | None = None
 
 
 class ContextParallelSharder:
@@ -364,8 +369,14 @@ class ContextParallelSharder:
         )
         return ctx, batch
 
-    def _indices(self, padded_seq_len: int, device) -> torch.Tensor:
-        layout = self.shard_layout or _NO_SHARD_LAYOUT
+    def _indices(
+        self,
+        padded_seq_len: int,
+        device,
+        *,
+        layout: "ShardLayout | None" = None,
+    ) -> torch.Tensor:
+        layout = layout or self.shard_layout or _NO_SHARD_LAYOUT
         captured = layout.local_token_global_indices
         if captured is not None:
             # Data-dependent layout: use the partition the shard reported, and
@@ -447,6 +458,7 @@ class ContextParallelSharder:
         seq_dim: int = 1,
         trim: bool = False,
         fill: float | int | None = None,
+        chunk_index: int | None = None,
     ) -> torch.Tensor:
         """Differentiably gather a token-aligned local shard to global order.
 
@@ -456,10 +468,23 @@ class ContextParallelSharder:
         reported position map (``fill`` for input positions whose tokens were
         dropped, e.g. re-padded pack slots). Raises when no layout is present
         (nothing to trim to).
+
+        A chunked THD batch contains one independent token coordinate space per
+        pipeline microbatch. Such layouts require ``chunk_index`` so the gather
+        uses the exact partition reported for that chunk; a top-level chunked
+        layout is never flattened or guessed.
         """
         layout = self.shard_layout or _NO_SHARD_LAYOUT
+        if layout.chunk_layouts is not None:
+            if chunk_index is None:
+                raise ValueError("chunk_index is required for a chunked CP token layout")
+            if chunk_index < 0 or chunk_index >= len(layout.chunk_layouts):
+                raise IndexError(f"chunk_index {chunk_index} is out of range for {len(layout.chunk_layouts)} CP chunks")
+            layout = layout.chunk_layouts[chunk_index]
+        elif chunk_index is not None:
+            raise ValueError("chunk_index is only valid for a chunked CP token layout")
         padded_seq_len = tensor.shape[seq_dim] * (self._cp_mesh.size() if self._cp_mesh is not None else 1)
-        indices = self._indices(padded_seq_len, tensor.device)
+        indices = self._indices(padded_seq_len, tensor.device, layout=layout)
         full = gather_token_tensor_by_indices(self._cp_mesh, tensor, indices, seq_dim=seq_dim)
         if not trim:
             return full
@@ -473,8 +498,17 @@ class ContextParallelSharder:
             if fill is None:
                 raise ValueError("trimming to input coordinates on a repositioned layout requires `fill`")
             positions = layout.input_token_stream_positions.to(full.device)
-            out = full.gather(1, positions.clamp(min=0).to(torch.long))
-            return out.masked_fill(positions < 0, fill)
+            gather_indices = positions.clamp(min=0).to(torch.long)
+            padding_mask = positions < 0
+            while gather_indices.ndim < full.ndim:
+                gather_indices = gather_indices.unsqueeze(-1)
+                padding_mask = padding_mask.unsqueeze(-1)
+            trailing_shape = full.shape[2:]
+            if trailing_shape:
+                gather_indices = gather_indices.expand(*positions.shape, *trailing_shape)
+                padding_mask = padding_mask.expand_as(gather_indices)
+            out = full.gather(1, gather_indices)
+            return out.masked_fill(padding_mask, fill)
         if layout.input_row_shape is not None:
             if layout.original_seq_len is not None:
                 full = full.narrow(seq_dim, 0, layout.original_seq_len)

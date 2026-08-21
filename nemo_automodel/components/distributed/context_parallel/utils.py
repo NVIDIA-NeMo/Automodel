@@ -559,12 +559,18 @@ def _resolve_cp_sharder(
     if is_thd:
         # The THD partition is data-dependent (cu_seqlens), so shard_batch
         # installs the index map it just computed on the sharder for the token
-        # verbs (chunked streams carry none). The BSHD->THD flatten is a pure
-        # reshape, so the pre-flatten row shape is the caller's coordinate
-        # system and the stream length is rows x cols.
+        # verbs. Chunked streams retain one independent index map per pipeline
+        # microbatch. The BSHD->THD flatten is a pure reshape, so the
+        # pre-flatten row shape is the caller's coordinate system and the stream
+        # length is rows x cols.
         def _shard_batch_te(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-            input_ids = batch.get("input_ids")
-            row_shape = tuple(input_ids.shape[:2]) if input_ids is not None and input_ids.dim() >= 2 else None
+            final_thd = "cu_seqlens" in batch and "seq_lens" not in batch and "seq_lens_padded" not in batch
+            primary = batch.get("inputs_embeds", batch.get("input_ids"))
+            row_shape = (
+                tuple(primary.shape[:2])
+                if isinstance(primary, torch.Tensor) and primary.dim() >= 2 and not final_thd
+                else None
+            )
             prepped, local_indices = make_cp_batch_for_te(
                 cp_mesh,
                 batch,
@@ -575,10 +581,24 @@ def _resolve_cp_sharder(
                 return_local_indices=True,
             )
             layout = None
-            if local_indices is not None:
+            if isinstance(local_indices, tuple):
+                cp_size = cp_mesh.size() if cp_mesh is not None else 1
+                layout = ShardLayout(
+                    chunk_layouts=tuple(
+                        ShardLayout(
+                            local_token_global_indices=indices,
+                            original_seq_len=indices.numel() * cp_size,
+                            padded_seq_len=indices.numel() * cp_size,
+                        )
+                        for indices in local_indices
+                    )
+                )
+            elif local_indices is not None:
+                stream_len = local_indices.numel() * (cp_mesh.size() if cp_mesh is not None else 1)
                 layout = ShardLayout(
                     local_token_global_indices=local_indices,
-                    padded_seq_len=row_shape[0] * row_shape[1] if row_shape is not None else None,
+                    original_seq_len=stream_len if final_thd else None,
+                    padded_seq_len=stream_len if final_thd or row_shape is not None else None,
                     input_row_shape=row_shape,
                 )
             return contextlib.nullcontext, prepped, layout
@@ -731,13 +751,15 @@ def make_cp_batch_for_te(
             seq_lens/seq_lens_padded tensors (default: -1000)
         return_local_indices (bool): Also return this rank's local-token global
             index map (the ``thd_get_partitioned_indices`` partition; an
-            identity arange when CP is inactive; None in chunked mode, where
-            each chunk is its own token space). Used by the THD ContextParallelSharder's
-            token verbs.
+            identity arange when CP is inactive). Chunked mode returns one map
+            per chunk because each chunk has its own token coordinate space.
+            Used by the THD ContextParallelSharder's token verbs.
 
     Returns:
-        dict: Processed batch in THD format (or ``(dict, LongTensor | None)``
-        when ``return_local_indices``) with the following keys:
+        dict: Processed batch in THD format. With ``return_local_indices``, the
+        return value is ``(dict, LongTensor)`` for one stream or
+        ``(dict, tuple[LongTensor, ...])`` for chunked streams. The batch has
+        the following keys:
             - input_ids: Sharded input token IDs [total_tokens] or [num_chunks, chunk_tokens]
             - labels: Sharded labels [total_tokens] or [num_chunks, chunk_tokens]
             - position_ids: Generated and sharded position IDs [total_tokens] or [num_chunks, chunk_tokens]
@@ -794,14 +816,18 @@ def make_cp_batch_for_te(
     if cp_mesh is None or cp_mesh.size() <= 1:
         if not return_local_indices:
             return batch
-        # Unsharded THD stream: identity index map. Chunked streams are
-        # per-chunk token spaces with no single step-wide map -> None.
+        # Unsharded THD streams use identity maps. Chunked streams retain one
+        # independent identity map per chunk rather than pretending there is a
+        # single step-wide token space.
         primary = batch.get("inputs_embeds", batch.get("input_ids"))
         if not isinstance(primary, torch.Tensor):
             raise ValueError("THD batch requires tensor input_ids or inputs_embeds")
-        local_indices = (
-            torch.arange(primary.shape[0], device=primary.device, dtype=torch.long) if num_chunks <= 1 else None
-        )
+        if num_chunks <= 1:
+            local_indices = torch.arange(primary.shape[0], device=primary.device, dtype=torch.long)
+        else:
+            local_indices = tuple(
+                torch.arange(primary.shape[1], device=primary.device, dtype=torch.long) for _ in range(num_chunks)
+            )
         return batch, local_indices
 
     if num_chunks <= 1:
@@ -812,6 +838,7 @@ def make_cp_batch_for_te(
 
     # Extract each chunk from the batched result and shard it
     chunks = []
+    chunk_local_indices = []
     for i in range(num_chunks):
         chunk_batch = {
             key: value[i]
@@ -819,14 +846,16 @@ def make_cp_batch_for_te(
             else value
             for key, value in batch.items()
         }
-        chunks.append(
-            _shard_thd_chunk_for_te(chunk_batch, cp_mesh, qkv_format, seq_lens_padding_value, padding_token_id)[0]
+        chunk, local_indices = _shard_thd_chunk_for_te(
+            chunk_batch, cp_mesh, qkv_format, seq_lens_padding_value, padding_token_id
         )
+        chunks.append(chunk)
+        chunk_local_indices.append(local_indices)
     return_dict = stack_thd_chunks(chunks, seq_lens_padding_value)
 
-    # Chunked mode: each chunk is its own token space, so there is no single
-    # step-wide local-token index map to expose.
-    return (return_dict, None) if return_local_indices else return_dict
+    # Chunked mode: each chunk is its own token space, so expose one partition
+    # map per chunk rather than flattening them into a misleading step-wide map.
+    return (return_dict, tuple(chunk_local_indices)) if return_local_indices else return_dict
 
 
 def _shard_thd_chunk_for_te(

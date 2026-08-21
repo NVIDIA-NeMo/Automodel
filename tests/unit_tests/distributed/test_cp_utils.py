@@ -1065,6 +1065,28 @@ def test_make_cp_batch_for_te_identity_indices_without_cp():
     assert torch.equal(local_indices, torch.arange(out["input_ids"].shape[-1]))
 
 
+def test_make_cp_batch_for_te_retains_identity_indices_for_each_final_thd_chunk():
+    batch = {
+        "input_ids": torch.arange(8),
+        "labels": torch.arange(8),
+        "position_ids": torch.arange(8),
+        "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
+        "max_seqlen": torch.tensor(4, dtype=torch.int32),
+        "qkv_format": "thd",
+    }
+
+    out, local_indices = _cu.make_cp_batch_for_te(
+        None,
+        batch,
+        num_chunks=2,
+        return_local_indices=True,
+    )
+
+    assert out["input_ids"].shape == (2, 4)
+    assert isinstance(local_indices, tuple) and len(local_indices) == 2
+    assert all(torch.equal(indices, torch.arange(4)) for indices in local_indices)
+
+
 def test_round_robin_sharder_captures_lengths_and_pads_token_tensors(monkeypatch):
     """The generic sharder captures original/padded lengths at shard time so the
     token verbs accept caller-coordinate tensors: unpadded down (with explicit
@@ -1125,6 +1147,72 @@ def test_te_sharder_captures_row_shape(monkeypatch):
     assert torch.equal(sharder.shard_token_tensor(rows), torch.tensor([1.0, 2.0, 3.0, 4.0]))
     # up: gather restores the row coordinate
     assert torch.equal(sharder.gather_token_tensor(torch.tensor([1.0, 2.0, 3.0, 4.0]), seq_dim=0, trim=True), rows)
+
+
+def test_te_sharder_captures_final_thd_stream_length_for_trim(monkeypatch):
+    local_indices = torch.arange(4)
+
+    def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
+        return (dict(batch), local_indices) if return_local_indices else dict(batch)
+
+    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
+
+    strategy = _cu._resolve_cp_sharder(
+        _DummySubMesh(1),
+        None,
+        magi=None,
+        is_thd=True,
+        num_chunks=1,
+        seq_lens_padding_value=-1000,
+        model=None,
+    )
+    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=1, tp_size=1))
+    batch = {
+        "input_ids": torch.arange(4),
+        "cu_seqlens": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "qkv_format": "thd",
+    }
+    sharder.shard(batch)
+
+    layout = sharder.shard_layout
+    assert layout.input_row_shape is None
+    assert (layout.original_seq_len, layout.padded_seq_len) == (4, 4)
+    values = torch.arange(4.0)
+    assert torch.equal(sharder.gather_token_tensor(values, seq_dim=0, trim=True), values)
+
+
+def test_te_sharder_captures_one_layout_per_pipeline_chunk(monkeypatch):
+    chunk_indices = (torch.tensor([0, 3]), torch.tensor([1, 2]))
+
+    def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
+        prepped = {"input_ids": torch.tensor([[0, 3], [1, 2]]), "qkv_format": "thd"}
+        return (prepped, chunk_indices) if return_local_indices else prepped
+
+    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
+
+    strategy = _cu._resolve_cp_sharder(
+        _DummySubMesh(2),
+        None,
+        magi=None,
+        is_thd=True,
+        num_chunks=2,
+        seq_lens_padding_value=-1000,
+        model=None,
+    )
+    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=2, tp_size=1))
+    sharder.shard(
+        {
+            "input_ids": torch.arange(8).reshape(2, 4),
+            "seq_lens": torch.tensor([[4], [4]]),
+            "seq_lens_padded": torch.tensor([[4], [4]]),
+        }
+    )
+
+    layout = sharder.shard_layout
+    assert layout.chunk_layouts is not None and len(layout.chunk_layouts) == 2
+    assert torch.equal(layout.chunk_layouts[0].local_token_global_indices, chunk_indices[0])
+    assert torch.equal(layout.chunk_layouts[1].local_token_global_indices, chunk_indices[1])
+    assert all((child.original_seq_len, child.padded_seq_len) == (4, 4) for child in layout.chunk_layouts)
 
 
 def test_resolve_cp_sharder_layers():

@@ -20,17 +20,18 @@ Each path runs training, forward-only evaluation, then training again on the
 same pipeline. Evaluation must match a native eager Llama in summed loss and
 weight statistics without creating gradients; both surrounding training calls
 must match eager loss plus every local-stage gradient. Additional flat-Datum
-forwards cover explicit per-token, per-Datum, and replicated loss layouts for
-raw 2+2 and final-THD 3+1 document splits. A final padded two-Datum update
-verifies that Engine broadcasts callback mappings to both pipeline ranks in
-logical input order and that the same pipeline can return to training.
+runs cover explicit loss layouts and typed per-token callback outputs for raw
+2+2 and final-THD 3+1 document splits. Under CP2 they run both forward and
+forward/backward, use ragged internally padded sequences, and require every PP
+and CP rank to receive the same restored Datum records. A final padded
+two-Datum update verifies legacy callback mappings in logical input order.
 
 Run with::
 
     torchrun --standalone --nproc-per-node=2 run_packed_pp.py
 
-Set ``CP_SIZE=2`` and use four ranks to run the forward-only PP2 x CP2
-explicit-layout checks::
+Set ``CP_SIZE=2`` and use four ranks to run the PP2 x CP2 output-restoration
+matrix::
 
     CP_SIZE=2 torchrun --standalone --nproc-per-node=4 run_packed_pp.py
 """
@@ -39,6 +40,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -61,6 +63,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM
 from nemo_automodel.engine import Engine, collate_prebatched
+from nemo_automodel.engine.outputs import LossFnOutputBatch, PerTokenOutput
 
 VOCAB_SIZE = 64
 SEQ_LEN = 8
@@ -248,9 +251,78 @@ def _final_explicit_layout_collate(datums: list[Datum]):
     )
 
 
+def _cp_padded_explicit_layout_collate(datums: list[Datum], *, final_thd: bool):
+    """Pack Datums with per-sequence CP padding, retaining their real boundaries."""
+    real_lengths = torch.tensor(
+        [datum.seq_len for datum in datums], dtype=torch.int32, device=datums[0].input_ids.device
+    )
+    padded_lengths = ((real_lengths + 3) // 4) * 4  # TE CP2 requires every sequence slot to divide by 2*CP.
+    total_tokens = int(padded_lengths.sum().item())
+    device = datums[0].input_ids.device
+
+    input_ids = torch.zeros((1, total_tokens), dtype=torch.long, device=device)
+    position_ids = torch.zeros_like(input_ids)
+    padding_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    token_fields = {
+        "labels": torch.full((1, total_tokens), -100, dtype=torch.long, device=device),
+        "weights": torch.zeros((1, total_tokens), dtype=torch.float32, device=device),
+        "advantages": torch.zeros((1, total_tokens), dtype=torch.float32, device=device),
+        "old_logprobs": torch.zeros((1, total_tokens), dtype=torch.float32, device=device),
+    }
+    offset = 0
+    for datum, real_length, padded_length in zip(datums, real_lengths.tolist(), padded_lengths.tolist()):
+        token_slice = slice(offset, offset + real_length)
+        input_ids[0, token_slice] = datum.input_ids
+        position_ids[0, token_slice] = torch.arange(real_length, device=device)
+        padding_mask[0, token_slice] = False
+        for name in token_fields:
+            token_fields[name][0, token_slice] = datum.loss_fn_inputs[name]
+        offset += padded_length
+
+    model_inputs: dict[str, object]
+    if final_thd:
+        model_inputs = {
+            "input_ids": input_ids.reshape(-1),
+            "position_ids": position_ids.reshape(-1),
+            "padding_mask": padding_mask.reshape(-1),
+            "cu_seqlens": F.pad(real_lengths.cumsum(0), (1, 0)).to(torch.int32),
+            "cu_seqlens_padded": F.pad(padded_lengths.cumsum(0), (1, 0)).to(torch.int32),
+            "max_seqlen": real_lengths.max(),
+            "qkv_format": "thd",
+        }
+        token_fields = {name: value.reshape(-1) for name, value in token_fields.items()}
+    else:
+        model_inputs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "padding_mask": padding_mask,
+            "seq_lens": real_lengths.unsqueeze(0),
+            "seq_lens_padded": padded_lengths.unsqueeze(0),
+            "qkv_format": "thd",
+        }
+
+    loss_inputs = CollatedLossInputs(
+        {
+            **token_fields,
+            "sample_id": torch.stack([datum.loss_fn_inputs["sample_id"] for datum in datums]),
+            "global_coefficients": datums[0].loss_fn_inputs["global_coefficients"],
+        },
+        layouts={
+            "labels": LossInputLayout.PER_TOKEN,
+            "weights": LossInputLayout.PER_TOKEN,
+            "advantages": LossInputLayout.PER_TOKEN,
+            "old_logprobs": LossInputLayout.PER_TOKEN,
+            "sample_id": LossInputLayout.PER_DATUM,
+            "global_coefficients": LossInputLayout.REPLICATED,
+        },
+        item_to_datum=tuple(range(len(datums))),
+    )
+    return model_inputs, loss_inputs
+
+
 def _explicit_layout_losses(output, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
     """Use both RL-style token fields so their routing affects the numerator."""
-    return _token_losses(output, loss_inputs) + 0.01 * loss_inputs["advantages"] + 0.02 * loss_inputs["old_logprobs"]
+    return _token_losses(output, loss_inputs) + 0.1 * loss_inputs["advantages"] + 0.05 * loss_inputs["old_logprobs"]
 
 
 def _explicit_layout_eager_reference(
@@ -438,92 +510,110 @@ def _run_thd_layout(
     return pipeline
 
 
-def _run_explicit_loss_layout_forward(
+def _run_explicit_loss_layout(
     pipeline: AutoPipeline,
     layout: str,
+    execution: str,
     device: torch.device,
     mesh_context: MeshContext,
 ) -> None:
-    """Validate semantic loss routing for one real two-stage packed pipeline."""
+    """Validate loss routing plus typed token-output restoration for one layout."""
     if layout == "raw":
-        lengths = [4, 4, 4, 4] if mesh_context.cp_size > 1 else [2, 2, 2, 2]
-        collate_fn = _raw_explicit_layout_collate
+        lengths = [3, 5, 7, 3] if mesh_context.cp_size > 1 else [2, 2, 2, 2]
+        collate_fn = (
+            partial(_cp_padded_explicit_layout_collate, final_thd=False)
+            if mesh_context.cp_size > 1
+            else _raw_explicit_layout_collate
+        )
         expected_microbatch_ids = {(11, 22), (33, 44)}
     elif layout == "final":
-        # Keep the uneven 3+1 Datum split while making every sequence length
-        # divisible by TE's 2*CP head/tail partition count under CP2.
-        lengths = [4, 4, 4, 12] if mesh_context.cp_size > 1 else [1, 1, 2, 4]
-        collate_fn = _final_explicit_layout_collate
+        lengths = [3, 3, 3, 9] if mesh_context.cp_size > 1 else [1, 1, 2, 4]
+        collate_fn = (
+            partial(_cp_padded_explicit_layout_collate, final_thd=True)
+            if mesh_context.cp_size > 1
+            else _final_explicit_layout_collate
+        )
         expected_microbatch_ids = {(11, 22, 33), (44,)}
     else:
         raise ValueError(f"unknown explicit loss layout: {layout}")
+    if execution not in {"forward", "forward_backward"}:
+        raise ValueError(f"unknown Engine execution: {execution}")
 
     for part in pipeline.parts:
         part.zero_grad(set_to_none=True)
 
     datums = _explicit_layout_datums(device, lengths)
     reference_loss_sum, reference_weight_sum = _explicit_layout_eager_reference(device, datums, collate_fn)
-    expected_tokens_by_ids = {}
-    for ids in expected_microbatch_ids:
-        indices = [sample_id // 11 - 1 for sample_id in ids]
-        expected_tokens_by_ids[ids] = {
-            "advantages": torch.cat([datums[index].loss_fn_inputs["advantages"] for index in indices]),
-            "old_logprobs": torch.cat([datums[index].loss_fn_inputs["old_logprobs"] for index in indices]),
-        }
 
     def loss_with_outputs(output, loss_inputs):
         sample_ids = tuple(int(value) for value in loss_inputs["sample_id"].tolist())
         if sample_ids not in expected_microbatch_ids:
             raise AssertionError(f"PP2 {layout} routed unexpected sample IDs {sample_ids}")
-        expected_tokens = expected_tokens_by_ids[sample_ids]
         valid_cu_seqlens = loss_inputs["cu_seqlens"].reshape(-1)
         valid_cu_seqlens = valid_cu_seqlens[valid_cu_seqlens >= 0]
         assert valid_cu_seqlens.numel() - 1 == len(sample_ids)
         if mesh_context.cp_size > 1:
-            import transformer_engine_torch as tex
-
-            cp_mesh = mesh_context.device_mesh["cp"]
-            local_indices = tex.thd_get_partitioned_indices(
-                valid_cu_seqlens.to(torch.int32),
-                int(valid_cu_seqlens[-1].item()),
-                cp_mesh.size(),
-                cp_mesh.get_local_rank(),
-            ).to(device=device, dtype=torch.long)
-            expected_tokens = {name: value.index_select(0, local_indices) for name, value in expected_tokens.items()}
-        torch.testing.assert_close(loss_inputs["advantages"].reshape(-1), expected_tokens["advantages"])
-        torch.testing.assert_close(loss_inputs["old_logprobs"].reshape(-1), expected_tokens["old_logprobs"])
+            # Each full pipeline chunk reserves 12 padded slots and CP2 owns six.
+            assert loss_inputs["weights"].numel() == 6
         torch.testing.assert_close(
             loss_inputs["global_coefficients"],
             torch.tensor([0.25, 0.75], device=device),
         )
         assert loss_inputs["global_coefficients"].shape == (2,)
         losses = _explicit_layout_losses(output, loss_inputs)
-        return losses, [{"sample_id": value} for value in loss_inputs["sample_id"]]
+        rl_probe = torch.stack((loss_inputs["advantages"], loss_inputs["old_logprobs"]), dim=-1)
+        return losses, LossFnOutputBatch(
+            per_token={"rl_probe": PerTokenOutput(rl_probe)},
+            per_datum=[{"sample_id": value} for value in loss_inputs["sample_id"]],
+        )
 
-    result = Engine(
+    engine = Engine(
         pipeline,
         device=device,
         mesh_context=mesh_context,
         microbatch_size=4,
         collate_fn=collate_fn,
-    ).forward(datums, loss_with_outputs)
+    )
+    result = getattr(engine, execution)(datums, loss_with_outputs)
 
-    torch.testing.assert_close(result.loss_sum.float(), reference_loss_sum.float(), atol=4e-2, rtol=2e-3)
-    torch.testing.assert_close(result.weight_sum.float(), reference_weight_sum.float(), atol=0, rtol=0)
-    output_ids = torch.stack([item["sample_id"] for item in result.loss_fn_outputs]).to(torch.long)
+    if execution == "forward":
+        torch.testing.assert_close(result.loss_sum.float(), reference_loss_sum.float(), atol=4e-2, rtol=2e-3)
+        torch.testing.assert_close(result.weight_sum.float(), reference_weight_sum.float(), atol=0, rtol=0)
+        outputs = result.loss_fn_outputs
+        if any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
+            raise AssertionError(f"PP2 x CP{mesh_context.cp_size} {layout} forward unexpectedly created gradients")
+    else:
+        loss, outputs = result
+        reference_loss = reference_loss_sum / reference_weight_sum
+        torch.testing.assert_close(loss.float(), reference_loss.float(), atol=4e-2, rtol=2e-3)
+        if not any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
+            raise AssertionError(f"PP2 x CP{mesh_context.cp_size} {layout} backward created no gradients")
+
+    output_ids = torch.stack([item["sample_id"] for item in outputs]).to(torch.long)
     expected_ids = torch.tensor([11, 22, 33, 44], device=device)
     torch.testing.assert_close(output_ids, expected_ids)
+    restored_probe = []
+    for datum, item in zip(datums, outputs):
+        expected_probe = torch.stack(
+            (datum.loss_fn_inputs["advantages"], datum.loss_fn_inputs["old_logprobs"]),
+            dim=-1,
+        )
+        torch.testing.assert_close(item["rl_probe"], expected_probe)
+        assert not item["rl_probe"].requires_grad
+        restored_probe.append(item["rl_probe"])
+    flat_probe = torch.cat(restored_probe)
     gathered = [torch.empty_like(output_ids) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, output_ids)
     assert all(torch.equal(ids, expected_ids) for ids in gathered)
-    if any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
-        raise AssertionError(f"PP2 {layout} explicit-layout forward unexpectedly created gradients")
+    gathered_probe = [torch.empty_like(flat_probe) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered_probe, flat_probe)
+    assert all(torch.equal(probe, flat_probe) for probe in gathered_probe)
     if dist.get_rank() == 0:
         datum_counts = "2+2" if layout == "raw" else "3+1"
+        reported_loss = result.loss_sum.item() if execution == "forward" else result[0].item()
         print(
-            f"PP2 x CP{mesh_context.cp_size} {layout} explicit "
-            f"PER_TOKEN/PER_DATUM/REPLICATED routing passed ({datum_counts} Datums; "
-            f"loss_sum={result.loss_sum.item():.6f}, weight_sum={result.weight_sum.item():.1f})"
+            f"PP2 x CP{mesh_context.cp_size} {layout} {execution} explicit loss/output routing passed "
+            f"({datum_counts} Datums; loss={reported_loss:.6f})"
         )
 
 
@@ -594,10 +684,10 @@ def main() -> None:
     try:
         if cp_size > 1:
             pipeline = _build_pipeline(device, mesh_context)
-            _run_explicit_loss_layout_forward(pipeline, "raw", device, mesh_context)
-            dist.barrier()
-            _run_explicit_loss_layout_forward(pipeline, "final", device, mesh_context)
-            dist.barrier()
+            for layout in ("raw", "final"):
+                for execution in ("forward", "forward_backward"):
+                    _run_explicit_loss_layout(pipeline, layout, execution, device, mesh_context)
+                    dist.barrier()
             return
 
         (
@@ -635,9 +725,9 @@ def main() -> None:
             weights,
         )
         dist.barrier()
-        _run_explicit_loss_layout_forward(final_pipeline, "raw", device, mesh_context)
+        _run_explicit_loss_layout(final_pipeline, "raw", "forward", device, mesh_context)
         dist.barrier()
-        _run_explicit_loss_layout_forward(final_pipeline, "final", device, mesh_context)
+        _run_explicit_loss_layout(final_pipeline, "final", "forward", device, mesh_context)
         dist.barrier()
         _run_padded_output_broadcast(final_pipeline, device, mesh_context)
         dist.barrier()
