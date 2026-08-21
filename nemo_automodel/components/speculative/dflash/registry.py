@@ -26,13 +26,22 @@ from dataclasses import dataclass
 from transformers import PreTrainedModel
 
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
+from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import Qwen3DFlash2DraftModel
 
 
 @dataclass(frozen=True)
 class DFlashDraftSpec:
-    """How to build a DFlash draft model for a particular target architecture."""
+    """How to build a DFlash draft model for a particular target architecture.
+
+    Attributes:
+        draft_cls: DFlash draft class (also the base for the Domino / JetSpec
+            recipes, which only change the head or the objective).
+        draft2_cls: DFlash 2 draft class -- the same backbone plus the in-block
+            convolutions and the candidate selector.
+    """
 
     draft_cls: type[PreTrainedModel]
+    draft2_cls: type[PreTrainedModel]
 
 
 # Qwen3-shaped dense / MoE targets. The DFlash draft only consumes post-block
@@ -45,7 +54,8 @@ _QWEN3_ARCHITECTURES: tuple[str, ...] = (
 
 
 DFLASH_DRAFT_REGISTRY: dict[str, DFlashDraftSpec] = {
-    arch: DFlashDraftSpec(draft_cls=Qwen3DFlashDraftModel) for arch in _QWEN3_ARCHITECTURES
+    arch: DFlashDraftSpec(draft_cls=Qwen3DFlashDraftModel, draft2_cls=Qwen3DFlash2DraftModel)
+    for arch in _QWEN3_ARCHITECTURES
 }
 
 

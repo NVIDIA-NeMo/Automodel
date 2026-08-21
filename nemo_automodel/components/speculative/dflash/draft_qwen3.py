@@ -218,12 +218,15 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
 
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
+    # Block class the stack is built from. DFlash 2 swaps in a block that wraps
+    # each sublayer in a two-tap convolution; everything else is unchanged.
+    decoder_layer_cls: type[Qwen3DFlashDecoderLayer] = Qwen3DFlashDecoderLayer
 
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
         self.layers = nn.ModuleList(
-            [Qwen3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [self.decoder_layer_cls(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         dflash_config = getattr(config, "dflash_config", {}) or {}
         self.target_layer_ids = dflash_config.get(
