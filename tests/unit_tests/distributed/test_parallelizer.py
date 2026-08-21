@@ -2682,6 +2682,32 @@ class TestSingleGpuActivationCheckpointing:
             assert isinstance(layer.self_attn, CheckpointWrapper)
 
 
+class TestFsdp2ShardingEnabled:
+    """`fsdp2_sharding_enabled` reports whether fully_shard — and its mixed-precision casts — apply."""
+
+    def test_disabled_on_single_rank_world(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
+
+        # The mesh is never inspected once the world is single-rank.
+        assert fsdp2_mod.fsdp2_sharding_enabled(MagicMock()) is False
+
+    def test_disabled_on_single_element_mesh(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 4)
+
+        assert fsdp2_mod.fsdp2_sharding_enabled(SimpleNamespace(size=lambda: 1)) is False
+
+    def test_enabled_on_multi_rank_mesh(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 4)
+
+        assert fsdp2_mod.fsdp2_sharding_enabled(SimpleNamespace(size=lambda: 4)) is True
+
+
 class TestSelectiveCheckpointSaveOps:
     """Tests for the TorchTitan-style save-op set used by selective AC."""
 

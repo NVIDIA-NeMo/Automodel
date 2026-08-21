@@ -48,7 +48,6 @@ import glob
 import json
 import logging
 import os
-from typing import Optional
 
 import torch
 from transformers import AutoTokenizer
@@ -88,7 +87,7 @@ def _apply_peft_to_model(model: NeMoAutoModelForCausalLM, checkpoint_path: str) 
     apply_lora_to_linear_modules(model, PeftConfig.from_dict(peft_dict))
 
 
-def load_model(checkpoint_path: Optional[str], base_model_path: Optional[str]) -> NeMoAutoModelForCausalLM:
+def load_model(checkpoint_path: str | None, base_model_path: str | None) -> NeMoAutoModelForCausalLM:
     """Load a causal LM for evaluation from a checkpoint or straight from the Hub.
 
     Mirrors ``examples/vlm_generate/generate.py``: a consolidated safetensors
