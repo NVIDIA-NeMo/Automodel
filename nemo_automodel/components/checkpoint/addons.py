@@ -530,6 +530,14 @@ def _extract_target_modules(
                 name[len("model.") :] if name.startswith("model.") else name for name in final_target_modules
             }
 
+    # Adapters whose HF checkpoint layout renames modules (e.g. Kimi K3's
+    # mlp.experts.{E}.gate_proj -> block_sparse_moe.experts.{E}.w1) convert the
+    # state-dict keys on save, so adapter_config.json's target_modules must get
+    # the same treatment or PEFT can't resolve them against the real model.
+    map_target_module = getattr(adapter, "map_peft_target_module_to_hf", None)
+    if callable(map_target_module):
+        final_target_modules = {map_target_module(name) for name in final_target_modules}
+
     # Under pipeline parallelism each rank only holds the local stage's layers,
     # so named_modules() above yields layer-specific target names for that stage
     # only. Union the sets across the PP group so adapter_config.json lists every
