@@ -1,16 +1,102 @@
-.github/ @nvidia-nemo/automation
-codecov.yml @nvidia-nemo/automation
-docker/ @nvidia-nemo/automation
-pyproject.toml @nvidia-nemo/automation
-uv.lock @nvidia-nemo/automation
-tests/ci_tests @nvidia-nemo/automation
+# The last matching pattern wins. Keep broad rules before their carve-outs.
 
-docs @jgerh @NVIDIA-NeMo/core-am
-nemo_automodel @NVIDIA-NeMo/core-am
-examples @NVIDIA-NeMo/core-am
-README.md @akoumpa @HuiyingLi @athitten @snowmanwwg
+# Default ownership
+* @NVIDIA-NeMo/am-reviewers-core
 
-nemo_automodel/components/datasets/llm/retrieval_*.py @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
-nemo_automodel/_transformers/retrieval.py @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
-nemo_automodel/recipes/retrieval/ @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
-examples/retrieval/ @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
+# Build, CI, packaging, and release automation
+/.github/ @NVIDIA-NeMo/am-reviewers-automation
+/docker/ @NVIDIA-NeMo/am-reviewers-automation
+/codecov.yml @NVIDIA-NeMo/am-reviewers-automation
+/pyproject.toml @NVIDIA-NeMo/am-reviewers-automation
+/uv.lock @NVIDIA-NeMo/am-reviewers-automation
+/.pre-commit-config.yaml @NVIDIA-NeMo/am-reviewers-automation
+/.flake8 @NVIDIA-NeMo/am-reviewers-automation
+/.pylintrc @NVIDIA-NeMo/am-reviewers-automation
+/.python-version @NVIDIA-NeMo/am-reviewers-automation
+/.dockerignore @NVIDIA-NeMo/am-reviewers-automation
+/tests/ci_tests/ @NVIDIA-NeMo/am-reviewers-automation
+
+# Documentation and top-level README
+/docs/ @NVIDIA-NeMo/am-reviewers-docs
+/README.md @NVIDIA-NeMo/am-reviewers-readme
+
+# Recipes. Domain-specific recipe rules below override this broad rule.
+/nemo_automodel/recipes/ @NVIDIA-NeMo/am-reviewers-recipes
+
+# Runtime and training infrastructure
+/nemo_automodel/components/distributed/ @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/components/training/ @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/components/optim/ @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/components/launcher/ @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/_transformers/infrastructure.py @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/components/loss/chunked_ce.py @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/components/loss/linear_ce.py @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/components/loss/masked_ce.py @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/components/loss/te_parallel_ce.py @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/components/loss/kd_loss.py @NVIDIA-NeMo/am-reviewers-runtime
+/nemo_automodel/components/loss/triton/ @NVIDIA-NeMo/am-reviewers-runtime
+
+# Data. Domain-specific dataset rules below override this broad rule.
+/nemo_automodel/components/datasets/ @NVIDIA-NeMo/am-reviewers-data
+
+# Mixture-of-experts and quantization
+/nemo_automodel/components/moe/ @NVIDIA-NeMo/am-reviewers-moe
+/nemo_automodel/components/quantization/ @NVIDIA-NeMo/am-reviewers-moe
+
+# Checkpointing
+/nemo_automodel/components/checkpoint/ @NVIDIA-NeMo/am-reviewers-ckpt
+
+# Models, attention, and multimodal surfaces
+/nemo_automodel/components/models/ @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/components/attention/ @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/_transformers/registry.py @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/_transformers/capabilities.py @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/_transformers/model_capabilities.py @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/_transformers/auto_model.py @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/components/datasets/vlm/ @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/components/datasets/multimodal/ @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/recipes/vlm/ @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/recipes/multimodal/ @NVIDIA-NeMo/am-reviewers-models
+/examples/vlm_finetune/ @NVIDIA-NeMo/am-reviewers-models
+/examples/vlm_benchmark/ @NVIDIA-NeMo/am-reviewers-models
+/examples/vlm_kd/ @NVIDIA-NeMo/am-reviewers-models
+/examples/multimodal_finetune/ @NVIDIA-NeMo/am-reviewers-models
+/examples/multimodal_pretrain/ @NVIDIA-NeMo/am-reviewers-models
+/nemo_automodel/components/moe/state_dict_mixin.py @NVIDIA-NeMo/am-reviewers-models
+
+# Diffusion and discrete diffusion language models
+/nemo_automodel/components/flow_matching/ @NVIDIA-NeMo/am-reviewers-diffusion
+/nemo_automodel/_diffusers/ @NVIDIA-NeMo/am-reviewers-diffusion
+/nemo_automodel/components/datasets/diffusion/ @NVIDIA-NeMo/am-reviewers-diffusion
+/nemo_automodel/recipes/diffusion/ @NVIDIA-NeMo/am-reviewers-diffusion
+/examples/diffusion/ @NVIDIA-NeMo/am-reviewers-diffusion
+/tools/diffusion/ @NVIDIA-NeMo/am-reviewers-diffusion
+/nemo_automodel/components/datasets/dllm/ @NVIDIA-NeMo/am-reviewers-diffusion
+/nemo_automodel/recipes/dllm/ @NVIDIA-NeMo/am-reviewers-diffusion
+/nemo_automodel/components/loss/dllm_loss.py @NVIDIA-NeMo/am-reviewers-diffusion
+/examples/dllm_sft/ @NVIDIA-NeMo/am-reviewers-diffusion
+
+# Retrieval, embedding, and reranking. Keep these rules last so they override
+# the broader data, models, recipes, examples, tests, and docs rules above.
+/nemo_automodel/components/datasets/llm/retrieval_collator.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/datasets/llm/retrieval_dataset.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/datasets/llm/retrieval_dataset_inline.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/datasets/llm/retrieval_dataset_normalized.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/datasets/llm/retrieval_distill_collator.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/_transformers/retrieval.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/recipes/retrieval/ @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/loss/infonce.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/loss/embedding_distill.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/loss/intermediate_distill.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/loss/dist_utils.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/models/common/inbatch_neg_utils.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/models/common/bidirectional.py @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/models/llama_bidirectional/ @NVIDIA-NeMo/automodel_retriever_maintainers
+/nemo_automodel/components/models/ministral_bidirectional/ @NVIDIA-NeMo/automodel_retriever_maintainers
+/examples/retrieval/ @NVIDIA-NeMo/automodel_retriever_maintainers
+/tools/retrieval/ @NVIDIA-NeMo/automodel_retriever_maintainers
+/tests/functional_tests/retrieval/ @NVIDIA-NeMo/automodel_retriever_maintainers
+/docs/model-coverage/embedding/ @NVIDIA-NeMo/automodel_retriever_maintainers
+/docs/model-coverage/reranker/ @NVIDIA-NeMo/automodel_retriever_maintainers
+/docs/guides/llm/retrieval-dataset.mdx @NVIDIA-NeMo/automodel_retriever_maintainers
+/docs/guides/llm/retrieval-finetune.mdx @NVIDIA-NeMo/automodel_retriever_maintainers
