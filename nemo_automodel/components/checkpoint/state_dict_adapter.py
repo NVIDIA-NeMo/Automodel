@@ -123,6 +123,7 @@ class StateDictAdapter(ABC):
         """
         return name
 
+
 class PassthroughStateDictAdapter(StateDictAdapter):
     """Adapter for models whose native tensors already have the exact Hugging Face representation.
 
