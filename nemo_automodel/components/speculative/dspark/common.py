@@ -13,7 +13,6 @@
 # limitations under the License.
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 from torch import nn
@@ -48,9 +47,9 @@ class DSparkForwardOutput:
     # [batch_size, num_anchors]
     block_keep_mask: torch.Tensor
     # [batch_size, num_anchors, block_size]
-    confidence_pred: Optional[torch.Tensor] = None
+    confidence_pred: torch.Tensor | None = None
     # [batch_size, num_anchors, block_size, vocab_size]
-    aligned_target_logits: Optional[torch.Tensor] = None
+    aligned_target_logits: torch.Tensor | None = None
 
 
 class AcceptRatePredictor(nn.Module):
@@ -125,7 +124,7 @@ def build_anchor_candidate_mask(
     *,
     seq_len: int,
     loss_mask: torch.Tensor,
-    doc_remaining: Optional[torch.Tensor] = None,
+    doc_remaining: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_candidates = max(seq_len - 1, 0)
     if num_candidates == 0:
@@ -147,7 +146,7 @@ def sample_anchor_positions(
     loss_mask: torch.Tensor,
     num_anchors: int,
     device: torch.device,
-    doc_remaining: Optional[torch.Tensor] = None,
+    doc_remaining: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     valid = build_anchor_candidate_mask(
         seq_len=seq_len,
@@ -201,8 +200,8 @@ def build_eval_mask(
     label_indices: torch.Tensor,
     safe_label_indices: torch.Tensor,
     block_keep_mask: torch.Tensor,
-    doc_remaining: Optional[torch.Tensor] = None,
-    anchor_positions: Optional[torch.Tensor] = None,
+    doc_remaining: torch.Tensor | None = None,
+    anchor_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     target_valid = label_indices < seq_len
     target_loss_mask = torch.gather(
@@ -228,7 +227,7 @@ def build_eval_mask(
 def create_position_ids(
     anchor_positions: torch.Tensor,
     block_size: int,
-    context_position_ids: Optional[torch.Tensor] = None,
+    context_position_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Position ids for the parallel draft blocks (``base position + offset``).
 
@@ -284,7 +283,7 @@ def create_noise_embed(
     return embed_tokens(noise_ids)
 
 
-def pin_rope_inv_freq_fp32(rotary_emb: Optional[nn.Module]) -> None:
+def pin_rope_inv_freq_fp32(rotary_emb: nn.Module | None) -> None:
     """Keep a RoPE module's ``inv_freq`` buffers in fp32 after a dtype cast.
 
     ``module.to(bfloat16)`` (the training build path) rounds the rotary

@@ -233,6 +233,29 @@ class TestQwen35Flops:
         r2 = flops_utils.qwen3_5_flops(cfg, gbs=4, seq_len=1024)
         assert r2 == pytest.approx(4 * r1, rel=1e-6)
 
+    def test_moe_counts_activated_experts_not_total_experts(self):
+        cfg = _qwen3_5_moe_cfg()
+        base = flops_utils.qwen3_5_flops(cfg, gbs=1, seq_len=1024)
+
+        cfg.num_experts *= 2
+        more_total_experts = flops_utils.qwen3_5_flops(cfg, gbs=1, seq_len=1024)
+        cfg.num_experts_per_tok *= 2
+        more_activated_experts = flops_utils.qwen3_5_flops(cfg, gbs=1, seq_len=1024)
+
+        assert more_total_experts == base
+        assert more_activated_experts > more_total_experts
+
+    def test_moe_counts_shared_expert_width(self):
+        cfg = _qwen3_5_moe_cfg()
+        base = flops_utils.qwen3_5_flops(cfg, gbs=1, seq_len=1024)
+        added_width = 512
+
+        cfg.shared_expert_intermediate_size += added_width
+        with_wider_shared_expert = flops_utils.qwen3_5_flops(cfg, gbs=1, seq_len=1024)
+
+        expected_delta = 6 * 1 * cfg.num_hidden_layers * 1024 * cfg.hidden_size * 3 * added_width
+        assert with_wider_shared_expert - base == expected_delta
+
     def test_vl_text_config_fallback(self):
         """VL composite config should extract text_config when num_hidden_layers is missing."""
         text_cfg = _qwen3_5_moe_cfg()

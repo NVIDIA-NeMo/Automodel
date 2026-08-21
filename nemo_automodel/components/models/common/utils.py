@@ -283,9 +283,10 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
-            indexer, and Sinkhorn kernels together.
+            indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
+            "cudnn" select their respective packed sparse-attention kernels.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
@@ -324,7 +325,9 @@ class BackendConfig:
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
+        "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    )
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope: Literal["torch", "quack"] = "torch"

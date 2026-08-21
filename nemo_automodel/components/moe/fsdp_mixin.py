@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator
 
 import torch
 from torch.distributed.fsdp import FSDPModule, fully_shard
@@ -223,7 +223,7 @@ def patched_backward_maybe_with_nosync(
     backward_type,
     bwd_kwargs: dict,
     last_backward: bool = False,
-) -> tuple[tuple[Optional[torch.Tensor], ...], Optional[list[dict[str, Any]]]]:
+) -> tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]] | None]:
     """
     Whether using PP with FSDP or DDP, there are some runtime differences between the last backward step and the
     other steps.  Namely, we need to accumulate gradients on previous steps and reduce them on the last step, but
@@ -235,7 +235,7 @@ def patched_backward_maybe_with_nosync(
         backward_type,
     ) -> Callable[
         [],
-        tuple[tuple[Optional[torch.Tensor], ...], Optional[list[dict[str, Any]]]],
+        tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]] | None],
     ]:
         if backward_type == "full":
             return lambda: (
