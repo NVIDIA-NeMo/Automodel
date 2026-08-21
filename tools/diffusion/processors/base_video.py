@@ -20,7 +20,7 @@ Wan2.1 and HunyuanVideo.
 """
 
 from abc import abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -51,7 +51,7 @@ class BaseVideoProcessor(BaseModelProcessor):
         pass
 
     @property
-    def frame_constraint(self) -> Optional[str]:
+    def frame_constraint(self) -> str | None:
         """
         Return frame count constraint.
 
@@ -102,7 +102,7 @@ class BaseVideoProcessor(BaseModelProcessor):
         self,
         video_path: str,
         target_size: Tuple[int, int],
-        num_frames: Optional[int] = None,
+        num_frames: int | None = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, np.ndarray]:
         """
@@ -202,8 +202,8 @@ class BaseVideoProcessor(BaseModelProcessor):
         expected_channels: int,
         spatial_downscale: int = 8,
         temporal_downscale: int = 4,
-        input_shape: Optional[Tuple[int, int, int, int, int]] = None,
-    ) -> Tuple[bool, Optional[str]]:
+        input_shape: Tuple[int, int, int, int, int] | None = None,
+    ) -> Tuple[bool, str | None]:
         """
         Validate latent tensor shape based on expected dimensions.
 
@@ -258,7 +258,7 @@ class BaseVideoProcessor(BaseModelProcessor):
         self,
         video_path: str,
         target_size: Tuple[int, int],
-        num_frames: Optional[int] = None,
+        num_frames: int | None = None,
         resize_mode: str = "bilinear",
         center_crop: bool = True,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:

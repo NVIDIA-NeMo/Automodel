@@ -20,7 +20,7 @@ uniformly without branching on model type.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Tuple
 
 import torch
 import torch.nn as nn
@@ -47,8 +47,8 @@ def _compute_per_token_nll(
 def encoder_ar_loss(
     encoder_logits: torch.Tensor,
     input_ids: torch.Tensor,
-    valid_mask: Optional[torch.Tensor] = None,
-    num_tokens: Optional[int] = None,
+    valid_mask: torch.Tensor | None = None,
+    num_tokens: int | None = None,
 ) -> torch.Tensor:
     """Autoregressive next-token CE on the encoder's causal logits.
 
@@ -97,8 +97,8 @@ class DLLMLossOutput(NamedTuple):
 
     total_loss: torch.Tensor
     dllm_loss: torch.Tensor
-    draft_correct_per_pos: Optional[torch.Tensor] = None
-    draft_count_per_pos: Optional[torch.Tensor] = None
+    draft_correct_per_pos: torch.Tensor | None = None
+    draft_count_per_pos: torch.Tensor | None = None
 
 
 class MDLMCrossEntropyLoss(nn.Module):
@@ -123,10 +123,10 @@ class MDLMCrossEntropyLoss(nn.Module):
         noise_mask: torch.Tensor,
         p_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        loss_mask_ar: Optional[torch.Tensor] = None,
-        num_diffusion_tokens: Optional[int] = None,
-        num_ar_tokens: Optional[int] = None,
-        causal_logits: Optional[torch.Tensor] = None,
+        loss_mask_ar: torch.Tensor | None = None,
+        num_diffusion_tokens: int | None = None,
+        num_ar_tokens: int | None = None,
+        causal_logits: torch.Tensor | None = None,
     ) -> DLLMLossOutput:
         """Compute the MDLM cross-entropy loss.
 
@@ -196,10 +196,10 @@ class BlockDiffusionCrossEntropyLoss(nn.Module):
         noise_mask: torch.Tensor,
         p_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        loss_mask_ar: Optional[torch.Tensor] = None,
-        num_diffusion_tokens: Optional[int] = None,
-        num_ar_tokens: Optional[int] = None,
-        causal_logits: Optional[torch.Tensor] = None,
+        loss_mask_ar: torch.Tensor | None = None,
+        num_diffusion_tokens: int | None = None,
+        num_ar_tokens: int | None = None,
+        causal_logits: torch.Tensor | None = None,
     ) -> DLLMLossOutput:
         """Compute the flat block-diffusion cross-entropy loss.
 
@@ -262,10 +262,10 @@ class HybridDiffusionLLMLoss(nn.Module):
         noise_mask: torch.Tensor,
         p_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        loss_mask_ar: Optional[torch.Tensor] = None,
-        num_diffusion_tokens: Optional[int] = None,
-        num_ar_tokens: Optional[int] = None,
-        causal_logits: Optional[torch.Tensor] = None,
+        loss_mask_ar: torch.Tensor | None = None,
+        num_diffusion_tokens: int | None = None,
+        num_ar_tokens: int | None = None,
+        causal_logits: torch.Tensor | None = None,
     ) -> DLLMLossOutput:
         """Compute the hybrid diffusion + AR loss.
 
@@ -390,7 +390,7 @@ class DFlashDecayLoss(nn.Module):
 
     def __init__(
         self,
-        loss_gamma: Optional[float] = 7.0,
+        loss_gamma: float | None = 7.0,
         use_fused_linear_ce: bool = False,
         chunk_size: int = 1024,
         normalize: str = "tokens",
@@ -403,7 +403,7 @@ class DFlashDecayLoss(nn.Module):
         self.chunk_size = int(chunk_size)
         self.normalize = normalize
 
-    def _decay_weights(self, T: int, block_size: Optional[int], device, dtype) -> torch.Tensor:
+    def _decay_weights(self, T: int, block_size: int | None, device, dtype) -> torch.Tensor:
         """Eq. 4 weights for ``T`` predicted positions, resetting per block.
 
         Returns all-ones (uniform) when ``loss_gamma is None`` (decay disabled).
@@ -421,10 +421,10 @@ class DFlashDecayLoss(nn.Module):
         self,
         token_nll: torch.Tensor,
         block_mask: torch.Tensor,
-        num_tokens: Optional[int],
-        block_size: Optional[int],
-        draft_correct_per_pos: Optional[torch.Tensor] = None,
-        draft_count_per_pos: Optional[torch.Tensor] = None,
+        num_tokens: int | None,
+        block_size: int | None,
+        draft_correct_per_pos: torch.Tensor | None = None,
+        draft_count_per_pos: torch.Tensor | None = None,
     ) -> DLLMLossOutput:
         """Apply decay weights + block mask, sum, and normalise."""
         _, T = token_nll.shape
@@ -446,8 +446,8 @@ class DFlashDecayLoss(nn.Module):
     def _draft_acc_per_pos(
         correct: torch.Tensor,
         block_mask: torch.Tensor,
-        block_size: Optional[int],
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        block_size: int | None,
+    ) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
         """Per-rank (correct, count) sums per block offset k=1..block_size-1.
 
         ``correct`` is a ``[B, T]`` bool/float tensor of argmax matches and
@@ -475,8 +475,8 @@ class DFlashDecayLoss(nn.Module):
         logits: torch.Tensor,
         target_ids: torch.Tensor,
         block_mask: torch.Tensor,
-        num_tokens: Optional[int] = None,
-        block_size: Optional[int] = None,
+        num_tokens: int | None = None,
+        block_size: int | None = None,
     ) -> DLLMLossOutput:
         """Compute the DFlash decay-weighted loss from pre-computed logits.
 
@@ -511,7 +511,7 @@ class DFlashDecayLoss(nn.Module):
     def _chunk_nll(
         hidden_chunk: torch.Tensor,
         lm_head_weight: torch.Tensor,
-        lm_head_bias: Optional[torch.Tensor],
+        lm_head_bias: torch.Tensor | None,
         target_chunk: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Project one position chunk; return its per-token NLL and argmax-matches.
@@ -531,9 +531,9 @@ class DFlashDecayLoss(nn.Module):
         lm_head_weight: torch.Tensor,
         target_ids: torch.Tensor,
         block_mask: torch.Tensor,
-        num_tokens: Optional[int] = None,
-        block_size: Optional[int] = None,
-        lm_head_bias: Optional[torch.Tensor] = None,
+        num_tokens: int | None = None,
+        block_size: int | None = None,
+        lm_head_bias: torch.Tensor | None = None,
     ) -> DLLMLossOutput:
         """Chunked linear-CE: never materialises the full logits tensor.
 
@@ -627,7 +627,7 @@ class IDLMLoss(nn.Module):
         valid_mask: torch.Tensor,
         *,
         seq_len: int,
-        num_diffusion_tokens: Optional[int] = None,
+        num_diffusion_tokens: int | None = None,
     ) -> DLLMLossOutput:
         """Compute the I-DLM block-diffusion loss.
 

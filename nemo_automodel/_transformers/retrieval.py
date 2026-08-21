@@ -17,7 +17,6 @@
 import inspect
 import os
 from collections.abc import Iterable, Sequence
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -217,9 +216,9 @@ def _load_from_extracted_state(
 def _build_backbone_from_extracted_submodel(
     extracted_model: PreTrainedModel,
     task: str,
-    pooling: Optional[str],
-    num_labels: Optional[int],
-    temperature: Optional[float],
+    pooling: str | None,
+    num_labels: int | None,
+    temperature: float | None,
 ) -> PreTrainedModel:
     """Build a task-specific retrieval backbone from an extracted text submodel."""
     text_config = extracted_model.config
@@ -335,10 +334,10 @@ def build_encoder_backbone(
     model_name_or_path: str,
     task: str,
     trust_remote_code: bool = False,
-    pooling: Optional[str] = None,
-    extract_submodel: Optional[str] = None,
-    num_labels: Optional[int] = None,
-    temperature: Optional[float] = None,
+    pooling: str | None = None,
+    extract_submodel: str | None = None,
+    num_labels: int | None = None,
+    temperature: float | None = None,
     loaded_config: PretrainedConfig | None = None,
     is_causal: bool | None = None,
     **hf_kwargs,
@@ -719,7 +718,7 @@ class BiEncoderModel(nn.Module):
     def save_pretrained(self, save_directory: str, **kwargs):
         save_encoder_pretrained(self, save_directory, **kwargs)
 
-    def encode(self, input_dict: dict) -> Optional[torch.Tensor]:
+    def encode(self, input_dict: dict) -> torch.Tensor | None:
         """Encode inputs and return pooled embeddings.
 
         Args:
@@ -760,7 +759,7 @@ class BiEncoderModel(nn.Module):
 
         return embeds.contiguous()
 
-    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
+    def forward(self, input_dict: dict = None, **kwargs) -> torch.Tensor | None:
         """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
         return self.encode(input_dict)
 
@@ -794,7 +793,7 @@ class CrossEncoderModel(nn.Module):
     def save_pretrained(self, save_directory: str, **kwargs):
         save_encoder_pretrained(self, save_directory, **kwargs)
 
-    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
+    def forward(self, input_dict: dict = None, **kwargs) -> torch.Tensor | None:
         inputs = input_dict if input_dict is not None else kwargs
         inputs.setdefault("return_dict", True)
         return self.model(**inputs)
