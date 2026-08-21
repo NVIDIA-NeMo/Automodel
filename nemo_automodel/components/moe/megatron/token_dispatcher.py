@@ -453,6 +453,7 @@ class _HybridEPManager(_DispatchManager):
             num_sms_combine_api=self.moe_hybridep_num_sms,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
+            permute_fusion=self.permute_fusion,
         )
 
         self.tokens_per_expert = tokens_per_expert
@@ -471,6 +472,7 @@ class _HybridEPManager(_DispatchManager):
             handle=self.handle,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
+            permute_fusion=self.permute_fusion,
         )
         self.handle = None
         self.num_permuted_tokens = None
