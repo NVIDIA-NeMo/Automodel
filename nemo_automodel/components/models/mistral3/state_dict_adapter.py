@@ -38,11 +38,14 @@ Structurally modelled after
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Iterator
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -92,11 +95,35 @@ def _dequantize_from_fp8(
     return (weight_fp8.float() * scale_inv.float()).to(target_dtype)
 
 
+@torch.no_grad()
+def _dequantize_from_fp8_into(
+    target: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    scale_inv: torch.Tensor,
+) -> None:
+    """Dequantize a per-tensor FP8 weight directly into its final model tensor.
+
+    ``target`` keeps its native model shape, BF16 dtype, device, strides, distributed placements, and storage.
+    ``weight_fp8`` has the same shape and distributed placements but uses the checkpoint's FP8 dtype and temporary
+    storage. ``scale_inv`` is the checkpoint's scalar BF16 inverse scale.
+    """
+    target.copy_(weight_fp8)
+    target.mul_(scale_inv.item())
+
+
+def _finish_fp8_loads(conversions: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]) -> None:
+    """Install one load part's FP8 tensors into final model storage."""
+    for target, weight_fp8, scale_inv in conversions:
+        _dequantize_from_fp8_into(target, weight_fp8, scale_inv)
+
+
 def _identity(k: str) -> str:
     return k
 
 
 _MISTRAL3P5_128B_NUM_HIDDEN_LAYERS = 88
+_CHECKPOINT_LAYERS_PER_PART = 8
+_DECODER_LAYER_KEY = re.compile(r"^(.*?\.layers\.(\d+))\.")
 
 
 def _config_attr(config: Any | None, attr: str) -> Any:
@@ -175,14 +202,16 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         hf_to_native: Callable[[str], str] = _identity,
         layout_name: str = "vlm_full",
         not_fp8_prefixes: tuple[str, ...] = (),
+        num_hidden_layers: int | None = None,
     ):
         self._native_to_hf = native_to_hf
         self._hf_to_native = hf_to_native
         self._layout_name = layout_name
         self._not_fp8_prefixes = tuple(not_fp8_prefixes)
+        self._num_hidden_layers = num_hidden_layers
 
     @classmethod
-    def for_causal_lm(cls) -> "Mistral3FP8StateDictAdapter":
+    def for_causal_lm(cls, config: Any | None = None) -> "Mistral3FP8StateDictAdapter":
         """Text-only path for per-tensor FP8 Ministral3ForCausalLM checkpoints.
 
         Devstral-2 stores text-model keys in the same layout exposed by the
@@ -190,7 +219,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         while embeddings, norms, and the untied LM head remain BF16 and are
         excluded by ``_NON_QUANTIZED_SUFFIXES``.
         """
-        return cls(layout_name="causal_lm")
+        return cls(layout_name="causal_lm", num_hidden_layers=_config_attr(config, "num_hidden_layers"))
 
     @classmethod
     def for_vlm_full(cls, config: Any | None = None) -> "Mistral3FP8StateDictAdapter":
@@ -251,8 +280,6 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         hf: dict[str, Any] = {}
         for model_key, value in state_dict.items():
             if exclude_key_regex is not None:
-                import re
-
                 if re.match(exclude_key_regex, model_key):
                     continue
             hf_key = self._native_to_hf(model_key)
@@ -264,6 +291,87 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
             else:
                 hf[hf_key] = value
         return hf
+
+    def iter_checkpoint_load_parts(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+        device_mesh: "DeviceMesh" | None = None,
+    ) -> Iterator[CheckpointLoadPart] | None:
+        """Load text-only Mistral3 FP8 weights in bounded decoder-layer groups.
+
+        Each quantized model tensor has BF16 model shape and storage. Its load part creates an FP8 destination with
+        the same shape, device, strides, and distributed placements, plus the scalar BF16 ``_scale_inv`` destination
+        stored by the checkpoint. After DCP fills both tensors, the part copies and scales the FP8 value directly into
+        the BF16 model tensor. Non-quantized tensors use their final model storage as the DCP destination.
+
+        This path requires the complete decoder on every rank. Pipeline-parallel ranks own different layer subsets and
+        therefore retain the existing rank-local DCP path until part scheduling can be coordinated across stages. VLM
+        layouts also retain that existing path.
+
+        Args:
+            model_state_dict: Native text-model names mapped to final model tensors. Decoder tensors may be local
+                DTensor shards; their placements are preserved by ``torch.empty_like``.
+            device_mesh: Optional distributed mesh. The tensors already carry their final placements, so this value is
+                not otherwise needed.
+
+        Returns:
+            One direct-load part for tensors outside decoder layers plus bounded temporary-load parts for decoder
+            layers, or ``None`` for VLM layouts, partial decoders, and non-BF16 model weights.
+        """
+        del device_mesh
+        if self._layout_name != "causal_lm":
+            return None
+        present_layer_indices = {
+            int(layer_match.group(2))
+            for model_key in model_state_dict
+            if (layer_match := _DECODER_LAYER_KEY.match(model_key)) is not None
+        }
+        if self._num_hidden_layers is None or present_layer_indices != set(range(self._num_hidden_layers)):
+            return None
+        if any(
+            _is_fp8_weight_key(model_key, self._not_fp8_prefixes) and tensor.dtype != torch.bfloat16
+            for model_key, tensor in model_state_dict.items()
+        ):
+            return None
+        return self._iter_causal_lm_checkpoint_load_parts(model_state_dict)
+
+    def _iter_causal_lm_checkpoint_load_parts(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+    ) -> Iterator[CheckpointLoadPart]:
+        grouped_model_keys: dict[str, list[str]] = {}
+        for model_key in model_state_dict:
+            layer_match = _DECODER_LAYER_KEY.match(model_key)
+            group_name = (
+                f"layers-{int(layer_match.group(2)) // _CHECKPOINT_LAYERS_PER_PART}"
+                if layer_match is not None
+                else "shared"
+            )
+            grouped_model_keys.setdefault(group_name, []).append(model_key)
+
+        for model_keys in grouped_model_keys.values():
+            checkpoint_tensors: dict[str, torch.Tensor] = {}
+            temporary_checkpoint_keys: set[str] = set()
+            conversions: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            for model_key in model_keys:
+                target = model_state_dict[model_key]
+                hf_key = self._native_to_hf(model_key)
+                if _is_fp8_weight_key(model_key, self._not_fp8_prefixes):
+                    weight_fp8 = torch.empty_like(target, dtype=torch.float8_e4m3fn)
+                    scale_inv = torch.empty((), dtype=torch.bfloat16)
+                    checkpoint_tensors[hf_key] = weight_fp8
+                    checkpoint_tensors[hf_key + "_scale_inv"] = scale_inv
+                    temporary_checkpoint_keys.update((hf_key, hf_key + "_scale_inv"))
+                    conversions.append((target, weight_fp8, scale_inv))
+                else:
+                    checkpoint_tensors[hf_key] = target
+
+            yield CheckpointLoadPart(
+                checkpoint_tensors=checkpoint_tensors,
+                model_keys=frozenset(model_keys),
+                temporary_checkpoint_keys=frozenset(temporary_checkpoint_keys),
+                finish=partial(_finish_fp8_loads, tuple(conversions)),
+            )
 
     # --------------------------------------------------------------------- #
     # HF → model                                                            #
