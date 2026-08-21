@@ -830,12 +830,10 @@ class Checkpointer:
         # fall behind other ranks' async allocations.
         is_safetensors = _is_safetensors_checkpoint(model_path)
         is_custom_model = _is_custom_model(model_state.model[0])
-        # Custom adapters traditionally took the frugal full-state path here because converting
-        # grouped experts into load destinations could materialize a second on-device copy and OOM.
-        # Adapters whose model-sized destinations alias final model storage can now opt into the standard DCP path
-        # below, which writes checkpoint tensors directly through those views. A bounded adapter may also retain
-        # small auxiliary destinations that it consumes in-place after the read. Keep the CPU path for other
-        # non-aliasing adapters and quantized initialization, whose conversion allocates model-sized tensors.
+        # Custom models traditionally loaded the complete checkpoint on the host because model-specific conversion
+        # could otherwise create a second full copy on the GPU. Use DCP when the adapter can place large checkpoint
+        # values directly in model weight memory. An adapter such as Gemma4 may also use a small temporary value that
+        # it applies after the read. Other custom adapters and quantized initialization keep the host fallback.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
         if torch.distributed.is_initialized():
@@ -843,16 +841,16 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
-        supports_memory_bounded_checkpoint_load = (
+        can_load_without_full_copy = (
             isinstance(state_dict_adapter, StateDictAdapter)
             and (
                 state_dict_adapter.supports_write_through_checkpoint_load
-                or state_dict_adapter.supports_bounded_checkpoint_load
+                or state_dict_adapter.supports_checkpoint_load_without_full_copy
             )
             and not self.config.dequantize_base_checkpoint
         )
         single_device_custom_safetensors = (
-            is_safetensors and is_custom_model and world_size == 1 and not supports_memory_bounded_checkpoint_load
+            is_safetensors and is_custom_model and world_size == 1 and not can_load_without_full_copy
         )
         if (
             is_init_step
@@ -936,7 +934,7 @@ class Checkpointer:
             # Only base-checkpoint initialization needs FP8 scale destinations.
             quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
-            load_into_empty_destinations=True,
+            for_checkpoint_load=True,
         )
         destinations_ready = time.monotonic()
         requested_bytes = sum(

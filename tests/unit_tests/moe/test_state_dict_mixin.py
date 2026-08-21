@@ -610,16 +610,6 @@ class TestFromHfWMergedExperts:
         assert up.is_contiguous()
         assert down.is_contiguous()
 
-    def test_direct_fill_rejects_inconsistent_expert_shapes(self):
-        mixin = MockMoEStateDictMixin(dtype=torch.float32)
-        expert_parts = [
-            (torch.zeros(3, 2), torch.zeros(3, 2)),
-            (torch.zeros(3, 2), torch.zeros(3, 3)),
-        ]
-
-        with pytest.raises(ValueError, match="Expert 1 projection shapes"):
-            mixin._direct_fill_grouped_expert_tensor(expert_parts)
-
     def test_direct_fill_merge_kernels_write_into_final_storage(self):
         mixin = MockMoEStateDictMixin(dtype=torch.float32)
         gated_parts = [
@@ -1174,29 +1164,24 @@ class TestInplaceLoadViews:
             "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
         )
 
-    def test_noncontiguous_load_destinations_use_blank_buffers(self):
+    def test_mok_noncontiguous_checkpoint_views_are_reused(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
-        mixin.backend.experts = "te"
+        mixin.backend.experts = "gmm"
+        mixin.backend.dispatcher = "mok"
         initialized = torch.arange(2 * 4 * 6, dtype=torch.float32).reshape(2, 4, 6)
 
-        def sentinel_empty_like(tensor, **kwargs):
-            return torch.full_like(tensor, -17.0, **kwargs)
-
-        with (
-            patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
-            patch("torch.empty_like", side_effect=sentinel_empty_like) as mock_empty_like,
-        ):
+        with patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False):
             result = mixin._convert_single_merged_expert_to_hf_split_experts(
                 "model.layers.0.mlp.experts.gate_and_up_projs",
                 initialized,
-                load_into_empty_destinations=True,
+                for_checkpoint_load=True,
             )
 
         assert result is not None and len(result) == 4
-        assert mock_empty_like.call_count == 4
+        source_ptr = initialized.untyped_storage().data_ptr()
         for _, destination in result:
-            assert destination.is_contiguous()
-            torch.testing.assert_close(destination, torch.full_like(destination, -17.0))
+            assert not destination.is_contiguous()
+            assert destination.untyped_storage().data_ptr() == source_ptr
 
     def test_te_checkpoint_layout_views_are_reused(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
@@ -1217,14 +1202,14 @@ class TestInplaceLoadViews:
                 mixin._convert_single_merged_expert_to_hf_split_experts(
                     "model.layers.0.mlp.experts.gate_and_up_projs",
                     virtual_gate_up,
-                    load_into_empty_destinations=True,
+                    for_checkpoint_load=True,
                 )
             )
             destinations.update(
                 mixin._convert_single_merged_expert_to_hf_split_experts(
                     "model.layers.0.mlp.experts.down_projs",
                     virtual_down,
-                    load_into_empty_destinations=True,
+                    for_checkpoint_load=True,
                 )
             )
 
@@ -1261,7 +1246,7 @@ class TestInplaceLoadViews:
             destinations = mixin._convert_single_merged_expert_to_hf_split_experts(
                 "model.layers.0.mlp.experts.gate_and_up_projs",
                 virtual_gate_up,
-                load_into_empty_destinations=True,
+                for_checkpoint_load=True,
             )
 
         assert destinations is not None and len(destinations) == 16
@@ -1270,7 +1255,7 @@ class TestInplaceLoadViews:
         collect.assert_not_called()
         empty_cache.assert_not_called()
 
-    def test_empty_te_destinations_round_trip_checkpoint_values(self):
+    def test_temporary_checkpoint_views_round_trip_loaded_values(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
         mixin.backend.experts = "te"
         initialized_gate_up = torch.full((2, 4, 6), 99.0)
@@ -1281,14 +1266,14 @@ class TestInplaceLoadViews:
                 mixin._convert_single_merged_expert_to_hf_split_experts(
                     "model.layers.0.mlp.experts.gate_and_up_projs",
                     initialized_gate_up,
-                    load_into_empty_destinations=True,
+                    for_checkpoint_load=True,
                 )
             )
             destinations.update(
                 mixin._convert_single_merged_expert_to_hf_split_experts(
                     "model.layers.0.mlp.experts.down_projs",
                     initialized_down,
-                    load_into_empty_destinations=True,
+                    for_checkpoint_load=True,
                 )
             )
 

@@ -1361,7 +1361,7 @@ def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
     torch.testing.assert_close(encoder.model.weight, checkpoint_weight)
 
 
-def test_single_device_gemma4_bounded_load_writes_through_transposed_destinations(tmp_path):
+def test_single_device_gemma4_loads_into_model_weights_without_full_copy(tmp_path):
     """A real HF storage reader loads and scales Gemma4 experts without a materialized fallback."""
 
     class Experts(torch.nn.Module):
@@ -1472,7 +1472,7 @@ def test_load_model_only_requests_quantized_adapter_keys_for_base_checkpoint(
         checkpointer.load_model(model, model_path=str(tmp_path / "model"), is_init_step=is_init_step)
 
     assert adapter.to_hf.call_args.kwargs["quantization"] is expected_quantization
-    assert adapter.to_hf.call_args.kwargs["load_into_empty_destinations"] is True
+    assert adapter.to_hf.call_args.kwargs["for_checkpoint_load"] is True
 
 
 def test_training_checkpoint_resume_ignores_base_fp8_metadata(tmp_path):
@@ -1696,9 +1696,9 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    @pytest.mark.parametrize("load_capability", ["write_through", "bounded"])
+    @pytest.mark.parametrize("load_capability", ["write_through", "without_full_copy"])
     @pytest.mark.parametrize("dequantize_base_checkpoint", [False, True])
-    def test_single_device_memory_bounded_adapter_routes_by_quantization(
+    def test_single_device_adapter_without_full_copy_routes_by_quantization(
         self,
         mock_load_full,
         mock_load_hf,
@@ -1707,14 +1707,14 @@ class TestLoadModelCustomModelGuard:
         dequantize_base_checkpoint,
         load_capability,
     ):
-        """Quantized conversion stays materialized for every memory-bounded adapter capability."""
+        """Quantized conversion keeps the full CPU fallback for both direct-load capabilities."""
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
         CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
         model.state_dict_adapter.supports_write_through_checkpoint_load = load_capability == "write_through"
-        model.state_dict_adapter.supports_bounded_checkpoint_load = load_capability == "bounded"
+        model.state_dict_adapter.supports_checkpoint_load_without_full_copy = load_capability == "without_full_copy"
         mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
         mock_load_hf.return_value = mock_state_dict
 

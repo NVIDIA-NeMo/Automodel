@@ -43,8 +43,8 @@ def adapter() -> Gemma4MoEStateDictAdapter:
     )
 
 
-def _run_ep_sharded_bounded_load(rank: int, world_size: int, init_file: str, model_path: str) -> None:
-    """Load this rank's HF grouped-expert slice through DTensor views of native storage."""
+def _run_ep_sharded_load_without_full_copy(rank: int, world_size: int, init_file: str, model_path: str) -> None:
+    """Load this rank's expert weights directly into its part of the model's weight memory."""
     os.environ["GLOO_SOCKET_IFNAME"] = "lo"
     dist.init_process_group(
         "gloo",
@@ -74,7 +74,7 @@ def _run_ep_sharded_bounded_load(rank: int, world_size: int, init_file: str, mod
         destinations = adapter.to_hf(
             native_state,
             device_mesh=mesh,
-            load_into_empty_destinations=True,
+            for_checkpoint_load=True,
         )
         gate_destination = destinations["model.language_model.layers.0.experts.gate_up_proj"]
         down_destination = destinations["model.language_model.layers.0.experts.down_proj"]
@@ -150,14 +150,16 @@ def test_ep_load_reads_only_local_grouped_experts_into_final_storage(tmp_path) -
     )
 
     mp.spawn(
-        _run_ep_sharded_bounded_load,
+        _run_ep_sharded_load_without_full_copy,
         args=(2, str(tmp_path / "dist_init"), str(model_path)),
         nprocs=2,
         join=True,
     )
 
 
-def test_large_destinations_alias_model_storage_and_scale_is_bounded(adapter: Gemma4MoEStateDictAdapter) -> None:
+def test_large_destinations_use_model_weight_memory_and_scale_stays_small(
+    adapter: Gemma4MoEStateDictAdapter,
+) -> None:
     gate_and_up = torch.zeros(N_EXPERTS, HIDDEN, 2 * EXPERT_INTER)
     down = torch.zeros(N_EXPERTS, EXPERT_INTER, HIDDEN)
     state_dict = {
@@ -165,7 +167,7 @@ def test_large_destinations_alias_model_storage_and_scale_is_bounded(adapter: Ge
         "model.language_model.layers.0.moe.experts.down_projs": down,
     }
 
-    destinations = adapter.to_hf(state_dict, load_into_empty_destinations=True)
+    destinations = adapter.to_hf(state_dict, for_checkpoint_load=True)
 
     gate_destination = destinations["model.language_model.layers.0.experts.gate_up_proj"]
     down_destination = destinations["model.language_model.layers.0.experts.down_proj"]
@@ -180,9 +182,7 @@ def test_large_destinations_alias_model_storage_and_scale_is_bounded(adapter: Ge
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_from_hf_finalizes_aliased_destinations_in_place(
-    adapter: Gemma4MoEStateDictAdapter, dtype: torch.dtype
-) -> None:
+def test_from_hf_applies_scales_to_loaded_model_weights(adapter: Gemma4MoEStateDictAdapter, dtype: torch.dtype) -> None:
     adapter.dtype = dtype
     expected_gate_hf = torch.randn(N_EXPERTS, 2 * EXPERT_INTER, HIDDEN, dtype=dtype)
     expected_down_hf = torch.randn(N_EXPERTS, HIDDEN, EXPERT_INTER, dtype=dtype)
@@ -200,7 +200,7 @@ def test_from_hf_finalizes_aliased_destinations_in_place(
         "model.language_model.layers.0.moe.experts.gate_and_up_projs": gate_and_up,
         "model.language_model.layers.0.moe.experts.down_projs": down,
     }
-    destinations = adapter.to_hf(state_dict, load_into_empty_destinations=True)
+    destinations = adapter.to_hf(state_dict, for_checkpoint_load=True)
     destinations["model.language_model.layers.0.experts.gate_up_proj"].copy_(expected_gate_hf)
     destinations["model.language_model.layers.0.experts.down_proj"].copy_(expected_down_hf)
     destinations["model.language_model.layers.0.router.per_expert_scale"].copy_(expected_scale)
