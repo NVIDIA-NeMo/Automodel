@@ -429,6 +429,48 @@ class _ConstantTarget(torch.nn.Module):
         return SimpleNamespace(logits=logits, hidden_states=[hidden] * (self.num_layers + 1))
 
 
+def test_spec_generate_builds_the_targets_own_cache_type():
+    """The target's KV cache must be built from the target's config.
+
+    A bare ``DynamicCache()`` gives every layer a plain attention cache. The
+    Qwen3.5-family targets this recipe adds support for are hybrid -- they
+    interleave ``linear_attention`` with ``full_attention`` -- and reject such a
+    cache on the first forward with "`has_previous_state` can only be called on
+    LinearAttention layers". Passing the config is what makes transformers build
+    the per-layer cache types the target actually has.
+    """
+    from nemo_automodel.components.speculative.dflash import draft_qwen3_dflash2 as module
+
+    configs = []
+    real_cache_cls = module.DynamicCache
+
+    def _recording_cache(*args, config=None, **kwargs):
+        configs.append(config)
+        return real_cache_cls(*args, config=config, **kwargs)
+
+    cfg = _draft_cfg()
+    draft = Qwen3DFlash2DraftModel(cfg)
+    target = _ConstantTarget(cfg, forced_token_id=3)
+    # Give the stub the config surface a real (possibly hybrid) target carries.
+    target.config = cfg
+
+    module.DynamicCache = _recording_cache
+    try:
+        draft.spec_generate(
+            target=target,
+            input_ids=torch.tensor([[1, 2, 3]]),
+            max_new_tokens=BLOCK_SIZE,
+            stop_token_ids=None,
+            temperature=0.0,
+        )
+    finally:
+        module.DynamicCache = real_cache_cls
+
+    # Both caches are built from a config, and the target's from the target's own.
+    assert configs == [cfg, draft.config]
+    assert None not in configs
+
+
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 def test_spec_generate_emits_the_targets_tokens(temperature):
     """Greedy and rejection-sampled decoding both emit what the target would.

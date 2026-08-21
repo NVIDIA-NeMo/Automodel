@@ -569,8 +569,14 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
             (1, max_length + block_size), self.mask_token_id, dtype=torch.long, device=target.device
         )
         position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
-        past_key_values_target = DynamicCache()
-        past_key_values_draft = DynamicCache()
+        # Build each cache from its own model's config. A bare ``DynamicCache()``
+        # gives every layer a plain attention cache, which a hybrid target -- the
+        # Qwen3.5 family interleaves ``linear_attention`` with ``full_attention``
+        # -- rejects on its first forward (``has_previous_state`` raises). The
+        # draft is a uniform Qwen3 stack, but pass its config too so the two are
+        # constructed the same way.
+        past_key_values_target = DynamicCache(config=getattr(target, "config", None))
+        past_key_values_draft = DynamicCache(config=self.config)
 
         # Prefill the target on the prompt.
         output = target(
