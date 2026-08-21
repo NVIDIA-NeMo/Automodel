@@ -305,6 +305,12 @@ class TrainDFlashRecipe(BaseRecipe):
             draft_config["sliding_window"] = self.draft_sliding_window
             draft_config["use_sliding_window"] = True
         draft_config["max_window_layers"] = draft_num_hidden_layers
+        # The DFlash draft is non-causal by construction: a block's positions
+        # attend to each other in both directions. Stamp that explicitly, as the
+        # published drafters do -- a reader that infers causality from the layer
+        # type defaults ``sliding_attention`` to CAUSAL, which would serve a
+        # sliding-window draft causally after it was trained non-causally.
+        draft_config["is_causal"] = False
         draft_config["num_target_layers"] = num_target_layers
         draft_config["block_size"] = self.block_size
         draft_config["dflash_config"] = self._build_dflash_config(recipe_cfg, target_layer_ids)

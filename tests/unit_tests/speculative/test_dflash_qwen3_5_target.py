@@ -127,6 +127,40 @@ def test_draft_config_projection_drops_qwen3_5_only_fields():
     assert Qwen3RotaryEmbedding(cfg).inv_freq.shape[0] * 2 == cfg.head_dim
 
 
+def test_saved_draft_config_declares_it_is_not_causal():
+    """The saved config must say ``is_causal: false``, as the published drafters do.
+
+    The DFlash draft is non-causal by construction. A reader that infers
+    causality from the layer type -- z-lab/dflash does exactly this:
+
+        is_causal = getattr(config, "is_causal", None)
+        self.is_causal = layer_type == "sliding_attention" if is_causal is None else bool(is_causal)
+
+    defaults a ``sliding_attention`` layer to CAUSAL. With ``draft_sliding_window``
+    set (the shipped Qwen3.8-27B recipe sets 2048) every draft layer is
+    ``sliding_attention``, so omitting the key serves the draft causally after it
+    was trained non-causally.
+    """
+    import inspect
+
+    from nemo_automodel.recipes.llm import train_dflash
+
+    source = inspect.getsource(train_dflash.TrainDFlashRecipe.setup)
+    assert 'draft_config["is_causal"] = False' in source
+
+    def reference_is_causal(config: dict, layer_idx: int) -> bool:
+        """Verbatim rule from z-lab/dflash's Qwen3DFlashAttention.__init__."""
+        layer_types = config.get("layer_types")
+        layer_type = layer_types[layer_idx] if layer_types else "full_attention"
+        is_causal = config.get("is_causal")
+        return layer_type == "sliding_attention" if is_causal is None else bool(is_causal)
+
+    sliding = {"layer_types": ["sliding_attention"] * 5, "is_causal": False}
+    assert not any(reference_is_causal(sliding, i) for i in range(5))
+    # Without the key the same config would be read as causal.
+    assert all(reference_is_causal({"layer_types": ["sliding_attention"] * 5}, i) for i in range(5))
+
+
 class _ModuleDictTarget(nn.Module):
     """Minimal stand-in for a ``*ForConditionalGeneration`` target.
 
