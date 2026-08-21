@@ -822,17 +822,13 @@ class Checkpointer:
                 _load_full_state_dict_into_model(model_state.model, converted_state_dict)
                 return
 
-        # When loading base model for a single model and the checkpoint is safetensors (not DCP),
-        # load the full state dict on every rank and use set_model_state_dict with
-        # full_state_dict=True (no broadcast) so each rank independently slices its
-        # local DTensor shard.  This avoids NCCL collectives entirely, side-stepping
-        # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
-        # fall behind other ranks' async allocations.
+        # Keep a full-state CPU path for legacy .bin checkpoints and base-checkpoint conversions that cannot safely
+        # expose DCP destinations. Standard HF safetensors and explicitly low-memory adapters use DCP below.
         is_safetensors = _is_safetensors_checkpoint(model_path)
         is_custom_model = _is_custom_model(model_state.model[0])
-        # Custom models traditionally loaded the complete checkpoint on the host because model-specific conversion
-        # could otherwise create a second full copy on the GPU. Use DCP when most tensors load into model weight memory
-        # and any temporary tensors are small. Other custom adapters and quantized initialization keep the host fallback.
+        # Models with standard HF state-dict keys need no conversion, so DCP can load their tensors directly. Custom
+        # adapters may also opt in when most tensors load into model weight memory and any temporary tensors are small.
+        # Quantized initialization and other adapter conversions keep the host fallback on one device.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
         if torch.distributed.is_initialized():
@@ -840,22 +836,18 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
-        can_use_low_memory_dcp = (
-            isinstance(state_dict_adapter, StateDictAdapter)
-            and state_dict_adapter.supports_low_memory_dcp_load
-            and not self.config.dequantize_base_checkpoint
+        uses_standard_hf_state_dict = not is_custom_model and state_dict_adapter is None
+        can_use_low_memory_dcp = not self.config.dequantize_base_checkpoint and (
+            uses_standard_hf_state_dict
+            or (isinstance(state_dict_adapter, StateDictAdapter) and state_dict_adapter.supports_low_memory_dcp_load)
         )
-        single_device_custom_safetensors = (
-            is_safetensors and is_custom_model and world_size == 1 and not can_use_low_memory_dcp
+        safetensors_requires_full_cpu = (
+            is_safetensors and not can_use_low_memory_dcp and (not is_custom_model or world_size == 1)
         )
         if (
             is_init_step
             and len(model_state.model) == 1
-            and (
-                _is_bin_checkpoint(model_path)
-                or (is_safetensors and not is_custom_model)
-                or single_device_custom_safetensors
-            )
+            and (_is_bin_checkpoint(model_path) or safetensors_requires_full_cpu)
         ):
             t0 = time.monotonic()
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
