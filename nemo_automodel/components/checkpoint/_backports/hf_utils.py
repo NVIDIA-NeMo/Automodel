@@ -18,7 +18,7 @@ import io
 import json
 import struct
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -76,7 +76,7 @@ class _HFStorageInfo:
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
-def _gen_file_name(index: int, largest_index: int, shard_index: Optional[int] = None) -> str:
+def _gen_file_name(index: int, largest_index: int, shard_index: int | None = None) -> str:
     if shard_index is not None:
         return (
             SHARDED_FILE_NAME.format(
@@ -111,7 +111,7 @@ def _get_dtype(dtype_str: str) -> torch.dtype:
     return dtype
 
 
-def _get_dcp_custom_metadata(metadata: Any) -> Optional[Any]:
+def _get_dcp_custom_metadata(metadata: Any) -> Any | None:
     if DEFAULT_EXTRA_METADATA_KEY in metadata:
         custom_metadata = metadata[DEFAULT_EXTRA_METADATA_KEY]
         if CUSTOM_METADATA_KEY in custom_metadata:
