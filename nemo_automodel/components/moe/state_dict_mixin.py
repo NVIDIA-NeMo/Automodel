@@ -829,6 +829,7 @@ class MoESplitExpertsStateDictMixin:
         *,
         prefix_override: str | None = None,
         for_checkpoint_load: bool = False,
+        track_inplace_load: bool = True,
         **kwargs,
     ) -> list[tuple[str, torch.Tensor]]:
         """Convert one grouped expert tensor to Hugging Face's per-expert layout.
@@ -845,6 +846,8 @@ class MoESplitExpertsStateDictMixin:
                 outside the main backbone, e.g. ``"mtp."`` for the MTP head.
             for_checkpoint_load: Return views that DCP will completely overwrite. Save/export callers leave this
                 disabled so converted tensors preserve their current values in contiguous storage.
+            track_inplace_load: Record direct-write views for a later ``from_hf`` call. Checkpoint load groups disable
+                this because they write into the model and finish the load without calling ``from_hf``.
             **kwargs: Absorbed for forward-compatibility with base callers
                 that forward arbitrary state-dict kwargs (e.g. ``exclude_key_regex``).
 
@@ -903,7 +906,7 @@ class MoESplitExpertsStateDictMixin:
                 and not quantization
                 and gate_up_storage_is_model_weight
             )
-            if inplace_ok:
+            if inplace_ok and track_inplace_load:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 
             result = []
@@ -956,7 +959,7 @@ class MoESplitExpertsStateDictMixin:
                 and not quantization
                 and down_storage_is_model_weight
             )
-            if inplace_ok:
+            if inplace_ok and track_inplace_load:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 
             result = []

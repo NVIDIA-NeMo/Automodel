@@ -22,7 +22,6 @@ from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
 from nemo_automodel.components.models.ling_v2.model import BailingMoeV2ForCausalLM
 from nemo_automodel.components.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 
 @pytest.fixture
@@ -228,7 +227,7 @@ class TestRoundTrip:
         torch.testing.assert_close(roundtripped["model.word_embeddings.weight"], hf_sd["model.word_embeddings.weight"])
 
 
-class TestStreamingLoadGroups:
+class TestCheckpointLoadGroups:
     def test_loads_fused_qkv_through_one_temporary_and_experts_through_final_views(
         self,
         adapter,
@@ -237,10 +236,8 @@ class TestStreamingLoadGroups:
         backend_config,
     ):
         model = BailingMoeV2ForCausalLM(config=config, moe_config=moe_config, backend=backend_config)
-        model_state = {
-            canonical_parameter_fqn(name): tensor for name, tensor in model.state_dict(keep_vars=True).items()
-        }
-        groups = adapter.iter_checkpoint_load_groups(model)
+        model_state = adapter.get_checkpoint_load_state(model)
+        groups = adapter.iter_checkpoint_load_groups(model_state)
         loaded_native_keys = set()
 
         ordinary_group = next(groups)
@@ -306,10 +303,10 @@ class TestStreamingLoadGroups:
 
         assert loaded_native_keys == set(model_state)
 
-    def test_streaming_guards_backend_and_distributed_mesh(self, adapter, config, moe_config):
-        assert adapter.supports_streaming_checkpoint_load is True
+    def test_checkpoint_load_groups_guard_backend_and_distributed_mesh(self, adapter, config, moe_config):
+        assert adapter.supports_checkpoint_load_groups is True
         with pytest.raises(ValueError, match="single-device"):
-            next(adapter.iter_checkpoint_load_groups(torch.nn.Linear(2, 2), device_mesh=object()))
+            next(adapter.iter_checkpoint_load_groups({}, device_mesh=object()))
 
         unsupported_backend = BackendConfig(
             attn="sdpa",
@@ -325,6 +322,6 @@ class TestStreamingLoadGroups:
             backend=unsupported_backend,
             dtype=torch.float32,
         )
-        assert unsupported_adapter.supports_streaming_checkpoint_load is False
-        with pytest.raises(RuntimeError, match="does not support streaming"):
-            next(unsupported_adapter.iter_checkpoint_load_groups(torch.nn.Linear(2, 2)))
+        assert unsupported_adapter.supports_checkpoint_load_groups is False
+        with pytest.raises(RuntimeError, match="does not support checkpoint load groups"):
+            next(unsupported_adapter.iter_checkpoint_load_groups({}))

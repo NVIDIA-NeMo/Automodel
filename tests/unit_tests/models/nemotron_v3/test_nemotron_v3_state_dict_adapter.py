@@ -162,9 +162,11 @@ class TestNemotronV3StateDictAdapter:
         experts = layer.mixer.experts
         model.model.layers = torch.nn.ModuleList([layer])
 
-        groups = list(adapter.iter_checkpoint_load_groups(model))
-        assert adapter.supports_streaming_checkpoint_load is True
-        assert len(groups) == 2
+        checkpoint_state = adapter.get_checkpoint_load_state(model)
+        groups = list(adapter.iter_checkpoint_load_groups(checkpoint_state))
+        assert adapter.supports_checkpoint_load_groups is True
+        assert len(groups) == 1
+        assert groups[0].native_keys == frozenset(checkpoint_state)
 
         all_destinations = {key: value for group in groups for key, value in group.destinations.items()}
         assert set(all_destinations) == {
@@ -192,16 +194,16 @@ class TestNemotronV3StateDictAdapter:
             layer.mixer.gate.e_score_correction_bias,
             torch.full_like(layer.mixer.gate.e_score_correction_bias, 2),
         )
-        for group in groups[1:]:
-            for destination in group.destinations.values():
+        for checkpoint_name, destination in all_destinations.items():
+            if ".experts." in checkpoint_name:
                 destination.fill_(3)
-            group.install()
+        groups[0].install()
         assert torch.count_nonzero(experts.gate_and_up_projs) == experts.gate_and_up_projs.numel()
         assert torch.count_nonzero(experts.down_projs) == experts.down_projs.numel()
         torch.testing.assert_close(model.model.embed_tokens.lora_A.weight, lora_initial)
 
         moe_config.expert_bias = True
-        assert adapter.supports_streaming_checkpoint_load is False
+        assert adapter.supports_checkpoint_load_groups is False
 
     def test_from_hf_map_structure(self, config, moe_config, backend):
         """Test from_hf_map structure."""
