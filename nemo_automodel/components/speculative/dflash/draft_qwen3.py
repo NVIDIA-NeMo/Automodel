@@ -47,6 +47,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 
+from nemo_automodel.components.speculative.dflash.target import resolve_text_config
+
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     """Greedy (temperature ~ 0) or temperature sampling over the last dim."""
@@ -102,7 +104,7 @@ def assert_target_supports_rollback(target: nn.Module) -> None:
     config = getattr(target, "config", None)
     if config is None:
         return
-    text_config = getattr(config, "text_config", None) or config
+    text_config = resolve_text_config(config)
     layer_types = getattr(text_config, "layer_types", None)
     if not layer_types:
         return
