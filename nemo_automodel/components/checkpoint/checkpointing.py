@@ -21,6 +21,7 @@ import pickle
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -70,7 +71,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     requires_tensor_merging,
 )
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -787,6 +788,137 @@ class Checkpointer:
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
         optimizer_state.load_state_dict(state_dict)
 
+    def _load_model_in_parts(
+        self,
+        model_state: ModelState,
+        load_parts: Iterator[CheckpointLoadPart],
+        model_state_dict: dict[str, torch.Tensor],
+        model_path: str,
+        storage_reader: StorageReader,
+    ) -> None:
+        """Load, convert, and release one checkpoint part at a time.
+
+        Args:
+            model_state: Wrapper for the model whose final parameter storage is populated.
+            load_parts: Adapter-owned sequence of checkpoint destinations and finish callbacks.
+            model_state_dict: Native model names mapped to final model tensors. Every key must be completed exactly
+                once across ``load_parts``.
+            model_path: Hugging Face safetensors checkpoint directory.
+            storage_reader: Reader already bound to ``model_path``. Its parsed metadata is reused across parts.
+
+        Raises:
+            RuntimeError: If the checkpoint is missing a requested tensor or the parts do not cover all model tensors.
+            TypeError: If the adapter yields an object other than :class:`CheckpointLoadPart`.
+            ValueError: If a part is empty or repeats checkpoint or model keys.
+        """
+        started = time.monotonic()
+        checkpoint_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+        metadata_seconds = time.monotonic() - started
+        expected_model_keys = set(model_state_dict)
+        requested_checkpoint_keys: set[str] = set()
+        completed_model_keys: set[str] = set()
+        requested_bytes = 0
+        max_temporary_bytes = 0
+        read_seconds = 0.0
+        finish_seconds = 0.0
+        part_count = 0
+        process_group_kwargs = {"process_group": self.process_group} if self.process_group is not None else {}
+
+        for part in load_parts:
+            if not isinstance(part, CheckpointLoadPart):
+                raise TypeError(f"Checkpoint adapter yielded {type(part).__name__}, expected CheckpointLoadPart")
+            if not part.checkpoint_tensors:
+                raise ValueError("Checkpoint adapter yielded a load part with no checkpoint tensors")
+            if not part.model_keys:
+                raise ValueError("Checkpoint adapter yielded a load part with no completed model tensors")
+
+            part_checkpoint_keys = set(part.checkpoint_tensors)
+            unknown_temporary_keys = sorted(part.temporary_checkpoint_keys - part_checkpoint_keys)
+            if unknown_temporary_keys:
+                raise ValueError(
+                    f"Checkpoint adapter reported {len(unknown_temporary_keys)} temporary tensors absent from its "
+                    f"load destinations (examples={unknown_temporary_keys[:5]})"
+                )
+            duplicate_checkpoint_keys = sorted(part_checkpoint_keys & requested_checkpoint_keys)
+            if duplicate_checkpoint_keys:
+                raise ValueError(
+                    f"Checkpoint adapter requested {len(duplicate_checkpoint_keys)} tensors more than once "
+                    f"(examples={duplicate_checkpoint_keys[:5]})"
+                )
+            missing_checkpoint_keys = sorted(part_checkpoint_keys - checkpoint_keys)
+            if missing_checkpoint_keys:
+                raise RuntimeError(
+                    f"Checkpoint {model_path} is missing {len(missing_checkpoint_keys)} tensors required by load "
+                    f"part {part_count + 1} (examples={missing_checkpoint_keys[:5]})"
+                )
+
+            duplicate_model_keys = sorted(part.model_keys & completed_model_keys)
+            if duplicate_model_keys:
+                raise ValueError(
+                    f"Checkpoint adapter completed {len(duplicate_model_keys)} model tensors more than once "
+                    f"(examples={duplicate_model_keys[:5]})"
+                )
+            unexpected_model_keys = sorted(part.model_keys - expected_model_keys)
+            if unexpected_model_keys:
+                raise ValueError(
+                    f"Checkpoint adapter reported {len(unexpected_model_keys)} unknown model tensors "
+                    f"(examples={unexpected_model_keys[:5]})"
+                )
+
+            part_bytes = sum(estimate_tensor_bytes(tensor) for tensor in part.checkpoint_tensors.values())
+            requested_bytes += part_bytes
+            temporary_bytes = sum(
+                estimate_tensor_bytes(
+                    tensor.to_local() if type(tensor).__name__ == "DTensor" else tensor  # noqa: PLC2801
+                )
+                for checkpoint_key, tensor in part.checkpoint_tensors.items()
+                if checkpoint_key in part.temporary_checkpoint_keys
+            )
+            max_temporary_bytes = max(max_temporary_bytes, temporary_bytes)
+            requested_checkpoint_keys |= part_checkpoint_keys
+
+            read_started = time.monotonic()
+            # The reader already points at model_path. Omitting checkpoint_id avoids resetting it, so safetensors
+            # metadata parsed before the first part can be reused by every subsequent DCP plan.
+            dcp.load(part.checkpoint_tensors, storage_reader=storage_reader, **process_group_kwargs)
+            read_seconds += time.monotonic() - read_started
+
+            finish_started = time.monotonic()
+            part.finish()
+            finish_seconds += time.monotonic() - finish_started
+            completed_model_keys |= part.model_keys
+            part_count += 1
+            del part
+
+        if part_count == 0:
+            raise RuntimeError("Checkpoint adapter returned an empty load-part sequence")
+        missing_model_keys = sorted(expected_model_keys - completed_model_keys)
+        if missing_model_keys:
+            raise RuntimeError(
+                f"Checkpoint load parts omitted {len(missing_model_keys)} model tensors "
+                f"(examples={missing_model_keys[:5]})"
+            )
+
+        if model_state.uses_tied_lm_head and not model_state.is_peft:
+            ensure_tied_lm_head(model_state.model[0])
+
+        total_seconds = time.monotonic() - started
+        requested_gb = requested_bytes / (1 << 30)
+        max_temporary_gb = max_temporary_bytes / (1 << 30)
+        logger.info(
+            "load_model: loaded a %.2f GB checkpoint in %d parts over %.2fs "
+            "(%.2f GB/s overall | largest temporary allocation on this rank %.2f GB, metadata %.2fs, "
+            "storage read %.2fs, finish %.2fs)",
+            requested_gb,
+            part_count,
+            total_seconds,
+            requested_gb / max(total_seconds, 1e-9),
+            max_temporary_gb,
+            metadata_seconds,
+            read_seconds,
+            finish_seconds,
+        )
+
     @torch.no_grad()
     def load_model(
         self,
@@ -859,7 +991,9 @@ class Checkpointer:
         is_custom_model = _is_custom_model(model_state.model[0])
         # Models with standard HF state-dict keys need no conversion, so DCP can load their tensors directly. Custom
         # adapters may also opt in when most tensors load into model weight memory and any temporary tensors are small.
-        # Quantized initialization and other adapter conversions keep the host fallback on one device.
+        # A quantized adapter may instead describe small, self-contained groups that DCP can load and convert in
+        # sequence. Other quantized initialization keeps the existing fallback: full CPU conversion on one device,
+        # or rank-local DCP conversion for a distributed custom model.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
         if torch.distributed.is_initialized():
@@ -872,9 +1006,53 @@ class Checkpointer:
             uses_standard_hf_state_dict
             or (isinstance(state_dict_adapter, StateDictAdapter) and state_dict_adapter.supports_low_memory_dcp_load)
         )
+
+        part_loaded_model_state_dict: dict[str, torch.Tensor] | None = None
+        checkpoint_load_parts: Iterator[CheckpointLoadPart] | None = None
+        if (
+            is_init_step
+            and is_safetensors
+            and should_dequantize_base_checkpoint
+            and isinstance(state_dict_adapter, StateDictAdapter)
+            and len(model_state.model) == 1
+            and key_mapping is None
+            and not allow_checkpoint_key_subset
+        ):
+            candidate_state_dict = model_state.state_dict()
+            candidate_parts = state_dict_adapter.iter_checkpoint_load_parts(
+                candidate_state_dict,
+                device_mesh=self.moe_mesh,
+            )
+            if candidate_parts is not None:
+                part_loaded_model_state_dict = candidate_state_dict
+                checkpoint_load_parts = candidate_parts
+
         safetensors_requires_full_cpu = (
-            is_safetensors and not can_use_low_memory_dcp and (not is_custom_model or world_size == 1)
+            is_safetensors
+            and not can_use_low_memory_dcp
+            and checkpoint_load_parts is None
+            and (not is_custom_model or world_size == 1)
         )
+        if checkpoint_load_parts is not None and part_loaded_model_state_dict is not None:
+            storage_reader = self._get_storage_reader(
+                model_path,
+                key_mapping=None,
+                is_init_step=True,
+                is_safetensors=True,
+            )
+            if storage_reader is None:
+                raise RuntimeError(
+                    f"No safetensors storage reader is available for part-by-part loading from {model_path}"
+                )
+            self._load_model_in_parts(
+                model_state,
+                checkpoint_load_parts,
+                part_loaded_model_state_dict,
+                model_path,
+                storage_reader,
+            )
+            return
+
         if (
             is_init_step
             and len(model_state.model) == 1
