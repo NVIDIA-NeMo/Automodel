@@ -20,17 +20,16 @@ handling is applied in from_hf).
 """
 
 import logging
-import re
 from typing import Any
 
 from transformers import LlamaConfig
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import PassthroughStateDictAdapter
 
 logger = logging.getLogger(__name__)
 
 
-class LlamaStateDictAdapter(StateDictAdapter):
+class LlamaStateDictAdapter(PassthroughStateDictAdapter):
     """State dict adapter for Llama models.
 
     Uses separate projections that match HuggingFace key names exactly, so
@@ -50,8 +49,6 @@ class LlamaStateDictAdapter(StateDictAdapter):
         hf_state_dict = adapter.to_hf(custom_state_dict)
     """
 
-    _supports_low_memory_dcp_load = True
-
     def __init__(self, config: LlamaConfig):
         """Initialize adapter with Llama config."""
         self.config = config
@@ -68,30 +65,3 @@ class LlamaStateDictAdapter(StateDictAdapter):
                 logger.info(f"Tying lm_head.weight to {embed_key} (HuggingFace checkpoint has tied weights)")
                 custom_state_dict[lm_head_key] = custom_state_dict[embed_key]
         return custom_state_dict
-
-    def to_hf(
-        self,
-        state_dict: dict[str, Any],
-        exclude_key_regex: str | None = None,
-        **kwargs,
-    ) -> dict[str, Any]:
-        # Model keys are already in HF format.
-        if exclude_key_regex is not None:
-            return {k: v for k, v in state_dict.items() if not re.search(exclude_key_regex, k)}
-        return dict(state_dict)
-
-    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
-        """Return one model tensor under its unchanged Hugging Face key.
-
-        Args:
-            fqn: Fully qualified model tensor name.
-            tensor: Model tensor to expose for checkpoint I/O.
-            **kwargs: Adapter options, including an optional exclusion regex.
-
-        Returns:
-            The unchanged key and tensor, or an empty list when excluded.
-        """
-        exclude_key_regex = kwargs.get("exclude_key_regex")
-        if exclude_key_regex is not None and re.search(exclude_key_regex, fqn):
-            return []
-        return [(fqn, tensor)]

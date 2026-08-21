@@ -148,6 +148,18 @@ def test_write_through_adapters_expose_aliasing_destinations(
     )
 
 
+@pytest.mark.parametrize("adapter_type", [LlamaStateDictAdapter, Qwen2StateDictAdapter, Qwen3StateDictAdapter])
+def test_passthrough_adapters_share_single_tensor_conversion(adapter_type: type[StateDictAdapter]) -> None:
+    adapter = object.__new__(adapter_type)
+    tensor = torch.zeros(2, 3)
+
+    converted = adapter.convert_single_tensor_to_hf("model.weight", tensor)
+    assert len(converted) == 1
+    assert converted[0][0] == "model.weight"
+    assert converted[0][1] is tensor
+    assert adapter.convert_single_tensor_to_hf("model.weight", tensor, exclude_key_regex=r"model\.weight") == []
+
+
 @pytest.mark.parametrize(
     "adapter_type",
     [

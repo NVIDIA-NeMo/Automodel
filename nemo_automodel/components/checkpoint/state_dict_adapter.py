@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -102,3 +103,45 @@ class StateDictAdapter(ABC):
             for key, value in state_dict.items()
         }
         return list(self.to_hf(shape_only_state, exclude_key_regex=r".*_extra_state.*", quantization=False))
+
+
+class PassthroughStateDictAdapter(StateDictAdapter):
+    """Shared adapter behavior for models whose native and Hugging Face tensor keys match."""
+
+    _supports_low_memory_dcp_load = True
+
+    def to_hf(
+        self,
+        state_dict: dict[str, Any],
+        exclude_key_regex: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Expose model tensors under their unchanged Hugging Face keys.
+
+        Args:
+            state_dict: Model state whose tensor values keep their existing storage.
+            exclude_key_regex: Optional regular expression selecting keys to omit.
+            **kwargs: Compatibility options that do not alter passthrough tensors.
+
+        Returns:
+            A new mapping containing the original tensor values.
+        """
+        if exclude_key_regex is None:
+            return dict(state_dict)
+        return {key: value for key, value in state_dict.items() if not re.search(exclude_key_regex, key)}
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
+        """Expose one model tensor under its unchanged Hugging Face key.
+
+        Args:
+            fqn: Fully qualified model tensor name.
+            tensor: Model tensor to expose for checkpoint I/O.
+            **kwargs: Adapter options, including an optional exclusion regex.
+
+        Returns:
+            The unchanged key and tensor, or an empty list when excluded.
+        """
+        exclude_key_regex = kwargs.get("exclude_key_regex")
+        if isinstance(exclude_key_regex, str) and re.search(exclude_key_regex, fqn):
+            return []
+        return [(fqn, tensor)]
