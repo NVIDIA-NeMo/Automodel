@@ -91,6 +91,14 @@ def _as_tuple(value: _T | Sequence[_T] | None) -> tuple[_T, ...]:
     return (value,)
 
 
+def _tensor_version(tensor: torch.Tensor) -> int:
+    """Return the in-place mutation counter when the Tensor exposes one."""
+    try:
+        return int(tensor._version)
+    except RuntimeError:
+        return -1
+
+
 def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], CollatedLossInputs | dict[str, torch.Tensor]]:
     """Return one already-collated Datum without changing its layout.
 
@@ -175,7 +183,7 @@ class ForwardResult:
 
 @dataclass(frozen=True)
 class ForwardBackwardResult:
-    """Training-window loss statistics and per-Datum callback outputs.
+    """One backward call's loss statistics and per-Datum callback outputs.
 
     The numerator is summed across the DP-CP gradient group. The full-sequence
     denominator is summed across DP only because CP ranks begin with replicated
@@ -186,11 +194,11 @@ class ForwardBackwardResult:
     identical on every PP stage in that replica.
 
     Attributes:
-        loss: Detached weighted mean for the complete optimizer window.
+        loss: Detached weighted mean for this call's Datum window.
         loss_sum: Detached numerator summed across DP and CP, then synchronized
             across PP stages.
-        weight_sum: Detached full-window denominator summed across DP, but not
-            CP, then synchronized across PP stages.
+        weight_sum: Detached denominator for this call, summed across DP but
+            not CP, then synchronized across PP stages.
         loss_fn_outputs: Detached per-Datum mappings in input order.
     """
 
@@ -216,6 +224,28 @@ class OptimStepResult:
     learning_rates: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class _PlannedDatum:
+    datum: Datum
+    weights: torch.Tensor
+    weights_version: int
+    weights_shape: torch.Size
+    weights_dtype: torch.dtype
+    weights_device: torch.device
+    weights_sum: float
+
+
+@dataclass
+class _AccumulationState:
+    windows: tuple[tuple[_PlannedDatum, ...], ...]
+    weight_sums: tuple[torch.Tensor, ...]
+    total_weight_sum: torch.Tensor
+    total_microbatches: int
+    microbatch_size: int
+    next_window: int = 0
+    status: str = "active"
+
+
 class Engine:
     """Run model forward or forward/backward over Datum windows.
 
@@ -226,10 +256,11 @@ class Engine:
     gradient-accumulation synchronization, and backward. When optimizers are
     provided, :meth:`optim_step` owns distributed gradient finalization,
     clipping, parameter updates, gradient clearing, model post-step hooks, and
-    LR-scheduler advancement. One :meth:`forward_backward` call represents the
-    complete optimizer accumulation window whose gradients :meth:`optim_step`
-    consumes. Dynamic loss scaling and overflow-skipped updates are not part of
-    this contract.
+    LR-scheduler advancement. By default, one :meth:`forward_backward` call is
+    the complete optimizer accumulation window consumed by
+    :meth:`optim_step`. Call :meth:`begin_accumulation` first when that window
+    must be split across multiple ``forward_backward`` calls. Dynamic loss
+    scaling and overflow-skipped updates are not part of this contract.
 
     Args:
         model: An already configured and distributed model, or a built
@@ -317,6 +348,183 @@ class Engine:
         self.optimizers = _as_tuple(optimizers)
         self.lr_schedulers = _as_tuple(lr_schedulers)
         self.max_grad_norm = max_grad_norm
+        self._accumulation_state: _AccumulationState | None = None
+        self._optim_step_consumed = False
+        self._grads_finalized = False
+        self._finalized_grad_norm: torch.Tensor | float | None = None
+        self._optim_step_in_progress = False
+        self._implicit_backward_status = "idle"
+
+    def begin_accumulation(self, windows: Sequence[Sequence[Datum]]) -> None:
+        """Plan one optimizer window split across multiple backward calls.
+
+        The complete plan is required before the first backward because the
+        supervised loss and MoE auxiliary loss use different global
+        denominators. Each subsequent :meth:`forward_backward` call must pass
+        the exact planned Datum objects for the next window, in order. A
+        :class:`ForwardBackwardResult` continues to describe only that call;
+        callers combine results with ``sum(loss_sum) / sum(weight_sum)``.
+
+        The first version supports eager/DDP/FSDP execution. Pipeline schedules
+        currently finalize gradients at the end of every schedule invocation,
+        so planned multi-call accumulation with PP fails explicitly instead of
+        silently treating each call as a complete optimizer window. If a
+        planned backward call fails after execution starts, partial distributed
+        state cannot be rolled back safely: the plan becomes broken and the
+        Engine must not be stepped or reused. To make rank-local loss-callback
+        failures fail together before backward, an explicit plan performs one
+        small control consensus per outer microbatch; the ordinary one-call
+        path adds no such collective.
+
+        Args:
+            windows: Non-empty sequence of non-empty Datum windows in their
+                future call order. The same Datum objects and weight tensors
+                must be passed unchanged to :meth:`forward_backward`. Every
+                non-final window must end on an Engine outer-microbatch
+                boundary.
+
+        Raises:
+            RuntimeError: If no optimizer is configured, another plan is
+                active, or gradients from an earlier optimizer window have not
+                been cleared.
+            NotImplementedError: If pipeline parallelism is enabled.
+            ValueError: If the plan is empty, malformed, or splits an outer
+                microbatch across calls.
+        """
+        if self.pipeline is not None:
+            raise NotImplementedError(
+                "planned multi-call accumulation is not supported with pipeline parallelism; "
+                "pipeline schedules currently finalize gradients after every schedule call"
+            )
+        if self._accumulation_state is not None:
+            raise RuntimeError("an Engine accumulation plan is already active")
+
+        self._validate_parallelism()
+        dp_group, dp_size = self._dp_group_and_size()
+        control_group, control_group_size = self._accumulation_control_group_and_size()
+        local_error: Exception | None = None
+        planned_windows: list[tuple[_PlannedDatum, ...]] = []
+        microbatch_counts: list[int] = []
+        local_weight_sums: list[float] = []
+        try:
+            if not self.optimizers:
+                raise RuntimeError("Engine.begin_accumulation requires at least one optimizer")
+            if not isinstance(windows, Sequence) or isinstance(windows, (str, bytes)) or not windows:
+                raise ValueError("begin_accumulation requires a non-empty sequence of Datum windows")
+            if (
+                self._implicit_backward_status != "idle"
+                or self._grads_finalized
+                or any(parameter.grad is not None for part in self.model_parts for parameter in part.parameters())
+            ):
+                raise RuntimeError("begin_accumulation requires cleared gradients")
+
+            for window_index, window in enumerate(windows):
+                microbatches = self._group_datums(window)
+                if window_index < len(windows) - 1 and len(window) % self.microbatch_size != 0:
+                    raise ValueError("every non-final accumulation window must end on an outer-microbatch boundary")
+
+                planned_window: list[_PlannedDatum] = []
+                local_weight_sum = 0.0
+                for datum in window:
+                    weights = datum.loss_fn_inputs.get("weights")
+                    if not isinstance(weights, torch.Tensor):
+                        raise ValueError("every Datum must contain a Tensor loss_fn_inputs['weights']")
+                    if weights.numel() == 0 or not bool(torch.isfinite(weights).all()) or bool((weights < 0).any()):
+                        raise ValueError("Datum weights must be non-empty, finite, and non-negative")
+                    weight_sum = float(weights.to(torch.float64).sum())
+                    local_weight_sum += weight_sum
+                    planned_window.append(
+                        _PlannedDatum(
+                            datum=datum,
+                            weights=weights,
+                            weights_version=_tensor_version(weights),
+                            weights_shape=weights.shape,
+                            weights_dtype=weights.dtype,
+                            weights_device=weights.device,
+                            weights_sum=weight_sum,
+                        )
+                    )
+                planned_windows.append(tuple(planned_window))
+                microbatch_counts.append(len(microbatches))
+                local_weight_sums.append(local_weight_sum)
+        except Exception as error:
+            local_error = error
+
+        self._synchronize_accumulation_error(
+            local_error,
+            control_group,
+            control_group_size,
+            peer_message="another model-parallel rank rejected the accumulation plan",
+        )
+        self._validate_window_size_across_group(len(planned_windows), control_group, control_group_size)
+        for count in microbatch_counts:
+            self._validate_window_size_across_group(count, control_group, control_group_size)
+
+        local_denominators = torch.tensor(local_weight_sums, dtype=torch.float64, device=self.device)
+        cp_group, cp_size = self._cp_group_and_size()
+        cp_error: Exception | None = None
+        if cp_size > 1:
+            gathered_cp_denominators = torch.empty(
+                cp_size * len(local_weight_sums),
+                dtype=local_denominators.dtype,
+                device=local_denominators.device,
+            )
+            dist.all_gather_into_tensor(gathered_cp_denominators, local_denominators, group=cp_group)
+            gathered_cp_denominators = gathered_cp_denominators.view(cp_size, len(local_weight_sums))
+            if not torch.allclose(
+                gathered_cp_denominators,
+                gathered_cp_denominators[0].expand_as(gathered_cp_denominators),
+                rtol=1e-8,
+                atol=1e-12,
+            ):
+                cp_error = ValueError(
+                    "context-parallel ranks must plan identical full-sequence weights; "
+                    f"got {gathered_cp_denominators.tolist()}"
+                )
+        self._synchronize_accumulation_error(
+            cp_error,
+            control_group,
+            control_group_size,
+            peer_message="another context-parallel group rejected the planned weight sums",
+        )
+
+        global_denominators = local_denominators.clone()
+        if dp_size > 1:
+            dist.all_reduce(global_denominators, op=dist.ReduceOp.SUM, group=dp_group)
+        weight_sums = list(global_denominators.detach().unbind())
+
+        if control_group_size > 1:
+            local_denominators = torch.stack(weight_sums)
+            gathered_denominators = torch.empty(
+                control_group_size * len(weight_sums),
+                dtype=local_denominators.dtype,
+                device=local_denominators.device,
+            )
+            dist.all_gather_into_tensor(gathered_denominators, local_denominators, group=control_group)
+            gathered_denominators = gathered_denominators.view(control_group_size, len(weight_sums))
+            if not torch.allclose(
+                gathered_denominators,
+                gathered_denominators[0].expand_as(gathered_denominators),
+                rtol=1e-8,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "every model-parallel rank must plan the same DP-global weight sums; "
+                    f"got {gathered_denominators.tolist()}"
+                )
+
+        total_weight_sum = torch.stack(weight_sums).sum()
+        self._accumulation_state = _AccumulationState(
+            windows=tuple(planned_windows),
+            weight_sums=tuple(weight_sums),
+            total_weight_sum=total_weight_sum,
+            total_microbatches=sum(microbatch_counts),
+            microbatch_size=self.microbatch_size,
+        )
+        self._optim_step_consumed = False
+        self._grads_finalized = False
+        self._finalized_grad_norm = None
+        self._implicit_backward_status = "idle"
 
     @torch.no_grad()
     def forward(
@@ -355,6 +563,8 @@ class Engine:
             record per hidden inner sample, and cannot produce records when PP
             splits it into multiple inner microbatches.
         """
+        if self._accumulation_state is not None:
+            raise RuntimeError("Engine.forward cannot run while a backward accumulation plan is active")
         microbatches = self._group_datums(datums)
         self._validate_execution_parallelism()
         cp_group, cp_size = self._cp_group_and_size()
@@ -445,7 +655,95 @@ class Engine:
         datums: Sequence[Datum],
         loss_fn: LossFn,
     ) -> ForwardBackwardResult:
-        """Accumulate gradients for a complete optimizer window.
+        """Run one backward window, optionally inside a predeclared accumulation plan.
+
+        Without :meth:`begin_accumulation`, this call remains a complete
+        optimizer window. With an active plan, calls must consume its Datum
+        windows in order. Every returned result is call-local even though all
+        gradients use the plan's full-step normalization.
+        """
+        state = self._accumulation_state
+        if state is None:
+            if self.optimizers:
+                if self._implicit_backward_status == "ready":
+                    raise RuntimeError(
+                        "forward_backward already produced the current optimizer window; "
+                        "call optim_step, or declare multiple calls up front with begin_accumulation"
+                    )
+                if self._implicit_backward_status == "broken":
+                    raise RuntimeError("the previous implicit backward window failed and this Engine cannot be reused")
+                if self._implicit_backward_status == "running":
+                    raise RuntimeError("an implicit forward_backward call is already running")
+            if self._grads_finalized:
+                raise RuntimeError(
+                    "gradients were already finalized; retry optim_step before another forward_backward call"
+                )
+            if self.optimizers:
+                self._implicit_backward_status = "running"
+            try:
+                result = self._forward_backward_window(datums, loss_fn)
+            except BaseException:
+                if self.optimizers:
+                    self._implicit_backward_status = "broken"
+                raise
+            self._optim_step_consumed = False
+            self._grads_finalized = False
+            self._finalized_grad_norm = None
+            if self.optimizers:
+                self._implicit_backward_status = "ready"
+            return result
+
+        if state.status == "broken":
+            raise RuntimeError("the active accumulation plan is broken and this Engine cannot be reused")
+        if state.status == "running":
+            raise RuntimeError("an accumulation forward_backward call is already running")
+        if state.status == "ready":
+            raise RuntimeError("the accumulation plan is complete; call optim_step before another backward")
+        if state.next_window >= len(state.windows):
+            raise RuntimeError("the accumulation plan has no remaining backward windows")
+
+        try:
+            self._validate_planned_window(
+                datums,
+                state.windows[state.next_window],
+                microbatch_size=state.microbatch_size,
+            )
+            is_first_window = state.next_window == 0
+            is_final_window = state.next_window == len(state.windows) - 1
+            state.status = "running"
+            result = self._forward_backward_window(
+                datums,
+                loss_fn,
+                result_denominator=state.weight_sums[state.next_window],
+                backward_denominator=state.total_weight_sum,
+                total_microbatches=state.total_microbatches,
+                is_first_window=is_first_window,
+                is_final_window=is_final_window,
+            )
+        except BaseException:
+            state.status = "broken"
+            raise
+
+        state.next_window += 1
+        state.status = "ready" if state.next_window == len(state.windows) else "active"
+        self._optim_step_consumed = False
+        self._grads_finalized = False
+        self._finalized_grad_norm = None
+        self._implicit_backward_status = "idle"
+        return result
+
+    def _forward_backward_window(
+        self,
+        datums: Sequence[Datum],
+        loss_fn: LossFn,
+        *,
+        result_denominator: torch.Tensor | None = None,
+        backward_denominator: torch.Tensor | None = None,
+        total_microbatches: int | None = None,
+        is_first_window: bool = True,
+        is_final_window: bool = True,
+    ) -> ForwardBackwardResult:
+        """Accumulate gradients for one implicit or explicitly planned window.
 
         ``datums`` is a flat optimizer accumulation window. The Engine groups
         it into outer batches of ``microbatch_size`` and invokes ``collate_fn``
@@ -475,10 +773,10 @@ class Engine:
         sample use ordinary flat Datums.
 
         Args:
-            datums: Flat sequence of Datum items in the complete optimizer
-                accumulation window. A Datum's token weights may have shape
-                [tokens] or the custom collater's batched token layout; the
-                loss tensor must use the identical shape.
+            datums: Flat sequence of Datum items in this call's window. A
+                Datum's token weights may have shape [tokens] or the custom
+                collater's batched token layout; the loss tensor must use the
+                identical shape.
             loss_fn: Computes either that per-token loss tensor or a scalar
                 local weighted-sum numerator from the raw model output and
                 collated loss inputs.
@@ -492,35 +790,59 @@ class Engine:
             ``loss_fn_outputs`` contains mappings for this DP replica's outer
             Datums in window order; pipeline execution returns the same
             mappings on every physical stage rank in that replica. Model
-            parameters are unchanged, but their gradients contain the complete
-            window's globally normalized backward result.
+            parameters are unchanged. Without an explicit accumulation plan,
+            gradients contain this call's globally normalized result. With a
+            plan, they accumulate using the complete plan's denominator even
+            though the returned statistics remain call-local.
         """
         microbatches = self._group_datums(datums)
         self._validate_parallelism()
         dp_group, dp_size = self._dp_group_and_size()
         grad_group, grad_group_size = self._gradient_group_and_size(dp_group, dp_size)
         self._validate_window_size_across_group(len(microbatches), grad_group, grad_group_size)
-        denominator = self._global_weight_sum(microbatches, dp_group, dp_size)
+        denominator = (
+            self._global_weight_sum(microbatches, dp_group, dp_size)
+            if result_denominator is None
+            else result_denominator
+        )
+        gradient_denominator = denominator if backward_denominator is None else backward_denominator
+        planned_accumulation = result_denominator is not None
+        plan_control_group, plan_control_group_size = (
+            self._accumulation_control_group_and_size() if planned_accumulation else (None, 1)
+        )
         zero_denominator = bool(denominator == 0)
+        zero_gradient_denominator = bool(gradient_denominator == 0)
         safe_denominator = torch.where(denominator > 0, denominator, torch.ones_like(denominator))
+        safe_gradient_denominator = torch.where(
+            gradient_denominator > 0,
+            gradient_denominator,
+            torch.ones_like(gradient_denominator),
+        )
         self._validate_pipeline_window(len(microbatches), denominator)
 
         pp_enabled = self.pipeline is not None
         for part in self.model_parts:
             part.train()
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=pp_enabled)
+        if is_first_window:
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=pp_enabled)
         inner_microbatches = self.pipeline.num_microbatches if self.pipeline is not None else 1
-        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-            self._cp_size() / (len(microbatches) * inner_microbatches)
+        effective_total_microbatches = (
+            len(microbatches) * inner_microbatches if total_microbatches is None else total_microbatches
         )
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(self._cp_size() / effective_total_microbatches)
 
         local_loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
         loss_fn_outputs: list[dict[str, Any]] = []
         returns_outputs: bool | None = None
         output_error: Exception | None = None
+        backward_scale = (
+            safe_gradient_denominator.new_zeros(())
+            if zero_denominator or zero_gradient_denominator
+            else safe_gradient_denominator.new_tensor(grad_group_size) / safe_gradient_denominator
+        )
 
         for index, datums in enumerate(microbatches):
-            is_last = index == len(microbatches) - 1
+            is_last = is_final_window and index == len(microbatches) - 1
             if is_last:
                 prepare_for_final_backward(self.model_parts, pp_enabled=pp_enabled)
 
@@ -529,11 +851,6 @@ class Engine:
             )
 
             if self.pipeline is not None:
-                backward_scale = (
-                    safe_denominator.new_zeros(())
-                    if zero_denominator
-                    else safe_denominator.new_tensor(grad_group_size) / safe_denominator
-                )
                 batch_returns_outputs, batch_outputs, batch_error = self._pipeline_execute(
                     model_inputs,
                     loss_inputs,
@@ -570,10 +887,27 @@ class Engine:
                 ):
                     forward_inputs = filter_forward_kwargs(self.model, model_inputs)
                     output = self.model(**forward_inputs)
-                    numerator, parsed_outputs, output_parse_error = _parse_loss_result(
-                        loss_fn(output, loss_inputs), loss_inputs["weights"]
-                    )
-                    if output_error is None and dp_size <= 1:
+                    loss_error: Exception | None = None
+                    numerator: torch.Tensor | None = None
+                    parsed_outputs: ParsedLossOutputs = None
+                    output_parse_error: Exception | None = None
+                    try:
+                        numerator, parsed_outputs, output_parse_error = _parse_loss_result(
+                            loss_fn(output, loss_inputs), loss_inputs["weights"]
+                        )
+                    except Exception as error:
+                        loss_error = error
+                    if planned_accumulation:
+                        self._synchronize_accumulation_error(
+                            loss_error,
+                            plan_control_group,
+                            plan_control_group_size,
+                            peer_message="another model-parallel rank failed in the planned loss callback",
+                        )
+                    elif loss_error is not None:
+                        raise loss_error
+                    assert numerator is not None
+                    if output_error is None and dp_size <= 1 and not planned_accumulation:
                         self._validate_loss_fn_outputs_across_cp(
                             parsed_outputs,
                             loss_inputs.get("weights"),
@@ -585,11 +919,11 @@ class Engine:
                         returns_outputs = _update_output_mode(returns_outputs, parsed_outputs)
                     if zero_denominator:
                         numerator = numerator * 0
-                    (numerator * (grad_group_size / safe_denominator)).backward()
+                    (numerator * backward_scale).backward()
 
                 if output_error is None:
                     try:
-                        if dp_size > 1:
+                        if dp_size > 1 or planned_accumulation:
                             self._validate_loss_fn_outputs_across_cp(
                                 parsed_outputs,
                                 loss_inputs.get("weights"),
@@ -613,7 +947,7 @@ class Engine:
                     except Exception as error:
                         output_error = error
                 local_loss_sum.add_(numerator.detach().to(torch.float64))
-            if index == 0:
+            if is_first_window and index == 0:
                 prepare_after_first_microbatch()
 
         # Piggyback the output-error bit on the existing end-of-window loss
@@ -625,10 +959,15 @@ class Engine:
         pp_group, pp_size = self._pp_group_and_size()
         if pp_size > 1:
             dist.all_reduce(step_state, op=dist.ReduceOp.SUM, group=pp_group)
+        if planned_accumulation:
+            if plan_control_group_size > grad_group_size:
+                control_error = step_state[1].clamp(max=1)
+                dist.all_reduce(control_error, op=dist.ReduceOp.MAX, group=plan_control_group)
+                step_state[1].copy_(control_error)
         if bool(step_state[1] > 0):
             if output_error is not None:
                 raise output_error
-            raise RuntimeError("another data-parallel replica failed while restoring loss_fn outputs")
+            raise RuntimeError("another model-parallel rank failed while restoring loss_fn outputs")
 
         loss_sum = step_state[0].detach()
         loss = (loss_sum / safe_denominator).detach()
@@ -654,12 +993,18 @@ class Engine:
         checkpointers use that fence to preserve ``finalize/clip -> wait ->
         step`` overlap.
 
+        Once the first optimizer mutation begins, failures from an optimizer,
+        model post-step hook, or scheduler cannot be rolled back and are
+        process-fatal in distributed execution.
+
         Args:
             before_optimizer_step: Optional callback invoked exactly once after
                 gradient finalization and clipping, but before the first
                 optimizer step. If it raises, parameters, optimizer state,
                 model post-step state, and schedulers remain untouched; the
-                finalized gradients remain available.
+                finalized gradients remain available. Outside an explicit
+                accumulation plan, distributed ranks must invoke this callback
+                consistently; rank-local execution failures are process-fatal.
 
         Returns:
             Gradient norm and post-scheduler learning rates for the completed
@@ -668,47 +1013,145 @@ class Engine:
         Raises:
             RuntimeError: If this Engine was constructed without optimizers.
         """
-        if not self.optimizers:
-            raise RuntimeError("Engine.optim_step requires at least one optimizer")
-        if before_optimizer_step is not None and not callable(before_optimizer_step):
-            raise TypeError("before_optimizer_step must be callable or None")
+        state = self._accumulation_state
+        local_preflight_error: Exception | None = None
+        try:
+            if not self.optimizers:
+                raise RuntimeError("Engine.optim_step requires at least one optimizer")
+            if before_optimizer_step is not None and not callable(before_optimizer_step):
+                raise TypeError("before_optimizer_step must be callable or None")
+            if self._optim_step_in_progress:
+                raise RuntimeError("Engine.optim_step is already running")
+            if state is not None:
+                if state.status == "broken":
+                    raise RuntimeError("the active accumulation plan is broken and cannot be optimized")
+                if state.status != "ready":
+                    raise RuntimeError(
+                        "the active accumulation plan must finish every forward_backward call before optim_step"
+                    )
+            else:
+                if self._implicit_backward_status == "broken":
+                    raise RuntimeError(
+                        "the previous implicit backward window failed and this Engine cannot be optimized"
+                    )
+                if self._implicit_backward_status == "running":
+                    raise RuntimeError("an implicit forward_backward call is still running")
+                if self._optim_step_consumed:
+                    raise RuntimeError("optim_step already consumed the current gradients; run forward_backward first")
+        except Exception as error:
+            local_preflight_error = error
+
+        control_group: dist.ProcessGroup | None = None
+        control_group_size = 1
+        # Explicit plans pay the small control collectives needed to fail
+        # together before mutation. Keep the ordinary one-call path free of
+        # new per-step collectives; its distributed callback contract remains
+        # the same as before planned accumulation was introduced.
+        synchronize_update = state is not None
+        if synchronize_update:
+            control_group, control_group_size = self._accumulation_control_group_and_size()
+        if synchronize_update:
+            self._synchronize_accumulation_error(
+                local_preflight_error,
+                control_group,
+                control_group_size,
+                peer_message="another model-parallel rank rejected optim_step",
+            )
+        elif local_preflight_error is not None:
+            raise local_preflight_error
 
         device_mesh = self.mesh_context.device_mesh if self.mesh_context is not None else None
         moe_mesh = self.mesh_context.moe_mesh if self.mesh_context is not None else None
         dp_group, dp_size = self._dp_group_and_size()
         _, grad_group_size = self._gradient_group_and_size(dp_group, dp_size)
         pp_enabled = self.pipeline is not None
-        grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm=self.max_grad_norm,
-            model_parts=self.model_parts,
-            norm_type=2.0,
-            pp_enabled=pp_enabled,
-            device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
-            ep_axis_name="ep" if moe_mesh is not None and "ep" in (moe_mesh.mesh_dim_names or ()) else None,
-            pp_axis_name="pp" if pp_enabled else None,
-            foreach=True,
-            num_label_tokens=None,
-            dp_group_size=grad_group_size,
-            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, device_mesh),
-        )
+        self._optim_step_in_progress = True
+        mutation_started = False
+        try:
+            if not self._grads_finalized:
+                finalization_error: Exception | None = None
+                try:
+                    self._finalized_grad_norm = scale_grads_and_clip_grad_norm(
+                        max_grad_norm=self.max_grad_norm,
+                        model_parts=self.model_parts,
+                        norm_type=2.0,
+                        pp_enabled=pp_enabled,
+                        device_mesh=device_mesh,
+                        moe_mesh=moe_mesh,
+                        ep_axis_name=(
+                            "ep" if moe_mesh is not None and "ep" in (moe_mesh.mesh_dim_names or ()) else None
+                        ),
+                        pp_axis_name="pp" if pp_enabled else None,
+                        foreach=True,
+                        num_label_tokens=None,
+                        dp_group_size=grad_group_size,
+                        expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, device_mesh),
+                    )
+                    if self._finalized_grad_norm is None:
+                        raise RuntimeError("gradient finalization did not return a gradient norm")
+                except Exception as error:
+                    finalization_error = error
+                if synchronize_update:
+                    self._synchronize_accumulation_error(
+                        finalization_error,
+                        control_group,
+                        control_group_size,
+                        peer_message="another model-parallel rank failed while finalizing gradients",
+                    )
+                elif finalization_error is not None:
+                    raise finalization_error
+                self._grads_finalized = True
+            grad_norm = self._finalized_grad_norm
+            assert grad_norm is not None
 
-        if before_optimizer_step is not None:
-            before_optimizer_step()
+            fence_error: Exception | None = None
+            if before_optimizer_step is not None:
+                try:
+                    before_optimizer_step()
+                except Exception as error:
+                    fence_error = error
+            if synchronize_update:
+                self._synchronize_accumulation_error(
+                    fence_error,
+                    control_group,
+                    control_group_size,
+                    peer_message="another model-parallel rank failed before the optimizer mutation fence",
+                )
+            elif fence_error is not None:
+                raise fence_error
 
-        for optimizer in self.optimizers:
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            mutation_started = True
+            for optimizer in self.optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-        for part in self.model_parts:
-            update_moe_gate_bias = getattr(part, "update_moe_gate_bias", None)
-            if callable(update_moe_gate_bias):
-                update_moe_gate_bias()
+            for part in self.model_parts:
+                update_moe_gate_bias = getattr(part, "update_moe_gate_bias", None)
+                if callable(update_moe_gate_bias):
+                    update_moe_gate_bias()
 
-        for scheduler in self.lr_schedulers:
-            scheduler.step(1)
+            for scheduler in self.lr_schedulers:
+                scheduler.step(1)
 
-        learning_rates = tuple(float(group["lr"]) for optimizer in self.optimizers for group in optimizer.param_groups)
+            learning_rates = tuple(
+                float(group["lr"]) for optimizer in self.optimizers for group in optimizer.param_groups
+            )
+        except Exception:
+            if mutation_started or not self._grads_finalized:
+                self._optim_step_consumed = True
+                if state is not None:
+                    state.status = "broken"
+                else:
+                    self._implicit_backward_status = "broken"
+            raise
+        finally:
+            self._optim_step_in_progress = False
+
+        self._accumulation_state = None
+        self._optim_step_consumed = True
+        self._grads_finalized = False
+        self._finalized_grad_norm = None
+        self._implicit_backward_status = "idle"
         return OptimStepResult(grad_norm=grad_norm, learning_rates=learning_rates)
 
     def _group_datums(self, datums: Sequence[Datum]) -> list[list[Datum]]:
@@ -1644,6 +2087,33 @@ class Engine:
         size = int(dp_cp_mesh.size())
         return (dp_cp_mesh.get_group() if size > 1 else None), size
 
+    def _accumulation_control_group_and_size(self) -> tuple[dist.ProcessGroup | None, int]:
+        """Return the full non-PP model group used to keep plan control flow aligned."""
+        if not dist.is_available() or not dist.is_initialized():
+            return None, 1
+        if self.mesh_context is None:
+            return None, dist.get_world_size()
+        if (group := getattr(self.mesh_context, "process_group", None)) is not None:
+            return group, dist.get_world_size(group=group)
+        if (device_mesh := getattr(self.mesh_context, "device_mesh", None)) is None:
+            return None, dist.get_world_size()
+
+        root_mesh = device_mesh._get_root_mesh() if hasattr(device_mesh, "_get_root_mesh") else device_mesh
+        size = int(root_mesh.size())
+        if size <= 1:
+            return None, 1
+        if root_mesh.ndim == 1:
+            return root_mesh.get_group(), size
+        if size == dist.get_world_size():
+            return None, size
+        for flat_mesh in getattr(root_mesh, "_flatten_mapping", {}).values():
+            if int(flat_mesh.size()) == size:
+                return flat_mesh.get_group(), size
+        raise NotImplementedError(
+            "planned multi-call accumulation on a rank-subset multi-axis DeviceMesh requires "
+            "MeshContext.process_group for the complete model"
+        )
+
     def _pp_group_and_size(self) -> tuple[dist.ProcessGroup | None, int]:
         if self.pipeline is None or not dist.is_available() or not dist.is_initialized():
             return None, 1
@@ -1688,6 +2158,75 @@ class Engine:
         denominator = torch.tensor(local_sum, dtype=torch.float64, device=self.device)
         self._validate_weight_sum_across_cp(denominator)
         return denominator
+
+    def _synchronize_accumulation_error(
+        self,
+        local_error: Exception | None,
+        group: dist.ProcessGroup | None,
+        group_size: int,
+        *,
+        peer_message: str,
+    ) -> None:
+        """Make every gradient rank reject a bad accumulation contract together."""
+        if group_size <= 1:
+            if local_error is not None:
+                raise local_error
+            return
+
+        failed = torch.tensor(int(local_error is not None), dtype=torch.int64, device=self.device)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+        if bool(failed):
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(peer_message)
+
+    def _validate_planned_window(
+        self,
+        datums: Sequence[Datum],
+        planned: tuple[_PlannedDatum, ...],
+        *,
+        microbatch_size: int,
+    ) -> None:
+        """Validate an accumulation-plan slot before any model collective."""
+        local_error: Exception | None = None
+        try:
+            if self.microbatch_size != microbatch_size:
+                raise RuntimeError(
+                    "Engine.microbatch_size changed after begin_accumulation; "
+                    f"planned {microbatch_size}, found {self.microbatch_size}"
+                )
+            if not isinstance(datums, Sequence) or isinstance(datums, (str, bytes)):
+                raise TypeError("planned forward_backward input must be a sequence of Datum")
+            if len(datums) != len(planned):
+                raise ValueError(
+                    f"planned forward_backward window has {len(planned)} Datums, but received {len(datums)}"
+                )
+            for index, (datum, expected) in enumerate(zip(datums, planned)):
+                if datum is not expected.datum:
+                    raise ValueError(
+                        f"planned forward_backward window Datum {index} is not the object declared to begin_accumulation"
+                    )
+                weights = datum.loss_fn_inputs.get("weights")
+                if weights is not expected.weights:
+                    raise ValueError(f"planned Datum {index} replaced its weights Tensor")
+                if (
+                    _tensor_version(weights) != expected.weights_version
+                    or weights.shape != expected.weights_shape
+                    or weights.dtype != expected.weights_dtype
+                    or weights.device != expected.weights_device
+                    or float(weights.to(torch.float64).sum()) != expected.weights_sum
+                ):
+                    raise ValueError(f"planned Datum {index} weights changed after begin_accumulation")
+        except Exception as error:
+            local_error = error
+
+        control_group, control_group_size = self._accumulation_control_group_and_size()
+        self._synchronize_accumulation_error(
+            local_error,
+            control_group,
+            control_group_size,
+            peer_message="another model-parallel rank changed its planned Datum window",
+        )
 
     def _validate_window_size_across_group(
         self,

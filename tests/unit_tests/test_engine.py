@@ -66,6 +66,21 @@ class ScaleModel(nn.Module):
         return input_ids.to(torch.float32) * self.weight
 
 
+class _MainAndAuxScaleModel(nn.Module):
+    """Small model whose main and auto-scaled auxiliary gradients are separable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_weight = nn.Parameter(torch.tensor(1.0))
+        self.aux_weight = nn.Parameter(torch.tensor(1.0))
+        self.forward_calls = 0
+
+    def forward(self, input_ids: torch.Tensor, **_) -> torch.Tensor:
+        self.forward_calls += 1
+        output = input_ids.to(torch.float32) * self.main_weight
+        return MoEAuxLossAutoScaler.apply(output, self.aux_weight)
+
+
 class _SubMesh:
     def __init__(self, size, rank=0):
         self._size = size
@@ -389,6 +404,14 @@ def test_optim_step_callback_failure_preserves_optimizer_and_post_step_state(mon
     torch.testing.assert_close(model.weight, torch.tensor(1.0))
     torch.testing.assert_close(model.weight.grad, torch.tensor(2.0))
 
+    # Retrying the mutation fence must consume the already-finalized gradients;
+    # running finalization/scaling twice would silently change the update.
+    result = engine.optim_step()
+    assert events == ["finalize", "before-step", "step", "zero", "gate", "scheduler"]
+    torch.testing.assert_close(model.weight, torch.tensor(0.8))
+    assert model.weight.grad is None
+    assert result.learning_rates == (0.1,)
+
 
 def test_optim_step_requires_an_optimizer(monkeypatch):
     monkeypatch.setattr(
@@ -495,6 +518,348 @@ def test_forward_backward_uses_one_denominator_for_the_window():
     assert model.weight.grad.item() == pytest.approx(2.0)
     assert torch.equal(model.weight, initial_weight)
     assert model.forward_calls == 2
+
+
+def test_planned_multi_call_matches_one_window_with_unequal_denominators():
+    window_a = [_datum([2, 100], [1.0, 0.0])]
+    window_b = [_datum([4, 8], [0.5, 1.5])]
+
+    reference_model = ScaleModel()
+    reference_optimizer = torch.optim.SGD(reference_model.parameters(), lr=0.1)
+    reference_engine = Engine(
+        reference_model,
+        device="cpu",
+        optimizers=reference_optimizer,
+        max_grad_norm=None,
+    )
+    reference_result = reference_engine.forward_backward(window_a + window_b, _identity_loss)
+    reference_grad = reference_model.weight.grad.detach().clone()
+    reference_step = reference_engine.optim_step()
+
+    planned_model = ScaleModel()
+    planned_optimizer = torch.optim.SGD(planned_model.parameters(), lr=0.1)
+    planned_engine = Engine(
+        planned_model,
+        device="cpu",
+        optimizers=planned_optimizer,
+        max_grad_norm=None,
+    )
+    planned_engine.begin_accumulation([window_a, window_b])
+    result_a = planned_engine.forward_backward(window_a, _identity_loss)
+    result_b = planned_engine.forward_backward(window_b, _identity_loss)
+    planned_grad = planned_model.weight.grad.detach().clone()
+    planned_step = planned_engine.optim_step()
+
+    assert result_a.loss_sum.item() == pytest.approx(2.0)
+    assert result_a.weight_sum.item() == pytest.approx(1.0)
+    assert result_a.loss.item() == pytest.approx(2.0)
+    assert result_b.loss_sum.item() == pytest.approx(14.0)
+    assert result_b.weight_sum.item() == pytest.approx(2.0)
+    assert result_b.loss.item() == pytest.approx(7.0)
+    assert reference_result.loss_sum.item() == pytest.approx(16.0)
+    assert reference_result.weight_sum.item() == pytest.approx(3.0)
+    assert reference_result.loss.item() == pytest.approx(16.0 / 3.0)
+    torch.testing.assert_close(planned_grad, reference_grad)
+    torch.testing.assert_close(planned_step.grad_norm, reference_step.grad_norm)
+    torch.testing.assert_close(planned_model.weight, reference_model.weight)
+
+
+def test_explicit_one_window_accumulation_matches_implicit_call():
+    implicit_window = [_datum([1, 9], [0.25, 0.75])]
+    explicit_window = [_datum([1, 9], [0.25, 0.75])]
+
+    implicit_model = ScaleModel()
+    implicit_optimizer = torch.optim.SGD(implicit_model.parameters(), lr=0.1)
+    implicit_engine = Engine(
+        implicit_model,
+        device="cpu",
+        optimizers=implicit_optimizer,
+        max_grad_norm=None,
+    )
+    implicit_result = implicit_engine.forward_backward(implicit_window, _identity_loss)
+
+    explicit_model = ScaleModel()
+    explicit_optimizer = torch.optim.SGD(explicit_model.parameters(), lr=0.1)
+    explicit_engine = Engine(
+        explicit_model,
+        device="cpu",
+        optimizers=explicit_optimizer,
+        max_grad_norm=None,
+    )
+    explicit_engine.begin_accumulation([explicit_window])
+    explicit_result = explicit_engine.forward_backward(explicit_window, _identity_loss)
+
+    torch.testing.assert_close(explicit_result.loss, implicit_result.loss)
+    torch.testing.assert_close(explicit_result.loss_sum, implicit_result.loss_sum)
+    torch.testing.assert_close(explicit_result.weight_sum, implicit_result.weight_sum)
+    torch.testing.assert_close(explicit_model.weight.grad, implicit_model.weight.grad)
+    explicit_engine.optim_step()
+    implicit_engine.optim_step()
+    torch.testing.assert_close(explicit_model.weight, implicit_model.weight)
+
+
+def test_begin_accumulation_requires_an_optimizer_before_forward():
+    model = ScaleModel()
+    engine = Engine(model, device="cpu")
+
+    with pytest.raises(RuntimeError, match="optimizer"):
+        engine.begin_accumulation([[_datum([1])]])
+
+    assert model.forward_calls == 0
+    assert model.weight.grad is None
+
+
+def test_multiple_backward_calls_with_an_optimizer_require_an_explicit_plan():
+    model = ScaleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=None)
+
+    engine.forward_backward([_datum([2])], _identity_loss)
+    with pytest.raises(RuntimeError, match="begin_accumulation"):
+        engine.forward_backward([_datum([6])], _identity_loss)
+
+    torch.testing.assert_close(model.weight.grad, torch.tensor(2.0))
+    engine.optim_step()
+    torch.testing.assert_close(model.weight, torch.tensor(0.8))
+
+
+def test_failed_implicit_backward_poisoned_gradients_cannot_be_reused():
+    model = ScaleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=None)
+    calls = 0
+
+    def fail_on_second_microbatch(output, _loss_inputs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("second microbatch failed")
+        return output
+
+    with pytest.raises(ValueError, match="second microbatch failed"):
+        engine.forward_backward([_datum([2]), _datum([6])], fail_on_second_microbatch)
+
+    # The first microbatch already produced a partial gradient. It must never
+    # be consumed or silently combined with a later optimizer window.
+    torch.testing.assert_close(model.weight.grad, torch.tensor(1.0))
+    with pytest.raises(RuntimeError, match="failed"):
+        engine.forward_backward([_datum([4])], _identity_loss)
+    with pytest.raises(RuntimeError, match="failed"):
+        engine.optim_step()
+    with pytest.raises(RuntimeError, match="cleared gradients"):
+        engine.begin_accumulation([[_datum([4])]])
+    torch.testing.assert_close(model.weight, torch.tensor(1.0))
+
+
+def test_planned_multi_call_uses_one_lifecycle_and_whole_step_moe_scale(monkeypatch):
+    events = []
+
+    @contextmanager
+    def recording_sync_ctx(_model, is_optim_step, _defer_fsdp_grad_sync):
+        events.append(f"sync-{is_optim_step}")
+        yield
+
+    monkeypatch.setattr(
+        engine_module,
+        "prepare_for_grad_accumulation",
+        lambda *_args, **_kwargs: events.append("prepare"),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "prepare_for_final_backward",
+        lambda *_args, **_kwargs: events.append("final"),
+    )
+    monkeypatch.setattr(engine_module, "prepare_after_first_microbatch", lambda: events.append("after-first"))
+    monkeypatch.setattr(engine_module, "get_sync_ctx", recording_sync_ctx)
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
+
+    model = _MainAndAuxScaleModel()
+    engine = Engine(model, device="cpu", optimizers=torch.optim.SGD(model.parameters(), lr=0.1))
+    # A zero-weight call still counts toward the whole-step MoE microbatch
+    # average even though it contributes no main-loss numerator.
+    window_a = [_datum([100], [0.0])]
+    window_b = [_datum([3]), _datum([5])]
+
+    engine.begin_accumulation([window_a, window_b])
+    result_a = engine.forward_backward(window_a, _identity_loss)
+    result_b = engine.forward_backward(window_b, _identity_loss)
+
+    assert events == [
+        "prepare",
+        "sync-False",
+        "after-first",
+        "sync-False",
+        "final",
+        "sync-True",
+    ]
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0 / 3.0)
+    assert result_a.loss_sum.item() == pytest.approx(0.0)
+    assert result_a.weight_sum.item() == pytest.approx(0.0)
+    assert result_a.loss.item() == pytest.approx(0.0)
+    assert result_b.loss.item() == pytest.approx(4.0)
+    assert model.main_weight.grad.item() == pytest.approx(4.0)
+    assert model.aux_weight.grad.item() == pytest.approx(1.0)
+    assert model.forward_calls == 3
+
+
+def test_planned_accumulation_rejects_unfinished_extra_and_double_steps(monkeypatch):
+    events = []
+
+    class RecordingSGD(torch.optim.SGD):
+        def step(self, closure=None):
+            events.append("step")
+            return super().step(closure)
+
+        def zero_grad(self, set_to_none=True):
+            events.append("zero")
+            return super().zero_grad(set_to_none=set_to_none)
+
+    class RecordingScheduler:
+        def step(self, increment):
+            assert increment == 1
+            events.append("scheduler")
+
+    model = ScaleModel()
+    optimizer = RecordingSGD(model.parameters(), lr=0.1)
+    engine = Engine(
+        model,
+        device="cpu",
+        optimizers=optimizer,
+        lr_schedulers=RecordingScheduler(),
+        max_grad_norm=None,
+    )
+    real_finalize = engine_module.scale_grads_and_clip_grad_norm
+
+    def recording_finalize(**kwargs):
+        events.append("finalize")
+        return real_finalize(**kwargs)
+
+    monkeypatch.setattr(engine_module, "scale_grads_and_clip_grad_norm", recording_finalize)
+    window_a = [_datum([1])]
+    window_b = [_datum([3])]
+    engine.begin_accumulation([window_a, window_b])
+    engine.forward_backward(window_a, _identity_loss)
+
+    with pytest.raises(RuntimeError):
+        engine.optim_step()
+    with pytest.raises(RuntimeError):
+        engine.begin_accumulation([window_a, window_b])
+    assert events == []
+
+    engine.forward_backward(window_b, _identity_loss)
+    with pytest.raises(RuntimeError):
+        engine.forward_backward(window_b, _identity_loss)
+    result = engine.optim_step()
+    assert events == ["finalize", "step", "zero", "scheduler"]
+    assert result.learning_rates == (0.1,)
+
+    with pytest.raises(RuntimeError):
+        engine.optim_step()
+    assert events == ["finalize", "step", "zero", "scheduler"]
+
+    # A new successful implicit window starts a new optimizer step.
+    engine.forward_backward(window_a, _identity_loss)
+    engine.optim_step()
+    assert events == [
+        "finalize",
+        "step",
+        "zero",
+        "scheduler",
+        "finalize",
+        "step",
+        "zero",
+        "scheduler",
+    ]
+
+
+def test_planned_accumulation_failure_breaks_engine_before_optimizer_step():
+    events = []
+
+    class RecordingSGD(torch.optim.SGD):
+        def step(self, closure=None):
+            events.append("step")
+            return super().step(closure)
+
+    model = ScaleModel()
+    optimizer = RecordingSGD(model.parameters(), lr=0.1)
+    engine = Engine(model, device="cpu", optimizers=optimizer)
+    window_a = [_datum([1])]
+    window_b = [_datum([3])]
+    engine.begin_accumulation([window_a, window_b])
+    engine.forward_backward(window_a, _identity_loss)
+
+    def failing_loss(_output, _loss_inputs):
+        raise ValueError("loss callback failed")
+
+    with pytest.raises(ValueError, match="loss callback failed"):
+        engine.forward_backward(window_b, failing_loss)
+
+    with pytest.raises(RuntimeError):
+        engine.optim_step()
+    with pytest.raises(RuntimeError):
+        engine.begin_accumulation([window_a])
+    with pytest.raises(RuntimeError):
+        engine.forward_backward(window_b, _identity_loss)
+    assert events == []
+    torch.testing.assert_close(model.weight, torch.tensor(1.0))
+
+
+@pytest.mark.parametrize("mismatch", ["datum_reference", "weights"])
+def test_planned_accumulation_validates_declared_datums_before_forward(mismatch):
+    model = ScaleModel()
+    engine = Engine(
+        model,
+        device="cpu",
+        microbatch_size=2,
+        optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+    )
+    window = [_datum([1], [1.0]), _datum([2], [1.0])]
+    engine.begin_accumulation([window])
+
+    actual_window = window
+    if mismatch == "datum_reference":
+        actual_window = [_datum([1], [1.0]), window[1]]
+    else:
+        window[0].loss_fn_inputs["weights"].mul_(2.0)
+
+    with pytest.raises((RuntimeError, ValueError)):
+        engine.forward_backward(actual_window, _identity_loss)
+    assert model.forward_calls == 0
+
+
+def test_planned_accumulation_rejects_microbatch_size_changes_before_forward():
+    model = ScaleModel()
+    engine = Engine(
+        model,
+        device="cpu",
+        microbatch_size=2,
+        optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+    )
+    window = [_datum([1]), _datum([2])]
+    engine.begin_accumulation([window])
+    engine.microbatch_size = 1
+
+    with pytest.raises(RuntimeError, match="microbatch_size changed"):
+        engine.forward_backward(window, _identity_loss)
+
+    assert model.forward_calls == 0
+
+
+def test_planned_accumulation_rejects_nonfinal_partial_outer_microbatch():
+    model = ScaleModel()
+    engine = Engine(
+        model,
+        device="cpu",
+        microbatch_size=2,
+        optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+    )
+    window_a = [_datum([1])]
+    window_b = [_datum([2])]
+
+    with pytest.raises(ValueError, match="microbatch|aligned|divisible"):
+        engine.begin_accumulation([window_a, window_b])
+
+    assert model.forward_calls == 0
 
 
 def test_forward_backward_groups_flat_datums_by_microbatch_size():
@@ -1438,6 +1803,26 @@ def test_pipeline_lifecycle_and_moe_scale_cover_outer_and_inner_microbatches(mon
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.25)
 
 
+def test_pipeline_rejects_planned_multi_call_before_forward():
+    model = ScaleModel()
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2)
+    engine = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+    )
+    window_a = [_datum([1, 2])]
+    window_b = [_datum([3, 4])]
+
+    with pytest.raises(NotImplementedError, match="pipeline|PP"):
+        engine.begin_accumulation([window_a, window_b])
+
+    assert pipeline.step_calls == 0
+    assert pipeline.backward_calls == 0
+    assert model.forward_calls == 0
+    assert model.weight.grad is None
+
+
 def test_pipeline_outputs_follow_logical_microbatch_order():
     model = ScaleModel()
     pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
@@ -2247,6 +2632,82 @@ def _context_parallel_worker(rank: int, world_size: int, init_file: str, dp_size
         assert forward_result.loss_sum.item() == pytest.approx(expected_sum)
         assert forward_result.weight_sum.item() == pytest.approx(4.0)
         assert model.module.weight.grad is None
+
+        # Planned accumulation must use the sum of the two DP-only
+        # denominators while letting CP ranks contribute disjoint numerators.
+        # The two calls deliberately have different weight sums, and DP ranks
+        # deliberately own different amounts of supervision when dp_size=2.
+        if dp_size == 1:
+            window_a = [
+                Datum(
+                    model_inputs={"input_ids": torch.tensor([[1, 2, 3, 4]])},
+                    loss_fn_inputs={"weights": torch.tensor([[1.0, 0.0, 0.0, 0.0]])},
+                )
+            ]
+            window_b = [
+                Datum(
+                    model_inputs={"input_ids": torch.tensor([[5, 6, 7, 8]])},
+                    loss_fn_inputs={"weights": torch.tensor([[0.0, 1.0, 1.0, 1.0]])},
+                )
+            ]
+            expected_a_sum, expected_a_weight = 1.0, 1.0
+            expected_b_sum, expected_b_weight = 21.0, 3.0
+        else:
+            dp_rank = get_flat_mesh(mesh_context.device_mesh, "dp").get_local_rank()
+            if dp_rank == 0:
+                window_a = [
+                    Datum(
+                        model_inputs={"input_ids": torch.tensor([[1, 2, 3, 4]])},
+                        loss_fn_inputs={"weights": torch.tensor([[1.0, 0.0, 0.0, 0.0]])},
+                    )
+                ]
+                window_b = [
+                    Datum(
+                        model_inputs={"input_ids": torch.tensor([[5, 6, 7, 8]])},
+                        loss_fn_inputs={"weights": torch.tensor([[0.0, 1.0, 1.0, 1.0]])},
+                    )
+                ]
+            else:
+                window_a = [
+                    Datum(
+                        model_inputs={"input_ids": torch.tensor([[9, 10, 11, 12]])},
+                        loss_fn_inputs={"weights": torch.tensor([[1.0, 1.0, 0.0, 0.0]])},
+                    )
+                ]
+                window_b = [
+                    Datum(
+                        model_inputs={"input_ids": torch.tensor([[13, 14, 15, 16]])},
+                        loss_fn_inputs={"weights": torch.tensor([[0.0, 0.0, 0.0, 1.0]])},
+                    )
+                ]
+            expected_a_sum, expected_a_weight = 20.0, 3.0
+            expected_b_sum, expected_b_weight = 37.0, 4.0
+
+        planned_model = _DDPWithCP(_DistributedCPModel())
+        planned_optimizer = torch.optim.SGD(planned_model.parameters(), lr=0.1)
+        planned_engine = Engine(
+            planned_model,
+            device="cpu",
+            mesh_context=mesh_context,
+            collate_fn=collate_prebatched,
+            optimizers=planned_optimizer,
+            max_grad_norm=None,
+        )
+        planned_engine.begin_accumulation([window_a, window_b])
+        result_a = planned_engine.forward_backward(window_a, _identity_loss)
+        result_b = planned_engine.forward_backward(window_b, _identity_loss)
+
+        assert result_a.loss_sum.item() == pytest.approx(expected_a_sum)
+        assert result_a.weight_sum.item() == pytest.approx(expected_a_weight)
+        assert result_a.loss.item() == pytest.approx(expected_a_sum / expected_a_weight)
+        assert result_b.loss_sum.item() == pytest.approx(expected_b_sum)
+        assert result_b.weight_sum.item() == pytest.approx(expected_b_weight)
+        assert result_b.loss.item() == pytest.approx(expected_b_sum / expected_b_weight)
+        expected_global_mean = (expected_a_sum + expected_b_sum) / (expected_a_weight + expected_b_weight)
+        assert planned_model.module.weight.grad.item() == pytest.approx(expected_global_mean)
+
+        planned_engine.optim_step()
+        assert planned_model.module.weight.item() == pytest.approx(1.0 - 0.1 * expected_global_mean)
     finally:
         dist.destroy_process_group()
 
@@ -2361,13 +2822,225 @@ def _data_parallel_output_error_worker(rank: int, world_size: int, init_file: st
                 per_datum=records,
             )
 
-        expected = "per_datum contains 2 records" if rank == 0 else "another data-parallel replica"
+        expected = "per_datum contains 2 records" if rank == 0 else "another model-parallel rank"
         with pytest.raises((ValueError, RuntimeError), match=expected):
             Engine(model, device="cpu").forward_backward(
                 [_datum([1, 2])],
                 loss_with_rank_local_output_error,
             )
         assert model.module.weight.grad is not None
+    finally:
+        dist.destroy_process_group()
+
+
+def _planned_accumulation_validation_consensus_worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        model = nn.parallel.DistributedDataParallel(ScaleModel())
+        engine = Engine(
+            model,
+            device="cpu",
+            optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+        )
+        window = [_datum([rank + 1])]
+        planned_windows = [window] if rank == 0 else [window, [_datum([rank + 2])]]
+
+        with pytest.raises((RuntimeError, ValueError)):
+            engine.begin_accumulation(planned_windows)
+        assert model.module.forward_calls == 0
+        dist.barrier()
+
+        model = nn.parallel.DistributedDataParallel(ScaleModel())
+        engine = Engine(
+            model,
+            device="cpu",
+            optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+        )
+        window = [_datum([rank + 1])]
+        engine.begin_accumulation([window])
+        if rank == 0:
+            window[0].loss_fn_inputs["weights"].mul_(2.0)
+
+        # Rank 1 must observe rank 0's local plan-validation failure instead of
+        # entering DDP forward and hanging on a different collective.
+        with pytest.raises((RuntimeError, ValueError)):
+            engine.forward_backward(window, _identity_loss)
+        assert model.module.forward_calls == 0
+    finally:
+        dist.destroy_process_group()
+
+
+def _model_parallel_planned_output_error_worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        mesh_context = MeshContext.build(
+            MegatronFSDPConfig(),
+            ParallelismSizes(dp_size=1, tp_size=world_size),
+            world_size=world_size,
+        )
+        model = ScaleModel()
+        engine = Engine(
+            model,
+            device="cpu",
+            mesh_context=mesh_context,
+            optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+        )
+        window = [_datum([1, 2])]
+        engine.begin_accumulation([window])
+
+        def loss_with_rank_local_output_error(output, _loss_inputs):
+            return output, ([{}, {}] if rank == 0 else [{}])
+
+        expected = "one mapping per Datum" if rank == 0 else "another model-parallel rank"
+        with pytest.raises((ValueError, RuntimeError), match=expected):
+            engine.forward_backward(window, loss_with_rank_local_output_error)
+
+        # Both model-parallel ranks complete backward, then enter the same
+        # terminal state even though only rank 0 owns the bad output contract.
+        assert model.weight.grad is not None
+        assert engine._accumulation_state is not None
+        assert engine._accumulation_state.status == "broken"
+        with pytest.raises(RuntimeError, match="broken"):
+            engine.optim_step()
+
+        model = ScaleModel()
+        engine = Engine(
+            model,
+            device="cpu",
+            mesh_context=mesh_context,
+            optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+        )
+        window = [_datum([1, 2])]
+        engine.begin_accumulation([window])
+
+        def rank_local_loss_failure(output, _loss_inputs):
+            if rank == 0:
+                raise ValueError("rank-local loss failure")
+            return output
+
+        expected = "rank-local loss failure" if rank == 0 else "another model-parallel rank"
+        with pytest.raises((ValueError, RuntimeError), match=expected):
+            engine.forward_backward(window, rank_local_loss_failure)
+
+        # Loss/shape errors are agreed before backward, so no peer enters a
+        # TP/EP/DP backward collective while another exits locally.
+        assert model.weight.grad is None
+        assert engine._accumulation_state is not None
+        assert engine._accumulation_state.status == "broken"
+    finally:
+        dist.destroy_process_group()
+
+
+def _model_parallel_optimizer_fence_worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    real_finalize = engine_module.scale_grads_and_clip_grad_norm
+    try:
+        mesh_context = MeshContext.build(
+            MegatronFSDPConfig(),
+            ParallelismSizes(dp_size=1, tp_size=world_size),
+            world_size=world_size,
+        )
+        steps = []
+
+        class RecordingSGD(torch.optim.SGD):
+            def step(self, closure=None):
+                steps.append("step")
+                return super().step(closure)
+
+        model = ScaleModel()
+        engine = Engine(
+            model,
+            device="cpu",
+            mesh_context=mesh_context,
+            optimizers=RecordingSGD(model.parameters(), lr=0.1),
+            max_grad_norm=None,
+        )
+        window = [_datum([1, 2])]
+        engine.begin_accumulation([window])
+        engine.forward_backward(window, _identity_loss)
+
+        finalize_calls = []
+
+        def recording_finalize(**_kwargs):
+            finalize_calls.append("finalize")
+            return torch.tensor(1.5)
+
+        engine_module.scale_grads_and_clip_grad_norm = recording_finalize
+
+        def rank_local_fence():
+            if rank == 0:
+                raise ValueError("rank-local fence failure")
+
+        expected = "rank-local fence failure" if rank == 0 else "another model-parallel rank"
+        with pytest.raises((ValueError, RuntimeError), match=expected):
+            engine.optim_step(before_optimizer_step=rank_local_fence)
+
+        assert finalize_calls == ["finalize"]
+        assert steps == []
+        torch.testing.assert_close(model.weight, torch.tensor(1.0))
+        assert model.weight.grad is not None
+
+        result = engine.optim_step()
+        assert finalize_calls == ["finalize"]
+        assert steps == ["step"]
+        torch.testing.assert_close(result.grad_norm, torch.tensor(1.5))
+        torch.testing.assert_close(model.weight, torch.tensor(0.85))
+    finally:
+        engine_module.scale_grads_and_clip_grad_norm = real_finalize
+        dist.destroy_process_group()
+
+
+def _planned_cp_preflight_consensus_worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        mesh_context = MeshContext.build(
+            MegatronFSDPConfig(),
+            ParallelismSizes(dp_size=2, cp_size=2),
+            world_size=world_size,
+        )
+        model = ScaleModel()
+        engine = Engine(
+            model,
+            device="cpu",
+            mesh_context=mesh_context,
+            optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+        )
+        # Only one CP subgroup disagrees. The full-control error reduction must
+        # stop all four ranks before any rank enters the later DP all-reduce.
+        weight = 2.0 if rank == 0 else 1.0
+        window = [_datum([rank + 1], [weight])]
+
+        with pytest.raises((ValueError, RuntimeError), match="context-parallel"):
+            engine.begin_accumulation([window])
+
+        assert engine._accumulation_state is None
+        assert model.forward_calls == 0
+        assert model.weight.grad is None
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
@@ -2422,5 +3095,41 @@ def test_data_parallel_output_errors_propagate_after_backward_without_hanging(tm
         _data_parallel_output_error_worker,
         args=(2, str(tmp_path / "engine_dp_output_error_init")),
         nprocs=2,
+        join=True,
+    )
+
+
+def test_planned_accumulation_validation_errors_reach_every_data_rank(tmp_path):
+    mp.spawn(
+        _planned_accumulation_validation_consensus_worker,
+        args=(2, str(tmp_path / "engine_planned_validation_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_planned_output_error_breaks_every_model_parallel_rank_after_backward(tmp_path):
+    mp.spawn(
+        _model_parallel_planned_output_error_worker,
+        args=(2, str(tmp_path / "engine_model_parallel_output_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_optimizer_fence_failure_reaches_every_model_parallel_rank_and_can_retry(tmp_path):
+    mp.spawn(
+        _model_parallel_optimizer_fence_worker,
+        args=(2, str(tmp_path / "engine_model_parallel_fence_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_planned_cp_preflight_failure_reaches_all_dp_cp_ranks(tmp_path):
+    mp.spawn(
+        _planned_cp_preflight_consensus_worker,
+        args=(4, str(tmp_path / "engine_planned_cp_preflight_init")),
+        nprocs=4,
         join=True,
     )
