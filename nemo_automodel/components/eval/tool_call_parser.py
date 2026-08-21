@@ -34,7 +34,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class ParsedToolCall:
         raw: the source substring this was parsed from.
     """
 
-    name: Optional[str]
+    name: str | None
     arguments: Dict[str, Any]
     arguments_valid_json: bool
     raw: str
@@ -74,7 +74,7 @@ _LLAMA_ANCHOR_RE = re.compile(r"<\|python_tag\|>\s*")
 _MISTRAL_ANCHOR_RE = re.compile(r"\[TOOL_CALLS\]\s*")
 
 
-def _extract_balanced(text: str, start: int, opener: str, closer: str) -> Optional[str]:
+def _extract_balanced(text: str, start: int, opener: str, closer: str) -> str | None:
     """Return the substring from ``text[start]`` (which must be ``opener``)
     through its matching ``closer``, skipping over chars inside JSON strings.
 
@@ -127,7 +127,7 @@ def _coerce_args(args_value: Any) -> Tuple[Dict[str, Any], bool]:
     return {}, False
 
 
-def _from_call_object(obj: Dict[str, Any], raw: str) -> Optional[ParsedToolCall]:
+def _from_call_object(obj: Dict[str, Any], raw: str) -> ParsedToolCall | None:
     """Build a :class:`ParsedToolCall` from a ``{"name": ..., "arguments": ...}`` dict.
 
     Llama 3.1 emits ``parameters`` instead of ``arguments``; both are accepted.
@@ -314,7 +314,7 @@ def _coerce_gt_args(args_value: Any) -> Dict[str, Any]:
     return {}
 
 
-def _score_one_pair(pred: Optional[ParsedToolCall], gt: Dict[str, Any]) -> Dict[str, float]:
+def _score_one_pair(pred: ParsedToolCall | None, gt: Dict[str, Any]) -> Dict[str, float]:
     """Score a single (pred, gt) tool-call pair. ``pred`` may be ``None``."""
     metrics = {
         "has_call": 0.0,

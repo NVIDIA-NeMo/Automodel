@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from contextlib import nullcontext
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
@@ -90,7 +90,7 @@ def _validate_precision_configuration(
     dtype: torch.dtype,
     compute_dtype: torch.dtype,
     *,
-    ddp_cfg: Optional[Dict[str, Any]],
+    ddp_cfg: Dict[str, Any] | None,
     peft_cfg: Any,
 ) -> None:
     """Reject split storage/compute dtypes on paths without FSDP param casting."""
@@ -156,11 +156,11 @@ def _calculate_throughput_metrics(
 
 def _build_diffusion_parallel_manager_args(
     *,
-    fsdp_cfg: Optional[Dict[str, Any]],
-    ddp_cfg: Optional[Dict[str, Any]],
+    fsdp_cfg: Dict[str, Any] | None,
+    ddp_cfg: Dict[str, Any] | None,
     world_size: int,
     dtype: torch.dtype,
-    compute_dtype: Optional[torch.dtype] = None,
+    compute_dtype: torch.dtype | None = None,
     lora_enabled: bool,
 ) -> Dict[str, Any]:
     """Build diffusion transformer manager args through the shared distributed parser."""
@@ -301,19 +301,19 @@ def build_diffusion_pipeline(
     finetune_mode: bool,
     device: torch.device,
     dtype: torch.dtype,
-    compute_dtype: Optional[torch.dtype] = None,
+    compute_dtype: torch.dtype | None = None,
     cpu_offload: bool = False,
-    fsdp_cfg: Optional[Dict[str, Any]] = None,
-    ddp_cfg: Optional[Dict[str, Any]] = None,
-    attention_backend: Optional[str] = None,
+    fsdp_cfg: Dict[str, Any] | None = None,
+    ddp_cfg: Dict[str, Any] | None = None,
+    attention_backend: str | None = None,
     transformer_engine_linear: bool = False,
     transformer_engine_fp8_safe_only: bool = False,
     fuse_qkv_projections: bool = False,
     compact_fused_qkv_projections: bool = False,
-    pipeline_spec: Optional[Dict[str, Any]] = None,
+    pipeline_spec: Dict[str, Any] | None = None,
     peft_cfg=None,
     model_type=None,
-    active_transformer: Optional[str] = None,
+    active_transformer: str | None = None,
 ) -> tuple[NeMoAutoDiffusionPipeline, Any]:
     """Build the sharded diffusion pipeline (model + parallel scheme).
 

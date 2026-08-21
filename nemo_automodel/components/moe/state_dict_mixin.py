@@ -264,7 +264,7 @@ class MoESplitExpertsStateDictMixin:
 
     def _concatenate_expert_weights(
         self, expert_weights_by_layer: dict[str, Any], n_experts: int
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Concatenate the weights of separate experts into GroupedExpert weights.
 
         Args:

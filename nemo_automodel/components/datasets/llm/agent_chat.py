@@ -73,7 +73,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Union
 
 from datasets import load_dataset
 
@@ -114,7 +114,7 @@ def _json_load_if_str(value: Any) -> Any:
     return value
 
 
-def _reasoning_content(turn: Dict[str, Any]) -> Optional[str]:
+def _reasoning_content(turn: Dict[str, Any]) -> str | None:
     """Return a turn's reasoning/thinking trace as a string, or ``None`` if absent.
 
     Shared by every conversion path so the ``reasoning_content`` field is read
@@ -165,7 +165,7 @@ def _trim_after_last_assistant(messages: List[Dict[str, Any]]) -> List[Dict[str,
 
 def _convert_messages(
     messages: List[Dict[str, Any]],
-    example_id: Optional[Union[int, str]] = None,
+    example_id: Union[int, str] | None = None,
     drop_history_reasoning_content: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert chatml-style agent messages to OpenAI chat-completions format.
@@ -317,7 +317,7 @@ def _convert_messages(
 def _chat_fits_sequence_length(
     tokenizer,
     messages: List[Dict[str, Any]],
-    tools: Optional[List[Dict[str, Any]]],
+    tools: List[Dict[str, Any]] | None,
     seq_length: int,
 ) -> bool:
     """Check a rendered length without materializing tokens beyond the budget."""
@@ -336,7 +336,7 @@ def _chat_fits_sequence_length(
 def _truncate_messages_to_fit(
     tokenizer,
     messages: List[Dict[str, Any]],
-    tools: Optional[List[Dict[str, Any]]],
+    tools: List[Dict[str, Any]] | None,
     seq_length: int,
 ) -> List[Dict[str, Any]]:
     """Drop the oldest conversation exchanges until the dialogue fits ``seq_length``.
@@ -393,7 +393,7 @@ def _format_example(
     tokenizer,
     eos_token_id: int,
     pad_token_id: int,
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
@@ -434,7 +434,7 @@ def _format_example_impl(
     tokenizer,
     eos_token_id: int,
     pad_token_id: int,
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
@@ -598,12 +598,12 @@ def _extract_eval_samples_from_example(
 
 def make_agent_chat_eval_samples(
     *,
-    dataset_name: Optional[str] = None,
-    path: Optional[Union[str, List[str]]] = None,
+    dataset_name: str | None = None,
+    path: Union[str, List[str]] | None = None,
     split: str = "train",
-    revision: Optional[str] = None,
-    limit_dataset_samples: Optional[int] = None,
-    max_eval_samples: Optional[int] = None,
+    revision: str | None = None,
+    limit_dataset_samples: int | None = None,
+    max_eval_samples: int | None = None,
 ) -> List[Dict[str, Any]]:
     """Build a flat list of tool-call eval samples from an agent SFT dataset.
 
@@ -661,16 +661,16 @@ def make_agent_chat_eval_samples(
 def make_agent_chat_dataset(
     tokenizer,
     *,
-    dataset_name: Optional[str] = None,
-    path: Optional[Union[str, List[str]]] = None,
+    dataset_name: str | None = None,
+    path: Union[str, List[str]] | None = None,
     split: str = "train",
-    revision: Optional[str] = None,
+    revision: str | None = None,
     filter_no_assistant: bool = False,
     filter_overlong: bool = False,
     trim_incomplete_last_turn: bool = False,
-    chat_template: Optional[str] = None,
-    seq_length: Optional[int] = None,
-    limit_dataset_samples: Optional[int] = None,
+    chat_template: str | None = None,
+    seq_length: int | None = None,
+    limit_dataset_samples: int | None = None,
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
