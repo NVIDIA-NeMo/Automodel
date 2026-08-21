@@ -125,8 +125,8 @@ fixture_keys:
     - hf_reload_timeout_seconds
     - hf_source_post_load_dequantize
     # Full-logit parity defaults to 2048 tokens from the repository's fixed
-    # long-form document. Named profiles gate mean and p95 KL; all metrics are
-    # emitted for calibration.
+    # long-form document. Named profiles gate mean and p95 KL; KL, JSD, cosine,
+    # and absolute-difference metrics are emitted for calibration.
     - parity_sequence_length
     - parity_tolerance_profile
     # Optional source_load, automodel_reload, hf_reload, or cross_tp profile
