@@ -38,6 +38,11 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: hf-internal-testing/tiny-random-LlamaForCausalLM
   torch_dtype: float32
+  # This smoke runs in fp32 with no mp_policy, so compute stays fp32 too. The
+  # default backend is flash_attention_2 whenever flash-attn is installed (as in
+  # the CI container), and FA2 accepts only fp16/bf16 -- pin the dtype-agnostic
+  # sdpa backend so the run does not depend on whether flash-attn is present.
+  attn_implementation: sdpa
 
 checkpoint:
   enabled: false
