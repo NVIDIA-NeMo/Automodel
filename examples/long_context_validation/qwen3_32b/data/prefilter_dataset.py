@@ -75,7 +75,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logging.basicConfig(
     level=logging.INFO,
@@ -181,7 +181,7 @@ def clean_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def parse_and_clean(messages_str: str, tools_str: Optional[str]) -> tuple[List[Dict[str, Any]], Optional[List[Dict]]]:
+def parse_and_clean(messages_str: str, tools_str: str | None) -> tuple[List[Dict[str, Any]], List[Dict] | None]:
     """Parse the JSON-string ``messages``/``tools`` columns and clean messages.
 
     Args:
@@ -206,7 +206,7 @@ def parse_and_clean(messages_str: str, tools_str: Optional[str]) -> tuple[List[D
 # ---------------------------------------------------------------------------
 
 
-def _auto_num_proc(dataset_len: int, requested: Optional[int] = None) -> int:
+def _auto_num_proc(dataset_len: int, requested: int | None = None) -> int:
     """Pick a worker count: explicit value, else ~80% of CPUs, clamped sanely."""
     if requested is not None:
         return max(1, requested)
@@ -229,7 +229,7 @@ def load_raw_dataset(dataset_id: str, name: str, split: str, max_samples: int):
     return load_dataset(dataset_id, data_files=data_files, split=split_arg)
 
 
-def add_token_lengths(dataset, tokenizer, num_proc: Optional[int] = None):
+def add_token_lengths(dataset, tokenizer, num_proc: int | None = None):
     """Add an exact ``n_tokens`` column (tools-aware, untruncated) and a ``valid`` flag.
 
     Keeps ``messages``/``tools`` as their original string columns to avoid Arrow
@@ -307,14 +307,14 @@ def print_coverage_curve(lengths: List[int], candidate_seq_lens: List[int]) -> N
 # ---------------------------------------------------------------------------
 
 
-def _cache_root(cache_dir: Optional[str]) -> str:
+def _cache_root(cache_dir: str | None) -> str:
     if cache_dir:
         return cache_dir
     hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
     return os.path.join(hf_home, "coderforge_cached")
 
 
-def analyzed_cache_path(cache_dir: Optional[str], dataset_id: str, split: str, model: str, chat_template) -> str:
+def analyzed_cache_path(cache_dir: str | None, dataset_id: str, split: str, model: str, chat_template) -> str:
     """Deterministic path for the analyzed (parsed + clean + n_tokens) JSONL cache."""
     ds_name = dataset_id.replace("/", "_")
     model_short = model.rstrip("/").split("/")[-1]
@@ -323,14 +323,14 @@ def analyzed_cache_path(cache_dir: Optional[str], dataset_id: str, split: str, m
     return os.path.join(_cache_root(cache_dir), "analyzed", fname)
 
 
-def filtered_cache_path(cache_dir: Optional[str], dataset_id: str, split: str, seq_length: int) -> str:
+def filtered_cache_path(cache_dir: str | None, dataset_id: str, split: str, seq_length: int) -> str:
     """Deterministic directory for a training-ready, length-filtered JSONL."""
     ds_name = dataset_id.replace("/", "_")
     dirname = f"{ds_name}_{split}_seq{seq_length}"
     return os.path.join(_cache_root(cache_dir), dirname)
 
 
-def write_analyzed_jsonl(dataset, path: str, reward_threshold: Optional[float]) -> List[int]:
+def write_analyzed_jsonl(dataset, path: str, reward_threshold: float | None) -> List[int]:
     """Write the analyzed JSONL (clean messages/tools + n_tokens) and return kept lengths."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     lengths: List[int] = []
