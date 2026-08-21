@@ -45,7 +45,9 @@ def _tiny_config() -> Qwen4ExpConfig:
         indexer_budget=8,
         indexer_n_heads=2,
         indexer_kv_heads=1,
-        indexer_head_dim=4,
+        # The main rotary width is 8 here, so the index head must be at least
+        # that wide just like the released 64-rope/128-index configuration.
+        indexer_head_dim=8,
         max_position_embeddings=16,
         rope_parameters={
             "rope_theta": 10000.0,
@@ -147,7 +149,7 @@ def test_tiny_qwen4_exp_forward_backward_and_state_layout() -> None:
     assert "model.language_model.hyper_connection_mixer.block_inject_weight.weight" not in keys
 
 
-def test_qsa_dense_training_fails_closed_above_budget() -> None:
+def test_qsa_sparse_training_runs_above_budget() -> None:
     config = _tiny_config()
     config.text_config.indexer_budget = 4
     backend = BackendConfig(
@@ -162,14 +164,18 @@ def test_qsa_dense_training_fails_closed_above_budget() -> None:
         moe_config=_tiny_moe_config(config.text_config),
         backend=backend,
     )
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
 
-    input_ids = torch.randint(2, config.text_config.vocab_size, (1, 5))
-    try:
-        model(input_ids=input_ids)
-    except NotImplementedError as error:
-        assert "indexer budget" in str(error)
-    else:
-        raise AssertionError("Expected QSA sequences above the dense-equivalence budget to fail closed")
+    input_ids = torch.randint(2, config.text_config.vocab_size, (1, 9))
+    output = model(input_ids=input_ids)
+    output.logits.square().mean().backward()
+
+    assert output.logits.shape == (1, 9, config.text_config.vocab_size)
+    assert torch.isfinite(output.logits).all()
+    attention = model.model.language_model.layers["0"].self_attn
+    assert attention.q_proj.weight.grad is not None
+    assert all(not parameter.requires_grad for parameter in attention.indexer.parameters())
+    assert all(parameter.grad is None for parameter in attention.indexer.parameters())
 
 
 def test_released_ple_table_requires_distributed_owner_group() -> None:

@@ -285,3 +285,10 @@ def test_nested_split_count_wins_over_stale_top_level_copy() -> None:
 def test_invalid_hyperconnection_count_is_rejected() -> None:
     with pytest.raises(ValueError, match="hc_count > 1"):
         Qwen4ExpTextConfig(hc_count=1)
+
+
+def test_qsa_attention_has_no_public_query_chunk_or_rematerialization_config() -> None:
+    serialized = Qwen4ExpTextConfig().to_dict()
+
+    assert "qsa_attention_query_chunk_size" not in serialized
+    assert "qsa_attention_activation_recompute" not in serialized

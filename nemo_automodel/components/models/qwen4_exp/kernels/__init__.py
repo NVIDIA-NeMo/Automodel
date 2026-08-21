@@ -1,0 +1,20 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Optional fused kernels for Qwen4-Exp.
+
+The sparse-GQA TileLang kernels are Apache-2.0 adaptations of the Miles
+DeepSeek-V4 kernels vendored elsewhere in AutoModel. Per-file headers preserve
+the upstream project, revision, source path, and copyright provenance.
+"""

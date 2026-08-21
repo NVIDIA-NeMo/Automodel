@@ -21,7 +21,7 @@ uses a different Sinkhorn-based HyperConnection parameterization.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -29,8 +29,10 @@ from torch import nn
 
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
-from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
+from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
+from nemo_automodel.components.models.qwen4_exp.qsa import Qwen4ExpQSAIndexer, qsa_gqa_attention
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -309,66 +311,27 @@ class Qwen4ExpHyperConnection(nn.Module):
             nn.init.trunc_normal_(self.block_inject_weight.weight, mean=0.0, std=init_std)
 
 
-class Qwen4ExpQSAIndexerParameters(nn.Module):
-    """Own the QSA indexer weights used by long-context full-attention layers.
+class Qwen4ExpQSAAttention(Qwen3NextAttention):
+    """Qwen4-Exp gated attention with compressed-block QSA routing.
 
-    QSA only chooses which keys a sparse attention kernel evaluates; it does
-    not alter attention values. For the target short-sequence SFT, every causal
-    key falls within ``indexer_budget`` and dense attention is exactly
-    equivalent. This module therefore owns and loads the checkpoint parameters
-    while :class:`Qwen4ExpDenseAttention` executes the equivalent dense path.
-
-    Args:
-        config: Qwen4-Exp text configuration.
-        backend: Linear backend configuration.
-
-    Tensor layout:
-        ``index_qk_proj`` maps ``[..., hidden_size]`` to
-        ``[..., (indexer_n_heads + indexer_kv_heads) * indexer_head_dim]``.
-    """
-
-    def __init__(self, config: object, backend: BackendConfig) -> None:
-        super().__init__()
-        hidden_size = int(getattr(config, "hidden_size"))
-        n_query_heads = int(getattr(config, "indexer_n_heads"))
-        n_key_heads = int(getattr(config, "indexer_kv_heads"))
-        head_dim = int(getattr(config, "indexer_head_dim"))
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.index_qk_proj = initialize_linear_module(
-            backend.linear,
-            hidden_size,
-            (n_query_heads + n_key_heads) * head_dim,
-            bias=False,
-            dtype=dtype,
-        )
-        self.q_layernorm = Qwen3NextRMSNorm(head_dim, eps=float(getattr(config, "rms_norm_eps")))
-        self.k_layernorm = Qwen3NextRMSNorm(head_dim, eps=float(getattr(config, "rms_norm_eps")))
-
-    @torch.no_grad()
-    def init_weights(self, init_std: float = 0.02) -> None:
-        """Initialize QSA indexer parameters for training from scratch.
-
-        Args:
-            init_std: Standard deviation for the fused query/key projection.
-        """
-        nn.init.trunc_normal_(self.index_qk_proj.weight, mean=0.0, std=init_std)
-        self.q_layernorm.reset_parameters()
-        self.k_layernorm.reset_parameters()
-
-
-class Qwen4ExpDenseAttention(Qwen3NextAttention):
-    """Qwen4-Exp gated attention with checkpoint-compatible QSA parameters.
-
-    The attention projection and output-gate equations are inherited from
-    Qwen3-Next/Qwen3.5. ``indexer`` is retained for state-dict compatibility;
-    the forward path evaluates dense causal attention, which is the exact QSA
-    result while the sequence length does not exceed the indexer token budget.
+    The main query/key/value, output gate, and output projection retain the
+    Qwen3-Next equations.  A separate frozen indexer returns logical token IDs,
+    then the model-owned QSA dispatcher evaluates only those IDs. CUDA BF16
+    training uses fused TileLang sparse GQA; CPU and explicit reference
+    backends use the PyTorch oracle. Main Q/K/V remain differentiable.
     """
 
     def __init__(self, config: object, layer_idx: int, backend: BackendConfig) -> None:
-        super().__init__(config, layer_idx, backend)
-        self.indexer_budget = int(getattr(config, "indexer_budget"))
-        self.indexer = Qwen4ExpQSAIndexerParameters(config, backend)
+        # QSA owns its sparse-attention dispatch. The inherited constructor is
+        # reused only for projections/norms, but its generic attention factory
+        # does not implement ``tilelang``. Give that factory an isolated SDPA
+        # copy, then discard the unused callable and retain the real backend.
+        parent_backend = replace(backend, attn="sdpa")
+        super().__init__(config, layer_idx, parent_backend)
+        self.backend = backend
+        self.attn_module = None
+        self.attn_func = None
+        self.indexer = Qwen4ExpQSAIndexer(config, backend)
 
     def forward(
         self,
@@ -378,32 +341,69 @@ class Qwen4ExpDenseAttention(Qwen3NextAttention):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: object,
     ) -> torch.Tensor:
-        """Evaluate exact short-sequence QSA as dense causal attention.
+        """Select compressed blocks and run model-owned sparse GQA.
 
         Args:
             x: Block input of shape ``[batch, sequence, hidden_size]``.
-            freqs_cis: Rotary values of shape
-                ``[axes, batch, sequence, rotary_dim]`` whose final axis stores
-                concatenated cosine and sine values.
+            freqs_cis: Rotary values ``[batch, sequence, rotary_dim]`` whose
+                final axis stores concatenated cosine and sine values.
             attention_mask: Optional token mask of shape ``[batch, sequence]``
                 or backend-specific causal attention mask.
-            **attn_kwargs: Backend attention metadata.
+            **attn_kwargs: Backend attention metadata. Packed and context-
+                parallel layouts are rejected by this stage-1 path.
 
         Returns:
             Attention output with the same shape as ``x``.
         """
-        sequence_length = x.shape[-2] if x.ndim >= 3 else x.shape[0]
-        if sequence_length > self.indexer_budget:
+        if x.ndim != 3:
             raise NotImplementedError(
-                "Qwen4-Exp QSA training above the configured indexer budget is not yet supported; "
-                f"got sequence_length={sequence_length}, indexer_budget={self.indexer_budget}"
+                f"Qwen4-Exp QSA currently requires non-packed [batch, sequence, hidden] inputs; got {tuple(x.shape)}"
             )
-        return super().forward(
+        if x.shape[1] == 0:
+            raise ValueError("Qwen4-Exp QSA requires a non-empty sequence")
+        if attn_kwargs.get("cu_seqlens") is not None:
+            raise NotImplementedError("Qwen4-Exp QSA packed THD attention is not yet supported")
+        if int(attn_kwargs.get("cp_size", 1)) != 1:
+            raise NotImplementedError("Qwen4-Exp QSA context parallelism is not yet supported")
+
+        selected_token_ids = self.indexer(
             x,
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
-            **attn_kwargs,
         )
+
+        batch_size, sequence_length, _ = x.shape
+        # Keep the indexer's fixed-width output hookable for parity while
+        # avoiding 2,051 padded gathers on short sequences.  Valid IDs are
+        # contiguous and a causal row can never contain more than S tokens.
+        attention_width = min(sequence_length, selected_token_ids.shape[-1])
+        selected_token_ids = selected_token_ids[..., :attention_width]
+        query = self.q_proj(x).view(batch_size, sequence_length, -1, self.head_dim * 2)
+        key = self.k_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
+        value = self.v_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
+        query, gate = torch.chunk(query, 2, dim=-1)
+        gate = gate.reshape(*x.shape[:-1], -1)
+        query = self.q_norm(query)
+        key = self.k_norm(key)
+        query, key = apply_rotary_emb_qk(
+            query,
+            key,
+            freqs_cis,
+            format="bshd",
+            rope_fusion=False,
+        )
+
+        attn_output = qsa_gqa_attention(
+            query,
+            key,
+            value,
+            selected_token_ids,
+            backend=self.backend.attn,
+            softmax_scale=self.scaling,
+        )
+        attn_output = attn_output.reshape(*x.shape[:-1], -1).contiguous()
+        attn_output = attn_output * torch.sigmoid(gate)
+        return self.o_proj(attn_output)
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
@@ -462,7 +462,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen4ExpGatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
-            self.self_attn = Qwen4ExpDenseAttention(config, layer_idx, backend)
+            self.self_attn = Qwen4ExpQSAAttention(config, layer_idx, backend)
         else:
             raise ValueError(f"Unsupported Qwen4-Exp layer type {self.layer_type!r}")
 
@@ -518,9 +518,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 ``[batch, sequence, hc_count * hidden]``.
             input_ids: Raw tokenizer IDs of shape ``[batch, sequence]`` used by
                 the PLE hash path.
-            freqs_cis: Rotary values of shape
-                ``[axes, batch, sequence, rotary_dim]`` whose final axis stores
-                concatenated cosine and sine values.
+            freqs_cis: Composed rotary values ``[batch, sequence, rotary_dim]``
+                whose final axis stores concatenated cosine and sine values.
             attention_mask: Optional token mask of shape ``[batch, sequence]``
                 or backend-specific causal attention mask.
             padding_mask: Optional ``[batch, sequence]`` mask where ``True``

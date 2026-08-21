@@ -14,11 +14,11 @@
 
 """Trainable Qwen4-Exp conditional-generation model.
 
-This implementation targets the released short-sequence SFT contract. QSA
-layers evaluate mathematically equivalent dense attention for sequences no
-longer than the checkpoint's 2,048-token index budget. Pipeline, tensor, and
-context parallelism are intentionally not advertised; expert and Engram table
-parallelism provide the storage scaling needed by the released checkpoint.
+This implementation uses the checkpoint's compressed-block QSA router and a
+fused TileLang sparse-GQA path for CUDA BF16 long-sequence SFT, with a PyTorch
+oracle for CPU and numerical parity. Pipeline, tensor, and context parallelism
+are intentionally not advertised; expert and Engram table parallelism provide
+the storage scaling needed by the released checkpoint.
 """
 
 from __future__ import annotations
@@ -407,7 +407,7 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
 
     @dataclass(frozen=True)
     class ModelCapabilities:
-        """Validated distributed features for the short-sequence SFT path."""
+        """Validated distributed features for the QSA sparse-SFT path."""
 
         supports_tp: bool = False
         supports_cp: bool = False

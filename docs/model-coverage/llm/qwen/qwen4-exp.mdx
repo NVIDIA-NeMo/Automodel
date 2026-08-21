@@ -7,7 +7,9 @@ slug: model-coverage/large-language-models/qwen/qwen4-exp
 Qwen4-Exp is a hybrid-attention MoE model with four persistent HyperConnection
 streams and an Engram-derived product-level embedding (PLE). NeMo AutoModel
 supports the language-only `Qwen4ExpForConditionalGeneration` path for
-full-parameter, short-sequence supervised fine-tuning.
+supervised fine-tuning. All backbone parameters are trainable except the QSA
+indexers, whose reference path exposes discrete top-k IDs but no auxiliary
+loss or straight-through gradient.
 
 <Info>
 
@@ -15,18 +17,20 @@ full-parameter, short-sequence supervised fine-tuning.
 |---|---|
 | **Task** | Text generation (MoE, hybrid attention, Engram PLE) |
 | **Architecture** | `Qwen4ExpForConditionalGeneration` |
-| **Decoder** | 48 layers: 36 GatedDeltaNet and 12 full-attention layers |
+| **Decoder** | 48 layers: 36 GatedDeltaNet and 12 QSA sparse-attention layers |
 | **Experts** | 512 routed experts, top-10 routing, plus one shared expert per layer |
 | **PLE** | One 51.2B-parameter table in decoder layer 2 |
-| **Validated sequence length** | Up to 2,048 tokens |
+| **Validated sequence length** | 4,096 tokens |
 
 </Info>
 
 ## Architecture
 
-- The decoder repeats three GatedDeltaNet layers followed by one full-attention
-  layer. Every layer has separate learned HyperConnection reads and writes for
-  attention and MoE.
+- The decoder repeats three GatedDeltaNet layers followed by one QSA
+  sparse-attention layer. QSA compresses index keys in groups of four, selects
+  up to 512 causal groups (2,048 tokens), appends the incomplete causal tail,
+  and evaluates main GQA only on those selected token IDs. Every layer has
+  separate learned HyperConnection reads and writes for attention and MoE.
 - The first decoder layer uses the normal Qwen4-Exp GatedDeltaNet and MoE
   skeleton without PLE. The second decoder layer first adds PLE values derived
   from eight raw-token bigram hashes and eight raw-token trigram hashes.
@@ -39,7 +43,7 @@ full-parameter, short-sequence supervised fine-tuning.
 
 | Area | Validated Configuration |
 |---|---|
-| FSDP2 | Full-parameter training with activation checkpointing |
+| FSDP2 | Backbone training with activation checkpointing; QSA indexers frozen |
 | Expert parallelism | EP64 |
 | Engram ownership | 64 contiguous row-owner shards over the world group |
 | Tensor / context / pipeline parallelism | Disabled |
@@ -68,11 +72,23 @@ cosine similarity from 0.9998 to 1.0000, and the corresponding logit-lens top-1
 token matched at every layer. The PLE delta had relative L2 error below 0.0063
 in both cases.
 
+The fused TileLang QSA path was also compared with SGLang on a fixed
+4,096-token input. Rows through position 2,050 matched the reference routing
+exactly. Replaying the exact SGLang layer input through AutoModel produced the
+same selected-token sets at the first sparse row (2,051) and the last row
+(4,095), and relative L2 error 0.0041 for the projected sparse-attention
+output. Positional ordering after top-k is not compared because the reference
+CUDA kernel does not define a stable order. A full-model EP8 run executing the
+fused kernel in all 12 QSA layers produced final logits with cosine similarity
+0.99952, relative L2 error 0.03175, and the same top-1 and top-5 tokens as the
+SGLang reference. The eight EP ranks were bitwise identical for every captured
+layer state, routing probe, final hidden state, and final logits.
+
 ## Example Recipe
 
 | Recipe | Description |
 |---|---|
-| [qwen4_exp_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen4_exp_180b_hellaswag_ep64.yaml) | 100-step full-parameter SFT on HellaSwag with FSDP2, EP64, and world-sized PLE ownership |
+| [qwen4_exp_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen4_exp_180b_hellaswag_ep64.yaml) | 100-step SFT on HellaSwag with FSDP2, EP64, and world-sized PLE ownership |
 
 Set `QWEN4_EXP_MODEL_PATH` to the checkpoint directory, allocate eight nodes
 with eight GPUs per node, and launch the recipe through your cluster launcher.
@@ -81,8 +97,15 @@ setup.
 
 ## Current Scope
 
-- Training uses dense causal attention for full-attention layers and fails
-  closed above the checkpoint's 2,048-token QSA indexer budget.
+- QSA uses fused TileLang sparse GQA for CUDA BF16 training when
+  `model.backend.attn=tilelang`. It streams the selected K/V rows without
+  materializing a query-by-selected-token gather. CPU execution retains a
+  bounded-workspace PyTorch numerical oracle; tests can also call that oracle
+  directly. CUDA execution requires TileLang and never silently falls back. The
+  discrete QSA indexers are frozen because the supplied inference reference
+  and checkpoint define neither an indexer auxiliary loss nor a
+  straight-through estimator; main attention Q/K/V and the rest of the
+  backbone remain trainable.
 - Packed sequences, left/interior padding, TP, CP, PP, MTP, and vision/video
   training are not supported by this implementation.
 - Optimizer checkpoint resume requires the same PLE owner-group size and
