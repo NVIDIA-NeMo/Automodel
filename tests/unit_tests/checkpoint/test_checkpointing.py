@@ -1942,7 +1942,14 @@ class TestLoadModelCustomModelGuard:
                 wraps=dcp.load,
             ) as dcp_load,
         ):
-            checkpointer.load_model(model, model_path=str(model_path), is_init_step=True)
+            # Mistral3 VLMs also expose a generic Transformers conversion mapping. Load parts already use exact HF
+            # checkpoint names, so that redundant mapping must not disable the adapter-owned grouped path.
+            checkpointer.load_model(
+                model,
+                model_path=str(model_path),
+                is_init_step=True,
+                key_mapping={"^model": "unused.generic.mapping"},
+            )
 
         full_cpu_load.assert_not_called()
         assert dcp_load.call_count == 2  # shared tensors and one bounded decoder-layer group

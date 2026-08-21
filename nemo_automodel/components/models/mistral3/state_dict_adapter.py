@@ -123,7 +123,8 @@ def _identity(k: str) -> str:
 
 _MISTRAL3P5_128B_NUM_HIDDEN_LAYERS = 88
 _CHECKPOINT_LAYERS_PER_PART = 8
-_DECODER_LAYER_KEY = re.compile(r"^(.*?\.layers\.(\d+))\.")
+_CAUSAL_LM_DECODER_LAYER_KEY = re.compile(r"^(model\.layers\.(\d+))\.")
+_VLM_DECODER_LAYER_KEY = re.compile(r"^(model\.language_model(?:\.model)?\.layers\.(\d+))\.")
 
 
 def _config_attr(config: Any | None, attr: str) -> Any:
@@ -249,13 +250,27 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
             "model.multi_modal_projector",
             # "lm_head" already in _NON_QUANTIZED_SUFFIXES via suffix match.
         )
+        text_config = _config_attr(config, "text_config")
+        # Tied Hugging Face checkpoints omit lm_head.weight. The existing fallback paths already handle that case;
+        # grouped loading currently requires every requested checkpoint key to exist. Keep tied VLMs on the fallback
+        # until grouped loading can represent a model tensor populated through another tied destination.
+        num_hidden_layers = (
+            _config_attr(text_config, "num_hidden_layers")
+            if _config_attr(config, "tie_word_embeddings") is False
+            else None
+        )
         if _uses_identity_vlm_layout(config):
-            return cls(layout_name="vlm_full_identity", not_fp8_prefixes=not_fp8)
+            return cls(
+                layout_name="vlm_full_identity",
+                not_fp8_prefixes=not_fp8,
+                num_hidden_layers=num_hidden_layers,
+            )
         return cls(
             native_to_hf=_vlm_full_native_to_hf,
             hf_to_native=_vlm_full_hf_to_native,
             layout_name="vlm_full",
             not_fp8_prefixes=not_fp8,
+            num_hidden_layers=num_hidden_layers,
         )
 
     # --------------------------------------------------------------------- #
@@ -297,34 +312,36 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: "DeviceMesh" | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
-        """Load text-only Mistral3 FP8 weights in bounded decoder-layer groups.
+        """Load Mistral3 FP8 weights in bounded decoder-layer groups.
 
         Each quantized model tensor has BF16 model shape and storage. Its load part creates an FP8 destination with
         the same shape, device, strides, and distributed placements, plus the scalar BF16 ``_scale_inv`` destination
         stored by the checkpoint. After DCP fills both tensors, the part copies and scales the FP8 value directly into
-        the BF16 model tensor. Non-quantized tensors use their final model storage as the DCP destination.
+        the BF16 model tensor. Non-quantized tensors, including VLM vision and projector weights, use their final model
+        storage as the DCP destination.
 
         This path requires the complete decoder on every rank. Pipeline-parallel ranks own different layer subsets and
-        therefore retain the existing rank-local DCP path until part scheduling can be coordinated across stages. VLM
-        layouts also retain that existing path.
+        therefore retain the existing rank-local DCP path until part scheduling can be coordinated across stages. Tied
+        VLM checkpoints also retain that path because they omit the LM-head tensor expected by grouped loading.
 
         Args:
-            model_state_dict: Native text-model names mapped to final model tensors. Decoder tensors may be local
-                DTensor shards; their placements are preserved by ``torch.empty_like``.
+            model_state_dict: Native model names mapped to final parameter and persistent-buffer tensors. Each tensor
+                has arbitrary model-defined rank and shape. Decoder tensors may be local DTensor shards; their global
+                shapes, local shards, and placements are preserved by ``torch.empty_like``. Non-quantized destinations
+                alias and are populated through final model storage.
             device_mesh: Optional distributed mesh. The tensors already carry their final placements, so this value is
                 not otherwise needed.
 
         Returns:
             One direct-load part for tensors outside decoder layers plus bounded temporary-load parts for decoder
-            layers, or ``None`` for VLM layouts, partial decoders, and non-BF16 model weights.
+            layers, or ``None`` for tied VLM checkpoints, partial decoders, and non-BF16 model weights.
         """
         del device_mesh
-        if self._layout_name != "causal_lm":
-            return None
+        decoder_layer_key = _CAUSAL_LM_DECODER_LAYER_KEY if self._layout_name == "causal_lm" else _VLM_DECODER_LAYER_KEY
         present_layer_indices = {
             int(layer_match.group(2))
             for model_key in model_state_dict
-            if (layer_match := _DECODER_LAYER_KEY.match(model_key)) is not None
+            if (layer_match := decoder_layer_key.match(model_key)) is not None
         }
         if self._num_hidden_layers is None or present_layer_indices != set(range(self._num_hidden_layers)):
             return None
@@ -333,15 +350,29 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
             for model_key, tensor in model_state_dict.items()
         ):
             return None
-        return self._iter_causal_lm_checkpoint_load_parts(model_state_dict)
+        return self._iter_checkpoint_load_parts(model_state_dict, decoder_layer_key)
 
-    def _iter_causal_lm_checkpoint_load_parts(
+    def _iter_checkpoint_load_parts(
         self,
         model_state_dict: dict[str, torch.Tensor],
+        decoder_layer_key: re.Pattern[str],
     ) -> Iterator[CheckpointLoadPart]:
+        """Build load parts for a complete causal-LM or VLM decoder.
+
+        Args:
+            model_state_dict: Native model names mapped to final tensors of arbitrary model-defined rank and shape.
+                Quantized linear weights must use BF16 final storage; non-quantized tensors remain direct DCP
+                destinations and are mutated in place during the load.
+            decoder_layer_key: Pattern that identifies decoder-layer names and captures the zero-based layer index in
+                group 2. It must exclude vision-tower layers from the bounded FP8 groups.
+
+        Returns:
+            Dependency-complete load parts. Each quantized destination has the same shape, strides, device, and DTensor
+            placements as its corresponding final model tensor but uses temporary FP8 storage.
+        """
         grouped_model_keys: dict[str, list[str]] = {}
         for model_key in model_state_dict:
-            layer_match = _DECODER_LAYER_KEY.match(model_key)
+            layer_match = decoder_layer_key.match(model_key)
             group_name = (
                 f"layers-{int(layer_match.group(2)) // _CHECKPOINT_LAYERS_PER_PART}"
                 if layer_match is not None

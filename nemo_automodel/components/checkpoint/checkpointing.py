@@ -1009,13 +1009,14 @@ class Checkpointer:
 
         part_loaded_model_state_dict: dict[str, torch.Tensor] | None = None
         checkpoint_load_parts: Iterator[CheckpointLoadPart] | None = None
+        # Adapter-owned parts name their DCP destinations with exact checkpoint keys, so any generic Transformers
+        # key_mapping is redundant for this path and must not prevent the adapter from describing bounded groups.
         if (
             is_init_step
             and is_safetensors
             and should_dequantize_base_checkpoint
             and isinstance(state_dict_adapter, StateDictAdapter)
             and len(model_state.model) == 1
-            and key_mapping is None
             and not allow_checkpoint_key_subset
         ):
             candidate_state_dict = model_state.state_dict()

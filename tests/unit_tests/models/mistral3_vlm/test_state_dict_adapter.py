@@ -259,11 +259,6 @@ class TestForCausalLmFactory:
             torch.full((2, 2), 7.0, dtype=torch.bfloat16),
         )
 
-    def test_vlm_layout_keeps_existing_one_pass_dcp_load(self):
-        adapter = Mistral3FP8StateDictAdapter.for_vlm_full()
-
-        assert adapter.iter_checkpoint_load_parts({}) is None
-
     def test_non_bf16_model_keeps_existing_one_pass_dcp_load(self):
         adapter = Mistral3FP8StateDictAdapter.for_causal_lm({"num_hidden_layers": 1})
         model_state = {"model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2)}
@@ -281,6 +276,17 @@ class TestForCausalLmFactory:
 
 class TestForVlmFullFactory:
     """The single shipped factory wires layout name and not_fp8_prefixes."""
+
+    def test_tied_vlm_layout_keeps_existing_one_pass_dcp_load(self):
+        adapter = Mistral3FP8StateDictAdapter.for_vlm_full(
+            SimpleNamespace(
+                tie_word_embeddings=True,
+                text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=1),
+            )
+        )
+        model_state = {"model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16)}
+
+        assert adapter.iter_checkpoint_load_parts(model_state) is None
 
     def test_layout_name(self):
         a = Mistral3FP8StateDictAdapter.for_vlm_full()
@@ -347,10 +353,99 @@ class TestForVlmFullFactory:
             assert a._hf_to_native(key) == key
 
     def test_smaller_mistral3_configs_keep_nested_body_layout(self):
-        cfg = SimpleNamespace(text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=36))
+        cfg = SimpleNamespace(
+            tie_word_embeddings=False,
+            text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=36),
+        )
         a = Mistral3FP8StateDictAdapter.for_vlm_full(cfg)
         assert a._layout_name == "vlm_full"
         assert a._native_to_hf("model.language_model.embed_tokens.weight") == "language_model.model.embed_tokens.weight"
+
+    def test_checkpoint_load_parts_dequantize_vlm_text_layers_and_direct_load_vlm_components(self):
+        config = SimpleNamespace(
+            tie_word_embeddings=False,
+            text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=2),
+        )
+        adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
+        text_weight_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        vision_weight_key = "model.vision_tower.transformer.layers.0.attention.q_proj.weight"
+        projector_weight_key = "model.multi_modal_projector.linear_1.weight"
+        model_state = {
+            "model.language_model.embed_tokens.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+            text_weight_key: torch.zeros(2, 2, dtype=torch.bfloat16),
+            "model.language_model.layers.1.mlp.down_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+            vision_weight_key: torch.zeros(2, 2, dtype=torch.bfloat16),
+            projector_weight_key: torch.zeros(2, 2, dtype=torch.bfloat16),
+            "lm_head.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        load_parts = adapter.iter_checkpoint_load_parts(model_state)
+        assert load_parts is not None
+        parts = list(load_parts)
+
+        assert len(parts) == 2
+        assert set().union(*(part.model_keys for part in parts)) == set(model_state)
+        shared_part = next(part for part in parts if vision_weight_key in part.model_keys)
+        assert shared_part.temporary_checkpoint_keys == frozenset()
+        assert (
+            shared_part.checkpoint_tensors["vision_tower.transformer.layers.0.attention.q_proj.weight"]
+            is model_state[vision_weight_key]
+        )
+        assert (
+            shared_part.checkpoint_tensors["multi_modal_projector.linear_1.weight"] is model_state[projector_weight_key]
+        )
+        decoder_part = next(part for part in parts if text_weight_key in part.model_keys)
+        checkpoint_text_key = "language_model.model.layers.0.self_attn.q_proj.weight"
+        assert decoder_part.checkpoint_tensors[checkpoint_text_key].dtype == torch.float8_e4m3fn
+        assert decoder_part.checkpoint_tensors[checkpoint_text_key] is not model_state[text_weight_key]
+
+        for part in parts:
+            for checkpoint_key, destination in part.checkpoint_tensors.items():
+                if checkpoint_key.endswith("_scale_inv"):
+                    destination.fill_(0.5)
+                elif destination.dtype == torch.float8_e4m3fn:
+                    destination.fill_(2.0)
+                else:
+                    destination.fill_(7.0)
+            part.finish()
+
+        torch.testing.assert_close(model_state[text_weight_key], torch.ones(2, 2, dtype=torch.bfloat16))
+        torch.testing.assert_close(model_state[vision_weight_key], torch.full((2, 2), 7.0, dtype=torch.bfloat16))
+        torch.testing.assert_close(model_state[projector_weight_key], torch.full((2, 2), 7.0, dtype=torch.bfloat16))
+
+    def test_vision_layer_indices_do_not_hide_partial_text_decoder(self):
+        config = SimpleNamespace(
+            tie_word_embeddings=False,
+            text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=2),
+        )
+        adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
+        model_state = {
+            "model.language_model.layers.1.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+            "model.vision_tower.transformer.layers.0.attention.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        assert adapter.iter_checkpoint_load_parts(model_state) is None
+
+    def test_identity_vlm_layout_uses_bounded_decoder_groups(self):
+        config = SimpleNamespace(
+            tie_word_embeddings=False,
+            text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=88),
+        )
+        adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
+        model_state = {
+            f"model.language_model.layers.{layer}.self_attn.q_proj.weight": torch.zeros(1, 1, dtype=torch.bfloat16)
+            for layer in range(88)
+        }
+
+        load_parts = adapter.iter_checkpoint_load_parts(model_state)
+        assert load_parts is not None
+        parts = list(load_parts)
+
+        assert len(parts) == 11
+        assert set().union(*(part.model_keys for part in parts)) == set(model_state)
+        first_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        first_part = next(part for part in parts if first_key in part.model_keys)
+        assert first_key in first_part.checkpoint_tensors
 
 
 # --------------------------------------------------------------------------- #
