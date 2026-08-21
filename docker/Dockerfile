@@ -251,11 +251,8 @@ ARG AUTOMODEL_INSTALL=all
 ARG UV_SYNC_ARGS="--locked"
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
 # causal-conv1d, mamba-ssm, and nv-grouped-gemm across BuildKit builds.
-# Ray's wheel bundles Java worker jars (ray/jars/ray_dist.jar) that vendor Jackson
-# releases flagged by the container scan (GHSA-r7wm-3cxj-wff9 and the earlier
-# jackson-databind findings); upstream Ray still ships jackson 2.18.6. Ray reaches
-# the venv only as a transitive Python dependency and Automodel never starts Java
-# workers, so drop the jars.
+# ray/jars/ray_dist.jar vendors a flagged jackson (GHSA-r7wm-3cxj-wff9) that upstream
+# has not bumped; Automodel uses Ray from Python only, so drop the Java worker jars.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
