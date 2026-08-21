@@ -1,0 +1,95 @@
+---
+title: "Qwen4-Exp"
+description: "Fine-tune the language-only Qwen4-Exp Engram MoE checkpoint with FSDP2 and expert parallelism."
+slug: model-coverage/large-language-models/qwen/qwen4-exp
+---
+
+Qwen4-Exp is a hybrid-attention MoE model with four persistent HyperConnection
+streams and an Engram-derived product-level embedding (PLE). NeMo AutoModel
+supports the language-only `Qwen4ExpForConditionalGeneration` path for
+full-parameter, short-sequence supervised fine-tuning.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text generation (MoE, hybrid attention, Engram PLE) |
+| **Architecture** | `Qwen4ExpForConditionalGeneration` |
+| **Decoder** | 48 layers: 36 GatedDeltaNet and 12 full-attention layers |
+| **Experts** | 512 routed experts, top-10 routing, plus one shared expert per layer |
+| **PLE** | One 51.2B-parameter table in decoder layer 2 |
+| **Validated sequence length** | Up to 2,048 tokens |
+
+</Info>
+
+## Architecture
+
+- The decoder repeats three GatedDeltaNet layers followed by one full-attention
+  layer. Every layer has separate learned HyperConnection reads and writes for
+  attention and MoE.
+- The first decoder layer uses the normal Qwen4-Exp GatedDeltaNet and MoE
+  skeleton without PLE. The second decoder layer first adds PLE values derived
+  from eight raw-token bigram hashes and eight raw-token trigram hashes.
+- The PLE table has 320,001,536 padded rows of width 160. Its 51.2 billion
+  parameters are stored as 128 physical checkpoint shards.
+- The final learned HyperConnection read collapses four 2,560-wide streams to
+  one 2,560-wide state before the untied language-model head.
+
+## Validated Configuration
+
+| Area | Validated Configuration |
+|---|---|
+| FSDP2 | Full-parameter training with activation checkpointing |
+| Expert parallelism | EP64 |
+| Engram ownership | 64 contiguous row-owner shards over the world group |
+| Tensor / context / pipeline parallelism | Disabled |
+| Workload | Non-packed, right-tail-padded HellaSwag next-token prediction |
+| Scale | 8 nodes / 64 H100 GPUs |
+| Duration | 100 optimizer steps |
+
+The 100-step run reduced training loss from 3.0734 at step 0 to 1.8195 at step
+99 and finished with validation loss 2.0610. The run completed without NaNs or
+collective errors and published model, optimizer, dataloader, scheduler, and
+RNG state in a distributed checkpoint.
+
+The PLE table uses contiguous owner sharding. Request ranks group hashed row IDs
+by owner; an equal-capacity All-to-All sends IDs to owners and a second
+autograd-aware All-to-All returns values. Backward reverses the value route so
+only the rank that owns a row stores and updates its gradient. The validated
+cluster run used NCCL's internal IB transport (`NCCL_NET_PLUGIN=none` and
+`NCCL_NET=IB`).
+
+## Numerical Validation
+
+The released checkpoint was compared with its SGLang reference on two fixed
+raw-token sequences, including an EOS-reset case. Token embeddings, n-gram hash
+IDs, and table values matched exactly. The first four decoder-layer states had
+cosine similarity from 0.9998 to 1.0000, and the corresponding logit-lens top-1
+token matched at every layer. The PLE delta had relative L2 error below 0.0063
+in both cases.
+
+## Example Recipe
+
+| Recipe | Description |
+|---|---|
+| [qwen4_exp_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen4_exp_180b_hellaswag_ep64.yaml) | 100-step full-parameter SFT on HellaSwag with FSDP2, EP64, and world-sized PLE ownership |
+
+Set `QWEN4_EXP_MODEL_PATH` to the checkpoint directory, allocate eight nodes
+with eight GPUs per node, and launch the recipe through your cluster launcher.
+See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node
+setup.
+
+## Current Scope
+
+- Training uses dense causal attention for full-attention layers and fails
+  closed above the checkpoint's 2,048-token QSA indexer budget.
+- Packed sequences, left/interior padding, TP, CP, PP, MTP, and vision/video
+  training are not supported by this implementation.
+- Optimizer checkpoint resume requires the same PLE owner-group size and
+  owner-rank-to-row mapping; optimizer-state resharding is not implemented.
+
+## References
+
+- [DeepSeek Engram repository](https://github.com/deepseek-ai/Engram)
+- [Engram paper](https://arxiv.org/abs/2601.07372)
+- [Megatron-LM-FL trainable Engram implementation](https://github.com/flagos-ai/Megatron-LM-FL/blob/main/megatron/core/transformer/engram.py)

@@ -64,11 +64,205 @@ from nemo_automodel.components.checkpoint.utils import (
     is_tied_word_embeddings,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.owner_sharding import get_owner_sharded_parameter_spec
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _PREFIX = "model."
 _OPTIMIZER_PARTS_KEY = "optimizer_parts"
 _OPTIMIZER_PART_KEY_PREFIX = "stage_"
+
+
+def _owner_sharded_optimizer_state_prefixes(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, tuple[str, str, int]]:
+    """Return stable DCP namespaces for model-owned parameter shards.
+
+    Owner-sharded tensors deliberately remain ordinary ``Parameter`` objects
+    instead of DTensors. PyTorch DCP would consequently classify their optimizer
+    tensors as replicated by FQN and retain only one rank's value. A versioned,
+    model-supplied namespace and owner identity make those tensors rank-distinct
+    without gathering them.
+
+    The state namespace uses both the semantic owner rank and global rank so
+    multiple owner groups cannot collide in one DCP collective.  Separate
+    rank-local metadata records the owner-group size.  Resuming therefore
+    requires the same owner-group membership, owner-rank-to-row mapping, and rank
+    count as the checkpoint; optimizer-state resharding across a different owner
+    topology is unsupported. Ordinary optimizer keys and owner-sharded keys
+    without a distributed owner group are unchanged.
+
+    Args:
+        model: Model whose tagged owner parameter has rank-local shape
+            ``[local_rows, embedding_dim]``.
+        optimizer: Optimizer containing that exact parameter identity.
+
+    Returns:
+        Mapping from canonical parameter FQN to its versioned state prefix,
+        topology-metadata key, and owner-group size.
+    """
+    marked_parameters: dict[int, torch.Tensor] = {}
+    for parameter_group in optimizer.param_groups:
+        for parameter in parameter_group["params"]:
+            if get_owner_sharded_parameter_spec(parameter) is None:
+                continue
+            parameter_id = id(parameter)
+            if parameter_id in marked_parameters:
+                raise RuntimeError("A tagged owner-sharded parameter appears more than once in the optimizer.")
+            marked_parameters[parameter_id] = parameter
+    if not marked_parameters:
+        return {}
+
+    fqns_by_parameter_id: dict[int, set[str]] = {parameter_id: set() for parameter_id in marked_parameters}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        if id(parameter) in fqns_by_parameter_id:
+            fqns_by_parameter_id[id(parameter)].add(canonical_parameter_fqn(name))
+
+    prefixes: dict[str, tuple[str, str, int]] = {}
+    for parameter_id, parameter in marked_parameters.items():
+        fqns = fqns_by_parameter_id[parameter_id]
+        if len(fqns) != 1:
+            raise RuntimeError(
+                "Cannot checkpoint a tagged owner-sharded optimizer parameter: "
+                f"expected exactly one canonical model FQN, found {sorted(fqns)}."
+            )
+        fqn = next(iter(fqns))
+        spec = get_owner_sharded_parameter_spec(parameter)
+        assert spec is not None
+        process_group = spec.process_group
+        if process_group is None:
+            distributed_world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            if distributed_world_size > 1:
+                raise RuntimeError(
+                    "Cannot checkpoint owner-sharded optimizer state for "
+                    f"'{fqn}': its process_group is None in a distributed world of size "
+                    f"{distributed_world_size}, so a unique owner identity cannot be derived."
+                )
+            continue
+        if not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "Cannot checkpoint owner-sharded optimizer state for "
+                f"'{fqn}': torch.distributed is not initialized for its owner process group."
+            )
+
+        try:
+            owner_world_size = torch.distributed.get_world_size(process_group)
+            owner_rank = torch.distributed.get_rank(process_group)
+            global_rank = torch.distributed.get_rank()
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Cannot checkpoint owner-sharded optimizer state for "
+                f"'{fqn}': failed to derive an identity from its owner process group."
+            ) from error
+        if owner_world_size < 1 or owner_rank < 0 or owner_rank >= owner_world_size:
+            raise RuntimeError(
+                "Cannot checkpoint owner-sharded optimizer state for "
+                f"'{fqn}': current global rank {global_rank} is not a valid member of its owner process group "
+                f"(owner rank {owner_rank}, size {owner_world_size})."
+            )
+
+        if fqn in prefixes:
+            raise RuntimeError(f"Duplicate owner-sharded optimizer parameter FQN '{fqn}'.")
+        prefixes[fqn] = (
+            f"state.{spec.optimizer_state_namespace}.owner_rank_{owner_rank}.global_rank_{global_rank}.{fqn}.",
+            f"{spec.optimizer_state_namespace}.metadata.global_rank_{global_rank}.{fqn}.owner_world_size",
+            owner_world_size,
+        )
+    return prefixes
+
+
+def _namespace_owner_sharded_optimizer_state(
+    state_dict: dict[str, Any],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> tuple[dict[str, Any], set[str]]:
+    """Make only tagged parameter state keys rank-distinct for DCP.
+
+    Args:
+        state_dict: Flattened optimizer mapping. Tensor values for an owner
+            parameter have the same rank-local shape as that parameter or are
+            scalar step values.
+        model: Model that owns the tagged rank-local parameter shard.
+        optimizer: Optimizer whose parameter identities define the state keys.
+
+    Returns:
+        Flattened mapping with owner state under rank-distinct keys and the set
+        of keys created for owner state or topology metadata. Tensor values
+        alias the corresponding input values; they are not copied.
+    """
+    prefixes = _owner_sharded_optimizer_state_prefixes(model, optimizer)
+    if not prefixes:
+        return state_dict, set()
+
+    namespaced: dict[str, Any] = {
+        metadata_key: owner_world_size for _, metadata_key, owner_world_size in prefixes.values()
+    }
+    owner_keys = set(namespaced)
+    for key, value in state_dict.items():
+        output_key = key
+        for fqn, (owner_prefix, _, _) in prefixes.items():
+            fqn_prefix = f"state.{fqn}."
+            if key.startswith(fqn_prefix):
+                output_key = f"{owner_prefix}{key.removeprefix(fqn_prefix)}"
+                owner_keys.add(output_key)
+                break
+        if output_key in namespaced:
+            raise RuntimeError(f"Owner-sharded optimizer state key collision for '{output_key}'.")
+        namespaced[output_key] = value
+    return namespaced, owner_keys
+
+
+def _restore_owner_sharded_optimizer_state_keys(
+    state_dict: dict[str, Any],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, Any]:
+    """Remove the current owner's DCP namespace before optimizer restore.
+
+    Args:
+        state_dict: Flattened DCP optimizer mapping. Tensor values for an owner
+            parameter have the same rank-local shape as that parameter or are
+            scalar step values.
+        model: Model that owns the tagged rank-local parameter shard.
+        optimizer: Optimizer whose parameter identities define restored keys.
+
+    Returns:
+        Flattened mapping with the current owner's state restored to ordinary
+        optimizer FQNs. Tensor values alias the corresponding input values.
+    """
+    prefixes = _owner_sharded_optimizer_state_prefixes(model, optimizer)
+    if not prefixes:
+        return state_dict
+
+    for fqn, (_, metadata_key, current_owner_world_size) in prefixes.items():
+        if metadata_key not in state_dict:
+            raise RuntimeError(
+                "Owner-sharded optimizer checkpoint is missing topology metadata for "
+                f"'{fqn}'. Legacy owner-sharded optimizer state cannot be resumed safely; "
+                "load the model weights and reset the optimizer."
+            )
+        checkpoint_owner_world_size = state_dict[metadata_key]
+        if checkpoint_owner_world_size != current_owner_world_size:
+            raise RuntimeError(
+                "Owner-sharded optimizer checkpoint topology does not match the current owner group for "
+                f"'{fqn}': checkpoint size {checkpoint_owner_world_size}, current size "
+                f"{current_owner_world_size}. Optimizer-state resharding is unsupported."
+            )
+
+    metadata_keys = {metadata_key for _, metadata_key, _ in prefixes.values()}
+    restored: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if key in metadata_keys:
+            continue
+        output_key = key
+        for fqn, (owner_prefix, _, _) in prefixes.items():
+            if key.startswith(owner_prefix):
+                output_key = f"state.{fqn}.{key.removeprefix(owner_prefix)}"
+                break
+        if output_key in restored:
+            raise RuntimeError(f"Owner-sharded optimizer state key collision for '{output_key}'.")
+        restored[output_key] = value
+    return restored
 
 
 def _is_quantized_module(module: torch.nn.Module) -> bool:
@@ -666,7 +860,20 @@ class OptimizerState:
                 get_optimizer_state_dict,
                 options=StateDictOptions(flatten_optimizer_state_dict=True, cpu_offload=self.cpu_offload),
             )
-            optimizer_state_dict = {k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()}
+            optimizer_state_dict = {}
+            for model_part, optimizer in zip(self.model, self.optimizer, strict=True):
+                part_state_dict, owner_keys = _namespace_owner_sharded_optimizer_state(
+                    func(model_part, optimizer),
+                    model_part,
+                    optimizer,
+                )
+                overlapping_owner_keys = optimizer_state_dict.keys() & owner_keys
+                if overlapping_owner_keys:
+                    raise RuntimeError(
+                        "Owner-sharded optimizer state keys overlap across model parts: "
+                        f"{sorted(overlapping_owner_keys)}"
+                    )
+                optimizer_state_dict.update(part_state_dict)
 
         state_dict = {
             "optim": optimizer_state_dict,
@@ -709,9 +916,16 @@ class OptimizerState:
                     optimizer.load_state_dict(optimizer_parts[part_key])
         else:
             # sets our state dicts on the optimizer, now that we've loaded
+            optimizer_state_dict = state_dict["optim"]
+            for model_part, optimizer in zip(self.model, self.optimizer, strict=True):
+                optimizer_state_dict = _restore_owner_sharded_optimizer_state_keys(
+                    optimizer_state_dict,
+                    model_part,
+                    optimizer,
+                )
             func = partial(
                 set_optimizer_state_dict,
-                optim_state_dict=state_dict["optim"],
+                optim_state_dict=optimizer_state_dict,
                 options=StateDictOptions(flatten_optimizer_state_dict=True),
             )
             list(map(func, self.model, self.optimizer))
