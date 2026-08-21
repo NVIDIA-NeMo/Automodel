@@ -15,7 +15,7 @@
 """MoE model configuration."""
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 
@@ -53,6 +53,8 @@ class MoEConfig:
     # Default 0.0 preserves the existing ``weighted_bias_swiglu_impl`` path.
     swiglu_limit: float = 0.0
     softmax_before_topk: bool = False
+    router_weights_fp32: bool = False
+    router_weight_uses_score_correction_bias: bool = False
     dtype: str | torch.dtype = torch.bfloat16
     shared_expert_gate: bool = False
     shared_expert_inter_dim: int | None = None
@@ -91,5 +93,5 @@ class MoEMetricsConfig:
 
     enabled: bool = False
     mode: str = "brief"
-    detailed_every_steps: Optional[int] = None
+    detailed_every_steps: int | None = None
     top_k_experts: int = 0

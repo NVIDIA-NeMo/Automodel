@@ -115,13 +115,13 @@ class _FakeCPMesh:
 
 
 # ---------------------------------------------------------------------------
-# get_capabilities: dense+audio (E2B/E4B) now supports CP
+# get_capabilities: dense+audio (E2B/E4B) supports TP and CP
 # ---------------------------------------------------------------------------
 def test_get_capabilities_dense_audio_variant_enables_cp():
     caps = Gemma4ForConditionalGeneration.get_capabilities(_cfg(audio=True))
     assert caps.supports_cp is True
-    # TP/PP/EP stay off for the dense+audio variant.
-    assert caps.supports_tp is False
+    assert caps.supports_tp is True
+    # PP/EP stay off for the dense+audio variant.
     assert caps.supports_pp is False
     assert caps.supports_ep is False
 
@@ -271,6 +271,7 @@ def test_cp_sunk_prepare_inputs_slices_per_layer_inputs_on_seq_dim():
     # ring metadata is sliced to the same local length
     assert prepared["mm_token_type_ids"].shape == (1, local)
     assert prepared["_gemma4_vision_group_ids"].shape == (1, local)
+    assert prepared["_gemma4_has_vision_tokens"] is False
 
 
 def test_prepare_per_layer_inputs_masks_image_tokens():

@@ -438,6 +438,9 @@ _DATASET_CONFIGS: dict[str, str] = {
     f"{_DATASETS}.vlm.datasets.make_rdr_dataset": f"{_DATASETS}.vlm.datasets.RdrDatasetConfig",
     f"{_DATASETS}.vlm.datasets.make_cord_v2_dataset": f"{_DATASETS}.vlm.datasets.CordV2DatasetConfig",
     f"{_DATASETS}.vlm.datasets.make_medpix_dataset": f"{_DATASETS}.vlm.datasets.MedPixDatasetConfig",
+    f"{_DATASETS}.vlm.datasets.make_shopify_product_catalogue_dataset": (
+        f"{_DATASETS}.vlm.datasets.ShopifyProductCatalogueDatasetConfig"
+    ),
     f"{_DATASETS}.vlm.datasets.make_llava_onevision_dataset": (f"{_DATASETS}.vlm.datasets.LlavaOnevisionDatasetConfig"),
     f"{_DATASETS}.vlm.datasets.make_tulu3_magicoder_text_mix_dataset": (
         f"{_DATASETS}.vlm.datasets.Tulu3MagicoderTextMixDatasetConfig"

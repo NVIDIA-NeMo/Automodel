@@ -78,13 +78,37 @@ When `checkpoint_robustness` is present, the robustness test runs after the fine
 2. **AutoModel reload** -- Reload from consolidated checkpoint, verify KL = 0
 3. **HF reload** -- Load into vanilla `transformers`/`peft`, verify KL below `hf_kl_threshold`
 4. **Cross-TP** (optional) -- Reload with different `tp_size`
-5. **Training resumption** (on by default) -- Baseline + resumed run, verify loss continuity
+5. **Training resumption** (on by default) -- Continue the checkpoint-producing trajectory, restore the exact boundary
+   checkpoint in a fresh trainer, and compare identical post-boundary batches and losses
 
 LLM recipes use the causal-LM harness, while `examples/vlm_finetune/` recipes use the VLM finetune recipe and
 `AutoModelForImageTextToText`. VLM parity currently exercises the language path with text-only `input_ids`; real-image
 multimodal parity is a separate follow-up.
 
-Phase 5 is the most expensive (two additional training passes). Use `no_check_resume: true` to skip it.
+The resume oracle is deliberately distinct from independent-run reproducibility. It checks scheduler position,
+complete optimizer parameter-group settings, LR and weight decay, RNG state, and per-rank batch identity. On the first
+shared step, after both branches have entered the same FSDP unshard/reshard lifecycle but before the optimizer update,
+it requires exact rank-local model parameters and optimizer tensors. Persistent buffers and gradients at that point,
+plus post-update model/optimizer fingerprints, are recorded diagnostically so a numerical divergence can be localized.
+Exact loss deltas and diagnostic comparisons are written for successful and failed runs.
+
+Select a shared scale-aware loss envelope with `resume_tolerance_profile`. Each stage allows
+`atol + rtol * max(abs(uninterrupted_loss), abs(resumed_loss))`: `strict` uses `1e-6 + 0%` for both stages;
+`standard` (default) uses `1e-5 + 0.2%` for the first step and `5e-3 + 0.2%` later; `relaxed` uses
+`1e-4 + 0.75%` first and `1e-2 + 0.75%` later. Prefer profiles over model-specific calibration, and use `relaxed`
+only for demonstrated distributed or low-precision drift after the exact state gates pass. `resume_first_loss_threshold`
+and `resume_loss_threshold` remain authoritative absolute-only overrides for exceptional cases. Use
+`no_check_resume: true` only for an explicitly documented restore blocker.
+
+CI also reuses the normal finetune that already precedes checkpoint robustness as a separate, non-blocking training-
+reproducibility metric; it does not launch another baseline. Normal finetune and checkpoint Phase 1 record per-rank
+batch digests, loss, and LR. They are compared only when component fingerprints match for model initialization and
+seed, dataset/dataloader ordering, batch sizes and topology, optimizer, LR scheduler, loss, and backend configuration.
+Otherwise the log reports `not_comparable` and names the mismatched components. Loss differences use the separately
+calibrated `training_reproducibility_loss_threshold` (default `5e-2`). Exceeding that envelope remains non-blocking but
+emits a prominent `ALERT` and saves a machine-readable `report.json` in the reproducibility artifact directory. This is
+an opportunistic diagnostic rather than required coverage: phase-specific overrides may make the two existing runs
+incomparable, while the shared-trajectory resume check remains the blocking reproducibility oracle.
 
 Use source-load parity for recipes where the initial HF checkpoint load is itself part of the contract, especially
 remote-code, force-HF, custom model, or tied/untied `lm_head` paths. The raw HF reference model is loaded only long
@@ -98,9 +122,8 @@ already require multi-GPU HF reloads) should enable it to avoid rank-0 OOM. Tune
 worst token, while the stricter mean threshold prevents broad drift; Phase 0 also reports p95 KL for diagnosis.
 `source_load_cosine_threshold` remains an independent full-logit check.
 
-`ci.time` must cover both finetune and robustness. Estimated overhead:
-- ~30% with `no_check_resume: true`
-- ~50-60% with resumption check (default)
+`ci.time` must cover both finetune and robustness. Resume adds one short restored continuation; it no longer launches a
+separate fresh baseline.
 
 ## How To
 

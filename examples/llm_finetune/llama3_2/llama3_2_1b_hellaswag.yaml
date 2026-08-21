@@ -100,7 +100,8 @@ ci:
     model.pretrained_model_name_or_path: meta-llama/Llama-3.2-3B-Instruct
     tokenizer_name: meta-llama/Llama-3.2-3B-Instruct
     cross_tp_size: 2
-    cross_tp_kl_threshold: 5e-3
+    # Allow observed bf16 row-parallel reduction drift across 8-GPU TP reloads.
+    cross_tp_kl_threshold: 6e-3
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
 

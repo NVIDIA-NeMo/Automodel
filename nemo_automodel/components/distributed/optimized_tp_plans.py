@@ -18,7 +18,7 @@ This module contains optimized tensor parallel plans for different model archite
 including LLaMA, Qwen, Gemma3, and Ministral3 models.
 """
 
-from typing import Callable, Dict, Union, cast
+from typing import TYPE_CHECKING, Callable, Dict, Union, cast
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -43,12 +43,13 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
-from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
-from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
 from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -217,41 +218,6 @@ def _parallelize_gemma3(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
-def _parallelize_gemma4(
-    model: Gemma4ForConditionalGeneration,
-    sequence_parallel: bool = False,
-) -> dict[str, ParallelStyle]:
-    """Parallelizes a Gemma4ForConditionalGeneration model across tensor parallel dimensions.
-
-    Gemma4 VLM uses model.language_model.{embed_tokens, layers.*} for the text
-    backbone, identical to the Gemma3 VLM layout.
-    """
-    if sequence_parallel:
-        import warnings
-
-        warnings.warn(
-            "sequence_parallel=True is not yet supported for Gemma4 and will be ignored. ",
-            stacklevel=2,
-        )
-
-    model_prefix = "model.language_model"
-
-    return cast(
-        dict[str, ParallelStyle],
-        {
-            f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-            f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
-            f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
-            "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-        },
-    )
-
-
 def get_llama_nemotron_super_tp_plan(
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
@@ -379,7 +345,7 @@ def _parallelize_llama(
 
 
 def _parallelize_ministral3(
-    model: Ministral3ForCausalLM,
+    model: "Ministral3ForCausalLM",
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Ministral3ForCausalLM model across data and tensor parallel dimensions."""
@@ -484,6 +450,41 @@ def _parallelize_mistral3_vlm(
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
+def _parallelize_muse_glimmer(
+    model,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """TP plan for the native MuseGlimmer dense VLM.
+
+    The vision tower stays replicated. The language backbone and vocabulary
+    matrices contain nearly all trainable parameters and are tensor-sharded.
+    MuseGlimmer has two KV heads, so the model strategy limits this complete
+    Q/K/V-sharding plan to TP1 or TP2.
+    """
+    if sequence_parallel:
+        import warnings
+
+        warnings.warn(
+            "sequence_parallel=True is not yet supported for MuseGlimmer and will be ignored.",
+            stacklevel=2,
+        )
+
+    plan: dict[str, ParallelStyle] = {
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.output_gate_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    return cast(dict[str, ParallelStyle], plan)
 
 
 def _parallelize_qwen(
@@ -741,7 +742,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     "transformers.models.falcon_h1.modeling_falcon_h1.FalconH1ForCausalLM": _parallelize_falcon_h1,
     "FalconH1ForCausalLM": _parallelize_falcon_h1,
     _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
-    _get_class_qualname(Ministral3ForCausalLM): _parallelize_ministral3,
+    "nemo_automodel.components.models.mistral3.model.Ministral3ForCausalLM": _parallelize_ministral3,
     # Mistral3 VLM (Pixtral + Ministral3) — native HF class plus the Automodel
     # FP8-VLM subclass that owns FP8 dequant.
     _get_class_qualname(Mistral3ForConditionalGeneration): _parallelize_mistral3_vlm,
@@ -750,7 +751,6 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
-    _get_class_qualname(Gemma4ForConditionalGeneration): _parallelize_gemma4,
     _get_class_qualname(PhiForCausalLM): _parallelize_phi,
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
@@ -761,4 +761,5 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     "NemotronFlashForCausalLM": _parallelize_llama,
     "DeciLMForCausalLM": _parallelize_decilm_nemotron,
     "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
+    "nemo_automodel.components.models.muse_glimmer.model.MuseGlimmerForConditionalGeneration": _parallelize_muse_glimmer,
 }

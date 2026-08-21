@@ -1,0 +1,148 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# CoderForge agent SFT on the BASE Qwen3-32B (dense) with context parallelism at 128K.
+#
+# Goal: uplift the SWE-bench Verified base baseline (~18.2%) by SFT'ing on CoderForge agent
+# trajectories, and show a clean training/val loss descent. (Eval is a follow-up PR.)
+#
+# Qwen3-32B (dense Qwen3ForCausalLM) has NO custom NeMo model class, so it loads as the stock
+# HuggingFace model through NeMoAutoModelForCausalLM. CP shards each sequence on the sequence
+# dimension across the CP group; the only CP-compatible attention for a stock HF model is SDPA
+# (torch context_parallel intercepts F.scaled_dot_product_attention). Two consequences vs the
+# gemma4 recipe:
+#   1. NO sequence packing — packing + CP>1 over SDPA is rejected ("Packed sequence is only
+#      supported with CP size 1"). We train UNPACKED: seq_length caps at 128K (data is prefiltered
+#      to <=128K, 99.9% retention) and default_collater pads each batch up to a multiple of
+#      2*cp_size. local_batch_size=1 -> each batch is one trajectory, so a median (~Nk) sample
+#      only computes ~N tokens, not a padded 128K.
+#   2. Assistant-only masking comes from qwen3_coderforge_chat_template.jinja (tools + {% generation %}
+#      blocks -> tokenizer emits return_assistant_tokens_mask). The stock Qwen3 template rewrites
+#      earlier turns and can't produce that mask.
+#
+# Topology (16 nodes / 128 GPUs): cp16 x dp8. 131072/16 = 8192 tokens/rank at the 128K worst case
+# -- the same per-rank sequence load as the proven gemma4-31B cp8 @ 64K run. cp16 spans 2 nodes
+# (CP across IB is slower than intra-node cp8, but cp8 @ 128K = 16384 tokens/rank risks OOM on 32B).
+#
+# Loss: FusedLinearCrossEntropy fuses lm_head + CE and consumes the final hidden state, avoiding the
+# [batch, seq, vocab] fp32 logit upcast that OOMs on 32B; it requires output_hidden_states=true.
+#
+# Run (16 nodes, static rendezvous via your multi-node launcher):
+#   automodel finetune llm -c examples/long_context_validation/qwen3_32b/qwen3_32b_coderforge_cp16_128k_lowerLR.yaml
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 16       # dp8 x local_batch_size 1 x grad_accum 2
+  local_batch_size: 1         # one (variable-length) trajectory per step -> no intra-batch pad waste
+  ckpt_every_steps: 100       # checkpoint every 100 to watch the eval closely
+  val_every_steps: 100        # validation loss every 100 gradient steps
+  # max_steps sets the cosine horizon; ckpt_every_steps=100 keeps the run resumable across 4h windows
+  # and lets you eval intermediate checkpoints (the gentler LR keeps improving through the early ones).
+  max_steps: 800
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-32B
+  output_hidden_states: true  # FusedLinearCrossEntropy needs the final hidden state, not full logits
+  # attn_implementation defaults to SDPA via the CP path; do NOT set flash_attention_2 (bypasses CP).
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /path/to/coderforge_ckpts/qwen3_32b_coderforge_cp16_lowerLR/
+  model_save_format: safetensors
+  save_consolidated: false    # DCP-only (fast); consolidate offline for eval. Avoids the slow inline 32B consolidation that got cut off mid-save (see AM-778/#3254).
+
+distributed:
+  strategy: fsdp2
+  dp_size: none               # auto: 128 / (tp1 * cp16) = 8
+  tp_size: 1
+  cp_size: 16                 # 131072 / (2*16) = 4096 -> divisible; 8192 tokens/rank at 128K
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  # Reduce-scatter grads every micro-batch. FSDP2 default (defer=true) accumulates the full
+  # UNSHARDED 32B grad across grad-accum steps and OOMs; defer off keeps only the sharded grad.
+  defer_fsdp_grad_sync: false
+
+clip_grad_norm:
+  max_norm: 1.0               # safety net against grad-norm spikes on the base model / long trajectories
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: data/cached/togethercomputer_CoderForge-Preview_filtered_reward1_seq131072/data.jsonl
+  split: train
+  seq_length: 131072
+  truncation: false           # data is prefiltered to <=128K; never truncate (would drop the turn-stop)
+  padding: do_not_pad         # collater pads each batch to a multiple of 2*cp_size
+  chat_template: examples/long_context_validation/qwen3_32b/qwen3_coderforge_chat_template.jinja
+
+packed_sequence:
+  packed_sequence_size: 0     # NO packing: packing + CP>1 over SDPA is unsupported for stock HF Qwen3
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  shuffle: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 32  # 2 * cp_size(16); pads each batch's sequence to a cp-divisible length
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: data/cached/togethercomputer_CoderForge-Preview_filtered_reward1_seq131072/val.jsonl
+  split: train
+  seq_length: 131072
+  truncation: false
+  padding: do_not_pad
+  chat_template: examples/long_context_validation/qwen3_32b/qwen3_coderforge_chat_template.jinja
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: false
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 32
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-6                   # gentler: halved from 1e-5 to slow drift into forgetting (try 3e-6 if it still peaks-then-regresses)
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+lr_scheduler:
+  lr_decay_style: cosine       # cosine horizon = max_steps -> smooth descent
+  lr_warmup_steps: 60
+  min_lr: 1.0e-6
+
+wandb:
+  enable: false
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>

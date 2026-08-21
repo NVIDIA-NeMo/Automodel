@@ -21,8 +21,6 @@ no compressor / indexer / sparse-attention path (the draft is always dense; V4's
 sparse machinery belongs to the target model, not this draft).
 """
 
-from typing import Optional
-
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
@@ -109,9 +107,9 @@ class DeepseekV4DSparkAttention(nn.Module):
         hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         del kwargs
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden_states.shape[1]
@@ -169,13 +167,13 @@ class DeepseekV4DSparkDecoderLayer(nn.Module):
 
     def forward(
         self,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[object] = None,
-        use_cache: Optional[bool] = False,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        target_hidden_states: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: object | None = None,
+        use_cache: bool | None = False,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del position_ids, past_key_value, use_cache, kwargs
@@ -325,8 +323,8 @@ class DeepseekV4DSparkModel(nn.Module):
     def predict_confidence_step(
         self,
         hidden_states: torch.Tensor,
-        prev_token_ids: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+        prev_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         if self.confidence_head is None:
             return None
         if self.confidence_head_with_markov:
@@ -343,7 +341,7 @@ class DeepseekV4DSparkModel(nn.Module):
         *,
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, proposal_len = base_logits.shape[:2]
         if proposal_len == 0:
@@ -369,7 +367,7 @@ class DeepseekV4DSparkModel(nn.Module):
         *,
         prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert base_logits.ndim == 2, (
             f"sample_draft_token_step expects base_logits shaped [batch, vocab], got {tuple(base_logits.shape)}."
@@ -392,10 +390,10 @@ class DeepseekV4DSparkModel(nn.Module):
         self,
         *,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        past_key_values: Optional[object] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden_states: torch.Tensor | None = None,
+        past_key_values: object | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -420,7 +418,7 @@ class DeepseekV4DSparkModel(nn.Module):
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        target_last_hidden_states: Optional[torch.Tensor] = None,
+        target_last_hidden_states: torch.Tensor | None = None,
     ) -> DSparkForwardOutput:
         bsz, seq_len = input_ids.shape
         device = input_ids.device

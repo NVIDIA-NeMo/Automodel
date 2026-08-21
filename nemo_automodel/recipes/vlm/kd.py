@@ -43,7 +43,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import wandb
@@ -55,7 +55,6 @@ from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
@@ -395,6 +394,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                     model=model,
                     hidden_states=hidden_states,
                     num_label_tokens=num_label_tokens,
+                    grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
                 )
             del hidden_states
 
@@ -413,19 +413,15 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             if is_train:
                 (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step with KD loss tracking."""
         num_label_tokens = torch.tensor(
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
-        if self.pp_enabled:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
-        else:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                float(self._get_dp_group_size(include_cp=True))
-            )
+        num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer: list[torch.Tensor] = []
 
@@ -435,7 +431,6 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
         for i, batch in enumerate(batches):
