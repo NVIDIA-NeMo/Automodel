@@ -2205,6 +2205,36 @@ def test_vlm_validation_uses_engine_forward_and_aggregates_uneven_batches(monkey
     assert metrics.metrics["num_label_tokens"] == pytest.approx(5.0)
 
 
+@pytest.mark.parametrize(
+    "batches",
+    [
+        [],
+        [{"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[-100, -100]])}],
+    ],
+)
+def test_vlm_validation_rejects_zero_global_denominator(monkeypatch, batches):
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.pp_enabled = False
+    recipe.loss_fn = object()
+    recipe.engine = MagicMock()
+    recipe.engine.forward.return_value = SimpleNamespace(
+        loss_sum=torch.tensor(0.0, dtype=torch.float64),
+        weight_sum=torch.tensor(0.0, dtype=torch.float64),
+        loss_fn_outputs=[],
+    )
+    recipe._dp_allreduce = MagicMock(side_effect=lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.ScopedRNG",
+        lambda **kwargs: nullcontext(),
+    )
+
+    with pytest.raises(ValueError, match="no supervised label tokens.*drop_last=true"):
+        recipe._run_validation_epoch(batches)
+
+    assert recipe._dp_allreduce.call_count == 2
+
+
 def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     """rope_fusion should remain True in VLM setup when cp_size == 1."""
     cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)

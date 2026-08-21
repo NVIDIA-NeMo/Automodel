@@ -612,8 +612,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
+        model_attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
-            model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
+            model_attn_implementation=model_attn_implementation,
             cp_size=self.mesh_context.cp_size,
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
@@ -643,6 +644,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.val_dataloader = None
         validation_config = self.cfg.vlm_validation_dataloader
         if validation_config is not None:
+            if self.pp_enabled and not validation_config.drop_last:
+                raise ValueError(
+                    "Pipeline-parallel VLM validation requires validation_dataloader.drop_last=true because "
+                    "AutoPipeline uses a fixed outer batch size. Enable drop_last or remove validation_dataset."
+                )
+            _validate_cp_packing_support(
+                self.model_parts[0],
+                packing_enabled=validation_config.packing is not None,
+                cp_size=self.mesh_context.cp_size,
+            )
+            validation_packing_attn_implementation = validation_config.resolve_packing_attn_implementation(
+                model_attn_implementation=model_attn_implementation,
+                cp_size=self.mesh_context.cp_size,
+            )
+            if validation_config.packing is not None and validation_config.packing.packing_format != "thd":
+                configure_packing(attn_implementation=validation_packing_attn_implementation)
             validation_build_context = FirstRankPerNode(group=process_group)
             with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
                 validation_build = validation_config.build(
@@ -652,6 +669,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                     dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
+                    packing_attn_implementation=validation_packing_attn_implementation,
+                    pp_n_microbatches=pp_n_microbatches,
                     cp_size=self.mesh_context.cp_size,
                 )
             self.val_dataloader = validation_build.dataloader
@@ -730,12 +749,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                     val_loss = {}
                     if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                        if self.pp_enabled:
-                            logger.warning("Validation is not supported for pipeline parallelism")
-                        else:
-                            val_log_data = self._run_validation_epoch(self.val_dataloader)
-                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_log_data)
+                        val_log_data = self._run_validation_epoch(self.val_dataloader)
+                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                        self.log_val_metrics(val_log_data)
                         for mp in self.model_parts:
                             mp.train()
 
@@ -1152,11 +1168,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 total_loss += result.loss_sum
                 total_num_label_tokens += result.weight_sum
 
-        # Engine.forward has already reconstructed CP shards. Only independent
-        # DP validation shards remain to combine (VLM PP validation stays disabled).
+        # Engine.forward has already reconstructed CP shards and synchronized
+        # PP stages. Only independent DP validation shards remain to combine.
         total_loss = self._dp_allreduce(total_loss).item()
         total_num_label_tokens = int(self._dp_allreduce(total_num_label_tokens).item())
-        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+        if total_num_label_tokens <= 0:
+            raise ValueError(
+                "VLM validation produced no supervised label tokens after DP aggregation. "
+                "With pipeline parallelism, validation_dataloader.drop_last=true may have removed every batch "
+                "because each DP shard is smaller than the local batch size; otherwise verify that labels are not "
+                "all masked."
+            )
+        val_loss = total_loss / total_num_label_tokens
 
         return MetricsSample(
             step=self.step_scheduler.step,
