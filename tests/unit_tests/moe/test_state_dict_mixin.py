@@ -641,6 +641,27 @@ class TestFromHfWMergedExperts:
         assert stack.call_count == 1
         assert stack.call_args.kwargs["out"] is grouped
 
+    @skip_if_no_gpu
+    @pytest.mark.run_only_on("GPU")
+    @pytest.mark.torch_memory_limit(cuda_mb=40)
+    def test_direct_fill_cuda_peak_is_inputs_plus_one_output(self):
+        """Catch reintroducing per-expert concatenation buffers before the final stack."""
+        mixin = MockMoEStateDictMixin(n_experts=8, inter_dim=512, dtype=torch.bfloat16)
+        # Inputs occupy 16 MiB and the grouped output occupies 16 MiB. The old cat-then-stack implementation retained
+        # another 16 MiB of per-expert concatenations and therefore exceeded this 40 MiB budget.
+        expert_parts = [
+            (
+                torch.empty((1024, 512), dtype=torch.bfloat16, device="cuda"),
+                torch.empty((1024, 512), dtype=torch.bfloat16, device="cuda"),
+            )
+            for _ in range(8)
+        ]
+
+        grouped = mixin._direct_fill_grouped_expert_tensor(expert_parts)
+
+        assert grouped.shape == (8, 1024, 1024)
+        assert grouped.is_contiguous()
+
     @patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local")
     @patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank")
     def test_basic_conversion(self, mock_should_load, mock_create_dtensor):
@@ -1153,7 +1174,7 @@ class TestInplaceLoadViews:
             "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
         )
 
-    def test_te_load_destinations_do_not_copy_initialized_gate_and_up_values(self):
+    def test_noncontiguous_load_destinations_use_blank_buffers(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
         mixin.backend.experts = "te"
         initialized = torch.arange(2 * 4 * 6, dtype=torch.float32).reshape(2, 4, 6)
@@ -1176,6 +1197,78 @@ class TestInplaceLoadViews:
         for _, destination in result:
             assert destination.is_contiguous()
             torch.testing.assert_close(destination, torch.full_like(destination, -17.0))
+
+    def test_te_checkpoint_layout_views_are_reused(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        mixin.backend.experts = "te"
+        gate_up_storage = torch.arange(2 * 6 * 4, dtype=torch.float32).reshape(2, 6, 4)
+        down_storage = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+
+        # GroupedExpertsTE exposes stack(per_expert_weights).transpose(-1, -2).
+        # The adapter transposes each expert back, yielding contiguous checkpoint-layout views.
+        virtual_gate_up = gate_up_storage.transpose(-1, -2)
+        virtual_down = down_storage.transpose(-1, -2)
+
+        with (
+            patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
+            patch("torch.empty_like") as empty_like,
+        ):
+            destinations = dict(
+                mixin._convert_single_merged_expert_to_hf_split_experts(
+                    "model.layers.0.mlp.experts.gate_and_up_projs",
+                    virtual_gate_up,
+                    load_into_empty_destinations=True,
+                )
+            )
+            destinations.update(
+                mixin._convert_single_merged_expert_to_hf_split_experts(
+                    "model.layers.0.mlp.experts.down_projs",
+                    virtual_down,
+                    load_into_empty_destinations=True,
+                )
+            )
+
+        empty_like.assert_not_called()
+        for expert_id in range(2):
+            gate = destinations[f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"]
+            up = destinations[f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"]
+            down = destinations[f"model.layers.0.mlp.experts.{expert_id}.down_proj.weight"]
+            assert gate.is_contiguous() and up.is_contiguous() and down.is_contiguous()
+            assert gate.untyped_storage().data_ptr() == gate_up_storage.untyped_storage().data_ptr()
+            assert up.untyped_storage().data_ptr() == gate_up_storage.untyped_storage().data_ptr()
+            assert down.untyped_storage().data_ptr() == down_storage.untyped_storage().data_ptr()
+            torch.testing.assert_close(gate, gate_up_storage[expert_id, :3])
+            torch.testing.assert_close(up, gate_up_storage[expert_id, 3:])
+            torch.testing.assert_close(down, down_storage[expert_id])
+
+    @skip_if_no_gpu
+    @pytest.mark.run_only_on("GPU")
+    @pytest.mark.torch_memory_limit(cuda_mb=70)
+    def test_te_checkpoint_layout_cuda_peak_stays_within_one_buffer(self):
+        """Catch allocating a second model-sized destination for TE checkpoint views."""
+        mixin = MockMoEStateDictMixin(n_experts=8, inter_dim=1024, dtype=torch.bfloat16)
+        mixin.backend.experts = "te"
+        # The TE stack is 64 MiB. Reusing its checkpoint-layout views fits this 70 MiB budget; allocating blank
+        # destinations of the same total size would double live allocation to 128 MiB.
+        gate_up_storage = torch.empty((8, 2048, 2048), dtype=torch.bfloat16, device="cuda")
+        virtual_gate_up = gate_up_storage.transpose(-1, -2)
+
+        with (
+            patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
+            patch("nemo_automodel.components.moe.state_dict_mixin.gc.collect") as collect,
+            patch("torch.cuda.empty_cache") as empty_cache,
+        ):
+            destinations = mixin._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.gate_and_up_projs",
+                virtual_gate_up,
+                load_into_empty_destinations=True,
+            )
+
+        assert destinations is not None and len(destinations) == 16
+        source_ptr = gate_up_storage.untyped_storage().data_ptr()
+        assert all(value.untyped_storage().data_ptr() == source_ptr for _, value in destinations)
+        collect.assert_not_called()
+        empty_cache.assert_not_called()
 
     def test_empty_te_destinations_round_trip_checkpoint_values(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
