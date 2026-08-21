@@ -371,18 +371,34 @@ def test_cache_hub_source_legal_assets_uses_exact_loaded_revision(monkeypatch):
     )
 
 
-def test_sentence_transformer_source_with_unsupported_module_is_rejected(tmp_path):
-    (tmp_path / "1_Pooling").mkdir()
+@pytest.mark.parametrize(
+    "module_types",
+    [
+        [
+            "sentence_transformers.models.Transformer",
+            "sentence_transformers.models.Pooling",
+            "sentence_transformers.models.Dense",
+        ],
+        [
+            "sentence_transformers.models.Transformer",
+            "sentence_transformers.models.Normalize",
+            "sentence_transformers.models.Pooling",
+        ],
+    ],
+)
+def test_sentence_transformer_source_with_unsupported_module_stack_is_rejected(tmp_path, module_types):
     (tmp_path / "modules.json").write_text(
         json.dumps(
             [
-                {"idx": 0, "path": "", "type": "sentence_transformers.models.Transformer"},
-                {"idx": 1, "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
-                {"idx": 2, "path": "2_Dense", "type": "sentence_transformers.models.Dense"},
+                {
+                    "idx": index,
+                    "path": "" if index == 0 else f"{index}_Module",
+                    "type": module_type,
+                }
+                for index, module_type in enumerate(module_types)
             ]
         )
     )
-    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode_mean_tokens": True}))
 
     with pytest.raises(ValueError, match="exact supported module stack"):
         sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
