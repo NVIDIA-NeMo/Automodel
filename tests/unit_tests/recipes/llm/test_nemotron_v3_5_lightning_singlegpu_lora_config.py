@@ -23,13 +23,7 @@ from nemo_automodel.components.config.loader import load_yaml_config
 from nemo_automodel.components.models.common import BackendConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-CONFIG_PATH = (
-    REPO_ROOT
-    / "examples"
-    / "llm_finetune"
-    / "nemotron"
-    / "nemotron_nano_v3_5_lightning_singlegpu_lora.yaml"
-)
+CONFIG_PATH = REPO_ROOT / "examples" / "llm_finetune" / "nemotron" / "nemotron_nano_v3_5_lightning_singlegpu_lora.yaml"
 
 
 def test_nemotron_v3_5_lightning_lora_is_strictly_single_gpu() -> None:
@@ -52,9 +46,7 @@ def test_nemotron_v3_5_lightning_lora_is_strictly_single_gpu() -> None:
     assert peft.alpha == 32
     assert peft.use_memory_efficient_lora is True
 
-    assert config.model.pretrained_model_name_or_path == (
-        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
-    )
+    assert config.model.pretrained_model_name_or_path == ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16")
     assert config.model.num_nextn_predict_layers == 2
     assert config.model.mtp_use_repeated_layer is True
     assert config.model.mtp_loss_scaling_factor == 0.1

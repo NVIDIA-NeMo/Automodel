@@ -63,7 +63,6 @@
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as metadata_version
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -216,7 +215,7 @@ class FusedLinearCrossEntropy(nn.Module):
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
         lm_weight: torch.Tensor,
-        num_label_tokens: Optional[int] = None,
+        num_label_tokens: int | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
         """Compute fused linear cross entropy matching PyTorch behavior.

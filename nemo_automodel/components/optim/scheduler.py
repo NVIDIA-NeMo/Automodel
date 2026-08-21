@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Optional, TypeVar
+from typing import Any, TypeVar
 
 from torch.optim.optimizer import Optimizer
 
@@ -53,10 +53,10 @@ class OptimizerParamScheduler:
         end_wd: float,
         wd_incr_steps: int,
         wd_incr_style: str,
-        use_checkpoint_opt_param_scheduler: Optional[bool] = True,
-        override_opt_param_scheduler: Optional[bool] = False,
-        wsd_decay_steps: Optional[int] = None,
-        lr_wsd_decay_style: Optional[str] = None,
+        use_checkpoint_opt_param_scheduler: bool | None = True,
+        override_opt_param_scheduler: bool | None = False,
+        wsd_decay_steps: int | None = None,
+        lr_wsd_decay_style: str | None = None,
     ) -> None:
         """
         Constructor for OptimizerParamScheduler.
