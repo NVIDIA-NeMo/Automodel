@@ -70,7 +70,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     requires_tensor_merging,
 )
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
-from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadGroup, StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -760,135 +760,6 @@ class Checkpointer:
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
         optimizer_state.load_state_dict(state_dict)
 
-    def _load_model_in_checkpoint_groups(
-        self,
-        model_state: ModelState,
-        adapter: StateDictAdapter,
-        model_path: str,
-        storage_reader: StorageReader,
-    ) -> None:
-        """Load one adapter-owned dependency group at a time and verify complete model coverage.
-
-        Args:
-            model_state: Wrapper around the single model part whose final parameter storage is populated.
-            adapter: Model-owned adapter that maps model tensors into dependency-complete checkpoint groups.
-            model_path: Hugging Face safetensors checkpoint directory.
-            storage_reader: Reader already bound to ``model_path``. Its metadata may be reused across groups.
-
-        Raises:
-            RuntimeError: If checkpoint keys are missing, if model tensors are not covered, or if no groups are yielded.
-            TypeError: If the adapter yields an object that is not a :class:`CheckpointLoadGroup`.
-            ValueError: If groups are empty or request the same checkpoint key more than once.
-        """
-        model_part = _unwrap_ddp_model(model_state.model[0])
-        checkpoint_state = adapter.get_checkpoint_load_state(model_part)
-        expected_native_keys = set(checkpoint_state)
-        ep_mesh_dims = [dim for dim in self.moe_mesh.mesh_dim_names if dim != "pp"] if self.moe_mesh is not None else []
-        ep_mesh = self.moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else self.moe_mesh
-        started = time.monotonic()
-        checkpoint_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
-        metadata_seconds = time.monotonic() - started
-
-        storage_seconds = 0.0
-        install_seconds = 0.0
-        requested_checkpoint_keys: set[str] = set()
-        loaded_native_keys: set[str] = set()
-        requested_bytes = 0
-        max_group_bytes = 0
-        group_count = 0
-
-        process_group = getattr(self, "process_group", None)
-        process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
-
-        for group in adapter.iter_checkpoint_load_groups(checkpoint_state, device_mesh=ep_mesh):
-            if not isinstance(group, CheckpointLoadGroup):
-                raise TypeError(
-                    f"{type(adapter).__name__}.iter_checkpoint_load_groups yielded {type(group).__name__}, "
-                    "expected CheckpointLoadGroup"
-                )
-            if not group.destinations:
-                raise ValueError(f"{type(adapter).__name__} yielded an empty checkpoint load group")
-            if not group.native_keys:
-                raise ValueError(f"{type(adapter).__name__} yielded a checkpoint load group with no model tensors")
-
-            group_keys = set(group.destinations)
-            duplicate_keys = sorted(group_keys & requested_checkpoint_keys)
-            if duplicate_keys:
-                raise ValueError(
-                    f"{type(adapter).__name__} requested {len(duplicate_keys)} checkpoint keys in multiple groups "
-                    f"(examples={duplicate_keys[:5]})"
-                )
-            missing_keys = sorted(group_keys - checkpoint_keys)
-            if missing_keys:
-                raise RuntimeError(
-                    f"Checkpoint {model_path} is missing {len(missing_keys)} keys required by checkpoint load group "
-                    f"{group_count + 1} (examples={missing_keys[:5]})"
-                )
-
-            group_native_keys = set(group.native_keys)
-            duplicate_native_keys = sorted(group_native_keys & loaded_native_keys)
-            if duplicate_native_keys:
-                raise ValueError(
-                    f"{type(adapter).__name__} completed {len(duplicate_native_keys)} model tensors in multiple "
-                    f"groups (examples={duplicate_native_keys[:5]})"
-                )
-            unexpected_native_keys = sorted(group_native_keys - expected_native_keys)
-            if unexpected_native_keys:
-                raise ValueError(
-                    f"{type(adapter).__name__} reported {len(unexpected_native_keys)} unknown model tensors "
-                    f"(examples={unexpected_native_keys[:5]})"
-                )
-
-            group_bytes = sum(estimate_tensor_bytes(tensor) for tensor in group.destinations.values())
-            requested_bytes += group_bytes
-            max_group_bytes = max(max_group_bytes, group_bytes)
-            requested_checkpoint_keys |= group_keys
-
-            storage_started = time.monotonic()
-            # The reader is already bound to ``model_path``. Omitting checkpoint_id prevents DCP from resetting it
-            # for every group, which lets the HF reader reuse parsed safetensors metadata.
-            dcp.load(group.destinations, storage_reader=storage_reader, **process_group_kwargs)
-            storage_seconds += time.monotonic() - storage_started
-
-            install_started = time.monotonic()
-            group.install()
-            install_seconds += time.monotonic() - install_started
-            loaded_native_keys |= group_native_keys
-            group_count += 1
-
-            del group
-
-        if group_count == 0:
-            raise RuntimeError(f"{type(adapter).__name__} opted into checkpoint load groups but yielded no groups")
-
-        missing_native_keys = sorted(expected_native_keys - loaded_native_keys)
-        if missing_native_keys:
-            raise RuntimeError(
-                f"{type(adapter).__name__} checkpoint load groups omitted {len(missing_native_keys)} model tensors "
-                f"(examples={missing_native_keys[:5]})"
-            )
-
-        if model_state.uses_tied_lm_head and not model_state.is_peft:
-            ensure_tied_lm_head(model_part)
-
-        total_seconds = time.monotonic() - started
-        requested_gb = requested_bytes / (1 << 30)
-        max_group_gb = max_group_bytes / (1 << 30)
-        logger.info(
-            "load_model: loaded %.2f GB in %d checkpoint groups over %.2fs "
-            "(%.2f GB/s overall | max group %.2f GB, metadata %.2fs, storage read %.2fs, install %.2fs, "
-            "native keys %d)",
-            requested_gb,
-            group_count,
-            total_seconds,
-            requested_gb / max(total_seconds, 1e-9),
-            max_group_gb,
-            metadata_seconds,
-            storage_seconds,
-            install_seconds,
-            len(loaded_native_keys),
-        )
-
     @torch.no_grad()
     def load_model(
         self,
@@ -978,32 +849,6 @@ class Checkpointer:
             )
             and not self.config.dequantize_base_checkpoint
         )
-        supports_checkpoint_load_groups = (
-            isinstance(state_dict_adapter, StateDictAdapter)
-            and state_dict_adapter.supports_checkpoint_load_groups
-            and not self.config.dequantize_base_checkpoint
-        )
-        if (
-            is_init_step
-            and is_safetensors
-            and len(model_state.model) == 1
-            and world_size == 1
-            and supports_checkpoint_load_groups
-            and not allow_checkpoint_key_subset
-        ):
-            storage_reader = self._get_storage_reader(
-                model_path,
-                key_mapping=None,
-                is_init_step=True,
-                is_safetensors=True,
-            )
-            if storage_reader is None:
-                raise RuntimeError(
-                    f"No safetensors storage reader is available for checkpoint load groups from {model_path}"
-                )
-            self._load_model_in_checkpoint_groups(model_state, state_dict_adapter, model_path, storage_reader)
-            return
-
         single_device_custom_safetensors = (
             is_safetensors and is_custom_model and world_size == 1 and not can_load_without_full_copy
         )
