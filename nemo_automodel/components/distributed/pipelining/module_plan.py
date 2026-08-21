@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
+
+logger = logging.getLogger(__name__)
+
+
+class PipelineStagePlanError(ValueError):
+    """Raised when a pipeline stage plan does not match the model's module tree."""
 
 
 def stage_ids_this_rank(pp_rank: int, pp_size: int, num_stages: int, style: str = "loop") -> tuple[int, ...]:
@@ -79,6 +86,103 @@ def generate_hf_model_fqn_per_model_part(
         module_names_per_stage.append(stage_modules)
 
     return module_names_per_stage
+
+
+def drop_absent_speculative_modules(
+    module_names_per_stage: list[list[str]],
+    present_module_fqns: set[str],
+) -> list[list[str]]:
+    """Remove speculative multimodal FQNs the model does not actually own.
+
+    :func:`generate_hf_model_fqn_per_model_part` places every name in
+    ``MULTIMODAL_SUFFIXES`` on stage 0 without knowing which encoders a given
+    checkpoint has, so a text-only model legitimately receives FQNs that resolve
+    to nothing. Those names are dropped here, which lets every remaining name be
+    treated as a hard requirement.
+
+    Args:
+        module_names_per_stage: Module FQNs owned by each global pipeline stage.
+        present_module_fqns: Every module FQN that exists in the model.
+
+    Returns:
+        The stage plan without the speculative names that do not resolve.
+    """
+    present_leaf_names = {fqn.rsplit(".", 1)[-1] for fqn in present_module_fqns}
+    kept_per_stage: list[list[str]] = []
+    dropped: list[str] = []
+    for stage_modules in module_names_per_stage:
+        kept: list[str] = []
+        for name in stage_modules:
+            leaf_name = name.rsplit(".", 1)[-1]
+            if name in present_module_fqns or leaf_name not in MULTIMODAL_SUFFIXES:
+                kept.append(name)
+                continue
+            dropped.append(name)
+            if leaf_name in present_leaf_names:
+                logger.warning(
+                    "Pipeline stage plan names %r, which does not exist, while the model does own a module named "
+                    "%r elsewhere; that module is assigned to no stage and will be dropped from every stage.",
+                    name,
+                    leaf_name,
+                )
+        kept_per_stage.append(kept)
+    if dropped:
+        logger.debug("Dropped %d speculative multimodal FQNs from the stage plan: %s", len(dropped), sorted(dropped))
+    return kept_per_stage
+
+
+def validate_stage_plan(
+    module_names_per_stage: list[list[str]],
+    *,
+    present_module_fqns: set[str],
+    layer_fqns: list[str],
+) -> None:
+    """Validate that a stage plan matches the model and partitions its layers.
+
+    Args:
+        module_names_per_stage: Module FQNs owned by each global pipeline stage.
+        present_module_fqns: Every module FQN that exists in the model.
+        layer_fqns: FQN of every transformer layer, in model order.
+
+    Raises:
+        PipelineStagePlanError: If a name does not resolve to a module, if a
+            stage owns no transformer layer, or if the stages do not cover every
+            transformer layer exactly once.
+    """
+    unresolved = {
+        stage_index: sorted(name for name in stage_modules if name not in present_module_fqns)
+        for stage_index, stage_modules in enumerate(module_names_per_stage)
+    }
+    unresolved = {stage_index: names for stage_index, names in unresolved.items() if names}
+    if unresolved:
+        details = "; ".join(f"stage {stage_index}: {names}" for stage_index, names in sorted(unresolved.items()))
+        raise PipelineStagePlanError(
+            f"Pipeline stage plan names modules that do not exist in the model ({details}). "
+            "Every planned FQN must resolve to a submodule, otherwise the stage silently loses that module."
+        )
+
+    layer_fqn_set = set(layer_fqns)
+    owner_per_layer: dict[str, list[int]] = {fqn: [] for fqn in layer_fqns}
+    empty_stages = []
+    for stage_index, stage_modules in enumerate(module_names_per_stage):
+        owned = [name for name in stage_modules if name in layer_fqn_set]
+        if not owned:
+            empty_stages.append(stage_index)
+        for name in owned:
+            owner_per_layer[name].append(stage_index)
+    if empty_stages:
+        raise PipelineStagePlanError(
+            f"Pipeline stages {empty_stages} own no transformer layer; every stage must own at least one of the "
+            f"{len(layer_fqns)} layers."
+        )
+
+    missing = [fqn for fqn, owners in owner_per_layer.items() if not owners]
+    duplicated = [f"{fqn} -> stages {owners}" for fqn, owners in owner_per_layer.items() if len(owners) > 1]
+    if missing or duplicated:
+        raise PipelineStagePlanError(
+            "Pipeline stages must cover every transformer layer exactly once, but layers assigned to no stage: "
+            f"{missing}; layers assigned to several stages: {duplicated}."
+        )
 
 
 def calculate_virtual_stages(

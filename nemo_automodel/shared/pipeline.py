@@ -12,14 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed model-owned contracts for pipeline parallelism."""
+"""Typed model-owned contracts for pipeline parallelism.
+
+Stage-boundary tensor metadata is intentionally absent from this contract.
+``torch.distributed.pipelining.PipelineStage`` infers it at runtime from the
+real inputs handed to ``schedule.step()``, propagating each stage's observed
+output metadata to the next stage. Runtime inference observes the actual dtype,
+context-parallel sharding, and tuple arity of a stage boundary, so models no
+longer declare it.
+"""
 
 from enum import Enum
 
 import torch
 import torch.nn as nn
 
-StageMetadata = tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]
+PP_MEDIA_INDEX_KEY = "pp_media_index"
 
 
 class PipelineForwardStyle(Enum):
@@ -32,12 +40,18 @@ class PipelineForwardStyle(Enum):
 class PipelineModelMixin:
     """Explicit pipeline behavior contract for model-owned specialization.
 
-    Models inherit this mixin only when they need to preserve their own forward,
-    customize stage ownership, or declare nonstandard stage-boundary tensors.
-    The generic HuggingFace pipeline path does not require the mixin.
+    Models inherit this mixin only when they need to preserve their own forward
+    or customize stage ownership. The generic HuggingFace pipeline path does not
+    require the mixin.
     """
 
     pipeline_forward_style = PipelineForwardStyle.PATCH_HF
+
+    #: Whether the final model part can skip its vocabulary projection and emit
+    #: hidden states for a fused loss such as ``FusedLinearCrossEntropy``.
+    #: Models keeping their own forward must honor ``_pp_return_hidden_states``
+    #: to opt in.
+    pipeline_supports_hidden_state_output: bool = False
 
     def pipeline_stage_modules(
         self,
@@ -59,77 +73,45 @@ class PipelineModelMixin:
         del layers_prefix, text_model
         return module_names_per_stage
 
-    def pipeline_stage_metas(
-        self,
-        *,
-        is_first: bool,
-        microbatch_size: int,
-        seq_len: int,
-        dtype: torch.dtype,
-    ) -> StageMetadata | None:
-        """Return model-specific stage-boundary tensor metadata when required.
 
-        Args:
-            is_first: Whether this model part owns the first global stage.
-            microbatch_size: Local samples per pipeline microbatch.
-            seq_len: Full input sequence length before any context sharding.
-            dtype: Activation dtype used at the pipeline boundary.
+def pp_media_chunk(module: nn.Module, name: str, pp_media_index: torch.Tensor | None):
+    """Return the media tensor staged for the microbatch currently being executed.
 
-        Returns:
-            ``None`` for the standard causal-LM contract, otherwise input and
-            output tuples of meta tensors. Tensor ranks are model-defined; their
-            leading axes represent local microbatch and sequence or token axes.
-        """
-        del is_first, microbatch_size, seq_len, dtype
-        return None
-
-
-def causal_lm_stage_metas(
-    *,
-    is_first: bool,
-    has_lm_head: bool,
-    emits_hidden_states: bool,
-    microbatch_size: int,
-    input_seq_len: int,
-    output_seq_len: int,
-    hidden_size: int,
-    vocab_size: int,
-    dtype: torch.dtype,
-    logits_dtype: torch.dtype | None = None,
-) -> StageMetadata:
-    """Construct the common causal-LM pipeline boundary metadata.
+    Pipeline schedules may execute microbatches in a schedule-defined order and
+    additionally run one probe forward per stage for runtime shape inference, so
+    the executing microbatch cannot be tracked with a cursor. Instead the batch
+    carries ``pp_media_index``: an int64 tensor of shape [batch] whose entry for
+    every sample is that sample's microbatch index. ``torch.distributed.pipelining``
+    splits it along the batch axis in lockstep with the model input, so each
+    forward receives a [microbatch] slice identifying its own chunk.
 
     Args:
-        is_first: Whether the stage consumes token IDs.
-        has_lm_head: Whether the stage owns the vocabulary projection.
-        emits_hidden_states: Whether a final stage intentionally bypasses its
-            vocabulary projection for a fused loss.
-        microbatch_size: Local samples per pipeline microbatch.
-        input_seq_len: Sequence length consumed by the first stage.
-        output_seq_len: Per-rank sequence length transferred between stages.
-        hidden_size: Hidden-state width.
-        vocab_size: Unpadded vocabulary width emitted by the LM head.
-        dtype: Hidden-state and logits dtype.
-        logits_dtype: Optional logits dtype when the LM head intentionally uses
-            different precision from hidden activations.
+        module: Stage-0 module holding ``_pp_media_chunks``, a mapping of media
+            name to one tensor per microbatch.
+        name: Media key to look up, e.g. ``"pixel_values"``.
+        pp_media_index: Tensor of shape [microbatch] holding this microbatch's
+            index, or None when the batch carries no media.
 
     Returns:
-        Input and output meta tensors. The first-stage input has shape
-        [microbatch, input_sequence]; other inputs and hidden outputs have shape
-        [microbatch, output_sequence, hidden], and logits have shape
-        [microbatch, output_sequence, vocab].
+        The staged tensor for this microbatch, or None when this microbatch
+        carries no media for that key. A microbatch whose samples are all
+        text-only is staged as an empty tensor so the per-microbatch chunk list
+        stays positionally aligned; it is reported here as None so callers skip
+        their media path instead of invoking an encoder on zero inputs.
     """
-    hidden_shape = (microbatch_size, output_seq_len, hidden_size)
-    if is_first:
-        inputs = (torch.empty(microbatch_size, input_seq_len, device="meta", dtype=torch.long),)
-    else:
-        inputs = (torch.empty(*hidden_shape, device="meta", dtype=dtype),)
-    output_width = hidden_size if not has_lm_head or emits_hidden_states else vocab_size
-    output_dtype = logits_dtype if has_lm_head and not emits_hidden_states and logits_dtype is not None else dtype
-    outputs = (torch.empty(microbatch_size, output_seq_len, output_width, device="meta", dtype=output_dtype),)
-    return inputs, outputs
-
-
-def context_parallel_seq_len(seq_len: int, cp_size: int) -> int:
-    """Return the padded per-rank sequence length for round-robin CP sharding."""
-    return (seq_len + (-seq_len) % (2 * cp_size)) // cp_size if cp_size > 1 else seq_len
+    chunks = getattr(module, "_pp_media_chunks", None)
+    if not chunks or pp_media_index is None:
+        return None
+    staged = chunks.get(name)
+    if staged is None:
+        return None
+    index = int(pp_media_index.reshape(-1)[0])
+    if index < 0 or index >= len(staged):
+        raise IndexError(
+            f"pp_media_index {index} is out of range for {len(staged)} staged '{name}' chunks; "
+            "the media staging and the schedule disagree about the microbatch count."
+        )
+    chunk = staged[index]
+    if chunk is None or (isinstance(chunk, torch.Tensor) and chunk.numel() == 0):
+        return None
+    return chunk
