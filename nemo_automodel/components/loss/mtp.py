@@ -19,6 +19,7 @@ from typing import Literal, overload
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.fsdp import FSDPModule
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.utils import (
@@ -132,7 +133,8 @@ def calculate_mtp_loss(
             path uses).
         mtp_per_depth_h: Per-depth hidden-state tensors of shape
             ``[batch, sequence, hidden]``, or ``[1, tokens, hidden]`` for a
-            flattened THD-packed stream.
+            flattened THD-packed stream. Projection paths cast these tensors
+            to the LM head's effective compute dtype when needed.
         mtp_per_depth_logits: Per-depth logit tensors of shape
             ``[batch, sequence, vocab]``, or ``[1, tokens, vocab]`` for a
             flattened THD-packed stream.
@@ -294,11 +296,18 @@ def calculate_mtp_loss(
             lm_head = _get_lm_head_module(model)
             if lm_head is None:
                 raise ValueError("lm_head module not found in model")
+            compute_dtype = None
+            if isinstance(lm_head, FSDPModule):
+                # A resharded head exposes its persistent master-copy dtype
+                # until the FSDP pre-forward hook materializes compute weights.
+                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
             lm_head_weight = getattr(lm_head, "weight", None)
-            if isinstance(lm_head_weight, torch.Tensor):
+            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
                 # Match the projection's parameter dtype instead of relying on
                 # linear kernels to accept mixed input/weight dtypes.
-                mtp_output = mtp_output.to(dtype=lm_head_weight.dtype)
+                compute_dtype = lm_head_weight.dtype
+            if compute_dtype is not None:
+                mtp_output = mtp_output.to(dtype=compute_dtype)
             depth_loss = calculate_loss(
                 loss_fn,
                 logits=lm_head(mtp_output),
