@@ -30,7 +30,6 @@ with model-specific optimizations (YaRN, MLA, etc.).
 """
 
 import math
-from typing import Optional
 
 import torch
 from torch import nn
@@ -190,7 +189,7 @@ def _get_rope_config(config) -> tuple[float, dict]:
     return base, rope_scaling
 
 
-def _compute_default_inv_freq(config, device: Optional[torch.device] = None) -> tuple[torch.Tensor, float]:
+def _compute_default_inv_freq(config, device: torch.device | None = None) -> tuple[torch.Tensor, float]:
     """Computes inverse frequencies for standard RoPE."""
     base, _ = _get_rope_config(config)
     dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
@@ -201,7 +200,7 @@ def _compute_default_inv_freq(config, device: Optional[torch.device] = None) -> 
     return inv_freq, 1.0
 
 
-def _compute_llama3_inv_freq(config, device: Optional[torch.device] = None) -> tuple[torch.Tensor, float]:
+def _compute_llama3_inv_freq(config, device: torch.device | None = None) -> tuple[torch.Tensor, float]:
     """Computes inverse frequencies for Llama3-style RoPE with smooth interpolation.
 
     Branch logic (matches HF _compute_llama3_parameters):
@@ -244,7 +243,7 @@ class LlamaRotaryEmbedding(nn.Module):
 
     inv_freq: torch.Tensor
 
-    def __init__(self, config, device: Optional[torch.device] = None, rope_fusion: bool = False):
+    def __init__(self, config, device: torch.device | None = None, rope_fusion: bool = False):
         super().__init__()
         self.max_seq_len_cached = 0
         self.rope_fusion = rope_fusion

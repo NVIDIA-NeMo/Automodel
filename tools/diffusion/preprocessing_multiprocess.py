@@ -54,7 +54,7 @@ import multiprocessing
 import os
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Dict, List, Protocol, Tuple, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +82,11 @@ VIDEO_EXTENSIONS = {"mp4", "avi", "mov", "mkv", "webm"}
 # =============================================================================
 # Global worker state (initialized once per process)
 # =============================================================================
-_worker_models: Optional[Dict[str, Any]] = None
-_worker_processor: Optional[BaseModelProcessor] = None
-_worker_calculator: Optional[MultiTierBucketCalculator] = None
-_worker_device: Optional[str] = None
-_worker_config: Optional[Dict[str, Any]] = None
+_worker_models: Dict[str, Any] | None = None
+_worker_processor: BaseModelProcessor | None = None
+_worker_calculator: MultiTierBucketCalculator | None = None
+_worker_device: str | None = None
+_worker_config: Dict[str, Any] | None = None
 
 
 # =============================================================================
@@ -194,7 +194,7 @@ def _load_all_captions(
     return captions
 
 
-def _process_image(args: Tuple) -> Optional[Dict]:
+def _process_image(args: Tuple) -> Dict | None:
     """Process a single image using pre-initialized worker state."""
     image_path, output_dir, verify, caption = args
 
@@ -286,24 +286,24 @@ def _process_shard_on_gpu(
 
 
 def preprocess_dataset(
-    image_dir: Optional[str],
+    image_dir: str | None,
     output_dir: str,
     processor_name: str,
-    model_name: Optional[str] = None,
+    model_name: str | None = None,
     shard_size: int = 10000,
     verify: bool = False,
     caption_field: str = "internvl",
-    max_images: Optional[int] = None,
+    max_images: int | None = None,
     max_pixels: int = 256 * 256,
     *,
-    dataset_name: Optional[str] = None,
+    dataset_name: str | None = None,
     dataset_split: str = "train",
-    dataset_config_name: Optional[str] = None,
-    dataset_media_column: Optional[str] = None,
-    dataset_caption_column: Optional[str] = None,
-    dataset_dir: Optional[str] = None,
+    dataset_config_name: str | None = None,
+    dataset_media_column: str | None = None,
+    dataset_caption_column: str | None = None,
+    dataset_dir: str | None = None,
     dataset_streaming: bool = False,
-    dataset_trust_remote_code: Optional[bool] = None,
+    dataset_trust_remote_code: bool | None = None,
 ):
     """
     Preprocess image dataset with one process per GPU.
@@ -568,7 +568,7 @@ def _resolve_video_resolution(
     orig_width: int,
     orig_height: int,
     config: Dict[str, Any],
-) -> Tuple[int, int, Optional[str], float]:
+) -> Tuple[int, int, str | None, float]:
     """Resolve target resolution. Returns (width, height, bucket_id, aspect_ratio)."""
     target_height = config.get("target_height")
     target_width = config.get("target_width")
@@ -611,12 +611,12 @@ def _build_result_dict(
     orig_width: int,
     orig_height: int,
     caption: str,
-    bucket_id: Optional[str],
+    bucket_id: str | None,
     aspect_ratio: float,
     num_frames: int = 1,
-    frame_index: Optional[int] = None,
-    total_frames_extracted: Optional[int] = None,
-    source_frame_index: Optional[int] = None,
+    frame_index: int | None = None,
+    total_frames_extracted: int | None = None,
+    source_frame_index: int | None = None,
 ) -> Dict[str, Any]:
     """Build a result dictionary for a processed video/frame."""
     result = {
@@ -754,7 +754,7 @@ def _process_video_frames_mode(args: Tuple) -> List[Dict]:
         return []
 
 
-def _process_video_video_mode(args: Tuple) -> Optional[Dict]:
+def _process_video_video_mode(args: Tuple) -> Dict | None:
     """Process video in video mode - multi-frame encoding as single sample."""
     video_path, output_dir, caption, config = args
 
@@ -889,17 +889,17 @@ def _process_video_shard_on_gpu(
 
 
 def preprocess_video_dataset(
-    video_dir: Optional[str],
+    video_dir: str | None,
     output_dir: str,
     processor_name: str,
-    model_name: Optional[str] = None,
+    model_name: str | None = None,
     mode: str = "video",
     num_frames: int = 10,
-    target_frames: Optional[int] = None,
-    resolution_preset: Optional[str] = None,
-    max_pixels: Optional[int] = None,
-    target_height: Optional[int] = None,
-    target_width: Optional[int] = None,
+    target_frames: int | None = None,
+    resolution_preset: str | None = None,
+    max_pixels: int | None = None,
+    target_height: int | None = None,
+    target_width: int | None = None,
     resize_mode: str = "bilinear",
     center_crop: bool = True,
     deterministic: bool = True,
@@ -907,16 +907,16 @@ def preprocess_video_dataset(
     caption_format: str = "sidecar",
     caption_field: str = "caption",
     shard_size: int = 10000,
-    max_videos: Optional[int] = None,
+    max_videos: int | None = None,
     *,
-    dataset_name: Optional[str] = None,
+    dataset_name: str | None = None,
     dataset_split: str = "train",
-    dataset_config_name: Optional[str] = None,
-    dataset_media_column: Optional[str] = None,
-    dataset_caption_column: Optional[str] = None,
-    dataset_dir: Optional[str] = None,
+    dataset_config_name: str | None = None,
+    dataset_media_column: str | None = None,
+    dataset_caption_column: str | None = None,
+    dataset_dir: str | None = None,
     dataset_streaming: bool = False,
-    dataset_trust_remote_code: Optional[bool] = None,
+    dataset_trust_remote_code: bool | None = None,
 ):
     """
     Preprocess video dataset with one process per GPU.

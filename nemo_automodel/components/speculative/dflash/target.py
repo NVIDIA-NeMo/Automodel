@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -47,10 +47,10 @@ class DFlashTargetBatch:
     # Full-vocab target logits ``[B, S, V]``, captured only when the wrapper is
     # built with ``capture_logits=True`` (JetSpec's forward-KL distillation needs
     # the teacher distribution; DFlash's hard-label CE does not). ``None`` otherwise.
-    logits: Optional[torch.Tensor] = None
-    position_ids: Optional[torch.Tensor] = None
-    seq_lens: Optional[torch.Tensor] = None
-    doc_remaining: Optional[torch.Tensor] = None
+    logits: torch.Tensor | None = None
+    position_ids: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+    doc_remaining: torch.Tensor | None = None
 
 
 class HFDFlashTargetModel:
@@ -130,9 +130,9 @@ class HFDFlashTargetModel:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        doc_remaining: Optional[torch.Tensor] = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> DFlashTargetBatch:
         """Run the target model and capture the selected layers' hidden states as context.
 
