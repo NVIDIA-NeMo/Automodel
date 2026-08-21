@@ -1524,12 +1524,20 @@ def test_single_device_gemma4_loads_into_model_weights_without_full_copy(tmp_pat
     )
 
 
-@pytest.mark.parametrize(("is_init_step", "expected_quantization"), [(True, True), (False, False)])
+@pytest.mark.parametrize(
+    ("is_init_step", "quantization_config", "expected_quantization"),
+    [
+        (True, {"quant_method": "fp8"}, True),
+        (True, None, False),
+        (False, {"quant_method": "fp8"}, False),
+    ],
+)
 def test_load_model_only_requests_quantized_adapter_keys_for_base_checkpoint(
-    tmp_path, is_init_step, expected_quantization
+    tmp_path, is_init_step, quantization_config, expected_quantization
 ):
     """FP8 source metadata is requested for base initialization, not training resume."""
     model = torch.nn.Linear(2, 2, bias=False)
+    model.config = SimpleNamespace(quantization_config=quantization_config)
     adapter = MagicMock()
     model_state_dict = model.state_dict()
     adapter.to_hf.return_value = model_state_dict
@@ -1655,10 +1663,15 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
     @pytest.mark.parametrize("world_size", [1, 2])
-    def test_standard_hf_safetensors_use_dcp(self, mock_load_full, mock_load_hf, mock_is_st, world_size):
-        """Standard HF state-dict layouts load with DCP on one or multiple ranks."""
+    @pytest.mark.parametrize("dequantize_base_checkpoint", [None, True])
+    def test_standard_hf_safetensors_use_dcp(
+        self, mock_load_full, mock_load_hf, mock_is_st, world_size, dequantize_base_checkpoint
+    ):
+        """Unquantized standard HF weights load with DCP even when dequantization is permitted."""
         checkpointer = self._make_checkpointer()
+        checkpointer.config.dequantize_base_checkpoint = dequantize_base_checkpoint
         model = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace(quantization_config=None)
 
         loaded_state = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
 
@@ -1685,6 +1698,7 @@ class TestLoadModelCustomModelGuard:
         checkpointer = self._make_checkpointer()
         checkpointer.config.dequantize_base_checkpoint = True
         model = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace(quantization_config={"quant_method": "fp8"})
         mock_load_hf.return_value = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
 
         with (
@@ -1806,20 +1820,31 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    @pytest.mark.parametrize("dequantize_base_checkpoint", [False, True])
-    def test_single_device_low_memory_dcp_routes_by_quantization(
+    @pytest.mark.parametrize(
+        ("dequantize_base_checkpoint", "quantization_config", "expect_full_cpu"),
+        [
+            (False, {"quant_method": "fp8"}, False),
+            (True, None, False),
+            (True, {"quant_method": "fp8"}, True),
+            (None, {"quant_method": "fp8"}, True),
+        ],
+    )
+    def test_single_device_low_memory_dcp_routes_by_required_dequantization(
         self,
         mock_load_full,
         mock_load_hf,
         mock_is_st,
         caplog,
         dequantize_base_checkpoint,
+        quantization_config,
+        expect_full_cpu,
     ):
-        """Quantized conversion keeps the full CPU fallback despite low-memory DCP support."""
+        """Only an enabled conversion of quantized source weights keeps the full CPU fallback."""
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
         CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace(quantization_config=quantization_config)
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
         model.state_dict_adapter.supports_low_memory_dcp_load = True
         mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
@@ -1850,7 +1875,7 @@ class TestLoadModelCustomModelGuard:
 
             checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
 
-        if dequantize_base_checkpoint:
+        if expect_full_cpu:
             mock_load_full.assert_called_once()
             mock_load_hf.assert_called_once()
             mock_dcp_load.assert_not_called()

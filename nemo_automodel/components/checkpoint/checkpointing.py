@@ -171,6 +171,33 @@ def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
     return model
 
 
+def _should_dequantize_base_checkpoint(model: nn.Module, requested: bool | None) -> bool:
+    """Return whether this load requires checkpoint dequantization.
+
+    ``requested`` permits dequantization unless it is explicitly ``False``.
+    The conversion is needed only when the source model config declares a
+    quantization method; a stale ``True`` setting must not route BF16 weights
+    through the quantized full-CPU loading path.
+
+    Args:
+        model: Model whose source checkpoint metadata is being loaded.
+        requested: Configured dequantization preference.
+
+    Returns:
+        Whether the source checkpoint declares quantized weights that should
+        be converted while loading.
+    """
+    if requested is False:
+        return False
+
+    quantization_config = getattr(getattr(_unwrap_ddp_model(model), "config", None), "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        quantization_method = quantization_config.get("quant_method")
+    else:
+        quantization_method = getattr(quantization_config, "quant_method", None)
+    return quantization_method is not None
+
+
 def _normalize_dtype_mapping_to_state_dict_keys(
     fqn_to_dtype_mapping: dict[str, str], state_dict_keys: list[str], base_model_prefix: str | None = None
 ) -> dict[str, str]:
@@ -799,6 +826,10 @@ class Checkpointer:
             cpu_offload=self.config.cpu_offload,
             has_expert_parallelism=self.moe_mesh is not None,
         )
+        should_dequantize_base_checkpoint = bool(
+            is_init_step
+            and _should_dequantize_base_checkpoint(model_state.model[0], self.config.dequantize_base_checkpoint)
+        )
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
         model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
@@ -837,7 +868,7 @@ class Checkpointer:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         uses_standard_hf_state_dict = not is_custom_model and state_dict_adapter is None
-        can_use_low_memory_dcp = not self.config.dequantize_base_checkpoint and (
+        can_use_low_memory_dcp = not should_dequantize_base_checkpoint and (
             uses_standard_hf_state_dict
             or (isinstance(state_dict_adapter, StateDictAdapter) and state_dict_adapter.supports_low_memory_dcp_load)
         )
@@ -920,7 +951,7 @@ class Checkpointer:
             state_dict,
             # Training checkpoints are saved from the dequantized native model.
             # Only base-checkpoint initialization needs FP8 scale destinations.
-            quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
+            quantization=should_dequantize_base_checkpoint,
             device_mesh=self.moe_mesh,
             for_checkpoint_load=True,
         )
