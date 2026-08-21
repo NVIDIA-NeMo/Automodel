@@ -86,6 +86,7 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
             # to disable the position decay (uniform weighting).
             loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
             selector_loss_weight=float(recipe_cfg.get("selector_loss_weight", 1.0)),
+            sliding_window=self.draft_sliding_window,
         )
 
     def setup(self):

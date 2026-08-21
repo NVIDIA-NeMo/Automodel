@@ -115,6 +115,7 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         num_anchors: int = 512,
         loss_decay_gamma: float | None = None,
         selector_loss_weight: float = 1.0,
+        sliding_window: int | None = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -125,6 +126,7 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
+            sliding_window=sliding_window,
         )
         if getattr(draft_model, "candidate_selector", None) is None:
             raise ValueError(

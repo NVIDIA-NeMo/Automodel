@@ -73,6 +73,32 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def _sliding_window_mask(query: torch.Tensor, key: torch.Tensor, sliding_window: int) -> torch.Tensor:
+    """Band mask keeping keys within ``sliding_window`` of each query's position.
+
+    The draft's queries are the trailing ``q_len`` positions of the concatenated
+    ``[context | noise-block]`` key axis, so a query at row ``i`` sits at key
+    position ``k_len - q_len + i``. Both bounds are strict, matching transformers'
+    ``sliding_window_overlay`` and the reference DFlash decode mask. The draft is
+    non-causal, so the band is symmetric; the forward half is inert in practice
+    because the block is far shorter than any real window.
+
+    Args:
+        query: Tensor of shape [batch, heads, query, head_dim].
+        key: Tensor of shape [batch, kv_heads, key, head_dim], where ``key``
+            spans the context followed by the draft block.
+        sliding_window: Maximum absolute position distance, exclusive.
+
+    Returns:
+        Bool tensor of shape [1, 1, query, key]; ``True`` where attention is kept.
+    """
+    q_len, k_len = query.shape[-2], key.shape[-2]
+    query_position = torch.arange(q_len, device=query.device).unsqueeze(-1) + (k_len - q_len)
+    key_position = torch.arange(k_len, device=query.device).unsqueeze(0)
+    distance = query_position - key_position
+    return ((distance < sliding_window) & (-distance < sliding_window))[None, None]
+
+
 class Qwen3DFlashAttention(nn.Module):
     """Non-causal attention whose keys/values are ``[context | noise-block]``.
 
@@ -104,7 +130,14 @@ class Qwen3DFlashAttention(nn.Module):
         )
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.sliding_window = None
+        # Training enforces the same window through the block mask
+        # (``components/attention/dflash_mask.py``); this covers the decode path,
+        # where no explicit mask is supplied. ``is_causal`` stays False regardless --
+        # the draft is non-causal by construction.
+        layer_types = getattr(config, "layer_types", None)
+        layer_type = layer_types[layer_idx] if layer_types else "full_attention"
+        window = getattr(config, "sliding_window", None)
+        self.sliding_window = int(window) if layer_type == "sliding_attention" and window else None
 
     def forward(
         self,
@@ -133,6 +166,8 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        if attention_mask is None and self.sliding_window is not None:
+            attention_mask = _sliding_window_mask(q, k, self.sliding_window)
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]

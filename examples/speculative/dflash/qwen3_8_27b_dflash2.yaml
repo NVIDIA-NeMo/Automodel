@@ -47,6 +47,8 @@ recipe_args:
   mask_token_id: 248070               # reserved token, matching the published drafter
   target_layer_ids: [5, 19, 33, 47, 61]
   attention_backend: flex_attention
+  draft_sliding_window: 2048          # the published drafter's sliding_attention window;
+  #                                   # omit to attend over the whole prefix instead
 
   # --- draft attention shape (omit to inherit the target's) ---
   draft_num_attention_heads: 32

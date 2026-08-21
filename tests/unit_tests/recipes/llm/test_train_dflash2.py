@@ -122,6 +122,7 @@ def test_build_trainer_module_is_dflash2():
     recipe.mask_token_id = MASK_ID
     recipe.block_size = BLOCK_SIZE
     recipe.target_model = _target_model()
+    recipe.draft_sliding_window = 2048
     module = recipe._build_trainer_module(
         "sdpa", {"num_anchors": 7, "loss_decay_gamma": 5.0, "selector_loss_weight": 0.25}
     )
@@ -129,6 +130,9 @@ def test_build_trainer_module_is_dflash2():
     assert module.num_anchors == 7
     assert module.loss_decay_gamma == 5.0
     assert module.selector_loss_weight == 0.25
+    # The window the recipe resolved must reach the trainer, or training and the
+    # saved ``sliding_attention`` config would disagree.
+    assert module.sliding_window == 2048
 
 
 def test_build_trainer_module_defaults_loss_decay_gamma_to_paper_value():
@@ -139,9 +143,11 @@ def test_build_trainer_module_defaults_loss_decay_gamma_to_paper_value():
     recipe.mask_token_id = MASK_ID
     recipe.block_size = BLOCK_SIZE
     recipe.target_model = _target_model()
+    recipe.draft_sliding_window = None
     module = recipe._build_trainer_module("sdpa", {})
     assert module.loss_decay_gamma == 7.0
     assert module.selector_loss_weight == 1.0
+    assert module.sliding_window is None
 
 
 def test_build_trainer_module_rejects_loss_type():

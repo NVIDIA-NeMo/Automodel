@@ -267,7 +267,21 @@ class TrainDFlashRecipe(BaseRecipe):
             draft_config["rope_parameters"] = {
                 key: value for key, value in rope_parameters.items() if not key.startswith("mrope_")
             }
-        draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
+        # ``draft_sliding_window`` bounds how far back the draft reads the target
+        # context. Unset (the DFlash default) keeps every draft layer on full
+        # attention; when set, the layers become ``sliding_attention`` so the saved
+        # config matches the published DFlash 2 drafters and a serving runtime
+        # applies the same window the draft was trained under.
+        draft_sliding_window = recipe_cfg.get("draft_sliding_window", None)
+        self.draft_sliding_window = None if draft_sliding_window is None else int(draft_sliding_window)
+        if self.draft_sliding_window is None:
+            draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
+            draft_config["sliding_window"] = None
+            draft_config["use_sliding_window"] = False
+        else:
+            draft_config["layer_types"] = ["sliding_attention"] * draft_num_hidden_layers
+            draft_config["sliding_window"] = self.draft_sliding_window
+            draft_config["use_sliding_window"] = True
         draft_config["max_window_layers"] = draft_num_hidden_layers
         draft_config["num_target_layers"] = num_target_layers
         draft_config["block_size"] = self.block_size
@@ -481,6 +495,7 @@ class TrainDFlashRecipe(BaseRecipe):
             # matching the null convention of loss_decay_gamma above.
             loss_type=str(recipe_cfg.get("loss_type", None) or "dflash"),
             prefix_weight_base=float(recipe_cfg.get("prefix_weight_base", 0.9)),
+            sliding_window=self.draft_sliding_window,
         )
 
     def _run_trainer_step(self, target_batch):
