@@ -26,7 +26,6 @@
 import math
 from collections.abc import Sequence
 from copy import deepcopy
-from typing import Optional
 
 import numpy as np
 import torch
@@ -94,8 +93,8 @@ def eager_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_cu_seqlens: Optional[torch.Tensor] = None,
-    k_cu_seqlens: Optional[torch.Tensor] = None,
+    q_cu_seqlens: torch.Tensor | None = None,
+    k_cu_seqlens: torch.Tensor | None = None,
     **kwargs,
 ) -> torch.Tensor:
     seq_length = q.shape[0]
