@@ -51,7 +51,7 @@ from enum import Enum
 from functools import lru_cache
 from itertools import accumulate
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Tuple, Type, Union
 
 import numpy
 import torch
@@ -216,7 +216,7 @@ class DType(Enum):
             raise ValueError("Invalid key passed to DType.size()")
 
     @classmethod
-    def optimal_dtype(cls, cardinality: Optional[int]) -> Type[numpy.number]:
+    def optimal_dtype(cls, cardinality: int | None) -> Type[numpy.number]:
         """Get the dtype to use for an index of a certain cardinality
 
         Args:
@@ -260,10 +260,10 @@ class _IndexWriter(object):
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[TracebackType],
-    ) -> Optional[bool]:
+        exc_type: Type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool | None:
         """Exit the context introduced by the 'with' keyword
 
         Args:
@@ -282,7 +282,7 @@ class _IndexWriter(object):
     def write(
         self,
         sequence_lengths: List[int],
-        sequence_modes: Optional[List[int]],
+        sequence_modes: List[int] | None,
         document_indices: List[int],
     ) -> None:
         """Write the index (.idx) file
@@ -386,7 +386,7 @@ class _IndexReader:
             offset=payload_offset + self.sequence_lengths.nbytes + self.sequence_pointers.nbytes,
         )
 
-        self.sequence_modes: Optional[numpy.ndarray] = None
+        self.sequence_modes: numpy.ndarray | None = None
         if multimodal:
             logger.info("Extracting sequence modes")
             self.sequence_modes = numpy.frombuffer(
@@ -419,7 +419,7 @@ class _IndexReader:
         return self.sequence_count
 
     @lru_cache(maxsize=8)
-    def __getitem__(self, idx: int) -> Tuple[numpy.int32, numpy.int64, Optional[numpy.int8]]:
+    def __getitem__(self, idx: int) -> Tuple[numpy.int32, numpy.int64, numpy.int8 | None]:
         """Return the pointer, length, and mode at the index
 
         Args:
@@ -545,7 +545,7 @@ class _S3BinReader(_BinReader):
         self._cache_nbytes = object_storage_config.bin_chunk_nbytes
         self._cache_bytes_start: int = 0
         self._cache_bytes_end: int = 0
-        self._cache: Optional[bytes] = None
+        self._cache: bytes | None = None
 
     def _extract_from_cache(self, offset: int, size: int) -> bytes:
         if self._cache is None:
@@ -618,7 +618,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         path_prefix: str,
         multimodal: bool = False,
         mmap: bool = True,
-        object_storage_config: Optional[ObjectStorageConfig] = None,
+        object_storage_config: ObjectStorageConfig | None = None,
     ) -> None:
         """Initialize the IndexedDataset
 
@@ -651,7 +651,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         path_prefix: str,
         multimodal: bool,
         mmap: bool,
-        object_storage_config: Optional[ObjectStorageConfig] = None,
+        object_storage_config: ObjectStorageConfig | None = None,
     ) -> None:
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
@@ -732,7 +732,7 @@ class IndexedDataset(torch.utils.data.Dataset):
             raise TypeError(f"Unexpected index type {type(idx)}")
 
     def get(
-        self, idx: int, offset: int = 0, length: Optional[int] = None
+        self, idx: int, offset: int = 0, length: int | None = None
     ) -> Union[numpy.ndarray, Tuple[numpy.ndarray, Any]]:
         ptr, seq_len, mode = self.index[idx]
         length = seq_len - offset if length is None else length
@@ -789,7 +789,7 @@ class IndexedDatasetBuilder(object):
         if self.multimodal:
             self.sequence_modes.append(mode)
 
-    def add_document(self, tensor: torch.Tensor, lengths: List[int], modes: Optional[List[int]] = None) -> None:
+    def add_document(self, tensor: torch.Tensor, lengths: List[int], modes: List[int] | None = None) -> None:
         """Add an entire document to the dataset
 
         Args:

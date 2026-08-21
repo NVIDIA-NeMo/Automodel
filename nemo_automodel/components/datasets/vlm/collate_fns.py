@@ -13,7 +13,7 @@
 # limitations under the License.
 import logging
 import random
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 from unittest.mock import MagicMock
 
 import torch
@@ -218,7 +218,7 @@ def build_labels(
 # ---------------------------------------------------------------------------
 
 
-def _get_assistant_marker(tokenizer) -> Optional[List[int]]:
+def _get_assistant_marker(tokenizer) -> List[int] | None:
     """Return the token-id sequence that introduces an assistant turn.
 
     For Qwen-family models the marker is ``[<|im_start|>, assistant, \\n]``.
@@ -236,7 +236,7 @@ def _get_assistant_marker(tokenizer) -> Optional[List[int]]:
         return None
 
 
-def _get_stop_token_id(tokenizer) -> Optional[int]:
+def _get_stop_token_id(tokenizer) -> int | None:
     """Return the token id of the turn-ending marker (``<|im_end|>``)."""
     try:
         tid = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -713,7 +713,7 @@ def qwen3_omni_collate_fn(
 def kimi_vl_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for KimiVL processors."""
     conversations = [example["conversation"] for example in examples]
@@ -848,7 +848,7 @@ def _expand_image_tokens(
 def kimi_k25_vl_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
     drop_overlong: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for Kimi K2.5 VL processors with pre-expanded image tokens.
@@ -1253,7 +1253,7 @@ def _drop_overlong_samples(conversations, processor, max_length):
 def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
     drop_overlong: bool = False,
     _post_tokenize_hook=None,
 ) -> dict[str, Any]:
@@ -1381,7 +1381,7 @@ def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
 def pad_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for pre-tokenized samples (from :class:`PreTokenizedDatasetWrapper`).
 
@@ -1773,7 +1773,7 @@ def packed_sequence_thd_vlm_collater(
 def nemotron_omni_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
     max_video_frames: int = 8,
 ) -> Dict[str, torch.Tensor]:
     """Collate for NemotronOmni (image / video / audio).
@@ -1813,12 +1813,12 @@ def nemotron_omni_collate_fn(
         sample_audio[idx] = waveform
 
     all_images: List[List[Any]] = []
-    all_videos: List[Optional[Tuple[List[Any], Optional[VideoMetadata]]]] = []
+    all_videos: List[Tuple[List[Any], VideoMetadata | None] | None] = []
     texts: List[str] = []
 
     for conversation in conversations:
         conv_images: List[Any] = []
-        conv_video: Optional[Tuple[List[Any], Optional[VideoMetadata]]] = None
+        conv_video: Tuple[List[Any], VideoMetadata | None] | None = None
         text_conversation = []
         for message in conversation:
             content = message.get("content")
@@ -2166,7 +2166,7 @@ def _truncate_token_axis(batch: Dict[str, torch.Tensor], max_length: int) -> Non
 def gemma4_prefix_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for Gemma4 models with thinking-channel prefix.
 
