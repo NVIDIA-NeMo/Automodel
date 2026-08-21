@@ -238,6 +238,8 @@ Select the loading route with `tokenizer_backend`:
 
 - `"nemo_auto"` (the default) uses NeMo AutoModel's model-type registry and falls back to its
   Transformers-compatible wrapper.
+- `"nemo_wrapped_auto"` bypasses registered NeMo tokenizers and uses Transformers `AutoTokenizer`
+  with NeMo AutoModel's tokenizer compatibility wrapper.
 - `"transformers_auto"` calls Transformers `AutoTokenizer` directly.
 - `"tokenizers"` loads `tokenizer.json` directly through Transformers `TokenizersBackend`. Use this route
   when the serialized tokenizer should be authoritative and no repository-provided tokenizer code is needed.
@@ -257,8 +259,8 @@ tok = NeMoAutoTokenizer.from_pretrained(
 )
 ```
 
-The legacy `force_hf=True` option is equivalent to `tokenizer_backend="transformers_auto"`.
-`force_default=True` bypasses registered NeMo tokenizers while remaining on the wrapped fallback route.
+The legacy `force_default=True` option is equivalent to `tokenizer_backend="nemo_wrapped_auto"`, and
+`force_hf=True` is equivalent to `tokenizer_backend="transformers_auto"`.
 Contradictory route selections raise `ValueError` instead of silently choosing one.
 
 ## Save Checkpoints in NeMo AutoModel and Load Everywhere

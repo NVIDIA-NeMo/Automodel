@@ -65,19 +65,21 @@ class NeMoAutoTokenizer:
     Similar to HuggingFace's AutoTokenizer, but with a custom registry for specialized
     tokenizer implementations.
 
-    ``tokenizer_backend`` selects one of three loading routes:
+    ``tokenizer_backend`` selects one of four loading routes:
     1. ``"nemo_auto"`` (default) uses a registered tokenizer when available,
        otherwise it falls back to the wrapped HuggingFace tokenizer.
-    2. ``"transformers_auto"`` uses Transformers ``AutoTokenizer`` directly.
-    3. ``"tokenizers"`` loads ``tokenizer.json`` through Transformers
+    2. ``"nemo_wrapped_auto"`` bypasses registered tokenizers and uses Transformers
+       ``AutoTokenizer`` with NeMo's tokenizer compatibility wrapper.
+    3. ``"transformers_auto"`` uses Transformers ``AutoTokenizer`` directly.
+    4. ``"tokenizers"`` loads ``tokenizer.json`` through Transformers
        ``TokenizersBackend``.
 
     Example:
         >>> # Will use MistralCommonBackend if available for Mistral models
         >>> tokenizer = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 
-        >>> # Force using the wrapped HF AutoTokenizer instead of a registered tokenizer
-        >>> tokenizer = NeMoAutoTokenizer.from_pretrained("gpt2", force_default=True)
+        >>> # Use the NeMo-wrapped AutoTokenizer instead of a registered tokenizer
+        >>> tokenizer = NeMoAutoTokenizer.from_pretrained("gpt2", tokenizer_backend="nemo_wrapped_auto")
 
         >>> # Explicitly opt in to BOS/EOS insertion
         >>> tokenizer = NeMoAutoTokenizer.from_pretrained("gpt2", add_bos_token=True, add_eos_token=True)
@@ -104,7 +106,7 @@ class NeMoAutoTokenizer:
         *args,
         force_default: bool = False,
         force_hf: bool = False,
-        tokenizer_backend: Literal["nemo_auto", "transformers_auto", "tokenizers"] | None = None,
+        tokenizer_backend: Literal["nemo_auto", "nemo_wrapped_auto", "transformers_auto", "tokenizers"] | None = None,
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "PreTrainedTokenizerBase":
@@ -113,26 +115,27 @@ class NeMoAutoTokenizer:
 
         Args:
             pretrained_model_name_or_path: Model identifier or path
-            force_default: Backward-compatible option that selects the wrapped fallback within the
-                ``"nemo_auto"`` route, bypassing registered tokenizers.
+            force_default: Backward-compatible alias for ``tokenizer_backend="nemo_wrapped_auto"``. An explicit
+                ``tokenizer_backend="nemo_auto"`` remains compatible with this legacy modifier.
             force_hf: Backward-compatible alias for ``tokenizer_backend="transformers_auto"``.
             tokenizer_backend: Tokenizer loading route. ``"nemo_auto"`` preserves the default NeMo dispatch,
-                ``"transformers_auto"`` uses Transformers AutoTokenizer, and ``"tokenizers"`` loads
-                ``tokenizer.json`` directly through Transformers TokenizersBackend.
+                ``"nemo_wrapped_auto"`` uses Transformers AutoTokenizer with NeMo's compatibility wrapper while
+                bypassing registered tokenizers, ``"transformers_auto"`` uses Transformers AutoTokenizer directly,
+                and ``"tokenizers"`` loads ``tokenizer.json`` directly through Transformers TokenizersBackend.
             trust_remote_code: Whether to trust remote code when loading config
             **kwargs: Additional arguments passed to the tokenizer's from_pretrained
 
         Returns:
             A tokenizer instance appropriate for the model type
         """
-        valid_backends = {"nemo_auto", "transformers_auto", "tokenizers"}
+        valid_backends = {"nemo_auto", "nemo_wrapped_auto", "transformers_auto", "tokenizers"}
         if tokenizer_backend is not None and tokenizer_backend not in valid_backends:
             raise ValueError(f"tokenizer_backend must be one of {sorted(valid_backends)}, got {tokenizer_backend!r}")
         if force_default and force_hf:
             raise ValueError("force_default=True and force_hf=True are mutually exclusive.")
-        if force_default and tokenizer_backend not in (None, "nemo_auto"):
+        if force_default and tokenizer_backend not in (None, "nemo_auto", "nemo_wrapped_auto"):
             raise ValueError(
-                "force_default=True selects the wrapped fallback within the nemo_auto route and cannot be combined "
+                "force_default=True is equivalent to tokenizer_backend='nemo_wrapped_auto' and cannot be combined "
                 f"with tokenizer_backend={tokenizer_backend!r}."
             )
         if force_hf and tokenizer_backend not in (None, "transformers_auto"):
@@ -141,12 +144,25 @@ class NeMoAutoTokenizer:
                 f"with tokenizer_backend={tokenizer_backend!r}."
             )
 
-        resolved_backend = "transformers_auto" if force_hf else (tokenizer_backend or "nemo_auto")
+        resolved_backend = tokenizer_backend or "nemo_auto"
+        if force_default:
+            resolved_backend = "nemo_wrapped_auto"
+        elif force_hf:
+            resolved_backend = "transformers_auto"
 
         if resolved_backend == "transformers_auto":
             from transformers import AutoTokenizer
 
             return AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
+            )
+
+        if resolved_backend == "nemo_wrapped_auto":
+            from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+                NeMoAutoTokenizerWithBosEosEnforced,
+            )
+
+            return NeMoAutoTokenizerWithBosEosEnforced.from_pretrained(
                 pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
             )
 
@@ -164,7 +180,7 @@ class NeMoAutoTokenizer:
 
         registry = _get_tokenizer_registry()
 
-        if not force_default and model_type:
+        if model_type:
             tokenizer_cls = registry.get_custom_tokenizer_cls(model_type)
             if tokenizer_cls is not None:
                 logger.info(f"Using custom tokenizer {tokenizer_cls.__name__} for model type '{model_type}'")

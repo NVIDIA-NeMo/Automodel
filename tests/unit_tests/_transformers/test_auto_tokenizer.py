@@ -418,6 +418,32 @@ class TestNeMoAutoTokenizerFromPretrained:
         assert tokenizer is stub
         load_transformers.assert_called_once_with("dummy/model", trust_remote_code=False, padding_side="left")
 
+    def test_nemo_wrapped_auto_backend_bypasses_registry_dispatch(self):
+        stub = _StubHFTokenizer()
+        with (
+            patch(
+                "nemo_automodel._transformers.auto_tokenizer._get_model_type",
+            ) as get_model_type,
+            patch(
+                "nemo_automodel._transformers.tokenization.nemo_auto_tokenizer."
+                "NeMoAutoTokenizerWithBosEosEnforced.from_pretrained",
+                return_value=stub,
+            ) as load_wrapped,
+        ):
+            tokenizer = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                tokenizer_backend="nemo_wrapped_auto",
+                padding_side="left",
+            )
+
+        assert tokenizer is stub
+        get_model_type.assert_not_called()
+        load_wrapped.assert_called_once_with(
+            "dummy/model",
+            trust_remote_code=False,
+            padding_side="left",
+        )
+
     def test_force_hf_accepts_equivalent_explicit_backend(self):
         stub = _StubHFTokenizer()
         with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
@@ -429,20 +455,43 @@ class TestNeMoAutoTokenizerFromPretrained:
 
         assert tokenizer is stub
 
-    def test_force_hf_rejects_conflicting_backend(self):
+    @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_auto", "nemo_wrapped_auto"])
+    def test_force_default_accepts_compatible_backend_and_selects_wrapped_auto(self, tokenizer_backend):
+        stub = _StubHFTokenizer()
+        with (
+            patch("nemo_automodel._transformers.auto_tokenizer._get_model_type") as get_model_type,
+            patch(
+                "nemo_automodel._transformers.tokenization.nemo_auto_tokenizer."
+                "NeMoAutoTokenizerWithBosEosEnforced.from_pretrained",
+                return_value=stub,
+            ) as load_wrapped,
+        ):
+            tokenizer = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_default=True,
+                tokenizer_backend=tokenizer_backend,
+            )
+
+        assert tokenizer is stub
+        get_model_type.assert_not_called()
+        load_wrapped.assert_called_once_with("dummy/model", trust_remote_code=False)
+
+    @pytest.mark.parametrize("tokenizer_backend", ["nemo_auto", "nemo_wrapped_auto", "tokenizers"])
+    def test_force_hf_rejects_conflicting_backend(self, tokenizer_backend):
         with pytest.raises(ValueError, match="cannot be combined"):
             NeMoAutoTokenizer.from_pretrained(
                 "dummy/model",
                 force_hf=True,
-                tokenizer_backend="tokenizers",
+                tokenizer_backend=tokenizer_backend,
             )
 
-    def test_force_default_rejects_conflicting_backend(self):
+    @pytest.mark.parametrize("tokenizer_backend", ["transformers_auto", "tokenizers"])
+    def test_force_default_rejects_conflicting_backend(self, tokenizer_backend):
         with pytest.raises(ValueError, match="force_default=True"):
             NeMoAutoTokenizer.from_pretrained(
                 "dummy/model",
                 force_default=True,
-                tokenizer_backend="tokenizers",
+                tokenizer_backend=tokenizer_backend,
             )
 
     def test_force_flags_are_mutually_exclusive(self):
