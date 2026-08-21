@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import warnings
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 
 def calculate_mfu(
@@ -742,7 +742,7 @@ def attention_flops_calculator(
     hidden_size,
     num_attention_heads,
     num_query_groups,
-    kv_channels: Optional[int] = None,
+    kv_channels: int | None = None,
     is_swa: bool = False,
     swa_window_size: int = 128,
 ):
@@ -800,9 +800,9 @@ def gpt_oss_flops_calculator(
     moe_ffn_hidden_size,
     moe_router_topk,
     vocab_size,
-    kv_channels: Optional[int] = None,
+    kv_channels: int | None = None,
     swa_window_size: int = 128,
-    window_attn_skip_freq: Optional[int] = 2,
+    window_attn_skip_freq: int | None = 2,
 ):
     """Calculate the flops for the GPT-OSS model"""
     flops = 0
@@ -1565,7 +1565,7 @@ def step3_5_flash_flops(config, gbs=1, seq_len=None):
     return gbs * (total_attn + total_mlp + total_vocab + mtp_total)
 
 
-def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
+def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
     """
     Get the appropriate FLOPs formula function for a given HuggingFace config.
 

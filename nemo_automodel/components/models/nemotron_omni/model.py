@@ -26,7 +26,7 @@ Architecture name: "NemotronH_Nano_Omni_Reasoning_V3" (from config.json)
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -769,7 +769,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     def extract_sound_feature(
         self,
         input_features: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Extract and project sound features from audio input.
 
@@ -827,22 +827,22 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
     def forward(
         self,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        image_flags: Optional[torch.LongTensor] = None,
-        imgs_sizes: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        labels: Optional[torch.LongTensor] = None,
-        sound_features: Optional[torch.FloatTensor] = None,
-        sound_attention_mask: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        pixel_values: torch.FloatTensor | None = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        image_flags: torch.LongTensor | None = None,
+        imgs_sizes: torch.LongTensor | None = None,
+        past_key_values: List[torch.FloatTensor] | None = None,
+        labels: torch.LongTensor | None = None,
+        sound_features: torch.FloatTensor | None = None,
+        sound_attention_mask: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[dict, Tuple, CausalLMOutputWithPast]:

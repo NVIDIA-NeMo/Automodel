@@ -37,7 +37,7 @@ into the weights).
 
 import re
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -83,7 +83,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional[DeviceMesh] = None,
+        device_mesh: DeviceMesh | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Convert Hugging Face Gemma4 weights into native model layout.
@@ -241,7 +241,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
@@ -266,7 +266,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
         """
         self._uses_model_prefix = any(key.startswith("model.") for key in state_dict)
         prefix = "model." if self._uses_model_prefix else ""
-        device_mesh: Optional[DeviceMesh] = kwargs.get("device_mesh")
+        device_mesh: DeviceMesh | None = kwargs.get("device_mesh")
         n_experts = self.moe_config.n_routed_experts
         expert_tensors = [tensor for fqn, tensor in state_dict.items() if ".moe.experts." in fqn]
         single_device_can_load_into_model = (
@@ -403,7 +403,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
     def _gather_expert_tensor(
         self,
         tensor: torch.Tensor,
-        device_mesh: Optional[DeviceMesh],
+        device_mesh: DeviceMesh | None,
         n_experts: int,
     ) -> torch.Tensor:
         """Gather EP-sharded expert tensor across ranks into a full tensor."""
