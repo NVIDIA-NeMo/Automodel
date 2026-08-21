@@ -580,50 +580,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, PipelineModelMixin, GenerationM
                 last.append("mtp")
         return stage_modules
 
-    def pipeline_stage_metas(
-        self,
-        *,
-        is_first: bool,
-        microbatch_size: int,
-        seq_len: int,
-        dtype: torch.dtype,
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Return analytical (inputs_meta, outputs_meta) for a PP stage.
-
-        Inter-stage tensors are plain ``[B, S, H]`` (no HC stream). With MTP
-        enabled, every transfer carries ``1 + D`` tensors so the variadic
-        forward signature is exercised on every microbatch.
-        """
-        hidden_shape = (microbatch_size, seq_len, self.config.hidden_size)
-        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
-
-        def meta(shape: tuple[int, ...], d: torch.dtype = dtype) -> torch.Tensor:
-            return torch.empty(*shape, device="meta", dtype=d)
-
-        def append_mtp(primary: torch.Tensor) -> tuple[torch.Tensor, ...]:
-            if mtp_depth == 0:
-                return (primary,)
-            return (primary, *(meta(hidden_shape) for _ in range(mtp_depth)))
-
-        if is_first:
-            inputs_meta: tuple[torch.Tensor, ...] = (
-                torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),
-            )
-        else:
-            inputs_meta = append_mtp(meta(hidden_shape))
-
-        if self.lm_head is not None:
-            primary_out = meta((microbatch_size, seq_len, self.config.vocab_size))
-        else:
-            primary_out = meta(hidden_shape)
-        outputs_meta = append_mtp(primary_out)
-        # Last stage appends an int32 [B, S] seq_idx so the loss fn can mask
-        # MTP label rolls across sub-seq boundaries — bonded to its microbatch
-        # via the PP output-tuple contract (schedule-agnostic).
-        if self.lm_head is not None and mtp_depth > 0:
-            outputs_meta = (*outputs_meta, meta((microbatch_size, seq_len), d=torch.int32))
-        return inputs_meta, outputs_meta
-
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -720,8 +676,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, PipelineModelMixin, GenerationM
 
         # Stash pre-squeeze [B, S] input_ids: the MTP embed tuple must be
         # built AFTER self.model() runs (FSDP2 root lazy-init requires the
-        # root forward first) but with the pre-squeeze shape so emitted
-        # tensors match the [B, S, H] contract from pipeline_stage_metas.
+        # root forward first) but with the pre-squeeze shape, so the emitted
+        # inter-stage tensors keep the [B, S, H] layout the next stage expects.
         pre_squeeze_input_ids = (
             input_ids
             if (
@@ -764,8 +720,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, PipelineModelMixin, GenerationM
         )
 
         # Root forward has run; FSDP2 lazy-init is satisfied. Build MTP embed
-        # tuple from pre-squeeze [B, S] ids so emitted shapes match
-        # pipeline_stage_metas.
+        # tuple from pre-squeeze [B, S] ids so every emitted MTP tensor is
+        # [B, S, H], matching the primary [B, S, H] inter-stage tensor.
         if pre_squeeze_input_ids is not None:
             mtp_embed_inputs = self._build_mtp_embed_inputs_for_pp(pre_squeeze_input_ids)
 

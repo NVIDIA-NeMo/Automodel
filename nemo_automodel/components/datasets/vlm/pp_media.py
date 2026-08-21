@@ -20,7 +20,12 @@ from typing import Any
 
 import torch
 
+from nemo_automodel.shared.pipeline import PP_MEDIA_INDEX_KEY
+
 VLM_PP_MEDIA_KEY = "_vlm_pp_media_chunks"
+
+#: Attribute on the stage-0 module holding ``{media name: [one tensor per microbatch]}``.
+PP_MEDIA_CHUNKS_ATTR = "_pp_media_chunks"
 
 _VLM_MEDIA_KEYS = (
     "pixel_values",
@@ -29,13 +34,97 @@ _VLM_MEDIA_KEYS = (
     "patch_newline_mask",
     "image_grid_hws",
     "image_grid_thw",
+    "grid_thws",
+    "image_flags",
     "image_sizes",
     "image_position_ids",
     "n_images_per_sample",
     "pixel_values_videos",
     "video_grid_thw",
+    "second_per_grid_ts",
     "n_videos_per_sample",
 )
+
+
+def _microbatch_sample_bounds(batch_size: int, n_microbatches: int) -> list[tuple[int, int]]:
+    """Return the ``[start, end)`` sample range owned by every PP microbatch.
+
+    The boundaries must match how ``torch.distributed.pipelining`` actually
+    splits the batch, because the pipeline schedule splits ``input_ids`` and the
+    ``pp_media_index`` companion tensor itself. torch splits with
+    ``torch.tensor_split``, which gives the first ``batch_size % n_microbatches``
+    microbatches one extra sample rather than filling ceil-sized microbatches
+    and leaving a short tail. Using ceil-sized bounds here would put samples
+    from two different media chunks into one microbatch whenever the batch size
+    is not divisible by the microbatch count, and the media lookup -- which
+    reads the first sample's index -- would then silently pair those samples
+    with another microbatch's images.
+
+    Args:
+        batch_size: Number of samples in the batch.
+        n_microbatches: Number of PP microbatches the batch is split into.
+
+    Returns:
+        One ``(start, end)`` sample range per microbatch, in microbatch order.
+    """
+    base, remainder = divmod(batch_size, n_microbatches)
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    for mb_idx in range(n_microbatches):
+        end = start + base + (1 if mb_idx < remainder else 0)
+        bounds.append((start, end))
+        start = end
+    return bounds
+
+
+def build_pp_media_index(batch_size: int, n_microbatches: int) -> torch.Tensor:
+    """Build the per-sample microbatch index that addresses staged media chunks.
+
+    Args:
+        batch_size: Number of samples in the batch.
+        n_microbatches: Number of PP microbatches the batch is split into.
+
+    Returns:
+        int64 CPU tensor of shape [batch] whose entry ``i`` is the microbatch
+        index that owns sample ``i``, matching the chunk order produced by
+        :func:`chunk_vlm_media` and :func:`chunk_patch_mapped_media`.
+    """
+    index = torch.zeros(batch_size, dtype=torch.int64)
+    for mb_idx, (start, end) in enumerate(_microbatch_sample_bounds(batch_size, n_microbatches)):
+        index[start:end] = mb_idx
+    return index
+
+
+def _chunk_rows_like(tensor: torch.Tensor, name: str, reference_chunks: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Split a row-aligned metadata tensor with the row boundaries of another chunk list.
+
+    Args:
+        tensor: Tensor whose axis 0 is aligned row-for-row with the concatenation
+            of ``reference_chunks``, e.g. one row per image.
+        name: Batch key of ``tensor``, used for error messages.
+        reference_chunks: Already-chunked tensors defining the row boundaries.
+
+    Returns:
+        One slice of ``tensor`` per entry of ``reference_chunks``.
+
+    Raises:
+        ValueError: If ``tensor`` has a different number of rows than the
+            concatenated ``reference_chunks``.
+    """
+    total_rows = sum(chunk.shape[0] for chunk in reference_chunks)
+    if tensor.shape[0] != total_rows:
+        raise ValueError(
+            f"VLM PP chunking cannot align '{name}' with the chunked media: "
+            f"{name}.shape={tuple(tensor.shape)} has {tensor.shape[0]} rows but the media chunks "
+            f"cover {total_rows} rows. '{name}' must carry exactly one row per media entry."
+        )
+    chunks: list[torch.Tensor] = []
+    start = 0
+    for reference in reference_chunks:
+        end = start + reference.shape[0]
+        chunks.append(tensor[start:end])
+        start = end
+    return chunks
 
 
 def chunk_vlm_media(
@@ -48,28 +137,46 @@ def chunk_vlm_media(
     """Split VLM pixel values and media metadata into PP microbatch chunks.
 
     Handles four layouts:
-    1. ``[N, C, H, W]`` with ``N == batch_size`` -- one full image per sample.
-    2. ``[N, max_patches, D]`` with ``N == batch_size`` -- padded patches per image.
-    3. Flat patches ``[total_patches, D]`` with per-sample media counts from
+    1. ``[batch, channels, height, width]`` -- one full image per sample.
+    2. ``[batch, max_patches, dim]`` -- padded patches per image.
+    3. Flat patches ``[total_patches, dim]`` with per-sample media counts from
        ``n_images_per_sample``.
     4. Flat patches with ``n_images == batch_size`` -- legacy one-image-per-sample.
+
+    Args:
+        pixel_values: Media tensor in one of the four layouts above; axis 0 is
+            either the sample axis or the flattened patch axis.
+        image_grid: Tensor of shape [n_media, grid_dims] holding one grid row per
+            media entry, e.g. ``[t, h, w]`` or ``[h, w]``.
+        batch_size: Number of samples in the batch.
+        n_microbatches: Number of PP microbatches to split the batch into.
+        n_images_per_sample: Optional tensor of shape [batch] whose entry ``i`` is
+            the number of media entries belonging to sample ``i``.
+
+    Returns:
+        ``(pixel_values_chunks, image_grid_chunks)``: two lists of exactly
+        ``n_microbatches`` tensors, sliced along axis 0 and ordered by microbatch.
+        Microbatches whose samples carry no media get an empty (zero-row) chunk so
+        that chunks stay addressable by microbatch index.
+
+    Raises:
+        ValueError: If ``pixel_values`` cannot be aligned with the batch.
     """
     n_images = image_grid.shape[0]
     pixel_values_chunks: list[torch.Tensor] = []
     image_grid_chunks: list[torch.Tensor] = []
 
+    bounds = _microbatch_sample_bounds(batch_size, n_microbatches)
+
     if pixel_values.shape[0] == batch_size and pixel_values.dim() in (3, 4):
         # 4D full-image tensors and 3D padded-patch tensors are indexed by sample.
-        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
-        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
+        for s_start, s_end in bounds:
+            pixel_values_chunks.append(pixel_values[s_start:s_end])
+            image_grid_chunks.append(image_grid[s_start:s_end])
     elif pixel_values.dim() == 3 and n_images_per_sample is not None:
         # Multi-image padded-patch layout: split by image counts per sample.
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-        # Match torch.chunk-style uneven splits so trailing samples are not dropped.
-        samples_per_mb = -(-batch_size // n_microbatches)
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
+        for s_start, s_end in bounds:
             img_start = 0 if s_start == 0 else int(cumsum_images[s_start - 1].item())
             img_end = int(cumsum_images[s_end - 1].item()) if s_end > 0 else 0
             pixel_values_chunks.append(pixel_values[img_start:img_end])
@@ -80,34 +187,26 @@ def chunk_vlm_media(
         cumsum_patches = torch.cumsum(patch_counts, dim=0)
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
 
-        samples_per_mb = -(-batch_size // n_microbatches)
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
-
-            img_start = 0 if s_start == 0 else cumsum_images[s_start - 1].item()
-            img_end = cumsum_images[s_end - 1].item() if s_end > 0 else 0
+        for s_start, s_end in bounds:
+            img_start = 0 if s_start == 0 else int(cumsum_images[s_start - 1].item())
+            img_end = int(cumsum_images[s_end - 1].item()) if s_end > 0 else 0
 
             image_grid_chunks.append(image_grid[img_start:img_end])
 
-            patch_start = 0 if img_start == 0 else cumsum_patches[img_start - 1].item()
-            patch_end = cumsum_patches[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
+            patch_start = 0 if img_start == 0 else int(cumsum_patches[img_start - 1].item())
+            patch_end = int(cumsum_patches[img_end - 1].item()) if img_end > 0 else 0
+            pixel_values_chunks.append(pixel_values[patch_start:patch_end])
     elif n_images == batch_size:
         # Legacy: exactly one image per sample.
         patch_counts = image_grid.prod(dim=1)
         cumsum = torch.cumsum(patch_counts, dim=0)
 
-        images_per_mb = -(-batch_size // n_microbatches)
-        for mb_idx in range(n_microbatches):
-            img_start = mb_idx * images_per_mb
-            img_end = min(img_start + images_per_mb, n_images)
-
+        for img_start, img_end in bounds:
             image_grid_chunks.append(image_grid[img_start:img_end])
 
-            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
-            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
+            patch_start = 0 if img_start == 0 else int(cumsum[img_start - 1].item())
+            patch_end = int(cumsum[img_end - 1].item()) if img_end > 0 else 0
+            pixel_values_chunks.append(pixel_values[patch_start:patch_end])
     else:
         raise ValueError(
             "VLM PP chunking cannot align pixel_values with the batch: "
@@ -122,7 +221,7 @@ def chunk_vlm_media(
     return pixel_values_chunks, image_grid_chunks
 
 
-def chunk_step3_media(
+def chunk_patch_mapped_media(
     pixel_values: torch.Tensor,
     *,
     batch_size: int,
@@ -131,12 +230,14 @@ def chunk_step3_media(
     patch_pixel_values: torch.Tensor | None = None,
     patch_newline_mask: torch.Tensor | None = None,
 ) -> dict[str, list[torch.Tensor]]:
-    """Chunk image tensors with per-sample patch counts for PP microbatches.
+    """Chunk media that carries per-sample patch counts instead of a grid.
 
-    Step3 processors emit one full image per sample in ``pixel_values`` and a
-    flat list of optional crop patches in ``patch_pixel_values``. ``num_patches``
-    maps samples to the flat patch tensor. Processors may also emit
+    Selected on batch structure, not on model identity: it handles any batch
+    whose ``pixel_values`` arrives without grid metadata and instead maps
+    samples to media rows through ``num_patches``. Either one full image per
+    sample plus a flat crop-patch tensor in ``patch_pixel_values``, or
     ``pixel_values`` itself as a flat patch tensor using the same mapping.
+    Step3-style processors are the current producers of this layout.
 
     Args:
         pixel_values: Either ``[batch, ...]`` (one image tensor per sample) or a
@@ -175,7 +276,7 @@ def chunk_step3_media(
             f"pixel_values.shape={tuple(pixel_values.shape)}, sum(num_patches)={int(num_patches.sum().item())}."
         )
 
-    samples_per_mb = -(-batch_size // n_microbatches)
+    bounds = _microbatch_sample_bounds(batch_size, n_microbatches)
     cumsum_patches = torch.cumsum(num_patches.cpu(), dim=0)
 
     result: dict[str, list[torch.Tensor]] = {
@@ -187,9 +288,7 @@ def chunk_step3_media(
     if patch_newline_mask is not None:
         result["patch_newline_mask"] = []
 
-    for mb_idx in range(n_microbatches):
-        sample_start = mb_idx * samples_per_mb
-        sample_end = min(sample_start + samples_per_mb, batch_size)
+    for sample_start, sample_end in bounds:
         patch_start = 0 if sample_start == 0 else int(cumsum_patches[sample_start - 1].item())
         patch_end = int(cumsum_patches[sample_end - 1].item()) if sample_end > 0 else patch_start
         pixel_start, pixel_end = (patch_start, patch_end) if flat_pixel_values else (sample_start, sample_end)
@@ -227,9 +326,27 @@ def prepare_vlm_media_for_pp(
     """Move VLM media tensors into pre-chunked PP media storage on the batch.
 
     This is intended to run from VLM collate/dataloader code when PP is enabled.
-    The returned batch no longer carries raw media tensors that PyTorch PP would
-    chunk by row incorrectly; instead it carries ``VLM_PP_MEDIA_KEY`` with
-    per-microbatch media chunks.
+    Media tensors are indexed by media entry (image, video, patch), not by sample,
+    so ``torch.distributed.pipelining`` would split them along the wrong axis. They
+    are therefore removed from the batch and stored pre-chunked under
+    ``VLM_PP_MEDIA_KEY``. The batch instead gains ``PP_MEDIA_INDEX_KEY``, an int64
+    tensor of shape [batch] that torch splits in lockstep with ``input_ids``, so
+    every forward can look up its own chunk regardless of execution order.
+
+    Args:
+        batch: Collated batch whose media tensors are moved into PP media storage.
+            Mutated in place and also returned.
+        batch_size: Number of samples in the batch.
+        n_microbatches: Number of PP microbatches the batch is split into.
+
+    Returns:
+        The same mapping, without raw media tensors and with ``VLM_PP_MEDIA_KEY``
+        plus ``PP_MEDIA_INDEX_KEY`` (shape [batch]) added when media was staged.
+
+    Raises:
+        ValueError: If ``n_microbatches`` is below 1, if videos are present without
+            ``video_grid_thw``, or if a per-media metadata tensor cannot be aligned
+            with the chunked media.
     """
     if n_microbatches < 1:
         raise ValueError(f"n_microbatches must be >= 1, got {n_microbatches}")
@@ -243,18 +360,21 @@ def prepare_vlm_media_for_pp(
     patch_newline_mask = batch.pop("patch_newline_mask", None)
     image_grid_hws = batch.pop("image_grid_hws", None)
     image_grid_thw = batch.pop("image_grid_thw", None)
+    grid_thws = batch.pop("grid_thws", None)
+    image_flags = batch.pop("image_flags", None)
     image_sizes = batch.pop("image_sizes", None)
     image_position_ids = batch.pop("image_position_ids", None)
     n_images_per_sample = batch.pop("n_images_per_sample", None)
     pixel_values_videos = batch.pop("pixel_values_videos", None)
     video_grid_thw = batch.pop("video_grid_thw", None)
+    second_per_grid_ts = batch.pop("second_per_grid_ts", None)
     n_videos_per_sample = batch.pop("n_videos_per_sample", None)
 
     image_grid = _select_image_grid(image_grid_hws, image_grid_thw, image_sizes, image_position_ids)
     pp_media: dict[str, list[torch.Tensor]] = {}
 
     if pixel_values is not None and image_grid is None:
-        step3_media = chunk_step3_media(
+        patch_mapped_media = chunk_patch_mapped_media(
             pixel_values,
             batch_size=batch_size,
             n_microbatches=n_microbatches,
@@ -262,7 +382,7 @@ def prepare_vlm_media_for_pp(
             patch_pixel_values=patch_pixel_values,
             patch_newline_mask=patch_newline_mask,
         )
-        pp_media.update(step3_media)
+        pp_media.update(patch_mapped_media)
 
     if pixel_values_videos is not None and video_grid_thw is None:
         raise ValueError("VLM PP media prep requires video_grid_thw with pixel_values_videos.")
@@ -289,8 +409,24 @@ def prepare_vlm_media_for_pp(
         pp_media["pixel_values_videos"] = pixel_values_videos_chunks
         pp_media["video_grid_thw"] = video_grid_thw_chunks
 
+    # Metadata carrying one row per media entry rather than one row per sample.
+    # Left in the batch it would be row-split along the media axis by torch.
+    per_image_reference = pp_media.get("image_grid_hws", pp_media.get("pixel_values"))
+    for name, tensor in (("grid_thws", grid_thws), ("image_flags", image_flags)):
+        if tensor is None:
+            continue
+        if per_image_reference is None:
+            raise ValueError(f"VLM PP media prep found '{name}' but no image tensors to align it with.")
+        pp_media[name] = _chunk_rows_like(tensor, name, per_image_reference)
+    if second_per_grid_ts is not None:
+        video_reference = pp_media.get("video_grid_thw")
+        if video_reference is None:
+            raise ValueError("VLM PP media prep found 'second_per_grid_ts' but no video tensors to align it with.")
+        pp_media["second_per_grid_ts"] = _chunk_rows_like(second_per_grid_ts, "second_per_grid_ts", video_reference)
+
     if pp_media:
         batch[VLM_PP_MEDIA_KEY] = pp_media
+        batch[PP_MEDIA_INDEX_KEY] = build_pp_media_index(batch_size, n_microbatches)
 
     return batch
 
@@ -319,72 +455,45 @@ def wrap_vlm_collate_for_pp(
     return wrapper
 
 
-def _will_run_forward_metadata_inference(pp: Any) -> bool:
-    """Return whether the next schedule step will probe stage 0 with a real forward."""
-    schedule = getattr(pp.info, "schedule", None)
-    stages = getattr(pp.info, "stages", None)
-    if schedule is None or not stages:
-        return False
-
-    first_stage = next((stage for stage in stages if getattr(stage, "is_first", False)), None)
-    if first_stage is None or hasattr(first_stage, "_configure_outputs_meta"):
-        return False
-
-    if hasattr(schedule, "_stage_forward_initialized"):
-        return not schedule._stage_forward_initialized
-    if hasattr(schedule, "_stages_forward_initialized"):
-        return not schedule._stages_forward_initialized
-    return False
-
-
 @contextmanager
 def stage_vlm_media_for_pp(pp: Any, model_parts: list[torch.nn.Module], batch: MutableMapping[str, Any]):
-    """Attach dataloader-prepared VLM media chunks to PP stage 0 for one schedule call."""
+    """Attach dataloader-prepared VLM media chunks to PP stage 0 for one schedule call.
+
+    The chunks are exposed as a single ``_pp_media_chunks`` mapping of media name to
+    one tensor per microbatch. Stage-0 forwards select their own entry with
+    ``nemo_automodel.shared.pipeline.pp_media_chunk`` using the ``pp_media_index``
+    kwarg the batch carries, so no cursor or other mutable state is involved and a
+    probe forward run for runtime shape inference consumes nothing.
+
+    Args:
+        pp: Built ``AutoPipeline`` whose ``info.has_first_stage`` decides whether
+            this rank owns stage 0.
+        model_parts: Local pipeline stage modules; ``model_parts[0]`` is stage 0.
+        batch: Batch carrying ``VLM_PP_MEDIA_KEY``; the key is always removed so
+            raw media never reaches ``schedule.step()``.
+
+    Yields:
+        None, for the duration of one schedule call.
+    """
     pp_media = batch.pop(VLM_PP_MEDIA_KEY, None)
     stage0_model = model_parts[0] if pp_media and getattr(pp.info, "has_first_stage", False) else None
-    staged = False
-    metadata_forward_hook = None
 
-    if stage0_model is not None:
-        if "pixel_values" in pp_media:
-            stage0_model._vlm_pixel_values_chunks = pp_media["pixel_values"]
-            stage0_model._vlm_image_grid_hws_chunks = pp_media.get("image_grid_hws")
-            stage0_model._vlm_num_patches_chunks = pp_media.get("num_patches")
-            stage0_model._vlm_patch_pixel_values_chunks = pp_media.get("patch_pixel_values")
-            stage0_model._vlm_patch_newline_mask_chunks = pp_media.get("patch_newline_mask")
-            staged = True
-        if "pixel_values_videos" in pp_media:
-            stage0_model._vlm_pixel_values_videos_chunks = pp_media["pixel_values_videos"]
-            stage0_model._vlm_video_grid_thw_chunks = pp_media.get("video_grid_thw")
-            staged = True
-        if staged:
-            stage0_model._vlm_chunk_idx = 0
-            if _will_run_forward_metadata_inference(pp):
+    if stage0_model is None:
+        yield
+        return
 
-                def reset_media_cursor_after_metadata_forward(_module, _args, _output):
-                    stage0_model._vlm_chunk_idx = 0
-                    metadata_forward_hook.remove()
-
-                metadata_forward_hook = stage0_model.register_forward_hook(reset_media_cursor_after_metadata_forward)
-
+    setattr(stage0_model, PP_MEDIA_CHUNKS_ATTR, dict(pp_media))
     try:
         yield
     finally:
-        if metadata_forward_hook is not None:
-            metadata_forward_hook.remove()
-        if staged and stage0_model is not None:
-            stage0_model._vlm_pixel_values_chunks = None
-            stage0_model._vlm_image_grid_hws_chunks = None
-            stage0_model._vlm_num_patches_chunks = None
-            stage0_model._vlm_patch_pixel_values_chunks = None
-            stage0_model._vlm_patch_newline_mask_chunks = None
-            stage0_model._vlm_pixel_values_videos_chunks = None
-            stage0_model._vlm_video_grid_thw_chunks = None
-            stage0_model._vlm_chunk_idx = None
+        setattr(stage0_model, PP_MEDIA_CHUNKS_ATTR, None)
 
 
 __all__ = [
+    "PP_MEDIA_CHUNKS_ATTR",
     "VLM_PP_MEDIA_KEY",
+    "build_pp_media_index",
+    "chunk_patch_mapped_media",
     "chunk_vlm_media",
     "prepare_vlm_media_for_pp",
     "stage_vlm_media_for_pp",

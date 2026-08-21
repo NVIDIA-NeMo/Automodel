@@ -58,10 +58,30 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.pipeline import (
     PipelineForwardStyle,
     PipelineModelMixin,
-    causal_lm_stage_metas,
-    context_parallel_seq_len,
+    pp_media_chunk,
 )
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+#: Module names the pipeline splitter treats as multimodal encoders rather than
+#: text-stack modules. Kept local to this package so the model does not import
+#: from another component; mirrors the generic HuggingFace pipeline splitter's list.
+_MULTIMODAL_SUFFIXES = (
+    "vision_tower",
+    "visual",
+    "vision_model",
+    "image_encoder",
+    "vision_encoder",
+    "embed_vision",
+    "audio_tower",
+    "audio_encoder",
+    "audio_model",
+    "mm_projector",
+    "multi_modal_projector",
+    "multimodal_projector",
+    "vision_projector",
+    "vit_large_projector",
+    "audio_projector",
+)
 
 
 @dataclass
@@ -508,8 +528,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, PipelineMode
                 "MiniMax M3 VL does not support MTP modules under pipeline parallelism yet; "
                 "set text_config.num_mtp_modules=0 for pp_size>1 runs."
             )
-        from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
-
         text_prefix = "model."  # M3's text stack lives directly under self.model
         fixed: list[list[str]] = []
         for stage in module_names_per_stage:
@@ -517,7 +535,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, PipelineMode
             for name in stage:
                 if layers_prefix != text_prefix and name.startswith(layers_prefix):
                     names.append(text_prefix + name[len(layers_prefix) :])
-                elif name.startswith(text_prefix) and name[len(text_prefix) :] in MULTIMODAL_SUFFIXES:
+                elif name.startswith(text_prefix) and name[len(text_prefix) :] in _MULTIMODAL_SUFFIXES:
                     names.append(name[len(text_prefix) :])
                 else:
                     names.append(name)
@@ -534,43 +552,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, PipelineMode
             return len(self.model.layers) != int(self.config.text_config.num_hidden_layers)
         except (TypeError, AttributeError):
             return False
-
-    def pipeline_stage_metas(
-        self,
-        *,
-        is_first: bool,
-        microbatch_size: int,
-        seq_len: int,
-        dtype: torch.dtype,
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Per-stage input/output meta tensors for the PP schedule's shape inference.
-
-        First stage consumes the FULL token ids ``[mb, seq]``; later stages
-        consume hidden states. The final stage (owning ``lm_head``) emits logits;
-        earlier stages emit hidden states.
-
-        Under context parallelism the first stage embeds the full sequence and
-        shards it to this rank's round-robin chunk pair inside forward
-        (see :func:`shard_sequence_for_cp_round_robin`), so every stage output and every
-        later-stage input carries the LOCAL (padded-to-``2*cp`` then ``//cp``)
-        sequence length while the first stage's input stays full-length. At
-        ``cp_size == 1`` the lengths coincide and the layout is symmetric.
-        """
-        text_config = self.config.text_config
-        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
-        head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
-        return causal_lm_stage_metas(
-            is_first=is_first,
-            has_lm_head=self.lm_head is not None,
-            emits_hidden_states=False,
-            microbatch_size=microbatch_size,
-            input_seq_len=seq_len,
-            output_seq_len=context_parallel_seq_len(seq_len, cp_size),
-            hidden_size=text_config.hidden_size,
-            vocab_size=text_config.vocab_size,
-            dtype=dtype,
-            logits_dtype=head_dtype,
-        )
 
     @staticmethod
     def _to_grid_list(grid_thw) -> list[list[int]]:
@@ -673,8 +654,38 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, PipelineMode
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        pp_media_index: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Run the M3 VL forward, either whole-model or as a single pipeline stage.
+
+        Args:
+            input_ids: Token ids of shape [batch, sequence], or, on a pipeline
+                stage after the first, the previous stage's hidden states of
+                shape [batch, local_sequence, hidden] (a floating tensor).
+            pixel_values: Image patches of shape [total_image_patches, patch_dim];
+                on stage 0 under pipeline parallelism it is instead pulled from
+                the media staged for this microbatch.
+            image_grid_thw: Per-image patch grid of shape [num_images, 3] ordered
+                (T, H, W), or an equivalent nested sequence.
+            pixel_values_videos: Video patches of shape
+                [total_video_patches, patch_dim]; staged like ``pixel_values``.
+            video_grid_thw: Per-video patch grid of shape [num_videos, 3] ordered
+                (T, H, W), or an equivalent nested sequence.
+            position_ids: Positions of shape [batch, sequence].
+            attention_mask: Mask of shape [batch, sequence].
+            inputs_embeds: Embeddings of shape [batch, sequence, hidden].
+            pp_media_index: Tensor of shape [microbatch] holding this
+                microbatch's index into the media staged on stage 0, or None
+                outside pipeline parallelism.
+            **kwargs: Extra arguments forwarded to the text model.
+
+        Returns:
+            Logits of shape [batch, local_sequence, vocab] on the last pipeline
+            stage or in the non-pipeline case, hidden states of shape
+            [batch, local_sequence, hidden] on earlier stages, or a
+            :class:`MiniMaxM3CausalLMOutput` when MTP logits are produced.
+        """
         is_pp_stage = self._is_pipeline_parallel_stage()
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the
@@ -688,36 +699,27 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, PipelineMode
             )
 
         # Pipeline stage 0 does not receive media in the batch: the VLM-PP collate
-        # strips pixel_values/grids and stage_vlm_media_for_pp attaches them here as
-        # per-microbatch chunks. Pull this microbatch's media off the cursor before
-        # embedding so vision features still get spliced (mirrors KimiVL/Step3p7).
-        # `_vlm_image_grid_hws_chunks` holds M3's image_grid_thw values (the PP media
-        # prep stores whatever grid the model emits under that key), so no reshape.
-        chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+        # strips pixel_values/grids and stage_vlm_media_for_pp attaches them to this
+        # module as per-microbatch chunks keyed by media name. `pp_media_index` rides
+        # the batch and identifies this microbatch's chunk, so the lookup is
+        # independent of the order the schedule runs microbatches in. Pull the media
+        # before embedding so vision features still get spliced (mirrors KimiVL/Step3p7).
+        # The staged "image_grid_hws" entry holds M3's image_grid_thw values (the PP
+        # media prep stores whatever grid the model emits under that key), so no reshape.
         if (
             pixel_values is None
             and pixel_values_videos is None
             and input_ids is not None
             and not torch.is_floating_point(input_ids)
-            and (chunks is not None or getattr(self, "_vlm_pixel_values_videos_chunks", None) is not None)
         ):
-            chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-            consumed = False
-            if chunks is not None and (input_ids == self.image_token_index).any() and chunk_idx < len(chunks):
-                pixel_values = chunks[chunk_idx]
-                image_grid_thw = self._vlm_image_grid_hws_chunks[chunk_idx]
-                consumed = True
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if (
-                video_chunks is not None
-                and (input_ids == self.video_token_index).any()
-                and chunk_idx < len(video_chunks)
-            ):
-                pixel_values_videos = video_chunks[chunk_idx]
-                video_grid_thw = self._vlm_video_grid_thw_chunks[chunk_idx]
-                consumed = True
-            if consumed:
-                self._vlm_chunk_idx = chunk_idx + 1
+            staged_images = pp_media_chunk(self, "pixel_values", pp_media_index)
+            if staged_images is not None and (input_ids == self.image_token_index).any():
+                pixel_values = staged_images
+                image_grid_thw = pp_media_chunk(self, "image_grid_hws", pp_media_index)
+            staged_videos = pp_media_chunk(self, "pixel_values_videos", pp_media_index)
+            if staged_videos is not None and (input_ids == self.video_token_index).any():
+                pixel_values_videos = staged_videos
+                video_grid_thw = pp_media_chunk(self, "video_grid_thw", pp_media_index)
 
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
 
@@ -725,8 +727,8 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, PipelineMode
         # stage_vlm_media_for_pp stashed grid-aware pixel chunks (pulled just above),
         # and the embed + vision splice below runs on this microbatch's FULL sequence
         # before shard_sequence_for_cp_round_robin shards it. So the CP shard composes with the
-        # media staging without changing the stage metas (the first-stage input is
-        # still input_ids [mb, S]; media never enters the stage tensor stream).
+        # media staging: the first-stage input is still input_ids [mb, S] and media
+        # never enters the stage tensor stream.
 
         # Pipeline stages after the first receive the previous stage's hidden
         # states in the input_ids slot (a float tensor); route them straight to

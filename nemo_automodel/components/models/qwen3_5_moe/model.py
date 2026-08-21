@@ -25,10 +25,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 from nemo_automodel.shared.pipeline import (
+    PP_MEDIA_INDEX_KEY,
     PipelineForwardStyle,
     PipelineModelMixin,
-    causal_lm_stage_metas,
-    context_parallel_seq_len,
+    pp_media_chunk,
 )
 
 
@@ -712,7 +712,7 @@ class Qwen3_5MoeForConditionalGeneration(
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
-    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
+    # forward() pulls this microbatch's pixel_values from the staged media chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     pipeline_forward_style = PipelineForwardStyle.MODEL
     # CP submesh, installed by Qwen3_5ParallelizationStrategy when context
@@ -1006,37 +1006,6 @@ class Qwen3_5MoeForConditionalGeneration(
 
         return inputs_embeds
 
-    def pipeline_stage_metas(
-        self,
-        *,
-        is_first: bool,
-        microbatch_size: int,
-        seq_len: int,
-        dtype: torch.dtype,
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Per-stage input/output meta tensors for the PP schedule's shape inference.
-
-        Matches the framework default except that under context parallelism the
-        first stage embeds the full sequence and shards it in forward, so every
-        stage output and later-stage input carries the LOCAL (padded-to-``2*cp``
-        then ``//cp``) sequence length while the first-stage input stays
-        full-length. At ``cp_size == 1`` this reduces to the default symmetric
-        shapes.
-        """
-        text_config = getattr(self.config, "text_config", self.config)
-        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
-        return causal_lm_stage_metas(
-            is_first=is_first,
-            has_lm_head=self.lm_head is not None,
-            emits_hidden_states=False,
-            microbatch_size=microbatch_size,
-            input_seq_len=seq_len,
-            output_seq_len=context_parallel_seq_len(seq_len, cp_size),
-            hidden_size=text_config.hidden_size,
-            vocab_size=text_config.vocab_size,
-            dtype=dtype,
-        )
-
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1058,7 +1027,12 @@ class Qwen3_5MoeForConditionalGeneration(
             else getattr(text_config, "output_hidden_states", False)
         )
 
-        # PP VLM support: retrieve pixel_values from stored chunks if not passed
+        # PP VLM support: media tensors cannot ride the batch under pipeline
+        # parallelism, because the schedule splits every batch tensor along dim 0
+        # and that does not line up with the per-image patch axis. They are staged
+        # per microbatch on stage 0 instead; ``pp_media_index`` ([microbatch] int64)
+        # identifies which staged chunk belongs to this forward.
+        pp_media_index = kwargs.pop(PP_MEDIA_INDEX_KEY, None)
         pixel_values = kwargs.get("pixel_values", None)
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
@@ -1069,43 +1043,31 @@ class Qwen3_5MoeForConditionalGeneration(
             (input_ids == image_token_id).any() or (input_ids == vision_start_token_id).any()
         )
 
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        consumed_vlm_chunk = False
-
         if pixel_values is None and has_media_tokens:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            if image_chunks is not None and chunk_idx < len(image_chunks):
-                pixel_values = image_chunks[chunk_idx]
-                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
-                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
-                    image_grid_hws = image_grid_chunks[chunk_idx]
-                    if image_grid_hws is not None and image_grid_hws.numel() > 0:
-                        if image_grid_hws.shape[-1] == 2:
-                            ones = torch.ones(
-                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
-                            )
-                            image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
-                        else:
-                            image_grid_thw = image_grid_hws
+            pixel_values = pp_media_chunk(self, "pixel_values", pp_media_index)
+            if pixel_values is not None:
+                image_grid_hws = pp_media_chunk(self, "image_grid_hws", pp_media_index)
+                if image_grid_hws is not None and image_grid_hws.numel() > 0:
+                    if image_grid_hws.shape[-1] == 2:
+                        # Staged grids may omit the temporal axis; images are single-frame.
+                        ones = torch.ones(
+                            image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
+                        )
+                        image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
+                    else:
+                        image_grid_thw = image_grid_hws
                 kwargs["pixel_values"] = pixel_values
                 kwargs["image_grid_thw"] = image_grid_thw
-                consumed_vlm_chunk = True
 
         if pixel_values_videos is None and has_media_tokens:
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if video_chunks is not None and chunk_idx < len(video_chunks):
-                video_chunk = video_chunks[chunk_idx]
-                if video_chunk.numel() > 0:
-                    pixel_values_videos = video_chunk
-                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
-                    if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
-                        video_grid_thw = video_grid_chunks[chunk_idx]
-                    kwargs["pixel_values_videos"] = pixel_values_videos
-                    kwargs["video_grid_thw"] = video_grid_thw
-                consumed_vlm_chunk = True
-
-        if consumed_vlm_chunk:
-            self._vlm_chunk_idx = chunk_idx + 1
+            video_chunk = pp_media_chunk(self, "pixel_values_videos", pp_media_index)
+            if video_chunk is not None and video_chunk.numel() > 0:
+                pixel_values_videos = video_chunk
+                staged_video_grid = pp_media_chunk(self, "video_grid_thw", pp_media_index)
+                if staged_video_grid is not None:
+                    video_grid_thw = staged_video_grid
+                kwargs["pixel_values_videos"] = pixel_values_videos
+                kwargs["video_grid_thw"] = video_grid_thw
 
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(

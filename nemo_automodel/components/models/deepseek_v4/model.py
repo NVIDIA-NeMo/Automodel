@@ -809,41 +809,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module,
 
         return stage_modules
 
-    def pipeline_stage_metas(
-        self,
-        *,
-        is_first: bool,
-        microbatch_size: int,
-        seq_len: int,
-        dtype: torch.dtype,
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Return PP input/output meta tensors for DSV4's HC and MTP contract."""
-
-        hidden_shape = (microbatch_size, seq_len, self.config.hidden_size)
-        hc_hidden_shape = (microbatch_size, seq_len, self.config.hc_mult, self.config.hidden_size)
-        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
-
-        def meta(shape: tuple[int, ...]) -> torch.Tensor:
-            return torch.empty(*shape, device="meta", dtype=dtype)
-
-        def append_mtp_metas(primary: torch.Tensor) -> tuple[torch.Tensor, ...]:
-            mtp_metas = (meta(hidden_shape) for _ in range(mtp_depth))
-            return (primary, *mtp_metas)
-
-        if is_first:
-            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
-        else:
-            inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
-
-        if self.lm_head is not None:
-            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size))
-        elif getattr(self.model, "norm", None) is not None:
-            output_meta = meta(hidden_shape)
-        else:
-            output_meta = meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape)
-
-        return inputs_meta, append_mtp_metas(output_meta)
-
     def _is_pipeline_parallel_stage(self) -> bool:
         if self.lm_head is None:
             return True

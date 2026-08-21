@@ -93,10 +93,12 @@ from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
+from .pipeline import gemma4_pipeline_forward
 from .sdpa_fp32 import enable_gemma4_sdpa_fp32
 
 
@@ -876,9 +878,15 @@ class Gemma4MoEModel(HFGemma4Model):
 # ---------------------------------------------------------------------------
 # Top-level conditional-generation model
 # ---------------------------------------------------------------------------
-class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
+class Gemma4ForConditionalGeneration(
+    HFCheckpointingMixin, PipelineModelMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin
+):
     tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
+    # Gemma4's stage forward is model-owned (mixed sliding/full attention, per-layer-type
+    # rotary embeddings, kv-sharing store, logit softcapping), so the generic HF pipeline
+    # patch must leave this class alone. See pipeline.py.
+    pipeline_forward_style = PipelineForwardStyle.MODEL
     # RoPE inv_freq must stay fp32: initialize_weights casts the model to bf16 and
     # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
     # modules afterwards (see llama/rope_utils.py).
@@ -1154,6 +1162,23 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if getattr(self.config, "tie_word_embeddings", getattr(text_config, "tie_word_embeddings", False)):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
+    def _is_pipeline_stage(self) -> bool:
+        """Return whether this module is one part of a pipeline-parallel split.
+
+        The pipeline splitter deep-copies the model, keeps only the modules the
+        stage owns and rebuilds the layer container as an ``nn.ModuleDict`` keyed
+        by the original layer index. The dense text backbone holds its layers in
+        an ``nn.ModuleList`` everywhere else, so that swap marks a stage even when
+        the split gives one stage every layer. The MoE backend builds an
+        ``nn.ModuleDict`` itself and does not support pipeline parallelism (see
+        ``get_capabilities``), so it never takes the pipeline path.
+        """
+        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        if getattr(text_config, "enable_moe_block", False):
+            return False
+        language_model = getattr(self.model, "language_model", None)
+        return isinstance(getattr(language_model, "layers", None), nn.ModuleDict)
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1166,10 +1191,62 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         pixel_values: torch.Tensor | None = None,
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
+        pp_media_index: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ):
+        """Run Gemma4 VL, dispatching to the dense, MoE, or pipeline-stage path.
+
+        Args:
+            input_ids: Token ids of shape [batch, sequence]; on a non-first
+                pipeline stage, the incoming hidden states of shape
+                [batch, sequence, hidden] instead.
+            position_ids: Positions of shape [batch, sequence].
+            attention_mask: Padding mask of shape [batch, sequence], or a 4D
+                additive/boolean mask.
+            padding_mask: Boolean mask of shape [batch, sequence], True on padding.
+            inputs_embeds: Embeddings of shape [batch, sequence, hidden].
+            cache_position: Positions of shape [sequence] within the sequence.
+            pixel_values: Image tensor for the vision tower.
+            image_position_ids: Image position ids for ``get_image_features``.
+            mm_token_type_ids: Token-type ids of shape [batch, sequence], 1 on
+                image positions.
+            pp_media_index: Tensor of shape [microbatch] holding this microbatch's
+                index into the media staged on pipeline stage 0; unused off the
+                pipeline path.
+            logits_to_keep: Number of trailing positions to project, or an index
+                tensor selecting them.
+            output_hidden_states: Whether to surface the final hidden states.
+            **kwargs: Extra arguments forwarded to the text backbone.
+
+        Returns:
+            On a pipeline stage, a tensor: logits of shape
+            [batch, sequence, vocab] from the stage owning ``lm_head``, else
+            hidden states of shape [batch, sequence, hidden]. Otherwise a
+            causal-LM output carrying logits of shape
+            [batch, kept_sequence, vocab].
+        """
+        if self._is_pipeline_stage():
+            return gemma4_pipeline_forward(
+                self,
+                input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                image_position_ids=image_position_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                cache_position=cache_position,
+                padding_mask=padding_mask,
+                pp_media_index=pp_media_index,
+                # One store per stage, threaded through every decoder layer so a
+                # kv-shared layer reads its source layer's keys/values. It must not
+                # be a plain dict: FSDP2 copies those per layer and loses the writes
+                # (see _FSDPSafeSharedKVStates).
+                shared_kv_states=_FSDPSafeSharedKVStates(),
+            )
+
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None

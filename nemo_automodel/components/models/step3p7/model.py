@@ -46,7 +46,12 @@ from nemo_automodel.components.models.step3p7.vision_encoder import StepRobotics
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
-from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin, context_parallel_seq_len
+from nemo_automodel.shared.pipeline import (
+    PP_MEDIA_INDEX_KEY,
+    PipelineForwardStyle,
+    PipelineModelMixin,
+    pp_media_chunk,
+)
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.getLogger(__name__)
@@ -449,38 +454,6 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, PipelineModelMixin, 
             stage_modules[-1].append("mtp")
         return stage_modules
 
-    def pipeline_stage_metas(
-        self,
-        *,
-        is_first: bool,
-        microbatch_size: int,
-        seq_len: int,
-        dtype: torch.dtype,
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        # Under context parallelism the first stage embeds the full sequence and
-        # shards it in forward, so every stage output and later-stage input (incl.
-        # the propagated MTP hidden states) carries the LOCAL (padded-to-2*cp then
-        # //cp) sequence length while the first-stage token-id input stays full.
-        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
-        local_seq_len = context_parallel_seq_len(seq_len, cp_size)
-
-        hidden_shape = (microbatch_size, local_seq_len, self.config.text_config.hidden_size)
-        vocab_shape = (microbatch_size, local_seq_len, self.config.text_config.vocab_size)
-        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
-
-        def meta(shape: tuple[int, ...]) -> torch.Tensor:
-            return torch.empty(*shape, device="meta", dtype=dtype)
-
-        if is_first:
-            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
-        else:
-            inputs_meta = (meta(hidden_shape), *(meta(hidden_shape) for _ in range(mtp_depth)))
-
-        primary_shape = vocab_shape if self.lm_head is not None else hidden_shape
-        mtp_shape = vocab_shape if self.lm_head is not None else hidden_shape
-        outputs_meta = (meta(primary_shape), *(meta(mtp_shape) for _ in range(mtp_depth)))
-        return inputs_meta, outputs_meta
-
     def _is_pipeline_parallel_stage(self) -> bool:
         if self.lm_head is None:
             return True
@@ -572,35 +545,29 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, PipelineModelMixin, 
             and (input_ids == self.config.image_token_id).any()
         )
 
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        consumed_vlm_chunk = False
+        # Under PP the media tensors do not ride the batch: the schedule splits
+        # every batch tensor along dim 0, which does not match the per-image patch
+        # axis, so stage 0 holds them staged per microbatch. ``pp_media_index``
+        # ([microbatch] int64) names the chunk belonging to this forward.
+        pp_media_index = kwargs.pop(PP_MEDIA_INDEX_KEY, None)
         if pixel_values is None and has_image_tokens:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            if image_chunks is not None and chunk_idx < len(image_chunks):
-                kwargs["pixel_values"] = image_chunks[chunk_idx]
-                patch_chunks = getattr(self, "_vlm_patch_pixel_values_chunks", None)
-                if patch_chunks is not None and chunk_idx < len(patch_chunks):
-                    kwargs["patch_pixel_values"] = patch_chunks[chunk_idx]
-                num_patches_chunks = getattr(self, "_vlm_num_patches_chunks", None)
-                if num_patches_chunks is not None and chunk_idx < len(num_patches_chunks):
-                    kwargs["num_patches"] = num_patches_chunks[chunk_idx]
-                newline_chunks = getattr(self, "_vlm_patch_newline_mask_chunks", None)
-                if newline_chunks is not None and chunk_idx < len(newline_chunks):
-                    kwargs["patch_newline_mask"] = newline_chunks[chunk_idx]
-                consumed_vlm_chunk = True
+            staged_pixel_values = pp_media_chunk(self, "pixel_values", pp_media_index)
+            if staged_pixel_values is not None:
+                kwargs["pixel_values"] = staged_pixel_values
+                for media_key in ("patch_pixel_values", "num_patches", "patch_newline_mask"):
+                    staged_media = pp_media_chunk(self, media_key, pp_media_index)
+                    if staged_media is not None:
+                        kwargs[media_key] = staged_media
                 if _debug_vision_enabled():
                     _debug_vision_log(
-                        "[step3p7][rank %s] PP consumed vision chunk=%s pixel_values=%s num_patches=%s",
+                        "[step3p7][rank %s] PP vision chunk=%s pixel_values=%s num_patches=%s",
                         _rank(),
-                        chunk_idx,
-                        tuple(image_chunks[chunk_idx].shape),
+                        None if pp_media_index is None else int(pp_media_index.reshape(-1)[0]),
+                        tuple(staged_pixel_values.shape),
                         None
                         if kwargs.get("num_patches", None) is None
                         else [int(x) for x in kwargs["num_patches"].detach().cpu().view(-1).tolist()],
                     )
-
-        if consumed_vlm_chunk:
-            self._vlm_chunk_idx = chunk_idx + 1
 
         if (
             inputs_embeds is not None

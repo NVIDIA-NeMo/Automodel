@@ -41,6 +41,7 @@ from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Q
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import pp_media_chunk
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -345,6 +346,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         video_second_per_grid: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
+        pp_media_index: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor | dict | CausalLMOutputWithPast:
         """Forward pass with multimodal fusion.
@@ -374,6 +376,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             output_hidden_states: When set, the returned output carries the final
                 hidden states (the input to ``lm_head``) so the recipe can run
                 fused linear cross-entropy.
+            pp_media_index: Tensor of shape [microbatch] holding this
+                microbatch's index into the media staged on stage 0, or None
+                outside pipeline parallelism.
             **attn_kwargs: Additional attention arguments
 
         Returns:
@@ -392,41 +397,28 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             )
             attention_mask = None
 
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        consumed_vlm_chunk = False
-
+        # Under pipeline parallelism the recipe stages the batch media on stage 0
+        # and the batch carries this microbatch's index, so this forward can pick
+        # up its own chunk without a cursor.
         if pixel_values is None:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            if image_chunks is not None and chunk_idx < len(image_chunks):
-                image_chunk = image_chunks[chunk_idx]
-                if image_chunk.numel() > 0:
-                    pixel_values = image_chunk
-                    image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
-                    if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
-                        image_grid = image_grid_chunks[chunk_idx]
-                        if image_grid is not None and image_grid.numel() > 0:
-                            if image_grid.shape[-1] == 2:
-                                ones = torch.ones(
-                                    image_grid.shape[0], 1, dtype=image_grid.dtype, device=image_grid.device
-                                )
-                                image_grid_thw = torch.cat([ones, image_grid], dim=-1)
-                            else:
-                                image_grid_thw = image_grid
-                consumed_vlm_chunk = True
+            image_chunk = pp_media_chunk(self, "pixel_values", pp_media_index)
+            if image_chunk is not None and image_chunk.numel() > 0:
+                pixel_values = image_chunk
+                image_grid = pp_media_chunk(self, "image_grid_hws", pp_media_index)
+                if image_grid is not None and image_grid.numel() > 0:
+                    if image_grid.shape[-1] == 2:
+                        ones = torch.ones(image_grid.shape[0], 1, dtype=image_grid.dtype, device=image_grid.device)
+                        image_grid_thw = torch.cat([ones, image_grid], dim=-1)
+                    else:
+                        image_grid_thw = image_grid
 
         if pixel_values_videos is None:
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if video_chunks is not None and chunk_idx < len(video_chunks):
-                video_chunk = video_chunks[chunk_idx]
-                if video_chunk.numel() > 0:
-                    pixel_values_videos = video_chunk
-                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
-                    if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
-                        video_grid_thw = video_grid_chunks[chunk_idx]
-                consumed_vlm_chunk = True
-
-        if consumed_vlm_chunk:
-            self._vlm_chunk_idx = chunk_idx + 1
+            video_chunk = pp_media_chunk(self, "pixel_values_videos", pp_media_index)
+            if video_chunk is not None and video_chunk.numel() > 0:
+                pixel_values_videos = video_chunk
+                video_grid_chunk = pp_media_chunk(self, "video_grid_thw", pp_media_index)
+                if video_grid_chunk is not None:
+                    video_grid_thw = video_grid_chunk
 
         # 1. Get input embeddings
         if inputs_embeds is None:

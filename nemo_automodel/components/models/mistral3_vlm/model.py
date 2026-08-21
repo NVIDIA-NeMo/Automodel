@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
+import torch.nn as nn
 from transformers import PretrainedConfig
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3CausalLMOutputWithPast,
@@ -48,9 +49,11 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
+from nemo_automodel.components.models.mistral3_vlm.pipeline import mistral3_vlm_pipeline_forward
 from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
 )
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +111,7 @@ def _rotary_reinit_self_hook(module, args, kwargs):
     module._mistral3_fp8_rotary_reinit_done = True
 
 
-class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration):
+class Mistral3FP8VLMForConditionalGeneration(PipelineModelMixin, _HFMistral3ForConditionalGeneration):
     """Full-VLM (vision + text) FP8 loader for Mistral3ForConditionalGeneration.
 
     Used when the user instantiates through
@@ -130,6 +133,11 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     # indefinitely (empirically verified: without this attribute the 4-layer
     # smoke never reaches the adapter load stage within 300s).
     _skip_init_weights_on_load = True
+
+    # A pipeline stage of this VLM needs the vision tower on stage 0 and can only
+    # run on the pruned module layout, so keep this class's own forward instead of
+    # letting the generic HF pipeline patch replace it. See pipeline.py.
+    pipeline_forward_style = PipelineForwardStyle.MODEL
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -192,6 +200,18 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         if getattr(getattr(self, "config", None), "tie_word_embeddings", False):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
+    def _is_pipeline_stage(self) -> bool:
+        """Return whether this module is one part of a pipeline-parallel split.
+
+        The pipeline splitter deep-copies the model, keeps only the modules the
+        stage owns and rebuilds the layer container as an ``nn.ModuleDict`` keyed
+        by the original layer index. The Ministral3 backbone holds its layers in
+        an ``nn.ModuleList`` everywhere else, so that swap marks a stage even when
+        the split gives one stage every layer.
+        """
+        language_model = getattr(self.model, "language_model", None)
+        return isinstance(getattr(language_model, "layers", None), nn.ModuleDict)
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -205,8 +225,9 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         logits_to_keep: Union[int, torch.Tensor] = 0,
         image_sizes: Optional[torch.Tensor] = None,
         output_hidden_states: Optional[bool] = None,
+        pp_media_index: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Mistral3CausalLMOutputWithPast:
+    ) -> Mistral3CausalLMOutputWithPast | torch.Tensor:
         """Forward pass with memory-efficient fused cross-entropy (cut-CE) support.
 
         Overrides HF's ``Mistral3ForConditionalGeneration.forward`` so the
@@ -235,13 +256,31 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
             image_sizes: Optional image sizes for the vision tower.
             output_hidden_states: Whether to surface the final hidden states on the
                 output (defaults to the text sub-config's ``output_hidden_states``).
+            pp_media_index: Tensor of shape ``[microbatch]`` holding this microbatch's
+                index into the media staged on pipeline stage 0, or None when the batch
+                carries no media. Unused off the pipeline path.
             **kwargs: Additional arguments forwarded to the base model.
 
         Returns:
+            On a pipeline stage, a tensor: logits of shape ``[B, S, V]`` from the
+            stage owning ``lm_head``, else hidden states of shape ``[B, S, H]``.
+            Otherwise a
             :class:`~transformers.models.mistral3.modeling_mistral3.Mistral3CausalLMOutputWithPast`
             with ``logits``, optional ``loss``, ``past_key_values``, and (when
             ``output_hidden_states`` is set) the final ``hidden_states`` tensor.
         """
+        if self._is_pipeline_stage():
+            return mistral3_vlm_pipeline_forward(
+                self,
+                input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                pp_media_index=pp_media_index,
+            )
+
         text_config = getattr(self.config, "text_config", self.config)
         output_hidden_states = (
             output_hidden_states

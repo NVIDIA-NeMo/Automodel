@@ -41,7 +41,7 @@ from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
-from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin, pp_media_chunk
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import Qwen3VLMoeStateDictAdapter
@@ -461,7 +461,7 @@ class Qwen3VLMoeForConditionalGeneration(
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
-    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
+    # forward() resolves per-microbatch media through pp_media_chunk;
     # patch_hf_model_for_pp must not replace it under PP.
     pipeline_forward_style = PipelineForwardStyle.MODEL
 
@@ -581,8 +581,34 @@ class Qwen3VLMoeForConditionalGeneration(
         cache_position: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
+        pp_media_index: torch.Tensor | None = None,
         **kwargs: Any,
     ):
+        """Run the Qwen3-VL forward, or its pipeline-stage equivalent.
+
+        Args:
+            input_ids: Token ids of shape [batch, sequence], or, on a non-first
+                pipeline stage, incoming hidden states of shape
+                [batch, sequence, hidden].
+            position_ids: Positions of shape [batch, sequence].
+            attention_mask: Mask of shape [batch, sequence].
+            padding_mask: Padding mask of shape [batch, sequence].
+            inputs_embeds: Embeddings of shape [batch, sequence, hidden].
+            cache_position: Cache offsets of shape [sequence].
+            logits_to_keep: Number of trailing positions to project, or an
+                index tensor selecting them.
+            output_hidden_states: Whether to return intermediate hidden states.
+            pp_media_index: Under pipeline parallelism, an int64 tensor of shape
+                [microbatch] identifying which staged media chunk belongs to
+                this microbatch. None outside pipeline parallelism.
+            **kwargs: Additional model inputs, including ``pixel_values`` of
+                shape [patches, channels] and ``image_grid_thw`` of shape
+                [images, 3] when media is passed directly.
+
+        Returns:
+            Logits of shape [batch, sequence, vocab] on the stage owning the LM
+            head, otherwise hidden states of shape [batch, sequence, hidden].
+        """
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         output_hidden_states = (
             output_hidden_states
@@ -590,54 +616,39 @@ class Qwen3VLMoeForConditionalGeneration(
             else getattr(text_config, "output_hidden_states", False)
         )
 
-        # PP VLM support: retrieve pixel_values from stored chunks if not passed directly
+        # PP VLM support: media staged for this microbatch is addressed by
+        # ``pp_media_index`` rather than by a mutating cursor, so a microbatch
+        # that carries no media tokens cannot desynchronize the ones after it.
         pixel_values = kwargs.get("pixel_values", None)
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
-        if input_ids is not None:
-            has_image_tokens = (input_ids == 151655).any()
-            has_video_tokens = (input_ids == 151656).any()
-        else:
-            has_image_tokens = False
-            has_video_tokens = False
 
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        consumed_vlm_chunk = False
-
-        if pixel_values is None and has_image_tokens:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            if image_chunks is not None and chunk_idx < len(image_chunks):
-                pixel_values = image_chunks[chunk_idx]
-                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
-                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
-                    image_grid_hws = image_grid_chunks[chunk_idx]
-                    # Convert image_grid_hws [N, 2] to image_grid_thw [N, 3] by prepending T=1
-                    if image_grid_hws is not None and image_grid_hws.numel() > 0:
-                        if image_grid_hws.shape[-1] == 2:
-                            ones = torch.ones(
-                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
-                            )
-                            image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
-                        else:
-                            image_grid_thw = image_grid_hws
-                kwargs["pixel_values"] = pixel_values
+        if pixel_values is None:
+            staged_images = pp_media_chunk(self, "pixel_values", pp_media_index)
+            if staged_images is not None:
+                image_grid_hws = pp_media_chunk(self, "image_grid_hws", pp_media_index)
+                if image_grid_hws is not None and image_grid_hws.numel() > 0:
+                    if image_grid_hws.shape[-1] == 2:
+                        # Convert image_grid_hws [images, 2] to image_grid_thw
+                        # [images, 3] by prepending a temporal extent of 1.
+                        ones = torch.ones(
+                            image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
+                        )
+                        image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
+                    else:
+                        image_grid_thw = image_grid_hws
+                kwargs["pixel_values"] = staged_images
                 kwargs["image_grid_thw"] = image_grid_thw
-                consumed_vlm_chunk = True
 
-        if pixel_values_videos is None and has_video_tokens:
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if video_chunks is not None and chunk_idx < len(video_chunks):
-                pixel_values_videos = video_chunks[chunk_idx]
-                video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
-                if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
-                    video_grid_thw = video_grid_chunks[chunk_idx]
-                kwargs["pixel_values_videos"] = pixel_values_videos
+        if pixel_values_videos is None:
+            staged_videos = pp_media_chunk(self, "pixel_values_videos", pp_media_index)
+            if staged_videos is not None:
+                staged_video_grid = pp_media_chunk(self, "video_grid_thw", pp_media_index)
+                if staged_video_grid is not None:
+                    video_grid_thw = staged_video_grid
+                kwargs["pixel_values_videos"] = staged_videos
                 kwargs["video_grid_thw"] = video_grid_thw
-                consumed_vlm_chunk = True
-
-        if consumed_vlm_chunk:
-            self._vlm_chunk_idx = chunk_idx + 1
 
         # With pipeline parallelism, attention_mask (from batch kwargs) can have a
         # different sequence length than inputs_embeds (hidden states from prev stage).

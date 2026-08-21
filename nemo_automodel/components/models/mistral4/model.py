@@ -46,6 +46,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin, pp_media_chunk
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -673,7 +674,7 @@ if _HF_MISTRAL3_AVAILABLE:
     from transformers import AutoModel
     from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
 
-    class Mistral3ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    class Mistral3ForConditionalGeneration(HFCheckpointingMixin, PipelineModelMixin, nn.Module, MoEFSDPSyncMixin):
         """Full multimodal Mistral 4: Pixtral vision + projector + Mistral4 MLA/MoE text backbone.
 
         Follows KimiK25VLForConditionalGeneration pattern: inherits from nn.Module
@@ -683,6 +684,12 @@ if _HF_MISTRAL3_AVAILABLE:
         # Head lives in the Mistral4 text backbone (separate lm_head, no tie
         # mechanism); the controlling flag is on the nested text_config.
         tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
+        # This forward already routes pipeline stages (vision merge on stage 0,
+        # incoming hidden states on later stages, lm_head on the last stage) and
+        # calls the Mistral4 text backbone, which the generic HF pipeline patch
+        # cannot drive. Keep it.
+        pipeline_forward_style = PipelineForwardStyle.MODEL
 
         @dataclass(frozen=True)
         class ModelCapabilities:
@@ -801,6 +808,16 @@ if _HF_MISTRAL3_AVAILABLE:
         def set_output_embeddings(self, new_embeddings):
             self.model.language_model.lm_head = new_embeddings
 
+        def _has_image_tokens(self, input_ids: torch.Tensor | None) -> bool:
+            """Return whether ``input_ids`` of shape [batch, sequence] holds image tokens.
+
+            False for the float hidden states a non-first pipeline stage receives in
+            this slot, and for a text-only microbatch.
+            """
+            if input_ids is None or self.image_token_index is None or torch.is_floating_point(input_ids):
+                return False
+            return bool((input_ids == self.image_token_index).any())
+
         def forward(
             self,
             input_ids: torch.Tensor | None = None,
@@ -811,27 +828,42 @@ if _HF_MISTRAL3_AVAILABLE:
             pixel_values: torch.Tensor | None = None,
             image_sizes: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
+            pp_media_index: torch.Tensor | None = None,
             **kwargs: Any,
         ) -> torch.Tensor:
-            # PP VLM support: retrieve pixel_values from stored chunks
-            if (
-                pixel_values is None
-                and hasattr(self, "_vlm_pixel_values_chunks")
-                and self._vlm_pixel_values_chunks is not None
-            ):
-                has_media_tokens = (
-                    input_ids is not None
-                    and self.image_token_index is not None
-                    and (input_ids == self.image_token_index).any()
-                )
-                if has_media_tokens:
-                    chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                    if chunk_idx < len(self._vlm_pixel_values_chunks):
-                        pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                        image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
-                        if image_grid_hws is not None:
-                            image_sizes = image_grid_hws
-                        self._vlm_chunk_idx = chunk_idx + 1
+            """Run the model, or the pipeline stage this module was pruned to.
+
+            Args:
+                input_ids: Token ids of shape [batch, sequence]; on a non-first
+                    pipeline stage, the incoming hidden states of shape
+                    [batch, sequence, hidden] instead.
+                position_ids: Positions of shape [batch, sequence].
+                attention_mask: Padding mask of shape [batch, sequence].
+                padding_mask: Boolean mask of shape [batch, sequence], True on padding.
+                pixel_values: Image patches for the vision tower, or None on stage 0
+                    to take this microbatch's staged chunk.
+                image_sizes: Image sizes of shape [images, 2] driving the patch split,
+                    or None to take this microbatch's staged chunk.
+                inputs_embeds: Embeddings of shape [batch, sequence, hidden].
+                pp_media_index: Tensor of shape [microbatch] holding this microbatch's
+                    index into the media staged on pipeline stage 0, or None when the
+                    batch carries no media.
+                **kwargs: Extra arguments forwarded to the text backbone.
+
+            Returns:
+                Logits of shape [batch, sequence, vocab] when this module owns
+                ``lm_head``, otherwise hidden states of shape
+                [batch, sequence, hidden] for the next pipeline stage.
+            """
+            # Pipeline stage 0 does not receive media in the batch: the VLM pipeline
+            # collate strips it and stages one chunk per microbatch on this module.
+            # Only look it up for a microbatch that actually holds image tokens, so a
+            # text-only microbatch does not run the vision tower on an empty chunk.
+            if pixel_values is None and self._has_image_tokens(input_ids):
+                pixel_values = pp_media_chunk(self, "pixel_values", pp_media_index)
+                staged_image_sizes = pp_media_chunk(self, "image_grid_hws", pp_media_index)
+                if staged_image_sizes is not None:
+                    image_sizes = staged_image_sizes
 
             if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
                 input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(

@@ -156,7 +156,7 @@ from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import Kimi
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
-from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin, pp_media_chunk
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # Check for flash attention
@@ -900,8 +900,8 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, PipelineModelMixin
     _no_split_modules = ["MoonViT3dEncoderLayer"]
     supports_gradient_checkpointing = True
 
-    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
-    # patch_hf_model_for_pp must not replace it under PP.
+    # forward() pulls this microbatch's pixel_values from the media staged on
+    # stage 0; patch_hf_model_for_pp must not replace it under PP.
     pipeline_forward_style = PipelineForwardStyle.MODEL
 
     @dataclass(frozen=True)
@@ -1017,8 +1017,45 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, PipelineModelMixin
         padding_mask=None,
         target_seq_length=None,  # For PP: fixed output length after image expansion
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        pp_media_index: torch.Tensor | None = None,
         **kwargs,
     ):
+        """Run the KimiK25VL forward, optionally as a pipeline stage.
+
+        Args:
+            input_ids: Token ids of shape [batch, sequence], or incoming hidden
+                states of shape [batch, sequence, hidden] on a non-first
+                pipeline stage.
+            attention_mask: Mask of shape [batch, sequence].
+            position_ids: Positions of shape [batch, sequence].
+            past_key_values: Unused; accepted for interface compatibility.
+            inputs_embeds: Embeddings of shape [batch, sequence, hidden].
+            labels: Target token ids of shape [batch, sequence].
+            use_cache: Unused; accepted for interface compatibility.
+            output_attentions: Unused; accepted for interface compatibility.
+            output_hidden_states: Whether the returned dataclass carries hidden
+                states of shape [batch, sequence, hidden].
+            return_dict: Whether to return a dataclass instead of raw logits.
+            pixel_values: Image patches of shape [total_patches, patch_dim]; on
+                stage 0 under pipeline parallelism it is instead pulled from the
+                media staged for this microbatch.
+            grid_thws: Per-image patch grid of shape [num_images, 3] ordered
+                (T, H, W).
+            padding_mask: Mask of shape [batch, sequence] marking padded tokens.
+            target_seq_length: Fixed sequence length the stage output is padded
+                or truncated to after image expansion, used under pipeline
+                parallelism.
+            logits_to_keep: Number of trailing positions to project, or an index
+                tensor selecting them.
+            pp_media_index: Tensor of shape [microbatch] holding this
+                microbatch's index into the media staged on stage 0, or None
+                outside pipeline parallelism.
+
+        Returns:
+            Logits of shape [batch, kept_sequence, vocab] on the legacy default
+            path, otherwise a ``LlavaCausalLMOutputWithPast`` carrying those
+            logits.
+        """
         # Resolve from the text/decoder sub-config (the language model produces text logits).
         output_hidden_states = (
             output_hidden_states
@@ -1026,32 +1063,28 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, PipelineModelMixin
             else getattr(self.config.text_config, "output_hidden_states", False)
         )
 
-        # Retrieve pre-chunked VLM inputs from model attributes (set by finetune.py for PP)
-        if (
-            pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
-            and self._vlm_pixel_values_chunks is not None
-        ):
-            has_media_tokens = (
-                input_ids is not None
-                and self.media_placeholder_token_id is not None
-                and (input_ids == self.media_placeholder_token_id).any()
-            )
-            if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(self._vlm_pixel_values_chunks):
-                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                    # Recipe stores as image_grid_hws [N, 2], convert to grid_thws [N, 3] (prepend T=1)
-                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
-                    if image_grid_hws.shape[-1] == 2:
-                        # Convert [N, 2] (H, W) -> [N, 3] (T, H, W) with T=1
-                        ones = torch.ones(
-                            image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
-                        )
-                        grid_thws = torch.cat([ones, image_grid_hws], dim=-1)
-                    else:
-                        grid_thws = image_grid_hws  # Already [N, 3]
-                    self._vlm_chunk_idx = chunk_idx + 1
+        # Under pipeline parallelism the recipe stages the batch media on stage 0
+        # and the batch carries this microbatch's index, so the native forward
+        # can pick up its own chunk without a cursor.
+        if pixel_values is None:
+            staged_pixel_values = pp_media_chunk(self, "pixel_values", pp_media_index)
+            if staged_pixel_values is not None:
+                pixel_values = staged_pixel_values
+                # The recipe stages image_grid_hws [N, 2]; convert to grid_thws [N, 3] (prepend T=1)
+                image_grid_hws = pp_media_chunk(self, "image_grid_hws", pp_media_index)
+                if image_grid_hws is None:
+                    raise ValueError(
+                        "Pipeline media staged 'pixel_values' for this microbatch without the matching "
+                        "'image_grid_hws'; the vision tower cannot infer the patch grid from pixels alone."
+                    )
+                if image_grid_hws.shape[-1] == 2:
+                    # Convert [N, 2] (H, W) -> [N, 3] (T, H, W) with T=1
+                    ones = torch.ones(
+                        image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
+                    )
+                    grid_thws = torch.cat([ones, image_grid_hws], dim=-1)
+                else:
+                    grid_thws = image_grid_hws  # Already [N, 3]
 
         hidden_states = self.model(
             input_ids=input_ids,

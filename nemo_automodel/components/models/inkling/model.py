@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
-from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin, causal_lm_stage_metas
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin, pp_media_chunk
 
 from .configuration import InklingConfig
 
@@ -285,31 +285,6 @@ class InklingForConditionalGeneration(
         module_names_per_stage[0].append(f"{layers_prefix}embed_norm")
         return module_names_per_stage
 
-    def pipeline_stage_metas(
-        self,
-        *,
-        is_first: bool,
-        microbatch_size: int,
-        seq_len: int,
-        dtype: torch.dtype,
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Return PP metadata using Inkling's unpadded runtime vocabulary."""
-        text_config = self.config.text_config
-        vocab_size = text_config.unpadded_vocab_size or text_config.vocab_size
-        head_dtype = self.lm_head.weight.dtype if self.lm_head is not None else dtype
-        return causal_lm_stage_metas(
-            is_first=is_first,
-            has_lm_head=self.lm_head is not None,
-            emits_hidden_states=False,
-            microbatch_size=microbatch_size,
-            input_seq_len=seq_len,
-            output_seq_len=seq_len,
-            hidden_size=text_config.hidden_size,
-            vocab_size=vocab_size,
-            dtype=dtype,
-            logits_dtype=head_dtype,
-        )
-
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -323,9 +298,37 @@ class InklingForConditionalGeneration(
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        pp_media_index: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Run the standard Inkling forward or its pipeline-stage equivalent."""
+        """Run the standard Inkling forward or its pipeline-stage equivalent.
+
+        Args:
+            input_ids: Token ids of shape [batch, sequence], or, on a non-first
+                pipeline stage, incoming hidden states of shape
+                [batch, sequence, hidden].
+            pixel_values: Image tensor whose layout follows the Inkling
+                processor; on stage 0 under pipeline parallelism it is instead
+                pulled from the media staged for this microbatch.
+            attention_mask: Mask of shape [batch, sequence].
+            position_ids: Positions of shape [batch, sequence].
+            past_key_values: Optional cache passed through to the base model.
+            audio_input_ids: Audio token ids of shape [batch, audio_sequence].
+            audio_input_ids_mask: Audio token mask of shape [batch, sequence].
+            inputs_embeds: Embeddings of shape [batch, sequence, hidden].
+            labels: Target token ids of shape [batch, sequence].
+            use_cache: Whether the base model returns a cache.
+            logits_to_keep: Number of trailing positions to project, or an index
+                tensor selecting them.
+            pp_media_index: Tensor of shape [microbatch] holding this
+                microbatch's index into the media staged on stage 0, or None
+                outside pipeline parallelism.
+
+        Returns:
+            Logits of shape [batch, kept_sequence, unpadded_vocab] on the last
+            pipeline stage, otherwise hidden states of shape
+            [batch, sequence, hidden].
+        """
         language_model = self.model.language_model
         if not isinstance(language_model.layers, nn.ModuleDict):
             return super().forward(
@@ -349,11 +352,7 @@ class InklingForConditionalGeneration(
 
         is_first_stage = language_model.embed_tokens is not None
         if pixel_values is None and is_first_stage:
-            chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-            if chunks is not None and chunk_idx is not None and chunk_idx < len(chunks):
-                pixel_values = chunks[chunk_idx]
-                self._vlm_chunk_idx = chunk_idx + 1
+            pixel_values = pp_media_chunk(self, "pixel_values", pp_media_index)
 
         outputs = self.model(
             input_ids=input_ids,

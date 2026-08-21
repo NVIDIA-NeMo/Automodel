@@ -391,61 +391,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module, 
         except TypeError:
             return False
 
-    def pipeline_stage_metas(
-        self,
-        *,
-        is_first: bool,
-        microbatch_size: int,
-        seq_len: int,
-        dtype: torch.dtype,
-    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Declare PP inter-stage I/O metas, threading the IndexShare top-k as a carry tensor.
-
-        Non-first stages additionally receive the previous "full" layer's top-k selection, and
-        non-last stages emit the running selection, so a stage that begins with a "shared" layer
-        has the top-k it needs (correct at any sequence length).
-        """
-        hidden_size = self.config.hidden_size
-        vocab_size = self.config.vocab_size
-        # TileLang's fused indexer always returns ``index_topk`` columns. Under
-        # CP the query length is sharded (for example 4096 / cp8 = 512), while
-        # K/V are gathered inside the model, so capping by the local query
-        # length would under-declare the inter-stage carry shape.
-        index_topk = int(self.config.index_topk)
-        topk = index_topk if self.backend.attn == "tilelang" else min(index_topk, seq_len)
-
-        def meta(shape: tuple[int, ...], dt: torch.dtype) -> torch.Tensor:
-            return torch.empty(*shape, device="meta", dtype=dt)
-
-        # The inter-stage tensor RANK matches the attention backend's data format, so each stage's
-        # forward emits its natural tensors and no per-boundary reshape is needed:
-        #   * TileLang DSA runs in THD (packed; batch folded into the token axis) -> 2D hidden
-        #     ``[T, H]`` and top-k ``[T, 1, topk]`` (the tilelang layout). tilelang implies THD.
-        #   * sdpa/te/eager run dense bshd -> 3D hidden ``[B, S, H]`` and top-k ``[B, S, topk]``.
-        # Top-k indices cross the boundary as float32: torch.distributed.pipelining calls
-        # ``requires_grad_(True)`` on recv buffers and int dtypes can't require grad; float32 holds
-        # the index values losslessly and ``forward`` casts back (int32 for tilelang, int64 dense).
-        thd = self.backend.attn == "tilelang"
-        if thd:
-            hidden_meta = meta((seq_len, hidden_size), dtype)
-            topk_meta = meta((seq_len, 1, topk), torch.float32)
-        else:
-            hidden_meta = meta((microbatch_size, seq_len, hidden_size), dtype)
-            topk_meta = meta((microbatch_size, seq_len, topk), torch.float32)
-
-        if is_first:
-            inputs_meta = (meta((microbatch_size, seq_len), torch.long),)
-        else:
-            inputs_meta = (hidden_meta, topk_meta)
-
-        if self.lm_head is not None:
-            # The last stage emits logits; compute_lm_head_logits restores [1, T, V] under THD.
-            outputs_meta = (meta((microbatch_size, seq_len, vocab_size), dtype),)
-        else:
-            outputs_meta = (hidden_meta, topk_meta)
-
-        return inputs_meta, outputs_meta
-
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -483,8 +428,9 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module, 
             else getattr(self.config, "output_hidden_states", False)
         )
 
-        # Carry-in arrives as float32 (see pipeline_stage_metas, where the pipeline recv
-        # buffer must be a grad-capable dtype); restore the int64 index values.
+        # Carry-in arrives as float32: torch.distributed.pipelining calls ``requires_grad_(True)``
+        # on recv buffers and integer dtypes cannot require grad, so the sender casts the top-k
+        # indices to float32 (lossless for index values); restore the integer index values here.
         carry_in = carry[0] if carry else None
         is_thd = attn_kwargs.get("qkv_format") == "thd"
 
@@ -492,11 +438,12 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module, 
         if carry_in is not None:
             # The carry arrives in the backend's natural top-k layout (THD: [T, 1, topk]; bshd:
             # [B, S, topk]) as float32. tilelang SparseMLA requires int32 indices; the dense path
-            # uses int64. Only the dtype differs -- no reshape (see pipeline_stage_metas).
+            # uses int64. Only the dtype differs -- no reshape.
             prev_topk_indices = carry_in.to(torch.int32) if is_thd else carry_in.to(torch.int64)
 
         # THD: squeeze the leading batch dim on EVERY stage. First stage ``input_ids`` is token ids
-        # [1, T]; later stages receive the upstream hidden state [1, T, H] (the 3D pipeline meta).
+        # [1, T]; later stages receive the upstream hidden state in the packed 2D layout [T, H] that
+        # the previous stage emitted, where the squeeze is a no-op.
         # squeeze_input_for_thd handles both (plain ``.squeeze(0)``) and also squeezes
         # position_ids / cu_seqlens so the 2D-THD DSA layers get consistent shapes on every stage.
         if is_thd:
@@ -533,9 +480,8 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module, 
                 return logits
             # Non-last stage: emit (hidden, float32 top-k carry) to the next stage. The tensors are
             # already in the backend's natural pipeline shape (THD: [T, H] + [T, 1, topk]; bshd:
-            # [B, S, H] + [B, S, topk]) per pipeline_stage_metas, so no reshape is needed.
-            # (THD requires packed_sequence_size >= index_topk so the tilelang top-k width matches
-            # the meta's min(index_topk, seq_len).)
+            # [B, S, H] + [B, S, topk]), so no reshape is needed. The receiving stage consumes the
+            # exact layout emitted here.
             zero_from_hidden = hidden.float().sum() * 0.0  # connected to grad-bearing hidden
             carry_out = topk_indices.to(torch.float32) + zero_from_hidden  # requires grad, value unchanged
             if carry_in is not None:
