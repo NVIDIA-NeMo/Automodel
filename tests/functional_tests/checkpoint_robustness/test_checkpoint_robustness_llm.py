@@ -789,35 +789,28 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
 
     The raw ``model_parts[0].forward`` can't be called directly on non-first PP
     stages (they expect float hidden states, not int token IDs). Mirror the
-    KD recipe's trick: swap the schedule's loss_fn for a capture closure, run
-    ``schedule.eval`` on the first stage, then broadcast the captured last-stage
-    logits along the PP group.
+    KD recipe's trick: swap the pipeline's loss_fn for a capture closure, run
+    ``AutoPipeline.step(forward_only=True)``, then broadcast the captured
+    last-stage logits along the PP group.
+
+    Stage boundary shapes are inferred at runtime from the batch handed to
+    ``step()``, so the prompt is fed at its natural length; no padding to a
+    static pipeline sequence length is needed.
+
+    Args:
+        trainer: Built trainer exposing ``pp`` (an ``AutoPipeline``).
+        input_ids: Token ids for a single prompt, of shape [sequence].
+        device: Device the pipeline stages execute on.
+
+    Returns:
+        Float32 CPU logits of shape [1, sequence, vocab], identical on every
+        rank of the pipeline group.
     """
-    schedule = trainer.pp.info.schedule
     pp_batch_size = trainer.pipeline_config.pp_batch_size
-    orig_seq_len = len(input_ids)
-
-    # PP recv buffer shapes are locked at first forward. r0.4.0 lacks
-    # AutoPipeline's input-driven runtime metadata resizing, so
-    # discover the locked seq_len from the stages and pad input_ids to match
-    # for the forward pass. Captured logits are sliced back to orig_seq_len.
-    def _discover_pp_seq_len() -> int:
-        pp_seq_len = getattr(trainer.pp, "pp_seq_len", None)
-        if pp_seq_len:
-            return pp_seq_len
-        for stage in getattr(trainer.pp.info, "stages", None) or ():
-            for meta in getattr(stage, "inputs_meta", None) or ():
-                if meta.ndim >= 2 and meta.shape[1] > 0:
-                    return meta.shape[1]
-        ds_seq_length = trainer.cfg.get("dataset.seq_length", None)
-        return ds_seq_length or orig_seq_len
-
-    pp_seq_len = _discover_pp_seq_len()
-    if orig_seq_len < pp_seq_len:
-        input_ids = list(input_ids) + [0] * (pp_seq_len - orig_seq_len)
+    seq_len = len(input_ids)
 
     # Replicate the prompt to pp_batch_size so the schedule's batch split is valid.
-    ids = torch.tensor([input_ids] * pp_batch_size, device=device, dtype=torch.long)
+    ids = torch.tensor([list(input_ids)] * pp_batch_size, device=device, dtype=torch.long)
     attention_mask = torch.ones_like(ids)
     targets = torch.zeros_like(ids) if trainer.pp.info.has_last_stage else None
 
@@ -827,8 +820,12 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
         captured[0] = logits.detach().float().clone()
         return logits.new_tensor(0.0, dtype=logits.dtype)
 
-    saved_loss_fn = schedule._loss_fn
-    schedule._loss_fn = _capture_loss_fn
+    saved_loss_fn = trainer.pp.loss_fn
+    saved_emits_hidden_states = trainer.pp.emits_hidden_states
+    # The capture needs vocabulary logits, so the last stage must not bypass its
+    # LM head here. Both arguments are declarative and identical on every rank,
+    # so the resulting runtime rebuild is collective-safe.
+    trainer.pp.configure_loss_fn(_capture_loss_fn, emits_hidden_states=False)
     try:
         for m in trainer.model_parts:
             m.eval()
@@ -837,12 +834,15 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
         # inference-mode tensors ("Inference tensors do not track version counter").
         with torch.no_grad():
             losses = [] if trainer.pp.info.has_last_stage else None
-            if trainer.pp.info.has_first_stage:
-                schedule.eval(ids, target=targets, losses=losses, attention_mask=attention_mask)
-            else:
-                schedule.eval(target=targets, losses=losses, attention_mask=attention_mask)
+            trainer.pp.step(
+                ids,
+                target=targets,
+                losses=losses,
+                forward_only=True,
+                attention_mask=attention_mask,
+            )
     finally:
-        schedule._loss_fn = saved_loss_fn
+        trainer.pp.configure_loss_fn(saved_loss_fn, emits_hidden_states=saved_emits_hidden_states)
 
     config = trainer.model_parts[0].config
     vocab_size = getattr(config, "vocab_size", None)
@@ -850,9 +850,9 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
         vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
     assert vocab_size is not None, "could not resolve vocab_size from model config"
 
-    buf = torch.zeros((1, orig_seq_len, vocab_size), device=device, dtype=torch.float32)
+    buf = torch.zeros((1, seq_len, vocab_size), device=device, dtype=torch.float32)
     if trainer.pp.info.has_last_stage and captured[0] is not None:
-        buf.copy_(captured[0][:1, :orig_seq_len, :])
+        buf.copy_(captured[0][:1, :seq_len, :])
 
     pp_mesh = trainer.device_mesh["pp"]
     pp_group = pp_mesh.get_group()

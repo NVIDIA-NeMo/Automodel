@@ -466,9 +466,10 @@ class TestQwen3VLMoeForConditionalGeneration:
         # Store pixel_values chunks for PP VLM support
         pixel_values_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
         image_grid_hws_chunk = torch.tensor([[2, 2]], device=device)  # [N, 2] format
-        model._vlm_pixel_values_chunks = [pixel_values_chunk]
-        model._vlm_image_grid_hws_chunks = [image_grid_hws_chunk]
-        model._vlm_chunk_idx = 0
+        model._pp_media_chunks = {
+            "pixel_values": [pixel_values_chunk],
+            "image_grid_hws": [image_grid_hws_chunk],
+        }
 
         captured_kwargs = {}
 
@@ -484,7 +485,7 @@ class TestQwen3VLMoeForConditionalGeneration:
                 return mock_output
 
             mock_model_forward.side_effect = capture_kwargs
-            model.forward(input_ids=input_ids)
+            model.forward(input_ids=input_ids, pp_media_index=torch.zeros(1, dtype=torch.long))
 
         # pixel_values should be retrieved from chunks
         assert "pixel_values" in captured_kwargs
@@ -492,8 +493,15 @@ class TestQwen3VLMoeForConditionalGeneration:
         # image_grid_thw should be converted from [N, 2] to [N, 3] format
         assert "image_grid_thw" in captured_kwargs
         assert captured_kwargs["image_grid_thw"].shape == (1, 3)
-        # Chunk index should be incremented
-        assert model._vlm_chunk_idx == 1
+
+        # Media selection is addressed by pp_media_index, not by a cursor: re-running
+        # the same microbatch index must resolve to the same chunk. A cursor would
+        # have advanced and handed back a different (or missing) image.
+        captured_kwargs.clear()
+        with patch.object(model.model, "forward") as replay_forward:
+            replay_forward.side_effect = capture_kwargs
+            model.forward(input_ids=input_ids, pp_media_index=torch.zeros(1, dtype=torch.long))
+        torch.testing.assert_close(captured_kwargs["pixel_values"], pixel_values_chunk)
 
     def test_forward_handles_thd_format(self, vl_config, backend_config, moe_config, device):
         """Test that forward() correctly handles thd format by calling squeeze_input_for_thd."""
@@ -841,12 +849,10 @@ class TestQwen3VLMoeForConditionalGenerationPPGuard:
     def test_video_token_id_is_151656(self, vl_config, backend_config, moe_config, device):
         """Test that video token ID 151656 (not 151652) is used for media token detection.
 
-        After the PP video chunking refactor, image and video chunks live on
-        separate attributes (``_vlm_pixel_values_chunks`` /
-        ``_vlm_image_grid_hws_chunks`` for images,
-        ``_vlm_pixel_values_videos_chunks`` / ``_vlm_video_grid_thw_chunks``
-        for videos). A video token in ``input_ids`` must therefore consume a
-        video chunk, not an image chunk.
+        Image and video media are staged under separate keys of
+        ``_pp_media_chunks`` (``pixel_values``/``image_grid_hws`` for images,
+        ``pixel_values_videos``/``video_grid_thw`` for videos), so a batch that
+        stages only video media must route through the video path.
         """
         model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         model_dtype = next(model.parameters()).dtype
@@ -856,21 +862,28 @@ class TestQwen3VLMoeForConditionalGenerationPPGuard:
 
         pixel_values_videos_chunk = torch.randn(8, 3, 2, 2, device=device, dtype=model_dtype)
         video_grid_thw_chunk = torch.tensor([[1, 2, 2]], device=device)
-        model._vlm_pixel_values_videos_chunks = [pixel_values_videos_chunk]
-        model._vlm_video_grid_thw_chunks = [video_grid_thw_chunk]
-        model._vlm_chunk_idx = 0
+        model._pp_media_chunks = {
+            "pixel_values_videos": [pixel_values_videos_chunk],
+            "video_grid_thw": [video_grid_thw_chunk],
+        }
 
+        captured_kwargs = {}
         with patch.object(model.model, "forward") as mock_forward:
             mock_output = MagicMock()
             mock_output.last_hidden_state = torch.randn(
                 1, 4, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
             )
-            mock_forward.return_value = mock_output
 
-            model.forward(input_ids=input_ids)
+            def capture_kwargs(*args, **kwargs):
+                captured_kwargs.update(kwargs)
+                return mock_output
 
-        # Chunk should have been consumed (idx incremented)
-        assert model._vlm_chunk_idx == 1
+            mock_forward.side_effect = capture_kwargs
+            model.forward(input_ids=input_ids, pp_media_index=torch.zeros(1, dtype=torch.long))
+
+        # The video chunk must reach the video path, and no image chunk is invented.
+        torch.testing.assert_close(captured_kwargs["pixel_values_videos"], pixel_values_videos_chunk)
+        assert captured_kwargs.get("pixel_values") is None
 
 
 @_requires_cuda
@@ -1122,9 +1135,7 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
     @staticmethod
     def _mock_self():
         ms = MagicMock()
-        ms._vlm_pixel_values_chunks = None
-        ms._vlm_image_grid_hws_chunks = None
-        ms._vlm_chunk_idx = 0
+        ms._pp_media_chunks = None
         return ms
 
     def test_pp_attention_mask_dropped_on_seq_len_mismatch(self):
@@ -1186,9 +1197,7 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
         ms = self._mock_self()
         pixel_chunk = torch.randn(4, 3, 2, 2)
         grid_hws_chunk = torch.tensor([[2, 2]])
-        ms._vlm_pixel_values_chunks = [pixel_chunk]
-        ms._vlm_image_grid_hws_chunks = [grid_hws_chunk]
-        ms._vlm_chunk_idx = 0
+        ms._pp_media_chunks = {"pixel_values": [pixel_chunk], "image_grid_hws": [grid_hws_chunk]}
 
         input_ids = torch.tensor([[1, 151655, 2, 3]])
 
@@ -1203,9 +1212,10 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
 
         ms.model.side_effect = lambda **kw: capture(**kw)
 
-        Qwen3VLMoeForConditionalGeneration.forward(ms, input_ids=input_ids)
+        Qwen3VLMoeForConditionalGeneration.forward(
+            ms, input_ids=input_ids, pp_media_index=torch.zeros(1, dtype=torch.long)
+        )
 
-        assert ms._vlm_chunk_idx == 1
         assert captured["pixel_values"] is pixel_chunk
         thw = captured["image_grid_thw"]
         assert thw is not None and thw.shape == (1, 3)
@@ -1222,11 +1232,7 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
         ms = self._mock_self()
         video_chunk = torch.randn(8, 3, 2, 2)
         video_grid_chunk = torch.tensor([[1, 2, 2]])
-        ms._vlm_pixel_values_videos_chunks = [video_chunk]
-        ms._vlm_video_grid_thw_chunks = [video_grid_chunk]
-        ms._vlm_pixel_values_chunks = None
-        ms._vlm_image_grid_hws_chunks = None
-        ms._vlm_chunk_idx = 0
+        ms._pp_media_chunks = {"pixel_values_videos": [video_chunk], "video_grid_thw": [video_grid_chunk]}
 
         input_ids = torch.tensor([[1, 151656, 2, 3]])
 
@@ -1242,9 +1248,10 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
 
         ms.model.side_effect = lambda **kw: capture(**kw)
 
-        Qwen3VLMoeForConditionalGeneration.forward(ms, input_ids=input_ids)
+        Qwen3VLMoeForConditionalGeneration.forward(
+            ms, input_ids=input_ids, pp_media_index=torch.zeros(1, dtype=torch.long)
+        )
 
-        assert ms._vlm_chunk_idx == 1
         assert captured["pixel_values_videos"] is video_chunk
         assert captured["video_grid_thw"] is video_grid_chunk
         assert captured["pixel_values"] is None  # image stream untouched
@@ -1253,9 +1260,9 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
         ms = self._mock_self()
         pixel_chunk = torch.randn(4, 3, 2, 2)
         grid_hws_chunk = torch.tensor([[2, 2]])
-        ms._vlm_pixel_values_chunks = [pixel_chunk]
-        ms._vlm_image_grid_hws_chunks = [grid_hws_chunk]
-        ms._vlm_chunk_idx = 0
+        # A microbatch whose samples are all text-only is staged as an EMPTY chunk
+        # so the chunk list stays positionally aligned with the microbatches.
+        ms._pp_media_chunks = {"pixel_values": [pixel_chunk[:0]], "image_grid_hws": [grid_hws_chunk[:0]]}
 
         input_ids = torch.tensor([[1, 2, 3, 4]])
 
@@ -1269,18 +1276,17 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
 
         ms.model.side_effect = lambda **kw: capture(**kw)
 
-        Qwen3VLMoeForConditionalGeneration.forward(ms, input_ids=input_ids)
+        Qwen3VLMoeForConditionalGeneration.forward(
+            ms, input_ids=input_ids, pp_media_index=torch.zeros(1, dtype=torch.long)
+        )
 
-        assert ms._vlm_chunk_idx == 0
         assert captured["pixel_values"] is None
 
     def test_chunked_pixel_values_passthrough_when_already_3d_grid(self):
         ms = self._mock_self()
         pixel_chunk = torch.randn(4, 3, 2, 2)
         grid_thw_chunk = torch.tensor([[1, 2, 2]])
-        ms._vlm_pixel_values_chunks = [pixel_chunk]
-        ms._vlm_image_grid_hws_chunks = [grid_thw_chunk]
-        ms._vlm_chunk_idx = 0
+        ms._pp_media_chunks = {"pixel_values": [pixel_chunk], "image_grid_hws": [grid_thw_chunk]}
 
         input_ids = torch.tensor([[1, 151655, 2, 3]])
 
@@ -1294,6 +1300,8 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
 
         ms.model.side_effect = lambda **kw: capture(**kw)
 
-        Qwen3VLMoeForConditionalGeneration.forward(ms, input_ids=input_ids)
+        Qwen3VLMoeForConditionalGeneration.forward(
+            ms, input_ids=input_ids, pp_media_index=torch.zeros(1, dtype=torch.long)
+        )
 
         torch.testing.assert_close(captured["image_grid_thw"], grid_thw_chunk)

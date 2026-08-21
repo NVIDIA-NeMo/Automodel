@@ -343,47 +343,77 @@ class TestPipelineHooks:
         assert "mtp" not in out[0]
         assert "mtp" in out[-1]
 
-    def test_pipeline_stage_metas_for_mtp_first_middle_and_final_stages(self):
-        cfg = _tiny_config(num_nextn_predict_layers=2)
+    @_REQUIRES_CUDA
+    def test_pp_stage_forwards_carry_hc_stream_and_mtp_embeddings(self):
+        """Chain the three PP stage forwards and assert every inter-stage tensor.
 
+        This is the contract the pipeline schedule infers at runtime: with
+        ``hc_mult > 1`` the stages that do not own ``hc_head`` exchange the 4-D HC
+        stream ``[B, S, hc_mult, hidden]``, every boundary additionally carries one
+        ``[B, S, hidden]`` MTP embedding per depth, and the last stage emits
+        ``(logits [B, S, vocab], *mtp_h [B, S, hidden])``.
+        """
+        cfg = _tiny_config(num_nextn_predict_layers=2)
+        depth = 2
+        bsz, seq = 2, 16
+
+        # First stage: owns embed_tokens; hc_head / norm / lm_head / mtp live downstream.
         first = _make_model(cfg)
+        first.train()
         first.lm_head = None
         first.model.norm = None
+        first.model.hc_head = None
         first.mtp = None
-        first_inputs, first_outputs = first.pipeline_stage_metas(
-            is_first=True, microbatch_size=2, seq_len=16, dtype=torch.float16
-        )
-        assert first_inputs[0].shape == (2, 16)
-        assert first_inputs[0].dtype == torch.long
-        assert len(first_outputs) == 3
-        assert first_outputs[0].shape == (2, 16, cfg.hc_mult, cfg.hidden_size)
-        assert first_outputs[1].shape == (2, 16, cfg.hidden_size)
+        first_out = first(torch.randint(0, cfg.vocab_size, (bsz, seq)))
+        assert len(first_out) == 1 + depth
+        assert first_out[0].shape == (bsz, seq, cfg.hc_mult, cfg.hidden_size)
+        for embed in first_out[1:]:
+            assert embed.shape == (bsz, seq, cfg.hidden_size)
 
+        # Middle stage: owns neither embeddings nor heads -> symmetric boundary.
         middle = _make_model(cfg)
+        middle.train()
         middle.model.embed_tokens = None
         middle.lm_head = None
         middle.model.norm = None
+        middle.model.hc_head = None
         middle.mtp = None
-        middle_inputs, middle_outputs = middle.pipeline_stage_metas(
-            is_first=False, microbatch_size=2, seq_len=16, dtype=torch.float16
-        )
-        assert len(middle_inputs) == 3
-        assert middle_inputs[0].shape == (2, 16, cfg.hc_mult, cfg.hidden_size)
-        assert middle_inputs[1].shape == (2, 16, cfg.hidden_size)
-        assert len(middle_outputs) == 3
-        assert middle_outputs[0].shape == (2, 16, cfg.hc_mult, cfg.hidden_size)
+        middle_out = middle(first_out[0].detach(), *(t.detach() for t in first_out[1:]))
+        assert len(middle_out) == 1 + depth
+        assert middle_out[0].shape == (bsz, seq, cfg.hc_mult, cfg.hidden_size)
+        for embed in middle_out[1:]:
+            assert embed.shape == (bsz, seq, cfg.hidden_size)
+
+        # Final stage: owns hc_head + norm + lm_head + mtp -> logits and per-depth hidden states.
+        final = _make_model(cfg)
+        final.train()
+        final.model.embed_tokens = None
+        final_out = final(middle_out[0].detach(), *(t.detach() for t in middle_out[1:]))
+        assert len(final_out) == 1 + depth
+        assert final_out[0].shape == (bsz, seq, cfg.vocab_size)
+        for mtp_hidden in final_out[1:]:
+            assert mtp_hidden.shape == (bsz, seq, cfg.hidden_size)
+
+    @_REQUIRES_CUDA
+    def test_final_pp_stage_keeps_tuple_arity_in_eval(self):
+        """Eval mode emits placeholder MTP tensors so the tuple arity never changes."""
+        cfg = _tiny_config(num_nextn_predict_layers=2)
+        depth = 2
+        bsz, seq = 2, 16
 
         final = _make_model(cfg)
+        final.eval()
         final.model.embed_tokens = None
-        final_inputs, final_outputs = final.pipeline_stage_metas(
-            is_first=False, microbatch_size=2, seq_len=16, dtype=torch.float16
-        )
-        assert len(final_inputs) == 3
-        assert final_inputs[0].shape == (2, 16, cfg.hc_mult, cfg.hidden_size)
-        assert len(final_outputs) == 3
-        assert final_outputs[0].shape == (2, 16, cfg.vocab_size)
-        assert final_outputs[1].shape == (2, 16, cfg.hidden_size)
-        assert final_outputs[2].shape == (2, 16, cfg.hidden_size)
+        hc_hidden = torch.randn(bsz, seq, cfg.hc_mult, cfg.hidden_size)
+        mtp_embeds = [torch.randn(bsz, seq, cfg.hidden_size) for _ in range(depth)]
+
+        with torch.no_grad():
+            out = final(hc_hidden, *mtp_embeds)
+
+        assert len(out) == 1 + depth
+        assert out[0].shape == (bsz, seq, cfg.vocab_size)
+        for placeholder in out[1:]:
+            assert placeholder.shape == (bsz, seq, cfg.hidden_size)
 
 
 if __name__ == "__main__":

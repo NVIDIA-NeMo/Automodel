@@ -1179,47 +1179,81 @@ def test_glm_dsa_tilelang_declares_validation_packing():
     assert GlmMoeDsaForCausalLM(config, backend=sdpa_backend).should_pack_validation_with_training() is False
 
 
-def test_glm_dsa_tilelang_pipeline_metas_use_thd_shapes():
+def _stub_tilelang_kernels(monkeypatch) -> None:
+    """Replace the GPU-only DSA kernels with shape-faithful CPU stubs.
+
+    Only the two TileLang kernels are stubbed; the model's own THD squeeze,
+    layer stack and pipeline-boundary plumbing run for real, so the observed
+    stage-boundary tensors are the model's.
+
+    Args:
+        monkeypatch: pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(layer_mod, "should_use_tilelang", lambda *args, **kwargs: True)
+
+    def fake_indexer_topk(index_q, index_k, head_weights, cu_seqlens, topk, **kwargs):
+        # Real kernel contract: [tokens, 1, index_topk] int32 selections.
+        return torch.zeros(index_q.shape[0], 1, topk, dtype=torch.int32, device=index_q.device)
+
+    def fake_sparse_attention(q, kv_latent, topk_indices, w_vc, scale):
+        # Real kernel contract: [tokens, heads, v_head_dim] in the query dtype.
+        return torch.zeros(q.shape[0], q.shape[1], w_vc.shape[1], dtype=q.dtype, device=q.device)
+
+    monkeypatch.setattr(layer_mod, "tilelang_indexer_topk", fake_indexer_topk)
+    monkeypatch.setattr(layer_mod, "tilelang_sparse_attention", fake_sparse_attention)
+
+
+def test_glm_dsa_tilelang_pp_stage_forward_emits_thd_shapes(monkeypatch):
+    """A TileLang (THD) middle stage emits 2-D hidden and a [T, 1, topk] carry.
+
+    TileLang DSA runs packed (batch folded into the token axis), so the tensors
+    that cross a pipeline boundary are hidden ``[tokens, hidden]`` and the top-k
+    carry ``[tokens, 1, index_topk]`` -- transported as float32 because pipeline
+    recv buffers must be grad-capable.
+    """
     config = _small_dsa_config()
     backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
-    model = GlmMoeDsaForCausalLM(config, backend=backend)
-    model.lm_head = None
-    seq_len = 32
-    topk = config.index_topk
+    _stub_tilelang_kernels(monkeypatch)
+    model = GlmMoeDsaForCausalLM(config, backend=backend).to(torch.bfloat16)
+    model.model.embed_tokens = None  # not the first stage
+    model.lm_head = None  # not the last stage
 
-    inputs_meta, outputs_meta = model.pipeline_stage_metas(
-        is_first=False,
-        microbatch_size=4,
-        seq_len=seq_len,
-        dtype=torch.bfloat16,
+    num_tokens = 128
+    hidden_in = torch.randn(num_tokens, config.hidden_size, dtype=torch.bfloat16)
+    carry_in = torch.zeros(num_tokens, 1, config.index_topk, dtype=torch.float32)
+
+    hidden_out, carry_out = model(
+        hidden_in,
+        carry_in,
+        position_ids=torch.arange(num_tokens).unsqueeze(0),
+        qkv_format="thd",
+        cu_seqlens=torch.tensor([0, num_tokens], dtype=torch.int32),
     )
 
-    assert len(inputs_meta) == 2
-    assert inputs_meta[0].shape == (seq_len, config.hidden_size)
-    assert inputs_meta[0].dtype == torch.bfloat16
-    assert inputs_meta[1].shape == (seq_len, 1, topk)
-    assert inputs_meta[1].dtype == torch.float32
-    assert len(outputs_meta) == 2
-    assert outputs_meta[0].shape == (seq_len, config.hidden_size)
-    assert outputs_meta[1].shape == (seq_len, 1, topk)
+    assert hidden_out.shape == (num_tokens, config.hidden_size)
+    assert hidden_out.dtype == torch.bfloat16
+    assert carry_out.shape == (num_tokens, 1, config.index_topk)
+    assert carry_out.dtype == torch.float32
 
 
-def test_glm_dsa_sdpa_pipeline_metas_cap_topk_by_seq_len():
+def test_glm_dsa_sdpa_pp_stage_forward_caps_topk_by_seq_len():
+    """The dense (sdpa) path is bshd and caps the carry width at the sequence length."""
     config = _small_dsa_config()
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
-    model = GlmMoeDsaForCausalLM(config, backend=backend)
+    model = GlmMoeDsaForCausalLM(config, backend=backend).to(torch.bfloat16)
+    model.model.embed_tokens = None
     model.lm_head = None
-    seq_len = 32
 
-    inputs_meta, outputs_meta = model.pipeline_stage_metas(
-        is_first=False,
-        microbatch_size=4,
-        seq_len=seq_len,
-        dtype=torch.bfloat16,
-    )
+    batch, seq_len = 4, 32
+    assert seq_len < config.index_topk  # the cap is what is under test
+    hidden_in = torch.randn(batch, seq_len, config.hidden_size, dtype=torch.bfloat16)
+    carry_in = torch.zeros(batch, seq_len, seq_len, dtype=torch.float32)
 
-    assert inputs_meta[1].shape == (4, seq_len, seq_len)
-    assert outputs_meta[1].shape == (4, seq_len, seq_len)
+    hidden_out, carry_out = model(hidden_in, carry_in)
+
+    assert hidden_out.shape == (batch, seq_len, config.hidden_size)
+    assert carry_out.shape == (batch, seq_len, seq_len)
+    assert carry_out.dtype == torch.float32
 
 
 def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():

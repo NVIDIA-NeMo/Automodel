@@ -47,6 +47,7 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_model,
     compute_trust_remote_code_from_model,
 )
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 
 
 def _build_loader(
@@ -1156,6 +1157,25 @@ class _StageNoLogitsToKeep(nn.Module):
         return None
 
 
+class _ModelStageDeclaringHiddenStates(PipelineModelMixin, nn.Module):
+    """A model that keeps its own forward and declares the fused-loss capability."""
+
+    pipeline_forward_style = PipelineForwardStyle.MODEL
+    pipeline_supports_hidden_state_output = True
+
+    def forward(self, input_ids=None, logits_to_keep=0, **kwargs):
+        return None
+
+
+class _ModelStageWithoutHiddenStates(PipelineModelMixin, nn.Module):
+    """A model that keeps its own forward and does not honor _pp_return_hidden_states."""
+
+    pipeline_forward_style = PipelineForwardStyle.MODEL
+
+    def forward(self, input_ids=None, logits_to_keep=0, **kwargs):
+        return None
+
+
 @pytest.mark.parametrize(
     "has_logits_to_keep, has_marker, pp_enabled, expect_fused",
     [
@@ -1168,20 +1188,46 @@ class _StageNoLogitsToKeep(nn.Module):
 def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, expect_fused):
     """FusedLinearCrossEntropy survives only when the probed stage module supports
     logits_to_keep and (under PP) advertises hidden-states emission via
-    _pp_return_hidden_states_supported; otherwise it downgrades to MaskedCrossEntropy."""
+    pipeline_supports_hidden_state_output; otherwise it downgrades to MaskedCrossEntropy."""
     from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
     from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
     from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
 
     probe = (_StageWithLogitsToKeep if has_logits_to_keep else _StageNoLogitsToKeep)()
     if has_marker:
-        probe._pp_return_hidden_states_supported = True  # set by patch_hf_model_for_pp on the generic forward
+        # patch_hf_model_for_pp stamps this on the generically patched forward.
+        probe.pipeline_supports_hidden_state_output = True
 
     result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(), probe, pp_enabled=pp_enabled)
 
     assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
     if not expect_fused:
         assert isinstance(result, MaskedCrossEntropy)
+
+
+def test_maybe_downgrade_loss_fn_keeps_fused_ce_for_declared_model_forward():
+    """A model that keeps its own forward and DECLARES the capability keeps fused CE.
+
+    The capability used to be stamped on the module only as a side effect of the
+    generic monkeypatching, so every model with ``PipelineForwardStyle.MODEL``
+    silently lost FusedLinearCrossEntropy under PP. It is a declared class
+    attribute now.
+    """
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    declared = _ModelStageDeclaringHiddenStates()
+    assert "pipeline_supports_hidden_state_output" not in vars(declared)  # class-declared, not stamped
+
+    kept = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(), declared, pp_enabled=True)
+    assert isinstance(kept, FusedLinearCrossEntropy)
+
+    # A model-forward stage that does not declare it still downgrades.
+    undeclared = _ModelStageWithoutHiddenStates()
+    assert undeclared.pipeline_supports_hidden_state_output is False  # mixin default
+    downgraded = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(), undeclared, pp_enabled=True)
+    assert isinstance(downgraded, MaskedCrossEntropy)
 
 
 def test_run_train_validation_loop_calls_gc_hook_once_per_step():
@@ -1337,6 +1383,9 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
             pp_batch_size=1,
             pp_microbatch_size=1,
             step=run_schedule,
+            # Stage ownership is read from the model parts, not from info.stages:
+            # the stages only exist after the first pp.step() builds the runtime.
+            last_stage_part=nn.Module() if pp_info.has_last_stage else None,
         ),
     )
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))

@@ -24,7 +24,7 @@ import torch.nn as nn
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.vlm.pp_media import (
     VLM_PP_MEDIA_KEY,
-    chunk_step3_media,
+    chunk_patch_mapped_media,
     chunk_vlm_media,
     prepare_vlm_media_for_pp,
     stage_vlm_media_for_pp,
@@ -43,6 +43,7 @@ from nemo_automodel.recipes.vlm.finetune import (
     _get_model_name,
     build_model,
 )
+from nemo_automodel.shared.pipeline import pp_media_chunk
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
@@ -532,8 +533,6 @@ def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     """Shared setup for _run_train_optim_step tests with pp_enabled=True."""
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device="cpu", rank=0, is_main=False)
-    # No "pp" in dim_names -> src_rank = mesh.reshape(-1)[-1].item(). With rank != src_rank
-    # and is_main=False, neither distributed send nor recv branch fires.
     recipe.device_mesh = SimpleNamespace(mesh=torch.tensor([1]), mesh_dim_names=("dp",))
     recipe.moe_mesh = None
     recipe.loss_fn = object()
@@ -549,6 +548,9 @@ def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
     recipe._get_dp_group_size = lambda include_cp=True: 1
     recipe._get_cp_group_size = lambda: 1
+    # Sharing the last stage's loss is a real PP collective; these tests exercise
+    # the reporting arithmetic on a single rank, so it is a no-op here.
+    recipe._broadcast_from_last_pp_stage = lambda tensor: tensor
 
     # Build a batch whose (labels != -100).sum() == num_label_tokens_in_batch.
     seq = [1] * num_label_tokens_in_batch + [-100] * (4 - num_label_tokens_in_batch)
@@ -1539,6 +1541,10 @@ class _MockAutoPipeline:
     def __init__(self, has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=True):
         self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
         self.info = self._info
+        self.pp_batch_size = 2 * n_microbatches
+        # Last-stage ownership is read off the model part, because the PyTorch
+        # stages only exist once the first ``step()`` builds the runtime.
+        self.last_stage_part = torch.nn.Identity() if has_last_stage else None
 
     def step(self, model_input: torch.Tensor, **kwargs):
         """Mirror AutoPipeline's first-stage argument routing."""
@@ -1581,8 +1587,8 @@ class TestForwardBackwardStepPP:
         """Create a recipe configured for PP testing."""
         return _create_pp_recipe()
 
-    def test_pp_skips_validation_forward(self, pp_recipe, monkeypatch):
-        """Test that PP mode skips forward pass during validation."""
+    def test_pp_runs_validation_forward_only(self, pp_recipe, monkeypatch):
+        """Validation runs through the same schedule, forward-only."""
         pp_recipe.pp = _MockAutoPipeline()
 
         monkeypatch.setattr(
@@ -1596,7 +1602,6 @@ class TestForwardBackwardStepPP:
         }
         loss_buffer = []
 
-        # Should return early without error
         pp_recipe._forward_backward_step(
             idx=0,
             batch=batch,
@@ -1606,8 +1611,9 @@ class TestForwardBackwardStepPP:
             is_train=False,  # Validation mode
         )
 
-        # Loss buffer should be empty (no forward pass)
-        assert len(loss_buffer) == 0
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+        assert pp_recipe.pp.info.schedule.step.call_args.kwargs["forward_only"] is True
+        assert len(loss_buffer) == 1
 
     def test_pp_vlm_chunking_equal_images_and_batch(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking when n_images == batch_size."""
@@ -1636,9 +1642,8 @@ class TestForwardBackwardStepPP:
 
         def step_side_effect(*args, **kwargs):
             model = pp_recipe.model_parts[0]
-            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._vlm_pixel_values_chunks]
-            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._vlm_image_grid_hws_chunks]
-            captured_chunks["chunk_idx"] = model._vlm_chunk_idx
+            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._pp_media_chunks["pixel_values"]]
+            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._pp_media_chunks["image_grid_hws"]]
             for _ in range(2):
                 kwargs["losses"].append(torch.tensor(0.5))
 
@@ -1655,14 +1660,11 @@ class TestForwardBackwardStepPP:
 
         # Verify chunking happened correctly
         model = pp_recipe.model_parts[0]
-        assert captured_chunks["chunk_idx"] == 0
         assert torch.equal(captured_chunks["pixel_values"][0], pixel_values[:13])
         assert torch.equal(captured_chunks["pixel_values"][1], pixel_values[13:])
         assert torch.equal(captured_chunks["image_grid"][0], image_grid_hws[:2])
         assert torch.equal(captured_chunks["image_grid"][1], image_grid_hws[2:])
-        assert model._vlm_pixel_values_chunks is None  # Cleared after step
-        assert model._vlm_image_grid_hws_chunks is None
-        assert model._vlm_chunk_idx is None
+        assert model._pp_media_chunks is None
 
         # Verify schedule.step was called
         pp_recipe.pp.info.schedule.step.assert_called_once()
@@ -1688,12 +1690,12 @@ class TestForwardBackwardStepPP:
             model = pp_recipe.model_parts[0]
             assert "pixel_values_videos" not in kwargs
             assert "video_grid_thw" not in kwargs
-            assert len(model._vlm_pixel_values_videos_chunks) == 2
-            assert len(model._vlm_video_grid_thw_chunks) == 2
-            assert model._vlm_video_grid_thw_chunks[0].shape[0] == 1
-            assert model._vlm_video_grid_thw_chunks[1].shape[0] == 3
-            assert model._vlm_pixel_values_videos_chunks[0].shape[0] == 4
-            assert model._vlm_pixel_values_videos_chunks[1].shape[0] == 9 + 6 + 16
+            assert len(model._pp_media_chunks["pixel_values_videos"]) == 2
+            assert len(model._pp_media_chunks["video_grid_thw"]) == 2
+            assert model._pp_media_chunks["video_grid_thw"][0].shape[0] == 1
+            assert model._pp_media_chunks["video_grid_thw"][1].shape[0] == 3
+            assert model._pp_media_chunks["pixel_values_videos"][0].shape[0] == 4
+            assert model._pp_media_chunks["pixel_values_videos"][1].shape[0] == 9 + 6 + 16
             for _ in range(2):
                 kwargs["losses"].append(torch.tensor(0.5))
 
@@ -1719,14 +1721,13 @@ class TestForwardBackwardStepPP:
         )
 
         model = pp_recipe.model_parts[0]
-        assert model._vlm_pixel_values_videos_chunks is None
-        assert model._vlm_video_grid_thw_chunks is None
-        assert model._vlm_chunk_idx is None
+        assert model._pp_media_chunks is None
+
         assert len(loss_buffer) == 1
 
     def test_pp_vlm_chunking_image_and_video_mixed(self, pp_recipe, monkeypatch):
         """When a batch carries both images and videos, both streams chunk independently
-        but share a single _vlm_chunk_idx initialized once at 0; both clean up to None."""
+        into the single ``_pp_media_chunks`` mapping, which is cleared after the step."""
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
@@ -1757,22 +1758,19 @@ class TestForwardBackwardStepPP:
             assert "pixel_values_videos" not in kwargs
             assert "video_grid_thw" not in kwargs
 
-            assert len(model._vlm_pixel_values_chunks) == 2
-            assert len(model._vlm_image_grid_hws_chunks) == 2
-            assert model._vlm_image_grid_hws_chunks[0].shape[0] == 2
-            assert model._vlm_image_grid_hws_chunks[1].shape[0] == 1
-            assert model._vlm_pixel_values_chunks[0].shape[0] == 4 + 9
-            assert model._vlm_pixel_values_chunks[1].shape[0] == 6
+            assert len(model._pp_media_chunks["pixel_values"]) == 2
+            assert len(model._pp_media_chunks["image_grid_hws"]) == 2
+            assert model._pp_media_chunks["image_grid_hws"][0].shape[0] == 2
+            assert model._pp_media_chunks["image_grid_hws"][1].shape[0] == 1
+            assert model._pp_media_chunks["pixel_values"][0].shape[0] == 4 + 9
+            assert model._pp_media_chunks["pixel_values"][1].shape[0] == 6
 
-            assert len(model._vlm_pixel_values_videos_chunks) == 2
-            assert len(model._vlm_video_grid_thw_chunks) == 2
-            assert model._vlm_video_grid_thw_chunks[0].shape[0] == 1
-            assert model._vlm_video_grid_thw_chunks[1].shape[0] == 3
-            assert model._vlm_pixel_values_videos_chunks[0].shape[0] == 4
-            assert model._vlm_pixel_values_videos_chunks[1].shape[0] == 9 + 6 + 16
-
-            # Single shared cursor: image-branch sets it to 0 first, video branch resets to 0 again.
-            assert model._vlm_chunk_idx == 0
+            assert len(model._pp_media_chunks["pixel_values_videos"]) == 2
+            assert len(model._pp_media_chunks["video_grid_thw"]) == 2
+            assert model._pp_media_chunks["video_grid_thw"][0].shape[0] == 1
+            assert model._pp_media_chunks["video_grid_thw"][1].shape[0] == 3
+            assert model._pp_media_chunks["pixel_values_videos"][0].shape[0] == 4
+            assert model._pp_media_chunks["pixel_values_videos"][1].shape[0] == 9 + 6 + 16
 
             for _ in range(2):
                 kwargs["losses"].append(torch.tensor(0.5))
@@ -1802,11 +1800,8 @@ class TestForwardBackwardStepPP:
         )
 
         model = pp_recipe.model_parts[0]
-        assert model._vlm_pixel_values_chunks is None
-        assert model._vlm_image_grid_hws_chunks is None
-        assert model._vlm_pixel_values_videos_chunks is None
-        assert model._vlm_video_grid_thw_chunks is None
-        assert model._vlm_chunk_idx is None
+        assert model._pp_media_chunks is None
+
         assert len(loss_buffer) == 1
 
     def test_pp_vlm_chunking_with_image_grid_thw(self, pp_recipe, monkeypatch):
@@ -1844,9 +1839,7 @@ class TestForwardBackwardStepPP:
 
         # Verify chunking happened correctly
         model = pp_recipe.model_parts[0]
-        assert model._vlm_pixel_values_chunks is None  # Cleared after step
-        assert model._vlm_image_grid_hws_chunks is None
-        assert model._vlm_chunk_idx is None
+        assert model._pp_media_chunks is None
 
         # Verify schedule.step was called
         pp_recipe.pp.info.schedule.step.assert_called_once()
@@ -1879,8 +1872,8 @@ class TestForwardBackwardStepPP:
 
         def step_side_effect(*args, **kwargs):
             model = pp_recipe.model_parts[0]
-            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._vlm_pixel_values_chunks]
-            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._vlm_image_grid_hws_chunks]
+            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._pp_media_chunks["pixel_values"]]
+            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._pp_media_chunks["image_grid_hws"]]
             for _ in range(2):
                 kwargs["losses"].append(torch.tensor(0.5))
 
@@ -1900,7 +1893,7 @@ class TestForwardBackwardStepPP:
         assert torch.equal(captured_chunks["pixel_values"][1], pixel_values[split_at:])
         assert torch.equal(captured_chunks["image_grid"][0], image_grid_thw[:1])
         assert torch.equal(captured_chunks["image_grid"][1], image_grid_thw[1:])
-        assert pp_recipe.model_parts[0]._vlm_pixel_values_chunks is None
+        assert pp_recipe.model_parts[0]._pp_media_chunks is None
         assert len(loss_buffer) == 1
 
     def test_pp_vlm_chunking_mismatched_images_raises(self):
@@ -1954,9 +1947,8 @@ class TestForwardBackwardStepPP:
         )
 
         model = pp_recipe.model_parts[0]
-        assert model._vlm_pixel_values_chunks is None  # Cleared after step
-        assert model._vlm_image_grid_hws_chunks is None
-        assert model._vlm_chunk_idx is None
+        assert model._pp_media_chunks is None
+
         pp_recipe.pp.info.schedule.step.assert_called_once()
         assert len(loss_buffer) == 1
 
@@ -1993,9 +1985,8 @@ class TestForwardBackwardStepPP:
         )
 
         model = pp_recipe.model_parts[0]
-        assert model._vlm_pixel_values_chunks is None  # Cleared after step
-        assert model._vlm_image_grid_hws_chunks is None
-        assert model._vlm_chunk_idx is None
+        assert model._pp_media_chunks is None
+
         pp_recipe.pp.info.schedule.step.assert_called_once()
         assert len(loss_buffer) == 1
 
@@ -3046,12 +3037,13 @@ class TestChunkVlmMedia:
     def test_uneven_batch_size_general_branch_covers_all_samples(self):
         """batch_size not divisible by n_microbatches must not drop trailing samples.
 
-        torch.tensor.chunk(n) used by schedule.step on input_ids returns ceil-sized
-        chunks. chunk_vlm_media must mirror that or the last sample's images are
-        silently lost while its text still flows through the schedule.
+        ``torch.distributed.pipelining`` splits schedule inputs with
+        ``torch.tensor_split``, which hands the first ``batch_size % n_microbatches``
+        microbatches one extra sample. chunk_vlm_media must mirror that, or a
+        microbatch is paired with another microbatch's images.
         """
 
-        # 7 samples across 3 microbatches: ceil(7/3)=3, expect splits [3, 3, 1].
+        # 7 samples across 3 microbatches: tensor_split gives [3, 2, 2].
         batch_size, n_microbatches = 7, 3
         image_grid = torch.tensor([[1, 2, 2]] * batch_size)  # 4 patches/image
         pixel_values = torch.randn(int(image_grid.prod(dim=1).sum().item()), 64)
@@ -3066,14 +3058,14 @@ class TestChunkVlmMedia:
         )
 
         assert len(ig_chunks) == n_microbatches
-        assert [c.shape[0] for c in ig_chunks] == [3, 3, 1]
+        assert [c.shape[0] for c in ig_chunks] == [3, 2, 2]
         assert sum(c.shape[0] for c in ig_chunks) == batch_size  # no sample dropped
         assert sum(c.shape[0] for c in pv_chunks) == pixel_values.shape[0]
 
     def test_uneven_batch_size_legacy_branch_covers_all_images(self):
-        """Legacy 1-image-per-sample branch must also use ceil division."""
+        """Legacy 1-image-per-sample branch must also use tensor_split boundaries."""
 
-        # 5 images across 3 microbatches: ceil(5/3)=2, expect splits [2, 2, 1].
+        # 5 images across 3 microbatches: tensor_split gives [2, 2, 1].
         batch_size, n_microbatches = 5, 3
         image_grid = torch.tensor([[1, 2, 2]] * batch_size)
         pixel_values = torch.randn(int(image_grid.prod(dim=1).sum().item()), 64)
@@ -3090,9 +3082,9 @@ class TestChunkVlmMedia:
         assert sum(c.shape[0] for c in ig_chunks) == batch_size
 
     def test_uneven_batch_size_gemma4_multi_image_branch_covers_all_samples(self):
-        """Gemma4 multi-image branch (3D pixel_values + counts) must also use ceil."""
-        # 7 samples across 3 microbatches: ceil(7/3)=3, expect sample splits [3, 3, 1].
-        # Image counts per split are [2 + 1 + 0, 3 + 1 + 2, 1] = [3, 6, 1].
+        """Gemma4 multi-image branch (3D pixel_values + counts) must also use tensor_split."""
+        # 7 samples across 3 microbatches: tensor_split gives sample splits [3, 2, 2].
+        # Image counts per split are [2 + 1 + 0, 3 + 1, 2 + 1] = [3, 4, 3].
         batch_size, n_microbatches = 7, 3
         max_patches = 4
         n_images_per_sample = torch.tensor([2, 1, 0, 3, 1, 2, 1])
@@ -3109,8 +3101,8 @@ class TestChunkVlmMedia:
         )
 
         assert len(ig_chunks) == n_microbatches
-        assert [c.shape[0] for c in ig_chunks] == [3, 6, 1]
-        assert [c.shape[0] for c in pv_chunks] == [3, 6, 1]
+        assert [c.shape[0] for c in ig_chunks] == [3, 4, 3]
+        assert [c.shape[0] for c in pv_chunks] == [3, 4, 3]
         assert sum(c.shape[0] for c in pv_chunks) == n_images
 
     def test_step3_media_chunks_full_images_and_flat_patches(self):
@@ -3119,7 +3111,7 @@ class TestChunkVlmMedia:
         patch_newline_mask = torch.tensor([True, False, False, True, False, True])
         num_patches = torch.tensor([2, 0, 3, 1])
 
-        chunks = chunk_step3_media(
+        chunks = chunk_patch_mapped_media(
             pixel_values,
             batch_size=4,
             n_microbatches=2,
@@ -3139,15 +3131,15 @@ class TestChunkVlmMedia:
 
     def test_step3_media_defaults_num_patches_and_validates_shapes(self):
         pixel_values = torch.randn(3, 2)
-        chunks = chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2)
+        chunks = chunk_patch_mapped_media(pixel_values, batch_size=3, n_microbatches=2)
         assert [chunk.tolist() for chunk in chunks["num_patches"]] == [[0, 0], [0]]
         assert "patch_pixel_values" not in chunks
         assert "patch_newline_mask" not in chunks
 
         with pytest.raises(ValueError, match="cannot align pixel_values with num_patches"):
-            chunk_step3_media(pixel_values[:2], batch_size=3, n_microbatches=2)
+            chunk_patch_mapped_media(pixel_values[:2], batch_size=3, n_microbatches=2)
         with pytest.raises(ValueError, match="num_patches must have length"):
-            chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2, num_patches=torch.tensor([1, 2]))
+            chunk_patch_mapped_media(pixel_values, batch_size=3, n_microbatches=2, num_patches=torch.tensor([1, 2]))
 
     def test_prepare_step3_media_without_image_grid_and_stage_cleanup(self):
         model = SimpleNamespace()
@@ -3169,80 +3161,55 @@ class TestChunkVlmMedia:
         assert VLM_PP_MEDIA_KEY in prepared
 
         with stage_vlm_media_for_pp(pp, [model], prepared):
-            assert len(model._vlm_pixel_values_chunks) == 2
-            assert len(model._vlm_patch_pixel_values_chunks) == 2
-            assert len(model._vlm_num_patches_chunks) == 2
-            assert len(model._vlm_patch_newline_mask_chunks) == 2
-            assert model._vlm_chunk_idx == 0
+            assert len(model._pp_media_chunks["pixel_values"]) == 2
+            assert len(model._pp_media_chunks["patch_pixel_values"]) == 2
+            assert len(model._pp_media_chunks["num_patches"]) == 2
+            assert len(model._pp_media_chunks["patch_newline_mask"]) == 2
 
-        assert model._vlm_pixel_values_chunks is None
-        assert model._vlm_patch_pixel_values_chunks is None
-        assert model._vlm_num_patches_chunks is None
-        assert model._vlm_patch_newline_mask_chunks is None
-        assert model._vlm_chunk_idx is None
+        assert model._pp_media_chunks is None
 
-    @pytest.mark.parametrize("schedule_flag", ["_stage_forward_initialized", "_stages_forward_initialized"])
-    def test_stage_media_replays_first_chunk_after_dynamic_metadata_forward(self, schedule_flag):
+    def test_stage_media_lookup_is_order_independent_and_repeatable(self):
+        """A probe forward consumes nothing and any execution order picks its own chunk.
+
+        ``PipelineStage`` runs one extra no-grad probe forward per stage for
+        runtime shape inference, and interleaved schedules execute microbatches
+        out of order. Both are safe because the chunk is addressed by the
+        ``pp_media_index`` the batch carries, not by a cursor.
+        """
+
         class MediaConsumer(nn.Module):
-            def forward(self):
-                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
-                self._vlm_chunk_idx += 1
-                return chunk
+            def forward(self, pp_media_index):
+                return pp_media_chunk(self, "pixel_values", pp_media_index)
 
         model = MediaConsumer()
-        schedule = SimpleNamespace(**{schedule_flag: False})
-        stage = SimpleNamespace(is_first=True)
-        pp = SimpleNamespace(
-            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
-        )
-        first_chunk = torch.tensor([1.0])
-        second_chunk = torch.tensor([2.0])
+        pp = SimpleNamespace(info=SimpleNamespace(has_first_stage=True))
+        chunks = [torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([3.0])]
         batch = {
             VLM_PP_MEDIA_KEY: {
-                "pixel_values": [first_chunk, second_chunk],
-                "image_grid_hws": [torch.ones(1), torch.ones(1)],
+                "pixel_values": list(chunks),
+                "image_grid_hws": [torch.ones(1)] * 3,
             }
         }
 
-        with stage_vlm_media_for_pp(pp, [model], batch):
-            metadata_output = model()
-            first_microbatch_output = model()
-            second_microbatch_output = model()
-
-            assert torch.equal(metadata_output, first_chunk)
-            assert torch.equal(first_microbatch_output, first_chunk)
-            assert torch.equal(second_microbatch_output, second_chunk)
-            assert model._vlm_chunk_idx == 2
-
-    @pytest.mark.parametrize("analytical_metadata,forward_initialized", [(True, False), (False, True)])
-    def test_stage_media_does_not_replay_without_dynamic_metadata_forward(
-        self, analytical_metadata, forward_initialized
-    ):
-        class MediaConsumer(nn.Module):
-            def forward(self):
-                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
-                self._vlm_chunk_idx += 1
-                return chunk
-
-        model = MediaConsumer()
-        schedule = SimpleNamespace(_stage_forward_initialized=forward_initialized)
-        stage = SimpleNamespace(is_first=True)
-        if analytical_metadata:
-            stage._configure_outputs_meta = lambda *_args: None
-        pp = SimpleNamespace(
-            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
-        )
-        first_chunk = torch.tensor([1.0])
-        batch = {
-            VLM_PP_MEDIA_KEY: {
-                "pixel_values": [first_chunk],
-                "image_grid_hws": [torch.ones(1)],
-            }
-        }
+        def index(microbatch_idx, microbatch_size=2):
+            return torch.full((microbatch_size,), microbatch_idx, dtype=torch.int64)
 
         with stage_vlm_media_for_pp(pp, [model], batch):
-            assert torch.equal(model(), first_chunk)
-            assert model._vlm_chunk_idx == 1
+            # Probe forward for shape inference, then an out-of-order schedule.
+            assert torch.equal(model(index(0)), chunks[0])
+            for microbatch_idx in (2, 0, 1, 0):
+                assert torch.equal(model(index(microbatch_idx)), chunks[microbatch_idx])
+
+        assert model._pp_media_chunks is None
+
+    def test_stage_media_rejects_out_of_range_index(self):
+        model = nn.Identity()
+        pp = SimpleNamespace(info=SimpleNamespace(has_first_stage=True))
+        batch = {VLM_PP_MEDIA_KEY: {"pixel_values": [torch.tensor([1.0])]}}
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            with pytest.raises(IndexError, match="out of range"):
+                pp_media_chunk(model, "pixel_values", torch.tensor([1], dtype=torch.int64))
 
     def test_prepare_flat_patches_without_image_grid(self):
         pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)

@@ -85,21 +85,26 @@ def test_inkling_rejects_tied_word_embeddings():
         InklingForConditionalGeneration.from_config(cfg)
 
 
-def test_pipeline_metadata_uses_unpadded_vocabulary_size():
+def test_last_pipeline_stage_emits_unpadded_vocabulary_logits(monkeypatch):
+    """The last stage's logits are truncated to the runtime (unpadded) vocabulary.
+
+    That width is what the pipeline schedule measures from the stage forward, so
+    it must come from the forward itself rather than from the padded lm_head.
+    """
     cfg = build_tiny_config()
     cfg.text_config.unpadded_vocab_size = cfg.text_config.vocab_size - 8
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
-    model = InklingForConditionalGeneration.from_config(cfg, backend=backend)
+    model = InklingForConditionalGeneration.from_config(cfg, backend=backend).to(dtype=torch.float32).eval()
 
-    inputs_meta, outputs_meta = model.pipeline_stage_metas(
-        is_first=False,
-        microbatch_size=2,
-        seq_len=16,
-        dtype=torch.float32,
-    )
+    stages = _split_into_two_stages(model, monkeypatch)
+    batch, seq, hidden = 2, 16, cfg.text_config.hidden_size
+    hidden_states = torch.randn(batch, seq, hidden)
 
-    assert inputs_meta[0].shape == (2, 16, cfg.text_config.hidden_size)
-    assert outputs_meta[0].shape == (2, 16, cfg.text_config.unpadded_vocab_size)
+    with torch.no_grad():
+        logits = stages[-1](hidden_states, use_cache=False)
+
+    assert logits.shape == (batch, seq, cfg.text_config.unpadded_vocab_size)
+    assert logits.dtype == torch.float32
 
 
 def test_requested_dtype_preserves_strict_fp32_modules():
@@ -308,7 +313,16 @@ def test_multimodal_tower_parity():
     torch.testing.assert_close(nemo_audio, hf_audio)
 
 
-def test_two_stage_pipeline_forward_parity(monkeypatch):
+def _split_into_two_stages(model, monkeypatch):
+    """Split ``model`` into two pipeline stage modules without a process group.
+
+    Args:
+        model: The full Inkling model to split.
+        monkeypatch: pytest monkeypatch fixture, used to stub ``PipelineStage``.
+
+    Returns:
+        The two stage modules, in pipeline order.
+    """
     import nemo_automodel.components.distributed.pipelining.model_parts as pipeline
 
     class FakePPMesh:
@@ -333,6 +347,19 @@ def test_two_stage_pipeline_forward_parity(monkeypatch):
 
     monkeypatch.setattr(pipeline, "PipelineStage", FakePipelineStage)
 
+    parts = pipeline.split_model_into_parts(
+        model=model,
+        pp_mesh=FakePPMesh(),
+        pp_schedule="interleaved1f1b",
+        layers_per_stage=2,
+        patch_inner_model=False,
+        patch_causal_lm_model=False,
+        round_to_pp_multiple="down",
+    )
+    return [part.module for part in parts]
+
+
+def test_two_stage_pipeline_forward_parity(monkeypatch):
     cfg, hf, nemo = _build_models()
     nemo.load_state_dict(nemo.state_dict_adapter.from_hf(hf.state_dict()), strict=False)
     input_ids = torch.randint(0, cfg.text_config.vocab_size - 2, (1, 16))
@@ -355,23 +382,24 @@ def test_two_stage_pipeline_forward_parity(monkeypatch):
             use_cache=False,
         ).logits
 
-    parts = pipeline.split_model_into_parts(
-        model=nemo,
-        pp_mesh=FakePPMesh(),
-        pp_schedule="interleaved1f1b",
-        layers_per_stage=2,
-        patch_inner_model=False,
-        patch_causal_lm_model=False,
-        round_to_pp_multiple="down",
-    )
-    model_parts = [part.module for part in parts]
+    model_parts = _split_into_two_stages(nemo, monkeypatch)
     assert len(model_parts) == 2
     assert model_parts[0].model.language_model.embed_norm is not None
 
-    model_parts[0]._vlm_pixel_values_chunks = [pixel_values]
-    model_parts[0]._vlm_chunk_idx = 0
+    # Stage 0 receives its media out-of-band, addressed by this microbatch's index.
+    model_parts[0]._pp_media_chunks = {"pixel_values": [torch.zeros_like(pixel_values), pixel_values]}
+    media_index = torch.ones(1, dtype=torch.int64)
     with torch.no_grad():
-        hidden_states = model_parts[0](input_ids, attention_mask=attention_mask, use_cache=False)
+        hidden_states = model_parts[0](
+            input_ids, attention_mask=attention_mask, use_cache=False, pp_media_index=media_index
+        )
         actual = model_parts[1](hidden_states, attention_mask=attention_mask, use_cache=False)
 
+    assert hidden_states.shape == (1, input_ids.shape[1], cfg.text_config.hidden_size)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+    # The lookup is positional, so re-running the same microbatch (as the runtime
+    # metadata probe does) yields the same activations -- no cursor is consumed.
+    with torch.no_grad():
+        repeat = model_parts[0](input_ids, attention_mask=attention_mask, use_cache=False, pp_media_index=media_index)
+    torch.testing.assert_close(repeat, hidden_states)

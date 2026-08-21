@@ -169,7 +169,9 @@ class TestPrepareModelInputsForCP:
         assert captured["mm_token_type_ids"].tolist() == [[0, 1, 0, 2]]
 
 
-class TestPopStagedVlmMedia:
+class TestStagedVlmMedia:
+    """Per-microbatch media resolution: batch-provided media plus staged chunks."""
+
     def test_drops_orphaned_image_media(self):
         model = _build_model(image_token_id=99, video_token_id=98, vision_start_token_id=97)
         kwargs = {
@@ -177,7 +179,7 @@ class TestPopStagedVlmMedia:
             "image_grid_thw": torch.tensor([[1, 4, 4]]),
         }
 
-        pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw = model._pop_staged_vlm_media(
+        pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw = model._staged_vlm_media(
             torch.tensor([[10, 11, 12]]),
             kwargs,
         )
@@ -196,13 +198,43 @@ class TestPopStagedVlmMedia:
             "image_grid_thw": image_grid_in,
         }
 
-        pixel_values, _, image_grid_thw, _ = model._pop_staged_vlm_media(
+        pixel_values, _, image_grid_thw, _ = model._staged_vlm_media(
             torch.tensor([[10, 99, 12]]),
             kwargs,
         )
 
         assert pixel_values is pixel_values_in
         assert image_grid_thw is image_grid_in
+
+    def test_resolves_staged_chunk_by_media_index(self):
+        """Stage 0 pulls this microbatch's chunk through ``pp_media_index``; the
+        lookup is positional, so the schedule's microbatch order cannot skew it."""
+        from nemo_automodel.shared.pipeline import PP_MEDIA_INDEX_KEY
+
+        model = _build_model(image_token_id=99, video_token_id=98, vision_start_token_id=97)
+        chunks = [torch.randn(4, 8), torch.randn(4, 8)]
+        # [N, 2] H/W grids must be promoted to [N, 3] T/H/W.
+        model._pp_media_chunks = {
+            "pixel_values": chunks,
+            "image_grid_hws": [torch.tensor([[4, 4]]), torch.tensor([[2, 2]])],
+        }
+        input_ids = torch.tensor([[10, 99, 12]])
+
+        for index, expected in enumerate(chunks):
+            pixel_values, _, image_grid_thw, _ = model._staged_vlm_media(
+                input_ids,
+                {PP_MEDIA_INDEX_KEY: torch.tensor([index], dtype=torch.int64)},
+            )
+            assert pixel_values is expected
+            assert image_grid_thw.shape == (1, 3)
+            assert image_grid_thw[0, 0] == 1  # single-frame temporal axis prepended
+
+        # Re-reading the same index is idempotent: no cursor is advanced.
+        pixel_values, _, _, _ = model._staged_vlm_media(
+            input_ids,
+            {PP_MEDIA_INDEX_KEY: torch.tensor([0], dtype=torch.int64)},
+        )
+        assert pixel_values is chunks[0]
 
 
 class TestEmbedAndSpliceForCP:
@@ -331,32 +363,73 @@ class _FakeCPMesh:
         return self._size
 
 
-class TestPipelineStageMetas:
-    """pipeline_stage_metas: CP shards stage outputs; cp=1 stays symmetric."""
+def _stub_embed(input_ids: torch.Tensor) -> torch.Tensor:
+    """Deterministic embedding: [B, S] ids -> [B, S, 8] where every value is the id."""
+    return input_ids.unsqueeze(-1).expand(*input_ids.shape, 8).float()
 
-    def _model(self, *, cp_size, lm_head):
+
+class _StubLanguageModel:
+    """Stand-in for the text backbone: echoes the hidden states it is given."""
+
+    def __init__(self, *, has_embed_tokens: bool):
+        self.embed_tokens = _stub_embed if has_embed_tokens else None
+
+    def __call__(self, *, inputs_embeds=None, **kwargs):
+        return types.SimpleNamespace(last_hidden_state=inputs_embeds)
+
+
+class _StubVLModel:
+    """Stand-in for ``Qwen3_5Model``: embeds ids and echoes hidden states."""
+
+    def __init__(self, *, has_embed_tokens: bool):
+        self.language_model = _StubLanguageModel(has_embed_tokens=has_embed_tokens)
+        self.visual = None
+
+    def __call__(self, *, input_ids=None, inputs_embeds=None, **kwargs):
+        hidden = inputs_embeds
+        if hidden is None:
+            hidden = input_ids if torch.is_floating_point(input_ids) else _stub_embed(input_ids)
+        return types.SimpleNamespace(last_hidden_state=hidden)
+
+
+class TestPipelineStageBoundaryUnderCP:
+    """What each PP stage forward emits under CP -- the schedule measures exactly this.
+
+    The first stage consumes FULL-length token ids and embeds + shards them in
+    forward, so every stage output carries the LOCAL (padded to ``2 * cp`` then
+    ``// cp``) sequence length; ``cp_size == 1`` keeps the symmetric layout.
+    """
+
+    def _stage(self, *, cp_size, lm_head, has_embed_tokens=True):
         model = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
         nn.Module.__init__(model)
-        model.config = types.SimpleNamespace(text_config=types.SimpleNamespace(hidden_size=8, vocab_size=32))
+        model.config = types.SimpleNamespace(
+            text_config=types.SimpleNamespace(hidden_size=8, vocab_size=32),
+            image_token_id=1000,
+            video_token_id=1001,
+            vision_start_token_id=1002,
+        )
         model.lm_head = nn.Linear(8, 32, bias=False) if lm_head else None
+        model.mtp = None
         model.cp_mesh = _FakeCPMesh(cp_size) if cp_size > 1 else None
+        model.model = _StubVLModel(has_embed_tokens=has_embed_tokens)
+        # Instance attribute shadows the class method.
+        model.get_input_embeddings = lambda: _stub_embed
         return model
 
-    def test_cp_shards_stage_outputs(self):
-        model = self._model(cp_size=2, lm_head=True)
-        ins, outs = model.pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
-        # first stage consumes the FULL token ids; output is the local shard (pad 6->8, //2 = 4)
-        assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long
-        assert outs[0].shape == (1, 4, 32)  # last stage (lm_head) -> vocab
+    def test_cp_first_stage_emits_local_shard(self):
+        model = self._stage(cp_size=2, lm_head=False)
+        hidden = model(torch.tensor([[5, 6, 7, 8, 9, 10]]))  # full 6 token ids in
+        # pad 6 -> 8, // cp_size 2 -> local sequence 4
+        assert hidden.shape == (1, 4, 8)
 
-    def test_cp_middle_stage_local_hidden(self):
-        model = self._model(cp_size=2, lm_head=False)
-        ins, outs = model.pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.float32)
-        assert ins[0].shape == (1, 4, 8)  # local hidden in
-        assert outs[0].shape == (1, 4, 8)  # local hidden out (no lm_head)
+    def test_cp_last_stage_projects_local_hidden(self):
+        model = self._stage(cp_size=2, lm_head=True, has_embed_tokens=False)
+        logits = model(torch.randn(1, 4, 8))  # upstream hidden states in the input_ids slot
+        assert logits.shape == (1, 4, 32)
+        assert logits.dtype == model.lm_head.weight.dtype
 
-    def test_cp1_symmetric_matches_default(self):
-        model = self._model(cp_size=1, lm_head=True)
-        ins, outs = model.pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
-        assert ins[0].shape == (2, 5) and ins[0].dtype == torch.long
-        assert outs[0].shape == (2, 5, 32)  # full length, no CP shard
+    def test_cp1_keeps_full_sequence(self):
+        model = self._stage(cp_size=1, lm_head=False)
+        hidden = model(torch.tensor([[5, 6, 7, 8, 9], [1, 2, 3, 4, 5]]))
+        assert hidden.shape == (2, 5, 8)

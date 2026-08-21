@@ -137,61 +137,111 @@ class TestCustomizePipelineStageModules:
 
 
 # ---------------------------------------------------------------------------
-# pipeline_stage_metas
+# Stage-boundary tensors (what the PP schedule infers from the forwards)
 # ---------------------------------------------------------------------------
 
 
-class TestPipelineStageMetas:
+def _stub_backbone(model, hidden_size):
+    """Replace the backbone with a shape-preserving stub returning [B, S, hidden]."""
+
+    def fake_inner(self, input_ids, **kwargs):
+        del self, kwargs
+        return torch.ones(input_ids.shape[0], input_ids.shape[1], hidden_size, dtype=torch.bfloat16)
+
+    model.model.forward = types.MethodType(fake_inner, model.model)
+
+
+class TestPPStageBoundaryTensors:
+    """The inter-stage tuples the stage forwards actually emit.
+
+    ``torch.distributed.pipelining`` infers stage metadata by running these
+    forwards, so the arity, shapes and dtypes asserted here are the pipeline
+    contract: plain ``[B, S, H]`` tensors (no HC stream) and, with MTP enabled,
+    ``1 + D`` tensors on every boundary plus an int32 ``[B, S]`` seq_idx tail on
+    the last stage.
+    """
+
     def test_first_middle_final_arity_and_shapes_with_mtp(self, backend):
         D = 2
+        B, S = 2, 16
         first, cfg = _make_model(
             backend,
             mtp_layers=D,
             mtp_layers_block_type=["attention", "moe"],
+            vocab_size=48,  # distinct from hidden_size so logits are identifiable
         )
+        first.train()
         first.lm_head = None
         first.model.norm = None
         first.mtp = None
-        f_in, f_out = first.pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=16, dtype=torch.bfloat16)
-        assert f_in[0].shape == (2, 16) and f_in[0].dtype == torch.long
-        assert len(f_out) == 1 + D
-        assert f_out[0].shape == (2, 16, cfg.hidden_size)
-        for h in f_out[1:]:
-            assert h.shape == (2, 16, cfg.hidden_size)
+        _stub_backbone(first, cfg.hidden_size)
+
+        first_out = first(torch.randint(0, cfg.vocab_size, (B, S)))
+        assert len(first_out) == 1 + D
+        for tensor in first_out:
+            assert tensor.shape == (B, S, cfg.hidden_size)
+            assert tensor.dtype == torch.bfloat16
 
         middle, _ = _make_model(
             backend,
             mtp_layers=D,
             mtp_layers_block_type=["attention", "moe"],
+            vocab_size=48,
         )
+        middle.train()
         middle.model.embed_tokens = None
         middle.lm_head = None
         middle.model.norm = None
         middle.mtp = None
-        m_in, m_out = middle.pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=16, dtype=torch.bfloat16)
-        assert len(m_in) == 1 + D and len(m_out) == 1 + D
-        assert m_in[0].shape == (2, 16, cfg.hidden_size)
+        _stub_backbone(middle, cfg.hidden_size)
+
+        middle_out = middle(first_out[0], *first_out[1:])
+        assert len(middle_out) == 1 + D
+        for tensor in middle_out:
+            assert tensor.shape == (B, S, cfg.hidden_size)
 
         final, _ = _make_model(
             backend,
             mtp_layers=D,
             mtp_layers_block_type=["attention", "moe"],
+            vocab_size=48,
         )
+        final.train()
         final.model.embed_tokens = None
-        l_in, l_out = final.pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=16, dtype=torch.bfloat16)
-        assert len(l_in) == 1 + D
-        # Final stage appends an int32 [B, S] seq_idx tail: (logits, *mtp_h, seq_idx).
-        assert len(l_out) == 1 + D + 1
-        assert l_out[0].shape == (2, 16, cfg.vocab_size)
-        for h in l_out[1 : 1 + D]:
-            assert h.shape == (2, 16, cfg.hidden_size)
-        assert l_out[-1].shape == (2, 16) and l_out[-1].dtype == torch.int32
+        _stub_backbone(final, cfg.hidden_size)
+        final.mtp.forward = types.MethodType(
+            lambda self, **kwargs: [kwargs["hidden_states"].clone() for _ in range(D)], final.mtp
+        )
 
-    def test_no_mtp_arity_is_one(self, backend):
-        model, cfg = _make_model(backend)
-        f_in, f_out = model.pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=8, dtype=torch.bfloat16)
-        assert len(f_in) == 1 and f_in[0].dtype == torch.long
-        assert len(f_out) == 1
+        final_out = final(middle_out[0], *middle_out[1:])
+        # Last stage appends an int32 [B, S] seq_idx tail: (logits, *mtp_h, seq_idx).
+        assert len(final_out) == 1 + D + 1
+        assert final_out[0].shape == (B, S, cfg.vocab_size)
+        for tensor in final_out[1 : 1 + D]:
+            assert tensor.shape == (B, S, cfg.hidden_size)
+        assert final_out[-1].shape == (B, S) and final_out[-1].dtype == torch.int32
+
+    def test_no_mtp_boundary_is_a_single_tensor(self, backend):
+        """Without MTP every stage emits one tensor, not a tuple."""
+        B, S = 1, 8
+        first, cfg = _make_model(backend, vocab_size=48)
+        first.train()
+        first.lm_head = None
+        first.model.norm = None
+        _stub_backbone(first, cfg.hidden_size)
+
+        hidden = first(torch.randint(0, cfg.vocab_size, (B, S)))
+        assert isinstance(hidden, torch.Tensor)
+        assert hidden.shape == (B, S, cfg.hidden_size) and hidden.dtype == torch.bfloat16
+
+        last, _ = _make_model(backend, vocab_size=48)
+        last.train()
+        last.model.embed_tokens = None
+        _stub_backbone(last, cfg.hidden_size)
+
+        logits = last(hidden)
+        assert isinstance(logits, torch.Tensor)
+        assert logits.shape == (B, S, cfg.vocab_size)
 
 
 # ---------------------------------------------------------------------------

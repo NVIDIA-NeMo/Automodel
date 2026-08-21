@@ -177,25 +177,64 @@ class _FakeCPMesh:
         return self._size
 
 
-class TestPipelineStageMetas:
-    def _model(self, *, cp_size, lm_head):
+def _stub_embed(input_ids: torch.Tensor) -> torch.Tensor:
+    """Deterministic embedding: [B, S] ids -> [B, S, 8] where every value is the id."""
+    return input_ids.unsqueeze(-1).expand(*input_ids.shape, 8).float()
+
+
+class _StubTextModel:
+    """Stand-in for ``Qwen3_5MoeModel``: embeds ids and echoes hidden states."""
+
+    def __init__(self, *, has_embed_tokens: bool):
+        self.language_model = types.SimpleNamespace(embed_tokens=_stub_embed if has_embed_tokens else None)
+
+    def __call__(self, *, input_ids=None, inputs_embeds=None, **kwargs):
+        hidden = inputs_embeds
+        if hidden is None:
+            hidden = input_ids if torch.is_floating_point(input_ids) else _stub_embed(input_ids)
+        return types.SimpleNamespace(last_hidden_state=hidden)
+
+
+class TestPipelineStageBoundaryUnderCP:
+    """What each PP stage forward emits under CP -- the schedule measures exactly this.
+
+    The first stage consumes FULL-length token ids and embeds + shards them in
+    forward, so every stage output carries the LOCAL (padded to ``2 * cp`` then
+    ``// cp``) sequence length. At ``cp_size == 1`` the layout stays symmetric.
+    """
+
+    def _stage(self, *, cp_size, lm_head, has_embed_tokens=True):
         model = Qwen3_5MoeForConditionalGeneration.__new__(Qwen3_5MoeForConditionalGeneration)
         nn.Module.__init__(model)
-        model.config = types.SimpleNamespace(text_config=types.SimpleNamespace(hidden_size=8, vocab_size=32))
+        model.config = types.SimpleNamespace(
+            text_config=types.SimpleNamespace(hidden_size=8, vocab_size=32),
+            image_token_id=1000,
+            video_token_id=1001,
+            vision_start_token_id=1002,
+        )
         model.lm_head = nn.Linear(8, 32, bias=False) if lm_head else None
+        model.mtp = None
         model.cp_mesh = _FakeCPMesh(cp_size) if cp_size > 1 else None
+        model.model = _StubTextModel(has_embed_tokens=has_embed_tokens)
+        # Instance attribute shadows the class method.
+        model.get_input_embeddings = lambda: _stub_embed
         return model
 
-    def test_cp_shards_stage_outputs(self):
-        model = self._model(cp_size=2, lm_head=True)
-        ins, outs = model.pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
-        assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long  # full token ids in
-        assert outs[0].shape == (1, 4, 32)  # local (pad 6->8, //2) logits out
+    def test_cp_first_stage_emits_local_shard(self):
+        model = self._stage(cp_size=2, lm_head=False)
+        out = model(torch.tensor([[5, 6, 7, 8, 9, 10]]))  # full 6 token ids in
+        # pad 6 -> 8, // cp_size 2 -> local sequence 4
+        assert out.logits.shape == (1, 4, 8)
 
-    def test_cp1_symmetric(self):
-        model = self._model(cp_size=1, lm_head=True)
-        ins, outs = model.pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
-        assert ins[0].shape == (2, 5) and outs[0].shape == (2, 5, 32)
+    def test_cp_last_stage_projects_local_hidden(self):
+        model = self._stage(cp_size=2, lm_head=True, has_embed_tokens=False)
+        out = model(torch.randn(1, 4, 8))  # upstream hidden states in the input_ids slot
+        assert out.logits.shape == (1, 4, 32)
+
+    def test_cp1_keeps_full_sequence(self):
+        model = self._stage(cp_size=1, lm_head=True)
+        out = model(torch.tensor([[5, 6, 7, 8, 9], [1, 2, 3, 4, 5]]))
+        assert out.logits.shape == (2, 5, 32)
 
 
 def _build_inner_model():

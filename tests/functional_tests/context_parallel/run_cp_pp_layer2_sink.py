@@ -17,8 +17,9 @@
 Drives the real ``AutoPipeline`` split and step boundary under cp2xpp2 (4 GPUs) and
 cp2xpp1 (2 GPUs) with a tiny random-init text-only config, exercising the whole
 sunk layer-2 contract: the sharder-only hook, the in-forward embed +
-shard_sequence_for_cp_round_robin, the asymmetric pipeline_stage_metas (full-length
-first-stage ids, local sharded outputs), and per-microbatch backward. Asserts:
+shard_sequence_for_cp_round_robin, the asymmetric stage boundary that runtime shape
+inference measures (full-length first-stage ids, local sharded outputs), and
+per-microbatch backward. Asserts:
 
   (1) 20 steps run clean -- no "backward through the graph a second time"
       (the double-backward the old shared pre-embed graph caused under PP*CP);
@@ -233,7 +234,6 @@ def main():
             layers_per_stage=1 if pp_schedule == "interleaved1f1b" else None,
             device=device,
             dtype=torch.bfloat16,
-            pp_seq_len=seqlen,
         ).build(model, loss_fn=loss_fn, parallelize_fn=cp_only_parallelize)
         model_part0, has_last = pp.parts[0], pp.info.has_last_stage
     else:

@@ -530,33 +530,56 @@ class TestIndexShare:
         assert seen_prev[0] == "carry-in"  # first (shared) layer received the carried selection
         assert out_topk == "carry-in"  # and it is returned for the next stage
 
-    def test_pipeline_stage_metas_threads_topk(self, config, backend_config):
-        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+    def test_pp_stage_forwards_thread_topk_carry(self, config, backend_config, device):
+        """Chain the three PP stage forwards and assert the tensors that cross each boundary.
+
+        This is what ``torch.distributed.pipelining`` observes when it infers stage
+        metadata at runtime: a non-last stage emits ``(hidden [B, S, H], top-k carry
+        [B, S, topk])`` and the last stage emits ``logits [B, S, V]``. The carry
+        crosses as float32 because pipeline recv buffers must be grad-capable;
+        ``forward`` casts it back to int64 on receipt.
+        """
         mbs, seq_len = 2, 16
         topk = min(config.index_topk, seq_len)
 
-        # First stage: input_ids in; (hidden, topk) out (non-last, since the full model here owns
-        # both embed and lm_head, lm_head-present means last — so emulate first+non-last by dropping lm_head).
-        first_in, first_out = model.pipeline_stage_metas(
-            is_first=True, microbatch_size=mbs, seq_len=seq_len, dtype=torch.bfloat16
-        )
-        assert len(first_in) == 1 and first_in[0].shape == (mbs, seq_len)  # input_ids
-        # last-stage outputs (this full model owns lm_head): logits only
-        assert len(first_out) == 1 and first_out[0].shape == (mbs, seq_len, config.vocab_size)
+        def stage() -> GlmMoeDsaForCausalLM:
+            return GlmMoeDsaForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
 
-        # Emulate a middle stage: no embed_tokens, no lm_head -> hidden+topk in and out.
+        # First stage: owns embed_tokens, no lm_head -> token ids in, (hidden, carry) out.
+        first = stage()
+        first.lm_head = None
+        input_ids = torch.randint(0, config.vocab_size, (mbs, seq_len), device=device)
+        hidden, carry = first(input_ids)
+        assert hidden.shape == (mbs, seq_len, config.hidden_size) and hidden.dtype == torch.bfloat16
+        assert carry.shape == (mbs, seq_len, topk) and carry.dtype == torch.float32
+
+        # Middle stage: neither embed_tokens nor lm_head -> the boundary is symmetric.
+        middle = stage()
+        middle.model.embed_tokens = None
+        middle.lm_head = None
+        mid_hidden, mid_carry = middle(hidden, carry)
+        assert mid_hidden.shape == (mbs, seq_len, config.hidden_size) and mid_hidden.dtype == torch.bfloat16
+        assert mid_carry.shape == (mbs, seq_len, topk) and mid_carry.dtype == torch.float32
+
+        # Last stage: owns lm_head -> a single logits tensor, no carry-out.
+        last = stage()
+        last.model.embed_tokens = None
+        logits = last(mid_hidden, mid_carry)
+        assert isinstance(logits, torch.Tensor)
+        assert logits.shape == (mbs, seq_len, config.vocab_size) and logits.dtype == torch.bfloat16
+
+    def test_pp_stage_topk_carry_width_follows_sequence_length(self, config, backend_config, device):
+        """The dense (sdpa) indexer caps the carry width at the sequence length."""
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
         model.lm_head = None
-        mid_in, mid_out = model.pipeline_stage_metas(
-            is_first=False, microbatch_size=mbs, seq_len=seq_len, dtype=torch.bfloat16
-        )
-        # Top-k carry crosses the pipeline boundary as float32 (recv buffers must be grad-capable);
-        # forward() casts it back to int64 on receipt.
-        assert len(mid_in) == 2
-        assert mid_in[0].shape == (mbs, seq_len, config.hidden_size)
-        assert mid_in[1].shape == (mbs, seq_len, topk) and mid_in[1].dtype == torch.float32
-        assert len(mid_out) == 2
-        assert mid_out[0].shape == (mbs, seq_len, config.hidden_size)
-        assert mid_out[1].shape == (mbs, seq_len, topk) and mid_out[1].dtype == torch.float32
+        short_seq = config.index_topk // 2
+        input_ids = torch.randint(0, config.vocab_size, (1, short_seq), device=device)
+
+        hidden, carry = model(input_ids)
+
+        assert hidden.shape == (1, short_seq, config.hidden_size)
+        assert carry.shape == (1, short_seq, short_seq)  # min(index_topk, seq_len)
+        assert carry.dtype == torch.float32
 
     def test_pp_stage_topk_carry_dtype_roundtrip(self, config, backend_config):
         # A non-first/non-last PP stage receives a float32 carry, casts it to int64 before the

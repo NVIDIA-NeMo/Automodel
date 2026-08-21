@@ -27,12 +27,12 @@ from nemo_automodel.components.models.kimi_k25_vl.model import (
     KimiK25VLModel,
     KimiK25VLMultiModalProjector,
     Learnable2DInterpPosEmbDividedFixed,
+    MoonVision3dPatchEmbed,
     MoonViT3dConfig,
     MoonViT3dEncoder,
     MoonViT3dEncoderLayer,
     MoonViT3dMLP,
     MoonViT3dPretrainedModel,
-    MoonVision3dPatchEmbed,
     Rope2DPosEmbRepeated,
     _apply_rope_vision,
     get_1d_sincos_pos_embed,
@@ -126,23 +126,19 @@ class TestKimiK25VLModelUpdates:
         """Ensure classmethod from_pretrained builds config then delegates to from_config."""
         cfg = KimiK25VLConfig()
 
-        with patch.object(
-            KimiK25VLConfig, "from_pretrained", return_value=cfg
-        ) as mock_from_pretrained:
+        with patch.object(KimiK25VLConfig, "from_pretrained", return_value=cfg) as mock_from_pretrained:
             with patch.object(
                 KimiK25VLForConditionalGeneration,
                 "from_config",
                 wraps=KimiK25VLForConditionalGeneration.from_config,
-            ) as mock_from_config:
+            ):
                 # Mock the actual model instantiation to avoid CUDA
                 with patch.object(
                     KimiK25VLForConditionalGeneration,
                     "__init__",
                     lambda self, *args, **kwargs: None,
                 ):
-                    model = KimiK25VLForConditionalGeneration.__new__(
-                        KimiK25VLForConditionalGeneration
-                    )
+                    KimiK25VLForConditionalGeneration.__new__(KimiK25VLForConditionalGeneration)
                     # Simulate from_pretrained behavior
                     mock_from_pretrained.assert_not_called()
 
@@ -1266,6 +1262,7 @@ class TestKimiK25VLModelForwardMocked:
         """Test forward accepts target_seq_length parameter for PP."""
         # Verify the parameter is accepted in the signature
         import inspect
+
         sig = inspect.signature(KimiK25VLModel.forward)
         params = list(sig.parameters.keys())
 
@@ -1285,6 +1282,7 @@ class TestKimiK25VLForConditionalGenerationFromPretrained:
     def test_from_pretrained_signature(self):
         """Test from_pretrained has expected signature."""
         import inspect
+
         sig = inspect.signature(KimiK25VLForConditionalGeneration.from_pretrained)
         params = list(sig.parameters.keys())
 
@@ -1323,9 +1321,7 @@ class TestKimiK25VLForConditionalGenerationFromPretrained:
         mock_from_config.return_value = mock_model
 
         # Call the method
-        result = KimiK25VLForConditionalGeneration.from_pretrained(
-            "/fake/path", torch_dtype=torch.bfloat16
-        )
+        KimiK25VLForConditionalGeneration.from_pretrained("/fake/path", torch_dtype=torch.bfloat16)
 
         mock_config_from_pretrained.assert_called_once_with("/fake/path")
         assert mock_config._name_or_path == "/fake/path"
@@ -1339,7 +1335,7 @@ class TestKimiK25VLForConditionalGenerationFromPretrained:
         mock_model.to.return_value = mock_model
         mock_from_config.return_value = mock_model
 
-        result = KimiK25VLForConditionalGeneration.from_pretrained(
+        KimiK25VLForConditionalGeneration.from_pretrained(
             "/fake/path", config=provided_config, torch_dtype=torch.bfloat16
         )
 
@@ -1358,9 +1354,7 @@ class TestKimiK25VLForConditionalGenerationFromPretrained:
         mock_model.to.return_value = mock_model
         mock_from_config.return_value = mock_model
 
-        result = KimiK25VLForConditionalGeneration.from_pretrained(
-            "/fake/path", num_hidden_layers=2, torch_dtype=torch.bfloat16
-        )
+        KimiK25VLForConditionalGeneration.from_pretrained("/fake/path", num_hidden_layers=2, torch_dtype=torch.bfloat16)
 
         # Check num_hidden_layers was overridden
         assert mock_config.text_config.num_hidden_layers == 2
@@ -1377,6 +1371,7 @@ class TestKimiK25VLForConditionalGenerationInit:
     def test_init_signature(self):
         """Test __init__ has expected signature."""
         import inspect
+
         sig = inspect.signature(KimiK25VLForConditionalGeneration.__init__)
         params = list(sig.parameters.keys())
 
@@ -1416,45 +1411,65 @@ class TestKimiK25VLForConditionalGenerationForward:
     def test_forward_signature_complete(self):
         """Test forward has all expected parameters."""
         import inspect
+
         sig = inspect.signature(KimiK25VLForConditionalGeneration.forward)
         params = list(sig.parameters.keys())
 
         expected_params = [
-            "self", "input_ids", "attention_mask", "position_ids",
-            "past_key_values", "inputs_embeds", "labels", "use_cache",
-            "output_attentions", "output_hidden_states", "return_dict",
-            "pixel_values", "grid_thws", "padding_mask", "target_seq_length",
+            "self",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "past_key_values",
+            "inputs_embeds",
+            "labels",
+            "use_cache",
+            "output_attentions",
+            "output_hidden_states",
+            "return_dict",
+            "pixel_values",
+            "grid_thws",
+            "padding_mask",
+            "target_seq_length",
             "kwargs",
         ]
 
         for param in expected_params:
             assert param in params, f"Missing parameter: {param}"
 
-    def test_forward_vlm_chunk_retrieval_logic(self):
-        """Test VLM chunk retrieval from model attributes."""
-        # Simulate the chunk retrieval logic
-        pixel_values = None
-        _vlm_pixel_values_chunks = [torch.randn(64, 3, 14, 14), torch.randn(32, 3, 14, 14)]
-        _vlm_image_grid_hws_chunks = [torch.tensor([[28, 28]]), torch.tensor([[14, 14]])]
-        media_placeholder_token_id = 163605
-        input_ids = torch.tensor([[1, 2, media_placeholder_token_id, 3, 4]])
-        _vlm_chunk_idx = 0
+    def test_pp_media_is_selected_by_index_not_a_cursor(self):
+        """Staged media is addressed positionally, so microbatch order cannot desync it.
 
-        has_media_tokens = (
-            input_ids is not None
-            and media_placeholder_token_id is not None
-            and (input_ids == media_placeholder_token_id).any().item()
-        )
+        Exercises the shared production helper rather than re-implementing the
+        lookup, and covers the all-text microbatch that broke the old cursor.
+        """
+        from nemo_automodel.shared.pipeline import pp_media_chunk
 
-        assert has_media_tokens == True
+        module = torch.nn.Module()
+        first = torch.randn(64, 3, 14, 14)
+        second = torch.randn(32, 3, 14, 14)
+        module._pp_media_chunks = {
+            "pixel_values": [torch.zeros(0, 3, 14, 14), first, second],
+            "image_grid_hws": [torch.zeros(0, 2), torch.tensor([[28, 28]]), torch.tensor([[14, 14]])],
+        }
 
-        if has_media_tokens:
-            if _vlm_chunk_idx < len(_vlm_pixel_values_chunks):
-                pixel_values = _vlm_pixel_values_chunks[_vlm_chunk_idx]
-                image_grid_hws = _vlm_image_grid_hws_chunks[_vlm_chunk_idx]
+        def index(value: int) -> torch.Tensor:
+            return torch.full((2,), value, dtype=torch.long)
 
-                assert pixel_values.shape == (64, 3, 14, 14)
-                assert image_grid_hws.shape == (1, 2)
+        # Microbatch 0 is all text: staged empty, reported as absent.
+        assert pp_media_chunk(module, "pixel_values", index(0)) is None
+        # Microbatches 1 and 2 get their own chunk regardless of evaluation order,
+        # and re-reading the same index is idempotent.
+        assert pp_media_chunk(module, "pixel_values", index(2)) is second
+        assert pp_media_chunk(module, "pixel_values", index(1)) is first
+        assert pp_media_chunk(module, "pixel_values", index(1)) is first
+        assert pp_media_chunk(module, "image_grid_hws", index(2)).shape == (1, 2)
+        # An unstaged key and a missing index are both absent, not an error.
+        assert pp_media_chunk(module, "pixel_values_videos", index(1)) is None
+        assert pp_media_chunk(module, "pixel_values", None) is None
+        # A cursor past the staged chunks is a staging/schedule disagreement.
+        with pytest.raises(IndexError, match="out of range"):
+            pp_media_chunk(module, "pixel_values", index(3))
 
     def test_forward_grid_thws_conversion(self):
         """Test conversion from image_grid_hws [N, 2] to grid_thws [N, 3]."""
@@ -1490,7 +1505,6 @@ class TestKimiK25VLForConditionalGenerationForward:
         """Test loss computation without attention mask."""
         logits = torch.randn(2, 10, 1000)
         labels = torch.randint(0, 1000, (2, 10))
-        attention_mask = None
 
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
@@ -1527,6 +1541,7 @@ class TestVisionAttentionFlash:
     def test_vision_attention_flash_exists(self):
         """Test vision_attention_flash function is importable."""
         from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+
         assert callable(vision_attention_flash)
 
     def test_vision_attention_flash_max_seqlen_computation(self):
@@ -1552,6 +1567,7 @@ class TestVisionAttentionFlash:
     def test_vision_attention_flash_signature(self):
         """Test vision_attention_flash has expected signature."""
         import inspect
+
         from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
 
         sig = inspect.signature(vision_attention_flash)
@@ -1584,7 +1600,7 @@ class TestVisionAttentionFlash:
         mock_output = torch.randn(seq_len, num_heads, head_dim)
         mock_flash_attn.return_value = mock_output
 
-        result = vision_attention_flash(q, k, v, cu_seqlens, cu_seqlens)
+        vision_attention_flash(q, k, v, cu_seqlens, cu_seqlens)
 
         mock_flash_attn.assert_called_once()
         call_args = mock_flash_attn.call_args
@@ -1645,6 +1661,7 @@ class TestSqueezeInputForThd:
     def test_squeeze_input_for_thd_import(self):
         """Test squeeze_input_for_thd is importable."""
         from nemo_automodel.components.models.kimi_k25_vl.model import squeeze_input_for_thd
+
         assert callable(squeeze_input_for_thd)
 
     def test_squeeze_input_for_thd_basic(self):

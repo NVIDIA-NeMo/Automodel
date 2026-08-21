@@ -798,25 +798,27 @@ class TestMistral3ForConditionalGeneration:
         # Without lm_head, output is hidden_states (hidden_size=64) not logits (vocab_size=256)
         assert out.shape == (1, 8, 64)
 
-    def test_pp_vlm_chunk_retrieval(self, multimodal_config, backend):
-        """PP VLM chunk attributes are stored and chunk_idx increments correctly."""
+    def test_pp_vlm_media_selected_by_microbatch_index(self, multimodal_config, backend):
+        """Each microbatch resolves its own staged media chunk, in any order."""
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
+        from nemo_automodel.shared.pipeline import pp_media_chunk
 
         model = OurMistral3ForCG(multimodal_config, backend=backend)
-        # Verify model has image_token_index set from config
         assert model.image_token_index == 10
-        # Verify chunk attributes can be set (used by PP recipe)
-        fake_pixels = torch.randn(1, 3, 16, 16)
-        fake_image_sizes = torch.tensor([[16, 16]])
-        model._vlm_pixel_values_chunks = [fake_pixels, fake_pixels]
-        model._vlm_image_grid_hws_chunks = [fake_image_sizes, fake_image_sizes]
-        model._vlm_chunk_idx = 0
-        assert len(model._vlm_pixel_values_chunks) == 2
-        # Simulate chunk consumption
-        model._vlm_chunk_idx = 1
-        assert model._vlm_chunk_idx == 1
+
+        first_pixels = torch.randn(1, 3, 16, 16)
+        second_pixels = torch.randn(2, 3, 16, 16)
+        model._pp_media_chunks = {
+            "pixel_values": [first_pixels, second_pixels],
+            "image_grid_hws": [torch.tensor([[16, 16]]), torch.tensor([[16, 16], [16, 16]])],
+        }
+
+        # Resolved out of order to show there is no cursor state.
+        assert pp_media_chunk(model, "pixel_values", torch.ones(1, dtype=torch.long)) is second_pixels
+        assert pp_media_chunk(model, "pixel_values", torch.zeros(1, dtype=torch.long)) is first_pixels
+        assert pp_media_chunk(model, "image_grid_hws", torch.ones(1, dtype=torch.long)).shape == (2, 2)
 
 
 @_skip_no_hf_mistral3

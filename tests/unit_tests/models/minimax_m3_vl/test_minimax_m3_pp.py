@@ -16,8 +16,11 @@
 
 These exercise the model-side PP hooks without a process group: the FQN
 rewrite (against the framework's real auto-generated names), the stage
-predicate, the shape metas, and partial-stage forwards (first / middle /
-last) built by nulling modules the way the framework's splitter does.
+predicate, the per-microbatch media staging, and partial-stage forwards
+(first / middle / last) built by nulling modules the way the framework's
+splitter does. The stage-boundary tensor contract is asserted on what each
+stage forward returns, which is exactly what the pipeline schedule measures
+when it infers stage metadata at runtime.
 """
 
 import copy
@@ -95,21 +98,26 @@ def test_is_pp_stage_full_model(vlm_model):
     assert vlm_model._is_pipeline_parallel_stage() is False
 
 
-def test_pipeline_stage_metas(vlm_model):
+def test_last_stage_logits_dtype_follows_lm_head(vlm_model):
+    """The logits dtype the pipeline observes is lm_head's, whatever the stage runs in.
+
+    The schedule measures the boundary dtype from the forward, so a bf16 stage must
+    emit bf16 logits (and the fp32 fixture emits fp32 logits, see
+    ``test_last_stage_forward_returns_logits``).
+    """
+    m = copy.deepcopy(vlm_model)
+    m.model.embed_tokens = None
+    _prune_layers(m, {"2"})  # keeps norm + lm_head
+    m = m.to(torch.bfloat16)
+    assert m._is_pipeline_parallel_stage() is True
+
+    b, s = 2, 16
     h = vlm_model.config.text_config.hidden_size
     v = vlm_model.config.text_config.vocab_size
-    ins, outs = vlm_model.pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
-    assert ins[0].shape == (2, 5) and ins[0].dtype == torch.long
-    assert outs[0].shape == (2, 5, v)  # full model owns lm_head
-    ins2, _ = vlm_model.pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=5, dtype=torch.float32)
-    assert ins2[0].shape == (2, 5, h)
+    out = m(torch.randn(b, s, h, dtype=torch.bfloat16))
 
-    # Logits meta must follow lm_head's own dtype, not the passed model dtype, so
-    # it stays correct if lm_head is ever kept in fp32 while the model runs bf16.
-    ins3, outs3 = vlm_model.pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=5, dtype=torch.bfloat16)
-    assert ins3[0].dtype == torch.bfloat16  # inter-stage hidden uses the model dtype
-    assert outs3[0].dtype == vlm_model.lm_head.weight.dtype  # logits follow lm_head (float32 here)
-    assert outs3[0].dtype != torch.bfloat16
+    assert out.shape == (b, s, v)
+    assert out.dtype == m.lm_head.weight.dtype == torch.bfloat16
 
 
 def test_first_stage_forward_returns_hidden(vlm_model):
@@ -123,6 +131,7 @@ def test_first_stage_forward_returns_hidden(vlm_model):
     ids = torch.randint(0, 120, (b, s))  # no image-token ids
     out = m(ids)
     assert out.shape == (b, s, h)
+    assert out.dtype == torch.float32  # the stage's own dtype crosses the boundary
 
 
 def test_middle_stage_forward_consumes_and_returns_hidden(vlm_model):
@@ -140,7 +149,7 @@ def test_middle_stage_forward_consumes_and_returns_hidden(vlm_model):
 
 
 def test_stage0_consumes_pp_media_chunks(vlm_model):
-    """Under PP, stage 0 receives media via _vlm_*_chunks (not in the batch); the
+    """Under PP, stage 0 receives media via ``_pp_media_chunks`` (not in the batch); the
     chunk path must reproduce the direct-media path so vision is actually spliced."""
     from .conftest import IMAGE_TOKEN_INDEX
 
@@ -153,16 +162,14 @@ def test_stage0_consumes_pp_media_chunks(vlm_model):
     with torch.no_grad():
         direct = vlm_model(ids, pixel_values=pixel_values, image_grid_thw=grid_thw)
 
-    # Stage 0: keep embed_tokens + all layers, but route through the chunk path
-    # with pixel_values omitted from the call, as the PP schedule does.
+    # Stage 0: keep embed_tokens + all layers, but route through the staged media
+    # with pixel_values omitted from the call, as the PP schedule does. The staged
+    # grid rides under the media-prep key "image_grid_hws".
     m = copy.deepcopy(vlm_model)
-    m._vlm_pixel_values_chunks = [pixel_values]
-    m._vlm_image_grid_hws_chunks = [grid_tensor]
-    m._vlm_chunk_idx = 0
+    m._pp_media_chunks = {"pixel_values": [pixel_values], "image_grid_hws": [grid_tensor]}
     with torch.no_grad():
-        via_chunks = m(ids)  # no pixel_values in the call -> must come from chunks
+        via_chunks = m(ids, pp_media_index=torch.zeros(1, dtype=torch.int64))
 
-    assert m._vlm_chunk_idx == 1, "media chunk cursor did not advance"
     torch.testing.assert_close(via_chunks, direct, rtol=1e-4, atol=1e-4)
 
     # Guard against the regression: without the chunk plumbing the image positions
@@ -171,6 +178,58 @@ def test_stage0_consumes_pp_media_chunks(vlm_model):
     with torch.no_grad():
         no_media = m_blind(ids)  # no chunks, no pixel_values -> no splicing
     assert not torch.allclose(no_media, direct, rtol=1e-3, atol=1e-3)
+
+
+def test_stage0_media_lookup_is_order_independent(vlm_model):
+    """``pp_media_index`` selects the chunk, so schedule order and probe forwards
+    cannot desynchronize stage 0 from its media (the old mutable cursor could)."""
+    from .conftest import IMAGE_TOKEN_INDEX
+
+    pixel_values, grid_thw, n_tokens = _make_image_inputs(vlm_model)
+    grid_tensor = torch.tensor(grid_thw, dtype=torch.long)
+    other_pixels = torch.zeros_like(pixel_values)
+
+    ids = torch.randint(2, 99, (1, 24))
+    ids[0, 5 : 5 + n_tokens] = IMAGE_TOKEN_INDEX
+    text_only_ids = torch.randint(2, 99, (1, 24))
+
+    m = copy.deepcopy(vlm_model)
+    # Microbatch 0 holds the zeroed image; microbatch 1 holds the real one.
+    m._pp_media_chunks = {
+        "pixel_values": [other_pixels, pixel_values],
+        "image_grid_hws": [grid_tensor, grid_tensor],
+    }
+
+    with torch.no_grad():
+        # A metadata-probe forward and a media-free microbatch must not advance
+        # anything: microbatch 1 still resolves to its own chunk afterwards.
+        m(text_only_ids, pp_media_index=torch.zeros(1, dtype=torch.int64))
+        first = m(ids, pp_media_index=torch.ones(1, dtype=torch.int64))
+        second = m(ids, pp_media_index=torch.ones(1, dtype=torch.int64))
+        zeroed = m(ids, pp_media_index=torch.zeros(1, dtype=torch.int64))
+        expected = vlm_model(ids, pixel_values=pixel_values, image_grid_thw=grid_thw)
+
+    torch.testing.assert_close(first, second)
+    torch.testing.assert_close(first, expected, rtol=1e-4, atol=1e-4)
+    assert not torch.allclose(first, zeroed, rtol=1e-3, atol=1e-3)
+
+
+def test_stage0_media_index_out_of_range_raises(vlm_model):
+    """An index past the staged chunks means staging and schedule disagree."""
+    from .conftest import IMAGE_TOKEN_INDEX
+
+    pixel_values, grid_thw, n_tokens = _make_image_inputs(vlm_model)
+    ids = torch.randint(2, 99, (1, 24))
+    ids[0, 5 : 5 + n_tokens] = IMAGE_TOKEN_INDEX
+
+    m = copy.deepcopy(vlm_model)
+    m._pp_media_chunks = {
+        "pixel_values": [pixel_values],
+        "image_grid_hws": [torch.tensor(grid_thw, dtype=torch.long)],
+    }
+
+    with pytest.raises(IndexError, match="out of range"), torch.no_grad():
+        m(ids, pp_media_index=torch.tensor([3], dtype=torch.int64))
 
 
 def test_mtp_under_pp_raises_on_forward(vlm_model):
@@ -199,3 +258,4 @@ def test_last_stage_forward_returns_logits(vlm_model):
     hidden_in = torch.randn(b, s, h)
     out = m(hidden_in)
     assert out.shape == (b, s, v)
+    assert out.dtype == m.lm_head.weight.dtype == torch.float32

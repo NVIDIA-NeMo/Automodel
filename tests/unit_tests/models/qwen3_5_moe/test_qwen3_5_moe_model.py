@@ -563,9 +563,10 @@ class TestQwen3_5MoeForConditionalGeneration:
 
         pixel_values_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
         image_grid_hws_chunk = torch.tensor([[2, 2]], device=device)
-        model._vlm_pixel_values_chunks = [pixel_values_chunk]
-        model._vlm_image_grid_hws_chunks = [image_grid_hws_chunk]
-        model._vlm_chunk_idx = 0
+        model._pp_media_chunks = {
+            "pixel_values": [pixel_values_chunk],
+            "image_grid_hws": [image_grid_hws_chunk],
+        }
 
         captured_kwargs = {}
 
@@ -580,13 +581,12 @@ class TestQwen3_5MoeForConditionalGeneration:
                 return mock_output
 
             mock_model_forward.side_effect = capture_kwargs
-            model.forward(input_ids=input_ids)
+            model.forward(input_ids=input_ids, pp_media_index=torch.zeros(1, dtype=torch.long))
 
         assert "pixel_values" in captured_kwargs
         torch.testing.assert_close(captured_kwargs["pixel_values"], pixel_values_chunk)
         assert "image_grid_thw" in captured_kwargs
         assert captured_kwargs["image_grid_thw"].shape == (1, 3)
-        assert model._vlm_chunk_idx == 1
 
     def test_forward_handles_thd_format(self, vl_config, backend_config, moe_config, device):
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
@@ -729,8 +729,19 @@ class TestQwen3_5MoeModelVLPath:
 # ---------------------------------------------------------------------------
 class TestConditionalGenerationPPVLMChunkEdgeCases:
     @staticmethod
-    def _run_forward_capturing_kwargs(model, input_ids, device):
-        """Run forward with mocked model.model.forward and return captured kwargs."""
+    def _run_forward_capturing_kwargs(model, input_ids, device, microbatch_index=0):
+        """Run forward with mocked model.model.forward and return captured kwargs.
+
+        Args:
+            model: Model under test.
+            input_ids: Token ids of shape [batch, sequence].
+            device: Device the mocked hidden states are created on.
+            microbatch_index: Value carried by ``pp_media_index``, selecting
+                which staged media chunk this microbatch owns.
+
+        Returns:
+            The keyword arguments the inner model was called with.
+        """
         model_dtype = next(model.parameters()).dtype
         batch, seq_len = input_ids.shape
         hidden_size = model.config.text_config.hidden_size
@@ -745,7 +756,10 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
                 return out
 
             mock_fwd.side_effect = capture
-            model.forward(input_ids=input_ids)
+            model.forward(
+                input_ids=input_ids,
+                pp_media_index=torch.full((batch,), microbatch_index, dtype=torch.long),
+            )
 
         return captured
 
@@ -757,9 +771,7 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
         pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
         grid_3d = torch.tensor([[1, 2, 2]], device=device)
 
-        model._vlm_pixel_values_chunks = [pixel_chunk]
-        model._vlm_image_grid_hws_chunks = [grid_3d]
-        model._vlm_chunk_idx = 0
+        model._pp_media_chunks = {"pixel_values": [pixel_chunk], "image_grid_hws": [grid_3d]}
 
         input_ids = torch.tensor([[vl_config.image_token_id, 1, 2, 3]], device=device)
         captured = self._run_forward_capturing_kwargs(model, input_ids, device)
@@ -773,9 +785,7 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
 
         pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
 
-        model._vlm_pixel_values_chunks = [pixel_chunk]
-        model._vlm_image_grid_hws_chunks = [None]
-        model._vlm_chunk_idx = 0
+        model._pp_media_chunks = {"pixel_values": [pixel_chunk], "image_grid_hws": [None]}
 
         input_ids = torch.tensor([[vl_config.image_token_id, 1, 2, 3]], device=device)
         captured = self._run_forward_capturing_kwargs(model, input_ids, device)
@@ -791,9 +801,7 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
         pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
         empty_grid = torch.zeros(0, 3, dtype=torch.long, device=device)
 
-        model._vlm_pixel_values_chunks = [pixel_chunk]
-        model._vlm_image_grid_hws_chunks = [empty_grid]
-        model._vlm_chunk_idx = 0
+        model._pp_media_chunks = {"pixel_values": [pixel_chunk], "image_grid_hws": [empty_grid]}
 
         input_ids = torch.tensor([[vl_config.image_token_id, 1, 2, 3]], device=device)
         captured = self._run_forward_capturing_kwargs(model, input_ids, device)
@@ -801,45 +809,48 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
         torch.testing.assert_close(captured["pixel_values"], pixel_chunk)
         assert captured["image_grid_thw"] is None
 
-    def test_forward_no_media_tokens_skips_chunk_retrieval(self, vl_config, backend_config, moe_config, device):
-        """Input without image/vision_start tokens should not retrieve chunks."""
+    def test_forward_all_text_microbatch_receives_no_media(self, vl_config, backend_config, moe_config, device):
+        """A microbatch staged with an empty chunk must not reach the vision path.
+
+        The staging code emits one chunk per microbatch, using an empty tensor for
+        an all-text microbatch so the chunk list stays positionally aligned with
+        the microbatches.
+        """
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         model_dtype = next(model.parameters()).dtype
 
-        pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+        model._pp_media_chunks = {
+            "pixel_values": [torch.zeros(0, 3, 4, 4, device=device, dtype=model_dtype)],
+            "image_grid_hws": [torch.zeros(0, 2, dtype=torch.long, device=device)],
+        }
 
-        model._vlm_pixel_values_chunks = [pixel_chunk]
-        model._vlm_image_grid_hws_chunks = [torch.tensor([[2, 2]], device=device)]
-        model._vlm_chunk_idx = 0
-
-        # Token ID 0 should not match the special token IDs (typically > 150000)
         input_ids = torch.zeros((1, 4), dtype=torch.long, device=device)
-        assert vl_config.image_token_id != 0 and vl_config.vision_start_token_id != 0
-
         captured = self._run_forward_capturing_kwargs(model, input_ids, device)
 
-        assert model._vlm_chunk_idx == 0  # Not incremented
-        assert "pixel_values" not in captured
+        assert captured.get("pixel_values") is None
 
-    def test_forward_exhausted_chunks_skips_retrieval(self, vl_config, backend_config, moe_config, device):
-        """When chunk_idx >= len(chunks), no pixel_values should be injected."""
+    def test_forward_media_index_out_of_range_raises(self, vl_config, backend_config, moe_config, device):
+        """A media index past the staged chunks is a staging/schedule disagreement.
+
+        The cursor protocol skipped this silently, which trained the language
+        model on placeholder embeddings. It must now fail loudly.
+        """
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         model_dtype = next(model.parameters()).dtype
 
-        pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
-
-        model._vlm_pixel_values_chunks = [pixel_chunk]
-        model._vlm_image_grid_hws_chunks = [torch.tensor([[2, 2]], device=device)]
-        model._vlm_chunk_idx = 1  # Already past the single chunk
+        model._pp_media_chunks = {
+            "pixel_values": [torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)],
+            "image_grid_hws": [torch.tensor([[2, 2]], device=device)],
+        }
 
         input_ids = torch.tensor([[vl_config.image_token_id, 1, 2, 3]], device=device)
-        captured = self._run_forward_capturing_kwargs(model, input_ids, device)
+        with pytest.raises(IndexError, match="out of range"):
+            self._run_forward_capturing_kwargs(model, input_ids, device, microbatch_index=1)
 
-        assert model._vlm_chunk_idx == 1  # Not incremented
-        assert "pixel_values" not in captured
-
-    def test_forward_vision_start_token_triggers_chunk_retrieval(self, vl_config, backend_config, moe_config, device):
-        """vision_start_token_id (not just image_token_id) should trigger chunk retrieval."""
+    def test_forward_vision_start_token_still_receives_staged_media(
+        self, vl_config, backend_config, moe_config, device
+    ):
+        """Media staged for a microbatch reaches the model regardless of which media token appears."""
         assert vl_config.vision_start_token_id is not None
 
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
@@ -848,15 +859,12 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
         pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
         grid_chunk = torch.tensor([[2, 2]], device=device)
 
-        model._vlm_pixel_values_chunks = [pixel_chunk]
-        model._vlm_image_grid_hws_chunks = [grid_chunk]
-        model._vlm_chunk_idx = 0
+        model._pp_media_chunks = {"pixel_values": [pixel_chunk], "image_grid_hws": [grid_chunk]}
 
         input_ids = torch.tensor([[vl_config.vision_start_token_id, 1, 2, 3]], device=device)
         captured = self._run_forward_capturing_kwargs(model, input_ids, device)
 
         torch.testing.assert_close(captured["pixel_values"], pixel_chunk)
-        assert model._vlm_chunk_idx == 1
 
 
 # ---------------------------------------------------------------------------

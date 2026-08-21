@@ -18,7 +18,6 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.pipelining.schedules import PipelineScheduleMulti, PipelineScheduleSingle
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.pipelining.model_parts import (
@@ -31,15 +30,16 @@ from nemo_automodel.components.distributed.pipelining.module_plan import (
     generate_hf_model_fqn_per_model_part,
     stage_ids_this_rank,
 )
-from nemo_automodel.components.distributed.pipelining.schedules import build_pipeline_schedule
+from nemo_automodel.components.distributed.pipelining.schedules import (
+    build_pipeline_schedule,
+    resolve_pipeline_schedule,
+)
 from nemo_automodel.components.distributed.pipelining.stage_runtime import (
-    _get_hidden_and_vocab_size,
-    _get_stage_metas,
+    build_pipeline_runtime,
     configure_pipeline_stage_backward,
     create_pipeline_stages,
-    warmup_pipeline_stage_neighbors,
 )
-from nemo_automodel.shared.pipeline import PipelineModelMixin
+from nemo_automodel.shared.pipeline import PP_MEDIA_INDEX_KEY, PipelineModelMixin, pp_media_chunk
 
 
 @pytest.mark.parametrize(
@@ -122,45 +122,41 @@ def test_calculate_virtual_stages_rejects_invalid_topology():
         calculate_virtual_stages(33, 4, 4, False, "nearest")
 
 
-class _SingleSchedule(PipelineScheduleSingle):
-    def __init__(self, stage, n_microbatches, loss_fn, scale_grads):
-        self.stage = stage
-        self.n_microbatches = n_microbatches
-        self.loss_fn = loss_fn
-        self.scale_grads = scale_grads
-
-    def _step_microbatches(self, arg_mbs=None, kwarg_mbs=None, target_mbs=None, losses=None):
-        del arg_mbs, kwarg_mbs, target_mbs, losses
-
-
-class _MultiSchedule(PipelineScheduleMulti):
-    def __init__(self, stages, n_microbatches, loss_fn, scale_grads):
-        self.stages = stages
-        self.n_microbatches = n_microbatches
-        self.loss_fn = loss_fn
-        self.scale_grads = scale_grads
-
-    def _step_microbatches(self, arg_mbs=None, kwarg_mbs=None, target_mbs=None, losses=None):
-        del arg_mbs, kwarg_mbs, target_mbs, losses
-
-
-@pytest.mark.parametrize(("schedule_cls", "stage_count"), [(_SingleSchedule, 1), (_MultiSchedule, 2)])
-def test_build_pipeline_schedule(schedule_cls, stage_count):
-    stages = [Mock() for _ in range(stage_count)]
+@pytest.mark.parametrize(
+    ("schedule_name", "schedule_type", "stage_count"),
+    [("1f1b", "Schedule1F1B", 1), ("interleaved1f1b", "ScheduleInterleaved1F1B", 2)],
+)
+def test_build_pipeline_schedule(schedule_name, schedule_type, stage_count):
+    """A schedule name resolves to the matching PyTorch schedule around the local stages."""
+    stages = [
+        Mock(stage_index=index, num_stages=stage_count, group_size=1, submod=Mock()) for index in range(stage_count)
+    ]
     loss_fn = Mock()
-    with patch(
-        "nemo_automodel.components.distributed.pipelining.schedules.get_schedule_class",
-        return_value=schedule_cls,
-    ):
-        schedule = build_pipeline_schedule(None, "test", 2, 8, stages, loss_fn, scale_grads=True)
 
-    assert schedule.n_microbatches == 4
-    assert schedule.loss_fn is loss_fn
+    schedule = build_pipeline_schedule(None, schedule_name, 2, 8, stages, loss_fn, scale_grads=True)
+
+    assert type(schedule).__name__ == schedule_type
+    assert schedule._n_microbatches == 4
+    assert schedule._loss_fn is loss_fn
     assert schedule.scale_grads is True
     if stage_count == 1:
-        assert schedule.stage is stages[0]
+        assert schedule._stage is stages[0]
     else:
-        assert schedule.stages is stages
+        assert schedule._stages is stages
+
+
+def test_resolve_pipeline_schedule_maps_names_to_stage_styles():
+    """Supported schedules resolve to the stage-assignment style they are split with."""
+    assert resolve_pipeline_schedule("1f1b")[1] == "loop"
+    assert resolve_pipeline_schedule("ZBVZeroBubble")[1] == "v"
+
+
+def test_resolve_pipeline_schedule_rejects_unmapped_and_unknown_names():
+    """Names PyTorch does not know, and ones this package cannot split, are rejected."""
+    with pytest.raises(ValueError, match="Unknown pipeline schedule"):
+        resolve_pipeline_schedule("not_a_schedule")
+    with pytest.raises(ValueError, match="must be a schedule name"):
+        resolve_pipeline_schedule(None)
 
 
 def test_build_pipeline_schedule_validates_batch_and_csv(tmp_path):
@@ -168,70 +164,6 @@ def test_build_pipeline_schedule_validates_batch_and_csv(tmp_path):
         build_pipeline_schedule(None, "1f1b", 3, 8, [Mock()], Mock())
     with pytest.raises(FileNotFoundError):
         build_pipeline_schedule(str(tmp_path / "missing.csv"), None, 2, 8, [Mock()], Mock())
-
-
-class _MetaModule(nn.Module):
-    def __init__(self, *, lm_head: bool = False, dtype: torch.dtype = torch.bfloat16):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(1, dtype=dtype))
-        self.lm_head = nn.Identity() if lm_head else None
-
-
-@pytest.mark.parametrize(
-    ("index", "lm_head", "input_shape", "output_shape"),
-    [
-        (0, False, (2, 16), (2, 16, 64)),
-        (1, False, (2, 16, 64), (2, 16, 64)),
-        (2, True, (2, 16, 64), (2, 16, 128)),
-    ],
-)
-def test_default_stage_metadata(index, lm_head, input_shape, output_shape):
-    part = PipelineModelPart(_MetaModule(lm_head=lm_head), index, 3)
-    config = types.SimpleNamespace(hidden_size=64, vocab_size=128)
-
-    inputs, outputs = _get_stage_metas(part, config, microbatch_size=2, seq_len=16)
-
-    assert inputs[0].shape == input_shape
-    assert outputs[0].shape == output_shape
-    assert inputs[0].device.type == outputs[0].device.type == "meta"
-
-
-def test_default_stage_metadata_uses_nested_config_dtype_and_hidden_output_flag():
-    module = _MetaModule(lm_head=True, dtype=torch.float16)
-    module._pp_return_hidden_states = True
-    part = PipelineModelPart(module, 1, 2)
-    config = types.SimpleNamespace(text_config=types.SimpleNamespace(hidden_size=32, vocab_size=96))
-
-    inputs, outputs = _get_stage_metas(part, config, microbatch_size=3, seq_len=7)
-
-    assert inputs[0].shape == outputs[0].shape == (3, 7, 32)
-    assert inputs[0].dtype == outputs[0].dtype == torch.float16
-
-
-def test_model_owned_stage_metadata_is_used():
-    class CustomModule(PipelineModelMixin, _MetaModule):
-        def __init__(self):
-            super().__init__(dtype=torch.float16)
-            self.calls = []
-
-        def pipeline_stage_metas(self, *, is_first, microbatch_size, seq_len, dtype):
-            self.calls.append((is_first, microbatch_size, seq_len, dtype))
-            hidden = torch.empty(microbatch_size, seq_len, 3, device="meta", dtype=dtype)
-            carry = torch.empty(microbatch_size, seq_len, 5, device="meta", dtype=torch.float32)
-            return (hidden, carry), (hidden, carry)
-
-    module = CustomModule()
-    part = PipelineModelPart(module, 1, 2)
-    inputs, outputs = _get_stage_metas(
-        part,
-        types.SimpleNamespace(),
-        microbatch_size=2,
-        seq_len=11,
-    )
-
-    assert module.calls == [(False, 2, 11, torch.float16)]
-    assert [tensor.shape for tensor in inputs] == [(2, 11, 3), (2, 11, 5)]
-    assert [tensor.dtype for tensor in outputs] == [torch.float16, torch.float32]
 
 
 class _FakeMesh:
@@ -250,105 +182,6 @@ class _FakeMesh:
         return self.group
 
 
-class _RecordingStage:
-    def __init__(
-        self,
-        submod,
-        stage_index,
-        num_stages,
-        device,
-        *,
-        group,
-        input_args=None,
-        output_args=None,
-    ):
-        self.submod = submod
-        self.stage_index = stage_index
-        self.num_stages = num_stages
-        self.device = device
-        self.group = group
-        self.inputs_meta = input_args
-        self.outputs_meta = output_args
-        self.is_first = stage_index == 0
-        self.is_last = stage_index == num_stages - 1
-
-
-def test_create_pipeline_stages_supplies_constructor_metadata():
-    parts = [PipelineModelPart(_MetaModule(), 0, 2), PipelineModelPart(_MetaModule(lm_head=True), 1, 2)]
-    mesh = _FakeMesh()
-    config = types.SimpleNamespace(hidden_size=64, vocab_size=128)
-    with patch("nemo_automodel.components.distributed.pipelining.stage_runtime.PipelineStage", _RecordingStage):
-        stages = create_pipeline_stages(
-            parts,
-            mesh,
-            "pp",
-            torch.device("cpu"),
-            model_config=config,
-            microbatch_size=2,
-            seq_len=16,
-        )
-
-    assert stages[0].submod is parts[0].module
-    assert stages[0].inputs_meta[0].shape == (2, 16)
-    assert stages[1].outputs_meta[0].shape == (2, 16, 128)
-    assert all(stage.group is mesh.group for stage in stages)
-
-
-def test_create_pipeline_stages_allows_dynamic_inference():
-    part = PipelineModelPart(_MetaModule(), 0, 1)
-    with patch("nemo_automodel.components.distributed.pipelining.stage_runtime.PipelineStage", _RecordingStage):
-        stage = create_pipeline_stages(
-            [part],
-            _FakeMesh(size=1),
-            "pp",
-            torch.device("cpu"),
-            model_config=types.SimpleNamespace(hidden_size=64, vocab_size=128),
-            microbatch_size=1,
-            seq_len=None,
-        )[0]
-
-    assert stage.inputs_meta is None
-    assert stage.outputs_meta is None
-
-
-def test_create_pipeline_stages_reports_unsupported_public_metadata_api():
-    class IncompatibleStage:
-        def __init__(self, submod, stage_index, num_stages, device, *, group):
-            del submod, stage_index, num_stages, device, group
-
-    with (
-        patch("nemo_automodel.components.distributed.pipelining.stage_runtime.PipelineStage", IncompatibleStage),
-        pytest.raises(RuntimeError, match="accepts input_args and output_args"),
-    ):
-        create_pipeline_stages(
-            [PipelineModelPart(_MetaModule(), 0, 1)],
-            _FakeMesh(size=1),
-            "pp",
-            torch.device("cpu"),
-            model_config=types.SimpleNamespace(hidden_size=64, vocab_size=128),
-            microbatch_size=1,
-            seq_len=8,
-        )
-
-
-def test_warmup_pipeline_stage_neighbors_uses_symmetric_edges():
-    stage = Mock(device=torch.device("cpu"), group_size=3)
-    stage.group.rank.return_value = 1
-    with (
-        patch("torch.distributed.get_process_group_ranks", return_value=[0, 1, 2]),
-        patch("torch.distributed.isend") as isend,
-        patch("torch.distributed.irecv") as irecv,
-        patch("torch.cuda.synchronize") as synchronize,
-        patch("torch.cuda.device_count", return_value=8),
-        patch("nemo_automodel.components.distributed.pipelining.stage_runtime.time.sleep"),
-    ):
-        warmup_pipeline_stage_neighbors(stage)
-
-    assert [call.kwargs["group_dst"] for call in isend.call_args_list] == [0, 2]
-    assert [call.kwargs["group_src"] for call in irecv.call_args_list] == [0, 2]
-    synchronize.assert_called_once_with(stage.device)
-
-
 def test_configure_pipeline_stage_backward_is_noop_by_default():
     stage = Mock()
     configure_pipeline_stage_backward(
@@ -357,32 +190,6 @@ def test_configure_pipeline_stage_backward_is_noop_by_default():
         reduce_grad_per_microbatch=False,
     )
     assert "backward_maybe_with_nosync" not in stage.__dict__
-
-
-@pytest.mark.parametrize(
-    ("config", "expected"),
-    [
-        (types.SimpleNamespace(hidden_size=64, vocab_size=128), (64, 128)),
-        (types.SimpleNamespace(text_config=types.SimpleNamespace(hidden_size=32, vocab_size=96)), (32, 96)),
-        (
-            types.SimpleNamespace(
-                hidden_size=64,
-                vocab_size=None,
-                text_config=types.SimpleNamespace(hidden_size=32, vocab_size=96),
-            ),
-            (64, 96),
-        ),
-    ],
-)
-def test_get_hidden_and_vocab_size(config, expected):
-    assert _get_hidden_and_vocab_size(config) == expected
-
-
-def test_get_hidden_and_vocab_size_reports_missing_fields():
-    with pytest.raises(ValueError, match="hidden_size"):
-        _get_hidden_and_vocab_size(types.SimpleNamespace())
-    with pytest.raises(ValueError, match="vocab_size"):
-        _get_hidden_and_vocab_size(types.SimpleNamespace(hidden_size=64))
 
 
 def test_split_model_parts_preserves_model_owned_stage_customization():
@@ -468,3 +275,211 @@ def test_stage_forward_preserves_tensor_outputs(output):
     else:
         assert torch.equal(result, output)
     assert str(__import__("inspect").signature(module.forward)) == original_signature
+
+
+# ---------------------------------------------------------------------------
+# Real single-rank pipeline runtime
+#
+# These tests construct a real ``torch.distributed.pipelining.PipelineStage`` and
+# drive a real schedule over a gloo group of size one, so they fail when stage
+# construction, runtime shape inference, or kwarg microbatching regresses.
+# ---------------------------------------------------------------------------
+
+requires_gloo = pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="requires torch.distributed with the gloo backend",
+)
+
+
+@pytest.fixture
+def single_rank_pp_mesh(tmp_path):
+    """Yield a one-rank pipeline mesh backed by a real gloo process group.
+
+    Yields:
+        The ``pp`` submesh of a one-dimensional CPU device mesh.
+    """
+    if torch.distributed.is_initialized():
+        pytest.skip("a process group is already initialized in this process")
+    from torch.distributed.device_mesh import init_device_mesh
+
+    torch.distributed.init_process_group(
+        "gloo",
+        rank=0,
+        world_size=1,
+        init_method=f"file://{tmp_path / 'pp_store'}",
+    )
+    try:
+        yield init_device_mesh("cpu", (1,), mesh_dim_names=("pp",))["pp"]
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class _TinyStageModule(nn.Module):
+    """Embedding plus projection standing in for one pipeline stage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(16, 8)
+        self.head = nn.Linear(8, 16)
+
+    def forward(self, input_ids: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        """Embed and project a microbatch of token ids.
+
+        Args:
+            input_ids: Token ids of shape [microbatch, sequence].
+            **kwargs: Ignored schedule keyword arguments.
+
+        Returns:
+            Logits of shape [microbatch, sequence, vocab].
+        """
+        del kwargs
+        return self.head(self.embed(input_ids))
+
+
+def _token_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Mean token cross-entropy.
+
+    Args:
+        logits: Tensor of shape [microbatch, sequence, vocab].
+        labels: Token ids of shape [microbatch, sequence].
+
+    Returns:
+        Scalar loss tensor.
+    """
+    return nn.functional.cross_entropy(logits.flatten(0, 1), labels.flatten(0, 1))
+
+
+@requires_gloo
+def test_create_pipeline_stages_defers_boundary_metadata_to_runtime(single_rank_pp_mesh):
+    """Stages are constructed without hand-written boundary metadata."""
+    parts = [PipelineModelPart(_TinyStageModule(), 0, 1)]
+
+    stages = create_pipeline_stages(parts, single_rank_pp_mesh, "pp", torch.device("cpu"))
+
+    assert len(stages) == 1
+    assert stages[0].submod is parts[0].module
+    assert stages[0].stage_index == 0
+    assert stages[0].num_stages == 1
+    # Metadata is measured by the first schedule step, not declared up front.
+    assert stages[0].inputs_meta is None
+
+
+@requires_gloo
+def test_pipeline_runtime_infers_stage_metadata_from_the_real_input(single_rank_pp_mesh):
+    """A real schedule step measures stage metadata and produces gradients."""
+    part = PipelineModelPart(_TinyStageModule(), 0, 1)
+    runtime = build_pipeline_runtime(
+        [part],
+        single_rank_pp_mesh,
+        "pp",
+        torch.device("cpu"),
+        microbatch_size=1,
+        local_batch_size=2,
+        schedule_name="1f1b",
+        schedule_csv=None,
+        loss_fn=_token_loss,
+        scale_grads=False,
+        patch_stage_backward_maybe_with_nosync=False,
+        reduce_grad_per_microbatch=False,
+    )
+    input_ids = torch.randint(0, 16, (2, 5))
+    labels = torch.randint(0, 16, (2, 5))
+    losses: list[torch.Tensor] = []
+
+    output = runtime.schedule.step(input_ids, target=labels, losses=losses)
+
+    assert output.shape == (2, 5, 16)
+    assert len(losses) == 2
+    # The measured metadata describes one microbatch of the real input.
+    assert runtime.stages[0].inputs_meta[0].shape == (1, 5)
+    assert runtime.stages[0].inputs_meta[0].dtype == torch.int64
+    assert part.module.head.weight.grad is not None
+
+
+class _MediaStageModule(nn.Module):
+    """Stage-0 module selecting its media chunk by microbatch index."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(16, 8)
+        self.head = nn.Linear(8, 16)
+        self.observed: list[tuple[int, float]] = []
+
+    def forward(self, input_ids: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        """Consume the staged media chunk for this microbatch.
+
+        Args:
+            input_ids: Token ids of shape [microbatch, sequence].
+            **kwargs: Schedule keyword arguments carrying ``pp_media_index``,
+                an int64 tensor of shape [microbatch].
+
+        Returns:
+            Logits of shape [microbatch, sequence, vocab].
+        """
+        media_index = kwargs.get(PP_MEDIA_INDEX_KEY)
+        pixel_values = pp_media_chunk(self, "pixel_values", media_index)
+        if pixel_values is not None:
+            self.observed.append((int(media_index.reshape(-1)[0]), float(pixel_values[0])))
+        return self.head(self.embed(input_ids))
+
+
+@requires_gloo
+def test_media_chunks_are_selected_by_index_not_by_a_cursor(single_rank_pp_mesh):
+    """Every forward reads the chunk its own microbatch index names.
+
+    A cursor advanced inside ``forward`` mis-assigns chunks as soon as the
+    schedule reorders microbatches or runs the shape-inference probe forward,
+    which executes microbatch 0 an extra time.
+    """
+    module = _MediaStageModule()
+    module._pp_media_chunks = {"pixel_values": [torch.tensor([10.0]), torch.tensor([20.0])]}
+    part = PipelineModelPart(module, 0, 1)
+    runtime = build_pipeline_runtime(
+        [part],
+        single_rank_pp_mesh,
+        "pp",
+        torch.device("cpu"),
+        microbatch_size=1,
+        local_batch_size=2,
+        schedule_name="1f1b",
+        schedule_csv=None,
+        loss_fn=_token_loss,
+        scale_grads=False,
+        patch_stage_backward_maybe_with_nosync=False,
+        reduce_grad_per_microbatch=False,
+    )
+    input_ids = torch.randint(0, 16, (2, 5))
+    labels = torch.randint(0, 16, (2, 5))
+
+    runtime.schedule.step(
+        input_ids,
+        target=labels,
+        losses=[],
+        **{PP_MEDIA_INDEX_KEY: torch.tensor([0, 1], dtype=torch.int64)},
+    )
+
+    assert module.observed, "the stage never received a media index"
+    expected = {0: 10.0, 1: 20.0}
+    for index, value in module.observed:
+        assert value == expected[index]
+    assert {index for index, _ in module.observed} == {0, 1}
+
+
+def test_pp_media_chunk_returns_none_without_staged_media():
+    """A module with no staged media yields None instead of raising."""
+    module = nn.Linear(2, 2)
+
+    assert pp_media_chunk(module, "pixel_values", torch.tensor([0])) is None
+
+    module._pp_media_chunks = {"pixel_values": [torch.zeros(1)]}
+    assert pp_media_chunk(module, "image_grid_hws", torch.tensor([0])) is None
+    assert pp_media_chunk(module, "pixel_values", None) is None
+
+
+def test_pp_media_chunk_rejects_an_index_the_staging_cannot_satisfy():
+    """A microbatch index beyond the staged chunks is a staging bug, not a silent reuse."""
+    module = nn.Linear(2, 2)
+    module._pp_media_chunks = {"pixel_values": [torch.zeros(1)]}
+
+    with pytest.raises(IndexError, match="out of range"):
+        pp_media_chunk(module, "pixel_values", torch.tensor([1]))

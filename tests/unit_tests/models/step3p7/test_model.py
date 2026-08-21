@@ -308,53 +308,103 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     assert sharder.local_token_global_indices is round_robin_local_indices
 
 
-def test_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
-    """Under CP the first stage input stays full-length token ids while every
-    stage output (and the propagated MTP hidden states) is the local shard;
-    cp_size==1 keeps the pre-CP symmetric shapes."""
+class _FakeCPMesh:
+    def __init__(self, size: int):
+        self._size = size
 
-    class _FakeCPMesh:
-        def __init__(self, size):
-            self._size = size
+    def size(self) -> int:
+        return self._size
 
-        def size(self):
-            return self._size
+
+def test_forward_cp_shards_stage_output_and_keeps_mtp_arity():
+    """Under CP the stage output (and every propagated MTP tensor) is the local shard.
+
+    The first stage embeds the FULL token ids and shards them inside forward, so
+    what crosses the pipeline boundary is ``[B, local_sequence, hidden]`` -- padded
+    to ``2 * cp`` then divided by ``cp`` -- while ``cp_size == 1`` stays symmetric.
+    """
+    hidden = 8
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])  # full sequence of 6 ids
 
     wrapper, _ = _wrapper_with_fake_inner()
-    hidden = wrapper.config.text_config.hidden_size
-    mtp_depth = int(getattr(wrapper.mtp_config, "num_layers", 0) or 0)
+    assert wrapper.cp_mesh is None
+    assert wrapper(input_ids=input_ids).shape == (1, 6, hidden)
 
-    # cp_size == 1: symmetric (regression against the pre-CP behavior).
-    ins, outs = wrapper.pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.float32)
-    assert ins[0].shape == (1, 6, hidden)
-    assert len(ins) == 1 + mtp_depth
-
-    # cp_size == 2: first-stage input full (6) ids, hidden states local (pad 6->8, //2 = 4).
+    # cp_size == 2: pad 6 -> 8, // 2 -> local sequence 4.
+    wrapper, _ = _wrapper_with_fake_inner()
     wrapper.cp_mesh = _FakeCPMesh(2)
-    ins, outs = wrapper.pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
-    assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long
-    assert outs[0].shape[1] == 4  # local sequence length on every output
-    assert all(o.shape[1] == 4 for o in outs)
+    assert wrapper(input_ids=input_ids).shape == (1, 4, hidden)
+
+    # A first PP stage with MTP emits (hidden, *mtp_embeds); all are local-length.
+    depth = 2
+    wrapper, _ = _wrapper_with_fake_inner()
+    wrapper.cp_mesh = _FakeCPMesh(2)
+    wrapper.lm_head = None  # not the last stage
+    wrapper.mtp_config = SimpleNamespace(enabled=True, num_layers=depth, loss_scaling_factor=0.1)
+    assert wrapper._is_pipeline_parallel_stage() is True
+
+    out = wrapper(input_ids=input_ids)
+
+    assert isinstance(out, tuple) and len(out) == 1 + depth
+    for tensor in out:
+        assert tensor.shape == (1, 4, hidden)
 
 
-def test_forward_consumes_pp_vlm_chunks_and_drops_mismatched_masks(monkeypatch):
+def test_forward_consumes_pp_media_chunks_and_drops_mismatched_masks(monkeypatch):
+    """Stage 0 pulls its media from ``_pp_media_chunks`` using ``pp_media_index``."""
     wrapper, fake_inner = _wrapper_with_fake_inner()
     monkeypatch.setenv("NEMO_STEP3P7_DEBUG_VISION", "1")
-    wrapper._vlm_chunk_idx = 0
-    wrapper._vlm_pixel_values_chunks = [torch.randn(1, 3, 8, 8)]
-    wrapper._vlm_patch_pixel_values_chunks = [torch.randn(2, 3, 8, 8)]
-    wrapper._vlm_num_patches_chunks = [torch.tensor([2])]
-    wrapper._vlm_patch_newline_mask_chunks = [torch.tensor([True, False])]
+    wanted_pixels = torch.randn(1, 3, 8, 8)
+    wrapper._pp_media_chunks = {
+        "pixel_values": [torch.zeros(1, 3, 8, 8), wanted_pixels],
+        "patch_pixel_values": [torch.zeros(2, 3, 8, 8), torch.randn(2, 3, 8, 8)],
+        "num_patches": [torch.tensor([0]), torch.tensor([2])],
+        "patch_newline_mask": [torch.tensor([False, False]), torch.tensor([True, False])],
+    }
 
     input_ids = torch.tensor([[31, 1, 2]])
-    logits = wrapper(input_ids=input_ids, inputs_embeds=torch.randn(1, 3, 8), attention_mask=torch.ones(1, 2))
+    logits = wrapper(
+        input_ids=input_ids,
+        inputs_embeds=torch.randn(1, 3, 8),
+        attention_mask=torch.ones(1, 2),
+        pp_media_index=torch.tensor([1], dtype=torch.int64),
+    )
 
     assert logits.shape == (1, 3, 8)
-    assert wrapper._vlm_chunk_idx == 1
-    assert fake_inner.last_kwargs["pixel_values"].shape == (1, 3, 8, 8)
+    assert fake_inner.last_kwargs["pixel_values"] is wanted_pixels
     assert fake_inner.last_kwargs["patch_pixel_values"].shape == (2, 3, 8, 8)
     assert torch.equal(fake_inner.last_kwargs["num_patches"], torch.tensor([2]))
+    assert torch.equal(fake_inner.last_kwargs["patch_newline_mask"], torch.tensor([True, False]))
+    # attention_mask that does not match the embedded sequence length is dropped.
     assert fake_inner.last_kwargs["attention_mask"] is None
+
+    # No cursor: repeating a microbatch (as the runtime shape probe does) and
+    # running microbatches out of order both resolve to their own chunk.
+    wrapper(
+        input_ids=input_ids,
+        inputs_embeds=torch.randn(1, 3, 8),
+        pp_media_index=torch.tensor([1], dtype=torch.int64),
+    )
+    assert fake_inner.last_kwargs["pixel_values"] is wanted_pixels
+    wrapper(
+        input_ids=input_ids,
+        inputs_embeds=torch.randn(1, 3, 8),
+        pp_media_index=torch.tensor([0], dtype=torch.int64),
+    )
+    assert torch.equal(fake_inner.last_kwargs["pixel_values"], torch.zeros(1, 3, 8, 8))
+
+
+def test_forward_media_index_out_of_range_raises():
+    """An index past the staged chunks means staging and schedule disagree."""
+    wrapper, _ = _wrapper_with_fake_inner()
+    wrapper._pp_media_chunks = {"pixel_values": [torch.randn(1, 3, 8, 8)]}
+
+    with pytest.raises(IndexError, match="out of range"):
+        wrapper(
+            input_ids=torch.tensor([[31, 1, 2]]),
+            inputs_embeds=torch.randn(1, 3, 8),
+            pp_media_index=torch.tensor([2], dtype=torch.int64),
+        )
 
 
 def test_forward_te_attention_drops_attention_mask_and_qkv_thd_squeezes(monkeypatch):

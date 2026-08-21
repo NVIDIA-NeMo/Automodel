@@ -16,7 +16,9 @@
 
 Regression cover for images x context-parallelism x pipeline-parallelism after the
 pre-embed sink. Media rides the existing per-microbatch side channel
-(prepare_vlm_media_for_pp -> stage_vlm_media_for_pp -> stage-0 chunk pull); the
+(prepare_vlm_media_for_pp -> stage_vlm_media_for_pp -> stage-0 chunk lookup keyed by
+the per-sample ``pp_media_index`` the batch carries, so the schedule's microbatch
+order and its shape-inference probe forward cannot desynchronize it); the
 in-forward embed + vision splice runs on the microbatch's full sequence with the
 CP ring dispatcher suspended around the (non-causal, unsharded) vision tower
 (cp_dispatcher_suspended), then shard_sequence_for_cp_round_robin shards the result. Two
@@ -175,7 +177,6 @@ def main():
             pp_batch_size=2,
             device=device,
             dtype=torch.bfloat16,
-            pp_seq_len=seqlen,
         ).build(model, loss_fn=loss_fn, parallelize_fn=cp_only)
         model_part0, has_last = pp.parts[0], pp.info.has_last_stage
     else:

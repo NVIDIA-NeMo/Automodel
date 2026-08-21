@@ -38,6 +38,8 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.config import DistributedSetup
+from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -77,7 +79,11 @@ class _ScheduleSpy:
 class _PipelineSpy:
     def __init__(self, *, has_first_stage: bool, schedule: _ScheduleSpy):
         self.pp_microbatch_size = 2
+        self.pp_batch_size = 2
         self.model_inputs = []
+        # The recipe reads last-stage ownership off the model part, because the
+        # PyTorch stages only exist after the first ``step()`` builds the runtime.
+        self.last_stage_part = torch.nn.Identity()
         self.info = SimpleNamespace(
             has_first_stage=has_first_stage,
             has_last_stage=True,
@@ -235,7 +241,12 @@ class _FakePPModel:
         self.parts = [stage0]
         self.pp_batch_size = 4
         self.pp_microbatch_size = 2
+        self.last_stage_part = None
+        self.configured_loss_fns = []
         self.info = SimpleNamespace(has_last_stage=False, stages=[], schedule=None)
+
+    def configure_loss_fn(self, loss_fn, *, emits_hidden_states: bool = False):
+        self.configured_loss_fns.append((loss_fn, emits_hidden_states))
 
 
 class _StageWithCPPreembedInForward:
@@ -268,7 +279,7 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(
         vlm_finetune,
         "create_distributed_setup_from_config",
-        lambda cfg, world_size: SimpleNamespace(
+        lambda cfg, world_size: DistributedSetup(
             mesh_context=SimpleNamespace(
                 pp_enabled=True,
                 device_mesh=None,
@@ -277,7 +288,9 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
                 pp_size=2,
             ),
             strategy_config=SimpleNamespace(),
-            pipeline_config=SimpleNamespace(),
+            # The recipe derives its runtime pipeline settings with
+            # ``dataclasses.replace``, so both of these must be real dataclasses.
+            pipeline_config=PipelineConfig(),
             moe_parallel_config=None,
             activation_checkpointing=False,
         ),
