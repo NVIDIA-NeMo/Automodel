@@ -253,6 +253,28 @@ def test_block_mask_routes_to_flex_not_sdpa():
     assert weights is None
 
 
+def test_large_head_dim_block_mask_uses_small_flex_kernel_options():
+    q, k, v = _qkv(1, 8, 4, 16, 512)
+    fake_flex = mock.Mock(return_value=(torch.zeros(1, 16, 8, 512), None))
+    with (
+        mock.patch.object(ffpa_mod, "_is_block_mask", return_value=True),
+        mock.patch.object(ffpa_mod, "_get_flex", return_value=fake_flex),
+    ):
+        ffpa_attention_forward(_module(512), q, k, v, attention_mask=object(), scaling=0.0442)
+
+    options = fake_flex.call_args.kwargs["kernel_options"]
+    assert options == {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "BLOCK_M1": 32,
+        "BLOCK_N1": 32,
+        "BLOCK_M2": 32,
+        "BLOCK_N2": 32,
+        "num_stages": 1,
+        "num_warps": 4,
+    }
+
+
 def test_block_mask_requires_flex_no_sdpa_fallback():
     q, k, v = _qkv(1, 8, 4, 16, 256)
     with (
