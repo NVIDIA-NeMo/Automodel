@@ -11,7 +11,17 @@ Pipeline parallelism addresses these challenges by splitting a model's layers ac
 
 AutoPipeline is NeMo AutoModel's high-level pipeline parallelism interface for Hugging Face-compatible models. Built on PyTorch's native `torch.distributed.pipelining`, it expects an HF-style model with a `config`, a supported decoder-layer layout, and pipeline-compatible forwards. Recipe-driven pipeline parallelism also requires the selected model implementation to advertise a `_pp_plan` (or use the supported MoE path) and pass the repository's pipeline validation; encoder-decoder models and models with actually tied input/output embedding weights are rejected.
 
-The functional module at `nemo_automodel.components.distributed.pipelining.functional` exposes the same HF-specific `pipeline_model()` splitter plus lower-level stage and schedule helpers. Custom PyTorch architectures can reuse helpers such as `stage_ids_this_rank()`, `calculate_virtual_stages()`, and `build_pipeline_schedule()` after their own code constructs valid `PipelineStage` objects; `pipeline_model()` is not a generic `nn.Module` splitter.
+`AutoPipeline` is the only entry point; there is no free-standing model splitter. The lower-level building blocks it composes live beside it in `nemo_automodel.components.distributed.pipelining`:
+
+| Module | Contents |
+| --- | --- |
+| `module_plan` | `stage_ids_this_rank()`, `generate_hf_model_fqn_per_model_part()`, `calculate_virtual_stages()` |
+| `model_parts` | `split_model_into_parts()`, `parallelize_model_parts()`, `PipelineModelPart`, `ParallelizeFnProtocol` |
+| `stage_runtime` | `create_pipeline_stages()`, `build_pipeline_runtime()` |
+| `schedules` | `build_pipeline_schedule()` |
+| `hf_utils` | `patch_hf_model_for_pp()`, `validate_hf_model_for_pipeline_support()` |
+
+Custom PyTorch architectures can reuse `stage_ids_this_rank()`, `calculate_virtual_stages()`, and `build_pipeline_schedule()` after their own model-owned code constructs valid `PipelineStage` objects. The splitting in `model_parts` retains Hugging Face-specific assumptions and is not a generic `nn.Module` splitter.
 
 This guide walks you through AutoPipeline for compatible Hugging Face models and the lower-level helpers for manually constructed stages. You'll learn how to configure pipeline stages, integrate with existing training workflows, optimize performance, and combine pipeline parallelism with other parallelization strategies.
 
@@ -42,7 +52,8 @@ AutoPipeline provides the following capabilities:
 - **PyTorch Native Integration**: Built on PyTorch's `torch.distributed.pipelining` for optimal performance
 - **Flexible Configuration**: Multiple scheduling strategies, configurable microbatch sizes, and automatic or manual layer splitting
 - **Mixed Parallelism Support**: Combine pipeline parallelism with data parallelism, tensor parallelism, and FSDP
-- **Modular Functional API**: Lower-level stage and schedule helpers can be reused with manually constructed `PipelineStage` objects
+- **Runtime Shape Inference**: Stage-boundary tensor metadata is measured from the first real batch, so no sequence length has to be declared up front
+- **Reusable Stage and Schedule Helpers**: Lower-level stage-id, virtual-stage, and schedule helpers can be reused with manually constructed `PipelineStage` objects
 - **Minimal Opinions**: Easy to extend and integrate with existing training workflows
 
 ## Quick Start with AutoPipeline (Hugging Face Models)
@@ -82,13 +93,21 @@ if __name__ == "__main__":
         pp_schedule="1f1b",
         pp_microbatch_size=1,
         pp_batch_size=8,  # Local batch size consumed by the pipeline schedule
-        device=torch.cuda.current_device(),
+        device=torch.device("cuda", torch.cuda.current_device()),
         dtype=torch.bfloat16,
     ).build(model, loss_fn=loss_fn)
 
-    # 4) Access pipeline components
-    print(ap.debug_summary())
-    print(ap.pretty_print_stages())
+    # 4) Inspect the pipeline topology
+    ap.log_debug_summary()
+
+    # 5) Run schedule steps, once the parts in ap.parts hold materialized weights
+    #    (the recipe path loads them from the checkpoint after the split).
+    #    The first step measures the stage boundary shapes from this batch, so
+    #    nothing about the sequence length is declared above.
+    input_ids = torch.randint(0, 128, (8, 512), device="cuda")
+    labels = input_ids.clone()
+    losses = [] if ap.info.has_last_stage else None
+    ap.step(input_ids, target=labels, losses=losses)
 ```
 
 ### Run the Quick Start Example
@@ -107,6 +126,63 @@ For a complete training example:
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp.yaml
 ```
 
+## Run the Pipeline
+
+`AutoPipeline` has a two-phase lifecycle.
+
+`build(model, loss_fn=..., parallelize_fn=...)` validates the model, splits it into the model parts this rank owns, and applies the `parallelize_fn` callback to each part. It does **not** create PyTorch `PipelineStage` objects or a schedule; `ap.info.schedule` and `ap.info.stages` are still `None` afterwards.
+
+`step(...)` creates the runtime on demand and then drives the schedule:
+
+```python
+losses = [] if ap.info.has_last_stage else None
+output = ap.step(
+    input_ids,                 # Whole-batch first-stage input, [batch, sequence]
+    target=labels,             # Whole-batch loss target consumed by the last stage
+    losses=losses,             # Receives one loss tensor per microbatch
+    forward_only=False,        # True runs schedule.eval (no backward)
+    attention_mask=mask,       # Extra model kwargs, split along the batch axis
+)
+```
+
+- Every pipeline rank must call `step()` with an identically shaped `model_input`; only the first stage consumes its values. `step()` itself drops the positional argument on ranks that do not own the first stage.
+- `losses` is filled with one entry per microbatch on the last-stage rank and left untouched elsewhere.
+- The return value is the merged last-stage output on the last-stage rank and `None` on every other rank.
+- Any extra keyword argument is forwarded to the model and split along the batch axis in lockstep with `model_input`.
+
+### Runtime Shape Inference
+
+Stage-boundary tensor metadata is never declared. On the first `step()`, `torch.distributed.pipelining.PipelineStage` runs each stage forward once under `torch.no_grad()` with zero-filled positional inputs and the real keyword arguments, then forwards the observed output metadata to the next stage. The measured metadata reflects the actual dtype, context-parallel sharding, and number of boundary tensors.
+
+There is no `pp_seq_len` setting. Earlier releases exposed one on `PipelineConfig` and `AutoPipeline`; it has been removed, and configs that still set `distributed.pipeline.pp_seq_len` should drop the key.
+
+<Warning>
+Because the probe forward runs for real, a stage-0 forward must be safe to execute with zero-filled positional inputs. Per-microbatch side-channel state must be addressed by an index carried in the batch rather than by a mutable cursor, since the probe forward consumes one extra call and schedules may execute microbatches out of order.
+</Warning>
+
+`PipelineStage` freezes the metadata it measured, so `AutoPipeline` discards the stages and the schedule and rebuilds them whenever any of the following changes:
+
+| Runtime key field | Source |
+| --- | --- |
+| `input_shape` | `model_input.shape[1:]` — the per-sample shape, so batch size alone does not force a rebuild |
+| `input_dtype` | `model_input.dtype` |
+| `forward_only` | The `forward_only` argument of `step()` |
+| `emits_hidden_states` | The last argument of `configure_loss_fn()` |
+
+A rebuild starts a group-wide metadata exchange, so `AutoPipeline` first all-gathers the key across the pipeline group and raises `RuntimeError` if the ranks disagree, rather than letting the mismatch hang.
+
+### Change the Loss
+
+The loss handed to `build()` can be replaced later:
+
+```python
+ap.configure_loss_fn(new_loss_fn, emits_hidden_states=False)
+```
+
+Both arguments are declarative and must be identical on every pipeline rank. `emits_hidden_states=True` sets `_pp_return_hidden_states` on the last-stage model part so it skips its vocabulary projection and emits hidden states for a fused loss such as `FusedLinearCrossEntropy`; the resulting rebuild happens uniformly on the next `step()`.
+
+A model that keeps its own forward instead of the Hugging Face patches must opt in to that contract by declaring `pipeline_supports_hidden_state_output = True` on its `PipelineModelMixin` subclass and honoring `_pp_return_hidden_states` in `forward()`.
+
 ## Configuration Options
 
 ### Basic Configuration
@@ -120,7 +196,11 @@ ap = AutoPipeline(
     pp_axis_name="pp",              # Name of pipeline axis (default: "pp")
 
     # Schedule configuration
-    pp_schedule="1f1b",             # Pipeline schedule ("1f1b", "LoopedBFS", etc.)
+    pp_schedule="1f1b",             # Schedule name, matched case-insensitively against
+                                    # PIPELINE_SCHEDULE_STAGE_STYLES in
+                                    # ...pipelining.schedules: 1F1B, GPipe,
+                                    # Interleaved1F1B, LoopedBFS,
+                                    # InterleavedZeroBubble, ZBVZeroBubble
     pp_microbatch_size=1,           # Microbatch size per stage
     pp_batch_size=8,                # Local schedule batch, split into microbatches
     # Recipe flows set this from step_scheduler.local_batch_size
@@ -149,8 +229,9 @@ These two flags switch AutoPipeline to lightweight, pipeline-friendly `forward()
   For compilation/performance, this patched forward prefers a precomputed `causal_mask_mapping` dict (it will fall back to computing masks and warn if you don't provide it).
 
 - **`patch_causal_lm_model`**: patches the *`...ForCausalLM` wrapper* forward (the module that owns `lm_head`) so pipeline stages return tensors:
-  - Returns **hidden states** when `lm_head` is absent on that stage.
-  - Returns **logits** when `lm_head` is present (typically only the last stage).
+  - Returns **hidden states** `[batch, sequence, hidden]` when `lm_head` is absent on that stage.
+  - Returns **hidden states** `[batch, sequence, hidden]` when `_pp_return_hidden_states` is set on the module, which is how `configure_loss_fn(..., emits_hidden_states=True)` defers the vocabulary projection to a fused loss.
+  - Returns **logits** `[batch, sequence, vocab]` when `lm_head` is present (typically only the last stage).
   - Supports `logits_to_keep` to compute logits for only the last `k` tokens.
   
   Note: this is only used when the module you pipeline is a `...ForCausalLM`-style wrapper (i.e., it has a `.model` attribute). If you pass a base decoder module directly, `patch_causal_lm_model` typically has no effect.
@@ -161,7 +242,7 @@ These two flags switch AutoPipeline to lightweight, pipeline-friendly `forward()
 - **Set both `False`** when your model already has a pipeline-friendly forward (returns tensors and can accept hidden states when embeddings are absent) or it needs custom kwargs/paths that the HF patch doesn't preserve (common for NeMo AutoModel-native model implementations, packed-sequence/`thd` paths, extra args like `padding_mask`, etc.). Many benchmark configs for NeMo-native models do this (for example `examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml`).
 - **Set `patch_inner_model=False, patch_causal_lm_model=True`** when your inner model is already stage-friendly, but the wrapper forward still returns a `ModelOutput` and you only want the wrapper simplified to “hidden states or logits”.
 
-If you disable `patch_causal_lm_model`, your last stage will typically output hidden states instead of logits; in that case, make sure your `loss_fn` (or your last-stage module) applies the LM head explicitly.
+If you disable `patch_causal_lm_model`, the model's own `forward()` runs unchanged on every stage, so that model is responsible for the whole stage contract: accepting hidden states when the embedding is absent, returning tensors the next stage can consume, and applying the LM head on the last stage. AutoPipeline only unwraps a returned `ModelOutput` down to its `logits` field so the stage boundary carries tensors.
 
 ### Automatic vs. Manual Layer Distribution
 
@@ -182,8 +263,8 @@ ap = AutoPipeline(
 Specify exactly which modules go to each stage:
 
 ```python
-from nemo_automodel.components.distributed.pipelining.functional import (
-    generate_hf_model_fqn_per_model_part
+from nemo_automodel.components.distributed.pipelining.module_plan import (
+    generate_hf_model_fqn_per_model_part,
 )
 
 # Generate balanced assignments
@@ -279,17 +360,17 @@ Key observations:
 - **Rotary embeddings** are shared across all stages (for position encoding)
 - **Transformer layers** are evenly distributed
 
-## Use Lower-Level Functional Helpers
+## Use Lower-Level Helpers
 
-AutoPipeline and the functional `pipeline_model()` convenience path both use Hugging Face-specific model splitting. For a custom architecture, construct the stage modules and PyTorch `PipelineStage` objects in model-owned code, then reuse the lower-level scheduling helpers. The examples below illustrate those lower-level pieces; they do not make `pipeline_model()` a generic model splitter.
+`AutoPipeline`'s splitting path is Hugging Face-specific. For a custom architecture, construct the stage modules and PyTorch `PipelineStage` objects in model-owned code, then reuse the lower-level scheduling helpers below.
 
-### Key Functional API Components
+### Key Helper Components
 
-The functional API provides several utilities for building custom pipeline parallel systems:
+These utilities are the pieces `AutoPipeline` itself composes:
 
 #### Stage ID Calculation
 ```python
-from nemo_automodel.components.distributed.pipelining.functional import stage_ids_this_rank
+from nemo_automodel.components.distributed.pipelining.module_plan import stage_ids_this_rank
 
 # Calculate which stages run on this rank
 # For a "loop" style schedule (default)
@@ -303,8 +384,8 @@ stage_ids = stage_ids_this_rank(pp_rank=0, pp_size=4, num_stages=8, style="v")
 
 #### Module Name Generation
 ```python
-from nemo_automodel.components.distributed.pipelining.functional import (
-    generate_hf_model_fqn_per_model_part
+from nemo_automodel.components.distributed.pipelining.module_plan import (
+    generate_hf_model_fqn_per_model_part,
 )
 
 # Generate balanced module assignments for an HF-style decoder layout
@@ -320,7 +401,7 @@ module_names = generate_hf_model_fqn_per_model_part(
 
 #### Virtual Stage Calculation
 ```python
-from nemo_automodel.components.distributed.pipelining.functional import calculate_virtual_stages
+from nemo_automodel.components.distributed.pipelining.module_plan import calculate_virtual_stages
 
 # Calculate virtual stages for interleaved schedules
 num_virtual_stages, stages_per_rank = calculate_virtual_stages(
@@ -334,7 +415,7 @@ num_virtual_stages, stages_per_rank = calculate_virtual_stages(
 
 #### Pipeline Schedule Build
 ```python
-from nemo_automodel.components.distributed.pipelining.functional import build_pipeline_schedule
+from nemo_automodel.components.distributed.pipelining.schedules import build_pipeline_schedule
 
 # Build a schedule for your stages
 schedule = build_pipeline_schedule(
@@ -360,11 +441,11 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.pipelining import PipelineStage
-from nemo_automodel.components.distributed.pipelining.functional import (
+from nemo_automodel.components.distributed.pipelining.module_plan import (
+    calculate_virtual_stages,
     stage_ids_this_rank,
-    build_pipeline_schedule,
-    calculate_virtual_stages
 )
+from nemo_automodel.components.distributed.pipelining.schedules import build_pipeline_schedule
 
 class CustomTransformerBlock(nn.Module):
     def __init__(self, hidden_size):
@@ -474,13 +555,11 @@ def main():
             print(f"Loss: {sum(losses) / len(losses)}")
 ```
 
-### Add a Parallelization Callback to HF-Compatible Splitting
+### Add a Parallelization Callback
 
-When using the HF-compatible `pipeline_model()` path, a callback can apply additional parallelism to each model part. Its signature must match `ParallelizeFnProtocol`:
+`AutoPipeline.build()` accepts a callback that applies additional parallelism to each local model part. Its signature must match `ParallelizeFnProtocol` in `nemo_automodel.components.distributed.pipelining.model_parts`:
 
 ```python
-from nemo_automodel.components.distributed.pipelining.functional import pipeline_model
-
 def custom_parallelize_fn(
     model, world_mesh, moe_mesh, *,
     dp_axis_names,
@@ -498,25 +577,25 @@ def custom_parallelize_fn(
     # Add any other parallelization strategies
     pass
 
-# Use pipeline_model only with an HF-compatible model.
-schedule, model_parts, has_first, has_last, stages = pipeline_model(
-    model=hf_compatible_model,
+# Use AutoPipeline only with an HF-compatible model.
+ap = AutoPipeline(
     world_mesh=world_mesh,
     moe_mesh=None,
     pp_axis_name="pp",
     dp_axis_names=("dp",),
     layers_per_stage=4,
-    pipeline_parallel_schedule="1f1b",
-    pipeline_parallel_schedule_csv=None,
-    microbatch_size=1,
-    local_batch_size=8,
-    device=torch.cuda.current_device(),
-    loss_fn=loss_fn,
-    parallelize_fn=custom_parallelize_fn,
+    pp_schedule="1f1b",
+    pp_schedule_csv=None,
+    pp_microbatch_size=1,
+    pp_batch_size=8,
+    device=torch.device("cuda", torch.cuda.current_device()),
     module_fqns_per_model_part=None,  # Or provide an explicit HF module assignment
     patch_inner_model=False,  # Use only when the model's inner forward is already stage-friendly
     patch_causal_lm_model=False,  # Use only when the wrapper already returns stage tensors
-)
+).build(hf_compatible_model, loss_fn=loss_fn, parallelize_fn=custom_parallelize_fn)
+
+# The schedule and stages are created lazily on the first ap.step(...) call, then
+# reachable as ap.info.schedule / ap.info.stages; the local parts are ap.parts.
 ```
 
 ### Tips for Manually Staged Custom Models
@@ -526,7 +605,7 @@ The lower-level helpers can support a custom model after its model-owned splitti
 1. **Module Naming**: Ensure your model has consistent module naming that can be mapped to stages
 2. **State Management**: Handle model state (embeddings, buffers) carefully across stages
 3. **Communication**: First and last stages need special handling for inputs/outputs
-4. **Splitting Ownership**: Keep custom model splitting in the model implementation; do not pass an arbitrary `nn.Module` to `pipeline_model()`
+4. **Splitting Ownership**: Keep custom model splitting in the model implementation; do not pass an arbitrary `nn.Module` to `AutoPipeline`
 5. **Testing**: Start with a small model and verify correct splitting before scaling up
 
 The schedule helpers are reusable, but the repository's automatic splitting path retains Hugging Face-specific assumptions.
@@ -579,36 +658,35 @@ print(f"Has last stage: {info.has_last_stage}")
 
 # Access model parts and runtime pipeline stages
 model_parts = ap.parts  # List of local model-part nn.Module objects
-pipeline_stages = info.stages  # List of local PipelineStage objects used by the schedule
-stage_modules = ap.list_stage_modules()  # Module names within each local model part
+pipeline_stages = info.stages  # Local PipelineStage objects, or None before the first step()
+last_stage_module = ap.last_stage_part  # None unless this rank owns the last global stage
 ```
+
+`info.enabled`, `info.stages`, and `info.schedule` describe the *runtime*, which is created on the first `ap.step(...)`. Before that first step they report `False`/`None` even though `build()` has already split and parallelized the model; `ap.parts` is populated by `build()` and is the right thing to inspect earlier.
 
 ### Analysis
 ```python
-# Parameter distribution
+# Parameter distribution across the local model parts
 stage_param_counts = ap.get_stage_param_counts()
-total_params = ap.get_total_param_count()
-trainable_params = ap.get_total_param_count(trainable_only=True)
+trainable_counts = ap.get_stage_param_counts(trainable_only=True)
+total_params = sum(stage_param_counts)
 
 for i, params in enumerate(stage_param_counts):
     percentage = (params / total_params) * 100
     print(f"Stage {i}: {params:,} parameters ({percentage:.1f}%)")
 
-# Debug summary
+# Debug summary: PP degree, local stage count, schedule type, microbatch count,
+# the current runtime key, and per-part parameter counts.
 print(ap.debug_summary())
-print(ap.pretty_print_stages(max_modules_per_stage=10))
-
-# Visualize schedule
-ap.visualize_current_schedule("pipeline_schedule.png")
+ap.log_debug_summary()  # Same text, emitted through the module logger at INFO
 ```
 
 ### Gradient Management
 ```python
-from nemo_automodel.components.distributed.pipelining.functional import scale_grads_by_divisor
 from nemo_automodel.components.training.utils import clip_grad_norm
 
-# Call these after backward on every pipeline rank.
-scale_grads_by_divisor(ap.info.stages, divisor=8)
+# Gradient scaling by the microbatch count is a schedule-level setting; pass
+# scale_grads_in_schedule=True to AutoPipeline instead of rescaling after backward.
 
 # Use the PP-aware clipping helper across the local model parts.
 grad_norm = clip_grad_norm(
@@ -646,7 +724,7 @@ uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
 Key parameters to override:
 - `--distributed.pp_size`: Number of pipeline ranks; PP, TP, CP, and inferred DP sizes must compose to the total worker count
 - `--step_scheduler.local_batch_size`: Runtime batch size used for both the pipeline schedule and dataloader
-- `--distributed.pipeline.pp_schedule`: Pipeline schedule (`1f1b`, `interleaved1f1b`, `LoopedBFS`, etc.)
+- `--distributed.pipeline.pp_schedule`: Pipeline schedule; matched case-insensitively against `PIPELINE_SCHEDULE_STAGE_STYLES` in `nemo_automodel.components.distributed.pipelining.schedules` (`1F1B`, `GPipe`, `Interleaved1F1B`, `LoopedBFS`, `InterleavedZeroBubble`, `ZBVZeroBubble`). PyTorch also registers `DualPipeV`, which this package rejects because its stage assignment is not implemented here.
 
 ### YAML Configuration Method
 
@@ -813,13 +891,23 @@ uv run automodel config.yaml --nproc-per-node 2
 - Adjust `layers_per_stage` parameter
 - Check parameter counts with `get_stage_param_counts()`
 
+**`Pipeline ranks disagree about the stage boundary metadata to build`:**
+- Every pipeline rank must call `step()` with the same input shape, dtype, and `forward_only` value. A rank-dependent sequence length (for example a per-rank dynamic-padding bucket) triggers this check.
+- `configure_loss_fn()` must be called on *every* pipeline rank with the same `emits_hidden_states` value, not only on the last-stage rank.
+
+**Loss is computed on logits when a fused loss was requested:**
+- Fused losses need the last stage to skip its LM head. That only happens when `configure_loss_fn(..., emits_hidden_states=True)` was called and the last-stage model honors `_pp_return_hidden_states`.
+- A model that keeps its own forward (`PipelineForwardStyle.MODEL`) must declare `pipeline_supports_hidden_state_output = True` and implement that branch; otherwise select a non-fused loss.
+
 ## Conclusion
 
-AutoPipeline and `pipeline_model()` provide the repository's HF-compatible splitting path, while lower-level functional helpers can be reused after custom code constructs its own pipeline stages.
+`AutoPipeline` is the repository's HF-compatible splitting path, while the lower-level `module_plan` and `schedules` helpers can be reused after custom code constructs its own pipeline stages.
 
 Key takeaways:
 - Pipeline parallelism enables training of models too large for a single GPU
 - AutoPipeline provides a simple API for Hugging Face-compatible models with powerful customization options
-- Lower-level functional helpers can schedule manually constructed stages for custom models
+- `build()` splits and parallelizes; `step()` builds the runtime on demand and drives the schedule
+- Stage boundary shapes are inferred from the first batch, and re-inferred whenever the input shape, dtype, train-vs-eval mode, or fused-loss output contract changes
+- Lower-level stage-id and schedule helpers can schedule manually constructed stages for custom models
 - Both can be combined with other parallelization strategies for optimal performance
 - Use built-in monitoring tools to understand and optimize your pipeline

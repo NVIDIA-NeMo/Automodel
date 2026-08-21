@@ -42,7 +42,6 @@ distributed:
     patch_inner_model: false
     patch_causal_lm_model: false
     layers_per_stage: 2
-    pp_seq_len: 32768
 
   moe:
     reshard_after_forward: true

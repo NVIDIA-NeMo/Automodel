@@ -92,7 +92,11 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
-from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
+from nemo_automodel.recipes._dist_utils import (
+    create_distributed_setup_from_config,
+    last_pipeline_stage_global_rank,
+    shard_optimizers_for_megatron_fsdp,
+)
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -158,7 +162,7 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
     if (
         pp_enabled
         and isinstance(loss_fn, FusedLinearCrossEntropy)
-        and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
+        and not getattr(probe_module, "pipeline_supports_hidden_state_output", False)
     ):
         logger.warning(
             "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
@@ -408,6 +412,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # (e.g. unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
 
+    #: Global rank owning the last pipeline stage, resolved once on first use.
+    _pp_last_stage_src_rank: int | None = None
+
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
 
@@ -503,9 +510,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pp_batch_size = self.cfg.get("step_scheduler.local_batch_size", 1)
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
-            )
+            if pp_batch_size // pp_microbatch_size < self.mesh_context.pp_size:
+                raise ValueError(
+                    f"step_scheduler.local_batch_size ({pp_batch_size}) // "
+                    f"distributed.pipeline.pp_microbatch_size ({pp_microbatch_size}) must be >= "
+                    f"distributed.pp_size ({self.mesh_context.pp_size}); the schedule needs at least "
+                    "one microbatch per pipeline stage."
+                )
 
             # THD override logic
             if (
@@ -520,25 +531,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"Overriding pp_batch_size: {pp_batch_size}, pp_microbatch_size: {pp_microbatch_size} for THD"
                 )
 
-            assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
-                "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
-            )
+            if isinstance(self.distributed_config, MegatronFSDPConfig):
+                raise ValueError(
+                    "distributed.strategy='megatron_fsdp' is not supported when pipeline parallelism "
+                    f"is enabled (distributed.pp_size={self.mesh_context.pp_size})."
+                )
 
-            # Update pipeline_config runtime fields
-            self.pipeline_config.pp_batch_size = pp_batch_size
-            self.pipeline_config.pp_microbatch_size = pp_microbatch_size
-            self.pipeline_config.patch_stage_backward_maybe_with_nosync = self.cfg.get(
-                "model.backend.enable_fsdp_optimizations", False
+            # Derive the runtime pipeline settings instead of mutating the parsed
+            # config, so the declarative config stays reusable and build order
+            # cannot change what a later build sees.
+            self.pipeline_config = replace(
+                self.pipeline_config,
+                pp_batch_size=pp_batch_size,
+                pp_microbatch_size=pp_microbatch_size,
+                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
+                loss_fn=self.loss_fn,
             )
-            self.pipeline_config.loss_fn = self.loss_fn
-
-            # Infer pp_seq_len from dataset config if not explicitly set
-            if hasattr(self.pipeline_config, "pp_seq_len") and self.pipeline_config.pp_seq_len is None:
-                packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
-                if packed_seq_size > 0:
-                    self.pipeline_config.pp_seq_len = packed_seq_size
-                elif self.cfg.get("dataset.seq_len", None) is not None:
-                    self.pipeline_config.pp_seq_len = self.cfg.dataset.seq_len
+            self.distributed_setup = replace(self.distributed_setup, pipeline_config=self.pipeline_config)
 
         # Build components
         self.peft_config = None
@@ -813,13 +822,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
 
     def _configure_pipeline_loss_fn(self):
-        if self.pp is None or not self.pp.info.has_last_stage:
+        """Install the pipeline loss on every pipeline rank.
+
+        ``emits_hidden_states`` is part of the pipeline runtime identity, so it
+        must be declared identically on all pipeline ranks even though only the
+        last stage ever calls the loss. Ranks without the last stage build the
+        loss against their own final part; it is never invoked there.
+        """
+        if self.pp is None:
             return
 
         last_stage_model = self.pp.last_stage_part
         if last_stage_model is None:
-            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
-
+            last_stage_model = self.model_parts[-1]
         self.pp.configure_loss_fn(
             self.cfg.mtp.build(self.loss_fn, last_stage_model),
             emits_hidden_states=isinstance(self.loss_fn, FusedLinearCrossEntropy),
@@ -961,13 +976,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
+            # ``last_stage_part`` is the local module owning the last global
+            # stage, recorded from the model parts by ``build()``. It is valid
+            # before the first ``pp.step()`` creates the PyTorch stages.
+            has_last_stage = self.pp.last_stage_part is not None
             with train_ctx(), fp8_ctx:
-                losses = [] if self.pp.info.has_last_stage else None
-                if self.pp.info.has_last_stage:
-                    masked_labels = labels.clone()
-                    targets = masked_labels
-                else:
-                    targets = None
+                losses = [] if has_last_stage else None
+                targets = labels.clone() if has_last_stage else None
 
                 input_ids = batch.pop("input_ids")
 
@@ -982,7 +997,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cu_seqlens = batch_filtered.get("cu_seqlens")
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
                     cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
-                pp_loss_fn = self.pp.loss_fn if self.pp.info.has_last_stage else None
+                pp_loss_fn = self.pp.loss_fn if has_last_stage else None
                 if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
                     pp_loss_fn.cu_seqlens = cu_seqlens
                 self.pp.step(
@@ -993,7 +1008,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     **batch_filtered,
                 )
 
-            if self.pp.info.has_last_stage:
+            if has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
             else:
                 local_loss = torch.tensor(0.0, device=self.dist_env.device)
@@ -1062,10 +1077,25 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
+        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group.
+
+        Args:
+            tensor: Scalar tensor holding the last stage's value on the owning
+                rank and acting as the receive buffer elsewhere.
+
+        Returns:
+            The same tensor, filled with the last stage's value on every rank.
+        """
         pp_group = self.device_mesh["pp"].get_group()
-        pp_src_rank = torch.distributed.get_global_rank(pp_group, torch.distributed.get_world_size(pp_group) - 1)
-        torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
+        if self._pp_last_stage_src_rank is None:
+            # The last stage is not always on the highest pipeline rank (V-shaped
+            # schedules put it back on rank 0), so ask the ranks who owns it.
+            self._pp_last_stage_src_rank = last_pipeline_stage_global_rank(
+                pp_group,
+                owns_last_stage=self.pp is not None and self.pp.last_stage_part is not None,
+                device=self.dist_env.device,
+            )
+        torch.distributed.broadcast(tensor, src=self._pp_last_stage_src_rank, group=pp_group)
         return tensor
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):

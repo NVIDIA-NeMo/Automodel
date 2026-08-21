@@ -319,24 +319,18 @@ class NewVLMForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         self.model.language_model.lm_head = new_embeddings
 
     def forward(self, input_ids=None, *, position_ids=None, attention_mask=None,
-                pixel_values=None, image_sizes=None, inputs_embeds=None, **kwargs):
-        # PP VLM support: retrieve pixel_values from stored chunks
-        if (
-            pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
-            and self._vlm_pixel_values_chunks is not None
-        ):
+                pixel_values=None, image_sizes=None, inputs_embeds=None,
+                pp_media_index=None, **kwargs):
+        # PP VLM support: pick this microbatch's staged media chunk.
+        if pixel_values is None:
             has_media_tokens = (
                 input_ids is not None
                 and self.image_token_index is not None
                 and (input_ids == self.image_token_index).any()
             )
             if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(self._vlm_pixel_values_chunks):
-                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                    # Also handle image_grid_hws if needed
-                    self._vlm_chunk_idx = chunk_idx + 1
+                pixel_values = pp_media_chunk(self, "pixel_values", pp_media_index)
+                # image_grid_hws is staged under the same index when the model needs it.
 
         outputs = self.model(
             input_ids=input_ids,
@@ -428,26 +422,40 @@ inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
 ## Pipeline Parallelism Support for VLMs
 
-VLMs need special handling for PP because vision inputs are only relevant at the first stage. The pattern uses `_vlm_pixel_values_chunks` and `_vlm_chunk_idx` to pass pixel values across micro-batches:
+VLMs need special handling for PP because vision inputs are only relevant at the
+first stage, and because media tensors are indexed by media entry (image, video,
+patch) rather than by sample, so the schedule cannot split them along the batch
+axis.
+
+The VLM collate wrapper therefore removes media from the batch, pre-chunks it per
+microbatch, and adds `pp_media_index`: an int64 tensor of shape `[batch]` whose
+entry for each sample is that sample's microbatch index. The schedule splits it
+along the batch axis in lockstep with `input_ids`, so every forward receives a
+`[microbatch]` slice naming its own chunk. The recipe stages the chunks on the
+stage-0 module as a single `_pp_media_chunks` mapping of media name to one tensor
+per microbatch.
+
+There is no cursor. `PipelineStage` runs one extra no-grad probe forward per stage
+for runtime shape inference, and interleaved schedules execute microbatches out of
+order, so a cursor would hand a forward the wrong image.
 
 ```python
-# In forward():
-if (
-    pixel_values is None
-    and hasattr(self, "_vlm_pixel_values_chunks")
-    and self._vlm_pixel_values_chunks is not None
-):
+from nemo_automodel.shared.pipeline import pp_media_chunk
+
+# In forward(), which must accept ``pp_media_index`` as a keyword argument:
+if pixel_values is None:
     has_media_tokens = (
         input_ids is not None
         and self.image_token_index is not None
         and (input_ids == self.image_token_index).any()
     )
     if has_media_tokens:
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        if chunk_idx < len(self._vlm_pixel_values_chunks):
-            pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-            self._vlm_chunk_idx = chunk_idx + 1
+        pixel_values = pp_media_chunk(self, "pixel_values", pp_media_index)
+        image_grid_hws = pp_media_chunk(self, "image_grid_hws", pp_media_index)
 ```
+
+`pp_media_chunk` returns `None` when this microbatch carries no media for that
+key, so the media path stays skipped instead of invoking an encoder on zero inputs.
 
 ---
 

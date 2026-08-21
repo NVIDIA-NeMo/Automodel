@@ -387,13 +387,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
 
             if self.pp_enabled:
-                reporting_loss = reporting_loss.to(self.dist_env.device)
-                # Send loss to first rank if pp group rank is 0
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-                if self.dist_env.rank == src_rank:
-                    torch.distributed.send(reporting_loss, dst=0)
-                elif self.dist_env.is_main:
-                    torch.distributed.recv(reporting_loss, src=src_rank)
+                # Only the rank owning the last pipeline stage computes a loss, and
+                # that is not necessarily the highest global rank (V-shaped schedules
+                # put the last stage back on pipeline rank 0).
+                reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss.to(self.dist_env.device))
 
             reporting_loss = reporting_loss.cpu().item()
 

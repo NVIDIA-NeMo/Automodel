@@ -19,10 +19,17 @@ and the typed :class:`DistributedSetup` used by the component layer.
 All dict handling lives here; the component layer stays typed. This module does
 not initialize ``torch.distributed``. Recipes call ``initialize_distributed``
 first, then pass the resulting world size here.
+
+It also hosts the small distributed helpers shared by several recipes, such as
+locating the rank that owns the last pipeline stage.
 """
 
 import logging
+from dataclasses import replace
 from typing import Any, Dict, Optional
+
+import torch
+import torch.distributed as dist
 
 from nemo_automodel.components.distributed.config import (
     DistributedSetup,
@@ -205,11 +212,12 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
         pipeline_config = None
 
     # Default the pipeline communication dtype to the FSDP mixed-precision activation
-    # dtype (the dtype of tensors crossing pipeline stage boundaries) so PP stage
-    # shape inference matches the real activation dtype (e.g. bf16 compute under fp32
-    # master weights). Deriving it from mp_policy.output_dtype is silent and correct;
-    # an explicit mismatch is honored but warned, since it can corrupt inter-stage
-    # recv buffers.
+    # dtype (the dtype of tensors crossing pipeline stage boundaries) so the pipeline
+    # computes in the real activation dtype (e.g. bf16 compute under fp32 master
+    # weights). Deriving it from mp_policy.output_dtype is silent and correct; an
+    # explicit mismatch is honored but warned, since it can corrupt inter-stage
+    # recv buffers. The derived value produces a *new* config: the parsed config
+    # stays declarative so repeated builds are not order-dependent.
     if pipeline_config is not None and pp_size > 1:
         mp_policy = getattr(strategy_config, "mp_policy", None)
         activation_dtype = None
@@ -217,7 +225,7 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
             activation_dtype = getattr(mp_policy, "output_dtype", None) or getattr(mp_policy, "param_dtype", None)
         if activation_dtype is not None:
             if pipeline_config.dtype is None:
-                pipeline_config.dtype = activation_dtype
+                pipeline_config = replace(pipeline_config, dtype=activation_dtype)
             elif pipeline_config.dtype != activation_dtype:
                 logger.warning(
                     "pipeline.dtype=%s does not match the FSDP activation dtype "
@@ -376,6 +384,38 @@ def create_distributed_setup_from_config(
         timeout_minutes=mesh_timeout_minutes,
         ranks=ranks,
     )
+
+
+def last_pipeline_stage_global_rank(pp_group: Any, *, owns_last_stage: bool, device: torch.device) -> int:
+    """Return the global rank of the pipeline rank that owns the last pipeline stage.
+
+    The highest pipeline rank is not always the owner: ``ScheduleZBVZeroBubble``
+    lays virtual stages out V-shaped, so the last global stage lives back on
+    pipeline rank 0. Ranks therefore agree on the owner by max-reducing their own
+    pipeline rank (``-1`` when they do not own the last stage) instead of
+    assuming the highest rank.
+
+    Args:
+        pp_group: Process group spanning the pipeline axis.
+        owns_last_stage: Whether the calling rank owns the last global stage.
+        device: Device holding the one-element reduction tensor.
+
+    Returns:
+        Global rank of the pipeline rank owning the last stage.
+
+    Raises:
+        RuntimeError: If no rank in ``pp_group`` reports owning the last stage.
+    """
+    candidate = torch.tensor(
+        [dist.get_rank(pp_group) if owns_last_stage else -1],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(candidate, op=dist.ReduceOp.MAX, group=pp_group)
+    owner_pp_rank = int(candidate.item())
+    if owner_pp_rank < 0:
+        raise RuntimeError("No rank in the pipeline group reported ownership of the last pipeline stage.")
+    return dist.get_global_rank(pp_group, owner_pp_rank)
 
 
 def shard_optimizers_for_megatron_fsdp(model, optimizers, distributed_config, *, allow=True):

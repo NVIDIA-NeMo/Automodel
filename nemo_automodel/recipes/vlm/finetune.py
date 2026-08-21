@@ -29,6 +29,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional
 
 import mlflow
@@ -77,7 +78,11 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
-from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
+from nemo_automodel.recipes._dist_utils import (
+    create_distributed_setup_from_config,
+    last_pipeline_stage_global_rank,
+    shard_optimizers_for_megatron_fsdp,
+)
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -390,6 +395,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
     # unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
 
+    #: Global rank owning the last pipeline stage, resolved once on first use.
+    _pp_last_stage_src_rank: int | None = None
+
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
 
@@ -470,21 +478,31 @@ class FinetuneRecipeForVLM(BaseRecipe):
             pp_batch_size = self.cfg.get("step_scheduler.local_batch_size", 1)
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
-            )
+            if pp_batch_size // pp_microbatch_size < self.mesh_context.pp_size:
+                raise ValueError(
+                    f"step_scheduler.local_batch_size ({pp_batch_size}) // "
+                    f"distributed.pipeline.pp_microbatch_size ({pp_microbatch_size}) must be >= "
+                    f"distributed.pp_size ({self.mesh_context.pp_size}); the schedule needs at least "
+                    "one microbatch per pipeline stage."
+                )
 
-            assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
-                "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
-            )
+            if isinstance(self.distributed_config, MegatronFSDPConfig):
+                raise ValueError(
+                    "distributed.strategy='megatron_fsdp' is not supported when pipeline parallelism "
+                    f"is enabled (distributed.pp_size={self.mesh_context.pp_size})."
+                )
 
-            # Update pipeline_config runtime fields
-            self.pipeline_config.pp_batch_size = pp_batch_size
-            self.pipeline_config.pp_microbatch_size = pp_microbatch_size
-            self.pipeline_config.patch_stage_backward_maybe_with_nosync = self.cfg.get(
-                "model.backend.enable_fsdp_optimizations", False
+            # Derive the runtime pipeline settings instead of mutating the parsed
+            # config, so the declarative config stays reusable and build order
+            # cannot change what a later build sees.
+            self.pipeline_config = replace(
+                self.pipeline_config,
+                pp_batch_size=pp_batch_size,
+                pp_microbatch_size=pp_microbatch_size,
+                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
+                loss_fn=self.loss_fn,
             )
-            self.pipeline_config.loss_fn = self.loss_fn
+            self.distributed_setup = replace(self.distributed_setup, pipeline_config=self.pipeline_config)
 
         # Build components with VLM-specific functions
         self.peft_config = None
@@ -607,6 +625,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                     dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
+                    # Validation runs through the same pipeline schedule, so its
+                    # media must be pre-chunked per microbatch exactly like training.
+                    pp_n_microbatches=pp_n_microbatches,
                 )
             self.val_dataloader = validation_build.dataloader
 
@@ -669,12 +690,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                     val_loss = {}
                     if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                        if self.pp_enabled:
-                            logger.warning("Validation is not supported for pipeline parallelism")
-                        else:
-                            val_log_data = self._run_validation_epoch(self.val_dataloader)
-                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_log_data)
+                        val_log_data = self._run_validation_epoch(self.val_dataloader)
+                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                        self.log_val_metrics(val_log_data)
                         for mp in self.model_parts:
                             mp.train()
 
@@ -767,11 +785,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # a plain method call (prepare_model_inputs_for_cp): sharder-only, it
         # touches no weights and consumes nothing. Invoke it on EVERY pp stage so
         # its aux-only sharder keeps input_ids full-length everywhere; otherwise
-        # non-first stages hit the generic round-robin sharder, feed an
-        # already-local sequence length to the pipeline runtime, whose analytical
-        # stage metadata would divide by CP a second time and truncate to S/cp²
-        # (text-decoder RoPE size mismatch).
-        _is_first_or_no_pp = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
+        # non-first stages hit the generic round-robin sharder and would shard an
+        # already-local sequence a second time, truncating it to S/cp² (text-decoder
+        # RoPE size mismatch).
+        # Global stage 0 always lives on pipeline rank 0 (both the looped and the
+        # V-shaped stage layouts start there), which is what this branch needs
+        # before any pipeline state exists. ``self.pp`` is not consulted here
+        # because this runs while the recipe is still assembling inputs.
+        _is_first_or_no_pp = not self.pp_enabled or self._get_pp_rank() == 0
         _cp_active = (
             self.device_mesh is not None
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
@@ -804,25 +825,30 @@ class FinetuneRecipeForVLM(BaseRecipe):
         labels = batch.pop("labels")
 
         if self.pp_enabled:
-            if not is_train:
-                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
-                return
-
+            # ``last_stage_part`` is the local module owning the last global
+            # stage, recorded from the model parts by ``build()``. It is valid
+            # before the first ``pp.step()`` creates the PyTorch stages.
+            has_last_stage = self.pp.last_stage_part is not None
             with train_ctx():
-                losses = [] if self.pp.info.has_last_stage else None
-                if self.pp.info.has_last_stage:
-                    masked_labels = labels.clone()
-                    targets = masked_labels
-                else:
-                    targets = None
+                losses = [] if has_last_stage else None
+                targets = labels.clone() if has_last_stage else None
 
                 model_input_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
                 model_input = batch.pop(model_input_key)
 
+                # ``batch`` still carries the per-sample media index the model
+                # forwards use to pick their microbatch's media chunk; it must ride
+                # along as a schedule kwarg and must not be filtered out here.
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
-                    self.pp.step(model_input, target=targets, losses=losses, **batch)
+                    self.pp.step(
+                        model_input,
+                        target=targets,
+                        losses=losses,
+                        forward_only=not is_train,
+                        **batch,
+                    )
 
-            if self.pp.info.has_last_stage:
+            if has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
             else:
                 local_loss = torch.tensor(0.0, device=self.dist_env.device)
@@ -902,14 +928,42 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
+    def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group.
+
+        Args:
+            tensor: Scalar tensor holding the last stage's value on the owning
+                rank and acting as the receive buffer elsewhere.
+
+        Returns:
+            The same tensor, filled with the last stage's value on every rank.
+        """
+        pp_group = self.device_mesh["pp"].get_group()
+        if self._pp_last_stage_src_rank is None:
+            # The last stage is not always on the highest pipeline rank (V-shaped
+            # schedules put it back on rank 0), so ask the ranks who owns it.
+            self._pp_last_stage_src_rank = last_pipeline_stage_global_rank(
+                pp_group,
+                owns_last_stage=self.pp is not None and self.pp.last_stage_part is not None,
+                device=self.dist_env.device,
+            )
+        torch.distributed.broadcast(tensor, src=self._pp_last_stage_src_rank, group=pp_group)
+        return tensor
+
     def _configure_pipeline_loss_fn(self):
-        if self.pp is None or not self.pp.info.has_last_stage:
+        """Install the pipeline loss on every pipeline rank.
+
+        The loss contract is part of the pipeline runtime identity, so it must be
+        declared identically on all pipeline ranks even though only the last stage
+        ever calls the loss. Ranks without the last stage build the loss against
+        their own final part; it is never invoked there.
+        """
+        if self.pp is None:
             return
 
         last_stage_model = self.pp.last_stage_part
         if last_stage_model is None:
-            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
-
+            last_stage_model = self.model_parts[-1]
         self.pp.configure_loss_fn(self.cfg.mtp.build(self.loss_fn, last_stage_model))
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
@@ -1023,25 +1077,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             # PP uses sum reduction per microbatch (no internal normalization).
             # Divide by num_label_tokens to get the mean loss, same as non-PP.
             reporting_loss = reporting_loss / num_label_tokens if num_label_tokens > 0 else reporting_loss * 0.0
-            reporting_loss = reporting_loss.float().to(self.dist_env.device)
-            # Send loss to first rank from the last PP stage of rank0's mesh coords.
-            # This avoids picking a global-rank sender from a different EP/PP group.
-            if self.device_mesh is not None and "pp" in self.device_mesh.mesh_dim_names:
-                dim_names = list(self.device_mesh.mesh_dim_names)
-                mesh = self.device_mesh.mesh
-                idx = []
-                for name in dim_names:
-                    if name == "pp":
-                        idx.append(-1)
-                    else:
-                        idx.append(0)
-                src_rank = mesh[tuple(idx)].item()
-            else:
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(reporting_loss, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(reporting_loss, src=src_rank)
+            # Only the rank owning the last pipeline stage computed a loss, and that
+            # is not necessarily the highest pipeline rank (V-shaped schedules put
+            # the last stage back on rank 0).
+            reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss.float().to(self.dist_env.device))
 
         reporting_loss = reporting_loss.item()
         # fix reporting_loss, tps across ranks
@@ -1078,11 +1117,38 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
 
+                if self.pp_enabled:
+                    if batch["labels"].shape[0] != self.pp.pp_batch_size:
+                        logger.warning(
+                            "Skipping a validation batch of %d samples: the pipeline schedule splits "
+                            "%d samples per step and its media chunks are pre-split to match. Set "
+                            "drop_last on the validation dataloader to avoid a short trailing batch.",
+                            batch["labels"].shape[0],
+                            self.pp.pp_batch_size,
+                        )
+                        continue
+                    # Run the schedule forward-only. The pipeline loss sums over
+                    # microbatches without normalizing, so accumulate it directly
+                    # and divide by the token count once at the end.
+                    pp_losses: list[torch.Tensor] = []
+                    self._forward_backward_step(
+                        0,
+                        batch,
+                        loss_buffer=pp_losses,
+                        num_label_tokens=None,
+                        num_batches=1,
+                        is_train=False,
+                    )
+                    total_loss += float(torch.sum(torch.stack(pp_losses)).item())
+                    total_tokens += num_label_tokens
+                    total_num_label_tokens += num_label_tokens
+                    continue
+
                 cp_sharder = ContextParallelSharder(
                     self.model_parts[0],
                     self.device_mesh,
                     batch,
-                    invoke_pre_embed=not self.pp_enabled,
+                    invoke_pre_embed=True,
                 )
                 train_ctx, batch = cp_sharder.shard(batch)
                 labels = batch.pop("labels")
@@ -1125,6 +1191,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
+        if self.pp_enabled:
+            # Only the last pipeline stage computes a loss; share it with the
+            # ranks that report and checkpoint on it.
+            val_loss = self._broadcast_from_last_pp_stage(
+                torch.tensor(val_loss, dtype=torch.float32, device=self.dist_env.device)
+            ).item()
 
         return MetricsSample(
             step=self.step_scheduler.step,

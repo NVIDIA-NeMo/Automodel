@@ -194,21 +194,7 @@ def _build_teacher_model_with_pp(
         return logits.new_tensor(0.0, dtype=logits.dtype)
 
     # Mirror the student pipeline config but swap in the capture loss_fn.
-    teacher_pipeline_config = PipelineConfig(
-        pp_schedule=pipeline_config.pp_schedule,
-        pp_schedule_csv=pipeline_config.pp_schedule_csv,
-        pp_microbatch_size=pipeline_config.pp_microbatch_size,
-        pp_batch_size=pipeline_config.pp_batch_size,
-        layers_per_stage=pipeline_config.layers_per_stage,
-        round_virtual_stages_to_pp_multiple=pipeline_config.round_virtual_stages_to_pp_multiple,
-        module_fqns_per_model_part=pipeline_config.module_fqns_per_model_part,
-        patch_inner_model=pipeline_config.patch_inner_model,
-        patch_causal_lm_model=pipeline_config.patch_causal_lm_model,
-        patch_stage_backward_maybe_with_nosync=pipeline_config.patch_stage_backward_maybe_with_nosync,
-        dtype=pipeline_config.dtype,
-        scale_grads_in_schedule=pipeline_config.scale_grads_in_schedule,
-        loss_fn=_teacher_capture_loss_fn,
-    )
+    teacher_pipeline_config = replace(pipeline_config, loss_fn=_teacher_capture_loss_fn)
     teacher_distributed_setup = DistributedSetup(
         mesh_context=distributed_setup.mesh_context,
         strategy_config=distributed_setup.strategy_config,
@@ -511,8 +497,12 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     for key, value in batch.items()
                     if value is not None and not (isinstance(value, dict) and not value)
                 }
-                targets = labels.clone() if self.teacher_pp.info.has_last_stage else None
-                losses = [] if self.teacher_pp.info.has_last_stage else None
+                # ``last_stage_part`` is the local module owning the last global
+                # stage, recorded from the model parts by ``build()``, so it is
+                # valid before the first step creates the PyTorch stages.
+                teacher_has_last_stage = self.teacher_pp.last_stage_part is not None
+                targets = labels.clone() if teacher_has_last_stage else None
+                losses = [] if teacher_has_last_stage else None
                 self.teacher_pp.step(
                     input_ids,
                     target=targets,
@@ -730,7 +720,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         batch_filtered = {k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)}
 
         # Only the last PP stage needs targets for the loss function.
-        targets = labels.clone() if self.pp.info.has_last_stage else None
+        # ``last_stage_part`` is the local module owning the last global stage,
+        # recorded from the model parts by ``build()``.
+        has_last_stage = self.pp.last_stage_part is not None
+        targets = labels.clone() if has_last_stage else None
 
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
@@ -742,7 +735,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             else:
                 # Run teacher under inference_mode; logits captured by _teacher_capture_loss_fn.
                 with torch.inference_mode():
-                    teacher_losses = [] if self.teacher_pp.info.has_last_stage else None
+                    teacher_losses = [] if self.teacher_pp.last_stage_part is not None else None
                     self.teacher_pp.step(
                         input_ids,
                         target=targets,
@@ -760,7 +753,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self._current_num_label_tokens = num_label_tokens
 
             # Run student forward (+ backward if training).
-            student_losses = [] if self.pp.info.has_last_stage else None
+            student_losses = [] if has_last_stage else None
             self.pp.step(
                 input_ids,
                 target=targets,
@@ -769,7 +762,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 **batch_filtered,
             )
 
-            if self.pp.info.has_last_stage:
+            if has_last_stage:
                 loss_buffer.append(torch.sum(torch.stack(student_losses)).detach().clone())
             else:
                 loss_buffer.append(torch.tensor(0.0, device=self.dist_env.device))

@@ -521,7 +521,10 @@ Pipeline parallelism:
 ```
 components/distributed/pipelining/config.py        -- PipelineConfig dataclass
 components/distributed/pipelining/autopipeline.py  -- AutoPipeline orchestrator
-components/distributed/pipelining/functional.py    -- pipeline_model(), schedule creation
+components/distributed/pipelining/model_parts.py   -- model splitting + parallelization
+components/distributed/pipelining/stage_runtime.py -- PipelineStage + schedule creation
+components/distributed/pipelining/schedules.py     -- schedule name/CSV resolution
+components/distributed/pipelining/module_plan.py   -- module FQN plan per stage
 components/distributed/pipelining/hf_utils.py      -- HF model validation for PP
 ```
 
