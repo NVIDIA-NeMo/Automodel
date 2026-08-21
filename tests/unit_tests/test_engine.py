@@ -818,52 +818,6 @@ def test_context_pipeline_parallel_rejects_mtp_without_combined_capability():
     assert model.forward_calls == 0
 
 
-def _model_ready_packed_collate(datums):
-    model_inputs, loss_inputs = collate_datums(datums, packed=True)
-    lengths = torch.tensor([datum.seq_len for datum in datums], dtype=torch.int32)
-    model_inputs = {
-        "input_ids": model_inputs["input_ids"].flatten(),
-        "position_ids": model_inputs["position_ids"].flatten(),
-        "cu_seqlens": F.pad(lengths.cumsum(0), (1, 0)),
-        "max_seqlen": lengths.max(),
-        "qkv_format": "thd",
-    }
-    loss_inputs = {
-        key: value.flatten() if value.ndim == 2 and value.shape[0] == 1 else value for key, value in loss_inputs.items()
-    }
-    return model_inputs, loss_inputs
-
-
-def test_packed_rl_callback_keeps_per_datum_sequence_boundaries():
-    model = ScaleModel()
-    first = _datum([1, 2])
-    second = _datum([3])
-    first.loss_fn_inputs["sequence_scale"] = torch.tensor(2.0)
-    second.loss_fn_inputs["sequence_scale"] = torch.tensor(0.5)
-
-    datums = [first, second]
-
-    def sequence_loss(output, _loss_inputs):
-        chunks = output.squeeze(0).split([datum.seq_len for datum in datums])
-        losses = torch.cat([chunk * datum.loss_fn_inputs["sequence_scale"] for chunk, datum in zip(chunks, datums)])
-        outputs = [
-            {"sequence_sum": chunk.sum(), "sequence_length": datum.seq_len} for chunk, datum in zip(chunks, datums)
-        ]
-        return losses, outputs
-
-    loss, outputs = Engine(
-        model,
-        device="cpu",
-        microbatch_size=2,
-        collate_fn=_model_ready_packed_collate,
-    ).forward_backward(datums, sequence_loss)
-
-    assert loss.item() == pytest.approx(2.5)
-    assert model.weight.grad.item() == pytest.approx(2.5)
-    assert [item["sequence_length"] for item in outputs] == [2, 1]
-    assert [item["sequence_sum"].item() for item in outputs] == pytest.approx([3.0, 3.0])
-
-
 def test_weights_mask_loss_and_denominator():
     model = ScaleModel()
     loss, _ = Engine(model, device="cpu").forward_backward(
@@ -1248,32 +1202,6 @@ def test_pipeline_outputs_follow_logical_microbatch_order():
     assert pipeline.step_calls == 1
     assert pipeline.backward_calls == 2
     assert [item["metric"].item() for item in outputs] == [1.0, 2.0]
-
-
-def test_pipeline_default_packed_collater_splits_flat_datums_inside_engine():
-    model = ScaleModel()
-    model.backend = SimpleNamespace(attn="te")
-    pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
-    datums = [_datum([1, 2]), _datum([3, 4]), _datum([5, 6]), _datum([7, 8])]
-
-    def loss_with_outputs(output, _loss_inputs):
-        return output, [
-            {"pair_sum": output[..., :2].sum()},
-            {"pair_sum": output[..., 2:].sum()},
-        ]
-
-    loss, outputs = Engine(
-        pipeline,
-        device="cpu",
-        mesh_context=_pipeline_mesh_context(),
-        microbatch_size=4,
-        collate_fn=partial(collate_datums, packed=True),
-    ).forward_backward(datums, loss_with_outputs)
-
-    assert loss.item() == pytest.approx(4.5)
-    assert model.weight.grad.item() == pytest.approx(4.5)
-    assert [item["pair_sum"].item() for item in outputs] == [3.0, 7.0, 11.0, 15.0]
-    assert [item["input_ids"].shape for item in pipeline.prepared_inputs[0]] == [(1, 4), (1, 4)]
 
 
 def _packed_layout_datums(lengths: list[int]) -> list[Datum]:

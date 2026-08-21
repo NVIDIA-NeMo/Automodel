@@ -1627,6 +1627,7 @@ def test_run_validation_epoch_uses_engine_forward_for_pp_complete_results(monkey
         assert loss_fn == recipe._engine_validation_loss_fn
     assert allreduce.call_count == 2
     assert all("include_cp" not in call.kwargs for call in allreduce.call_args_list)
+    recipe.model_parts[0].eval.assert_not_called()
     assert metrics.metrics["val_loss"] == pytest.approx(13.0 / 5.0)
     assert metrics.metrics["num_label_tokens"] == pytest.approx(5.0)
 
@@ -2059,75 +2060,23 @@ class TestRunTrainOptimStepUsesEngine:
         self,
         monkeypatch,
         pp_enabled,
-        dp_group_size=4,
-        cp_group_size=1,
     ):
-        from nemo_automodel.components.config.loader import ConfigNode
-
-        cfg = ConfigNode(
-            {
-                "nvtx": False,
-                "model": {},
-                "dataloader": {"collate_fn": "nemo_automodel.components.datasets.utils.default_collater"},
-                "dataset": {},
-                "validation_dataloader": {},
-                "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-                "optimizer": {},
-                "loss_fn": {},
-                "checkpoint": {"best_metric_key": "default"},
-                "distributed": {"cp_size": 1},
-                "autopipeline": {"pp_microbatch_size": 1},
-            }
-        )
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
-            lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
-        )
-        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
-        recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-
+        recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+        object.__setattr__(recipe, "cfg", ConfigNode({"fp8": None}))
         object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
         object.__setattr__(recipe, "device_mesh", None)
-        object.__setattr__(recipe, "moe_mesh", None)
         object.__setattr__(recipe, "pp_enabled", pp_enabled)
-        object.__setattr__(recipe, "te_fp8", None)
         object.__setattr__(recipe, "model_parts", [nn.Linear(4, 4)])
-        object.__setattr__(
-            recipe,
-            "optimizer",
-            [SimpleNamespace(step=lambda: None, zero_grad=lambda: None, param_groups=[{"lr": 0.01}])],
-        )
-        object.__setattr__(recipe, "lr_schedulers", [])
         object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
-
-        if pp_enabled:
-            pp_info = SimpleNamespace(
-                has_first_stage=True,
-                has_last_stage=True,
-                schedule=SimpleNamespace(_n_microbatches=1),
-            )
-            object.__setattr__(
-                recipe,
-                "pp",
-                SimpleNamespace(
-                    info=pp_info,
-                    pp_batch_size=1,
-                    pp_microbatch_size=1,
-                    update_seq_len=lambda seq_len: None,
-                ),
-            )
-        object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-
         monkeypatch.setattr(
             recipe,
             "_dp_allreduce",
             lambda val, include_cp=False: val if isinstance(val, torch.Tensor) else torch.tensor(val),
         )
-        monkeypatch.setattr(recipe, "_get_dp_group_size", lambda include_cp=False: dp_group_size)
-        monkeypatch.setattr(recipe, "_get_cp_group_size", lambda: cp_group_size)
+        monkeypatch.setattr(recipe, "_get_dp_group_size", lambda include_cp=False: 4)
+        monkeypatch.setattr(recipe, "_get_cp_group_size", lambda: 1)
 
         object.__setattr__(recipe, "checkpointer", SimpleNamespace(maybe_wait_for_staging=lambda: None))
-        object.__setattr__(recipe, "lr_scheduler", None)
         object.__setattr__(recipe, "loss_fn", object())
         engine = MagicMock()
         engine.forward_backward.return_value = (torch.tensor(0.5), [])

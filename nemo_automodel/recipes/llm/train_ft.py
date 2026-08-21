@@ -1088,10 +1088,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             Scalar local causal-LM plus MTP loss sum.
         """
         model = self.model_parts[0]
-        if self.pp_enabled:
-            model = next(
-                model_part for model_part, stage in zip(self.model_parts, self.pp.info.stages) if stage.is_last
-            )
         grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
         hidden_states = get_final_hidden_states(output)
         if isinstance(self.loss_fn, FusedLinearCrossEntropy) and hidden_states is None:
@@ -1173,6 +1169,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self,
         output: Any,
         loss_inputs: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
+        *,
+        is_train: bool = True,
     ) -> torch.Tensor:
         """Compute a local summed causal-LM loss for Engine normalization.
 
@@ -1182,6 +1180,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_inputs: CP-local labels and weights with matching token axes,
                 optional packed-sequence metadata, and optional per-depth MTP
                 targets whose tensors share the labels' token axes.
+            is_train: Whether the loss participates in training gradients.
 
         Returns:
             Scalar local loss-sum tensor.
@@ -1196,7 +1195,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_inputs["labels"],
             loss_inputs,
             num_label_tokens=None,
-            is_train=True,
+            is_train=is_train,
         )
 
     def _engine_validation_loss_fn(
@@ -1205,18 +1204,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         loss_inputs: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
     ) -> torch.Tensor:
         """Compute the validation loss numerator without training reductions."""
-        if self.pp_enabled:
-            if self.pipeline_loss_fn is None:
-                raise RuntimeError("The last pipeline stage has no configured causal-LM loss")
-            self.pipeline_loss_fn.cu_seqlens = loss_inputs.get("cu_seqlens")
-            return self.pipeline_loss_fn(output, loss_inputs["labels"])
-        return self._compute_causal_lm_loss(
-            output,
-            loss_inputs["labels"],
-            loss_inputs,
-            num_label_tokens=None,
-            is_train=False,
-        )
+        return self._engine_loss_fn(output, loss_inputs, is_train=False)
 
     def _run_train_optim_step(self, batches: list[dict[str, Any]]) -> MetricsSample:
         """Execute a single training step.
@@ -1316,9 +1304,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             val_dataloader: DataLoader for the validation dataset.
         """
         with ScopedRNG(seed=1, ranked=True):
-            for mp in self.model_parts:
-                mp.eval()
-
             total_loss = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
             total_num_label_tokens = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
 

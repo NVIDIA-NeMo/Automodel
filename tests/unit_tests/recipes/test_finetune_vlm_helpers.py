@@ -465,8 +465,10 @@ def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call():
 
     assert recipe._compute_vlm_loss.call_count == 2
     first_call, second_call = recipe._compute_vlm_loss.call_args_list
+    assert first_call.kwargs["is_train"] is True
     assert first_call.kwargs["log_drafter"] is True
     assert first_call.kwargs["log_denominator"] == 4
+    assert second_call.kwargs["is_train"] is True
     assert second_call.kwargs["log_drafter"] is False
     assert second_call.kwargs["log_denominator"] == 4
 
@@ -2101,6 +2103,8 @@ def test_vlm_engine_validation_loss_uses_eval_path():
         is_train=False,
         cu_seqlens=cu_seqlens,
         mtp_per_depth_targets=targets,
+        log_drafter=False,
+        log_denominator=None,
     )
 
 
@@ -2164,6 +2168,7 @@ def test_vlm_validation_uses_engine_forward_and_aggregates_uneven_batches(monkey
         assert loss_fn == recipe._engine_validation_loss_fn
     assert allreduce.call_count == 2
     assert all("include_cp" not in call.kwargs for call in allreduce.call_args_list)
+    recipe.model_parts[0].eval.assert_not_called()
     assert metrics.metrics["val_loss"] == pytest.approx(13.0 / 5.0)
     assert metrics.metrics["num_label_tokens"] == pytest.approx(5.0)
 

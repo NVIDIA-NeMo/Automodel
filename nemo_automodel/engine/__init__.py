@@ -337,25 +337,12 @@ class Engine:
             with self.context_fn(model_inputs), cp_context():
                 forward_inputs = filter_forward_kwargs(self.model, model_inputs)
                 output = self.model(**forward_inputs)
-                result = loss_fn(output, loss_inputs)
-                has_outputs = isinstance(result, tuple)
-                if returns_outputs is None:
-                    returns_outputs = has_outputs
-                elif returns_outputs != has_outputs:
-                    raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
-                if isinstance(result, tuple):
-                    losses, outputs = result
-                    if (
-                        not isinstance(outputs, Sequence)
-                        or isinstance(outputs, (str, bytes))
-                        or len(outputs) != len(batch_datums)
-                        or not all(isinstance(item, Mapping) for item in outputs)
-                    ):
+                numerator, outputs = _parse_loss_result(loss_fn(output, loss_inputs), loss_inputs["weights"])
+                returns_outputs = _update_output_mode(returns_outputs, outputs)
+                if outputs is not None:
+                    if len(outputs) != len(batch_datums):
                         raise ValueError("loss_fn outputs must contain one mapping per Datum")
-                    loss_fn_outputs.extend(_detach(dict(item)) for item in outputs)
-                else:
-                    losses = result
-                numerator = _weighted_numerator(losses, loss_inputs["weights"])
+                    loss_fn_outputs.extend(outputs)
                 if zero_weight_sum:
                     numerator = numerator * 0
             local_loss_sum.add_(numerator.detach().to(torch.float64))
@@ -483,25 +470,12 @@ class Engine:
                 ):
                     forward_inputs = filter_forward_kwargs(self.model, model_inputs)
                     output = self.model(**forward_inputs)
-                    result = loss_fn(output, loss_inputs)
-                    has_outputs = isinstance(result, tuple)
-                    if returns_outputs is None:
-                        returns_outputs = has_outputs
-                    elif returns_outputs != has_outputs:
-                        raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
-                    if isinstance(result, tuple):
-                        losses, outputs = result
-                        if (
-                            not isinstance(outputs, Sequence)
-                            or isinstance(outputs, (str, bytes))
-                            or len(outputs) != len(datums)
-                            or not all(isinstance(item, Mapping) for item in outputs)
-                        ):
+                    numerator, outputs = _parse_loss_result(loss_fn(output, loss_inputs), loss_inputs["weights"])
+                    returns_outputs = _update_output_mode(returns_outputs, outputs)
+                    if outputs is not None:
+                        if len(outputs) != len(datums):
                             raise ValueError("loss_fn outputs must contain one mapping per Datum")
-                        loss_fn_outputs.extend(_detach(dict(item)) for item in outputs)
-                    else:
-                        losses = result
-                    numerator = _weighted_numerator(losses, loss_inputs["weights"])
+                        loss_fn_outputs.extend(outputs)
                     if zero_denominator:
                         numerator = numerator * 0
                     (numerator * (grad_group_size / safe_denominator)).backward()
@@ -948,44 +922,16 @@ class Engine:
         returns_outputs: bool | None = None
 
         with cp_context():
-            primary_name = _primary_name(model_inputs)
-            primary = model_inputs[primary_name]
-            if not isinstance(primary, torch.Tensor) or primary.ndim == 0:
-                raise ValueError("pipeline Engine requires a tensor input_ids or inputs_embeds")
-
+            primary_microbatch, is_thd, batch_size = self._plan_pipeline_batch(model_inputs)
             num_microbatches = self.pipeline.num_microbatches
-            is_thd = model_inputs.get("qkv_format") == "thd"
-            if num_microbatches == 1:
-                primary_microbatch = primary
-            elif is_thd:
-                if primary.shape[0] != num_microbatches:
-                    raise ValueError(
-                        f"THD sharder produced {primary.shape[0]} chunks, "
-                        f"expected {num_microbatches} pipeline microbatches"
-                    )
-                primary_microbatch = primary.narrow(0, 0, 1)
-            else:
-                batch_size = primary.shape[0]
-                if batch_size % num_microbatches != 0:
-                    raise ValueError(
-                        f"pipeline outer batch size {batch_size} must be divisible by {num_microbatches} microbatches"
-                    )
-                materialized_batch_size = batch_size // num_microbatches
-                if materialized_batch_size != self.pipeline.pp_microbatch_size:
-                    raise ValueError(
-                        f"materialized pipeline microbatch has batch size {materialized_batch_size}, "
-                        f"but AutoPipeline is configured for pp_microbatch_size={self.pipeline.pp_microbatch_size}"
-                    )
-                primary_microbatch = primary.narrow(0, 0, materialized_batch_size)
-
-            if is_thd and num_microbatches == 1:
-                seq_len = primary_microbatch.shape[0]
-            else:
-                seq_len = primary_microbatch.shape[1] if primary_microbatch.ndim >= 2 else primary_microbatch.shape[0]
-            effective_microbatch_size = 1 if is_thd else primary_microbatch.shape[0]
+            seq_len = (
+                primary_microbatch.shape[0]
+                if is_thd and num_microbatches == 1
+                else primary_microbatch.shape[min(primary_microbatch.ndim - 1, 1)]
+            )
             self.pipeline.update_seq_len(
                 seq_len,
-                microbatch_size=effective_microbatch_size,
+                microbatch_size=1 if is_thd else primary_microbatch.shape[0],
                 input_tensor=primary_microbatch,
             )
 
@@ -1000,26 +946,19 @@ class Engine:
                         loss_inputs,
                         loss_batch_layout,
                         num_datums=len(datums),
+                        is_thd=is_thd,
+                        batch_size=batch_size,
                     )
                 )
 
                 def pipeline_loss(output: Any, microbatch_index: int) -> torch.Tensor:
                     nonlocal returns_outputs
                     loss_inputs_mb = loss_microbatches[microbatch_index]
-                    result = loss_fn(output, loss_inputs_mb)
-                    has_outputs = isinstance(result, tuple)
-                    if returns_outputs is None:
-                        returns_outputs = has_outputs
-                    elif returns_outputs != has_outputs:
-                        raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
-                    if isinstance(result, tuple):
-                        losses, batch_outputs = result
-                        if (
-                            not isinstance(batch_outputs, Sequence)
-                            or isinstance(batch_outputs, (str, bytes))
-                            or not all(isinstance(item, Mapping) for item in batch_outputs)
-                        ):
-                            raise ValueError("loss_fn outputs must be a sequence of mappings")
+                    numerator, batch_outputs = _parse_loss_result(
+                        loss_fn(output, loss_inputs_mb), loss_inputs_mb["weights"]
+                    )
+                    returns_outputs = _update_output_mode(returns_outputs, batch_outputs)
+                    if batch_outputs is not None:
                         datum_indices = (
                             None
                             if datum_indices_by_microbatch is None
@@ -1030,24 +969,20 @@ class Engine:
                                 "a prebatched Datum may return outputs only when num_microbatches=1 because "
                                 "its inner sample boundaries are not part of the Datum contract"
                             )
-                        detached_outputs = [_detach(dict(item)) for item in batch_outputs]
                         if datum_indices is not None:
-                            if len(detached_outputs) != len(datum_indices):
+                            if len(batch_outputs) != len(datum_indices):
                                 raise ValueError(
-                                    f"pipeline loss_fn returned {len(detached_outputs)} outputs for microbatch "
+                                    f"pipeline loss_fn returned {len(batch_outputs)} outputs for microbatch "
                                     f"{microbatch_index}, expected {len(datum_indices)} from its Datum mapping"
                                 )
-                            for datum_index, item in zip(datum_indices, detached_outputs):
+                            for datum_index, item in zip(datum_indices, batch_outputs):
                                 if outputs_by_datum[datum_index] is not None:
                                     raise RuntimeError(
                                         f"pipeline returned more than one output for Datum {datum_index}"
                                     )
                                 outputs_by_datum[datum_index] = item
                         else:
-                            outputs_by_microbatch[microbatch_index] = detached_outputs
-                    else:
-                        losses = result
-                    numerator = _weighted_numerator(losses, loss_inputs_mb["weights"])
+                            outputs_by_microbatch[microbatch_index] = batch_outputs
                     if zero_weight_sum:
                         numerator = numerator * 0
                     local_loss_sum.add_(numerator.detach().to(torch.float64))
@@ -1112,6 +1047,37 @@ class Engine:
             raise RuntimeError("pipeline output synchronization received invalid per-Datum outputs")
         return _to_device(received, self.device)
 
+    def _plan_pipeline_batch(self, model_inputs: Mapping[str, Any]) -> tuple[torch.Tensor, bool, int | None]:
+        """Validate the PP outer-batch shape once for metadata and slicing."""
+        primary_name = _primary_name(model_inputs)
+        primary = model_inputs[primary_name]
+        if not isinstance(primary, torch.Tensor) or primary.ndim == 0:
+            raise ValueError("pipeline Engine requires a tensor input_ids or inputs_embeds")
+
+        num_microbatches = self.pipeline.num_microbatches
+        is_thd = model_inputs.get("qkv_format") == "thd"
+        if num_microbatches == 1:
+            return primary, is_thd, None
+        if is_thd:
+            if primary.shape[0] != num_microbatches:
+                raise ValueError(
+                    f"THD sharder produced {primary.shape[0]} chunks, expected {num_microbatches} pipeline microbatches"
+                )
+            return primary.narrow(0, 0, 1), True, None
+
+        batch_size = primary.shape[0]
+        if batch_size % num_microbatches != 0:
+            raise ValueError(
+                f"pipeline outer batch size {batch_size} must be divisible by {num_microbatches} microbatches"
+            )
+        materialized_batch_size = batch_size // num_microbatches
+        if materialized_batch_size != self.pipeline.pp_microbatch_size:
+            raise ValueError(
+                f"materialized pipeline microbatch has batch size {materialized_batch_size}, "
+                f"but AutoPipeline is configured for pp_microbatch_size={self.pipeline.pp_microbatch_size}"
+            )
+        return primary.narrow(0, 0, materialized_batch_size), False, batch_size
+
     def _materialize_pipeline_microbatches(
         self,
         model_inputs: dict[str, Any],
@@ -1119,6 +1085,8 @@ class Engine:
         loss_batch_layout: _LossBatchLayout,
         *,
         num_datums: int,
+        is_thd: bool,
+        batch_size: int | None,
     ) -> tuple[list[dict[str, Any]], list[LossInputs], list[tuple[int, ...]] | None]:
         """Split one CP-prepared outer batch into exact pipeline inputs.
 
@@ -1146,7 +1114,7 @@ class Engine:
                     [model_inputs],
                     loss_batch_layout.item_to_datum,
                     num_datums=num_datums,
-                    is_thd=model_inputs.get("qkv_format") == "thd",
+                    is_thd=is_thd,
                 )
                 assert datum_indices is not None
             return (
@@ -1155,32 +1123,12 @@ class Engine:
                 datum_indices,
             )
 
-        primary_name = _primary_name(model_inputs)
-        primary = model_inputs[primary_name]
-        if not isinstance(primary, torch.Tensor) or primary.ndim == 0:
-            raise ValueError(f"pipeline Engine requires tensor {primary_name}")
-
-        is_thd = model_inputs.get("qkv_format") == "thd"
         if is_thd:
-            if primary.shape[0] != num_microbatches:
-                raise ValueError(
-                    f"THD sharder produced {primary.shape[0]} chunks, expected {num_microbatches} pipeline microbatches"
-                )
             model_microbatches = [
                 _select_chunk(model_inputs, index, num_microbatches) for index in range(num_microbatches)
             ]
         else:
-            batch_size = primary.shape[0]
-            if batch_size % num_microbatches != 0:
-                raise ValueError(
-                    f"pipeline outer batch size {batch_size} must be divisible by {num_microbatches} microbatches"
-                )
-            materialized_batch_size = batch_size // num_microbatches
-            if materialized_batch_size != self.pipeline.pp_microbatch_size:
-                raise ValueError(
-                    f"materialized pipeline microbatch has batch size {materialized_batch_size}, "
-                    f"but AutoPipeline is configured for pp_microbatch_size={self.pipeline.pp_microbatch_size}"
-                )
+            assert batch_size is not None
             custom_dims: dict[str, int] = {}
             chunk_dims = getattr(self.model, "get_pipeline_kwargs_chunk_dims", None)
             if chunk_dims is not None:
@@ -1768,6 +1716,30 @@ def _weighted_numerator(losses: Any, weights: torch.Tensor) -> torch.Tensor:
     if losses.device != weights.device:
         raise ValueError("loss_fn losses and weights must be on the same device")
     return numerator
+
+
+def _parse_loss_result(
+    result: torch.Tensor | tuple[torch.Tensor, Sequence[Mapping[str, Any]]],
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, list[dict[str, Any]] | None]:
+    """Normalize one loss callback result without applying Datum routing."""
+    if not isinstance(result, tuple):
+        return _weighted_numerator(result, weights), None
+    losses, outputs = result
+    if (
+        not isinstance(outputs, Sequence)
+        or isinstance(outputs, (str, bytes))
+        or not all(isinstance(item, Mapping) for item in outputs)
+    ):
+        raise ValueError("loss_fn outputs must be a sequence of mappings")
+    return _weighted_numerator(losses, weights), [_detach(dict(item)) for item in outputs]
+
+
+def _update_output_mode(previous: bool | None, outputs: list[dict[str, Any]] | None) -> bool:
+    current = outputs is not None
+    if previous is not None and previous != current:
+        raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
+    return current
 
 
 def _detach(value: Any) -> Any:

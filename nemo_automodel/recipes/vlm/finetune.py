@@ -943,6 +943,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         out: Any,
         loss_inputs: Mapping[str, torch.Tensor | tuple[torch.Tensor, ...]],
         *,
+        is_train: bool = True,
         log_drafter: bool = False,
         log_denominator: int | float | None = None,
     ) -> torch.Tensor:
@@ -955,6 +956,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 have shape [batch, sequence] or [tokens]. Optional ``cu_seqlens``
                 has shape [num_sequences + 1] or [1, num_sequences + 1], and each
                 ``mtp_per_depth_targets`` tensor matches the labels' local layout.
+            is_train: Whether the loss participates in training gradients.
 
         Returns:
             Scalar local loss-sum tensor.
@@ -974,7 +976,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             out=out,
             labels=labels,
             num_label_tokens=None,
-            is_train=True,
+            is_train=is_train,
             cu_seqlens=cu_seqlens,
             mtp_per_depth_targets=mtp_per_depth_targets,
             log_drafter=log_drafter,
@@ -987,24 +989,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         loss_inputs: Mapping[str, torch.Tensor | tuple[torch.Tensor, ...]],
     ) -> torch.Tensor:
         """Compute the validation loss numerator without training reductions."""
-        labels = cast(torch.Tensor, loss_inputs["labels"])
-        cu_seqlens = cast(torch.Tensor | None, loss_inputs.get("cu_seqlens"))
-        if self.pp_enabled:
-            if self.pipeline_loss_fn is None:
-                raise RuntimeError("The last pipeline stage has no configured causal-LM loss")
-            self.pipeline_loss_fn.cu_seqlens = cu_seqlens
-            return self.pipeline_loss_fn(out, labels)
-        return self._compute_vlm_loss(
-            out=out,
-            labels=labels,
-            num_label_tokens=None,
-            is_train=False,
-            cu_seqlens=cu_seqlens,
-            mtp_per_depth_targets=cast(
-                tuple[torch.Tensor, ...] | None,
-                loss_inputs.get("mtp_per_depth_targets"),
-            ),
-        )
+        return self._engine_loss_fn(out, loss_inputs, is_train=False)
 
     @contextmanager
     def _cp_vision_frame_sharding_context(self):
@@ -1164,9 +1149,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             Metrics for the completed validation epoch.
         """
         with ScopedRNG(seed=1, ranked=True):
-            for mp in self.model_parts:
-                mp.eval()
-
             total_loss = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
             total_num_label_tokens = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
             for batch in val_dataloader:

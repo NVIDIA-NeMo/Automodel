@@ -305,7 +305,6 @@ class AutoPipeline:
         *,
         target: torch.Tensor | None = None,
         losses: list[torch.Tensor] | None = None,
-        return_outputs: bool = True,
         **kwargs: Any,
     ) -> Any:
         """Run one pipeline schedule step with model-owned input chunking.
@@ -317,9 +316,6 @@ class AutoPipeline:
                 ranks without the last pipeline stage.
             losses: Mutable list populated with scalar loss tensors, or ``None``
                 on ranks without the last pipeline stage.
-            return_outputs: Whether the last pipeline stage returns merged model
-                outputs when supported by the installed PyTorch version. Tensor
-                layouts are defined by the underlying model.
             **kwargs: Keyword schedule inputs. Tensor values may have arbitrary
                 model-defined layouts; model-owned metadata identifies any
                 nonstandard batch axis.
@@ -333,18 +329,12 @@ class AutoPipeline:
 
         schedule_args = (model_input,) if self._info.has_first_stage else ()
         kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
-        schedule_options = (
-            {"return_outputs": return_outputs}
-            if "return_outputs" in inspect.signature(schedule.step).parameters
-            else {}
-        )
 
         if kwargs_chunk_spec is None:
             return schedule.step(
                 *schedule_args,
                 target=target,
                 losses=losses,
-                **schedule_options,
                 **kwargs,
             )
 
@@ -355,7 +345,6 @@ class AutoPipeline:
                 *schedule_args,
                 target=target,
                 losses=losses,
-                **schedule_options,
                 **kwargs,
             )
         finally:

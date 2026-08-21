@@ -404,23 +404,12 @@ class TestAutoPipelineKwargsChunkSpec:
 
     def test_step_without_model_hook_uses_pytorch_default_chunking(self):
         ap = self._pipeline_with_parts(nn.Module())
-        original_loss_fn = ap.info.schedule._loss_fn
 
         ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
 
         assert ap.info.schedule.kwargs_chunk_spec_during_step is None
         assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
         assert ap.info.schedule._kwargs_chunk_spec is None
-        assert ap.info.schedule._loss_fn is original_loss_fn
-        assert ap.info.schedule.return_outputs_during_step is True
-
-    def test_step_does_not_forward_return_outputs_to_older_pytorch(self):
-        schedule = _LegacyStepSchedule()
-        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
-
-        ap.step(torch.zeros(2, 8), return_outputs=False)
-
-        assert schedule.received_return_outputs is False
 
     def test_step_microbatches_passes_prepared_inputs_without_resplitting(self):
         schedule = _KwargsChunkSchedule(invoke_loss=True)
@@ -474,11 +463,22 @@ class TestAutoPipelineKwargsChunkSpec:
         assert schedule.args_split == [(), ()]
         assert all("inputs_embeds" not in kwargs for kwargs in schedule.kwargs_split)
 
-    def test_step_microbatches_does_not_forward_return_outputs_to_older_pytorch(self):
-        schedule = _LegacyStepSchedule()
+    @pytest.mark.parametrize(
+        ("method_name", "schedule_cls"),
+        [
+            ("step_microbatches", _LegacyStepSchedule),
+            ("eval_microbatches", _LegacyEvalSchedule),
+        ],
+    )
+    def test_prepared_microbatches_do_not_forward_return_outputs_to_older_pytorch(
+        self,
+        method_name,
+        schedule_cls,
+    ):
+        schedule = schedule_cls()
         ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
 
-        ap.step_microbatches(
+        getattr(ap, method_name)(
             [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
             loss_fn=Mock(),
             return_outputs=False,
@@ -524,20 +524,6 @@ class TestAutoPipelineKwargsChunkSpec:
         assert schedule._split_inputs == original_split_inputs
         assert schedule._loss_fn is original_loss_fn
 
-    def test_eval_microbatches_does_not_forward_return_outputs_to_older_pytorch(self):
-        schedule = _LegacyEvalSchedule()
-        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
-
-        ap.eval_microbatches(
-            [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
-            loss_fn=Mock(),
-            return_outputs=False,
-        )
-
-        assert schedule.eval_calls == 1
-        assert schedule.step_calls == 0
-        assert schedule.received_return_outputs is False
-
     def test_eval_microbatches_uses_step_capability_when_eval_forwards_kwargs(self):
         schedule = _ForwardingEvalSchedule()
         ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
@@ -578,37 +564,21 @@ class TestAutoPipelineKwargsChunkSpec:
         with pytest.raises(ValueError, match="Expected 2|exactly one"):
             ap.step_microbatches(model_inputs, loss_fn=Mock())
 
-    def test_step_microbatches_restores_schedule_state_after_failure(self):
+    @pytest.mark.parametrize("method_name", ["step_microbatches", "eval_microbatches"])
+    def test_prepared_microbatches_restore_schedule_state_after_failure(self, method_name):
         schedule = _KwargsChunkSchedule(fail_on_step=True)
         original_split_inputs = schedule._split_inputs
         original_loss_fn = schedule._loss_fn
         ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
 
         with pytest.raises(RuntimeError, match="schedule failed"):
-            ap.step_microbatches(
+            getattr(ap, method_name)(
                 [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
                 loss_fn=Mock(),
             )
 
-        assert schedule.split_inputs_during_step is not original_split_inputs
-        assert schedule.loss_fn_during_step is not original_loss_fn
-        assert schedule._split_inputs == original_split_inputs
-        assert schedule._loss_fn is original_loss_fn
-
-    def test_eval_microbatches_restores_schedule_state_after_failure(self):
-        schedule = _KwargsChunkSchedule(fail_on_step=True)
-        original_split_inputs = schedule._split_inputs
-        original_loss_fn = schedule._loss_fn
-        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
-
-        with pytest.raises(RuntimeError, match="schedule failed"):
-            ap.eval_microbatches(
-                [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
-                loss_fn=Mock(),
-            )
-
-        assert schedule.eval_calls == 1
-        assert schedule.step_calls == 0
+        assert schedule.eval_calls == int(method_name == "eval_microbatches")
+        assert schedule.step_calls == int(method_name == "step_microbatches")
         assert schedule.split_inputs_during_step is not original_split_inputs
         assert schedule.loss_fn_during_step is not original_loss_fn
         assert schedule._split_inputs == original_split_inputs
