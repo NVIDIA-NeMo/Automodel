@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -30,7 +33,70 @@ from nemo_automodel.components.datasets.utils import (
 
 CROSS_ENTROPY_IGNORE_IDX = -100
 
-__all__ = ["Datum", "collate_datums"]
+__all__ = ["CollatedLossInputs", "Datum", "LossInputLayout", "collate_datums"]
+
+
+class LossInputLayout(str, Enum):
+    """How one loss input relates to the Datums being collated.
+
+    ``PER_TOKEN`` values follow token padding, packing, CP sharding, and PP
+    microbatching. ``PER_DATUM`` values contain one scalar for each outer
+    :class:`Datum`; CP ranks receive the same scalars, so a loss callback uses
+    them with its CP-local token contribution rather than returning a repeated
+    full-sequence scalar. ``REPLICATED`` values are batch-level metadata copied
+    unchanged to every CP/PP microbatch.
+    """
+
+    PER_TOKEN = "per_token"
+    PER_DATUM = "per_datum"
+    REPLICATED = "replicated"
+
+
+class CollatedLossInputs(dict[str, torch.Tensor]):
+    """Collated loss tensors with layout metadata outside the tensor mapping.
+
+    This remains a normal ``dict`` for source compatibility. ``layouts`` is a
+    complete mapping over the dictionary's initial keys. ``item_to_datum``
+    maps each padded row or valid THD sequence back to the input Datum index;
+    the current Engine accepts the identity mapping (one item per Datum, in
+    input order). It is ``None`` when a collater cannot expose its inner
+    boundaries, as with an already-prebatched batch. ``copy()`` preserves the
+    side channel; converting this object to a plain ``dict`` intentionally
+    drops it and opts back into the Engine's conservative legacy inference.
+    """
+
+    def __init__(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        layouts: Mapping[str, LossInputLayout],
+        item_to_datum: tuple[int, ...] | None,
+    ) -> None:
+        super().__init__(values)
+        if set(layouts) != set(self):
+            raise ValueError("layouts must contain exactly the CollatedLossInputs keys")
+        if not all(isinstance(layout, LossInputLayout) for layout in layouts.values()):
+            raise TypeError("every loss input layout must be a LossInputLayout")
+        resolved_item_to_datum = None if item_to_datum is None else tuple(item_to_datum)
+        if resolved_item_to_datum is not None and not all(isinstance(index, int) for index in resolved_item_to_datum):
+            raise TypeError("item_to_datum must contain integer Datum indices")
+
+        # Store a normal dict so the public collate result remains pickleable
+        # across DataLoader worker boundaries. Expose only a read-only view.
+        self._layouts = dict(layouts)
+        self.item_to_datum = resolved_item_to_datum
+
+    @property
+    def layouts(self) -> Mapping[str, LossInputLayout]:
+        """Complete, read-only field-layout mapping."""
+        return MappingProxyType(self._layouts)
+
+    def copy(self) -> CollatedLossInputs:
+        """Return a shallow copy that retains the layout side channel."""
+        return type(self)(self, layouts=self.layouts, item_to_datum=self.item_to_datum)
+
+    def __copy__(self) -> CollatedLossInputs:
+        return self.copy()
 
 
 @dataclass(init=False)
@@ -49,12 +115,16 @@ class Datum:
             model-specific because LLM and VLM processors emit different
             fields.
         loss_fn_inputs: Tensor values consumed by the loss function.
+        loss_fn_input_layouts: Optional semantic layouts for loss fields. The
+            canonical collater infers omitted fields using its legacy
+            token-aligned-versus-scalar rules.
         input_ids: Deprecated convenience spelling for the old text-only API.
             It cannot be combined with ``model_inputs``.
     """
 
     model_inputs: dict[str, Any]
     loss_fn_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    loss_fn_input_layouts: dict[str, LossInputLayout] = field(default_factory=dict)
 
     def __init__(
         self,
@@ -62,6 +132,7 @@ class Datum:
         loss_fn_inputs: dict[str, torch.Tensor] | None = None,
         *,
         input_ids: torch.Tensor | list[int] | None = None,
+        loss_fn_input_layouts: Mapping[str, LossInputLayout] | None = None,
     ) -> None:
         # Preserve the old positional ``Datum(input_ids, loss_fn_inputs)`` form
         # while downstream users move to the model-ready mapping.
@@ -79,6 +150,7 @@ class Datum:
 
         self.model_inputs = dict(model_inputs)
         self.loss_fn_inputs = dict(loss_fn_inputs or {})
+        self.loss_fn_input_layouts = dict(loss_fn_input_layouts or {})
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -96,6 +168,12 @@ class Datum:
         for key, value in self.loss_fn_inputs.items():
             if not isinstance(value, torch.Tensor):
                 self.loss_fn_inputs[key] = torch.as_tensor(value)
+
+        unknown_layouts = set(self.loss_fn_input_layouts) - set(self.loss_fn_inputs)
+        if unknown_layouts:
+            raise ValueError(f"loss_fn_input_layouts contains unknown loss inputs: {sorted(unknown_layouts)}")
+        if not all(isinstance(layout, LossInputLayout) for layout in self.loss_fn_input_layouts.values()):
+            raise TypeError("every loss_fn_input_layouts value must be a LossInputLayout")
 
     @property
     def input_ids(self) -> torch.Tensor:
@@ -160,7 +238,7 @@ def collate_datums(
     packed: bool = False,
     pad_seq_len_divisible: int | None = None,
     ignore_index: int = CROSS_ENTROPY_IGNORE_IDX,
-) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+) -> tuple[dict[str, Any], CollatedLossInputs]:
     """Collate text Datums into separate model and loss inputs.
 
     This is the default text collater. Callers with model-specific VLM
@@ -174,9 +252,12 @@ def collate_datums(
         ignore_index: Label fill value used internally by the THD collater.
 
     Returns:
-        ``(model_inputs, loss_fn_inputs)``. Per-token loss inputs have shape
-        ``[B, T]`` in padded mode and ``[1, total_tokens]`` in packed mode;
-        scalar loss inputs have shape ``[B]``.
+        ``(model_inputs, loss_fn_inputs)``. The second item remains a ``dict``
+        and also exposes complete ``layouts`` and ``item_to_datum`` metadata.
+        Per-token loss inputs have shape ``[B, T]`` in padded mode and
+        ``[1, total_tokens]`` in packed mode; per-Datum scalar loss inputs have
+        shape ``[B]``. Replicated inputs retain one copy of their original
+        shape.
     """
     if not datums:
         raise ValueError("collate_datums requires at least one Datum")
@@ -213,21 +294,66 @@ def collate_datums(
     width = int(model_inputs["input_ids"].shape[-1])
 
     loss_inputs: dict[str, torch.Tensor] = {}
+    loss_layouts: dict[str, LossInputLayout] = {}
     for key in sorted(loss_keys):
         values = [datum.loss_fn_inputs[key] for datum in datums]
-        per_token = all(value.ndim == 1 and value.shape[0] == datum.seq_len for value, datum in zip(values, datums))
-        if per_token:
+        declared_layouts = [datum.loss_fn_input_layouts[key] for datum in datums if key in datum.loss_fn_input_layouts]
+        if declared_layouts and len(declared_layouts) != len(datums):
+            raise ValueError(f"every Datum must declare the layout for loss input {key!r}, or none may declare it")
+        explicit_layouts = set(declared_layouts)
+        if len(explicit_layouts) > 1:
+            raise ValueError(f"every Datum must use the same explicit layout for loss input {key!r}")
+        explicit_layout = next(iter(explicit_layouts), None)
+
+        token_aligned = [value.ndim == 1 and value.shape[0] == datum.seq_len for value, datum in zip(values, datums)]
+        if explicit_layout is LossInputLayout.PER_TOKEN and not all(token_aligned):
+            shapes = [tuple(value.shape) for value in values]
+            raise ValueError(
+                f"PER_TOKEN loss input {key!r} must be 1-D and match each Datum's token length; got {shapes}"
+            )
+
+        scalar_per_datum = [value.numel() == 1 for value in values]
+        if explicit_layout is LossInputLayout.PER_DATUM and not all(scalar_per_datum):
+            shapes = [tuple(value.shape) for value in values]
+            raise ValueError(f"PER_DATUM loss input {key!r} must contain one value per Datum; got {shapes}")
+
+        layout = explicit_layout
+        if layout is None:
+            if all(token_aligned):
+                layout = LossInputLayout.PER_TOKEN
+            elif all(scalar_per_datum):
+                layout = LossInputLayout.PER_DATUM
+            else:
+                shapes = [tuple(value.shape) for value in values]
+                raise ValueError(
+                    f"the default collater only supports scalar or 1-D token-aligned loss inputs; {key!r} has {shapes}"
+                )
+
+        loss_layouts[key] = layout
+        if layout is LossInputLayout.PER_TOKEN:
             if packed:
                 loss_inputs[key] = torch.cat(values).unsqueeze(0)
             else:
                 loss_inputs[key] = torch.stack([F.pad(value, (0, width - value.shape[0])) for value in values])
             continue
 
-        if not all(value.numel() == 1 for value in values):
-            shapes = [tuple(value.shape) for value in values]
-            raise ValueError(
-                f"the default collater only supports scalar or 1-D token-aligned loss inputs; {key!r} has {shapes}"
-            )
-        loss_inputs[key] = torch.stack([value.reshape(()) for value in values])
+        if layout is LossInputLayout.PER_DATUM:
+            loss_inputs[key] = torch.stack([value.reshape(()) for value in values])
+            continue
 
-    return model_inputs, loss_inputs
+        first = values[0]
+        if not all(
+            value.shape == first.shape
+            and value.dtype == first.dtype
+            and value.device == first.device
+            and torch.equal(value, first)
+            for value in values[1:]
+        ):
+            raise ValueError(f"REPLICATED loss input {key!r} must have the same value in every Datum")
+        loss_inputs[key] = first
+
+    return model_inputs, CollatedLossInputs(
+        loss_inputs,
+        layouts=loss_layouts,
+        item_to_datum=tuple(range(len(datums))),
+    )

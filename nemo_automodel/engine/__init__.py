@@ -25,7 +25,12 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from nemo_automodel.components.datasets.datum import Datum, collate_datums
+from nemo_automodel.components.datasets.datum import (
+    CollatedLossInputs,
+    Datum,
+    LossInputLayout,
+    collate_datums,
+)
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
@@ -40,7 +45,10 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
-CollateFn = Callable[[list[Datum]], tuple[dict[str, Any], dict[str, torch.Tensor]]]
+CollateFn = Callable[
+    [list[Datum]],
+    tuple[dict[str, Any], dict[str, torch.Tensor] | CollatedLossInputs],
+]
 LossInputValue = torch.Tensor | tuple[torch.Tensor, ...]
 LossInputs = dict[str, LossInputValue]
 LossFn = Callable[
@@ -58,7 +66,7 @@ def _nullcontext_for_batch(_model_inputs: dict[str, Any]) -> AbstractContextMana
     return nullcontext()
 
 
-def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], CollatedLossInputs | dict[str, torch.Tensor]]:
     """Return one already-collated Datum without changing its layout.
 
     The Datum represents the whole prebatched item. Consequently, one
@@ -76,7 +84,27 @@ def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], dict[str, t
     if len(datums) != 1:
         raise ValueError("collate_prebatched expects exactly one Datum per microbatch")
     datum = datums[0]
-    return dict(datum.model_inputs), dict(datum.loss_fn_inputs)
+    if set(datum.loss_fn_input_layouts) == set(datum.loss_fn_inputs):
+        loss_inputs: CollatedLossInputs | dict[str, torch.Tensor] = CollatedLossInputs(
+            datum.loss_fn_inputs,
+            layouts=datum.loss_fn_input_layouts,
+            item_to_datum=None,
+        )
+    else:
+        # Source-compatible prebatched callers without complete metadata keep
+        # the legacy inference path. It remains fail-closed for ambiguous
+        # packed per-Datum fields.
+        loss_inputs = dict(datum.loss_fn_inputs)
+    return dict(datum.model_inputs), loss_inputs
+
+
+@dataclass(frozen=True)
+class _LossBatchLayout:
+    """Field semantics and logical-item routing captured at collate time."""
+
+    fields: Mapping[str, LossInputLayout]
+    item_to_datum: tuple[int, ...] | None
+    unresolved_fields: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -150,9 +178,14 @@ class Engine:
         uses one inner pipeline microbatch; recipes enforce that configuration.
         Packed pipeline batches with multiple inner microbatches must split at
         sequence boundaries into equal-width token chunks. Token-aligned loss
-        fields follow those chunks. Per-Datum scalar loss fields do not yet
-        carry enough boundary metadata to be split in that layout and are
-        rejected instead of being replicated silently.
+        fields follow those chunks. Layout-aware collaters may additionally
+        route per-Datum scalar fields from THD sequence boundaries and preserve
+        replicated fields unchanged. A ``PER_DATUM`` field is copied to every
+        CP rank; a loss callback combines it with that rank's CP-local token
+        contribution so scalar numerators remain additive across CP. Custom or
+        prebatched collaters that hide the sequence-to-Datum relationship
+        remain fail-closed for per-Datum fields instead of guessing inner
+        sample boundaries.
     """
 
     def __init__(
@@ -233,7 +266,9 @@ class Engine:
         returns_outputs: bool | None = None
 
         for batch_datums in microbatches:
-            cp_context, model_inputs, loss_inputs = self._prepare_batch(batch_datums, inner_microbatches)
+            cp_context, model_inputs, loss_inputs, loss_batch_layout = self._prepare_batch(
+                batch_datums, inner_microbatches
+            )
             if self.pipeline is not None:
                 batch_returns_outputs, batch_outputs = self._pipeline_execute(
                     model_inputs,
@@ -242,6 +277,7 @@ class Engine:
                     loss_fn,
                     local_loss_sum,
                     cp_context,
+                    loss_batch_layout,
                     backward_scale=None,
                     zero_weight_sum=zero_weight_sum,
                 )
@@ -369,7 +405,7 @@ class Engine:
             if is_last:
                 prepare_for_final_backward(self.model_parts, pp_enabled=pp_enabled)
 
-            cp_context, model_inputs, loss_inputs = self._prepare_batch(datums, inner_microbatches)
+            cp_context, model_inputs, loss_inputs, loss_batch_layout = self._prepare_batch(datums, inner_microbatches)
 
             if self.pipeline is not None:
                 backward_scale = (
@@ -384,6 +420,7 @@ class Engine:
                     loss_fn,
                     local_loss_sum,
                     cp_context,
+                    loss_batch_layout,
                     backward_scale=backward_scale,
                     zero_weight_sum=zero_denominator,
                 )
@@ -447,11 +484,92 @@ class Engine:
             list(datums[start : start + self.microbatch_size]) for start in range(0, len(datums), self.microbatch_size)
         ]
 
+    @staticmethod
+    def _resolve_loss_batch_layout(
+        datums: list[Datum],
+        model_inputs: Mapping[str, Any],
+        loss_inputs: Mapping[str, LossInputValue],
+    ) -> _LossBatchLayout:
+        """Resolve collater metadata without exposing it to the loss callback."""
+        if isinstance(loss_inputs, CollatedLossInputs):
+            if set(loss_inputs.layouts) != set(loss_inputs):
+                raise ValueError("CollatedLossInputs.layouts must describe every loss field exactly once")
+            item_to_datum = loss_inputs.item_to_datum
+            if item_to_datum is not None and item_to_datum != tuple(range(len(datums))):
+                raise ValueError(
+                    "Engine currently requires collater item_to_datum to preserve outer Datum order; "
+                    f"got {list(item_to_datum)} for {len(datums)} Datums"
+                )
+            return _LossBatchLayout(
+                fields=dict(loss_inputs.layouts),
+                item_to_datum=item_to_datum,
+            )
+
+        weights = loss_inputs.get("weights")
+        if not isinstance(weights, torch.Tensor):
+            raise ValueError("collate_fn must return a Tensor loss input named 'weights'")
+
+        fields: dict[str, LossInputLayout] = {}
+        unresolved: set[str] = set()
+        for name, value in loss_inputs.items():
+            declared = {datum.loss_fn_input_layouts[name] for datum in datums if name in datum.loss_fn_input_layouts}
+            if len(declared) > 1:
+                raise ValueError(f"Datum items disagree on the loss layout for field {name!r}")
+            if declared:
+                if not all(name in datum.loss_fn_input_layouts for datum in datums):
+                    raise ValueError(f"every Datum must declare the loss layout for field {name!r}")
+                fields[name] = next(iter(declared))
+                continue
+
+            if isinstance(value, torch.Tensor) and _loss_sequence_dim(dict(model_inputs), value) is not None:
+                fields[name] = LossInputLayout.PER_TOKEN
+                continue
+
+            # Preserve source compatibility for older prepared/custom batches
+            # whose output weights are not token-shaped. This is deliberately
+            # unresolved rather than a new public PER_DATUM-weight contract:
+            # padded PP keeps its historical shape slicing, while packed PP
+            # fails closed without explicit token weights.
+            if name == "weights":
+                fields[name] = LossInputLayout.REPLICATED
+                unresolved.add(name)
+                continue
+
+            datum_values = [datum.loss_fn_inputs.get(name) for datum in datums]
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim > 0
+                and value.shape[0] == len(datums)
+                and all(isinstance(item, torch.Tensor) and item.numel() == 1 for item in datum_values)
+            ):
+                fields[name] = LossInputLayout.PER_DATUM
+            else:
+                fields[name] = LossInputLayout.REPLICATED
+            unresolved.add(name)
+
+        # Legacy padded collaters historically preserve one input row per
+        # Datum. Keep that path source compatible; packed collaters must opt in
+        # explicitly because a THD sequence is not necessarily an outer Datum.
+        item_to_datum: tuple[int, ...] | None = None
+        primary = model_inputs.get("inputs_embeds", model_inputs.get("input_ids"))
+        if (
+            model_inputs.get("qkv_format") != "thd"
+            and isinstance(primary, torch.Tensor)
+            and primary.ndim > 0
+            and primary.shape[0] == len(datums)
+        ):
+            item_to_datum = tuple(range(len(datums)))
+        return _LossBatchLayout(
+            fields=fields,
+            item_to_datum=item_to_datum,
+            unresolved_fields=frozenset(unresolved),
+        )
+
     def _prepare_batch(
         self,
         datums: list[Datum],
         num_pipeline_microbatches: int,
-    ) -> tuple[Callable[[], AbstractContextManager[Any]], dict[str, Any], LossInputs]:
+    ) -> tuple[Callable[[], AbstractContextManager[Any]], dict[str, Any], LossInputs, _LossBatchLayout]:
         """Collate, move, and CP-shard one outer batch.
 
         Args:
@@ -461,21 +579,40 @@ class Engine:
                 the prepared outer batch must materialize.
 
         Returns:
-            The CP context factory, CP-local model inputs, and CP-local loss
-            inputs. Token-aligned model and loss tensors use the same padded,
-            packed THD, Magi, or model-owned local sequence layout.
+            The CP context factory, CP-local model inputs, CP-local loss
+            inputs, and collated field-layout metadata. Token-aligned model
+            and loss tensors use the same padded, packed THD, Magi, or
+            model-owned local sequence layout.
         """
-        model_inputs, loss_inputs = self.collate_fn(datums)
+        model_inputs, collated_loss_inputs = self.collate_fn(datums)
+        loss_batch_layout = self._resolve_loss_batch_layout(datums, model_inputs, collated_loss_inputs)
+        loss_inputs = dict(collated_loss_inputs)
+        weight_layout = loss_batch_layout.fields.get("weights")
+        if weight_layout is not LossInputLayout.PER_TOKEN and not (
+            weight_layout is LossInputLayout.REPLICATED and "weights" in loss_batch_layout.unresolved_fields
+        ):
+            raise ValueError("loss input 'weights' must use the PER_TOKEN layout")
+        if "labels" in loss_inputs and loss_batch_layout.fields["labels"] is not LossInputLayout.PER_TOKEN:
+            raise ValueError("loss input 'labels' must use the PER_TOKEN layout")
         self._validate_collated_weights(datums, loss_inputs)
+        token_reference_name, loss_seq_dim = self._validate_loss_batch_layout(
+            datums,
+            model_inputs,
+            loss_inputs,
+            loss_batch_layout.fields,
+        )
         model_inputs = _to_device(model_inputs, self.device)
         loss_inputs = _to_device(loss_inputs, self.device)
-        full_weights = loss_inputs["weights"]
-        loss_seq_dim = _loss_sequence_dim(model_inputs, full_weights)
+        token_reference = (
+            loss_inputs[token_reference_name]
+            if token_reference_name is not None
+            else _model_token_template(model_inputs)
+        )
 
         cp_batch = dict(model_inputs)
         labels = loss_inputs.get("labels")
         cp_batch["labels"] = (
-            labels.clone() if isinstance(labels, torch.Tensor) else torch.zeros_like(full_weights, dtype=torch.long)
+            labels.clone() if isinstance(labels, torch.Tensor) else torch.zeros_like(token_reference, dtype=torch.long)
         )
         is_thd = cp_batch.get("qkv_format") == "thd"
         position_ids = cp_batch.get("position_ids")
@@ -491,24 +628,31 @@ class Engine:
 
         thd_loss_fields: list[str] = []
         if is_thd:
-            ambiguous_per_datum_fields = [
+            if "weights" in loss_batch_layout.unresolved_fields:
+                raise ValueError("packed THD execution requires token-aligned loss weights")
+            unresolved_non_token_fields = [
                 name
-                for name, value in loss_inputs.items()
-                if name != "labels"
-                and isinstance(value, torch.Tensor)
-                and value.ndim > 0
-                and value.shape[0] == len(datums)
-                and len(datums) > 1
-                and not _is_token_aligned(value, full_weights)
+                for name in loss_batch_layout.unresolved_fields
+                if loss_batch_layout.fields[name] is not LossInputLayout.PER_TOKEN
             ]
-            if num_pipeline_microbatches > 1 and ambiguous_per_datum_fields:
+            if num_pipeline_microbatches > 1 and unresolved_non_token_fields:
                 raise NotImplementedError(
-                    "packed pipeline microbatching cannot yet split per-Datum loss fields "
-                    f"{ambiguous_per_datum_fields}; use token-aligned fields or a prepared collater"
+                    "packed pipeline microbatching requires an explicit PER_DATUM or REPLICATED layout for "
+                    f"non-token loss fields {unresolved_non_token_fields}"
+                )
+            per_datum_fields = [
+                name for name, layout in loss_batch_layout.fields.items() if layout is LossInputLayout.PER_DATUM
+            ]
+            if num_pipeline_microbatches > 1 and per_datum_fields and loss_batch_layout.item_to_datum is None:
+                raise NotImplementedError(
+                    "packed pipeline microbatching requires collater item_to_datum metadata for per-Datum "
+                    f"loss fields {per_datum_fields}; use collate_datums or an explicitly layout-aware collater"
                 )
             for name, value in loss_inputs.items():
-                if name == "labels" or not _is_token_aligned(value, full_weights):
+                if name == "labels" or loss_batch_layout.fields[name] is not LossInputLayout.PER_TOKEN:
                     continue
+                if not _is_token_aligned(value, token_reference):
+                    raise ValueError(f"per-token loss field {name!r} does not match the collated token layout")
                 key = f"{_LOSS_FIELD_PREFIX}{name}"
                 if key in cp_batch:
                     raise ValueError(f"model inputs contain reserved Engine key {key!r}")
@@ -547,12 +691,27 @@ class Engine:
                     )
             loss_inputs = local_loss_inputs
         else:
-            loss_inputs = self._shard_loss_inputs(sharder, loss_inputs, loss_seq_dim)
+            loss_inputs = self._shard_loss_inputs(
+                sharder,
+                loss_inputs,
+                loss_seq_dim,
+                loss_batch_layout.fields,
+                token_reference,
+                loss_batch_layout.unresolved_fields,
+            )
         if labels is not None:
             loss_inputs["labels"] = local_labels
         if mtp_cp_inputs is not None:
             loss_inputs = self._attach_mtp_cp_inputs(sharder, mtp_cp_inputs, model_inputs, loss_inputs)
-        return cp_context, model_inputs, loss_inputs
+            loss_batch_layout = _LossBatchLayout(
+                fields={
+                    **loss_batch_layout.fields,
+                    "mtp_per_depth_targets": LossInputLayout.PER_TOKEN,
+                },
+                item_to_datum=loss_batch_layout.item_to_datum,
+                unresolved_fields=loss_batch_layout.unresolved_fields,
+            )
+        return cp_context, model_inputs, loss_inputs, loss_batch_layout
 
     def _prepare_mtp_cp_inputs(self, batch: dict[str, Any]) -> MTPContextParallelInputs | None:
         """Prepare global MTP future-token tensors before CP shards the batch.
@@ -643,6 +802,7 @@ class Engine:
         loss_fn: LossFn,
         local_loss_sum: torch.Tensor,
         cp_context: Callable[[], AbstractContextManager[Any]],
+        loss_batch_layout: _LossBatchLayout,
         *,
         backward_scale: torch.Tensor | None,
         zero_weight_sum: bool,
@@ -656,6 +816,8 @@ class Engine:
             loss_fn: Model-output loss callback.
             local_loss_sum: Accumulator updated with detached numerators.
             cp_context: Context covering the complete pipeline schedule.
+            loss_batch_layout: Semantic layout of every loss field plus the
+                collater's logical item-to-Datum routing, when available.
             backward_scale: Multiplier returned to the training schedule for
                 backward, or ``None`` to run the forward-only schedule.
             zero_weight_sum: Whether reporting numerators must be forced to
@@ -666,6 +828,7 @@ class Engine:
             logical Datum order.
         """
         outputs_by_microbatch: list[list[dict[str, Any]] | None] = [None] * self.pipeline.num_microbatches
+        outputs_by_datum: list[dict[str, Any] | None] = [None] * len(datums)
         returns_outputs: bool | None = None
 
         with cp_context():
@@ -715,8 +878,13 @@ class Engine:
             # that metadata first so VLM media cursors are not reset after the
             # first actual pipeline microbatch.
             with self.context_fn(model_inputs):
-                model_microbatches, loss_microbatches = self._materialize_pipeline_microbatches(
-                    model_inputs, loss_inputs
+                model_microbatches, loss_microbatches, datum_indices_by_microbatch = (
+                    self._materialize_pipeline_microbatches(
+                        model_inputs,
+                        loss_inputs,
+                        loss_batch_layout,
+                        num_datums=len(datums),
+                    )
                 )
 
                 def pipeline_loss(output: Any, microbatch_index: int) -> torch.Tensor:
@@ -736,12 +904,31 @@ class Engine:
                             or not all(isinstance(item, Mapping) for item in batch_outputs)
                         ):
                             raise ValueError("loss_fn outputs must be a sequence of mappings")
-                        if len(datums) == 1 and self.pipeline.num_microbatches > 1:
+                        datum_indices = (
+                            None
+                            if datum_indices_by_microbatch is None
+                            else datum_indices_by_microbatch[microbatch_index]
+                        )
+                        if datum_indices is None and len(datums) == 1 and self.pipeline.num_microbatches > 1:
                             raise ValueError(
                                 "a prebatched Datum may return outputs only when num_microbatches=1 because "
                                 "its inner sample boundaries are not part of the Datum contract"
                             )
-                        outputs_by_microbatch[microbatch_index] = [_detach(dict(item)) for item in batch_outputs]
+                        detached_outputs = [_detach(dict(item)) for item in batch_outputs]
+                        if datum_indices is not None:
+                            if len(detached_outputs) != len(datum_indices):
+                                raise ValueError(
+                                    f"pipeline loss_fn returned {len(detached_outputs)} outputs for microbatch "
+                                    f"{microbatch_index}, expected {len(datum_indices)} from its Datum mapping"
+                                )
+                            for datum_index, item in zip(datum_indices, detached_outputs):
+                                if outputs_by_datum[datum_index] is not None:
+                                    raise RuntimeError(
+                                        f"pipeline returned more than one output for Datum {datum_index}"
+                                    )
+                                outputs_by_datum[datum_index] = item
+                        else:
+                            outputs_by_microbatch[microbatch_index] = detached_outputs
                     else:
                         losses = result
                     numerator = _weighted_numerator(losses, loss_inputs_mb["weights"])
@@ -763,14 +950,19 @@ class Engine:
 
         outputs: list[dict[str, Any]] = []
         if self.pipeline.info.has_last_stage and returns_outputs:
-            if any(items is None for items in outputs_by_microbatch):
-                raise RuntimeError("pipeline schedule did not evaluate loss_fn for every logical microbatch")
-            outputs = [item for items in outputs_by_microbatch if items is not None for item in items]
-            if len(outputs) != len(datums):
-                raise ValueError(
-                    f"pipeline loss_fn returned {len(outputs)} outputs across the outer batch, "
-                    f"expected one for each of its {len(datums)} Datums"
-                )
+            if datum_indices_by_microbatch is not None:
+                if any(item is None for item in outputs_by_datum):
+                    raise RuntimeError("pipeline schedule did not return exactly one output for every Datum")
+                outputs = [item for item in outputs_by_datum if item is not None]
+            else:
+                if any(items is None for items in outputs_by_microbatch):
+                    raise RuntimeError("pipeline schedule did not evaluate loss_fn for every logical microbatch")
+                outputs = [item for items in outputs_by_microbatch if items is not None for item in items]
+                if len(outputs) != len(datums):
+                    raise ValueError(
+                        f"pipeline loss_fn returned {len(outputs)} outputs across the outer batch, "
+                        f"expected one for each of its {len(datums)} Datums"
+                    )
         outputs = self._broadcast_pipeline_outputs(outputs)
         return bool(outputs), outputs
 
@@ -808,7 +1000,10 @@ class Engine:
         self,
         model_inputs: dict[str, Any],
         loss_inputs: LossInputs,
-    ) -> tuple[list[dict[str, Any]], list[LossInputs]]:
+        loss_batch_layout: _LossBatchLayout,
+        *,
+        num_datums: int,
+    ) -> tuple[list[dict[str, Any]], list[LossInputs], list[tuple[int, ...]] | None]:
         """Split one CP-prepared outer batch into exact pipeline inputs.
 
         Args:
@@ -817,31 +1012,46 @@ class Engine:
                 [microbatches, tokens, ...].
             loss_inputs: CP-local loss tensors. Token-aligned fields have the
                 same leading token axes as the primary model tensor.
+            loss_batch_layout: Semantic field layouts and optional collater
+                item-to-Datum mapping.
+            num_datums: Number of outer Datum items represented by this batch.
 
         Returns:
-            Parallel lists of complete model and loss mappings, each with
-            exactly ``pipeline.num_microbatches`` items. Tensor slicing returns
-            views that retain a size-one pipeline microbatch axis.
+            Parallel lists of complete model and loss mappings, plus optional
+            logical Datum indices for each microbatch. Every list has exactly
+            ``pipeline.num_microbatches`` items. Token slicing retains a
+            size-one pipeline microbatch axis.
         """
         num_microbatches = self.pipeline.num_microbatches
         if num_microbatches == 1:
-            return [dict(model_inputs)], [_with_loss_metadata(model_inputs, loss_inputs)]
+            datum_indices = [tuple(range(num_datums))]
+            if loss_batch_layout.item_to_datum is not None:
+                datum_indices = _pipeline_datum_indices(
+                    [model_inputs],
+                    loss_batch_layout.item_to_datum,
+                    num_datums=num_datums,
+                    is_thd=model_inputs.get("qkv_format") == "thd",
+                )
+                assert datum_indices is not None
+            return (
+                [dict(model_inputs)],
+                [_with_loss_metadata(model_inputs, loss_inputs)],
+                datum_indices,
+            )
 
         primary_name = _primary_name(model_inputs)
         primary = model_inputs[primary_name]
         if not isinstance(primary, torch.Tensor) or primary.ndim == 0:
             raise ValueError(f"pipeline Engine requires tensor {primary_name}")
 
-        if model_inputs.get("qkv_format") == "thd":
+        is_thd = model_inputs.get("qkv_format") == "thd"
+        if is_thd:
             if primary.shape[0] != num_microbatches:
                 raise ValueError(
                     f"THD sharder produced {primary.shape[0]} chunks, expected {num_microbatches} pipeline microbatches"
                 )
             model_microbatches = [
                 _select_chunk(model_inputs, index, num_microbatches) for index in range(num_microbatches)
-            ]
-            loss_microbatches = [
-                _select_chunk(loss_inputs, index, num_microbatches) for index in range(num_microbatches)
             ]
         else:
             batch_size = primary.shape[0]
@@ -863,16 +1073,33 @@ class Engine:
                 _slice_batch_mapping(model_inputs, index, num_microbatches, batch_size, custom_dims)
                 for index in range(num_microbatches)
             ]
-            loss_microbatches = [
-                _slice_batch_mapping(loss_inputs, index, num_microbatches, batch_size)
-                for index in range(num_microbatches)
-            ]
+
+        datum_indices_by_microbatch = _pipeline_datum_indices(
+            model_microbatches,
+            loss_batch_layout.item_to_datum,
+            num_datums=num_datums,
+            is_thd=is_thd,
+        )
+        loss_microbatches = [
+            _materialize_loss_mapping(
+                loss_inputs,
+                loss_batch_layout.fields,
+                loss_batch_layout.unresolved_fields,
+                index=index,
+                num_chunks=num_microbatches,
+                batch_size=None if is_thd else batch_size,
+                datum_indices=(None if datum_indices_by_microbatch is None else datum_indices_by_microbatch[index]),
+                num_datums=num_datums,
+                is_thd=is_thd,
+            )
+            for index in range(num_microbatches)
+        ]
 
         loss_microbatches = [
             _with_loss_metadata(model_microbatch, loss_microbatch)
             for model_microbatch, loss_microbatch in zip(model_microbatches, loss_microbatches)
         ]
-        return model_microbatches, loss_microbatches
+        return model_microbatches, loss_microbatches, datum_indices_by_microbatch
 
     def _validate_parallelism(self) -> None:
         """Validate topology plus backward-specific distributed contracts."""
@@ -1022,9 +1249,12 @@ class Engine:
     def _shard_loss_inputs(
         self,
         sharder: ContextParallelSharder,
-        loss_inputs: dict[str, torch.Tensor],
+        loss_inputs: LossInputs,
         seq_dim: int | None,
-    ) -> dict[str, torch.Tensor]:
+        layouts: Mapping[str, LossInputLayout],
+        token_reference: torch.Tensor,
+        unresolved_fields: frozenset[str],
+    ) -> LossInputs:
         """Apply the model batch's CP token layout to loss-only tensors.
 
         Args:
@@ -1034,40 +1264,93 @@ class Engine:
                 leading token axes is sharded identically.
             seq_dim: Sequence axis in the pre-CP loss tensors, or ``None`` when
                 the weights do not follow the model's token axes.
+            layouts: Explicit semantic layout for every loss field. Only
+                ``PER_TOKEN`` fields follow the context-parallel token shard.
+            token_reference: Tensor carrying the full collated token axes.
+            unresolved_fields: Legacy fields whose semantics were not declared
+                by their collater. Non-token legacy weights cannot cross a CP
+                layout change safely.
 
         Returns:
             Loss tensors in the model output's CP-local token layout. Non-token
             tensors are returned unchanged; the input mapping is not mutated.
         """
-        weights = loss_inputs["weights"]
-        layout = sharder.shard_layout
-        if self._cp_size() == 1 and layout is None:
-            return {name: value for name, value in loss_inputs.items() if name != "labels"}
+        shard_layout = sharder.shard_layout
         layout_changed = self._cp_size() > 1 or (
-            layout is not None
+            shard_layout is not None
             and (
-                layout.input_row_shape is not None
-                or layout.input_token_stream_positions is not None
-                or layout.original_seq_len != layout.padded_seq_len
+                shard_layout.input_row_shape is not None
+                or shard_layout.input_token_stream_positions is not None
+                or shard_layout.original_seq_len != shard_layout.padded_seq_len
             )
         )
+        if "weights" in unresolved_fields and layout_changed:
+            raise ValueError("context-parallel loss weights must match the model's token axes")
+        if self._cp_size() == 1 and shard_layout is None:
+            return {name: value for name, value in loss_inputs.items() if name != "labels"}
         if seq_dim is None:
-            if layout_changed:
-                raise ValueError("context-parallel loss weights must match the model's token axes")
-            return dict(loss_inputs)
+            if any(field_layout is LossInputLayout.PER_TOKEN for field_layout in layouts.values()):
+                raise ValueError("context-parallel per-token loss inputs must match the model's token axes")
+            return {name: value for name, value in loss_inputs.items() if name != "labels"}
 
-        local: dict[str, torch.Tensor] = {}
+        local: LossInputs = {}
         for name, value in loss_inputs.items():
             if name == "labels":
                 continue
-            token_aligned = value.ndim >= weights.ndim and tuple(value.shape[: weights.ndim]) == tuple(weights.shape)
-            local[name] = sharder.shard_token_tensor(value, seq_dim=seq_dim, fill=0) if token_aligned else value
+            if layouts[name] is not LossInputLayout.PER_TOKEN:
+                local[name] = value
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"per-token loss field {name!r} must be a Tensor before CP sharding")
+            token_aligned = _is_token_aligned(value, token_reference)
+            if not token_aligned:
+                raise ValueError(f"per-token loss field {name!r} does not match the collated token layout")
+            local[name] = sharder.shard_token_tensor(value, seq_dim=seq_dim, fill=0)
         return local
+
+    @staticmethod
+    def _validate_loss_batch_layout(
+        datums: Sequence[Datum],
+        model_inputs: Mapping[str, Any],
+        loss_inputs: Mapping[str, LossInputValue],
+        layouts: Mapping[str, LossInputLayout],
+    ) -> tuple[str | None, int | None]:
+        """Validate semantic loss layouts before any CP/PP transformation."""
+        if set(layouts) != set(loss_inputs):
+            raise ValueError("loss input layouts must describe every collated loss field exactly once")
+        weights = loss_inputs.get("weights")
+        if not isinstance(weights, torch.Tensor):
+            raise ValueError("collate_fn must return a Tensor loss input named 'weights'")
+        token_fields = [name for name, layout in layouts.items() if layout is LossInputLayout.PER_TOKEN]
+        token_reference_name = "weights" if layouts.get("weights") is LossInputLayout.PER_TOKEN else None
+        if token_reference_name is None and "labels" in token_fields:
+            token_reference_name = "labels"
+        if token_reference_name is None and token_fields:
+            token_reference_name = token_fields[0]
+        token_reference = loss_inputs.get(token_reference_name) if token_reference_name is not None else None
+        if token_reference_name is not None and not isinstance(token_reference, torch.Tensor):
+            raise TypeError(f"per-token loss field {token_reference_name!r} must be a Tensor")
+        loss_seq_dim = (
+            _loss_sequence_dim(model_inputs, token_reference) if isinstance(token_reference, torch.Tensor) else None
+        )
+        if token_reference_name is not None and loss_seq_dim is None:
+            raise ValueError(f"per-token loss field {token_reference_name!r} must match the primary model token axes")
+
+        for name, value in loss_inputs.items():
+            layout = layouts[name]
+            if layout is LossInputLayout.PER_TOKEN:
+                if not isinstance(value, torch.Tensor) or not _is_token_aligned(value, token_reference):
+                    raise ValueError(f"per-token loss field {name!r} does not match the collated token layout")
+            elif layout is LossInputLayout.PER_DATUM:
+                if not isinstance(value, torch.Tensor) or value.ndim == 0 or value.shape[0] != len(datums):
+                    shape = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+                    raise ValueError(f"per-Datum loss field {name!r} must have leading size {len(datums)}, got {shape}")
+        return token_reference_name, loss_seq_dim
 
     @staticmethod
     def _validate_collated_weights(
         datums: list[Datum],
-        loss_inputs: dict[str, torch.Tensor],
+        loss_inputs: Mapping[str, LossInputValue],
     ) -> None:
         weights = loss_inputs.get("weights")
         if not isinstance(weights, torch.Tensor):
@@ -1094,26 +1377,44 @@ def _to_device(value: Any, device: torch.device) -> Any:
     return value
 
 
-def _loss_sequence_dim(model_inputs: dict[str, Any], weights: torch.Tensor) -> int | None:
+def _model_token_template(model_inputs: Mapping[str, Any]) -> torch.Tensor:
+    """Return a tensor with exactly the primary model input's token axes."""
+    primary_name = _primary_name(model_inputs)
+    primary = model_inputs[primary_name]
+    if not isinstance(primary, torch.Tensor) or primary.ndim == 0:
+        raise ValueError("model primary input must be a non-scalar Tensor")
+    if primary_name == "inputs_embeds":
+        if primary.ndim < 2 or primary.shape[-1] == 0:
+            raise ValueError("inputs_embeds must contain token and hidden dimensions")
+        return primary.select(-1, 0)
+    return primary
+
+
+def _loss_sequence_dim(model_inputs: dict[str, Any], value: torch.Tensor) -> int | None:
     """Find the sequence axis shared by primary model tokens and loss weights.
 
     Args:
         model_inputs: Pre-CP model mapping whose ``input_ids`` has shape
             ``[batch, sequence]`` or ``[tokens]``, or whose ``inputs_embeds``
             has shape ``[batch, sequence, hidden]``.
-        weights: Loss weights of shape ``[batch, sequence]`` or ``[tokens]``.
+        value: Candidate token-aligned tensor. It may have trailing feature
+            dimensions after the primary input's token axes.
 
     Returns:
-        The sequence axis in ``weights``, or ``None`` when the layouts do not
+        The sequence axis in ``value``, or ``None`` when the layouts do not
         describe the same token stream.
     """
-    primary = model_inputs.get("inputs_embeds", model_inputs.get("input_ids"))
-    if not isinstance(primary, torch.Tensor):
+    try:
+        token_template = _model_token_template(model_inputs)
+    except ValueError:
         return None
-    if primary.ndim >= 2 and weights.ndim >= 2 and tuple(weights.shape[:2]) == tuple(primary.shape[:2]):
-        return 1
-    if primary.ndim == 1 and weights.ndim == 1 and weights.shape == primary.shape:
-        return 0
+    token_dims = token_template.ndim
+    if (
+        token_dims in {1, 2}
+        and value.ndim >= token_dims
+        and tuple(value.shape[:token_dims]) == tuple(token_template.shape)
+    ):
+        return token_dims - 1
     return None
 
 
@@ -1228,6 +1529,112 @@ def _slice_batch_mapping(
         for name, value in values.items()
         if value is not None and not (isinstance(value, dict) and not value)
     }
+
+
+def _pipeline_datum_indices(
+    model_microbatches: Sequence[Mapping[str, Any]],
+    item_to_datum: tuple[int, ...] | None,
+    *,
+    num_datums: int,
+    is_thd: bool,
+) -> list[tuple[int, ...]] | None:
+    """Map each materialized model microbatch back to its outer Datums."""
+    if item_to_datum is None:
+        if is_thd:
+            return None
+        row_count = sum(_padded_microbatch_size(microbatch) for microbatch in model_microbatches)
+        if row_count != num_datums:
+            return None
+        item_to_datum = tuple(range(num_datums))
+
+    if len(item_to_datum) != num_datums or sorted(item_to_datum) != list(range(num_datums)):
+        raise ValueError(
+            "collater item_to_datum must contain every outer Datum index exactly once; "
+            f"got {list(item_to_datum)} for {num_datums} Datums"
+        )
+
+    counts = [
+        _thd_microbatch_sequence_count(microbatch) if is_thd else _padded_microbatch_size(microbatch)
+        for microbatch in model_microbatches
+    ]
+    if sum(counts) != len(item_to_datum):
+        raise ValueError(
+            "collater item_to_datum does not match the materialized model items; "
+            f"microbatch counts are {counts}, mapping has {len(item_to_datum)} entries"
+        )
+
+    result: list[tuple[int, ...]] = []
+    start = 0
+    for count in counts:
+        result.append(item_to_datum[start : start + count])
+        start += count
+    return result
+
+
+def _padded_microbatch_size(model_inputs: Mapping[str, Any]) -> int:
+    primary = model_inputs[_primary_name(model_inputs)]
+    if not isinstance(primary, torch.Tensor) or primary.ndim == 0:
+        raise ValueError("padded pipeline microbatch requires a batched primary tensor")
+    return int(primary.shape[0])
+
+
+def _thd_microbatch_sequence_count(model_inputs: Mapping[str, Any]) -> int:
+    cu_seqlens = model_inputs.get("cu_seqlens")
+    if not isinstance(cu_seqlens, torch.Tensor):
+        raise ValueError("packed per-Datum routing requires tensor cu_seqlens in every pipeline microbatch")
+    valid = cu_seqlens.reshape(-1)
+    valid = valid[valid >= 0]
+    if valid.numel() < 2:
+        raise ValueError("packed pipeline microbatch must contain at least one sequence")
+    return int(valid.numel() - 1)
+
+
+def _materialize_loss_mapping(
+    loss_inputs: Mapping[str, LossInputValue],
+    layouts: Mapping[str, LossInputLayout],
+    unresolved_fields: frozenset[str],
+    *,
+    index: int,
+    num_chunks: int,
+    batch_size: int | None,
+    datum_indices: tuple[int, ...] | None,
+    num_datums: int,
+    is_thd: bool,
+) -> LossInputs:
+    """Materialize token, Datum, and replicated loss fields by semantics."""
+    result: LossInputs = {}
+    for name, value in loss_inputs.items():
+        if name in unresolved_fields:
+            if is_thd:
+                raise NotImplementedError(
+                    f"packed pipeline microbatching requires an explicit layout for loss field {name!r}"
+                )
+            assert batch_size is not None
+            result[name] = _slice_batch_mapping({name: value}, index, num_chunks, batch_size)[name]
+            continue
+        layout = layouts[name]
+        if layout is LossInputLayout.PER_TOKEN:
+            if is_thd:
+                result[name] = _select_chunk(value, index, num_chunks)
+            else:
+                assert batch_size is not None
+                result[name] = _slice_batch_mapping({name: value}, index, num_chunks, batch_size)[name]
+        elif layout is LossInputLayout.PER_DATUM:
+            if datum_indices is None:
+                raise NotImplementedError(
+                    f"pipeline microbatching cannot route per-Datum loss field {name!r} without "
+                    "collater item_to_datum metadata"
+                )
+            if not isinstance(value, torch.Tensor) or value.ndim == 0 or value.shape[0] != num_datums:
+                shape = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+                raise ValueError(f"per-Datum loss field {name!r} must have leading size {num_datums}, got {shape}")
+            indices = torch.tensor(datum_indices, dtype=torch.long, device=value.device)
+            result[name] = value.index_select(0, indices)
+        elif layout is LossInputLayout.REPLICATED:
+            result[name] = value
+        else:  # pragma: no cover - normalized by Datum/CollatedLossInputs
+            raise ValueError(f"unsupported loss layout {layout!r} for field {name!r}")
+    return result
 
 
 def _weighted_numerator(losses: Any, weights: torch.Tensor) -> torch.Tensor:

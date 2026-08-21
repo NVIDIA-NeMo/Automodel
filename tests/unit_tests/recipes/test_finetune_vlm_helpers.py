@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.datum import LossInputLayout
 from nemo_automodel.components.datasets.vlm.pp_media import (
     VLM_PP_MEDIA_KEY,
     chunk_step3_media,
@@ -508,6 +509,10 @@ def test_make_engine_datum_filters_raw_media_off_first_pipeline_stage():
     assert "pixel_values" not in datum.model_inputs
     assert "image_grid_thw" not in datum.model_inputs
     assert VLM_PP_MEDIA_KEY not in datum.model_inputs
+    assert datum.loss_fn_input_layouts == {
+        "labels": LossInputLayout.PER_TOKEN,
+        "weights": LossInputLayout.PER_TOKEN,
+    }
 
     recipe.pp.info.has_first_stage = True
     first_stage_datum = recipe._make_engine_datum(batch)
@@ -2116,6 +2121,10 @@ def test_vlm_validation_uses_engine_forward_and_aggregates_uneven_batches(monkey
         assert datums[0].model_inputs["pixel_values"] is batch["pixel_values"]
         assert datums[0].loss_fn_inputs["labels"] is batch["labels"]
         torch.testing.assert_close(datums[0].loss_fn_inputs["weights"], batch["labels"].ne(-100))
+        assert datums[0].loss_fn_input_layouts == {
+            "labels": LossInputLayout.PER_TOKEN,
+            "weights": LossInputLayout.PER_TOKEN,
+        }
         assert loss_fn == recipe._engine_validation_loss_fn
     assert allreduce.call_count == 2
     assert all("include_cp" not in call.kwargs for call in allreduce.call_args_list)

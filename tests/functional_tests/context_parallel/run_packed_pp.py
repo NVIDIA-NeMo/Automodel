@@ -12,20 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-GPU Engine/AutoPipeline parity for packed THD Llama.
+"""Engine/AutoPipeline parity for packed THD Llama.
 
 The test runs the same two-microbatch, four-document update through PP=2 from
 both raw THD metadata (``seq_lens``) and final THD metadata (``cu_seqlens``).
 Each path runs training, forward-only evaluation, then training again on the
 same pipeline. Evaluation must match a native eager Llama in summed loss and
 weight statistics without creating gradients; both surrounding training calls
-must match eager loss plus every local-stage gradient. A final padded two-Datum
-update verifies that Engine broadcasts the callback's per-Datum mappings to
-both pipeline ranks in logical input order.
+must match eager loss plus every local-stage gradient. Additional flat-Datum
+forwards cover explicit per-token, per-Datum, and replicated loss layouts for
+raw 2+2 and final-THD 3+1 document splits. A final padded two-Datum update
+verifies that Engine broadcasts callback mappings to both pipeline ranks in
+logical input order and that the same pipeline can return to training.
 
 Run with::
 
     torchrun --standalone --nproc-per-node=2 run_packed_pp.py
+
+Set ``CP_SIZE=2`` and use four ranks to run the forward-only PP2 x CP2
+explicit-layout checks::
+
+    CP_SIZE=2 torchrun --standalone --nproc-per-node=4 run_packed_pp.py
 """
 
 from __future__ import annotations
@@ -38,9 +45,17 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from transformers import LlamaConfig
 
-from nemo_automodel.components.datasets.datum import Datum
+from nemo_automodel.components.datasets.datum import (
+    CollatedLossInputs,
+    Datum,
+    LossInputLayout,
+    collate_datums,
+)
 from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
+from nemo_automodel.components.distributed.context_parallel.utils import (
+    attach_te_context_parallel,
+    make_cp_batch_for_te,
+)
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.models.common import BackendConfig
@@ -172,6 +187,103 @@ def _eager_reference(
     return eval_loss_sum.detach(), eval_weight_sum.detach(), loss.detach(), grads, raw_inputs, labels, weights
 
 
+def _explicit_layout_datums(device: torch.device, lengths: list[int]) -> list[Datum]:
+    """Build flat Datums carrying all three explicit loss-input layouts."""
+    datums = []
+    token_start = 1
+    for datum_index, length in enumerate(lengths):
+        input_ids = torch.arange(token_start, token_start + length, device=device)
+        datums.append(
+            Datum(
+                model_inputs={"input_ids": input_ids},
+                loss_fn_inputs={
+                    "labels": (input_ids + 1) % VOCAB_SIZE,
+                    "weights": torch.ones(length, dtype=torch.float32, device=device),
+                    "advantages": input_ids.to(torch.float32) / 10,
+                    "old_logprobs": -input_ids.to(torch.float32) / 20,
+                    "sample_id": torch.tensor((datum_index + 1) * 11, device=device),
+                    # Leading size equals the number of PP microbatches. It
+                    # must remain a complete replicated vector in both.
+                    "global_coefficients": torch.tensor([0.25, 0.75], device=device),
+                },
+                loss_fn_input_layouts={
+                    "labels": LossInputLayout.PER_TOKEN,
+                    "weights": LossInputLayout.PER_TOKEN,
+                    "advantages": LossInputLayout.PER_TOKEN,
+                    "old_logprobs": LossInputLayout.PER_TOKEN,
+                    "sample_id": LossInputLayout.PER_DATUM,
+                    "global_coefficients": LossInputLayout.REPLICATED,
+                },
+            )
+        )
+        token_start += length
+    return datums
+
+
+def _raw_explicit_layout_collate(datums: list[Datum]):
+    return collate_datums(datums, packed=True)
+
+
+def _final_explicit_layout_collate(datums: list[Datum]):
+    """Produce a model-ready flat THD stream while retaining layout metadata."""
+    model_inputs, loss_inputs = collate_datums(datums, packed=True)
+    lengths = torch.tensor(
+        [datum.seq_len for datum in datums], dtype=torch.int32, device=model_inputs["input_ids"].device
+    )
+    final_model_inputs = {
+        "input_ids": model_inputs["input_ids"].reshape(-1),
+        "position_ids": model_inputs["position_ids"].reshape(-1),
+        "cu_seqlens": F.pad(lengths.cumsum(0), (1, 0)).to(torch.int32),
+        "max_seqlen": lengths.max(),
+        "qkv_format": "thd",
+    }
+    final_loss_inputs = {
+        name: value.reshape(-1) if loss_inputs.layouts[name] is LossInputLayout.PER_TOKEN else value
+        for name, value in loss_inputs.items()
+    }
+    return final_model_inputs, CollatedLossInputs(
+        final_loss_inputs,
+        layouts=loss_inputs.layouts,
+        item_to_datum=loss_inputs.item_to_datum,
+    )
+
+
+def _explicit_layout_losses(output, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Use both RL-style token fields so their routing affects the numerator."""
+    return _token_losses(output, loss_inputs) + 0.01 * loss_inputs["advantages"] + 0.02 * loss_inputs["old_logprobs"]
+
+
+def _explicit_layout_eager_reference(
+    device: torch.device,
+    datums: list[Datum],
+    collate_fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute full-stream numerator and denominator for a layout-aware batch."""
+    model_inputs, loss_inputs = collate_fn(datums)
+    prepared = make_cp_batch_for_te(
+        None,
+        {**_clone_mapping(model_inputs), "labels": loss_inputs["labels"].clone()},
+    )
+    prepared = {
+        name: value.to(device) if isinstance(value, torch.Tensor) else value for name, value in prepared.items()
+    }
+    prepared_labels = prepared.pop("labels")
+    eager_loss_inputs = {
+        "labels": prepared_labels,
+        "weights": loss_inputs["weights"].reshape(-1).to(device),
+        "advantages": loss_inputs["advantages"].reshape(-1).to(device),
+        "old_logprobs": loss_inputs["old_logprobs"].reshape(-1).to(device),
+    }
+
+    model = _build_model(device).eval()
+    with torch.no_grad():
+        losses = _explicit_layout_losses(model(**prepared), eager_loss_inputs)
+        loss_sum = (losses * eager_loss_inputs["weights"]).sum()
+        weight_sum = eager_loss_inputs["weights"].sum()
+    del model
+    return loss_sum.detach(), weight_sum.detach()
+
+
 def _build_pipeline(
     device: torch.device,
     mesh_context: MeshContext,
@@ -189,6 +301,12 @@ def _build_pipeline(
         pp_seq_len=SEQ_LEN,
     ).build(model, loss_fn=_token_losses)
     del model
+    if mesh_context.cp_size > 1:
+        cp_mesh = mesh_context.device_mesh["cp"]
+        tp_mesh = mesh_context.device_mesh["tp"]
+        configured = sum(attach_te_context_parallel(part, cp_mesh, tp_mesh) for part in pipeline.parts)
+        if configured == 0:
+            raise AssertionError("PP2 x CP2 functional configured no Transformer Engine attention modules")
     return pipeline
 
 
@@ -320,6 +438,95 @@ def _run_thd_layout(
     return pipeline
 
 
+def _run_explicit_loss_layout_forward(
+    pipeline: AutoPipeline,
+    layout: str,
+    device: torch.device,
+    mesh_context: MeshContext,
+) -> None:
+    """Validate semantic loss routing for one real two-stage packed pipeline."""
+    if layout == "raw":
+        lengths = [4, 4, 4, 4] if mesh_context.cp_size > 1 else [2, 2, 2, 2]
+        collate_fn = _raw_explicit_layout_collate
+        expected_microbatch_ids = {(11, 22), (33, 44)}
+    elif layout == "final":
+        # Keep the uneven 3+1 Datum split while making every sequence length
+        # divisible by TE's 2*CP head/tail partition count under CP2.
+        lengths = [4, 4, 4, 12] if mesh_context.cp_size > 1 else [1, 1, 2, 4]
+        collate_fn = _final_explicit_layout_collate
+        expected_microbatch_ids = {(11, 22, 33), (44,)}
+    else:
+        raise ValueError(f"unknown explicit loss layout: {layout}")
+
+    for part in pipeline.parts:
+        part.zero_grad(set_to_none=True)
+
+    datums = _explicit_layout_datums(device, lengths)
+    reference_loss_sum, reference_weight_sum = _explicit_layout_eager_reference(device, datums, collate_fn)
+    expected_tokens_by_ids = {}
+    for ids in expected_microbatch_ids:
+        indices = [sample_id // 11 - 1 for sample_id in ids]
+        expected_tokens_by_ids[ids] = {
+            "advantages": torch.cat([datums[index].loss_fn_inputs["advantages"] for index in indices]),
+            "old_logprobs": torch.cat([datums[index].loss_fn_inputs["old_logprobs"] for index in indices]),
+        }
+
+    def loss_with_outputs(output, loss_inputs):
+        sample_ids = tuple(int(value) for value in loss_inputs["sample_id"].tolist())
+        if sample_ids not in expected_microbatch_ids:
+            raise AssertionError(f"PP2 {layout} routed unexpected sample IDs {sample_ids}")
+        expected_tokens = expected_tokens_by_ids[sample_ids]
+        valid_cu_seqlens = loss_inputs["cu_seqlens"].reshape(-1)
+        valid_cu_seqlens = valid_cu_seqlens[valid_cu_seqlens >= 0]
+        assert valid_cu_seqlens.numel() - 1 == len(sample_ids)
+        if mesh_context.cp_size > 1:
+            import transformer_engine_torch as tex
+
+            cp_mesh = mesh_context.device_mesh["cp"]
+            local_indices = tex.thd_get_partitioned_indices(
+                valid_cu_seqlens.to(torch.int32),
+                int(valid_cu_seqlens[-1].item()),
+                cp_mesh.size(),
+                cp_mesh.get_local_rank(),
+            ).to(device=device, dtype=torch.long)
+            expected_tokens = {name: value.index_select(0, local_indices) for name, value in expected_tokens.items()}
+        torch.testing.assert_close(loss_inputs["advantages"].reshape(-1), expected_tokens["advantages"])
+        torch.testing.assert_close(loss_inputs["old_logprobs"].reshape(-1), expected_tokens["old_logprobs"])
+        torch.testing.assert_close(
+            loss_inputs["global_coefficients"],
+            torch.tensor([0.25, 0.75], device=device),
+        )
+        assert loss_inputs["global_coefficients"].shape == (2,)
+        losses = _explicit_layout_losses(output, loss_inputs)
+        return losses, [{"sample_id": value} for value in loss_inputs["sample_id"]]
+
+    result = Engine(
+        pipeline,
+        device=device,
+        mesh_context=mesh_context,
+        microbatch_size=4,
+        collate_fn=collate_fn,
+    ).forward(datums, loss_with_outputs)
+
+    torch.testing.assert_close(result.loss_sum.float(), reference_loss_sum.float(), atol=4e-2, rtol=2e-3)
+    torch.testing.assert_close(result.weight_sum.float(), reference_weight_sum.float(), atol=0, rtol=0)
+    output_ids = torch.stack([item["sample_id"] for item in result.loss_fn_outputs]).to(torch.long)
+    expected_ids = torch.tensor([11, 22, 33, 44], device=device)
+    torch.testing.assert_close(output_ids, expected_ids)
+    gathered = [torch.empty_like(output_ids) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, output_ids)
+    assert all(torch.equal(ids, expected_ids) for ids in gathered)
+    if any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
+        raise AssertionError(f"PP2 {layout} explicit-layout forward unexpectedly created gradients")
+    if dist.get_rank() == 0:
+        datum_counts = "2+2" if layout == "raw" else "3+1"
+        print(
+            f"PP2 x CP{mesh_context.cp_size} {layout} explicit "
+            f"PER_TOKEN/PER_DATUM/REPLICATED routing passed ({datum_counts} Datums; "
+            f"loss_sum={result.loss_sum.item():.6f}, weight_sum={result.weight_sum.item():.1f})"
+        )
+
+
 def _run_padded_output_broadcast(pipeline: AutoPipeline, device: torch.device, mesh_context: MeshContext) -> None:
     for part in pipeline.parts:
         part.zero_grad(set_to_none=True)
@@ -369,15 +576,30 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    if dist.get_world_size() != 2:
-        raise ValueError("packed PP functional requires exactly two ranks")
+    cp_size = int(os.environ.get("CP_SIZE", "1"))
+    if cp_size not in {1, 2}:
+        raise ValueError(f"packed PP functional supports CP_SIZE 1 or 2, got {cp_size}")
+    expected_world_size = 2 * cp_size
+    if dist.get_world_size() != expected_world_size:
+        raise ValueError(
+            f"packed PP functional with CP_SIZE={cp_size} requires {expected_world_size} ranks, "
+            f"got {dist.get_world_size()}"
+        )
 
     mesh_context = MeshContext.build(
         FSDP2Config(),
-        ParallelismSizes(dp_size=1, pp_size=2),
+        ParallelismSizes(dp_size=1, pp_size=2, cp_size=cp_size),
         world_size=dist.get_world_size(),
     )
     try:
+        if cp_size > 1:
+            pipeline = _build_pipeline(device, mesh_context)
+            _run_explicit_loss_layout_forward(pipeline, "raw", device, mesh_context)
+            dist.barrier()
+            _run_explicit_loss_layout_forward(pipeline, "final", device, mesh_context)
+            dist.barrier()
+            return
+
         (
             reference_eval_loss_sum,
             reference_eval_weight_sum,
@@ -412,6 +634,10 @@ def main() -> None:
             labels,
             weights,
         )
+        dist.barrier()
+        _run_explicit_loss_layout_forward(final_pipeline, "raw", device, mesh_context)
+        dist.barrier()
+        _run_explicit_loss_layout_forward(final_pipeline, "final", device, mesh_context)
         dist.barrier()
         _run_padded_output_broadcast(final_pipeline, device, mesh_context)
         dist.barrier()

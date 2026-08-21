@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pickle
+from copy import copy, deepcopy
+
 import pytest
 import torch
 
 from nemo_automodel.components.datasets.datum import (
     CROSS_ENTROPY_IGNORE_IDX,
+    CollatedLossInputs,
     Datum,
+    LossInputLayout,
     collate_datums,
 )
 
@@ -77,6 +82,30 @@ def test_datum_accepts_model_specific_inputs():
     assert datum.seq_len == 2
 
 
+def test_datum_accepts_optional_loss_input_layouts():
+    datum = Datum(
+        input_ids=torch.tensor([1, 2]),
+        loss_fn_inputs={"weights": torch.ones(2)},
+        loss_fn_input_layouts={"weights": LossInputLayout.PER_TOKEN},
+    )
+    assert datum.loss_fn_input_layouts == {"weights": LossInputLayout.PER_TOKEN}
+
+
+def test_datum_rejects_invalid_loss_input_layouts():
+    with pytest.raises(ValueError, match="unknown loss inputs"):
+        Datum(
+            input_ids=torch.tensor([1]),
+            loss_fn_inputs={"weights": torch.ones(1)},
+            loss_fn_input_layouts={"missing": LossInputLayout.PER_TOKEN},
+        )
+    with pytest.raises(TypeError, match="must be a LossInputLayout"):
+        Datum(
+            input_ids=torch.tensor([1]),
+            loss_fn_inputs={"weights": torch.ones(1)},
+            loss_fn_input_layouts={"weights": "per_token"},  # type: ignore[dict-item]
+        )
+
+
 def test_to_features_applies_masking_convention():
     feats = _toy_datums()[0].to_features()
     assert feats["input_ids"] == [10, 11, 12]
@@ -101,6 +130,13 @@ def test_to_features_native_python_ints():
 
 def test_collate_padded_uses_default_collater_schema():
     batch, loss_inputs = collate_datums(_toy_datums())
+    assert isinstance(loss_inputs, CollatedLossInputs)
+    assert loss_inputs.layouts == {
+        "advantages": LossInputLayout.PER_TOKEN,
+        "target_tokens": LossInputLayout.PER_TOKEN,
+        "weights": LossInputLayout.PER_TOKEN,
+    }
+    assert loss_inputs.item_to_datum == (0, 1)
     assert batch["input_ids"].shape == (2, 3)
     assert batch["input_ids"][1].tolist() == [20, 21, 0]  # right-pad
     assert "labels" not in batch
@@ -148,6 +184,151 @@ def test_collate_packed_per_sample_side_input_is_one_per_datum():
     batch, loss_inputs = collate_datums(datums, packed=True)
     assert batch["input_ids"].shape == (1, 5)
     assert loss_inputs["advantages"].tolist() == pytest.approx([0.5, 0.9])
+    assert loss_inputs.layouts == {"advantages": LossInputLayout.PER_DATUM}
+    # Logical THD items are the two valid sequences, not the one physical row.
+    assert loss_inputs.item_to_datum == (0, 1)
+
+
+def test_collated_loss_inputs_copy_preserves_side_channel_and_dict_compatibility():
+    result = collate_datums(_toy_datums())
+    loss_inputs = result[1]
+
+    assert isinstance(result, tuple)
+    for copied in (
+        loss_inputs.copy(),
+        copy(loss_inputs),
+        deepcopy(loss_inputs),
+        pickle.loads(pickle.dumps(loss_inputs)),  # noqa: S301 - trusted in-process round trip
+    ):
+        assert isinstance(copied, CollatedLossInputs)
+        assert copied.keys() == loss_inputs.keys()
+        assert all(torch.equal(copied[key], loss_inputs[key]) for key in loss_inputs)
+        assert copied.layouts == loss_inputs.layouts
+        assert copied.item_to_datum == loss_inputs.item_to_datum
+
+
+def test_collated_loss_inputs_requires_complete_read_only_layouts():
+    with pytest.raises(ValueError, match="exactly"):
+        CollatedLossInputs(
+            {"weights": torch.ones(2)},
+            layouts={},
+            item_to_datum=(0,),
+        )
+
+    loss_inputs = CollatedLossInputs(
+        {"weights": torch.ones(2)},
+        layouts={"weights": LossInputLayout.PER_TOKEN},
+        item_to_datum=(index for index in [0]),  # type: ignore[arg-type]
+    )
+    assert loss_inputs.item_to_datum == (0,)
+    with pytest.raises(TypeError):
+        loss_inputs.layouts["weights"] = LossInputLayout.REPLICATED  # type: ignore[index]
+
+
+def test_collate_explicit_per_datum_overrides_single_token_shape_inference():
+    datum = Datum(
+        input_ids=torch.tensor([7]),
+        loss_fn_inputs={"advantage": torch.tensor([0.5])},
+        loss_fn_input_layouts={"advantage": LossInputLayout.PER_DATUM},
+    )
+
+    _, loss_inputs = collate_datums([datum])
+
+    assert loss_inputs["advantage"].shape == (1,)
+    assert loss_inputs.layouts == {"advantage": LossInputLayout.PER_DATUM}
+
+
+@pytest.mark.parametrize(
+    ("layout", "value", "message"),
+    [
+        (LossInputLayout.PER_TOKEN, torch.tensor(1.0), "PER_TOKEN"),
+        (LossInputLayout.PER_DATUM, torch.ones(2), "PER_DATUM"),
+    ],
+)
+def test_collate_validates_explicit_loss_input_layout(layout, value, message):
+    datum = Datum(
+        input_ids=torch.tensor([1, 2]),
+        loss_fn_inputs={"field": value},
+        loss_fn_input_layouts={"field": layout},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        collate_datums([datum])
+
+
+def test_collate_rejects_conflicting_explicit_layouts():
+    datums = [
+        Datum(
+            input_ids=torch.tensor([1]),
+            loss_fn_inputs={"field": torch.tensor([0.5])},
+            loss_fn_input_layouts={"field": LossInputLayout.PER_TOKEN},
+        ),
+        Datum(
+            input_ids=torch.tensor([2]),
+            loss_fn_inputs={"field": torch.tensor([0.9])},
+            loss_fn_input_layouts={"field": LossInputLayout.PER_DATUM},
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="same explicit layout"):
+        collate_datums(datums)
+
+
+def test_collate_rejects_partially_declared_layouts():
+    datums = [
+        Datum(
+            input_ids=torch.tensor([1]),
+            loss_fn_inputs={"field": torch.tensor([0.5])},
+            loss_fn_input_layouts={"field": LossInputLayout.PER_TOKEN},
+        ),
+        Datum(
+            input_ids=torch.tensor([2]),
+            loss_fn_inputs={"field": torch.tensor([0.9])},
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="every Datum must declare"):
+        collate_datums(datums)
+
+
+def test_collate_replicated_input_keeps_one_identical_value():
+    shared = torch.tensor([0.1, 0.2])
+    datums = [
+        Datum(
+            input_ids=torch.tensor([1, 2]),
+            loss_fn_inputs={"coefficients": shared},
+            loss_fn_input_layouts={"coefficients": LossInputLayout.REPLICATED},
+        ),
+        Datum(
+            input_ids=torch.tensor([3]),
+            loss_fn_inputs={"coefficients": shared.clone()},
+            loss_fn_input_layouts={"coefficients": LossInputLayout.REPLICATED},
+        ),
+    ]
+
+    _, loss_inputs = collate_datums(datums, packed=True)
+
+    assert loss_inputs["coefficients"] is shared
+    assert loss_inputs.layouts == {"coefficients": LossInputLayout.REPLICATED}
+    assert loss_inputs.item_to_datum == (0, 1)
+
+
+def test_collate_replicated_input_requires_equal_values():
+    datums = [
+        Datum(
+            input_ids=torch.tensor([1]),
+            loss_fn_inputs={"coefficient": torch.tensor(0.1)},
+            loss_fn_input_layouts={"coefficient": LossInputLayout.REPLICATED},
+        ),
+        Datum(
+            input_ids=torch.tensor([2]),
+            loss_fn_inputs={"coefficient": torch.tensor(0.2)},
+            loss_fn_input_layouts={"coefficient": LossInputLayout.REPLICATED},
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="same value"):
+        collate_datums(datums)
 
 
 def test_collate_carries_per_token_float_side_inputs():

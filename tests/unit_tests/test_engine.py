@@ -27,9 +27,16 @@ import torch.nn.functional as F
 from torch import nn
 
 import nemo_automodel.engine as engine_module
+from nemo_automodel import CollatedLossInputs as PublicCollatedLossInputs
 from nemo_automodel import Datum as PublicDatum
 from nemo_automodel import Engine as PublicEngine
-from nemo_automodel.components.datasets.datum import Datum, collate_datums
+from nemo_automodel import LossInputLayout as PublicLossInputLayout
+from nemo_automodel.components.datasets.datum import (
+    CollatedLossInputs,
+    Datum,
+    LossInputLayout,
+    collate_datums,
+)
 from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel.sharder import (
@@ -193,6 +200,8 @@ def _identity_loss(output, _loss_inputs):
 def test_engine_and_datum_are_lazy_top_level_exports():
     assert PublicEngine is Engine
     assert PublicDatum is Datum
+    assert PublicLossInputLayout is LossInputLayout
+    assert PublicCollatedLossInputs is CollatedLossInputs
 
 
 def test_forward_runs_eval_without_grad_lifecycle_and_returns_local_statistics(monkeypatch):
@@ -402,6 +411,63 @@ def test_context_parallel_shards_model_and_rl_loss_inputs_together():
     assert model.weight.grad.item() == pytest.approx(11 / 6)
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(2.0)
     assert not cp_context_active
+
+
+def test_context_parallel_rejects_legacy_non_token_weights():
+    class CPModel(ScaleModel):
+        def prepare_model_inputs_for_cp(self, batch, *, num_chunks):
+            assert num_chunks == 1
+            return {
+                "cp_sharder": ContextParallelSharder(
+                    shard_batch=lambda *args, **kwargs: shard_batch_contiguous(
+                        *args,
+                        pad_multiple=1,
+                        **kwargs,
+                    ),
+                    local_token_global_indices=contiguous_local_indices,
+                )
+            }
+
+    model = CPModel()
+    mesh_context = SimpleNamespace(pp_size=1, cp_size=2, device_mesh=_CPMesh(size=2, rank=0))
+    datum = Datum(
+        model_inputs={"input_ids": torch.tensor([[1, 2, 3, 4]])},
+        loss_fn_inputs={
+            "labels": torch.tensor([[2, 3, 4, -100]]),
+            "weights": torch.tensor([1.0]),
+        },
+    )
+
+    with pytest.raises(ValueError, match="context-parallel loss weights must match"):
+        Engine(
+            model,
+            device="cpu",
+            mesh_context=mesh_context,
+            collate_fn=collate_prebatched,
+        ).forward([datum], _identity_loss)
+    assert model.forward_calls == 0
+
+
+def test_packed_thd_rejects_legacy_non_token_weights_without_pp_splitting():
+    model = ScaleModel()
+    model.backend = SimpleNamespace(attn="te")
+    datum = Datum(
+        model_inputs={
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3]]),
+            "seq_lens": torch.tensor([[4]], dtype=torch.int32),
+            "seq_lens_padded": torch.tensor([[4]], dtype=torch.int32),
+            "qkv_format": "thd",
+        },
+        loss_fn_inputs={
+            "labels": torch.tensor([[2, 3, 4, -100]]),
+            "weights": torch.tensor([1.0]),
+        },
+    )
+
+    with pytest.raises(ValueError, match="packed THD.*token-aligned loss weights"):
+        Engine(model, device="cpu", collate_fn=collate_prebatched).forward([datum], _identity_loss)
+    assert model.forward_calls == 0
 
 
 @pytest.mark.parametrize("execution", ["forward", "forward_backward"])
@@ -1003,62 +1069,236 @@ def test_pipeline_default_packed_collater_splits_flat_datums_inside_engine():
     assert [item["input_ids"].shape for item in pipeline.prepared_inputs[0]] == [(1, 4), (1, 4)]
 
 
-def test_pipeline_default_packed_collater_rejects_ambiguous_per_datum_loss_fields():
+def _packed_layout_datums(lengths: list[int]) -> list[Datum]:
+    """Build flat Datums whose three loss layouts are easy to distinguish."""
+    datums = []
+    token_start = 1
+    for datum_index, length in enumerate(lengths):
+        input_ids = torch.arange(token_start, token_start + length)
+        datums.append(
+            Datum(
+                model_inputs={"input_ids": input_ids},
+                loss_fn_inputs={
+                    "weights": torch.ones(length),
+                    "advantages": input_ids.to(torch.float32) * 10,
+                    "old_logprobs": -input_ids.to(torch.float32),
+                    "sample_id": torch.tensor((datum_index + 1) * 11),
+                    # Its leading extent deliberately collides with PP=2. A
+                    # shape-based splitter would silently turn this into one
+                    # value per microbatch instead of replicating it intact.
+                    "global_coefficients": torch.tensor([701.0, 709.0]),
+                },
+                loss_fn_input_layouts={
+                    "weights": LossInputLayout.PER_TOKEN,
+                    "advantages": LossInputLayout.PER_TOKEN,
+                    "old_logprobs": LossInputLayout.PER_TOKEN,
+                    "sample_id": LossInputLayout.PER_DATUM,
+                    "global_coefficients": LossInputLayout.REPLICATED,
+                },
+            )
+        )
+        token_start += length
+    return datums
+
+
+def _final_thd_layout_collate(datums: list[Datum]):
+    """Convert canonical packed output to final THD without dropping layout metadata."""
+    model_inputs, loss_inputs = collate_datums(datums, packed=True)
+    lengths = torch.tensor([datum.seq_len for datum in datums], dtype=torch.int32)
+    final_model_inputs = {
+        "input_ids": model_inputs["input_ids"].reshape(-1),
+        "position_ids": model_inputs["position_ids"].reshape(-1),
+        "cu_seqlens": F.pad(lengths.cumsum(0), (1, 0)).to(torch.int32),
+        "max_seqlen": lengths.max(),
+        "qkv_format": "thd",
+    }
+    final_loss_inputs = {
+        name: value.reshape(-1) if loss_inputs.layouts[name] is LossInputLayout.PER_TOKEN else value
+        for name, value in loss_inputs.items()
+    }
+    return final_model_inputs, CollatedLossInputs(
+        final_loss_inputs,
+        layouts=loss_inputs.layouts,
+        item_to_datum=loss_inputs.item_to_datum,
+    )
+
+
+@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+def test_pipeline_raw_thd_routes_explicit_loss_layouts_and_outputs_in_datum_order(execution):
+    model = ScaleModel()
+    model.backend = SimpleNamespace(attn="te")
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
+    datums = _packed_layout_datums([2, 2, 2, 2])
+    seen = []
+
+    def loss_with_outputs(output, loss_inputs):
+        torch.testing.assert_close(loss_inputs["global_coefficients"], torch.tensor([701.0, 709.0]))
+        assert loss_inputs["global_coefficients"].shape == (2,)
+        torch.testing.assert_close(loss_inputs["advantages"], output * 10)
+        torch.testing.assert_close(loss_inputs["old_logprobs"], -output)
+        sample_ids = loss_inputs["sample_id"].clone()
+        seen.append(sample_ids.tolist())
+        return output, [{"sample_id": sample_id} for sample_id in sample_ids]
+
+    engine = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+        microbatch_size=4,
+        collate_fn=partial(collate_datums, packed=True),
+    )
+    result = getattr(engine, execution)(datums, loss_with_outputs)
+
+    assert seen == [[33, 44], [11, 22]]
+    if execution == "forward":
+        assert result.loss_sum.item() == pytest.approx(36.0)
+        assert result.weight_sum.item() == pytest.approx(8.0)
+        outputs = result.loss_fn_outputs
+        assert pipeline.eval_calls == 1
+        assert pipeline.step_calls == 0
+        assert pipeline.backward_calls == 0
+        assert model.weight.grad is None
+    else:
+        loss, outputs = result
+        assert loss.item() == pytest.approx(4.5)
+        assert pipeline.eval_calls == 0
+        assert pipeline.step_calls == 1
+        assert pipeline.backward_calls == 2
+        assert model.weight.grad.item() == pytest.approx(4.5)
+    assert [item["sample_id"].item() for item in outputs] == [11, 22, 33, 44]
+
+
+def test_pipeline_packed_legacy_collater_metadata_stripping_fails_closed():
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
     pipeline = _FakeAutoPipeline(model, num_microbatches=2)
-    datums = [
-        Datum(
-            model_inputs={"input_ids": torch.tensor([index, index + 1])},
-            loss_fn_inputs={"weights": torch.ones(2), "reward": torch.tensor(float(index))},
-        )
-        for index in (1, 3, 5, 7)
-    ]
+    datums = _packed_layout_datums([2, 2, 2, 2])
 
-    with pytest.raises(NotImplementedError, match="per-Datum loss fields.*reward"):
+    def strip_layout_metadata(items):
+        model_inputs, loss_inputs = collate_datums(items, packed=True)
+        return model_inputs, dict(loss_inputs)
+
+    with pytest.raises(NotImplementedError, match="item_to_datum metadata"):
         Engine(
             pipeline,
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
             microbatch_size=4,
-            collate_fn=partial(collate_datums, packed=True),
-        ).forward_backward(datums, _identity_loss)
+            collate_fn=strip_layout_metadata,
+        ).forward(datums, _identity_loss)
+
+    assert pipeline.eval_calls == 0
 
 
-def test_pipeline_outputs_allow_uneven_datum_counts_at_final_thd_boundaries():
+def test_pipeline_final_thd_routes_three_plus_one_datums_and_restores_output_order():
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
     pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
-    datums = [_datum([1]), _datum([2]), _datum([3]), _datum([4, 5, 6])]
+    datums = _packed_layout_datums([1, 1, 2, 4])
+    seen = []
 
-    def final_thd_collate(items):
-        lengths = [datum.seq_len for datum in items]
-        tokens = torch.cat([datum.input_ids for datum in items])
-        return (
-            {
-                "input_ids": tokens,
-                "position_ids": torch.cat([torch.arange(length) for length in lengths]),
-                "cu_seqlens": torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32),
-                "max_seqlen": torch.tensor(max(lengths), dtype=torch.int32),
-                "qkv_format": "thd",
-            },
-            {"weights": torch.cat([datum.loss_fn_inputs["weights"] for datum in items])},
-        )
+    def loss_with_outputs(output, loss_inputs):
+        torch.testing.assert_close(loss_inputs["global_coefficients"], torch.tensor([701.0, 709.0]))
+        assert loss_inputs["global_coefficients"].shape == (2,)
+        torch.testing.assert_close(loss_inputs["advantages"], output * 10)
+        torch.testing.assert_close(loss_inputs["old_logprobs"], -output)
+        sample_ids = loss_inputs["sample_id"].clone()
+        seen.append(sample_ids.tolist())
+        return output, [{"sample_id": sample_id} for sample_id in sample_ids]
 
-    def loss_with_outputs(output, _loss_inputs):
-        first_token = int(output.reshape(-1)[0].item())
-        ids = [1, 2, 3] if first_token == 1 else [4]
-        return output, [{"datum_id": torch.tensor(datum_id)} for datum_id in ids]
-
-    _, outputs = Engine(
+    result = Engine(
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
         microbatch_size=4,
-        collate_fn=final_thd_collate,
-    ).forward_backward(datums, loss_with_outputs)
+        collate_fn=_final_thd_layout_collate,
+    ).forward(datums, loss_with_outputs)
 
-    assert [item["datum_id"].item() for item in outputs] == [1, 2, 3, 4]
+    assert result.loss_sum.item() == pytest.approx(36.0)
+    assert result.weight_sum.item() == pytest.approx(8.0)
+    assert seen == [[44], [11, 22, 33]]
+    assert [item["sample_id"].item() for item in result.loss_fn_outputs] == [11, 22, 33, 44]
+
+
+def test_pipeline_final_thd_rejects_wrong_outputs_even_when_window_total_matches():
+    model = ScaleModel()
+    model.backend = SimpleNamespace(attn="te")
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
+    datums = _packed_layout_datums([1, 1, 2, 4])
+
+    with pytest.raises(ValueError, match="returned 2 outputs for microbatch 1, expected 1"):
+        Engine(
+            pipeline,
+            device="cpu",
+            mesh_context=_pipeline_mesh_context(),
+            microbatch_size=4,
+            collate_fn=_final_thd_layout_collate,
+        ).forward(
+            datums,
+            lambda output, _loss_inputs: (output, [{"wrong": 0}, {"wrong": 1}]),
+        )
+
+
+def test_engine_rejects_collater_item_reordering_before_execution():
+    datums = _packed_layout_datums([2, 2])
+
+    def reordered_collate(items):
+        model_inputs, loss_inputs = collate_datums(items)
+        return model_inputs, CollatedLossInputs(
+            loss_inputs,
+            layouts=loss_inputs.layouts,
+            item_to_datum=(1, 0),
+        )
+
+    with pytest.raises(ValueError, match="preserve outer Datum order"):
+        Engine(
+            ScaleModel(),
+            device="cpu",
+            microbatch_size=2,
+            collate_fn=reordered_collate,
+        ).forward(datums, _identity_loss)
+
+
+def test_engine_keeps_weights_as_a_per_token_contract():
+    datum = Datum(
+        model_inputs={"input_ids": torch.tensor([1])},
+        loss_fn_inputs={"weights": torch.tensor([1.0])},
+        loss_fn_input_layouts={"weights": LossInputLayout.PER_DATUM},
+    )
+
+    with pytest.raises(ValueError, match="weights.*PER_TOKEN"):
+        Engine(ScaleModel(), device="cpu").forward([datum], _identity_loss)
+
+
+def test_pipeline_single_microbatch_validates_thd_item_count():
+    model = ScaleModel()
+    model.backend = SimpleNamespace(attn="te")
+    pipeline = _FakeAutoPipeline(model, num_microbatches=1)
+    datum = _datum([1, 2])
+
+    def two_sequence_collate(_items):
+        return (
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "position_ids": torch.tensor([0, 0]),
+                "cu_seqlens": torch.tensor([0, 1, 2], dtype=torch.int32),
+                "max_seqlen": torch.tensor(1, dtype=torch.int32),
+                "qkv_format": "thd",
+            },
+            CollatedLossInputs(
+                {"weights": torch.ones(2)},
+                layouts={"weights": LossInputLayout.PER_TOKEN},
+                item_to_datum=(0,),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="item_to_datum does not match"):
+        Engine(
+            pipeline,
+            device="cpu",
+            mesh_context=_pipeline_mesh_context(),
+            collate_fn=two_sequence_collate,
+        ).forward([datum], _identity_loss)
 
 
 def test_pipeline_output_sync_finds_last_stage_on_physical_rank_zero(monkeypatch):
@@ -1126,6 +1366,39 @@ def test_pipeline_prebatched_outputs_require_one_inner_microbatch():
             [datum],
             lambda output, _inputs: (output, [{"metric": output.sum()}]),
         )
+
+
+def test_pipeline_prebatched_per_datum_field_without_item_mapping_is_rejected():
+    model = ScaleModel()
+    model.backend = SimpleNamespace(attn="te")
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2)
+    datum = Datum(
+        model_inputs={
+            "input_ids": torch.arange(1, 9),
+            "position_ids": torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]),
+            "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
+            "max_seqlen": torch.tensor(4, dtype=torch.int32),
+            "qkv_format": "thd",
+        },
+        loss_fn_inputs={
+            "weights": torch.ones(8),
+            "sample_id": torch.tensor([17]),
+        },
+        loss_fn_input_layouts={
+            "weights": LossInputLayout.PER_TOKEN,
+            "sample_id": LossInputLayout.PER_DATUM,
+        },
+    )
+
+    with pytest.raises(NotImplementedError, match="item_to_datum metadata"):
+        Engine(
+            pipeline,
+            device="cpu",
+            mesh_context=_pipeline_mesh_context(),
+            collate_fn=collate_prebatched,
+        ).forward([datum], _identity_loss)
+
+    assert pipeline.eval_calls == 0
 
 
 def test_pipeline_final_thd_embeddings_use_the_token_axis_for_sequence_length():

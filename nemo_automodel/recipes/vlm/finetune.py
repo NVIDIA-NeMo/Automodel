@@ -47,7 +47,7 @@ from nemo_automodel._transformers import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.datum import Datum
+from nemo_automodel.components.datasets.datum import Datum, LossInputLayout
 from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -932,6 +932,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         return Datum(
             model_inputs=model_inputs,
             loss_fn_inputs={"labels": labels, "weights": labels.ne(-100)},
+            loss_fn_input_layouts={
+                "labels": LossInputLayout.PER_TOKEN,
+                "weights": LossInputLayout.PER_TOKEN,
+            },
         )
 
     def _engine_loss_fn(
