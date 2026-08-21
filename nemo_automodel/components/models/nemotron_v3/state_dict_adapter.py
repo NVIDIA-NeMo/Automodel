@@ -136,8 +136,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         TE/DeepEP is configured for distributed runs, but the MoE layer deliberately falls back to ``GroupedExperts``
         when world size is one. The adapter configuration still says ``experts="te"``, so the legacy converter assumes
         the grouped tensors are TE stack copies and rebuilds them. For non-gated ReLU-squared experts, the runtime
-        grouped tensors instead provide per-expert transposed views that write through to final storage. Expert bias
-        and other activations retain the allocating fallback until their layouts have concrete coverage.
+        grouped tensors instead provide per-expert transposed views of the model's weight memory. Expert bias and
+        other activations keep the full-checkpoint fallback until their layouts have concrete coverage.
         """
         return (
             self.moe_config is not None
@@ -160,9 +160,9 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             device_mesh: Must be ``None``. Distributed expert parameters require a rank-symmetric group plan.
 
         Returns:
-            Iterator whose first group contains ordinary parameter aliases and whose remaining groups contain one
-            complete MoE layer each. Expert destinations use HF shapes [expert_hidden, hidden] for ``up_proj`` and
-            [hidden, expert_hidden] for ``down_proj`` and are transposed views of final grouped parameter storage.
+            Iterator whose first group contains ordinary parameters and whose remaining groups contain one complete
+            MoE layer each. Expert destinations use HF shapes [expert_hidden, hidden] for ``up_proj`` and
+            [hidden, expert_hidden] for ``down_proj`` while using the grouped model weights as their memory.
 
         Raises:
             RuntimeError: If this adapter configuration did not opt into streaming checkpoint loading.
@@ -258,13 +258,13 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                     f"Ordinary Nemotron destination {checkpoint_name} is {type(checkpoint_destination).__name__}, "
                     "expected Tensor"
                 )
-            aliases_parameter = (
+            uses_parameter_memory = (
                 checkpoint_destination.device == destination.device
                 and checkpoint_destination.untyped_storage().data_ptr() == destination.untyped_storage().data_ptr()
             )
-            if not aliases_parameter:
+            if not uses_parameter_memory:
                 raise ValueError(
-                    f"Ordinary Nemotron destination {checkpoint_name} does not alias final parameter {native_name}"
+                    f"Ordinary Nemotron destination {checkpoint_name} does not use model parameter {native_name} memory"
                 )
             if checkpoint_name in ordinary_destinations:
                 raise ValueError(f"Duplicate ordinary Nemotron checkpoint destination: {checkpoint_name}")
