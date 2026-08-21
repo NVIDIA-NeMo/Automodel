@@ -1351,7 +1351,7 @@ class Checkpointer:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
                 if is_rank_0():
                     logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
-            except BaseException as e:  # noqa: B036 - re-raised on the main thread in async_wait
+            except BaseException as e:  # Re-raised on the main thread in async_wait.
                 self._consolidation_error = e
 
         self._consolidation_thread = threading.Thread(
