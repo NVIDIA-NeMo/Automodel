@@ -29,6 +29,7 @@ from nemo_automodel.components.models.minimax_m2.model import MiniMaxM2ForCausal
 from nemo_automodel.components.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.shared.import_utils import is_peft_min_version
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MINIMAX_RECIPE = _REPO_ROOT / "examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml"
@@ -124,18 +125,23 @@ def _make_adapter_and_state(family: str, rank: int):
 def _paramwrapper_delta(lora_a: torch.Tensor, lora_b: torch.Tensor, num_experts: int, scale: float):
     """Compute the grouped expert delta represented by PEFT ParamWrapper tensors.
 
+    Mirrors ParamWrapper.get_delta_weight for the installed peft: 0.19.1
+    flipped the in/out interpretation of non-transposed 3-D parameters
+    (huggingface/peft#3165), which swaps the einsum output order.
+
     Args:
-        lora_a: Tensor of shape [rank * experts, input].
-        lora_b: Tensor of shape [output, rank * experts].
+        lora_a: Tensor of shape [rank * experts, features].
+        lora_b: Tensor of shape [features, rank * experts].
         num_experts: Number of experts folded into the rank axes.
         scale: LoRA scaling factor.
 
     Returns:
-        Tensor of shape [experts, input, output].
+        Tensor shaped like the wrapped expert parameter.
     """
     lora_a = lora_a.reshape(num_experts, -1, lora_a.shape[-1])
     lora_b = lora_b.reshape(lora_b.shape[0], -1, num_experts)
-    return torch.einsum("ore,eri->eio", lora_b, lora_a) * scale
+    equation = "ore,eri->eoi" if is_peft_min_version("0.19.1") else "ore,eri->eio"
+    return torch.einsum(equation, lora_b, lora_a) * scale
 
 
 @pytest.mark.parametrize("family", ["nemotron_v3", "minimax_m2"])
