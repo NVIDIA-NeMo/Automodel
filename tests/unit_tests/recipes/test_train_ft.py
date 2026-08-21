@@ -31,6 +31,7 @@ from nemo_automodel.components.datasets.datum import LossInputLayout
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 from torch.utils.data import IterableDataset
 
+from nemo_automodel._transformers.mfu import MFUConfig
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
@@ -49,6 +50,16 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_model,
     compute_trust_remote_code_from_model,
 )
+
+
+def test_recipe_config_resolves_mfu_settings():
+    config = RecipeConfig(ConfigNode({"mfu": {"device": "h100", "peak_tflops": 1979.0}}))
+
+    assert config.mfu == MFUConfig(device="h100", peak_tflops=1979.0)
+
+
+def test_recipe_config_defaults_mfu_settings():
+    assert RecipeConfig(ConfigNode({})).mfu == MFUConfig()
 
 
 def _build_loader(
@@ -1866,15 +1877,20 @@ def test_pp_autoconfig_failure_skips_masks(caplog):
     add_masks.assert_not_called()
 
 
-def test_pp_deepseek_v4_skips_masks(caplog):
-    """DeepSeek V4 computes masks internally, so PP mask precomputation is skipped."""
+@pytest.mark.parametrize(
+    "model_type",
+    ["deepseek_v4", "glm_moe_dsa"],
+)
+def test_pp_custom_sparse_model_skips_masks(caplog, model_type):
+    """Custom sparse models compute masks internally, so PP precomputation is skipped."""
     calls = []
     cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "deepseek-ai/DeepSeek-V4-Pro"})
+    model_name = "zai-org/GLM-5.2" if model_type == "glm_moe_dsa" else "deepseek-ai/DeepSeek-V4-Pro"
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": model_name})
     with (
         patch(
             "nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained",
-            return_value=MagicMock(model_type="deepseek_v4"),
+            return_value=MagicMock(model_type=model_type),
         ),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.INFO),
@@ -1884,7 +1900,7 @@ def test_pp_deepseek_v4_skips_masks(caplog):
     collate_fn(["dummy"])
     assert calls == ["base"]
     add_masks.assert_not_called()
-    assert "Skipping pipeline parallel causal mask precomputation for model_type=deepseek_v4" in caplog.text
+    assert f"Skipping pipeline parallel causal mask precomputation for model_type={model_type}" in caplog.text
 
 
 def test_pp_autoconfig_success_chains_masks():

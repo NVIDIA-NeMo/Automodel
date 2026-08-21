@@ -15,7 +15,7 @@
 import inspect
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal
 
 import torch
 import torch.nn as nn
@@ -43,11 +43,11 @@ class PipelineInfo:
     """Runtime state produced by pipeline-parallel setup."""
 
     enabled: bool
-    schedule: Optional[_PipelineSchedule]
+    schedule: _PipelineSchedule | None
     has_first_stage: bool
     has_last_stage: bool
-    model_parts: Optional[list[nn.Module]]
-    stages: Optional[list[PipelineStage]]
+    model_parts: list[nn.Module] | None
+    stages: list[PipelineStage] | None
 
 
 class AutoPipeline:
@@ -56,33 +56,33 @@ class AutoPipeline:
     def __init__(
         self,
         # Device Mesh
-        world_mesh: Optional[DeviceMesh] = None,
-        moe_mesh: Optional[DeviceMesh] = None,
+        world_mesh: DeviceMesh | None = None,
+        moe_mesh: DeviceMesh | None = None,
         pp_axis_name: str = "pp",
         dp_axis_names: tuple[str, ...] = ("dp",),
-        cp_axis_name: Optional[str] = None,
-        tp_axis_name: Optional[str] = None,
-        ep_axis_name: Optional[str] = None,
-        ep_shard_axis_names: Optional[tuple[str, ...]] = None,
+        cp_axis_name: str | None = None,
+        tp_axis_name: str | None = None,
+        ep_axis_name: str | None = None,
+        ep_shard_axis_names: tuple[str, ...] | None = None,
         # Pipeline Parallel
-        pp_schedule: Optional[str] = "1f1b",
-        pp_schedule_csv: Optional[str] = None,
+        pp_schedule: str | None = "1f1b",
+        pp_schedule_csv: str | None = None,
         pp_microbatch_size: int = 1,
         pp_batch_size: int = 1,
-        layers_per_stage: Optional[int] = None,
-        round_virtual_stages_to_pp_multiple: Optional[Literal["up", "down"]] = None,
-        module_fqns_per_model_part: Optional[list[list[str]]] = None,
+        layers_per_stage: int | None = None,
+        round_virtual_stages_to_pp_multiple: Literal["up", "down"] | None = None,
+        module_fqns_per_model_part: list[list[str]] | None = None,
         # Patching
         patch_inner_model: bool = True,
         patch_causal_lm_model: bool = True,
         patch_stage_backward_maybe_with_nosync: bool = False,
         defer_fsdp_grad_sync: bool = True,
         # Runtime
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
         scale_grads_in_schedule: bool = False,
         # Shape inference optimization
-        pp_seq_len: Optional[int] = None,
+        pp_seq_len: int | None = None,
     ):
         # Validation
         if pp_schedule_csv is None and pp_schedule is None:
@@ -128,16 +128,16 @@ class AutoPipeline:
             stages=None,
         )
         self._model_config = None
-        self._pp_current_seq_len: Optional[int] = None
-        self._pp_current_microbatch_size: Optional[int] = None
+        self._pp_current_seq_len: int | None = None
+        self._pp_current_microbatch_size: int | None = None
         self._pp_current_input_signature: tuple[tuple[int, ...], torch.dtype] | None = None
 
     def build(
         self,
         model: nn.Module,
         *,
-        loss_fn: Optional[Callable] = None,
-        parallelize_fn: Optional[ParallelizeFnProtocol] = None,
+        loss_fn: Callable | None = None,
+        parallelize_fn: ParallelizeFnProtocol | None = None,
     ):
         """Build the pipeline: validate -> init meta -> split -> schedule."""
         # 0. Validation
@@ -522,7 +522,7 @@ class AutoPipeline:
             names_per_stage.append(names)
         return names_per_stage
 
-    def visualize_current_schedule(self, filename: Optional[str] = None) -> None:
+    def visualize_current_schedule(self, filename: str | None = None) -> None:
         from torch.distributed.pipelining._schedule_visualizer import get_schedule_ops, visualize_schedule
 
         schedule = self._info.schedule

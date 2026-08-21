@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
-from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Generator, List, Sequence, Tuple, Union
 
 import torch
 import transformers
@@ -201,7 +201,7 @@ _BAGEL_FULL_LAYER_CHECKPOINT_MODULE_LISTS = (
 )
 
 
-def _get_module_by_fqn(module: nn.Module, fqn: str) -> Optional[nn.Module]:
+def _get_module_by_fqn(module: nn.Module, fqn: str) -> nn.Module | None:
     obj = module
     for part in fqn.split("."):
         obj = getattr(obj, part, None)
@@ -252,15 +252,15 @@ class ParallelizationStrategy(ABC):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
-        reshard_after_forward: Optional[bool] = None,
+        reshard_after_forward: bool | None = None,
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         **kwargs,
@@ -276,11 +276,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -289,7 +289,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         enable_fsdp2_prefetch: bool = True,
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
-        reshard_after_forward: Optional[bool] = None,
+        reshard_after_forward: bool | None = None,
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         fully_shard_fn=None,
@@ -499,15 +499,15 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
-        reshard_after_forward: Optional[bool] = None,
+        reshard_after_forward: bool | None = None,
         **kwargs,
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
@@ -770,11 +770,11 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -882,11 +882,11 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = True,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -1055,7 +1055,7 @@ def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
     return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
 
 
-def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
+def register_parallel_strategy(arg=None, *, name: str | None = None):
     """Decorator to register out-of-tree parallelism strategies.
 
     Supports:
@@ -1192,12 +1192,12 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
-    mp_policy: Optional[MixedPrecisionPolicy],
-    offload_policy: Optional[OffloadPolicy] = None,
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None = None,
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
-    reshard_after_forward: Optional[bool] = None,
+    reshard_after_forward: bool | None = None,
     fully_shard_fn=None,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     ignored_multimodal_params: set[nn.Parameter] | None = None,
@@ -1699,7 +1699,7 @@ def validate_tp_mesh(model, tp_mesh):
     )
 
 
-def _find_largest_module_list(model: nn.Module) -> Optional[Union[nn.ModuleList, nn.ModuleDict]]:
+def _find_largest_module_list(model: nn.Module) -> Union[nn.ModuleList, nn.ModuleDict] | None:
     """
     Heuristic function to find the largest layer container in a model.
 
@@ -1715,7 +1715,7 @@ def _find_largest_module_list(model: nn.Module) -> Optional[Union[nn.ModuleList,
     Returns:
         Optional[Union[nn.ModuleList, nn.ModuleDict]]: The largest layer container found, or None.
     """
-    largest_module_list: Optional[Union[nn.ModuleList, nn.ModuleDict]] = None
+    largest_module_list: Union[nn.ModuleList, nn.ModuleDict] | None = None
     largest_size = 0
 
     def _is_pp_layer_module_dict(module: nn.ModuleDict) -> bool:
@@ -2126,7 +2126,7 @@ def _uses_custom_moe_modules(model: nn.Module) -> bool:
 def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
-    tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
     tp_size: int = 1,
 ) -> Dict[str, ParallelStyle]:
     """
@@ -2340,11 +2340,11 @@ def _get_parallel_plan(
 def fsdp2_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
-    mp_policy: Optional[MixedPrecisionPolicy] = None,
-    offload_policy: Optional[OffloadPolicy] = None,
+    mp_policy: MixedPrecisionPolicy | None = None,
+    offload_policy: OffloadPolicy | None = None,
     sequence_parallel: bool = False,
     activation_checkpointing: bool = False,
-    tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
     dp_replicate_mesh_name: str = "dp_replicate",
     dp_shard_cp_mesh_name: str = "dp_shard_cp",
     tp_mesh_name: str = "tp",
@@ -2353,7 +2353,7 @@ def fsdp2_strategy_parallelize(
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
-    reshard_after_forward: Optional[bool] = None,
+    reshard_after_forward: bool | None = None,
     activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
 ):
@@ -2533,8 +2533,8 @@ def megatron_fsdp_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
     optimizer=None,
-    megatron_fsdp_unit_modules: Optional[List[str]] = None,
-    tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
+    megatron_fsdp_unit_modules: List[str] | None = None,
+    tp_shard_plan: Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]] | None = None,
     zero_dp_strategy: int = 3,
     init_fsdp_with_meta_device: bool = False,
     grad_reduce_in_fp32: bool = False,

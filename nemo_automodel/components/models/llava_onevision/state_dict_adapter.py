@@ -29,7 +29,7 @@ Applies the same regex rename HF does via ``_checkpoint_conversion_mapping``:
 """
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 
@@ -45,6 +45,8 @@ _NEMO_TO_HF_RULES = [
 
 
 class LlavaOneVisionStateDictAdapter(StateDictAdapter):
+    _supports_write_through_checkpoint_load = True
+
     def __init__(self, config: Any = None, **kwargs):
         self.config = config
 
@@ -54,7 +56,7 @@ class LlavaOneVisionStateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         exclude = re.compile(exclude_key_regex) if exclude_key_regex else None

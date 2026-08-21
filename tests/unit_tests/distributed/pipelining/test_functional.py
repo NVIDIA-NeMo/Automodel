@@ -26,6 +26,7 @@ from torch.distributed.pipelining.schedules import (
 from nemo_automodel.components.distributed.pipelining.functional import (
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
+    _preserve_grads_across_stage_reinit,
     _set_stage_metas,
     _use_static_pipeline_stage_metadata,
     _warmup_pipeline_stage_neighbors,
@@ -1666,3 +1667,243 @@ class TestWrapStageForwardToEmitTensor:
         _wrap_stage_forward_to_emit_tensor(m)
         params = list(inspect.signature(m.forward).parameters)
         assert params == ["input_ids", "position_ids", "attention_mask"]
+
+
+class _MetadataRecordingSubmod:
+    """Stage submodule stand-in exposing only what _precompute_stage_shapes reads.
+
+    A real class rather than a ``Mock`` because ``_precompute_stage_shapes``
+    probes for an optional ``get_pipeline_stage_metas`` hook; a ``Mock`` would
+    auto-create it and silently route the test down the model-owned path.
+    """
+
+    def __init__(self, *, has_lm_head: bool, dtype: torch.dtype) -> None:
+        self._dtype = dtype
+        self.lm_head = object() if has_lm_head else None
+
+    def parameters(self):
+        """Yield one parameter carrying the stage's dtype.
+
+        Returns:
+            Iterator over a single tensor of shape [1], used only for dtype
+            resolution.
+        """
+        return iter([torch.empty(1, dtype=self._dtype)])
+
+
+class _MetadataRecordingStage:
+    """PipelineStage stand-in that records the static metadata installed on it."""
+
+    def __init__(self, *, is_first: bool, has_lm_head: bool, dtype: torch.dtype = torch.bfloat16) -> None:
+        self.is_first = is_first
+        self.inputs_meta: tuple[torch.Tensor, ...] | None = None
+        self._outputs_meta: tuple[torch.Tensor, ...] | None = None
+        self.submod = _MetadataRecordingSubmod(has_lm_head=has_lm_head, dtype=dtype)
+
+    def _configure_outputs_meta(self, outputs_meta: tuple[torch.Tensor, ...]) -> None:
+        """Record the stage output metadata.
+
+        Args:
+            outputs_meta: Meta tensors describing this stage's outputs, each of
+                shape [microbatch, sequence, hidden] for a non-final stage or
+                [microbatch, sequence, vocab] for a stage owning the LM head.
+        """
+        self._outputs_meta = outputs_meta
+
+
+def _make_pipeline_stages(pp_size: int) -> list[_MetadataRecordingStage]:
+    """Build a linear chain of recording stages for a given pipeline depth.
+
+    Args:
+        pp_size: Number of pipeline stages; the first receives token ids and the
+            last owns the LM head.
+
+    Returns:
+        List of ``pp_size`` stages ordered first to last.
+    """
+    return [_MetadataRecordingStage(is_first=(i == 0), has_lm_head=(i == pp_size - 1)) for i in range(pp_size)]
+
+
+class TestPrecomputeStageShapesCompositeAndDepth:
+    """Static metadata must reach every stage, including VLM composite configs.
+
+    These cases cover topologies the 2-GPU PR runners cannot execute -- the real
+    recipes run gemma4_31b at tp4/pp2 and tp4/pp4, and mistral3p5_128b at
+    tp8/pp8. Stage metadata is independent of the tensor-parallel size, so the
+    pipeline depth can be exercised faithfully on CPU.
+    """
+
+    def _vlm_config(self, hidden_size: int = 512, vocab_size: int = 262144):
+        """Build a VLM composite config exposing dims only under ``text_config``.
+
+        Mirrors ``Gemma4Config``, which has no top-level ``hidden_size`` or
+        ``vocab_size``; the pipeline must resolve both from the text config.
+        """
+        return types.SimpleNamespace(
+            text_config=types.SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size),
+        )
+
+    def test_vlm_composite_config_resolves_text_config_dims(self):
+        """VLM configs without top-level dims resolve through text_config."""
+        hidden_size, vocab_size = _get_hidden_and_vocab_size(self._vlm_config())
+
+        assert hidden_size == 512
+        assert vocab_size == 262144
+
+    @pytest.mark.parametrize("pp_size", [2, 4, 8])
+    def test_every_stage_receives_static_metadata(self, pp_size):
+        """No stage is left on dynamic inference at any supported pipeline depth."""
+        stages = _make_pipeline_stages(pp_size)
+
+        _precompute_stage_shapes(stages, self._vlm_config(), microbatch_size=1, seq_len=512)
+
+        for index, stage in enumerate(stages):
+            assert stage.inputs_meta is not None, f"stage {index} of {pp_size} left without input metadata"
+            assert stage._outputs_meta is not None, f"stage {index} of {pp_size} left without output metadata"
+
+    @pytest.mark.parametrize("pp_size", [2, 4, 8])
+    def test_stage_boundary_shapes_chain(self, pp_size):
+        """Each stage's output metadata matches the next stage's input metadata."""
+        stages = _make_pipeline_stages(pp_size)
+
+        _precompute_stage_shapes(stages, self._vlm_config(), microbatch_size=1, seq_len=512)
+
+        # First stage consumes token ids; every later stage consumes hidden states.
+        assert stages[0].inputs_meta[0].shape == (1, 512)
+        assert stages[0].inputs_meta[0].dtype == torch.long
+        for stage in stages[1:]:
+            assert stage.inputs_meta[0].shape == (1, 512, 512)
+
+        for producer, consumer in zip(stages[:-1], stages[1:]):
+            assert producer._outputs_meta[0].shape == consumer.inputs_meta[0].shape, (
+                "inter-stage hidden-state shape mismatch would deadlock the p2p exchange"
+            )
+
+        # Only the LM-head stage emits vocab-width logits.
+        assert stages[-1]._outputs_meta[0].shape == (1, 512, 262144)
+
+
+class _UserMetaStage:
+    """PipelineStage stand-in exposing only PyTorch 2.13's ``_user_meta`` API.
+
+    PyTorch 2.13 removed ``PipelineStage._configure_outputs_meta``. Stages that
+    expose ``_user_meta`` instead are the ones that regressed in commit 00f40419
+    of PR #2983.
+    """
+
+    def __init__(self, *, is_first: bool, has_lm_head: bool, dtype: torch.dtype = torch.bfloat16) -> None:
+        self.is_first = is_first
+        self.submod = _MetadataRecordingSubmod(has_lm_head=has_lm_head, dtype=dtype)
+        self._user_meta = types.SimpleNamespace(inputs=None, outputs=None)
+
+
+class TestPrecomputeStageShapesNewStageApi:
+    """The PyTorch 2.13 stage API must still receive static metadata.
+
+    Regression guard for commit 00f40419 of PR #2983 on the generic (no
+    ``get_pipeline_stage_metas`` hook) path that gemma4 and mistral3p5 take.
+    """
+
+    def _vlm_config(self):
+        """Build a Gemma4-shaped composite config with dims only under text_config."""
+        return types.SimpleNamespace(
+            text_config=types.SimpleNamespace(hidden_size=512, vocab_size=262144),
+        )
+
+    @pytest.mark.parametrize("pp_size", [2, 4, 8])
+    def test_generic_path_installs_static_metadata_on_user_meta_stages(self, pp_size):
+        """Stages without the legacy attribute still get static metadata."""
+        stages = [_UserMetaStage(is_first=(i == 0), has_lm_head=(i == pp_size - 1)) for i in range(pp_size)]
+
+        _precompute_stage_shapes(stages, self._vlm_config(), microbatch_size=1, seq_len=512)
+
+        for index, stage in enumerate(stages):
+            assert stage._user_meta.inputs is not None, (
+                f"stage {index} of {pp_size} fell back to dynamic inference instead of static metadata"
+            )
+            assert stage._user_meta.outputs is not None, (
+                f"stage {index} of {pp_size} fell back to dynamic inference instead of static metadata"
+            )
+
+        assert stages[0]._user_meta.inputs[0].shape == (1, 512)
+        assert stages[-1]._user_meta.outputs[0].shape == (1, 512, 262144)
+
+    def test_activations_are_marked_requires_grad(self):
+        """Inter-stage float activations must carry requires_grad for the backward pass."""
+        stages = [
+            _UserMetaStage(is_first=True, has_lm_head=False),
+            _UserMetaStage(is_first=False, has_lm_head=True),
+        ]
+
+        _precompute_stage_shapes(stages, self._vlm_config(), microbatch_size=1, seq_len=512)
+
+        # Token ids are integral and must not be marked; hidden states must be.
+        assert stages[0]._user_meta.inputs[0].requires_grad is False
+        assert stages[1]._user_meta.inputs[0].requires_grad is True
+        assert stages[0]._user_meta.outputs[0].requires_grad is True
+
+
+class TestPreserveGradsAcrossStageReinit:
+    """Stage re-initialization must not discard accumulated gradients.
+
+    ``_initialize_pp_stages`` always ends by calling
+    ``_post_metadata_inference_cleanup``, which nulls parameter gradients.
+    ``reset_pp_stage_shapes`` re-initializes on every sequence-length change, so
+    under gradient accumulation that cleanup lands between micro-batches and drops
+    everything accumulated so far.
+    """
+
+    def _make_stage(self, inference_mode):
+        """Build a stage stand-in whose cleanup nulls its submodule's gradients.
+
+        Args:
+            inference_mode: Value to expose as the stage's ``_inference_mode``.
+
+        Returns:
+            Tuple of (stage, param) where ``param`` is a tensor of shape [2] whose
+            ``.grad`` is also shape [2].
+        """
+        submod = torch.nn.Linear(2, 1, bias=False)
+        param = submod.weight
+        param.grad = torch.ones_like(param)
+
+        stage = types.SimpleNamespace(submod=submod, _inference_mode=inference_mode)
+
+        def _cleanup():
+            for p in submod.parameters():
+                p.grad = None
+
+        stage._post_metadata_inference_cleanup = _cleanup
+        return stage, param
+
+    def test_static_mode_keeps_accumulated_grads(self, monkeypatch):
+        """With static metadata no inference ran, so gradients must survive."""
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        stage, param = self._make_stage(InferenceMode.STATIC)
+        expected = param.grad.clone()
+
+        _preserve_grads_across_stage_reinit([stage])
+        stage._post_metadata_inference_cleanup()
+
+        assert param.grad is not None, "accumulated gradients were discarded on stage re-init"
+        torch.testing.assert_close(param.grad, expected)
+
+    def test_dynamic_mode_still_clears_stale_grads(self):
+        """Dynamic inference runs a throwaway backward, so its grads must be cleared."""
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        stage, param = self._make_stage(InferenceMode.DYNAMIC)
+
+        _preserve_grads_across_stage_reinit([stage])
+        stage._post_metadata_inference_cleanup()
+
+        assert param.grad is None
+
+    def test_stage_without_cleanup_hook_is_skipped(self):
+        """Older PyTorch stages have no cleanup hook and must not raise."""
+        stage = types.SimpleNamespace(submod=torch.nn.Linear(2, 1))
+
+        _preserve_grads_across_stage_reinit([stage])
+
+        assert not hasattr(stage, "_post_metadata_inference_cleanup")

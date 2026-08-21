@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -62,16 +62,16 @@ _MAGI_SELF_KEY_LEN: dict = {}
 # Active CP group for the custom-model attention factory (set by the recipe).
 # The custom factory's attn_func is a closure with no access to the attention
 # module, so it reads the cp_group from here. One CP group is active per process.
-_ACTIVE_CP_GROUP: Optional["dist.ProcessGroup"] = None
+_ACTIVE_CP_GROUP: "dist.ProcessGroup" | None = None
 
 
-def set_active_cp_group(cp_group: Optional["dist.ProcessGroup"]) -> None:
+def set_active_cp_group(cp_group: "dist.ProcessGroup" | None) -> None:
     """Record the CP group the custom-model magi attn_func should use."""
     global _ACTIVE_CP_GROUP
     _ACTIVE_CP_GROUP = cp_group
 
 
-def get_active_cp_group() -> Optional["dist.ProcessGroup"]:
+def get_active_cp_group() -> "dist.ProcessGroup" | None:
     """Return the CP group set by :func:`set_active_cp_group` (may be None)."""
     return _ACTIVE_CP_GROUP
 
@@ -90,7 +90,7 @@ def get_active_cp_group() -> Optional["dist.ProcessGroup"]:
 
 # Active mask spec for the custom-model attn_func (set per step by the caller;
 # None -> plain causal self-key). Keyed implicitly by the single active cp_group.
-_ACTIVE_ATTN_SPEC: Optional["AttnMaskSpec"] = None
+_ACTIVE_ATTN_SPEC: "AttnMaskSpec" | None = None
 # id(cp_group) -> (spec_fingerprint, built_key), so all layers in a step reuse one key.
 _FLEX_KEY_CACHE: dict = {}
 
@@ -185,13 +185,13 @@ class AttnMaskSpec:
         return cls(q_ranges, k_ranges, mask_types, total), sample_token_ranges
 
 
-def set_active_attn_spec(spec: Optional["AttnMaskSpec"]) -> None:
+def set_active_attn_spec(spec: "AttnMaskSpec" | None) -> None:
     """Set the mask spec the custom-model magi attn_func should apply this step."""
     global _ACTIVE_ATTN_SPEC
     _ACTIVE_ATTN_SPEC = spec
 
 
-def get_active_attn_spec() -> Optional["AttnMaskSpec"]:
+def get_active_attn_spec() -> "AttnMaskSpec" | None:
     """Return the active mask spec (None -> plain causal self-key)."""
     return _ACTIVE_ATTN_SPEC
 
@@ -284,7 +284,7 @@ def _self_key_for(
     return key
 
 
-def make_magi_attn_func(softmax_scale: Optional[float] = None):  # pragma: no cover - requires GPU + magi_attention
+def make_magi_attn_func(softmax_scale: float | None = None):  # pragma: no cover - requires GPU + magi_attention
     """Build the attn_func used by the custom-model attention factory.
 
     The returned callable accepts q/k/v in either THD ``[t, nh, hd]`` or BSHD
@@ -408,10 +408,10 @@ def register_magi_attention() -> None:  # pragma: no cover - requires GPU + magi
         query: torch.Tensor,  # (b, num_heads, seq, head_dim)
         key: torch.Tensor,
         value: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
         dropout: float = 0.0,
-        scaling: Optional[float] = None,
-        is_causal: Optional[bool] = None,
+        scaling: float | None = None,
+        is_causal: bool | None = None,
         **kwargs: Any,
     ):
         cp_group = getattr(module, "cp_group", None)
@@ -472,7 +472,7 @@ def register_magi_attention() -> None:  # pragma: no cover - requires GPU + magi
     logger.info("Registered 'magi' attention backend (MagiAttention FFA) in transformers.")
 
 
-def get_cp_group(device_mesh) -> Optional[dist.ProcessGroup]:
+def get_cp_group(device_mesh) -> dist.ProcessGroup | None:
     """Return the CP process group from the device mesh (size-1 group is fine)."""
     if device_mesh is None:
         return None
@@ -508,7 +508,7 @@ def _set_cp_group_on_attention(model, cp_group) -> None:
 def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     model,
     batch: dict,
-    cp_group: Optional[dist.ProcessGroup],
+    cp_group: dist.ProcessGroup | None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     *,
     return_local_indices: bool = False,
@@ -705,7 +705,7 @@ def _iter_language_model_attention(model):
 def magi_prepare_vlm(
     model,
     batch: dict,
-    cp_group: Optional[dist.ProcessGroup],
+    cp_group: dist.ProcessGroup | None,
 ):
     """Prepare a VLM (bs==1) step for MagiAttention on the language backbone.
 
@@ -747,10 +747,10 @@ class MagiState:
 
     enabled: bool = False
     custom: bool = False  # custom-model factory backend (vs HF attn_implementation)
-    cp_group: Optional["dist.ProcessGroup"] = None
+    cp_group: "dist.ProcessGroup" | None = None
     cp_size: int = 1
     domain: str = "llm"  # recipe domain ("llm" | "vlm"), bound at setup
-    device_mesh: Optional[Any] = None  # full device mesh, bound at setup (cp=1 THD conversion)
+    device_mesh: Any | None = None  # full device mesh, bound at setup (cp=1 THD conversion)
 
     @property
     def hf_dispatch(self) -> bool:
