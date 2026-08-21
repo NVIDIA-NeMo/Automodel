@@ -442,6 +442,50 @@ def test_generate_padded_varlen_mask_params_excludes_cp_padding():
     assert ends.dtype == torch.int32
 
 
+def test_tilelang_topk_chunks_rows_without_changing_results(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+
+    logits = torch.randn(7, 11)
+    expected_scores, expected_indices = torch.topk(logits, 4, dim=-1)
+    original_topk = torch.topk
+    call_shapes = []
+
+    def tracked_topk(values, *args, **kwargs):
+        call_shapes.append(tuple(values.shape))
+        return original_topk(values, *args, **kwargs)
+
+    monkeypatch.setattr(indexer_mod, "_TOPK_MAX_ELEMENTS_PER_CALL", 22)
+    monkeypatch.setattr(indexer_mod.torch, "topk", tracked_topk)
+
+    scores, indices = indexer_mod._topk_in_row_chunks(logits, 4)
+
+    assert call_shapes == [(2, 11), (2, 11), (2, 11), (1, 11)]
+    torch.testing.assert_close(scores, expected_scores)
+    torch.testing.assert_close(indices, expected_indices)
+
+
+def test_tilelang_topk_keeps_small_inputs_in_one_call(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+
+    logits = torch.randn(3, 5)
+    original_topk = torch.topk
+    call_shapes = []
+
+    def tracked_topk(values, *args, **kwargs):
+        call_shapes.append(tuple(values.shape))
+        return original_topk(values, *args, **kwargs)
+
+    monkeypatch.setattr(indexer_mod, "_TOPK_MAX_ELEMENTS_PER_CALL", logits.numel())
+    monkeypatch.setattr(indexer_mod.torch, "topk", tracked_topk)
+
+    scores, indices = indexer_mod._topk_in_row_chunks(logits, 2)
+    expected_scores, expected_indices = original_topk(logits, 2, dim=-1)
+
+    assert call_shapes == [tuple(logits.shape)]
+    torch.testing.assert_close(scores, expected_scores)
+    torch.testing.assert_close(indices, expected_indices)
+
+
 def test_indexer_generates_topk_and_varlen_mask_params(monkeypatch):
     from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
 
@@ -457,6 +501,7 @@ def test_indexer_generates_topk_and_varlen_mask_params(monkeypatch):
 
     monkeypatch.setattr(indexer_mod, "indexer_fwd_interface", fake_indexer_fwd)
     monkeypatch.setattr(indexer_mod, "indexer_bwd_interface", fake_indexer_bwd)
+    monkeypatch.setattr(indexer_mod, "_TOPK_MAX_ELEMENTS_PER_CALL", 3)
 
     cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
     starts, ends = indexer_mod.generate_varlen_mask_params(cu_seqlens)
@@ -1181,6 +1226,7 @@ def test_glm_dsa_tilelang_declares_validation_packing():
 
 def test_glm_dsa_tilelang_pipeline_metas_use_thd_shapes():
     config = _small_dsa_config()
+    config.indexer_types = ["shared"]
     backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
     model = GlmMoeDsaForCausalLM(config, backend=backend)
     model.lm_head = None
@@ -1206,6 +1252,7 @@ def test_glm_dsa_tilelang_pipeline_metas_use_thd_shapes():
 
 def test_glm_dsa_sdpa_pipeline_metas_cap_topk_by_seq_len():
     config = _small_dsa_config()
+    config.indexer_types = ["shared"]
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
     model = GlmMoeDsaForCausalLM(config, backend=backend)
     model.lm_head = None
@@ -1222,9 +1269,43 @@ def test_glm_dsa_sdpa_pipeline_metas_cap_topk_by_seq_len():
     assert outputs_meta[1].shape == (4, seq_len, seq_len)
 
 
-def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
+def test_glm_dsa_pipeline_metas_omit_topk_without_indexshare():
     config = _small_dsa_config()
-    backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
+    model = GlmMoeDsaForCausalLM(config, backend=backend)
+    model.lm_head = None
+
+    inputs_meta, outputs_meta = model.get_pipeline_stage_metas(
+        is_first=False,
+        microbatch_size=4,
+        seq_len=32,
+        dtype=torch.bfloat16,
+    )
+
+    assert len(inputs_meta) == 1
+    assert inputs_meta[0].shape == (4, 32, config.hidden_size)
+    assert len(outputs_meta) == 1
+    assert outputs_meta[0].shape == (4, 32, config.hidden_size)
+
+
+def test_glm_dsa_pipeline_stage_returns_only_hidden_without_indexshare(monkeypatch):
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
+    model = GlmMoeDsaForCausalLM(config, backend=backend)
+    model.model.embed_tokens = None
+    model.lm_head = None
+    hidden = torch.zeros(1, 4, config.hidden_size)
+    monkeypatch.setattr(model.model, "forward", lambda *args, **kwargs: (hidden, None))
+
+    output = model(hidden)
+
+    assert output is hidden
+
+
+@pytest.mark.parametrize("attn_backend", ["tilelang", "cudnn"])
+def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder(attn_backend):
+    config = _small_dsa_config()
+    backend = BackendConfig(attn=attn_backend, linear="torch", rms_norm="torch", rope_fusion=False)
     model = GlmMoeDsaForCausalLM(config, backend=backend)
 
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.arange(8).view(1, 8)}, num_chunks=3)
@@ -1238,12 +1319,12 @@ def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
     assert fn.keywords["num_chunks"] == 3
 
 
-def test_glm_dsa_prepare_model_inputs_for_cp_requires_tilelang():
+def test_glm_dsa_prepare_model_inputs_for_cp_requires_packed_backend():
     config = _small_dsa_config()
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
     model = GlmMoeDsaForCausalLM(config, backend=backend)
 
-    with pytest.raises(NotImplementedError, match="backend.attn='tilelang'"):
+    with pytest.raises(NotImplementedError, match="backend.attn in"):
         model.prepare_model_inputs_for_cp({"input_ids": torch.arange(8).view(1, 8)})
 
 
