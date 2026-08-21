@@ -6,7 +6,6 @@ position: 5
 NeMo AutoModel is built to work with the Hugging Face ecosystem.
 In practice, compatibility comes in two layers:
 
-- **API compatibility**: for many workflows, you can keep your existing `transformers` code and swap in NeMo AutoModel “drop-in” wrappers (`NeMoAutoModel*`, `NeMoAutoTokenizer`) with minimal changes.
 - **API compatibility**: For many workflows, you can keep your existing `transformers` code and swap in NeMo AutoModel drop-in wrappers (`NeMoAutoModel*`, `NeMoAutoTokenizer`) with minimal changes.
 - **Artifact compatibility**: NeMo AutoModel produces Hugging Face-compatible checkpoints (config, tokenizer, and safetensors) that can be loaded by Hugging Face Transformers and downstream tools such as vLLM and SGLang.
 
@@ -57,7 +56,6 @@ These APIs follow familiar Hugging Face Transformers patterns for model loading,
 
 NeMo AutoModel introduces several optimizations and architectural changes to improve training efficiency and hardware utilization.
 
-- **Performance features**: NeMo AutoModel can automatically apply optional kernel patches and optimizations (e.g., SDPA selection, Liger kernels, DeepEP, etc.) while keeping the public model API the same.
 - **Performance features**: NeMo AutoModel can automatically apply optional kernel patches and optimizations (for example, SDPA selection, Liger kernels, and DeepEP) while keeping the public model API the same.
 - **Distributed training stack**: NeMo AutoModel recipes and CLI are designed for multi-GPU and multi-node fine-tuning with PyTorch-native distributed features such as FSDP2 and pipeline parallelism. When loading models directly from Python, pass a [`DistributedSetup`](/development/distributed-setup) using `from_pretrained(..., distributed_setup=...)` to enable tensor, pipeline, context, and expert parallelism.
 - **CUDA expectation**: NeMo AutoModel `NeMoAutoModel*` wrappers are primarily optimized for NVIDIA GPU workflows and offer support for CPU workflows as well.
