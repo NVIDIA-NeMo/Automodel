@@ -101,6 +101,12 @@ dataloader:
 
 optimizer:
   _target_: torch.optim.Adam
+  # Use the fused Adam kernel. On the 26.06 base image (torch 2.12) the default
+  # foreach Adam step over FSDP2/DTensor-sharded parameters regressed ~2x versus
+  # the 26.04 base image (torch 2.11), which dominated the reported throughput
+  # regression for this recipe; the fused path is not affected and is numerically
+  # equivalent here (identical per-step loss).
+  fused: true
   betas:
   - 0.9
   - 0.999
