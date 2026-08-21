@@ -51,16 +51,16 @@ class MoESplitExpertsStateDictMixin:
 
     @property
     def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether every checkpoint value, including experts, loads directly into model weights."""
+        """Whether every checkpoint tensor, including expert tensors, loads directly into model weights."""
         experts_load_directly = self.moe_config is None or self._supports_write_through_expert_checkpoint_load
         return self._supports_write_through_checkpoint_load and experts_load_directly
 
     @property
     def _supports_write_through_expert_checkpoint_load(self) -> bool:
-        """Whether grouped expert checkpoint values load directly into model weight memory.
+        """Whether grouped expert checkpoint tensors load directly into model weight memory.
 
         This covers only the shared expert conversion. A concrete adapter must also verify that all non-expert
-        checkpoint values load directly before it enables the full-checkpoint fast path.
+        checkpoint tensors load directly before it enables the full-checkpoint fast path.
         """
         return self.backend.experts != "te" and self.backend.dispatcher != "mok"
 

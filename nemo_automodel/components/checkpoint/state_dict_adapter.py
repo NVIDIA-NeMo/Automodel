@@ -31,7 +31,7 @@ class StateDictAdapter(ABC):
 
     @property
     def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether every checkpoint value is loaded directly into final model weight memory.
+        """Whether every checkpoint tensor is loaded directly into the model's existing weight memory.
 
         Enable this only when writing every tensor returned by ``to_hf`` for base-checkpoint loading updates the
         model itself. This lets the loader skip a complete CPU copy of the checkpoint.
@@ -42,8 +42,9 @@ class StateDictAdapter(ABC):
     def supports_checkpoint_load_without_full_copy(self) -> bool:
         """Whether DCP can load this adapter without another full set of model weights.
 
-        Large checkpoint values must be loaded into the model's existing weight memory. Small temporary values are
-        allowed; for example, Gemma4 loads a scale vector and applies it to an already-loaded model weight.
+        Large checkpoint tensors must be loaded into the model's existing weight memory. Small temporary tensors are
+        allowed when they can be applied and discarded without making a model-sized copy. For example, Gemma4 loads
+        a scale tensor and applies it to already-loaded expert weights.
         """
         return self._supports_checkpoint_load_without_full_copy
 

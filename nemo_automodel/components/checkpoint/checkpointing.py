@@ -832,7 +832,7 @@ class Checkpointer:
         is_custom_model = _is_custom_model(model_state.model[0])
         # Custom models traditionally loaded the complete checkpoint on the host because model-specific conversion
         # could otherwise create a second full copy on the GPU. Use DCP when the adapter can place large checkpoint
-        # values directly in model weight memory. An adapter such as Gemma4 may also use a small temporary value that
+        # tensors directly in model weight memory. An adapter such as Gemma4 may also use a small temporary tensor that
         # it applies after the read. Other custom adapters and quantized initialization keep the host fallback.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
