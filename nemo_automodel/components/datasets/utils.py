@@ -504,15 +504,24 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
 def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -> dict:
     """Collater for neat-packed LLM sequences.
 
-    Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
-    indexed ``attention_mask`` to the format required by the attention backend.
+    Stacks ``input_ids``, ``labels``, ``position_ids`` and turns the indexed
+    ``attention_mask`` (``[B, S]`` document map, ``0`` = padding) into the form
+    each attention backend consumes:
 
-    For flash attention (``flash_attention_2`` / ``flash_attention_3`` /
-    ``flash_attention_4``): keeps the indexed 2D mask ``[B, S]``.
-    For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
+    - Flash attention (``flash_attention_2`` / ``flash_attention_3`` /
+      ``flash_attention_4``): emits typed packed-sequence metadata as
+      ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
+      ``max_length_q``/``max_length_k``) so HuggingFace routes the batch through
+      ``flash_attn_varlen_func``. No ``attention_mask`` is emitted so HF takes the
+      varlen-kwargs branch; the per-document map is preserved as ``_packed_seq_ids``
+      for loss and context-parallel consumers.
+    - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
 
     Args:
-        batch: List of sample dicts produced by ``neat_pack_dataset``.
+        batch: List of sample dicts produced by ``neat_pack_dataset``. Each holds
+            1-D ``input_ids``/``labels``/``position_ids``/``attention_mask``
+            tensors of shape ``[sequence]``; ``attention_mask`` is the indexed
+            document map.
         attn_implementation: Attention backend (``"flash_attention_2"``,
             ``"sdpa"``, or ``"eager"``).
 
@@ -527,19 +536,29 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
 
-    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
-        mask_out = attention_mask
-    else:
-        mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
-
     result = {
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
-        "attention_mask": mask_out,
     }
-    if attention_mask.max() > 1:
-        result["_packed_seq_ids"] = attention_mask
+
+    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
+        # No attention_mask: HF then takes its varlen-kwargs branch, not the binary-mask unpad path.
+        from nemo_automodel.components.datasets.packed_seq import (
+            packed_seq_params_from_doc_ids,
+            to_flash_attention_kwargs,
+        )
+
+        params = packed_seq_params_from_doc_ids(attention_mask)
+        result.update(to_flash_attention_kwargs(params))
+        # Emitted only for 2+ docs, matching the sdpa path; consumed by loss / CP.
+        if attention_mask.max() > 1:
+            result["_packed_seq_ids"] = attention_mask
+    else:
+        result["attention_mask"] = _indexed_mask_to_4d_block_causal(attention_mask)
+        if attention_mask.max() > 1:
+            result["_packed_seq_ids"] = attention_mask
+
     return result
 
 

@@ -43,6 +43,15 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 )
 from nemo_automodel.components.models.qwen3_vl.parallelization import register_qwen3_vl_parallel_strategy
 
+_PACKED_FLASH_ATTENTION_KWARGS = frozenset(
+    {
+        "cu_seq_lens_q",
+        "cu_seq_lens_k",
+        "max_length_q",
+        "max_length_k",
+    }
+)
+
 
 class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditionalGeneration):
     """Dense Qwen3-VL with a DeepStack-aware context-parallel forward path."""
@@ -338,17 +347,49 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Any,
     ) -> tuple | Qwen3VLCausalLMOutputWithPast:
-        """Run Qwen3-VL, including its in-forward CP multimodal path.
+        """Run Qwen3-VL, including its model-owned multimodal and CP paths.
 
-        Named tensor arguments preserve the Hugging Face
-        ``Qwen3VLForConditionalGeneration.forward`` layouts. The internal CP path
-        consumes ``inputs_embeds`` of shape ``[batch, local_sequence, hidden]``,
-        ``visual_pos_masks`` of shape ``[batch, local_sequence]``, and DeepStack
-        tensors of shape ``[local_visual_tokens, hidden]``.
+        Args:
+            input_ids: Optional token ids of shape ``[batch, sequence]``.
+            attention_mask: Optional padding mask of shape ``[batch, sequence]``
+                or attention mask of shape ``[batch, 1, query_sequence,
+                key_sequence]``.
+            position_ids: Optional text positions of shape ``[batch, sequence]``
+                or multimodal RoPE positions of shape ``[3, batch, sequence]``.
+            past_key_values: Optional Hugging Face decoder cache.
+            inputs_embeds: Optional token embeddings of shape ``[batch, sequence,
+                hidden]``.
+            labels: Optional target ids of shape ``[batch, sequence]``.
+            pixel_values: Optional image patch rows of shape
+                ``[image_patch_rows, patch_dim]``.
+            pixel_values_videos: Optional video patch rows of shape
+                ``[video_patch_rows, patch_dim]``.
+            image_grid_thw: Optional image grids of shape ``[num_images, 3]``,
+                storing temporal, height, and width extents.
+            video_grid_thw: Optional video grids of shape ``[num_videos, 3]``,
+                storing temporal, height, and width extents.
+            mm_token_type_ids: Optional modality ids of shape ``[batch,
+                sequence]``.
+            use_cache: Whether to return and update the decoder cache.
+            cache_position: Optional absolute cache positions of shape
+                ``[sequence]``.
+            logits_to_keep: Number of trailing logits to return, or token indices
+                of shape ``[kept_sequence]``.
+            **kwargs: Additional Hugging Face language-model options. Packed
+                FlashAttention metadata contains cumulative sequence lengths of
+                shape ``[num_documents + 1]`` and scalar maximum lengths.
+
+        Returns:
+            Qwen3-VL output whose logits have shape ``[batch, kept_sequence,
+            vocab]``, or the corresponding Hugging Face tuple when requested by
+            the delegated upstream path.
         """
         cp_mesh = getattr(self, "cp_mesh", None)
         cp_size = cp_mesh.size() if cp_mesh is not None else 1
-        if cp_size <= 1:
+        has_media = pixel_values is not None or pixel_values_videos is not None
+        has_packed_flash_metadata = any(key in kwargs for key in _PACKED_FLASH_ATTENTION_KWARGS)
+        use_packed_media_path = cp_size <= 1 and has_media and has_packed_flash_metadata
+        if cp_size <= 1 and not use_packed_media_path:
             return super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -369,9 +410,9 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
 
         if input_ids is None:
             if inputs_embeds is None:
-                raise ValueError("Qwen3-VL context parallelism requires input_ids or inputs_embeds")
+                raise ValueError("Qwen3-VL's model-owned forward requires input_ids or inputs_embeds")
             if pixel_values is not None or pixel_values_videos is not None:
-                raise ValueError("Qwen3-VL media inputs under context parallelism require input_ids")
+                raise ValueError("Qwen3-VL media inputs on the model-owned forward require input_ids")
             visual_pos_masks = None
             deepstack_visual_embeds = None
         else:
@@ -386,6 +427,17 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
                     image_grid_thw=image_grid_thw,
                     video_grid_thw=video_grid_thw,
                 )
+
+        if use_packed_media_path and position_ids is None:
+            position_ids = self.model.compute_3d_position_ids(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
 
         inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._shard_multimodal_inputs_for_cp(
             inputs_embeds,
