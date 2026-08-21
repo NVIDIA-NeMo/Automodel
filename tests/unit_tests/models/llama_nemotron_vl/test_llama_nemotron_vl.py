@@ -565,6 +565,20 @@ def test_llama_nemotron_vl_config_builds_composed_subconfigs():
     assert config.get_text_config(decoder=True) is config.llm_config
 
 
+def test_llama_nemotron_vl_config_accepts_but_drops_legacy_attention_field():
+    """Legacy outer attention metadata loads without overriding the text policy."""
+    llm_config = _tiny_llm_config()
+    llm_config["is_causal"] = True
+    config = LlamaNemotronVLConfig(
+        vision_config=_tiny_vision_config(),
+        llm_config=llm_config,
+        bidirectional_attention=True,
+    )
+
+    assert config.llm_config.is_causal is True
+    assert "bidirectional_attention" not in config.to_dict()
+
+
 def test_llama_nemotron_vl_config_rejects_unsupported_vision_model():
     vision_config = _tiny_vision_config()
     vision_config["model_type"] = "unsupported_vision"
