@@ -21,7 +21,7 @@ inference engine (SGLang or vLLM). The training code lives in
 | **EAGLE-3.1** | EAGLE-3 with two drafter toggles (`fc_norm`, `norm_output`), matching the vLLM EAGLE-3.1 architecture. | `TrainEagle3Recipe` | `eagle3_1/` |
 | **P-EAGLE** | Parallel-drafting EAGLE-3: predicts all `num_depths` tokens in one forward over a COD-subsampled sequence instead of the TTT unroll. Serves on vLLM only. | `TrainEagle3Recipe` (`parallel_drafting: true`) | `p-eagle/` |
 | **DFlash** | Block-parallel drafting: drafts a whole block of `block_size` tokens in one non-causal "denoising" forward over `[anchor, MASK, MASK, ...]`. | `TrainDFlashRecipe` (LLM) / `DiffusionLMSFTRecipe` (DLLM SFT) | `dflash/`, `../dllm_sft/*dflash*` |
-| **DFlash 2** | DFlash backbone plus a two-tap dynamic convolution around every draft sublayer (kills suffix decay) and a pairwise path selector that walks one coherent path through each position's top-k candidates. | `TrainDFlash2Recipe` | `dflash/qwen3_dflash2.yaml` |
+| **DFlash 2** | DFlash backbone plus a two-tap dynamic convolution around every draft sublayer (kills suffix decay) and a pairwise path selector that walks one coherent path through each position's top-k candidates. | `TrainDFlash2Recipe` | `dflash/qwen3_dflash2.yaml`, `dflash/qwen3_8_27b_dflash2.yaml` |
 | **Domino** | DFlash backbone plus a serial GRU correction head (`prefix_gru` / `embed_proj`) that refines each block position on the previous ones. | `TrainDominoRecipe` | `dflash/qwen3_domino.yaml` |
 | **JetSpec** | DFlash backbone trained as a *causal* parallel tree drafter: causal in-block attention plus forward-KL distillation against the target distribution. | `TrainJetSpecRecipe` | `jetspec/` |
 | **DSpark** | Semi-autoregressive parallel drafting: a parallel backbone drafts the block, a lightweight serial Markov head adds intra-block dependency, and a confidence head predicts per-position acceptance. | `TrainDSparkRecipe` | `dspark/` |
@@ -71,7 +71,10 @@ The shipped example configs only cover a subset.
   only, using a dedicated NoPE-MLA draft class (eager attention, no context or
   tensor parallelism and no sequence packing, see
   `eagle3/README_kimi_k3.md`).
-- **DFlash / DFlash 2 / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`.
+- **DFlash / DFlash 2 / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
+  `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`,
+  `Qwen3_5MoeForConditionalGeneration` (the Qwen3.5 family, which `Qwen/Qwen3.8-27B`
+  belongs to; its decoder config is read from the nested `text_config`).
 - **DSpark**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
   (`Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration`),
@@ -571,6 +574,8 @@ checkpoint cadence: `ckpt_every_steps`, `save_checkpoint_every_epoch`.
 | `parallel_drafting`, `num_depths`, `num_draft_layers`, `down_sample_ratio`, `down_sample_ratio_min`, `mask_token_id`, `sequence_partitions` | P-EAGLE | `mask_token_id` is required (no default). `sequence_partitions > 1` splits each sequence by dependency lineage to bound long-context memory. |
 | `block_size`, `num_anchors`, `loss_decay_gamma`, `mask_token_id`, `target_layer_ids`, `attention_backend` | DFlash (LLM recipe) | Block drafting knobs. |
 | `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k`, `selector_loss_weight` | DFlash 2 | Convolution and path-selector knobs on top of the DFlash set. |
+| `draft_sliding_window` | DFlash family | Bounds how far back a block reads the target context; unset attends over the whole prefix. |
+| `draft_num_attention_heads`, `draft_num_key_value_heads`, `draft_head_dim` | DFlash family | Size the draft's attention independently of the target's; default to the target's shape. |
 | `emb_dim`, `gru_hidden_dim`, `pure_draft_prefix_len`, `shift_label` | Domino | Correction-head knobs on top of the DFlash set. |
 | `kd_temperature`, `kd_chunk_size` | JetSpec | Forward-KL distillation knobs on top of the DFlash set. |
 | `markov_rank`, `markov_head_type`, `confidence_head_alpha`, `confidence_head_with_markov`, `ce_loss_alpha` | DSpark | Markov / confidence-head knobs on top of the block-drafting set (`block_size`, `num_anchors`, `mask_token_id`, `target_layer_ids`, and so on). |
@@ -582,7 +587,8 @@ The following tree shows the configs in this folder:
 ```
 examples/speculative/
   eagle1/    eagle2/    eagle3/    eagle3_1/    p-eagle/
-  dflash/                     # DFlash + DFlash 2 (qwen3_dflash2.yaml)
+  dflash/                     # DFlash + DFlash 2 (qwen3_dflash2.yaml,
+                              #   qwen3_8_27b_dflash2.yaml)
                               #   + Domino (qwen3_domino.yaml) configs
   jetspec/   dspark/
   bench_sweep/                # --datasets-config example for bench_sweep.py
