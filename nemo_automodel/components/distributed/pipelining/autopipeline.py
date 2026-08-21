@@ -36,6 +36,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 )
 
 logger = logging.getLogger(__name__)
+_MISSING_STAGE_STATE = object()
 
 
 @dataclass
@@ -357,6 +358,7 @@ class AutoPipeline:
         loss_fn: Callable[[Any, int], Any],
         losses: list[torch.Tensor] | None = None,
         return_outputs: bool = False,
+        finalize_backward: bool = True,
     ) -> Any:
         """Run a schedule step over already prepared model microbatches.
 
@@ -374,16 +376,41 @@ class AutoPipeline:
             losses: Mutable list populated by the schedule on the last stage.
             return_outputs: Whether the last stage returns merged model outputs
                 when supported by the installed PyTorch version.
+            finalize_backward: Whether this schedule invocation ends the
+                optimizer's backward window. ``False`` keeps DDP in no-sync
+                mode and completes local FSDP post-backward state while
+                deferring its gradient collective; per-microbatch gradient
+                reduction remains authoritative when configured.
 
         Returns:
             The value returned by the underlying PyTorch pipeline schedule.
+
+        Raises:
+            ValueError: If a non-final call would use schedule-local gradient
+                scaling and rescale gradients accumulated by earlier calls.
+            RuntimeError: If a non-final call is attempted before
+                accumulation-aware pipeline stages have been built.
         """
+        if not finalize_backward and self.scale_grads_in_schedule:
+            raise ValueError(
+                "planned pipeline accumulation requires scale_grads_in_schedule=False; "
+                "schedule-local scaling would rescale gradients from earlier calls"
+            )
+        if not finalize_backward and (
+            not self._info.stages
+            or any(not vars(stage).get("_nemo_accumulation_aware", False) for stage in self._info.stages)
+        ):
+            raise RuntimeError(
+                "finalize_backward=False requires accumulation-aware pipeline stages; "
+                "build the AutoPipeline before running planned accumulation"
+            )
         return self._run_prepared_microbatches(
             model_inputs,
             loss_fn=loss_fn,
             losses=losses,
             return_outputs=return_outputs,
             schedule_method="step",
+            finalize_backward=finalize_backward,
         )
 
     def eval_microbatches(
@@ -425,6 +452,7 @@ class AutoPipeline:
             losses=losses,
             return_outputs=return_outputs,
             schedule_method="eval",
+            finalize_backward=True,
         )
 
     def _run_prepared_microbatches(
@@ -435,6 +463,7 @@ class AutoPipeline:
         losses: list[torch.Tensor] | None,
         return_outputs: bool,
         schedule_method: Literal["step", "eval"],
+        finalize_backward: bool,
     ) -> Any:
         """Run one schedule method with an exact prepared-microbatch split."""
         schedule = self._info.schedule
@@ -480,6 +509,11 @@ class AutoPipeline:
         )
         previous_split_inputs = schedule._split_inputs
         previous_loss_fn = schedule._loss_fn
+        previous_stage_state: list[tuple[PipelineStage, object]] = []
+        if schedule_method == "step":
+            for stage in self._info.stages or ():
+                previous_stage_state.append((stage, vars(stage).get("_nemo_finalize_backward", _MISSING_STAGE_STATE)))
+                stage._nemo_finalize_backward = finalize_backward
         schedule._split_inputs = lambda _args, _kwargs=None: (model_args_chunks, model_kwargs_chunks)
         schedule._loss_fn = indexed_loss
         try:
@@ -491,6 +525,11 @@ class AutoPipeline:
         finally:
             schedule._loss_fn = previous_loss_fn
             schedule._split_inputs = previous_split_inputs
+            for stage, previous in previous_stage_state:
+                if previous is _MISSING_STAGE_STATE:
+                    del stage._nemo_finalize_backward
+                else:
+                    stage._nemo_finalize_backward = previous
 
     @property
     def parts(self) -> list[nn.Module]:

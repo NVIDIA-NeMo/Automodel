@@ -403,16 +403,19 @@ class Engine:
         :class:`ForwardBackwardResult` continues to describe only that call;
         callers combine results with ``sum(loss_sum) / sum(weight_sum)``.
 
-        The first version supports eager/DDP/FSDP execution. Pipeline schedules
-        currently finalize gradients at the end of every schedule invocation,
-        so planned multi-call accumulation with PP fails explicitly instead of
-        silently treating each call as a complete optimizer window. If a
-        planned backward call fails after execution starts, partial distributed
-        state cannot be rolled back safely: the plan becomes broken and the
-        Engine must not be stepped or reused. To make rank-local loss-callback
-        failures fail together before backward, an explicit plan performs one
-        small control consensus per outer microbatch; the ordinary one-call
-        path adds no such collective.
+        Under pipeline parallelism the Engine carries the plan's final-window
+        boundary through AutoPipeline so a schedule-local last backward does
+        not prematurely synchronize deferred gradients. If a planned backward
+        call reports an error after execution starts, partial distributed state
+        cannot be rolled back safely: the plan becomes broken and the Engine
+        must not be stepped or reused. For non-pipeline execution, an explicit
+        plan performs one small control consensus per outer microbatch so a
+        rank-local loss-callback failure is reported together before backward;
+        the ordinary one-call path adds no such collective. A pipeline loss
+        callback runs inside PyTorch's distributed schedule, so an exception
+        from that callback is process-fatal rather than a recoverable
+        broken-plan error. Output-only callback errors returned through the
+        normal schedule path are synchronized across pipeline stages.
 
         Args:
             windows: Non-empty sequence of non-empty Datum windows in their
@@ -425,15 +428,9 @@ class Engine:
             RuntimeError: If no optimizer is configured, another plan is
                 active, or gradients from an earlier optimizer window have not
                 been cleared.
-            NotImplementedError: If pipeline parallelism is enabled.
             ValueError: If the plan is empty, malformed, or splits an outer
                 microbatch across calls.
         """
-        if self.pipeline is not None:
-            raise NotImplementedError(
-                "planned multi-call accumulation is not supported with pipeline parallelism; "
-                "pipeline schedules currently finalize gradients after every schedule call"
-            )
         if self._accumulation_state is not None:
             raise RuntimeError("an Engine accumulation plan is already active")
 
@@ -556,7 +553,8 @@ class Engine:
             windows=tuple(planned_windows),
             weight_sums=tuple(weight_sums),
             total_weight_sum=total_weight_sum,
-            total_microbatches=sum(microbatch_counts),
+            total_microbatches=sum(microbatch_counts)
+            * (self.pipeline.num_microbatches if self.pipeline is not None else 1),
             microbatch_size=self.microbatch_size,
         )
         self._optim_step_consumed = False
@@ -900,6 +898,7 @@ class Engine:
                     output_restore_plan,
                     backward_scale=backward_scale,
                     zero_weight_sum=zero_denominator,
+                    finalize_backward=is_last,
                 )
                 if output_error is None:
                     if batch_error is not None:
@@ -1562,6 +1561,7 @@ class Engine:
         *,
         backward_scale: torch.Tensor | None,
         zero_weight_sum: bool,
+        finalize_backward: bool = True,
     ) -> tuple[bool | None, list[dict[str, Any]], Exception | None]:
         """Run prepared pipeline microbatches in training or forward-only mode.
 
@@ -1580,6 +1580,9 @@ class Engine:
                 backward, or ``None`` to run the forward-only schedule.
             zero_weight_sum: Whether reporting numerators must be forced to
                 graph-connected zero.
+            finalize_backward: Whether this pipeline schedule invocation ends
+                the complete optimizer backward window. Ignored for
+                forward-only execution.
 
         Returns:
             Whether the callback returned outputs, its detached outputs in
@@ -1639,15 +1642,21 @@ class Engine:
                     return numerator if backward_scale is None else numerator * backward_scale
 
                 losses = [] if self.pipeline.info.has_last_stage else None
-                run_microbatches = (
-                    self.pipeline.eval_microbatches if backward_scale is None else self.pipeline.step_microbatches
-                )
-                run_microbatches(
-                    model_microbatches,
-                    loss_fn=pipeline_loss,
-                    losses=losses,
-                    return_outputs=False,
-                )
+                if backward_scale is None:
+                    self.pipeline.eval_microbatches(
+                        model_microbatches,
+                        loss_fn=pipeline_loss,
+                        losses=losses,
+                        return_outputs=False,
+                    )
+                else:
+                    self.pipeline.step_microbatches(
+                        model_microbatches,
+                        loss_fn=pipeline_loss,
+                        losses=losses,
+                        return_outputs=False,
+                        finalize_backward=finalize_backward,
+                    )
 
         outputs: list[dict[str, Any]] = []
         serialized_outputs: bytes | None = None
@@ -2132,7 +2141,7 @@ class Engine:
         return (dp_cp_mesh.get_group() if size > 1 else None), size
 
     def _accumulation_control_group_and_size(self) -> tuple[dist.ProcessGroup | None, int]:
-        """Return the full non-PP model group used to keep plan control flow aligned."""
+        """Return the full model group used to keep plan control flow aligned."""
         if not dist.is_available() or not dist.is_initialized():
             return None, 1
         if self.mesh_context is None:

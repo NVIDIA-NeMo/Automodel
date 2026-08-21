@@ -20,10 +20,11 @@ import math
 import os
 import time
 import types
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 import torch
 import torch.nn as nn
+from torch.distributed import fsdp as torch_fsdp
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import (
@@ -42,8 +43,19 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     model_keeps_self_forward,
     patch_hf_model_for_pp,
 )
+from nemo_automodel.shared.import_utils import safe_import_from
 
 logger = logging.getLogger(__name__)
+
+_HAS_REPLICATE_MODULE, ReplicateModule = safe_import_from(
+    "torch.distributed._composable.replicate_with_fsdp",
+    "ReplicateModule",
+)
+_HAS_REPLICATE_STATE, replicate = safe_import_from(
+    "torch.distributed._composable.replicate_with_fsdp",
+    "replicate",
+)
+_HAS_REPLICATE_WITH_FSDP = _HAS_REPLICATE_MODULE and _HAS_REPLICATE_STATE
 
 
 def _get_optional_hook(module: object, name: str) -> Callable | None:
@@ -489,6 +501,99 @@ def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
                 param.grad = grad
 
         stage._post_metadata_inference_cleanup = types.MethodType(_cleanup_preserving_grads, stage)
+
+
+def _accumulation_aware_backward_maybe_with_nosync(
+    self: PipelineStage,
+    backward_type: str,
+    bwd_kwargs: dict[str, Any],
+    last_backward: bool = False,
+) -> tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]] | None]:
+    """Keep a schedule-local last backward open across planned Engine windows.
+
+    A configured per-microbatch reduction remains authoritative. Otherwise a
+    non-final Engine window must not let PyTorch's schedule-local
+    ``last_backward`` trigger DDP/FSDP gradient synchronization.
+
+    Args:
+        backward_type: PyTorch stage operation: ``full``, ``input``, or
+            ``weight`` backward.
+        bwd_kwargs: Schedule-owned state for one local PP microbatch. ``full``
+            and ``input`` carry ``stage_output``, ``output_grads``, and
+            ``input_values`` tensor trees; ``weight`` carries ``stage_output``
+            and the split-backward ``param_groups``. All tensor shapes, dtypes,
+            devices, and layouts are model- and stage-defined. This wrapper
+            forwards them unchanged and performs no redistribution.
+        last_backward: Whether the PyTorch schedule considers this its final
+            local backward operation.
+
+    Returns:
+        The original stage backward result unchanged: stage-input gradient
+        tensors in their model-defined local layouts, plus optional
+        split-backward parameter-group records.
+    """
+    finalize_backward = self._nemo_finalize_backward or self._reduce_grad_per_microbatch
+    return self._nemo_original_backward_maybe_with_nosync(
+        backward_type,
+        bwd_kwargs,
+        last_backward=last_backward and finalize_backward,
+    )
+
+
+def _accumulation_aware_perform_reduce_grad(self: PipelineStage, grad_scale_factor: int) -> None:
+    """Complete a PP schedule while deferring its final gradient collective.
+
+    FSDP post-backward is both a communication boundary and required local
+    lifecycle cleanup. On a non-final planned window, run that cleanup with
+    gradient synchronization disabled so accumulated unsharded gradients are
+    preserved for the final window. Schedule-owned gradient scaling still runs
+    once per schedule. The original implementation is used unchanged for
+    ordinary calls, final planned windows, and per-microbatch reduction mode.
+    """
+    finalize_backward = self._nemo_finalize_backward or self._reduce_grad_per_microbatch
+    if finalize_backward:
+        self._nemo_original_perform_reduce_grad(grad_scale_factor)
+        return
+
+    if isinstance(self.submod, torch_fsdp.FSDPModule):
+        fsdp_module = self.submod
+        fsdp_module.set_is_last_backward(True)
+        fsdp_module.set_reshard_after_backward(True)
+        fsdp_module.set_requires_gradient_sync(False)
+        fsdp_state = (
+            replicate.state(fsdp_module)
+            if _HAS_REPLICATE_WITH_FSDP and isinstance(fsdp_module, ReplicateModule)
+            else torch_fsdp.fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
+        )
+        for state in fsdp_state._state_ctx.all_states:
+            if state._fsdp_param_group:
+                state._fsdp_param_group.post_backward()
+        fsdp_state._root_post_backward_final_callback()
+
+    if grad_scale_factor != 1:
+        self.scale_grads(grad_scale_factor)
+
+
+def _make_pipeline_stages_accumulation_aware(
+    stages: list[PipelineStage],
+    *,
+    reduce_grad_per_microbatch: bool,
+) -> None:
+    """Install behavior-neutral stage gates used by planned PP accumulation."""
+    for stage in stages:
+        stage._reduce_grad_per_microbatch = reduce_grad_per_microbatch
+        stage._nemo_finalize_backward = True
+        if vars(stage).get("_nemo_accumulation_aware", False):
+            continue
+
+        stage._nemo_original_backward_maybe_with_nosync = stage.backward_maybe_with_nosync
+        stage.backward_maybe_with_nosync = types.MethodType(_accumulation_aware_backward_maybe_with_nosync, stage)
+
+        perform_reduce_grad = getattr(stage, "perform_reduce_grad", None)
+        if callable(perform_reduce_grad):
+            stage._nemo_original_perform_reduce_grad = perform_reduce_grad
+            stage.perform_reduce_grad = types.MethodType(_accumulation_aware_perform_reduce_grad, stage)
+        stage._nemo_accumulation_aware = True
 
 
 def reset_pp_stage_shapes(
@@ -1003,12 +1108,20 @@ def pipeline_model(
 
         for stage in stages:
             stage.backward_maybe_with_nosync = types.MethodType(patched_backward_maybe_with_nosync, stage)
-            stage._reduce_grad_per_microbatch = reduce_grad_per_microbatch
 
         logger.info(
             "Patched pipeline stages with backward_maybe_with_nosync "
             f"(reduce_grad_per_microbatch={reduce_grad_per_microbatch})"
         )
+
+    # PyTorch considers every schedule invocation a complete optimizer window:
+    # its last backward and REDUCE_GRAD action finalize DP/FSDP gradients. Keep
+    # those exact defaults, but make the boundary controllable when Engine has
+    # predeclared one optimizer window spanning multiple schedule invocations.
+    _make_pipeline_stages_accumulation_aware(
+        stages,
+        reduce_grad_per_microbatch=reduce_grad_per_microbatch,
+    )
 
     # Determine if this rank has first/last stage
     has_first_stage = False

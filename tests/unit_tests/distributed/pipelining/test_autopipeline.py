@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.pipelining.microbatch import TensorChunkSpec, split_args_kwargs_into_chunks
 
+import nemo_automodel.components.distributed.pipelining.functional as pipeline_functional
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import (
     generate_hf_model_fqn_per_model_part,
@@ -117,6 +118,12 @@ class DummyPipelineStage:
     def scale_grads(self, divisor: int):
         # record the last divisor for verification if needed
         self._scaled = divisor
+
+    def backward_maybe_with_nosync(self, _backward_type, _bwd_kwargs, last_backward=False):
+        return (), None
+
+    def perform_reduce_grad(self, divisor: int):
+        self.scale_grads(divisor)
 
 
 class FakeSchedule:
@@ -359,8 +366,58 @@ class _NoEvalSchedule(_LegacyStepSchedule):
     eval = None
 
 
+class _FinalizationStage:
+    """Record the two schedule-local gradient-finalization signals."""
+
+    def __init__(self, submod=None):
+        self.events = []
+        self.submod = nn.Module() if submod is None else submod
+
+    def backward_maybe_with_nosync(self, _backward_type, _bwd_kwargs, *, last_backward=False):
+        self.events.append(("backward", last_backward))
+        return (), None
+
+    def perform_reduce_grad(self, divisor):
+        self.events.append(("reduce", divisor))
+        set_requires_gradient_sync = getattr(self.submod, "set_requires_gradient_sync", None)
+        if callable(set_requires_gradient_sync):
+            set_requires_gradient_sync(True)
+        self.scale_grads(divisor)
+
+    def scale_grads(self, divisor):
+        self.events.append(("scale", divisor))
+
+
+class _FinalizationSchedule(_KwargsChunkSchedule):
+    """Model the final backward and reduce calls made by a PyTorch schedule."""
+
+    def __init__(self, stage):
+        super().__init__()
+        self._stage = stage
+        self._stages = [stage]
+
+    def step(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
+        result = super().step(
+            *args,
+            target=target,
+            losses=losses,
+            return_outputs=return_outputs,
+            **kwargs,
+        )
+        self._stage.backward_maybe_with_nosync("full", {}, last_backward=True)
+        self._stage.perform_reduce_grad(2)
+        return result
+
+
 class TestAutoPipelineKwargsChunkSpec:
-    def _pipeline_with_parts(self, *parts: nn.Module, schedule=None, has_first_stage: bool = True):
+    def _pipeline_with_parts(
+        self,
+        *parts: nn.Module,
+        schedule=None,
+        has_first_stage: bool = True,
+        defer_fsdp_grad_sync: bool = True,
+        scale_grads_in_schedule: bool = False,
+    ):
         ap = AutoPipeline(
             world_mesh=FakeDeviceMesh(),
             pp_axis_name="pp",
@@ -368,6 +425,8 @@ class TestAutoPipelineKwargsChunkSpec:
             pp_microbatch_size=1,
             pp_batch_size=2,
             device=torch.device("cpu"),
+            defer_fsdp_grad_sync=defer_fsdp_grad_sync,
+            scale_grads_in_schedule=scale_grads_in_schedule,
         )
         ap._info.schedule = schedule or _KwargsChunkSchedule()
         ap._info.model_parts = list(parts)
@@ -462,6 +521,134 @@ class TestAutoPipelineKwargsChunkSpec:
 
         assert schedule.args_split == [(), ()]
         assert all("inputs_embeds" not in kwargs for kwargs in schedule.kwargs_split)
+
+    def test_step_microbatches_defers_schedule_finalization_until_the_logical_last_call(self):
+        stage = _FinalizationStage()
+        schedule = _FinalizationSchedule(stage)
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+        pipeline_functional._make_pipeline_stages_accumulation_aware(
+            [stage],
+            reduce_grad_per_microbatch=False,
+        )
+        ap._info.stages = [stage]
+        model_inputs = [{"input_ids": torch.zeros(1, 8)} for _ in range(2)]
+
+        ap.step_microbatches(model_inputs, loss_fn=Mock(), finalize_backward=False)
+        assert stage.events == [("backward", False), ("scale", 2)]
+        assert stage._nemo_finalize_backward is True
+
+        ap.step_microbatches(model_inputs, loss_fn=Mock(), finalize_backward=True)
+        assert stage.events == [
+            ("backward", False),
+            ("scale", 2),
+            ("backward", True),
+            ("reduce", 2),
+            ("scale", 2),
+        ]
+
+    def test_step_microbatches_preserves_requested_per_microbatch_gradient_reduction(self):
+        stage = _FinalizationStage()
+        schedule = _FinalizationSchedule(stage)
+        ap = self._pipeline_with_parts(
+            nn.Module(),
+            schedule=schedule,
+            defer_fsdp_grad_sync=False,
+        )
+        pipeline_functional._make_pipeline_stages_accumulation_aware(
+            [stage],
+            reduce_grad_per_microbatch=True,
+        )
+        ap._info.stages = [stage]
+
+        ap.step_microbatches(
+            [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
+            loss_fn=Mock(),
+            finalize_backward=False,
+        )
+
+        assert stage.events == [("backward", True), ("reduce", 2), ("scale", 2)]
+
+    def test_step_microbatches_rejects_cross_call_schedule_gradient_scaling(self):
+        schedule = _KwargsChunkSchedule()
+        ap = self._pipeline_with_parts(
+            nn.Module(),
+            schedule=schedule,
+            scale_grads_in_schedule=True,
+        )
+
+        with pytest.raises(ValueError, match="scale_grads_in_schedule=False"):
+            ap.step_microbatches(
+                [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
+                loss_fn=Mock(),
+                finalize_backward=False,
+            )
+
+        assert schedule.step_calls == 0
+
+    @pytest.mark.parametrize("stage_state", [None, "unwrapped"])
+    def test_step_microbatches_requires_accumulation_aware_stages_for_nonfinal_call(self, stage_state):
+        schedule = _KwargsChunkSchedule()
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+        ap._info.stages = None if stage_state is None else [_FinalizationStage()]
+
+        with pytest.raises(RuntimeError, match="accumulation-aware pipeline stages"):
+            ap.step_microbatches(
+                [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
+                loss_fn=Mock(),
+                finalize_backward=False,
+            )
+
+        assert schedule.step_calls == 0
+
+    def test_nonfinal_fully_sharded_stage_runs_post_backward_without_sync(self, monkeypatch):
+        fsdp_events = []
+
+        class FakeFSDPModule:
+            def set_is_last_backward(self, value):
+                fsdp_events.append(("last", value))
+
+            def set_reshard_after_backward(self, value):
+                fsdp_events.append(("reshard", value))
+
+            def set_requires_gradient_sync(self, value):
+                fsdp_events.append(("sync", value))
+
+        parameter_group = types.SimpleNamespace(post_backward=lambda: fsdp_events.append(("post", None)))
+        fsdp_state = types.SimpleNamespace(
+            _state_ctx=types.SimpleNamespace(
+                all_states=[types.SimpleNamespace(_fsdp_param_group=parameter_group)],
+            ),
+            _root_post_backward_final_callback=lambda: fsdp_events.append(("root", None)),
+        )
+        import torch.distributed.fsdp as torch_fsdp
+
+        monkeypatch.setattr(torch_fsdp, "FSDPModule", FakeFSDPModule)
+        monkeypatch.setattr(torch_fsdp.fully_shard, "state", lambda _module: fsdp_state)
+
+        stage = _FinalizationStage(FakeFSDPModule())
+        pipeline_functional._make_pipeline_stages_accumulation_aware(
+            [stage],
+            reduce_grad_per_microbatch=False,
+        )
+        stage._nemo_finalize_backward = False
+        stage.perform_reduce_grad(2)
+
+        assert fsdp_events == [
+            ("last", True),
+            ("reshard", True),
+            ("sync", False),
+            ("post", None),
+            ("root", None),
+        ]
+        assert stage.events == [("scale", 2)]
+
+        fsdp_events.clear()
+        stage.events.clear()
+        stage._nemo_finalize_backward = True
+        stage.perform_reduce_grad(2)
+
+        assert fsdp_events == [("sync", True)]
+        assert stage.events == [("reduce", 2), ("scale", 2)]
 
     @pytest.mark.parametrize(
         ("method_name", "schedule_cls"),

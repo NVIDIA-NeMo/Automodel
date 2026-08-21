@@ -133,6 +133,7 @@ class _FakeAutoPipeline(AutoPipeline):
         self.step_calls = 0
         self.eval_calls = 0
         self.backward_calls = 0
+        self.finalize_backward_calls = []
         self.updated_seq_lens = []
         self.updated_microbatch_sizes = []
         self.updated_input_shapes = []
@@ -156,11 +157,12 @@ class _FakeAutoPipeline(AutoPipeline):
         self.updated_microbatch_sizes.append(microbatch_size)
         self.updated_input_shapes.append(tuple(input_tensor.shape) if input_tensor is not None else None)
 
-    def step_microbatches(self, model_inputs, *, loss_fn, losses, return_outputs):
+    def step_microbatches(self, model_inputs, *, loss_fn, losses, return_outputs, finalize_backward=True):
         assert return_outputs is False
         assert len(model_inputs) == self.num_microbatches
         self.prepared_inputs.append(model_inputs)
         self.step_calls += 1
+        self.finalize_backward_calls.append(finalize_backward)
         if self.events is not None:
             self.events.append("step")
 
@@ -192,7 +194,7 @@ class _FakeAutoPipeline(AutoPipeline):
 
 
 def _pipeline_mesh_context():
-    return SimpleNamespace(pp_size=2, cp_size=1, device_mesh=None, process_group=None)
+    return SimpleNamespace(pp_size=2, cp_size=1, device_mesh=None, moe_mesh=None, process_group=None)
 
 
 class _DDPWithCP(nn.parallel.DistributedDataParallel):
@@ -1748,6 +1750,7 @@ def test_pipeline_window_uses_schedule_microbatches_and_global_normalization():
     assert model.weight.grad.item() == pytest.approx(4.5)
     assert result.loss_fn_outputs == []
     assert pipeline.step_calls == 2
+    assert pipeline.finalize_backward_calls == [False, True]
     # The fake schedule performs and counts every backward, then returns None.
     # A second Engine-owned backward would either fail or change these counts.
     assert pipeline.backward_calls == backward_calls == 4
@@ -1930,24 +1933,140 @@ def test_pipeline_lifecycle_and_moe_scale_cover_outer_and_inner_microbatches(mon
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.25)
 
 
-def test_pipeline_rejects_planned_multi_call_before_forward():
+def test_pipeline_planned_multi_call_matches_one_window_with_unequal_weights():
+    window_a = [_datum([[2], [100]], [[1.0], [0.0]])]
+    window_b = [_datum([[4], [8]], [[0.5], [1.5]])]
+
+    reference_model = ScaleModel()
+    reference_optimizer = torch.optim.SGD(reference_model.parameters(), lr=0.1)
+    reference_pipeline = _FakeAutoPipeline(reference_model, num_microbatches=2)
+    reference_engine = Engine(
+        reference_pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+        collate_fn=collate_prebatched,
+        optimizers=reference_optimizer,
+        max_grad_norm=None,
+    )
+    reference_result = reference_engine.forward_backward(window_a + window_b, _identity_loss)
+    reference_grad = reference_model.weight.grad.detach().clone()
+    reference_step = reference_engine.optim_step()
+
+    planned_model = ScaleModel()
+    planned_optimizer = torch.optim.SGD(planned_model.parameters(), lr=0.1)
+    planned_pipeline = _FakeAutoPipeline(planned_model, num_microbatches=2)
+    planned_engine = Engine(
+        planned_pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+        collate_fn=collate_prebatched,
+        optimizers=planned_optimizer,
+        max_grad_norm=None,
+    )
+    planned_engine.begin_accumulation([window_a, window_b])
+    result_a = planned_engine.forward_backward(window_a, _identity_loss)
+    result_b = planned_engine.forward_backward(window_b, _identity_loss)
+    planned_grad = planned_model.weight.grad.detach().clone()
+    planned_step = planned_engine.optim_step()
+
+    assert result_a.loss_sum.item() == pytest.approx(2.0)
+    assert result_a.weight_sum.item() == pytest.approx(1.0)
+    assert result_a.loss.item() == pytest.approx(2.0)
+    assert result_b.loss_sum.item() == pytest.approx(14.0)
+    assert result_b.weight_sum.item() == pytest.approx(2.0)
+    assert result_b.loss.item() == pytest.approx(7.0)
+    assert reference_result.loss_sum.item() == pytest.approx(16.0)
+    assert reference_result.weight_sum.item() == pytest.approx(3.0)
+    assert reference_result.loss.item() == pytest.approx(16.0 / 3.0)
+    assert reference_pipeline.step_calls == planned_pipeline.step_calls == 2
+    assert reference_pipeline.finalize_backward_calls == [False, True]
+    assert planned_pipeline.finalize_backward_calls == [False, True]
+    assert reference_pipeline.backward_calls == planned_pipeline.backward_calls == 4
+    torch.testing.assert_close(planned_grad, reference_grad)
+    torch.testing.assert_close(planned_step.grad_norm, reference_step.grad_norm)
+    torch.testing.assert_close(planned_model.weight, reference_model.weight)
+
+
+def test_pipeline_planned_accumulation_uses_one_lifecycle_and_all_inner_microbatches(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        engine_module,
+        "prepare_for_grad_accumulation",
+        lambda _parts, *, pp_enabled: events.append(f"prepare:{pp_enabled}"),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "prepare_for_final_backward",
+        lambda _parts, *, pp_enabled: events.append(f"final:{pp_enabled}"),
+    )
+    monkeypatch.setattr(engine_module, "prepare_after_first_microbatch", lambda: events.append("after_first"))
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
+
+    model = _MainAndAuxScaleModel()
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2, events=events)
+    engine = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+        collate_fn=collate_prebatched,
+        optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+        max_grad_norm=None,
+    )
+    window_a = [_datum([[100], [200]], [[0.0], [0.0]])]
+    window_b = [_datum([[3], [5]], [[1.0], [1.0]])]
+
+    engine.begin_accumulation([window_a, window_b])
+    result_a = engine.forward_backward(window_a, _identity_loss)
+    result_b = engine.forward_backward(window_b, _identity_loss)
+
+    assert events == ["prepare:True", "step", "after_first", "final:True", "step"]
+    assert result_a.loss.item() == pytest.approx(0.0)
+    assert result_b.loss.item() == pytest.approx(4.0)
+    assert pipeline.step_calls == 2
+    assert pipeline.backward_calls == 4
+    assert pipeline.finalize_backward_calls == [False, True]
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.25)
+    assert model.main_weight.grad.item() == pytest.approx(4.0)
+    assert model.aux_weight.grad.item() == pytest.approx(1.0)
+
+
+def test_pipeline_planned_accumulation_enforces_state_and_retries_a_failed_fence():
     model = ScaleModel()
     pipeline = _FakeAutoPipeline(model, num_microbatches=2)
     engine = Engine(
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
+        collate_fn=collate_prebatched,
+        optimizers=torch.optim.SGD(model.parameters(), lr=0.1),
+        max_grad_norm=None,
     )
-    window_a = [_datum([1, 2])]
-    window_b = [_datum([3, 4])]
+    window_a = [_datum([[1], [3]])]
+    window_b = [_datum([[5], [7]])]
+    engine.begin_accumulation([window_a, window_b])
+    engine.forward_backward(window_a, _identity_loss)
 
-    with pytest.raises(NotImplementedError, match="pipeline|PP"):
-        engine.begin_accumulation([window_a, window_b])
+    with pytest.raises(RuntimeError, match="finish every forward_backward"):
+        engine.optim_step()
+    torch.testing.assert_close(model.weight, torch.tensor(1.0))
 
-    assert pipeline.step_calls == 0
-    assert pipeline.backward_calls == 0
-    assert model.forward_calls == 0
+    engine.forward_backward(window_b, _identity_loss)
+    expected_grad = model.weight.grad.detach().clone()
+
+    def fail_before_step():
+        raise ValueError("checkpoint staging failed")
+
+    with pytest.raises(ValueError, match="checkpoint staging failed"):
+        engine.optim_step(before_optimizer_step=fail_before_step)
+    torch.testing.assert_close(model.weight, torch.tensor(1.0))
+    torch.testing.assert_close(model.weight.grad, expected_grad)
+
+    engine.optim_step()
+    torch.testing.assert_close(model.weight, 1.0 - 0.1 * expected_grad)
     assert model.weight.grad is None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        engine.optim_step()
 
 
 def test_pipeline_outputs_follow_logical_microbatch_order():

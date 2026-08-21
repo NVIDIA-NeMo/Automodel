@@ -30,8 +30,14 @@ the loose bound a cross-topology reference would force.
 Sequence length changes between windows, which is what triggers the stage reset
 that caused the loss.
 
+The second phase drives those same varying-length FSDP2 stages through Engine:
+one complete ``forward_backward`` call is the reference for an explicit plan
+split across two calls. This additionally verifies that a non-final pipeline
+schedule completes FSDP post-backward cleanup without synchronizing gradients.
+
 Usage:
     torchrun --nproc-per-node=2 run_pp_grad_accum_parity.py
+    torchrun --nproc-per-node=4 run_pp_grad_accum_parity.py  # PP2 x DP2
 """
 
 import torch
@@ -43,6 +49,7 @@ BATCH = 2
 # Two accumulation windows with *different* sequence lengths. The change is the
 # trigger: equal lengths would skip the stage reset and hide the regression.
 WINDOW_SEQ_LENS = (32, 48)
+LOCAL_WINDOW_WEIGHT_SUM = BATCH * sum(WINDOW_SEQ_LENS)
 
 
 def _build_model(device: torch.device) -> torch.nn.Module:
@@ -94,12 +101,14 @@ def _batch(seq_len: int, device: torch.device) -> dict[str, torch.Tensor]:
         device: Device to place the tensors on.
 
     Returns:
-        Dict with ``input_ids`` and ``labels``, both of shape [BATCH, seq_len].
+        Dict with ``input_ids``, ``attention_mask``, and ``labels``, all of
+        shape [BATCH, seq_len]. The mask is explicitly all ones so direct
+        schedule and Engine collation exercise identical model inputs.
     """
     torch.manual_seed(seq_len)  # same window -> same data on every rank and phase
     ids = torch.randint(2, VOCAB, (BATCH, seq_len), device=device)
     dist.broadcast(ids, src=0)
-    return {"input_ids": ids, "labels": ids.clone()}
+    return {"input_ids": ids, "attention_mask": torch.ones_like(ids), "labels": ids.clone()}
 
 
 def _run_window(pp, seq_len: int, device: torch.device) -> None:
@@ -137,21 +146,233 @@ def _zero_grads(model) -> None:
         param.grad = None
 
 
+def _scale_aware_grad_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    relative_max_error: float = 0.03,
+    absolute_floor: float = 2e-3,
+    relative_norm_error: float = 0.02,
+) -> tuple[bool, float, float, float]:
+    """Compare equal-shaped local gradient shards with a BF16-aware bound.
+
+    Args:
+        actual: Float32 local FSDP gradient shard being checked.
+        expected: Equal-shaped float32 local FSDP reference shard.
+        relative_max_error: Allowed max-element error relative to the largest
+            absolute reference element.
+        absolute_floor: Absolute max-element allowance for values near zero.
+        relative_norm_error: Allowed relative error in the full shard norm.
+
+    Returns:
+        Whether both the max-error and norm checks pass, followed by the
+        observed max error, its allowed bound, and ``||actual||/||expected||``.
+    """
+    if actual.shape != expected.shape:
+        return False, float("inf"), 0.0, float("inf")
+    if expected.numel() == 0:
+        return True, 0.0, absolute_floor, 1.0
+
+    max_error = float((actual - expected).abs().max())
+    error_bound = relative_max_error * float(expected.abs().max()) + absolute_floor
+    actual_norm = float(actual.norm())
+    expected_norm = float(expected.norm())
+    if expected_norm == 0.0:
+        norm_ratio = 1.0 if actual_norm == 0.0 else float("inf")
+        norm_close = actual_norm <= absolute_floor
+    else:
+        norm_ratio = actual_norm / expected_norm
+        norm_close = abs(norm_ratio - 1.0) <= relative_norm_error
+    return max_error <= error_bound and norm_close, max_error, error_bound, norm_ratio
+
+
+def _engine_window(seq_len: int, weight_scale: float, device: torch.device):
+    """Build one flat Datum window with a caller-specific token denominator.
+
+    Args:
+        seq_len: Token length of every Datum in the window.
+        weight_scale: Constant value assigned to every token loss weight.
+        device: Device holding the generated tensors.
+
+    Returns:
+        ``BATCH`` Datums whose ``input_ids``, ``attention_mask``, ``labels``,
+        and ``weights`` each have shape ``[sequence]``. The Engine collates
+        them to ``[BATCH, sequence]`` before PP splits the batch axis.
+    """
+    from nemo_automodel.components.datasets.datum import Datum
+
+    batch = _batch(seq_len, device)
+    return [
+        Datum(
+            model_inputs={"input_ids": input_ids, "attention_mask": attention_mask},
+            loss_fn_inputs={
+                "labels": labels,
+                "weights": torch.full_like(labels, weight_scale, dtype=torch.float32),
+            },
+        )
+        for input_ids, attention_mask, labels in zip(
+            batch["input_ids"],
+            batch["attention_mask"],
+            batch["labels"],
+        )
+    ]
+
+
+def _run_engine_planned_parity(
+    pp,
+    mesh,
+    device: torch.device,
+    rank: int,
+    direct_normalized_grads: dict[str, torch.Tensor],
+) -> None:
+    """Compare one Engine window with the same FSDP2 PP work split across calls.
+
+    Args:
+        pp: Built PP2 AutoPipeline whose local stage is FSDP2-wrapped.
+        mesh: ``[pp, dp]`` device mesh; DP may be one or two.
+        device: CUDA device for this rank's token tensors.
+        rank: Global rank used in actionable assertion messages.
+        direct_normalized_grads: Per-parameter direct-schedule reference. Each
+            value is the float32 local FSDP shard accumulated over both
+            varying-length windows, with every microbatch loss divided by the
+            complete local-window token denominator.
+    """
+    from nemo_automodel.components.distributed.mesh import MeshContext
+    from nemo_automodel.engine import Engine
+
+    def token_losses(pred, loss_inputs):
+        """Return unweighted token cross entropy in the Engine loss layout.
+
+        Args:
+            pred: Pipeline output with logits shaped
+                ``[pp_microbatch, sequence, vocab]``.
+            loss_inputs: Mapping containing ``labels`` and ``weights`` shaped
+                ``[pp_microbatch, sequence]``.
+
+        Returns:
+            Per-token cross entropy with the same shape as ``weights``. Engine
+            applies the token weights and complete-window denominator.
+        """
+        logits = pred.logits if hasattr(pred, "logits") else pred
+        return torch.nn.functional.cross_entropy(
+            logits.float().flatten(0, 1),
+            loss_inputs["labels"].flatten(0, 1),
+            reduction="none",
+        ).view_as(loss_inputs["weights"])
+
+    window_a = _engine_window(WINDOW_SEQ_LENS[0], 1.0, device)
+    window_b = _engine_window(WINDOW_SEQ_LENS[1], 1.0, device)
+    part = pp.parts[0]
+    mesh_context = MeshContext.from_meshes(mesh)
+
+    _zero_grads(part)
+    reference_engine = Engine(
+        pp,
+        device=device,
+        mesh_context=mesh_context,
+        microbatch_size=BATCH,
+        optimizers=torch.optim.SGD(part.parameters(), lr=0.01),
+        max_grad_norm=None,
+    )
+    reference_result = reference_engine.forward_backward(window_a + window_b, token_losses)
+    reference_grads = _snapshot_grads(part)
+
+    _zero_grads(part)
+    planned_engine = Engine(
+        pp,
+        device=device,
+        mesh_context=mesh_context,
+        microbatch_size=BATCH,
+        optimizers=torch.optim.SGD(part.parameters(), lr=0.01),
+        max_grad_norm=None,
+    )
+    planned_engine.begin_accumulation([window_a, window_b])
+    result_a = planned_engine.forward_backward(window_a, token_losses)
+    result_b = planned_engine.forward_backward(window_b, token_losses)
+    planned_grads = _snapshot_grads(part)
+
+    assert result_a.weight_sum.item() != result_b.weight_sum.item(), (
+        f"[rank {rank}] Engine fixture must use unequal call denominators"
+    )
+    torch.testing.assert_close(result_a.loss_sum + result_b.loss_sum, reference_result.loss_sum, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(
+        result_a.weight_sum + result_b.weight_sum,
+        reference_result.weight_sum,
+        rtol=0,
+        atol=0,
+    )
+    combined_loss = (result_a.loss_sum + result_b.loss_sum) / (result_a.weight_sum + result_b.weight_sum)
+    torch.testing.assert_close(combined_loss, reference_result.loss, rtol=2e-2, atol=2e-3)
+
+    missing = set(reference_grads) ^ set(planned_grads)
+    assert not missing, f"[rank {rank}] Engine gradient key mismatch: {sorted(missing)[:5]}"
+    direct_missing = set(direct_normalized_grads) ^ set(planned_grads)
+    assert not direct_missing, f"[rank {rank}] direct/Engine gradient key mismatch: {sorted(direct_missing)[:5]}"
+    mismatches = []
+    oracle_mismatches = []
+    for name in sorted(reference_grads):
+        got, want = planned_grads[name], reference_grads[name]
+        if not torch.allclose(got, want, rtol=2e-2, atol=2e-3):
+            mismatches.append(f"{name}: max|delta|={(got - want).abs().max():.3e}")
+        direct = direct_normalized_grads[name]
+        single_close, max_error, error_bound, norm_ratio = _scale_aware_grad_close(want, direct)
+        if not single_close:
+            oracle_mismatches.append(
+                f"{name}/single: max|delta|={max_error:.3e} bound={error_bound:.3e} norm_ratio={norm_ratio:.6f}"
+            )
+        planned_close, max_error, error_bound, norm_ratio = _scale_aware_grad_close(got, direct)
+        if not planned_close:
+            oracle_mismatches.append(
+                f"{name}/planned: max|delta|={max_error:.3e} bound={error_bound:.3e} norm_ratio={norm_ratio:.6f}"
+            )
+    if mismatches:
+        raise AssertionError(
+            f"[rank {rank}] Engine planned PP gradients != one complete window "
+            f"({len(mismatches)}/{len(reference_grads)} parameters differ).\n  " + "\n  ".join(mismatches[:8])
+        )
+    if oracle_mismatches:
+        raise AssertionError(
+            f"[rank {rank}] Engine normalized gradients disagree with the independent direct normalized oracle "
+            f"({len(oracle_mismatches)} mismatches; global_weight_sum={reference_result.weight_sum.item():.1f}, "
+            f"dp_size={mesh['dp'].size()}).\n  " + "\n  ".join(oracle_mismatches[:8])
+        )
+
+    print(f"[rank {rank}] Engine planned PP/FSDP2 parity OK over {len(reference_grads)} parameters")
+
+
 def main() -> None:
     """Compare accumulated gradients against the sum of per-window gradients."""
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
+    if world not in {2, 4}:
+        raise ValueError(f"PP grad-accumulation parity requires 2 or 4 ranks, got {world}")
     torch.cuda.set_device(rank % torch.cuda.device_count())
     device = torch.device("cuda", rank % torch.cuda.device_count())
 
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
 
-    mesh = init_device_mesh("cuda", (world, 1), mesh_dim_names=("pp", "dp"))
+    mesh = init_device_mesh("cuda", (2, world // 2), mesh_dim_names=("pp", "dp"))
     model = _build_model(device)
 
     def loss_fn(pred, target):
+        """Return one PP microbatch's CE normalized by the full local window.
+
+        Args:
+            pred: Pipeline output with logits shaped
+                ``[pp_microbatch, sequence, vocab]``.
+            target: Token labels shaped ``[pp_microbatch, sequence]``.
+
+        Returns:
+            Scalar summed cross entropy divided by the complete two-window
+            local token denominator. This matches Engine's backward scale.
+        """
         logits = pred.logits if hasattr(pred, "logits") else pred
-        return torch.nn.functional.cross_entropy(logits.float().flatten(0, 1), target.flatten(0, 1), reduction="sum")
+        loss_sum = torch.nn.functional.cross_entropy(
+            logits.float().flatten(0, 1),
+            target.flatten(0, 1),
+            reduction="sum",
+        )
+        return loss_sum / LOCAL_WINDOW_WEIGHT_SUM
 
     pp = AutoPipeline(
         world_mesh=mesh,
@@ -191,8 +412,10 @@ def main() -> None:
     _zero_grads(part)
     _run_window(pp, WINDOW_SEQ_LENS[-1], device)
     last_only = _snapshot_grads(part)
-    differs = any(not torch.allclose(last_only[n], reference[n], rtol=1e-3, atol=1e-4) for n in reference)
-    assert differs, f"[rank {rank}] windows produce identical gradients; test cannot detect a wipe"
+    catches_dropped_window = any(not _scale_aware_grad_close(last_only[name], reference[name])[0] for name in reference)
+    assert catches_dropped_window, (
+        f"[rank {rank}] last-window-only gradients pass the Engine oracle tolerance; test cannot detect a wipe"
+    )
 
     mismatches = []
     for name in sorted(reference):
@@ -211,6 +434,7 @@ def main() -> None:
         )
 
     print(f"[rank {rank}] PP grad-accumulation parity OK over {len(reference)} parameters")
+    _run_engine_planned_parity(pp, mesh, device, rank, reference)
     dist.barrier()
     dist.destroy_process_group()
 
