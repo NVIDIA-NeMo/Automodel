@@ -51,7 +51,7 @@ from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.models.common.mtp import prepare_mtp_context_parallel_inputs
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.engine import Engine, ForwardResult, OptimStepResult, collate_prebatched
+from nemo_automodel.engine import Engine, ForwardBackwardResult, ForwardResult, OptimStepResult, collate_prebatched
 from nemo_automodel.engine.outputs import LossFnOutputBatch, PerTokenOutput
 
 
@@ -482,13 +482,16 @@ def test_forward_backward_uses_one_denominator_for_the_window():
     initial_weight = model.weight.detach().clone()
     engine = Engine(model, device="cpu")
 
-    loss, outputs = engine.forward_backward(
+    result = engine.forward_backward(
         [_datum([1, 2]), _datum([3])],
         _identity_loss,
     )
 
-    assert loss.item() == pytest.approx(2.0)
-    assert outputs == []
+    assert isinstance(result, ForwardBackwardResult)
+    assert result.loss.item() == pytest.approx(2.0)
+    assert result.loss_sum.item() == pytest.approx(6.0)
+    assert result.weight_sum.item() == pytest.approx(3.0)
+    assert result.loss_fn_outputs == []
     assert model.weight.grad.item() == pytest.approx(2.0)
     assert torch.equal(model.weight, initial_weight)
     assert model.forward_calls == 2
@@ -502,7 +505,7 @@ def test_forward_backward_groups_flat_datums_by_microbatch_size():
         return collate_datums(datums)
 
     model = ScaleModel()
-    loss, _ = Engine(
+    result = Engine(
         model,
         device="cpu",
         microbatch_size=2,
@@ -511,7 +514,7 @@ def test_forward_backward_groups_flat_datums_by_microbatch_size():
 
     assert group_sizes == [2, 2, 1]
     assert model.forward_calls == 3
-    assert loss.item() == pytest.approx(3.0)
+    assert result.loss.item() == pytest.approx(3.0)
 
 
 def test_raw_thd_packed_collater_is_prepared_by_context_parallel_sharder():
@@ -524,14 +527,14 @@ def test_raw_thd_packed_collater_is_prepared_by_context_parallel_sharder():
         assert inputs["weights"].shape == output.shape == (3,)
         return output
 
-    loss, _ = Engine(
+    result = Engine(
         model,
         device="cpu",
         microbatch_size=2,
         collate_fn=partial(collate_datums, packed=True),
     ).forward_backward([_datum([1, 2]), _datum([3])], loss_fn)
 
-    assert loss.item() == pytest.approx(2.0)
+    assert result.loss.item() == pytest.approx(2.0)
     assert "seq_lens" not in seen
     assert "seq_lens_padded" not in seen
     assert seen["cu_seqlens"].tolist() == [0, 2, 3]
@@ -615,9 +618,9 @@ def test_context_parallel_shards_model_and_rl_loss_inputs_together():
         torch.testing.assert_close(inputs["advantages"], torch.tensor([[0.5, 0.6, 0.0, 0.0]]))
         return output
 
-    loss, _ = engine.forward_backward([datum], loss_fn)
+    result = engine.forward_backward([datum], loss_fn)
 
-    assert loss.item() == pytest.approx(11 / 6)
+    assert result.loss.item() == pytest.approx(11 / 6)
     assert model.weight.grad.item() == pytest.approx(11 / 6)
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(2.0)
     assert not cp_context_active
@@ -776,8 +779,9 @@ def test_context_parallel_prepares_mtp_futures_before_sharding(execution):
         assert result.weight_sum.item() == pytest.approx(8)
         assert model.weight.grad is None
     else:
-        loss, _ = result
-        assert loss.item() == pytest.approx(46 / 8)
+        assert result.loss.item() == pytest.approx(46 / 8)
+        assert result.loss_sum.item() == pytest.approx(46)
+        assert result.weight_sum.item() == pytest.approx(8)
         assert model.weight.grad.item() == pytest.approx(46 / 8)
 
 
@@ -823,23 +827,27 @@ def test_context_pipeline_parallel_rejects_mtp_without_combined_capability():
 
 def test_weights_mask_loss_and_denominator():
     model = ScaleModel()
-    loss, _ = Engine(model, device="cpu").forward_backward(
+    result = Engine(model, device="cpu").forward_backward(
         [_datum([1, 100], [1.0, 0.0]), _datum([3, 5], [0.5, 1.0])],
         _identity_loss,
     )
 
-    assert loss.item() == pytest.approx(3.0)
+    assert result.loss.item() == pytest.approx(3.0)
+    assert result.loss_sum.item() == pytest.approx(7.5)
+    assert result.weight_sum.item() == pytest.approx(2.5)
     assert model.weight.grad.item() == pytest.approx(3.0)
 
 
 def test_fractional_weight_sum_below_one_is_not_clamped():
     model = ScaleModel()
-    loss, _ = Engine(model, device="cpu").forward_backward(
+    result = Engine(model, device="cpu").forward_backward(
         [_datum([2, 4], [0.2, 0.3])],
         _identity_loss,
     )
 
-    assert loss.item() == pytest.approx(3.2)
+    assert result.loss.item() == pytest.approx(3.2)
+    assert result.loss_sum.item() == pytest.approx(1.6)
+    assert result.weight_sum.item() == pytest.approx(0.5)
     assert model.weight.grad.item() == pytest.approx(3.2)
 
 
@@ -849,13 +857,13 @@ def test_loss_fn_outputs_follow_datum_order_and_are_detached():
     def loss_with_outputs(output, _loss_inputs):
         return output, [{"first_token": row.flatten()[0], "model_value": row.sum()} for row in output]
 
-    _, outputs = Engine(model, device="cpu", microbatch_size=2).forward_backward(
+    result = Engine(model, device="cpu", microbatch_size=2).forward_backward(
         [_datum([1, 2]), _datum([3]), _datum([4])],
         loss_with_outputs,
     )
 
-    assert [item["first_token"].item() for item in outputs] == [1, 3, 4]
-    assert all(not item["model_value"].requires_grad for item in outputs)
+    assert [item["first_token"].item() for item in result.loss_fn_outputs] == [1, 3, 4]
+    assert all(not item["model_value"].requires_grad for item in result.loss_fn_outputs)
 
 
 @pytest.mark.parametrize("execution", ["forward", "forward_backward"])
@@ -871,7 +879,7 @@ def test_typed_batch_outputs_split_token_fields_into_datum_records(execution):
         )
 
     result = getattr(Engine(ScaleModel(), device="cpu", microbatch_size=2), execution)(datums, loss_with_outputs)
-    outputs = result.loss_fn_outputs if execution == "forward" else result[1]
+    outputs = result.loss_fn_outputs
 
     assert [item["sample_id"].item() for item in outputs] == [11, 22]
     torch.testing.assert_close(outputs[0]["token_probe"], torch.tensor([[1.0, 101.0], [2.0, 102.0]]))
@@ -1159,11 +1167,11 @@ def test_raw_output_and_loss_inputs_support_an_rl_loss_callback():
         losses = -(ratio * inputs["advantages"])
         return losses, [{"policy_sum": (losses * inputs["weights"]).sum()}]
 
-    loss, outputs = Engine(model, device="cpu").forward_backward([datum], policy_loss)
+    result = Engine(model, device="cpu").forward_backward([datum], policy_loss)
 
-    assert torch.isfinite(loss)
-    assert torch.isfinite(outputs[0]["policy_sum"])
-    assert not outputs[0]["policy_sum"].requires_grad
+    assert torch.isfinite(result.loss)
+    assert torch.isfinite(result.loss_fn_outputs[0]["policy_sum"])
+    assert not result.loss_fn_outputs[0]["policy_sum"].requires_grad
     assert model.embedding.weight.grad is not None
     assert model.output.weight.grad is not None
 
@@ -1230,7 +1238,7 @@ def test_pipeline_window_uses_schedule_microbatches_and_global_normalization():
         assert output.shape == inputs["weights"].shape == (1, 2)
         return output
 
-    loss, outputs = Engine(
+    result = Engine(
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
@@ -1244,9 +1252,9 @@ def test_pipeline_window_uses_schedule_microbatches_and_global_normalization():
         loss_fn,
     )
 
-    assert loss.item() == pytest.approx(4.5)
+    assert result.loss.item() == pytest.approx(4.5)
     assert model.weight.grad.item() == pytest.approx(4.5)
-    assert outputs == []
+    assert result.loss_fn_outputs == []
     assert pipeline.step_calls == 2
     # The fake schedule performs and counts every backward, then returns None.
     # A second Engine-owned backward would either fail or change these counts.
@@ -1434,7 +1442,7 @@ def test_pipeline_outputs_follow_logical_microbatch_order():
     model = ScaleModel()
     pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
 
-    _, outputs = Engine(
+    result = Engine(
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
@@ -1446,7 +1454,7 @@ def test_pipeline_outputs_follow_logical_microbatch_order():
 
     assert pipeline.step_calls == 1
     assert pipeline.backward_calls == 2
-    assert [item["metric"].item() for item in outputs] == [1.0, 2.0]
+    assert [item["metric"].item() for item in result.loss_fn_outputs] == [1.0, 2.0]
 
 
 def _packed_layout_datums(lengths: list[int]) -> list[Datum]:
@@ -1535,7 +1543,7 @@ def test_pipeline_typed_batch_outputs_split_packed_stream_in_datum_order(executi
         ),
         execution,
     )(datums, loss_with_outputs)
-    outputs = result.loss_fn_outputs if execution == "forward" else result[1]
+    outputs = result.loss_fn_outputs
 
     assert [item["sample_id"].item() for item in outputs] == [11, 22, 33, 44]
     for datum, item in zip(datums, outputs):
@@ -1577,18 +1585,19 @@ def test_pipeline_raw_thd_routes_explicit_loss_layouts_and_outputs_in_datum_orde
     if execution == "forward":
         assert result.loss_sum.item() == pytest.approx(36.0)
         assert result.weight_sum.item() == pytest.approx(8.0)
-        outputs = result.loss_fn_outputs
         assert pipeline.eval_calls == 1
         assert pipeline.step_calls == 0
         assert pipeline.backward_calls == 0
         assert model.weight.grad is None
     else:
-        loss, outputs = result
-        assert loss.item() == pytest.approx(4.5)
+        assert result.loss.item() == pytest.approx(4.5)
+        assert result.loss_sum.item() == pytest.approx(36.0)
+        assert result.weight_sum.item() == pytest.approx(8.0)
         assert pipeline.eval_calls == 0
         assert pipeline.step_calls == 1
         assert pipeline.backward_calls == 2
         assert model.weight.grad.item() == pytest.approx(4.5)
+    outputs = result.loss_fn_outputs
     assert [item["sample_id"].item() for item in outputs] == [11, 22, 33, 44]
 
 
@@ -1911,9 +1920,9 @@ def test_pipeline_te_thd_keeps_arbitrary_loss_fields_aligned_through_cp(monkeypa
         assert output.shape == inputs["weights"].shape == (1, 2)
         return output
 
-    loss, _ = engine.forward_backward([datum], loss_fn)
+    result = engine.forward_backward([datum], loss_fn)
 
-    assert loss.item() == pytest.approx(18 / 8)
+    assert result.loss.item() == pytest.approx(18 / 8)
     assert len(pipeline.prepared_inputs) == 1
     assert [item["input_ids"].shape for item in pipeline.prepared_inputs[0]] == [(1, 2), (1, 2)]
     torch.testing.assert_close(seen[0][0], torch.tensor([[1.0, 4.0]]))
@@ -1942,14 +1951,14 @@ def test_pipeline_groups_multiple_flat_datums_into_one_outer_batch():
     model = ScaleModel()
     pipeline = _FakeAutoPipeline(model)
 
-    loss, _ = Engine(
+    result = Engine(
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
         microbatch_size=2,
     ).forward_backward([_datum([1]), _datum([2])], _identity_loss)
 
-    assert loss.item() == pytest.approx(1.5)
+    assert result.loss.item() == pytest.approx(1.5)
     assert pipeline.step_calls == 1
     assert model.forward_calls == 2
 
@@ -2056,9 +2065,9 @@ def test_prebatched_datum_keeps_existing_recipe_batch_layout():
         loss_fn_inputs={"weights": torch.tensor([[1.0, 1.0], [1.0, 0.0]])},
     )
 
-    loss, _ = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward([datum], _identity_loss)
+    result = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward([datum], _identity_loss)
 
-    assert loss.item() == pytest.approx(2.0)
+    assert result.loss.item() == pytest.approx(2.0)
     assert model.weight.grad.item() == pytest.approx(2.0)
 
 
@@ -2072,9 +2081,9 @@ def test_prebatched_datum_keeps_vlm_media_layout():
         loss_fn_inputs={"weights": torch.ones(2)},
     )
 
-    loss, _ = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward([datum], _identity_loss)
+    result = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward([datum], _identity_loss)
 
-    assert torch.isfinite(loss)
+    assert torch.isfinite(result.loss)
     assert model.text.weight.grad is not None
     assert model.vision.weight.grad is not None
 
@@ -2082,22 +2091,24 @@ def test_prebatched_datum_keeps_vlm_media_layout():
 def test_scalar_loss_is_a_local_weighted_sum_numerator():
     model = ScaleModel()
 
-    loss, _ = Engine(model, device="cpu").forward_backward(
+    result = Engine(model, device="cpu").forward_backward(
         [_datum([1, 100], [1.0, 0.0]), _datum([3, 5], [0.5, 1.0])],
         lambda output, inputs: (output * inputs["weights"]).sum(),
     )
 
-    assert loss.item() == pytest.approx(3.0)
+    assert result.loss.item() == pytest.approx(3.0)
     assert model.weight.grad.item() == pytest.approx(3.0)
 
 
 def test_zero_weights_run_graph_connected_zero_backward():
     model = ScaleModel()
-    loss, _ = Engine(model, device="cpu").forward_backward(
+    result = Engine(model, device="cpu").forward_backward(
         [_datum([1, 2], [0.0, 0.0])],
         _identity_loss,
     )
-    assert loss.item() == 0
+    assert result.loss.item() == 0
+    assert result.loss_sum.item() == 0
+    assert result.weight_sum.item() == 0
     assert model.forward_calls == 1
     assert model.weight.grad.item() == 0
 
@@ -2170,9 +2181,11 @@ def _distributed_worker(rank: int, world_size: int, init_file: str) -> None:
         assert model.module.forward_calls == 0
 
         window = [_datum([1, 2]), _datum([3])] if rank == 0 else [_datum([4]), _datum([5, 6])]
-        loss, outputs = Engine(model, device="cpu").forward_backward(window, _identity_loss)
-        assert loss.item() == pytest.approx(3.5)
-        assert outputs == []
+        result = Engine(model, device="cpu").forward_backward(window, _identity_loss)
+        assert result.loss.item() == pytest.approx(3.5)
+        assert result.loss_sum.item() == pytest.approx(21.0)
+        assert result.weight_sum.item() == pytest.approx(6.0)
+        assert result.loss_fn_outputs == []
         assert model.module.weight.grad.item() == pytest.approx(3.5)
     finally:
         dist.destroy_process_group()
@@ -2209,14 +2222,16 @@ def _context_parallel_worker(rank: int, world_size: int, init_file: str, dp_size
                 )
             ]
 
-        loss, _ = Engine(
+        result = Engine(
             model,
             device="cpu",
             mesh_context=mesh_context,
             collate_fn=collate_prebatched,
         ).forward_backward(window, _identity_loss)
 
-        assert loss.item() == pytest.approx(4.5)
+        assert result.loss.item() == pytest.approx(4.5)
+        assert result.loss_sum.item() == pytest.approx(18.0 if dp_size == 1 else 36.0)
+        assert result.weight_sum.item() == pytest.approx(4.0 if dp_size == 1 else 8.0)
         assert model.module.weight.grad.item() == pytest.approx(4.5)
 
         model.module.weight.grad = None

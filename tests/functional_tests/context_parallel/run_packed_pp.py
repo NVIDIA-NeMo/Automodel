@@ -464,9 +464,11 @@ def _run_thd_layout(
         collate_fn=collate_prebatched,
     )
 
-    pre_eval_loss, pre_eval_outputs = engine.forward_backward([datum], _token_losses)
-    torch.testing.assert_close(pre_eval_loss.float(), reference_loss.float(), atol=2e-3, rtol=2e-3)
-    assert pre_eval_outputs == []
+    pre_eval_result = engine.forward_backward([datum], _token_losses)
+    torch.testing.assert_close(pre_eval_result.loss.float(), reference_loss.float(), atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(pre_eval_result.loss_sum.float(), reference_eval_loss_sum.float(), atol=4e-2, rtol=2e-3)
+    torch.testing.assert_close(pre_eval_result.weight_sum.float(), reference_eval_weight_sum.float(), atol=0, rtol=0)
+    assert pre_eval_result.loss_fn_outputs == []
     pre_eval_grad_diff = _assert_local_grad_parity(pipeline, reference_grads)
     for part in pipeline.parts:
         part.zero_grad(set_to_none=True)
@@ -494,17 +496,19 @@ def _run_thd_layout(
     # Reuse the exact pipeline immediately. Together with the training call
     # above, this proves both train->eval and eval->train schedule transitions
     # restore temporary split/loss callbacks and backward state.
-    loss, outputs = engine.forward_backward([datum], _token_losses)
+    train_result = engine.forward_backward([datum], _token_losses)
 
-    torch.testing.assert_close(loss.float(), reference_loss.float(), atol=2e-3, rtol=2e-3)
-    assert outputs == []
+    torch.testing.assert_close(train_result.loss.float(), reference_loss.float(), atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(train_result.loss_sum.float(), reference_eval_loss_sum.float(), atol=4e-2, rtol=2e-3)
+    torch.testing.assert_close(train_result.weight_sum.float(), reference_eval_weight_sum.float(), atol=0, rtol=0)
+    assert train_result.loss_fn_outputs == []
     grad_diff = _assert_local_grad_parity(pipeline, reference_grads)
     if dist.get_rank() == 0:
         print(
             f"PP2 {layout} THD forward+backward parity passed "
             f"(eval loss-sum diff="
             f"{(forward_result.loss_sum.float() - reference_eval_loss_sum.float()).abs().item():.6f}, "
-            f"train loss diff={(loss.float() - reference_loss.float()).abs().item():.6f}, "
+            f"train loss diff={(train_result.loss.float() - reference_loss.float()).abs().item():.6f}, "
             f"pre/post-eval grad max={pre_eval_grad_diff:.6f}/{grad_diff:.6f})"
         )
     return pipeline
@@ -579,16 +583,17 @@ def _run_explicit_loss_layout(
     if execution == "forward":
         torch.testing.assert_close(result.loss_sum.float(), reference_loss_sum.float(), atol=4e-2, rtol=2e-3)
         torch.testing.assert_close(result.weight_sum.float(), reference_weight_sum.float(), atol=0, rtol=0)
-        outputs = result.loss_fn_outputs
         if any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
             raise AssertionError(f"PP2 x CP{mesh_context.cp_size} {layout} forward unexpectedly created gradients")
     else:
-        loss, outputs = result
         reference_loss = reference_loss_sum / reference_weight_sum
-        torch.testing.assert_close(loss.float(), reference_loss.float(), atol=4e-2, rtol=2e-3)
+        torch.testing.assert_close(result.loss.float(), reference_loss.float(), atol=4e-2, rtol=2e-3)
+        torch.testing.assert_close(result.loss_sum.float(), reference_loss_sum.float(), atol=4e-2, rtol=2e-3)
+        torch.testing.assert_close(result.weight_sum.float(), reference_weight_sum.float(), atol=0, rtol=0)
         if not any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
             raise AssertionError(f"PP2 x CP{mesh_context.cp_size} {layout} backward created no gradients")
 
+    outputs = result.loss_fn_outputs
     output_ids = torch.stack([item["sample_id"] for item in outputs]).to(torch.long)
     expected_ids = torch.tensor([11, 22, 33, 44], device=device)
     torch.testing.assert_close(output_ids, expected_ids)
@@ -610,7 +615,7 @@ def _run_explicit_loss_layout(
     assert all(torch.equal(probe, flat_probe) for probe in gathered_probe)
     if dist.get_rank() == 0:
         datum_counts = "2+2" if layout == "raw" else "3+1"
-        reported_loss = result.loss_sum.item() if execution == "forward" else result[0].item()
+        reported_loss = result.loss_sum.item() if execution == "forward" else result.loss.item()
         print(
             f"PP2 x CP{mesh_context.cp_size} {layout} {execution} explicit loss/output routing passed "
             f"({datum_counts} Datums; loss={reported_loss:.6f})"
@@ -642,7 +647,7 @@ def _run_padded_output_broadcast(pipeline: AutoPipeline, device: torch.device, m
         losses = _token_losses(output, loss_inputs)
         return losses, [{"sample_id": loss_inputs["sample_id"][0], "score": logits.float().mean()}]
 
-    loss, outputs = Engine(
+    result = Engine(
         pipeline,
         device=device,
         mesh_context=mesh_context,
@@ -650,13 +655,13 @@ def _run_padded_output_broadcast(pipeline: AutoPipeline, device: torch.device, m
     ).forward_backward(datums, loss_with_output)
 
     expected_ids = torch.tensor([17, 29], device=device)
-    output_ids = torch.stack([item["sample_id"] for item in outputs]).to(device=device, dtype=torch.long)
+    output_ids = torch.stack([item["sample_id"] for item in result.loss_fn_outputs]).to(device=device, dtype=torch.long)
     torch.testing.assert_close(output_ids, expected_ids)
     gathered = [torch.empty_like(output_ids) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, output_ids)
     assert all(torch.equal(ids, expected_ids) for ids in gathered)
-    assert torch.isfinite(loss)
-    assert all(torch.isfinite(item["score"]) for item in outputs)
+    assert torch.isfinite(result.loss)
+    assert all(torch.isfinite(item["score"]) for item in result.loss_fn_outputs)
     if dist.get_rank() == 0:
         print("PP2 padded per-Datum outputs passed (logical order [17, 29] synchronized on both ranks)")
 

@@ -552,6 +552,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
         )
         capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
+        self._has_joint_drafter = getattr(capability_model, "drafter", None) is not None
         _validate_cp_vision_frame_sharding_support(capability_model, self.cp_vision_frame_sharding)
         apply_te_patches()
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
@@ -1062,11 +1063,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         Returns:
             Metrics for the completed optimizer step.
         """
-        num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
-        )
-        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
-
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
             sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
@@ -1074,7 +1070,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        log_drafter = self.step_scheduler.is_remote_logging_step
+        log_drafter = self.step_scheduler.is_remote_logging_step and self._has_joint_drafter
+        log_denominator = None
+        if log_drafter:
+            # The optional drafter breakdown is emitted from inside the first
+            # loss callback, before forward_backward can return its weight_sum.
+            # Preserve its exact global mean only on logging steps; ordinary
+            # steps avoid this otherwise-duplicate collective.
+            local_label_tokens = torch.tensor(
+                sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            )
+            log_denominator = max(self._dp_allreduce(local_label_tokens).item(), 1)
 
         def engine_loss_fn(
             out: Any,
@@ -1087,13 +1093,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 out,
                 loss_inputs,
                 log_drafter=should_log,
-                log_denominator=max(num_label_tokens, 1),
+                log_denominator=log_denominator,
             )
 
-        reporting_loss, _ = self.engine.forward_backward(
+        forward_backward_result = self.engine.forward_backward(
             [self._make_engine_datum(batch) for batch in batches],
             engine_loss_fn,
         )
+        reporting_loss = forward_backward_result.loss
+        num_label_tokens = int(forward_backward_result.weight_sum.item())
 
         step_result = self.engine.optim_step(
             before_optimizer_step=self.checkpointer.maybe_wait_for_staging,

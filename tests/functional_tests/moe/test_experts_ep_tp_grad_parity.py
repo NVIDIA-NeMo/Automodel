@@ -216,9 +216,9 @@ def _ep_tp_grad_parity_worker(rank: int, world_size: int, port: int) -> None:
             optimizers=optimizer,
             max_grad_norm=1e6,
         )
-        engine_loss, _ = engine.forward_backward([datum], loss_fn)
+        forward_backward_result = engine.forward_backward([datum], loss_fn)
         torch.testing.assert_close(observed["output"], y_ref, rtol=1e-4, atol=1e-5)
-        torch.testing.assert_close(engine_loss, loss_ref.to(torch.float64), rtol=1e-5, atol=1e-7)
+        torch.testing.assert_close(forward_backward_result.loss, loss_ref.to(torch.float64), rtol=1e-5, atol=1e-7)
 
         n_local_experts = _N_EXPERTS // world_size
         start = rank * n_local_experts

@@ -206,7 +206,7 @@ def _run_model(
         observed["labels"] = loss_inputs["labels"].detach()
         return local_logits.float().square().mean(dim=-1)
 
-    engine_loss, _ = Engine(
+    forward_backward_result = Engine(
         cp_model,
         device=device,
         mesh_context=mesh_context,
@@ -230,16 +230,16 @@ def _run_model(
     # The Engine must normalize the exact distributed logits tightly. The
     # baseline comparison is looser because independently executed BF16
     # attention paths can differ by roughly one ULP, which doubles under x**2.
-    torch.testing.assert_close(engine_loss.float(), cp_loss, atol=1e-6, rtol=1e-5)
-    torch.testing.assert_close(engine_loss.float(), baseline_loss.detach(), atol=1e-6, rtol=1e-2)
+    torch.testing.assert_close(forward_backward_result.loss.float(), cp_loss, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(forward_backward_result.loss.float(), baseline_loss.detach(), atol=1e-6, rtol=1e-2)
     torch.testing.assert_close(cp_logits, baseline_logits, atol=3e-2, rtol=3e-2)
     for cp_grad, baseline_grad in zip(cp_grads, baseline_grads):
         torch.testing.assert_close(cp_grad, baseline_grad, atol=1e-3, rtol=5e-2)
     assert torch.isfinite(cp_logits).all()
     assert all(torch.isfinite(cp_grad).all() for cp_grad in cp_grads)
     if dist.get_rank() == 0:
-        loss_diff = (engine_loss.float() - baseline_loss.detach()).abs().item()
-        normalization_diff = (engine_loss.float() - cp_loss).abs().item()
+        loss_diff = (forward_backward_result.loss.float() - baseline_loss.detach()).abs().item()
+        normalization_diff = (forward_backward_result.loss.float() - cp_loss).abs().item()
         output_diff = (cp_logits.float() - baseline_logits.float()).abs().max().item()
         grad_diff = max(
             (cp_grad - baseline_grad).abs().max().item() for cp_grad, baseline_grad in zip(cp_grads, baseline_grads)

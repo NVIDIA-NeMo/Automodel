@@ -148,6 +148,6 @@ def test_recipes_run_one_datum_engine_window_then_one_optimizer_step(recipe_cls,
     assert model.forward_calls == 2
     assert optimizer.step_calls == 1
     assert optimizer.zero_calls == 1
-    assert reductions == 2  # token counters only; Engine already reduced the loss
+    assert reductions == 1  # throughput tokens only; Engine returns the loss denominator
     for actual, expected in zip(model.parameters(), reference.parameters()):
         torch.testing.assert_close(actual, expected)

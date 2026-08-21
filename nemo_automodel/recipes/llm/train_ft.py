@@ -1216,11 +1216,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             Metrics for the completed optimizer step.
         """
 
-        num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
-        )
-        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
-
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
             sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
@@ -1228,10 +1223,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        reporting_loss, _ = self.engine.forward_backward(
+        forward_backward_result = self.engine.forward_backward(
             [self._make_engine_datum(batch) for batch in batches],
             self._engine_loss_fn,
         )
+        reporting_loss = forward_backward_result.loss
+        num_label_tokens = int(forward_backward_result.weight_sum.item())
         step_result = self.engine.optim_step(before_optimizer_step=self.checkpointer.maybe_wait_for_staging)
 
         # Precompute FP8 scales

@@ -241,8 +241,8 @@ def main():
             model_inputs=batch,
             loss_fn_inputs={"labels": labels, "weights": torch.ones_like(labels, dtype=torch.float32)},
         )
-        local, _ = engine.forward_backward([datum], loss_fn)
-        losses.append(float(local.detach()))
+        result = engine.forward_backward([datum], loss_fn)
+        losses.append(float(result.loss.detach()))
 
     embed = model_part0.get_input_embeddings()
     egrad = (

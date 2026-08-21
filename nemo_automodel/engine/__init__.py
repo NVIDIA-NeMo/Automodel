@@ -70,6 +70,7 @@ _T = TypeVar("_T")
 
 __all__ = [
     "Engine",
+    "ForwardBackwardResult",
     "ForwardResult",
     "LossFnOutputBatch",
     "OptimStepResult",
@@ -167,6 +168,33 @@ class ForwardResult:
         loss_fn_outputs: Detached per-Datum mappings in input order.
     """
 
+    loss_sum: torch.Tensor
+    weight_sum: torch.Tensor
+    loss_fn_outputs: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ForwardBackwardResult:
+    """Training-window loss statistics and per-Datum callback outputs.
+
+    The numerator is summed across the DP-CP gradient group. The full-sequence
+    denominator is summed across DP only because CP ranks begin with replicated
+    weights; both are synchronized across PP stages. ``loss`` is
+    ``loss_sum / weight_sum`` when the denominator is nonzero and zero
+    otherwise. ``loss_fn_outputs`` remains local to one data-parallel replica,
+    is restored to full token order across CP when explicitly typed, and is
+    identical on every PP stage in that replica.
+
+    Attributes:
+        loss: Detached weighted mean for the complete optimizer window.
+        loss_sum: Detached numerator summed across DP and CP, then synchronized
+            across PP stages.
+        weight_sum: Detached full-window denominator summed across DP, but not
+            CP, then synchronized across PP stages.
+        loss_fn_outputs: Detached per-Datum mappings in input order.
+    """
+
+    loss: torch.Tensor
     loss_sum: torch.Tensor
     weight_sum: torch.Tensor
     loss_fn_outputs: list[dict[str, Any]]
@@ -416,7 +444,7 @@ class Engine:
         self,
         datums: Sequence[Datum],
         loss_fn: LossFn,
-    ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    ) -> ForwardBackwardResult:
         """Accumulate gradients for a complete optimizer window.
 
         ``datums`` is a flat optimizer accumulation window. The Engine groups
@@ -456,14 +484,16 @@ class Engine:
                 collated loss inputs.
 
         Returns:
-            ``(loss, loss_fn_outputs)``. ``loss`` is a detached scalar reduced
-            over the DP-CP gradient group and, for pipeline execution,
-            synchronized across PP stages. ``loss_fn_outputs`` contains
-            mappings for this DP replica's outer Datums in window order;
-            pipeline execution returns the same mappings on every physical
-            stage rank in that replica. Model parameters are unchanged, but
-            their gradients contain the complete window's globally normalized
-            backward result.
+            Structured loss statistics and callback outputs. ``loss_sum`` is
+            reduced across the DP-CP gradient group, while ``weight_sum`` is
+            reduced across DP only so replicated CP weights are not counted
+            twice. Both are synchronized across PP stages, and ``loss`` is
+            their safe quotient.
+            ``loss_fn_outputs`` contains mappings for this DP replica's outer
+            Datums in window order; pipeline execution returns the same
+            mappings on every physical stage rank in that replica. Model
+            parameters are unchanged, but their gradients contain the complete
+            window's globally normalized backward result.
         """
         microbatches = self._group_datums(datums)
         self._validate_parallelism()
@@ -600,8 +630,14 @@ class Engine:
                 raise output_error
             raise RuntimeError("another data-parallel replica failed while restoring loss_fn outputs")
 
-        loss = (step_state[0] / safe_denominator).detach()
-        return loss, loss_fn_outputs
+        loss_sum = step_state[0].detach()
+        loss = (loss_sum / safe_denominator).detach()
+        return ForwardBackwardResult(
+            loss=loss,
+            loss_sum=loss_sum,
+            weight_sum=denominator.detach(),
+            loss_fn_outputs=loss_fn_outputs,
+        )
 
     @torch.no_grad()
     def optim_step(

@@ -34,6 +34,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+from nemo_automodel.engine import ForwardBackwardResult
 from nemo_automodel.recipes._typed_config import (
     _STEP_SCHEDULER_RUNTIME_KEYS,
     _as_dict,
@@ -392,6 +393,7 @@ def _build_engine_recipe_for_optim_step(*, pp_enabled: bool = False):
     recipe.moe_mesh = None
     recipe.loss_fn = object()
     recipe.model_parts = [_TensorModel()]
+    recipe._has_joint_drafter = False
     recipe.pp_enabled = pp_enabled
     if pp_enabled:
         recipe.pp = SimpleNamespace(info=SimpleNamespace(has_first_stage=True))
@@ -406,7 +408,12 @@ def _build_engine_recipe_for_optim_step(*, pp_enabled: bool = False):
     recipe._get_dp_group_size = lambda include_cp=True: 1
     recipe._get_cp_group_size = lambda: 1
     recipe.engine = MagicMock()
-    recipe.engine.forward_backward.return_value = (torch.tensor(0.25), [])
+    recipe.engine.forward_backward.return_value = ForwardBackwardResult(
+        loss=torch.tensor(0.25),
+        loss_sum=torch.tensor(1.0),
+        weight_sum=torch.tensor(4.0),
+        loss_fn_outputs=[],
+    )
     recipe.engine.optim_step.return_value = SimpleNamespace(grad_norm=2.5, learning_rates=(0.01,))
     return recipe
 
@@ -447,6 +454,7 @@ def test_run_train_step_passes_flat_prebatched_datums_to_engine():
 @pytest.mark.cuda(False)
 def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call():
     recipe = _build_engine_recipe_for_optim_step()
+    recipe._has_joint_drafter = True
     recipe.step_scheduler.is_remote_logging_step = True
     batches = [
         {"labels": torch.tensor([[1, -100, 2]]), "input_ids": torch.tensor([[1, 2, 3]])},
@@ -457,7 +465,12 @@ def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call():
     def forward_backward(datums, loss_fn):
         for datum in datums:
             loss_fn(object(), datum.loss_fn_inputs)
-        return torch.tensor(0.25), []
+        return ForwardBackwardResult(
+            loss=torch.tensor(0.25),
+            loss_sum=torch.tensor(1.0),
+            weight_sum=torch.tensor(4.0),
+            loss_fn_outputs=[],
+        )
 
     recipe.engine.forward_backward.side_effect = forward_backward
 
@@ -474,9 +487,32 @@ def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call():
 
 
 @pytest.mark.cuda(False)
+def test_train_step_does_not_reduce_drafter_denominator_for_regular_model():
+    recipe = _build_engine_recipe_for_optim_step()
+    recipe.step_scheduler.is_remote_logging_step = True
+    reductions = []
+
+    def allreduce(tensor, include_cp=False):
+        reductions.append(tensor.clone())
+        return tensor
+
+    recipe._dp_allreduce = allreduce
+    batch = {"labels": torch.tensor([[1, -100, 2]]), "input_ids": torch.tensor([[1, 2, 3]])}
+
+    recipe._run_train_optim_step([batch])
+
+    assert len(reductions) == 1  # Throughput tokens only; Engine owns the loss denominator.
+
+
+@pytest.mark.cuda(False)
 def test_run_train_step_uses_engine_for_empty_supervision():
     recipe = _build_engine_recipe_for_optim_step()
-    recipe.engine.forward_backward.return_value = (torch.tensor(0.0), [])
+    recipe.engine.forward_backward.return_value = ForwardBackwardResult(
+        loss=torch.tensor(0.0),
+        loss_sum=torch.tensor(0.0),
+        weight_sum=torch.tensor(0.0),
+        loss_fn_outputs=[],
+    )
     batch = {"labels": torch.full((1, 4), -100), "input_ids": torch.arange(4).reshape(1, 4)}
     metrics = recipe._run_train_optim_step([batch])
 

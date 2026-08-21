@@ -40,6 +40,7 @@ from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyE
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
+from nemo_automodel.engine import ForwardBackwardResult
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
@@ -2079,7 +2080,12 @@ class TestRunTrainOptimStepUsesEngine:
         object.__setattr__(recipe, "checkpointer", SimpleNamespace(maybe_wait_for_staging=lambda: None))
         object.__setattr__(recipe, "loss_fn", object())
         engine = MagicMock()
-        engine.forward_backward.return_value = (torch.tensor(0.5), [])
+        engine.forward_backward.return_value = ForwardBackwardResult(
+            loss=torch.tensor(0.5),
+            loss_sum=torch.tensor(2.0),
+            weight_sum=torch.tensor(4.0),
+            loss_fn_outputs=[],
+        )
         engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
         object.__setattr__(recipe, "engine", engine)
         object.__setattr__(recipe, "timestamp", 0.0)
@@ -2096,7 +2102,12 @@ class TestRunTrainOptimStepUsesEngine:
         make_datum = MagicMock(side_effect=datums)
         monkeypatch.setattr(recipe, "_make_engine_datum", make_datum)
         engine = MagicMock()
-        engine.forward_backward.return_value = (torch.tensor(0.25), [])
+        engine.forward_backward.return_value = ForwardBackwardResult(
+            loss=torch.tensor(0.25),
+            loss_sum=torch.tensor(1.75),
+            weight_sum=torch.tensor(7.0),
+            loss_fn_outputs=[],
+        )
         engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.02,))
         object.__setattr__(recipe, "engine", engine)
         optimizer = SimpleNamespace(
@@ -2115,6 +2126,7 @@ class TestRunTrainOptimStepUsesEngine:
         assert metrics.metrics["loss"] == pytest.approx(0.25)
         assert metrics.metrics["grad_norm"] == pytest.approx(1.0)
         assert metrics.metrics["lr"] == pytest.approx(0.02)
+        assert metrics.metrics["num_label_tokens"] == 7
 
     def test_pp_thd_batch_uses_engine(self, monkeypatch):
         recipe = self._make_recipe(monkeypatch, pp_enabled=True)
@@ -2124,7 +2136,12 @@ class TestRunTrainOptimStepUsesEngine:
             "qkv_format": "thd",
         }
         engine = MagicMock()
-        engine.forward_backward.return_value = (torch.tensor(0.5), [])
+        engine.forward_backward.return_value = ForwardBackwardResult(
+            loss=torch.tensor(0.5),
+            loss_sum=torch.tensor(1.0),
+            weight_sum=torch.tensor(2.0),
+            loss_fn_outputs=[],
+        )
         engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
         object.__setattr__(recipe, "engine", engine)
 
