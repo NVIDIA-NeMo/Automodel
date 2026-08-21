@@ -55,7 +55,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
-from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
+from nemo_automodel.components.speculative.dflash.registry import DFlashDraftSpec, resolve_dflash_draft_spec
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
@@ -235,8 +235,9 @@ class TrainDFlashRecipe(BaseRecipe):
 
         # DFlash draft config: a small non-causal Qwen3 stack that reuses the
         # target's architecture defaults (head_dim, rope_theta, rms_norm_eps, ...).
+        draft_cls = self._draft_cls(draft_spec)
         draft_config = target_config.to_dict()
-        draft_config["architectures"] = ["Qwen3DFlashDraftModel"]
+        draft_config["architectures"] = [draft_cls.__name__]
         draft_config["num_hidden_layers"] = draft_num_hidden_layers
         # ``layer_types``/``max_window_layers`` are sized to the target's depth;
         # rebuild them for the (shallower) draft. The DFlash attention never uses
@@ -252,7 +253,7 @@ class TrainDFlashRecipe(BaseRecipe):
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
         draft_config_obj = Qwen3Config.from_dict(draft_config)
         draft_config_obj._attn_implementation = attention_backend
-        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
         # Optional torch.compile of the draft, in place; after the fp8 swap.
@@ -419,6 +420,16 @@ class TrainDFlashRecipe(BaseRecipe):
         return HFDFlashTargetModel(
             self.target_model, target_layer_ids=target_layer_ids, cp_mesh=getattr(self, "cp_mesh", None)
         )
+
+    def _draft_cls(self, draft_spec: DFlashDraftSpec) -> type[torch.nn.Module]:
+        """Pick the draft class from the resolved spec.
+
+        Subclasses override to select a different draft of the same family; the
+        DFlash 2 recipe returns ``draft_spec.draft2_cls``. The returned class name
+        is also what lands in the saved config's ``architectures``, which is how a
+        serving engine tells the two drafts apart.
+        """
+        return draft_spec.draft_cls
 
     def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
         """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
