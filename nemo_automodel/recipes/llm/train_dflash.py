@@ -495,6 +495,10 @@ class TrainDFlashRecipe(BaseRecipe):
     def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
         """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
         return {
+            # The published drafters carry block_size here rather than at the top
+            # level; write both so the saved config matches their layout while
+            # older readers that expect the top-level key keep working.
+            "block_size": self.block_size,
             "mask_token_id": self.mask_token_id,
             "target_layer_ids": target_layer_ids,
         }

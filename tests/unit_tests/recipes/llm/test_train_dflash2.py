@@ -96,10 +96,13 @@ def test_draft_cls_selects_the_dflash2_draft():
 def test_build_dflash_config_adds_conv_and_selector_fields():
     recipe = _recipe()
     recipe.mask_token_id = MASK_ID
+    recipe.block_size = BLOCK_SIZE
     cfg = {"conv_kernel_size": 3, "conv_group_size": 8, "selector_rank": 128, "selector_top_k": 8}
     out = recipe._build_dflash_config(cfg, TARGET_LAYER_IDS)
     assert out["mask_token_id"] == MASK_ID
     assert out["target_layer_ids"] == TARGET_LAYER_IDS
+    # The published drafters carry block_size here, not at the config's top level.
+    assert out["block_size"] == BLOCK_SIZE
     assert out["conv_kernel_size"] == 3
     assert out["conv_group_size"] == 8
     assert out["selector_rank"] == 128
@@ -109,6 +112,7 @@ def test_build_dflash_config_adds_conv_and_selector_fields():
 def test_build_dflash_config_defaults_match_the_blog_shapes():
     recipe = _recipe()
     recipe.mask_token_id = MASK_ID
+    recipe.block_size = BLOCK_SIZE
     out = recipe._build_dflash_config({}, TARGET_LAYER_IDS)
     assert out["conv_kernel_size"] == 2
     assert out["conv_group_size"] == 16

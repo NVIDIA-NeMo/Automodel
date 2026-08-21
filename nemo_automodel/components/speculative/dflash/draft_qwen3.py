@@ -272,7 +272,15 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.block_size = config.block_size
+        # The published drafters (DFlash and DFlash 2 alike) keep ``block_size``
+        # inside ``dflash_config`` and carry no top-level key, so read it there
+        # first; the top-level attribute is what this repo's own recipes have
+        # always written, and stays the fallback for checkpoints saved that way.
+        self.block_size = dflash_config.get("block_size", getattr(config, "block_size", None))
+        if self.block_size is None:
+            raise ValueError(
+                "DFlash draft config carries no block_size, neither in dflash_config nor at the top level."
+            )
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         # Optional Domino correction head (ported from SpecForge#571). DFlash drafts
         # a block in parallel and is non-causal; the Domino head adds a *causal*

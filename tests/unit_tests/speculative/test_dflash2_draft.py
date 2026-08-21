@@ -199,6 +199,29 @@ def test_state_dict_keys_match_the_published_dflash2_layout():
             assert keys[f"layers.{layer}.{conv}.kernel_projection.weight"].shape == (2 * 2 * groups, HIDDEN)
 
 
+def test_published_config_layout_keeps_block_size_in_dflash_config():
+    """A released drafter's config.json must construct the draft class as-is.
+
+    ``z-lab/Qwen3.8-27B-DFlash2`` (and the DFlash 1 drafters before it) carry
+    ``block_size`` inside ``dflash_config`` and have no top-level key at all, so
+    reading it only off the top level raises ``AttributeError`` on exactly the
+    checkpoints the PR claims to load without a key map.
+    """
+    cfg = _draft_cfg()
+    # Exactly the published layout: block_size in dflash_config, nowhere else.
+    cfg.dflash_config = {**cfg.dflash_config, "block_size": BLOCK_SIZE}
+    del cfg.block_size
+    assert not hasattr(cfg, "block_size")
+
+    draft = Qwen3DFlash2DraftModel(cfg)
+    assert draft.block_size == BLOCK_SIZE
+
+    # The top-level key stays the fallback for configs this repo saved earlier.
+    legacy = _draft_cfg()
+    legacy.dflash_config = {k: v for k, v in legacy.dflash_config.items() if k != "block_size"}
+    assert Qwen3DFlash2DraftModel(legacy).block_size == BLOCK_SIZE
+
+
 def test_conv_block_size_defaults_and_validation():
     draft = Qwen3DFlash2DraftModel(_draft_cfg())
     # A whole number of blocks is the trainer's packed layout.
