@@ -169,6 +169,9 @@ s3 = [
 msc = [
     "multi-storage-client>=0.13",
 ]
+gigatoken = [
+    "gigatoken",
+]
 vlm-media = [
     "albumentations",  # required by nemotron-parse processor remote code; pulls opencv-python-headless
     "opencv-python-headless==4.10.0.84",
