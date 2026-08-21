@@ -1697,7 +1697,7 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    @pytest.mark.parametrize("load_capability", ["write_through", "without_full_copy", "streaming"])
+    @pytest.mark.parametrize("load_capability", ["write_through", "without_full_copy", "groups"])
     @pytest.mark.parametrize("dequantize_base_checkpoint", [False, True])
     def test_single_device_adapter_without_full_copy_routes_by_quantization(
         self,
@@ -1716,7 +1716,7 @@ class TestLoadModelCustomModelGuard:
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
         model.state_dict_adapter.supports_write_through_checkpoint_load = load_capability == "write_through"
         model.state_dict_adapter.supports_checkpoint_load_without_full_copy = load_capability == "without_full_copy"
-        model.state_dict_adapter.supports_streaming_checkpoint_load = load_capability == "streaming"
+        model.state_dict_adapter.supports_checkpoint_load_groups = load_capability == "groups"
         mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
         mock_load_hf.return_value = mock_state_dict
 
@@ -1737,7 +1737,7 @@ class TestLoadModelCustomModelGuard:
                 side_effect=lambda model_part, state_dict, **kwargs: state_dict,
             ),
             patch.object(checkpointer, "_get_storage_reader", return_value=MagicMock()),
-            patch.object(checkpointer, "_load_model_in_checkpoint_groups") as mock_streaming_load,
+            patch.object(checkpointer, "_load_model_in_checkpoint_groups") as mock_grouped_load,
             patch.object(checkpointer, "_do_load", return_value=mock_state_dict) as mock_dcp_load,
         ):
             mock_model_state = mock_model_state_cls.return_value
@@ -1749,17 +1749,17 @@ class TestLoadModelCustomModelGuard:
         if dequantize_base_checkpoint:
             mock_load_full.assert_called_once()
             mock_load_hf.assert_called_once()
-            mock_streaming_load.assert_not_called()
+            mock_grouped_load.assert_not_called()
             mock_dcp_load.assert_not_called()
-        elif load_capability == "streaming":
+        elif load_capability == "groups":
             mock_load_full.assert_not_called()
             mock_load_hf.assert_not_called()
-            mock_streaming_load.assert_called_once()
+            mock_grouped_load.assert_called_once()
             mock_dcp_load.assert_not_called()
         else:
             mock_load_full.assert_not_called()
             mock_load_hf.assert_not_called()
-            mock_streaming_load.assert_not_called()
+            mock_grouped_load.assert_not_called()
             mock_dcp_load.assert_called_once()
             assert "load_model:" in caplog.text
 
@@ -1781,18 +1781,24 @@ def test_checkpoint_group_executor_installs_before_requesting_next_group(caplog)
     peak_active_groups = 0
     installed: dict[int, torch.Tensor] = {}
 
-    def iter_groups(model_part, device_mesh=None):
+    checkpoint_state = {
+        "native.0": torch.empty(3),
+        "native.1": torch.empty(3),
+    }
+    adapter.get_checkpoint_load_state.return_value = checkpoint_state
+
+    def iter_groups(load_state, device_mesh=None):
         """Yield groups after verifying the prior group's destination was installed.
 
         Args:
-            model_part: Model whose parameters have arbitrary shapes; this test only verifies object identity.
+            load_state: Native model tensors of shape [elements] that the groups must cover.
             device_mesh: Optional distributed mesh, expected to be ``None`` for this single-process test.
 
         Returns:
             Iterator of groups containing destination tensors of shape [elements].
         """
         nonlocal active_groups, peak_active_groups
-        assert model_part is model_state.model[0]
+        assert load_state is checkpoint_state
         assert device_mesh is None
         for group_id in range(2):
             assert active_groups == 0
@@ -1841,8 +1847,8 @@ def test_checkpoint_group_executor_installs_before_requesting_next_group(caplog)
     assert torch.equal(installed[1], torch.full((3,), 2.0))
     assert mock_load.call_count == 2
     reader.read_metadata.assert_called_once()
-    assert "streamed" in caplog.text
-    assert "2 groups" in caplog.text
+    assert "loaded" in caplog.text
+    assert "2 checkpoint groups" in caplog.text
 
 
 def test_checkpoint_group_executor_reuses_hf_metadata_and_loads_exact_values(tmp_path):
@@ -1865,6 +1871,9 @@ def test_checkpoint_group_executor_reuses_hf_metadata_and_loads_exact_values(tmp
         for index, key in enumerate(checkpoint)
     ]
     adapter = MagicMock(spec=StateDictAdapter)
+    adapter.get_checkpoint_load_state.return_value = {
+        f"native.{index}": backing_tensors[key] for index, key in enumerate(checkpoint)
+    }
     adapter.iter_checkpoint_load_groups.return_value = iter(groups)
     model_state = SimpleNamespace(
         model=[torch.nn.Linear(2, 2)],
@@ -1880,6 +1889,36 @@ def test_checkpoint_group_executor_reuses_hf_metadata_and_loads_exact_values(tmp
     assert mock_list_files.call_count == 1
     for key, expected in checkpoint.items():
         torch.testing.assert_close(destinations[key], expected)
+
+
+def test_checkpoint_group_executor_rejects_incomplete_model_coverage():
+    checkpointer = TestLoadModelCustomModelGuard()._make_checkpointer()
+    model_state = SimpleNamespace(
+        model=[torch.nn.Linear(2, 2)],
+        uses_tied_lm_head=False,
+        is_peft=False,
+    )
+    adapter = MagicMock(spec=StateDictAdapter)
+    adapter.get_checkpoint_load_state.return_value = {
+        "native.loaded": torch.empty(2),
+        "native.omitted": torch.empty(2),
+    }
+    adapter.iter_checkpoint_load_groups.return_value = iter(
+        [
+            CheckpointLoadGroup(
+                destinations={"checkpoint.loaded": torch.empty(2)},
+                native_keys=frozenset({"native.loaded"}),
+            )
+        ]
+    )
+    reader = MagicMock()
+    reader.read_metadata.return_value = SimpleNamespace(state_dict_metadata={"checkpoint.loaded": object()})
+
+    with (
+        patch("nemo_automodel.components.checkpoint.checkpointing.dcp.load"),
+        pytest.raises(RuntimeError, match="omitted 1 model tensors.*native.omitted"),
+    ):
+        checkpointer._load_model_in_checkpoint_groups(model_state, adapter, "/checkpoint", reader)
 
 
 class TestLoadModelCheckpointKeySubset:

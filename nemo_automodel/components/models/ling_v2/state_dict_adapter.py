@@ -53,7 +53,6 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
-from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 # Map of single-key renames applied in both directions.  Each tuple is
 # (HF substring, native substring); replacement is whole-substring and
@@ -175,7 +174,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         self._uses_model_prefix = True
 
     @property
-    def supports_streaming_checkpoint_load(self) -> bool:
+    def supports_checkpoint_load_groups(self) -> bool:
         """Whether Ling can load single-device QKV and expert transformations one layer at a time."""
         return (
             self.backend.experts in {"torch", "torch_mm"}
@@ -183,7 +182,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
             and not self.moe_config.expert_bias
         )
 
-    def _add_streaming_expert_destinations(
+    def _add_expert_checkpoint_views(
         self,
         builder: _LingExpertGroupBuilder,
         *,
@@ -221,19 +220,13 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                 f"expected {expected_shape}"
             )
 
-        for expert_id, expert_weight in enumerate(grouped_weight.unbind(0)):
-            if projection == "gate_and_up_projs":
-                checkpoint_tensors = {
-                    "gate_proj": expert_weight[:, :expert_hidden].transpose(0, 1),
-                    "up_proj": expert_weight[:, expert_hidden:].transpose(0, 1),
-                }
-            else:
-                checkpoint_tensors = {"down_proj": expert_weight.transpose(0, 1)}
-            for checkpoint_projection, checkpoint_destination in checkpoint_tensors.items():
-                checkpoint_name = f"{expert_root}.{expert_id}.{checkpoint_projection}.weight"
-                if checkpoint_name in builder.destinations:
-                    raise ValueError(f"Duplicate Ling expert checkpoint destination {checkpoint_name}")
-                builder.destinations[checkpoint_name] = checkpoint_destination
+        checkpoint_views = self._checkpoint_load_views(native_name, grouped_weight)
+        duplicate_keys = sorted(checkpoint_views.keys() & builder.destinations.keys())
+        if duplicate_keys:
+            raise ValueError(
+                f"Duplicate Ling expert checkpoint destinations for {expert_root} (examples={duplicate_keys[:5]})"
+            )
+        builder.destinations.update(checkpoint_views)
 
         builder.native_keys.add(native_name)
         builder.projections.add(projection)
@@ -324,16 +317,16 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
 
     def iter_checkpoint_load_groups(
         self,
-        model_part: torch.nn.Module,
+        checkpoint_state: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,
     ) -> Iterator[CheckpointLoadGroup]:
         """Yield Ling checkpoint tensors in groups that are installed before the next group is read.
 
         Args:
-            model_part: Single-device Ling model whose parameters and persistent buffers are final destinations.
-                Attention Q/K/V parameters have shapes [q_hidden, hidden], [kv_hidden, hidden], and
-                [kv_hidden, hidden]. Grouped gate/up experts have shape [experts, hidden, 2 * expert_hidden], and
-                grouped down experts have shape [experts, expert_hidden, hidden].
+            checkpoint_state: Canonical native names and final Ling model tensors. Attention Q/K/V parameters have
+                shapes [q_hidden, hidden], [kv_hidden, hidden], and [kv_hidden, hidden]. Grouped gate/up experts have
+                shape [experts, hidden, 2 * expert_hidden], and grouped down experts have shape
+                [experts, expert_hidden, hidden].
             device_mesh: Must be ``None``. Distributed Ling loads continue to use the rank-sharded DCP path.
 
         Returns:
@@ -341,17 +334,17 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
             uses one temporary fused-QKV tensor and splits it into Q, K, and V before the iterator advances.
 
         Raises:
-            RuntimeError: If the configured expert backend did not opt into streaming.
+            RuntimeError: If the configured expert backend does not support checkpoint load groups.
             ValueError: If a distributed mesh, unsupported tensor layout, incomplete dependency group, or allocating
                 ordinary destination is encountered.
         """
-        if not self.supports_streaming_checkpoint_load:
+        if not self.supports_checkpoint_load_groups:
             raise RuntimeError(
-                f"{type(self).__name__} does not support streaming for experts={self.backend.experts}, "
+                f"{type(self).__name__} does not support checkpoint load groups for experts={self.backend.experts}, "
                 f"dispatcher={self.backend.dispatcher}"
             )
         if device_mesh is not None:
-            raise ValueError("Ling streaming checkpoint loading currently requires a single-device model")
+            raise ValueError("Ling checkpoint load groups currently require a single-device model")
 
         ordinary_destinations: dict[str, torch.Tensor] = {}
         ordinary_native_keys: set[str] = set()
@@ -359,13 +352,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         expert_groups: dict[str, _LingExpertGroupBuilder] = {}
         n_experts = self.moe_config.n_routed_experts
 
-        for state_name, state_tensor in model_part.state_dict(keep_vars=True).items():
-            native_name = canonical_parameter_fqn(state_name)
-            if "lora" in native_name or native_name.endswith("._extra_state"):
-                continue
-            if not isinstance(state_tensor, torch.Tensor):
-                raise ValueError(f"Ling state entry {native_name} is {type(state_tensor).__name__}, expected Tensor")
-
+        for native_name, state_tensor in checkpoint_state.items():
             qkv_match = _NATIVE_LAYER_QKV_RE.match(native_name)
             if qkv_match is not None:
                 prefix = qkv_match.group("prefix")
@@ -373,7 +360,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                 builder = qkv_groups.setdefault(prefix, _LingQKVGroupBuilder(projections={}))
                 if projection in builder.projections:
                     raise ValueError(f"Duplicate Ling {projection.upper()} projection for {prefix}")
-                builder.projections[projection] = (native_name, state_tensor.detach())
+                builder.projections[projection] = (native_name, state_tensor)
                 continue
 
             expert_match = _STREAMABLE_EXPERT_WEIGHT.match(native_name)
@@ -384,40 +371,25 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                     expert_root,
                     _LingExpertGroupBuilder(destinations={}, native_keys=set(), projections=set()),
                 )
-                self._add_streaming_expert_destinations(
+                self._add_expert_checkpoint_views(
                     builder,
                     expert_root=expert_root,
                     native_name=native_name,
                     projection=projection,
-                    grouped_weight=state_tensor.detach(),
+                    grouped_weight=state_tensor,
                 )
                 continue
 
-            destination = state_tensor.detach()
-            converted = self.convert_single_tensor_to_hf(native_name, destination, quantization=False)
-            if len(converted) != 1:
-                raise ValueError(f"Ordinary Ling state tensor {native_name} produced {len(converted)} destinations")
-            checkpoint_name, checkpoint_destination = converted[0]
-            if not isinstance(checkpoint_destination, torch.Tensor):
-                raise ValueError(
-                    f"Ordinary Ling destination {checkpoint_name} is {type(checkpoint_destination).__name__}, "
-                    "expected Tensor"
-                )
-            uses_parameter_memory = (
-                checkpoint_destination.device == destination.device
-                and checkpoint_destination.untyped_storage().data_ptr() == destination.untyped_storage().data_ptr()
-            )
-            if not uses_parameter_memory:
-                raise ValueError(f"Ordinary Ling destination {checkpoint_name} does not use {native_name} memory")
+            checkpoint_name, checkpoint_destination = self._single_checkpoint_load_view(native_name, state_tensor)
             if checkpoint_name in ordinary_destinations:
                 raise ValueError(f"Duplicate ordinary Ling checkpoint destination {checkpoint_name}")
             ordinary_destinations[checkpoint_name] = checkpoint_destination
             ordinary_native_keys.add(native_name)
 
         if not qkv_groups:
-            raise ValueError("Ling streaming load plan found no fused-QKV layers")
+            raise ValueError("Ling checkpoint load plan found no fused-QKV layers")
         if not expert_groups:
-            raise ValueError("Ling streaming load plan found no grouped expert layers")
+            raise ValueError("Ling checkpoint load plan found no grouped expert layers")
 
         if ordinary_destinations:
             yield CheckpointLoadGroup(

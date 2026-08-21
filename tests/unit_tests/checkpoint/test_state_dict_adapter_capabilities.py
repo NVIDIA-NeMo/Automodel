@@ -67,6 +67,23 @@ class _AllocatingKeysAdapter(StateDictAdapter):
         return [(fqn, tensor)]
 
 
+class _TransposeLoadAdapter(_AllocatingKeysAdapter):
+    """Test adapter whose checkpoint layout transposes each model tensor."""
+
+    _supports_checkpoint_load_groups = True
+
+    def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+        self.checkpoint_conversion_kwargs = kwargs
+        return [(f"checkpoint.{fqn}", tensor.transpose(0, 1))]
+
+
+class _CopyingLoadAdapter(_TransposeLoadAdapter):
+    """Invalid direct-load adapter that allocates a new checkpoint tensor."""
+
+    def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+        return [(f"checkpoint.{fqn}", tensor.transpose(0, 1).contiguous())]
+
+
 def test_get_hf_state_dict_keys_uses_shape_only_tensors() -> None:
     adapter = _AllocatingKeysAdapter()
     state_dict = {
@@ -79,6 +96,47 @@ def test_get_hf_state_dict_keys_uses_shape_only_tensors() -> None:
     assert keys == ["fused.weight"]
     assert adapter.converted_devices == [torch.device("meta"), torch.device("meta")]
     assert list(state_dict) == ["q.weight", "k.weight"]
+
+
+def test_shared_checkpoint_group_uses_model_views_and_excludes_non_base_state() -> None:
+    class _ModelWithRuntimeState(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2, 3))
+            self.lora_A = torch.nn.Parameter(torch.ones(1, 3))
+            self.register_buffer("running_scale", torch.zeros(2, 1))
+
+        def get_extra_state(self) -> dict[str, bool]:
+            return {"runtime_only": True}
+
+        def set_extra_state(self, state: object) -> None:
+            del state
+
+    model = _ModelWithRuntimeState()
+    adapter = _TransposeLoadAdapter()
+
+    checkpoint_state = adapter.get_checkpoint_load_state(model)
+    groups = list(adapter.iter_checkpoint_load_groups(checkpoint_state))
+
+    assert set(checkpoint_state) == {"weight", "running_scale"}
+    assert len(groups) == 1
+    assert groups[0].native_keys == frozenset(checkpoint_state)
+    assert adapter.checkpoint_conversion_kwargs["for_checkpoint_load"] is True
+    assert adapter.checkpoint_conversion_kwargs["track_inplace_load"] is False
+    weight_destination = groups[0].destinations["checkpoint.weight"]
+    assert tuple(weight_destination.shape) == (3, 2)
+    assert not weight_destination.is_contiguous()
+    assert weight_destination.untyped_storage().data_ptr() == model.weight.untyped_storage().data_ptr()
+    weight_destination.fill_(4)
+    torch.testing.assert_close(model.weight, torch.full_like(model.weight, 4))
+
+
+def test_shared_checkpoint_group_rejects_allocating_conversion() -> None:
+    source = torch.zeros(2, 3)
+    adapter = _CopyingLoadAdapter()
+
+    with pytest.raises(ValueError, match="does not use model tensor weight storage"):
+        list(adapter.iter_checkpoint_load_groups({"weight": source}))
 
 
 def _assert_destinations_write_through(
