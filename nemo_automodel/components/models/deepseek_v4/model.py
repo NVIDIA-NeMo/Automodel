@@ -43,7 +43,7 @@ Compress-ratio sliding-window attention is not yet implemented.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -116,8 +116,8 @@ class DeepseekV4CausalLMOutput(CausalLMOutputWithPast):
         mtp_loss_scaling_factor: Coefficient for the MTP auxiliary loss.
     """
 
-    mtp_per_depth_h: Optional[list[torch.Tensor]] = None
-    mtp_loss_scaling_factor: Optional[float] = None
+    mtp_per_depth_h: list[torch.Tensor] | None = None
+    mtp_loss_scaling_factor: float | None = None
 
 
 def _seq_lens_from_cu_seqlens(cu_seqlens: torch.Tensor, name: str) -> torch.Tensor:
@@ -922,7 +922,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
         mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
         if output_hidden_states is None:
