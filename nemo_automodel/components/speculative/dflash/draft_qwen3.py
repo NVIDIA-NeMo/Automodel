@@ -29,7 +29,7 @@ mask that enforces this is built by the trainer wrapper in
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Tuple
 
 import torch
 from torch import nn
@@ -111,11 +111,11 @@ class Qwen3DFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         target_hidden: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
         q = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
@@ -164,14 +164,14 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
 
     def forward(
         self,
-        target_hidden: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        target_hidden: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -296,10 +296,10 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
     def forward(
         self,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -325,7 +325,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         target: nn.Module,
         input_ids: torch.LongTensor,
         max_new_tokens: int,
-        stop_token_ids: Optional[list[int]],
+        stop_token_ids: list[int] | None,
         temperature: float,
     ) -> torch.LongTensor:
         """Block-parallel speculative decoding: draft a block, verify with the target, accept the matching prefix."""

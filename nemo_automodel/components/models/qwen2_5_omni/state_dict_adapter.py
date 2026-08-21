@@ -14,7 +14,7 @@
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -66,7 +66,7 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
@@ -83,7 +83,7 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional[Any] = None,
+        device_mesh: Any | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         out: dict[str, Any] = {}
