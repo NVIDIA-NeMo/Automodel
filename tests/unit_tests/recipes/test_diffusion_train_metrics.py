@@ -718,6 +718,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.grad_clip_foreach = False
     recipe.defer_fsdp_grad_sync = True
     recipe.transformer_engine_fp8 = False
+    recipe._autocast_dtype = None
     recipe.peft_cfg = None
     recipe._elapsed_seconds_since = MagicMock(return_value=(2.0, 10.0))
     recipe._count_global_samples = MagicMock(return_value=5)

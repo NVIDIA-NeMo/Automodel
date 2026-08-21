@@ -27,7 +27,7 @@ import logging
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 
@@ -255,9 +255,9 @@ def _instantiate_distributed(
 
 
 def _with_activation_checkpointing(
-    config: Optional[DistributedStrategyConfig],
+    config: DistributedStrategyConfig | None,
     activation_checkpointing: bool,
-) -> Optional[DistributedStrategyConfig]:
+) -> DistributedStrategyConfig | None:
     """Return a strategy config whose AC flag matches the resolved setup."""
     if config is None or not hasattr(config, "activation_checkpointing"):
         return config
@@ -269,11 +269,11 @@ def _with_activation_checkpointing(
 
 
 def _instantiate_pipeline(
-    config: Optional[PipelineConfig],
+    config: PipelineConfig | None,
     mesh: MeshContext,
-    device: Optional[torch.device] = None,
-    strategy_config: Optional[Union[FSDP2Config, MegatronFSDPConfig, DDPConfig]] = None,
-) -> Optional[AutoPipeline]:
+    device: torch.device | None = None,
+    strategy_config: Union[FSDP2Config, MegatronFSDPConfig, DDPConfig] | None = None,
+) -> AutoPipeline | None:
     """Instantiate AutoPipeline from config.
 
     Args:
@@ -307,8 +307,8 @@ def _instantiate_pipeline(
 
 
 def _instantiate_qat(
-    config: Optional[QATConfig],
-) -> Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]]:
+    config: QATConfig | None,
+) -> Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"] | None:
     if config is None:
         return None
     return config.create_quantizer()
@@ -317,7 +317,7 @@ def _instantiate_qat(
 def parallelize_for_pp(
     model: torch.nn.Module,
     *,
-    model_wrapper: Optional[Union[FSDP2Manager, MegatronFSDPManager, DDPManager]] = None,
+    model_wrapper: Union[FSDP2Manager, MegatronFSDPManager, DDPManager] | None = None,
     **kwargs,
 ) -> torch.nn.Module:
     """Parallelize model for pipeline parallelism (non-MoE case).
@@ -342,13 +342,13 @@ def parallelize_for_pp(
 
 def instantiate_infrastructure(
     *,
-    distributed_config: Optional[DistributedStrategyConfig] = None,
-    pipeline_config: Optional[PipelineConfig] = None,
-    qat_config: Optional[QATConfig] = None,
-    moe_parallel_config: Optional[MoEParallelizerConfig] = None,
+    distributed_config: DistributedStrategyConfig | None = None,
+    pipeline_config: PipelineConfig | None = None,
+    qat_config: QATConfig | None = None,
+    moe_parallel_config: MoEParallelizerConfig | None = None,
     activation_checkpointing: bool | str | None = None,
-    device: Optional[torch.device] = None,
-    mesh: Optional[MeshContext] = None,
+    device: torch.device | None = None,
+    mesh: MeshContext | None = None,
 ) -> tuple:
     """Instantiate infrastructure objects from config classes.
 
