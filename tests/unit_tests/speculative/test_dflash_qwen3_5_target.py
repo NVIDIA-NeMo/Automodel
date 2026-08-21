@@ -32,6 +32,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import Qwen3DFlash2DraftModel
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel, resolve_text_config
+from nemo_automodel.recipes.llm.train_dflash import _project_onto_qwen3_config_keys
 
 
 def test_qwen3_5_targets_resolve_to_the_qwen3_shaped_drafts():
@@ -61,6 +62,69 @@ def test_resolve_text_config_unwraps_only_when_nested():
     # A wrapper config that declares ``text_config = None`` must not blank the config.
     explicit_none = SimpleNamespace(text_config=None, num_hidden_layers=8)
     assert resolve_text_config(explicit_none) is explicit_none
+
+
+def test_draft_config_projection_drops_qwen3_5_only_fields():
+    """The draft config must not inherit fields a Qwen3 stack does not declare.
+
+    A Qwen3.5 text config carries linear-attention shapes, MTP fields, gating,
+    and ``partial_rotary_factor: 0.25`` (top-level and inside ``rope_parameters``).
+    The published Qwen3.8-27B drafter ships with none of them and a full-width
+    rotary table; a leaked ``partial_rotary_factor`` would make a serving runtime
+    rebuild the rotary at a quarter width against full-rotary trained weights.
+    """
+    text_config = {
+        "head_dim": 256,
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "num_hidden_layers": 64,
+        "max_position_embeddings": 262144,
+        "rms_norm_eps": 1e-06,
+        "vocab_size": 248320,
+        "tie_word_embeddings": False,
+        "eos_token_id": 248044,
+        "partial_rotary_factor": 0.25,
+        "attn_output_gate": True,
+        "full_attention_interval": 4,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 128,
+        "mamba_ssm_dtype": "float32",
+        "mtp_num_hidden_layers": 1,
+        "output_gate_type": "swish",
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [11, 11, 10],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000,
+            "rope_type": "default",
+        },
+    }
+    projected = _project_onto_qwen3_config_keys(text_config)
+
+    for leaked in (
+        "partial_rotary_factor",
+        "attn_output_gate",
+        "full_attention_interval",
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "mamba_ssm_dtype",
+        "mtp_num_hidden_layers",
+        "output_gate_type",
+    ):
+        assert leaked not in projected
+    # Matches the published drafter's rope_parameters exactly.
+    assert projected["rope_parameters"] == {"rope_theta": 10000000, "rope_type": "default"}
+    # The inherited decoder shape survives the projection.
+    for kept in ("head_dim", "hidden_size", "num_attention_heads", "rms_norm_eps", "vocab_size", "eos_token_id"):
+        assert projected[kept] == text_config[kept]
+
+    # And the built config yields a full-width rotary table (head_dim / 2 freqs).
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+
+    cfg = Qwen3Config.from_dict({**projected, "num_hidden_layers": 5})
+    assert Qwen3RotaryEmbedding(cfg).inv_freq.shape[0] * 2 == cfg.head_dim
 
 
 class _ModuleDictTarget(nn.Module):

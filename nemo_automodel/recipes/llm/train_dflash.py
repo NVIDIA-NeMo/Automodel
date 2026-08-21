@@ -90,6 +90,39 @@ def _packing_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     }
 
 
+def _project_onto_qwen3_config_keys(target_text_config: dict) -> dict:
+    """Project the target's decoder config onto the keys a plain Qwen3 config declares.
+
+    The draft is always a Qwen3-shaped stack, but its config starts from the
+    target's, and a Qwen3.5 text config carries fields the draft has no use for:
+    linear-attention shapes, MTP, output gating, and ``partial_rotary_factor``
+    (top-level and inside ``rope_parameters``, on its own key or as mRoPE
+    sections). None of them may reach the saved draft config -- the published
+    drafters ship without them, and they are not inert there: the HF Qwen3 stack
+    the draft trains with applies full rotary regardless, so a serving runtime
+    that honours a leaked ``partial_rotary_factor: 0.25`` would rebuild the
+    rotary table at a quarter width and silently mismatch the trained weights.
+
+    Args:
+        target_text_config: ``to_dict()`` of the target's decoder config.
+
+    Returns:
+        The subset of ``target_text_config`` a ``Qwen3Config`` declares, with
+        ``rope_parameters`` reduced to the keys the published drafters ship
+        (``rope_theta`` / ``rope_type``).
+    """
+    qwen3_keys = Qwen3Config().to_dict().keys()
+    draft_config = {key: value for key, value in target_text_config.items() if key in qwen3_keys}
+    rope_parameters = draft_config.get("rope_parameters")
+    if isinstance(rope_parameters, dict):
+        draft_config["rope_parameters"] = {
+            key: value
+            for key, value in rope_parameters.items()
+            if not key.startswith("mrope_") and key != "partial_rotary_factor"
+        }
+    return draft_config
+
+
 def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
     """Reject sequence-packing configs the DFlash path cannot honor (fail fast at setup).
 
@@ -239,7 +272,7 @@ class TrainDFlashRecipe(BaseRecipe):
         # DFlash draft config: a small non-causal Qwen3 stack that reuses the
         # target's architecture defaults (head_dim, rope_theta, rms_norm_eps, ...).
         draft_cls = self._draft_cls(draft_spec)
-        draft_config = target_text_config.to_dict()
+        draft_config = _project_onto_qwen3_config_keys(target_text_config.to_dict())
         draft_config["architectures"] = [draft_cls.__name__]
         # The draft is a Qwen3-shaped stack whatever the target's own ``model_type``
         # is; stamping it keeps the saved config loadable by the serving runtimes.
@@ -256,17 +289,6 @@ class TrainDFlashRecipe(BaseRecipe):
             override = recipe_cfg.get(draft_key, None)
             if override is not None:
                 draft_config[target_key] = int(override)
-        # ``layer_types``/``max_window_layers`` are sized to the target's depth;
-        # rebuild them for the (shallower) draft. The DFlash attention never uses
-        # sliding windows, so every draft layer is full attention.
-        # A multimodal target's text config carries mRoPE sections the text-only
-        # draft never applies; drop them so the saved draft config matches what the
-        # published drafters ship and no serving runtime tries to honour them.
-        rope_parameters = draft_config.get("rope_parameters")
-        if isinstance(rope_parameters, dict):
-            draft_config["rope_parameters"] = {
-                key: value for key, value in rope_parameters.items() if not key.startswith("mrope_")
-            }
         # ``draft_sliding_window`` bounds how far back the draft reads the target
         # context. Unset (the DFlash default) keeps every draft layer on full
         # attention; when set, the layers become ``sliding_attention`` so the saved
