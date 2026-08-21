@@ -28,7 +28,7 @@ from nemo_automodel.components.models.muse_glimmer.config import MuseGlimmerConf
 class MuseGlimmerStateDictAdapter(StateDictAdapter):
     """Map canonical nested MuseGlimmer checkpoint keys to the native legacy module tree."""
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(self, config: MuseGlimmerConfig) -> None:
         self.config = config

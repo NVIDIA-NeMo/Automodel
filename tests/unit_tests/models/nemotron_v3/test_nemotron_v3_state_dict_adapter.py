@@ -115,21 +115,21 @@ class TestNemotronV3StateDictAdapter:
 
         assert adapter._expert_path_segment == "mixer.experts"
 
-    def test_write_through_load_capability_requires_aliasing_expert_backend(self, config, moe_config, backend):
+    def test_low_memory_dcp_capability_requires_model_backed_experts(self, config, moe_config, backend):
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
-        assert adapter.supports_write_through_checkpoint_load is True
+        assert adapter.supports_low_memory_dcp_load is True
 
         adapter.backend.experts = "te"
         adapter.backend.dispatcher = "deepep"
         with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
-            assert adapter.supports_write_through_checkpoint_load is False
+            assert adapter.supports_low_memory_dcp_load is False
 
         with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
-            assert adapter.supports_write_through_checkpoint_load is True
+            assert adapter.supports_low_memory_dcp_load is True
 
         adapter.backend.experts = "gmm"
         adapter.backend.dispatcher = "mok"
-        assert adapter.supports_write_through_checkpoint_load is False
+        assert adapter.supports_low_memory_dcp_load is False
 
     def test_te_single_device_fallback_loads_through_grouped_parameter_views(self, config, moe_config, backend):
         backend.experts = "te"
@@ -154,7 +154,7 @@ class TestNemotronV3StateDictAdapter:
                 },
                 for_checkpoint_load=True,
             )
-            assert adapter.supports_write_through_checkpoint_load is True
+            assert adapter.supports_low_memory_dcp_load is True
 
         assert set(destinations) == {
             f"backbone.layers.0.mixer.experts.{expert_id}.{projection}.weight"
@@ -196,7 +196,7 @@ class TestNemotronV3AdapterDense:
 
     def test_init_accepts_none_moe_config(self, adapter):
         assert adapter.moe_config is None
-        assert adapter.supports_write_through_checkpoint_load is True
+        assert adapter.supports_low_memory_dcp_load is True
 
     def test_from_hf_renames_without_experts(self, adapter):
         hf_sd = {

@@ -106,9 +106,9 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
     """
 
     @property
-    def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether the embedded language adapter and all wrapper renames preserve storage."""
-        return self._llm_adapter.supports_write_through_checkpoint_load
+    def supports_low_memory_dcp_load(self) -> bool:
+        """Whether the embedded language adapter supports a low-memory DCP load."""
+        return self._llm_adapter.supports_low_memory_dcp_load
 
     def __init__(
         self,

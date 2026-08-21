@@ -61,7 +61,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
       4. Expert-parallel sharding when a device mesh is provided
     """
 
-    _supports_checkpoint_load_without_full_copy = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,

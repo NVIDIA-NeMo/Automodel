@@ -51,17 +51,17 @@ class MoESplitExpertsStateDictMixin:
     # - self.backend: Backend configuration object
 
     @property
-    def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether every checkpoint tensor, including expert tensors, loads directly into model weights."""
-        experts_load_directly = self.moe_config is None or self._supports_write_through_expert_checkpoint_load
-        return self._supports_write_through_checkpoint_load and experts_load_directly
+    def supports_low_memory_dcp_load(self) -> bool:
+        """Whether DCP needs at most small temporary tensors for this MoE checkpoint."""
+        experts_use_model_storage = self.moe_config is None or self._expert_checkpoint_tensors_use_model_storage
+        return self._supports_low_memory_dcp_load and experts_use_model_storage
 
     @property
-    def _supports_write_through_expert_checkpoint_load(self) -> bool:
-        """Whether grouped expert checkpoint tensors load directly into model weight memory.
+    def _expert_checkpoint_tensors_use_model_storage(self) -> bool:
+        """Whether grouped expert checkpoint tensors use the model's weight memory.
 
-        This covers only the shared expert conversion. A concrete adapter must also verify that all non-expert
-        checkpoint tensors load directly before it enables the full-checkpoint fast path.
+        This covers only the shared expert conversion. A concrete adapter must also verify that its non-expert
+        checkpoint tensors require at most small temporary tensors before enabling low-memory DCP loading.
         """
         return self._grouped_expert_storage_is_model_weight and self.backend.dispatcher != "mok"
 
