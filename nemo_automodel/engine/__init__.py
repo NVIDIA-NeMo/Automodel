@@ -51,6 +51,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.engine.outputs import LossFnOutputBatch, PerTokenOutput
+from nemo_automodel.shared.import_utils import MISSING_TORCHAO_MSG, safe_import_from
 
 CollateFn = Callable[
     [list[Datum]],
@@ -97,6 +98,40 @@ def _tensor_version(tensor: torch.Tensor) -> int:
         return int(tensor._version)
     except RuntimeError:
         return -1
+
+
+def _resolve_fp8_scale_precompute(
+    model_parts: Sequence[nn.Module],
+) -> tuple[tuple[nn.Module, ...], Callable[[nn.Module], None] | None]:
+    """Resolve the torchao post-step function only for opted-in model parts.
+
+    Args:
+        model_parts: Local eager model or pipeline parts after FP8 conversion
+            and distributed model partitioning.
+
+    Returns:
+        Opted-in local model parts and the torchao precompute function. Both
+        are empty when no part requests FP8 FSDP scale precomputation.
+
+    Raises:
+        ImportError: If an opted-in part requires a torchao API that is not
+            available. Resolution happens during Engine construction, before
+            any optimizer mutation.
+    """
+    capable_parts = tuple(
+        part for part in model_parts if getattr(part, "precompute_float8_dynamic_scale_for_fsdp", False)
+    )
+    if not capable_parts:
+        return (), None
+
+    available, precompute = safe_import_from(
+        "torchao.float8",
+        "precompute_float8_dynamic_scale_for_fsdp",
+        msg=MISSING_TORCHAO_MSG,
+    )
+    if not available:
+        raise ImportError(MISSING_TORCHAO_MSG)
+    return capable_parts, precompute
 
 
 def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], CollatedLossInputs | dict[str, torch.Tensor]]:
@@ -337,6 +372,9 @@ class Engine:
         self.pipeline = model if isinstance(model, AutoPipeline) else None
         self.model_parts = model.parts if self.pipeline is not None else [model]
         self.model = self.model_parts[0]
+        self._fp8_scale_precompute_parts, self._fp8_scale_precompute_fn = _resolve_fp8_scale_precompute(
+            self.model_parts
+        )
         self.device = torch.device(device)
         self.mesh_context = mesh_context
         self.microbatch_size = microbatch_size
@@ -991,7 +1029,9 @@ class Engine:
         expert-gradient correction and global clipping once, then invokes an
         optional mutation fence before any optimizer changes. Async
         checkpointers use that fence to preserve ``finalize/clip -> wait ->
-        step`` overlap.
+        step`` overlap. After updating weights, it runs model maintenance for
+        MoE gate bias and opted-in FP8 FSDP scale precomputation before
+        advancing LR schedulers.
 
         Once the first optimizer mutation begins, failures from an optimizer,
         model post-step hook, or scheduler cannot be rolled back and are
@@ -1129,6 +1169,10 @@ class Engine:
                 update_moe_gate_bias = getattr(part, "update_moe_gate_bias", None)
                 if callable(update_moe_gate_bias):
                     update_moe_gate_bias()
+
+            if self._fp8_scale_precompute_fn is not None:
+                for part in self._fp8_scale_precompute_parts:
+                    self._fp8_scale_precompute_fn(part)
 
             for scheduler in self.lr_schedulers:
                 scheduler.step(1)

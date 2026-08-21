@@ -228,6 +228,64 @@ def test_engine_and_datum_are_lazy_top_level_exports():
     assert PublicCollatedLossInputs is CollatedLossInputs
 
 
+def test_fp8_scale_resolver_skips_import_without_capable_model_parts(monkeypatch):
+    first = ScaleModel()
+    second = ScaleModel()
+    second.precompute_float8_dynamic_scale_for_fsdp = False
+    monkeypatch.setattr(
+        engine_module,
+        "safe_import_from",
+        lambda *_args, **_kwargs: pytest.fail("non-FP8 Engine construction must not import torchao"),
+    )
+
+    parts, precompute = engine_module._resolve_fp8_scale_precompute([first, second])
+
+    assert parts == ()
+    assert precompute is None
+
+
+def test_fp8_scale_resolver_filters_capable_parts_and_caches_callable(monkeypatch):
+    first = ScaleModel()
+    disabled = ScaleModel()
+    third = ScaleModel()
+    first.precompute_float8_dynamic_scale_for_fsdp = True
+    disabled.precompute_float8_dynamic_scale_for_fsdp = False
+    third.precompute_float8_dynamic_scale_for_fsdp = True
+    precompute = lambda _part: None
+    calls = []
+
+    def resolve(module, symbol, *, msg):
+        calls.append((module, symbol, msg))
+        return True, precompute
+
+    monkeypatch.setattr(engine_module, "safe_import_from", resolve)
+
+    parts, resolved = engine_module._resolve_fp8_scale_precompute([first, disabled, third])
+
+    assert parts == (first, third)
+    assert resolved is precompute
+    assert calls == [
+        (
+            "torchao.float8",
+            "precompute_float8_dynamic_scale_for_fsdp",
+            engine_module.MISSING_TORCHAO_MSG,
+        )
+    ]
+
+
+def test_capable_fp8_model_rejects_missing_torchao_api_during_engine_construction(monkeypatch):
+    model = ScaleModel()
+    model.precompute_float8_dynamic_scale_for_fsdp = True
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    monkeypatch.setattr(engine_module, "safe_import_from", lambda *_args, **_kwargs: (False, object()))
+
+    with pytest.raises(ImportError, match="torchao"):
+        Engine(model, device="cpu", optimizers=optimizer)
+
+    torch.testing.assert_close(model.weight, torch.tensor(1.0))
+    assert model.weight.grad is None
+
+
 def test_optim_step_clips_updates_and_clears_real_gradients():
     model = ScaleModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -293,6 +351,15 @@ def test_optim_step_orders_multi_optimizer_topology_and_post_step_work(monkeypat
     second_scheduler = RecordingScheduler("second", second_optimizer)
     device_mesh = _NamedMesh(("cp", "tp"), cp=_SubMesh(2), tp=_SubMesh(4))
     moe_mesh = _NamedMesh(("ep_shard", "ep"), ep_shard=_SubMesh(2), ep=_SubMesh(2))
+
+    def precompute_fp8_scale(part):
+        events.append(f"fp8-{part.name}")
+
+    def resolve_fp8_scale_precompute(parts):
+        assert parts == [first, second]
+        return tuple(parts), precompute_fp8_scale
+
+    monkeypatch.setattr(engine_module, "_resolve_fp8_scale_precompute", resolve_fp8_scale_precompute)
     engine = Engine(
         pipeline,
         device="cpu",
@@ -334,6 +401,8 @@ def test_optim_step_orders_multi_optimizer_topology_and_post_step_work(monkeypat
         "zero-second",
         "gate-first",
         "gate-second",
+        "fp8-first",
+        "fp8-second",
         "scheduler-first",
         "scheduler-second",
     ]
@@ -355,6 +424,64 @@ def test_optim_step_orders_multi_optimizer_topology_and_post_step_work(monkeypat
     assert result.learning_rates == pytest.approx((0.11, 0.21))
     assert first.weight.grad is None
     assert second.weight.grad is None
+
+
+def test_optim_step_fp8_post_step_failure_does_not_advance_scheduler(monkeypatch):
+    events = []
+
+    class GateModel(ScaleModel):
+        def update_moe_gate_bias(self):
+            events.append("gate")
+
+    class RecordingSGD(torch.optim.SGD):
+        def step(self, closure=None):
+            events.append("step")
+            return super().step(closure)
+
+        def zero_grad(self, set_to_none=True):
+            events.append("zero")
+            return super().zero_grad(set_to_none=set_to_none)
+
+    class RecordingScheduler:
+        def step(self, increment):
+            events.append("scheduler")
+
+    model = GateModel()
+    model.weight.grad = torch.tensor(2.0)
+    optimizer = RecordingSGD(model.parameters(), lr=0.1)
+
+    def fail_fp8_post_step(part):
+        assert part is model
+        events.append("fp8")
+        raise RuntimeError("fp8 scale precompute failed")
+
+    monkeypatch.setattr(
+        engine_module,
+        "_resolve_fp8_scale_precompute",
+        lambda parts: (tuple(parts), fail_fp8_post_step),
+    )
+    engine = Engine(
+        model,
+        device="cpu",
+        optimizers=optimizer,
+        lr_schedulers=RecordingScheduler(),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "scale_grads_and_clip_grad_norm",
+        lambda **_kwargs: torch.tensor(2.0),
+    )
+
+    with pytest.raises(RuntimeError, match="fp8 scale precompute failed"):
+        engine.optim_step()
+
+    assert events == ["step", "zero", "gate", "fp8"]
+    torch.testing.assert_close(model.weight, torch.tensor(0.8))
+    assert model.weight.grad is None
+
+    with pytest.raises(RuntimeError, match="already consumed|cannot be optimized"):
+        engine.optim_step()
+    assert events == ["step", "zero", "gate", "fp8"]
 
 
 def test_optim_step_callback_failure_preserves_optimizer_and_post_step_state(monkeypatch):

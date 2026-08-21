@@ -524,7 +524,7 @@ def test_run_train_step_uses_engine_for_empty_supervision():
 
 
 @pytest.mark.cuda(False)
-def test_run_train_step_keeps_fp8_precompute_after_engine_optim_step(monkeypatch):
+def test_train_step_leaves_fp8_post_step_work_to_engine(monkeypatch):
     recipe = _build_engine_recipe_for_optim_step()
     recipe.cfg = _Cfg(
         fp8={
@@ -533,22 +533,18 @@ def test_run_train_step_keeps_fp8_precompute_after_engine_optim_step(monkeypatch
         }
     )
     recipe.device_mesh = {"dp_shard": SimpleNamespace(size=lambda: 2)}
-    events = []
-
-    def optim_step(**kwargs):
-        events.append("optim_step")
-        return SimpleNamespace(grad_norm=2.5, learning_rates=(0.01,))
-
-    recipe.engine.optim_step.side_effect = optim_step
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.precompute_float8_dynamic_scale_for_fsdp",
-        lambda model: events.append(("fp8_precompute", model)),
+        lambda _model: pytest.fail("the VLM recipe must not run FP8 post-step work directly"),
+        raising=False,
     )
 
     batch = {"labels": torch.tensor([[1, 2]]), "input_ids": torch.tensor([[3, 4]])}
     recipe._run_train_optim_step([batch])
 
-    assert events == ["optim_step", ("fp8_precompute", recipe.model_parts[0])]
+    recipe.engine.optim_step.assert_called_once_with(
+        before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging,
+    )
 
 
 def test_make_engine_datum_filters_raw_media_off_first_pipeline_stage():

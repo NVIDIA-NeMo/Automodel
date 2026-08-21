@@ -210,6 +210,24 @@ class TestFP8Conversion:
         # Should return the same model instance when disabled
         assert result is model
 
+    @patch("nemo_automodel.components.quantization.fp8.convert_to_float8_training")
+    def test_default_recipe_enables_tensorwise_fsdp_scale_precompute_capability(self, mock_convert):
+        """``recipe_name=None`` selects the tensorwise path and must expose the same capability."""
+        model = nn.Linear(32, 64)
+        config = FP8Config(
+            enabled=True,
+            recipe_name=None,
+            enable_fsdp_float8_all_gather=True,
+            precompute_float8_dynamic_scale_for_fsdp=True,
+            emulate=True
+        )
+
+        result = apply_fp8_to_model(model, config=config)
+
+        assert result is model
+        assert result.precompute_float8_dynamic_scale_for_fsdp is True
+        mock_convert.assert_called_once()
+
     def test_apply_fp8_to_model_with_individual_params(self):
         """Test apply_fp8_to_model with individual parameters instead of config."""
         model = nn.Linear(32, 64)
@@ -246,7 +264,7 @@ class TestFP8Conversion:
         """Test verification with mock FP8 modules."""
         # This test requires torchao to work properly
         try:
-            from torchao.float8.float8_linear import Float8Linear
+            from torchao.float8.float8_linear import Float8Linear  # noqa: F401
         except ImportError:
             pytest.skip("torchao not available")
 

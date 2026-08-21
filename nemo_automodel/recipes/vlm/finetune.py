@@ -37,7 +37,6 @@ import torch
 import torch.nn as nn
 import wandb
 from torch.utils.data import DataLoader
-from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers.processing_utils import ProcessorMixin
 
 from nemo_automodel._transformers import (
@@ -1106,17 +1105,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         step_result = self.engine.optim_step(
             before_optimizer_step=self.checkpointer.maybe_wait_for_staging,
         )
-
-        # Precompute FP8 scales
-        fp8_config = self.cfg.get("fp8", None)
-        if (
-            fp8_config is not None
-            and fp8_config.get("enabled", False)
-            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
-            and self.device_mesh is not None
-            and self.device_mesh["dp_shard"].size() > 1
-        ):
-            precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.install_optimized_model_weights()

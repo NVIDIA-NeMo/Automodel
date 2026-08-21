@@ -190,13 +190,6 @@ def apply_fp8_to_model(
     if not HAVE_TORCHAO:
         raise ImportError(MISSING_TORCHAO_MSG)
 
-    # Set precompute attribute on model
-    model.precompute_float8_dynamic_scale_for_fsdp = (
-        fp8_config.precompute_float8_dynamic_scale_for_fsdp
-        and fp8_config.recipe_name == "tensorwise"
-        and fp8_config.enable_fsdp_float8_all_gather
-    )
-
     # Handle config creation or recipe-based configuration
     if fp8_config.recipe_name is not None and fp8_config.recipe_name != "tensorwise":
         torchao_config = Float8LinearConfig.from_recipe_name(fp8_config.recipe_name)
@@ -214,6 +207,12 @@ def apply_fp8_to_model(
             emulate=fp8_config.emulate,
         )
         logger.info("Using FP8 tensorwise scaling")
+
+    # Record the resolved torchao capability before distributed partitioning.
+    # Pipeline parts inherit it when the model is copied and split.
+    model.precompute_float8_dynamic_scale_for_fsdp = fp8_config.precompute_float8_dynamic_scale_for_fsdp and getattr(
+        torchao_config, "enable_fsdp_float8_all_gather", False
+    )
 
     # Check hardware capability if not using emulation
     config_emulate = getattr(torchao_config, "emulate", fp8_config.emulate)

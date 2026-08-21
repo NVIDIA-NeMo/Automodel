@@ -2154,7 +2154,7 @@ class TestRunTrainOptimStepUsesEngine:
         assert datums[0].model_inputs["qkv_format"] == "thd"
         assert loss_fn == recipe._engine_loss_fn
 
-    def test_fp8_scale_precompute_stays_after_engine_optim_step(self, monkeypatch):
+    def test_train_step_leaves_fp8_post_step_work_to_engine(self, monkeypatch):
         recipe = self._make_recipe(monkeypatch, pp_enabled=False)
         object.__setattr__(
             recipe,
@@ -2168,36 +2168,22 @@ class TestRunTrainOptimStepUsesEngine:
                 }
             ),
         )
-
-        class _DeviceMesh:
-            def __getitem__(self, name):
-                assert name == "dp_shard"
-                return SimpleNamespace(size=lambda: 2)
-
-        object.__setattr__(recipe, "device_mesh", _DeviceMesh())
-        events = []
-        recipe.checkpointer.maybe_wait_for_staging = lambda: events.append("checkpoint_wait")
-
-        def optim_step(*, before_optimizer_step):
-            events.append("optim_step_start")
-            before_optimizer_step()
-            events.append("optim_step_done")
-            return SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
-
-        recipe.engine.optim_step.side_effect = optim_step
+        object.__setattr__(
+            recipe,
+            "device_mesh",
+            {"dp_shard": SimpleNamespace(size=lambda: 2)},
+        )
         monkeypatch.setattr(
             "nemo_automodel.recipes.llm.train_ft.precompute_float8_dynamic_scale_for_fsdp",
-            lambda model: events.append(("fp8_precompute", model)),
+            lambda _model: pytest.fail("the LLM recipe must not run FP8 post-step work directly"),
+            raising=False,
         )
 
         recipe._run_train_optim_step([{"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[2, -100]])}])
 
-        assert events == [
-            "optim_step_start",
-            "checkpoint_wait",
-            "optim_step_done",
-            ("fp8_precompute", recipe.model_parts[0]),
-        ]
+        recipe.engine.optim_step.assert_called_once_with(
+            before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging,
+        )
 
 
 # -----------------------------------------------------------------------------
