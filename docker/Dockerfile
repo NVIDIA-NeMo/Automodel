@@ -212,6 +212,8 @@ ARG AUTOMODEL_INSTALL=all
 ARG UV_SYNC_ARGS="--locked"
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
 # causal-conv1d, mamba-ssm, and nv-grouped-gemm across BuildKit builds.
+# ray/jars/ray_dist.jar vendors a flagged jackson (GHSA-r7wm-3cxj-wff9) that upstream
+# has not bumped; Automodel uses Ray from Python only, so drop the Java worker jars.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
@@ -221,7 +223,8 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         MAX_JOBS=8 \
         UV_CONCURRENT_INSTALLS=8 \
         uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
-    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))"
+    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
+    rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
