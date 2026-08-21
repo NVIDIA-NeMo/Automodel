@@ -101,6 +101,11 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         img_context_token_id: int = 128258,  # tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
         **kwargs,
     ):
+        # Retain the legacy argument position for compatibility, but do not serialize it.
+        if bidirectional_attention is True:
+            logger.warning(
+                "Ignoring legacy bidirectional_attention; configure text attention with llm_config.is_causal."
+            )
         if vision_config is not None:
             if vision_config["model_type"] == "siglip_vision_model":
                 self.vision_config = SiglipVisionConfig(**vision_config)
@@ -135,7 +140,6 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
         self.pooling = pooling
-        self.bidirectional_attention = bidirectional_attention
         self.img_context_token_id = img_context_token_id
         self.max_input_tiles = max_input_tiles
         super().__init__(**kwargs)

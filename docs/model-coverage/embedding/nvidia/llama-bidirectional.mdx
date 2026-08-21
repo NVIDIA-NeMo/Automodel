@@ -4,7 +4,7 @@ description: ""
 slug: model-coverage/embedding-models/nvidia/llama-bidirectional
 ---
 
-NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses **bidirectional attention**, so each token can attend to both past and future tokens in the sequence, producing richer representations for semantic similarity and dense retrieval.
+NeMo AutoModel provides a retrieval variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. It defaults to **bidirectional attention**, so each token can attend to both past and future tokens in the sequence, and can also preserve or explicitly select standard causal attention.
 
 For the cross-encoder variant, see [Llama (Bidirectional) for Reranking](/model-coverage/reranking-models/nvidia/llama-bidirectional).
 
@@ -17,7 +17,7 @@ For the cross-encoder variant, see [Llama (Bidirectional) for Reranking](/model-
 
 ## Available Models
 
-Any Llama checkpoint can be loaded as a bidirectional backbone. The following configurations are tested:
+Any Llama checkpoint can be loaded as a retrieval backbone with bidirectional or causal attention. The following configurations are tested:
 
 - **Llama 3.2 1B** — fast iteration, fits on a single GPU
 - **Llama 3.1 8B** — higher-quality embeddings for production use
@@ -28,7 +28,22 @@ The bidirectional bi-encoder path is used for embedding generation and dense ret
 
 | Architecture | Task | Auto Class | Description |
 |---|---|---|---|
-| `LlamaBidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Bidirectional Llama with mean pooling for dense embeddings |
+| `LlamaBidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Llama with configurable attention and mean pooling for dense embeddings |
+
+## Attention Mode
+
+Set `model.is_causal` in a bi-encoder recipe:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
+  is_causal: false
+```
+
+An explicit value takes precedence over the value saved in the checkpoint's text config. When neither exists, the
+bi-encoder defaults to `false`. The resolved value is persisted when the model is saved. This setting does not affect
+cross-encoder models. For Llama Nemotron VL, it changes only the language tower; vision attention remains unchanged.
+Changing the policy changes embeddings, so regenerate any stored corpus embeddings before using the updated model.
 
 ## Pooling Strategies
 

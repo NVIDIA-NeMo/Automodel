@@ -348,13 +348,14 @@ def build_encoder_backbone(
     Auto classes and extracts the dotted path. For supported extracted text
     backbones, it then builds the registered retrieval class for the requested
     task. For unsupported extracted text backbones, it returns the extracted model
-    with ``is_causal=False`` for ``"embedding"`` and wraps it with
+    with the resolved attention policy for ``"embedding"`` and wraps it with
     ``AutoModelForSequenceClassification`` for ``"score"``.
 
     Without ``extract_submodel``, model types listed in :data:`SUPPORTED_BACKBONES`
     resolve to custom bidirectional classes from :class:`ModelRegistry`; all other
-    model types fall back to HuggingFace Auto classes, with embedding backbones
-    configured with ``is_causal=False``.
+    model types fall back to HuggingFace Auto classes. Embedding backbones use the
+    explicit attention policy, then a saved text-config value, and otherwise default
+    to ``is_causal=False``.
 
     Args:
         model_name_or_path: Path or HuggingFace Hub identifier.
@@ -368,7 +369,8 @@ def build_encoder_backbone(
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
         loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
-        is_causal: Whether an embedding backbone uses causal self-attention.
+        is_causal: Whether an embedding backbone uses causal self-attention. If omitted,
+            restores the saved text-config policy or defaults to ``False``.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
