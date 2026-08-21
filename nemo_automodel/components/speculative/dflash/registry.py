@@ -50,6 +50,14 @@ class DFlashDraftSpec:
 _QWEN3_ARCHITECTURES: tuple[str, ...] = (
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    # Qwen3.5-family targets, which is what ``Qwen/Qwen3.8-27B`` ships as
+    # (``model_type: qwen3_5``). The ``*ForConditionalGeneration`` variants keep
+    # their decoder hyper-parameters on a nested ``text_config``; the recipe and
+    # the target wrapper unwrap it via ``resolve_text_config``.
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
 )
 
 

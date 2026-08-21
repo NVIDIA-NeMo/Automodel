@@ -56,7 +56,7 @@ from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppre
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import DFlashDraftSpec, resolve_dflash_draft_spec
-from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
+from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel, resolve_text_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
@@ -181,7 +181,10 @@ class TrainDFlashRecipe(BaseRecipe):
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
         # width) so the two never disagree.
-        num_target_layers = int(target_config.num_hidden_layers)
+        # A ``*ForConditionalGeneration`` target keeps its decoder hyper-parameters on
+        # a nested ``text_config``; for causal-LM targets this is the identity.
+        target_text_config = resolve_text_config(target_config)
+        num_target_layers = int(target_text_config.num_hidden_layers)
         draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
         target_layer_ids = list(
             recipe_cfg.get("target_layer_ids", None)
@@ -190,7 +193,7 @@ class TrainDFlashRecipe(BaseRecipe):
         self.target_wrapper = self._build_target_wrapper(target_layer_ids)
 
         self.block_size = int(recipe_cfg.get("block_size", 16))
-        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
+        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_text_config.vocab_size)
 
         # ``packed_sequence_size > 0`` enables sequence packing; the DFlash target,
         # block mask, anchor sampling, and draft RoPE all consume the block-causal
@@ -236,12 +239,34 @@ class TrainDFlashRecipe(BaseRecipe):
         # DFlash draft config: a small non-causal Qwen3 stack that reuses the
         # target's architecture defaults (head_dim, rope_theta, rms_norm_eps, ...).
         draft_cls = self._draft_cls(draft_spec)
-        draft_config = target_config.to_dict()
+        draft_config = target_text_config.to_dict()
         draft_config["architectures"] = [draft_cls.__name__]
+        # The draft is a Qwen3-shaped stack whatever the target's own ``model_type``
+        # is; stamping it keeps the saved config loadable by the serving runtimes.
+        draft_config["model_type"] = "qwen3"
         draft_config["num_hidden_layers"] = draft_num_hidden_layers
+        # The published drafters size their attention independently of the target
+        # (e.g. Qwen3.8-27B: 32 heads / 8 kv / head_dim 128 against a 24 / 4 / 256
+        # target). Default to the target's shape and let a recipe override it.
+        for draft_key, target_key in (
+            ("draft_num_attention_heads", "num_attention_heads"),
+            ("draft_num_key_value_heads", "num_key_value_heads"),
+            ("draft_head_dim", "head_dim"),
+        ):
+            override = recipe_cfg.get(draft_key, None)
+            if override is not None:
+                draft_config[target_key] = int(override)
         # ``layer_types``/``max_window_layers`` are sized to the target's depth;
         # rebuild them for the (shallower) draft. The DFlash attention never uses
         # sliding windows, so every draft layer is full attention.
+        # A multimodal target's text config carries mRoPE sections the text-only
+        # draft never applies; drop them so the saved draft config matches what the
+        # published drafters ship and no serving runtime tries to honour them.
+        rope_parameters = draft_config.get("rope_parameters")
+        if isinstance(rope_parameters, dict):
+            draft_config["rope_parameters"] = {
+                key: value for key, value in rope_parameters.items() if not key.startswith("mrope_")
+            }
         draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
         draft_config["max_window_layers"] = draft_num_hidden_layers
         draft_config["num_target_layers"] = num_target_layers
