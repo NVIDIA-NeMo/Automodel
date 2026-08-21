@@ -50,6 +50,37 @@ from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Q
 from nemo_automodel.components.models.qwen3_vl_moe.state_dict_adapter import Qwen3VLMoeStateDictAdapter
 
 
+class _AllocatingKeysAdapter(StateDictAdapter):
+    """Test adapter whose normal conversion joins two tensors."""
+
+    def __init__(self) -> None:
+        self.converted_devices: list[torch.device] = []
+
+    def to_hf(self, state_dict, **kwargs):
+        self.converted_devices = [value.device for value in state_dict.values() if isinstance(value, torch.Tensor)]
+        return {"fused.weight": torch.cat((state_dict.pop("q.weight"), state_dict.pop("k.weight")), dim=0)}
+
+    def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
+        return hf_state_dict
+
+    def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+        return [(fqn, tensor)]
+
+
+def test_get_hf_state_dict_keys_uses_shape_only_tensors() -> None:
+    adapter = _AllocatingKeysAdapter()
+    state_dict = {
+        "q.weight": torch.ones(4, 8),
+        "k.weight": torch.ones(2, 8),
+    }
+
+    keys = adapter.get_hf_state_dict_keys(state_dict)
+
+    assert keys == ["fused.weight"]
+    assert adapter.converted_devices == [torch.device("meta"), torch.device("meta")]
+    assert list(state_dict) == ["q.weight", "k.weight"]
+
+
 def _assert_destinations_write_through(
     adapter: StateDictAdapter,
     state_dict: dict[str, torch.Tensor],
