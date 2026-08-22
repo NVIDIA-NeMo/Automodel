@@ -89,7 +89,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
     Note: NemotronV3 uses 'mixer' instead of 'mlp' in layer paths.
     """
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,
@@ -281,7 +281,12 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # emitted HF keys stay under ``mtp.`` instead of ``backbone.``.
         if fqn.startswith("mtp."):
             fqn = _strip_mamba_fp32_holder_key(fqn)
-            expert_split = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, prefix_override="mtp.")
+            expert_split = self._convert_single_merged_expert_to_hf_split_experts(
+                fqn,
+                tensor,
+                prefix_override="mtp.",
+                **kwargs,
+            )
             result = expert_split if expert_split is not None else [(fqn, tensor)]
             result = [(key, _upcast_mamba_fp32_state_tensor(key, value)) for key, value in result]
             if exclude_key_regex:

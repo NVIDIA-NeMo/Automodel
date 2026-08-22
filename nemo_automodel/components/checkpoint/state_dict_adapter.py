@@ -15,6 +15,8 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
+import torch
+
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -26,27 +28,17 @@ class StateDictAdapter(ABC):
     state dict format and other model state dict formats.
     """
 
-    _supports_write_through_checkpoint_load: bool = False
-    _supports_checkpoint_load_without_full_copy: bool = False
+    _supports_low_memory_dcp_load: bool = False
 
     @property
-    def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether every checkpoint tensor is loaded directly into the model's existing weight memory.
+    def supports_low_memory_dcp_load(self) -> bool:
+        """Whether DCP can load the checkpoint with zero or small temporary tensors.
 
-        Enable this only when writing every tensor returned by ``to_hf`` for base-checkpoint loading updates the
-        model itself. This lets the loader skip a complete CPU copy of the checkpoint.
+        Most checkpoint tensors must load directly into the model's existing weight memory. Small temporary tensors
+        are allowed when they are converted and released after the read. Enable this only when the extra memory is
+        safely below a full model copy, including when loading on one GPU.
         """
-        return self._supports_write_through_checkpoint_load
-
-    @property
-    def supports_checkpoint_load_without_full_copy(self) -> bool:
-        """Whether DCP can load this adapter without another full set of model weights.
-
-        Large checkpoint tensors must be loaded into the model's existing weight memory. Small temporary tensors are
-        allowed when they can be applied and discarded without making a model-sized copy. For example, Gemma4 loads
-        a scale tensor and applies it to already-loaded expert weights.
-        """
-        return self._supports_checkpoint_load_without_full_copy
+        return self._supports_low_memory_dcp_load
 
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
@@ -95,7 +87,7 @@ class StateDictAdapter(ABC):
         pass
 
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
-        """Return the Hugging Face keys produced by ``to_hf``.
+        """Return the Hugging Face keys produced by ``to_hf`` without converting real weights.
 
         Args:
             state_dict: Native model state mapping. Tensor values may have
@@ -105,4 +97,8 @@ class StateDictAdapter(ABC):
         Returns:
             Hugging Face state-dict keys in adapter iteration order.
         """
-        return list(self.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=False))
+        shape_only_state = {
+            key: torch.empty_like(value, device="meta") if isinstance(value, torch.Tensor) else value
+            for key, value in state_dict.items()
+        }
+        return list(self.to_hf(shape_only_state, exclude_key_regex=r".*_extra_state.*", quantization=False))

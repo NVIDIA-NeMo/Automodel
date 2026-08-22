@@ -104,16 +104,59 @@ class TestNemotronV3StateDictAdapter:
 
         assert adapter._expert_path_segment == "mixer.experts"
 
-    def test_write_through_load_capability_requires_aliasing_expert_backend(self, config, moe_config, backend):
+    def test_low_memory_dcp_capability_requires_model_backed_experts(self, config, moe_config, backend):
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
-        assert adapter.supports_write_through_checkpoint_load is True
+        assert adapter.supports_low_memory_dcp_load is True
 
         adapter.backend.experts = "te"
-        assert adapter.supports_write_through_checkpoint_load is False
+        adapter.backend.dispatcher = "deepep"
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+            assert adapter.supports_low_memory_dcp_load is False
+
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
+            assert adapter.supports_low_memory_dcp_load is True
 
         adapter.backend.experts = "gmm"
         adapter.backend.dispatcher = "mok"
-        assert adapter.supports_write_through_checkpoint_load is False
+        assert adapter.supports_low_memory_dcp_load is False
+
+    def test_te_single_device_fallback_loads_through_grouped_parameter_views(self, config, moe_config, backend):
+        backend.experts = "te"
+        backend.dispatcher = "deepep"
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        gate_and_up = torch.zeros(
+            moe_config.n_routed_experts,
+            moe_config.expert_dim,
+            moe_config.moe_inter_dim,
+        )
+        down = torch.zeros(
+            moe_config.n_routed_experts,
+            moe_config.moe_inter_dim,
+            moe_config.expert_dim,
+        )
+
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
+            destinations = adapter.to_hf(
+                {
+                    "model.layers.0.mixer.experts.gate_and_up_projs": gate_and_up,
+                    "model.layers.0.mixer.experts.down_projs": down,
+                },
+                for_checkpoint_load=True,
+            )
+            assert adapter.supports_low_memory_dcp_load is True
+
+        assert set(destinations) == {
+            f"backbone.layers.0.mixer.experts.{expert_id}.{projection}.weight"
+            for expert_id in range(moe_config.n_routed_experts)
+            for projection in ("up_proj", "down_proj")
+        }
+        for expert_id in range(moe_config.n_routed_experts):
+            up_destination = destinations[f"backbone.layers.0.mixer.experts.{expert_id}.up_proj.weight"]
+            down_destination = destinations[f"backbone.layers.0.mixer.experts.{expert_id}.down_proj.weight"]
+            assert up_destination.untyped_storage().data_ptr() == gate_and_up.untyped_storage().data_ptr()
+            assert down_destination.untyped_storage().data_ptr() == down.untyped_storage().data_ptr()
+            assert not up_destination.is_contiguous()
+            assert not down_destination.is_contiguous()
 
     def test_from_hf_map_structure(self, config, moe_config, backend):
         """Test from_hf_map structure."""
@@ -142,7 +185,7 @@ class TestNemotronV3AdapterDense:
 
     def test_init_accepts_none_moe_config(self, adapter):
         assert adapter.moe_config is None
-        assert adapter.supports_write_through_checkpoint_load is True
+        assert adapter.supports_low_memory_dcp_load is True
 
     def test_from_hf_renames_without_experts(self, adapter):
         hf_sd = {

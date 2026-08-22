@@ -19,6 +19,7 @@ from typing import Any, Optional
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
@@ -50,19 +51,35 @@ class MoESplitExpertsStateDictMixin:
     # - self.backend: Backend configuration object
 
     @property
-    def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether every checkpoint tensor, including expert tensors, loads directly into model weights."""
-        experts_load_directly = self.moe_config is None or self._supports_write_through_expert_checkpoint_load
-        return self._supports_write_through_checkpoint_load and experts_load_directly
+    def supports_low_memory_dcp_load(self) -> bool:
+        """Whether DCP needs at most small temporary tensors for this MoE checkpoint."""
+        experts_use_model_storage = self.moe_config is None or self._expert_checkpoint_tensors_use_model_storage
+        return self._supports_low_memory_dcp_load and experts_use_model_storage
 
     @property
-    def _supports_write_through_expert_checkpoint_load(self) -> bool:
-        """Whether grouped expert checkpoint tensors load directly into model weight memory.
+    def _expert_checkpoint_tensors_use_model_storage(self) -> bool:
+        """Whether grouped expert checkpoint tensors use the model's weight memory.
 
-        This covers only the shared expert conversion. A concrete adapter must also verify that all non-expert
-        checkpoint tensors load directly before it enables the full-checkpoint fast path.
+        This covers only the shared expert conversion. A concrete adapter must also verify that its non-expert
+        checkpoint tensors require at most small temporary tensors before enabling low-memory DCP loading.
         """
-        return self.backend.experts != "te" and self.backend.dispatcher != "mok"
+        return self._grouped_expert_storage_is_model_weight and self.backend.dispatcher != "mok"
+
+    @property
+    def _grouped_expert_storage_is_model_weight(self) -> bool:
+        """Whether the runtime grouped expert tensors use the model's parameter storage.
+
+        TE normally exposes virtual grouped tensors backed by ``torch.stack`` copies. The MoE layer instead constructs
+        ordinary ``GroupedExperts`` when an EP dispatcher runs with world size one, so the same TE configuration uses
+        real model parameters in that runtime. Non-EP dispatchers also construct ordinary grouped experts.
+        """
+        if self.backend.experts != "te":
+            return True
+        if self.backend.dispatcher == "mok":
+            return False
+        if self.backend.dispatcher not in {"deepep", "hybridep", "uccl_ep"}:
+            return True
+        return get_world_size_safe() == 1
 
     @property
     def _is_gated_moe(self) -> bool:
@@ -867,7 +884,7 @@ class MoESplitExpertsStateDictMixin:
         # down_projs transpose still uses the model's weight memory. Treat the two native tensors independently so
         # MoK rebuilds gate/up after the read while DCP loads down directly into the model.
         backend = getattr(self, "backend", None)
-        grouped_storage_is_model_weight = getattr(backend, "experts", None) != "te"
+        grouped_storage_is_model_weight = self._grouped_expert_storage_is_model_weight
         gate_up_storage_is_model_weight = (
             grouped_storage_is_model_weight and getattr(backend, "dispatcher", None) != "mok"
         )

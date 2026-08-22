@@ -78,7 +78,7 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     only the three HYV3-specific name renames + MTP-layer filtering live here.
     """
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,
