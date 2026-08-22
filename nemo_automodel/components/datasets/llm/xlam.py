@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional
+from typing import TYPE_CHECKING, ClassVar, Dict, List
 
 from datasets import load_dataset
 
@@ -97,7 +97,7 @@ def _convert_tools(raw_tools: List[Dict]) -> List[Dict]:
     return converted
 
 
-def _convert_tool_calls(raw_calls: List[Dict], example_id: Optional[int] = None) -> List[Dict]:
+def _convert_tool_calls(raw_calls: List[Dict], example_id: int | None = None) -> List[Dict]:
     """
     Convert xLAM answers field into OpenAI tool_calls messages.
     """

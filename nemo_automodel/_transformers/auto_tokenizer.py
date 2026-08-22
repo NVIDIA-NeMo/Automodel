@@ -14,12 +14,12 @@
 
 import importlib
 import logging
-from typing import Callable, Optional, Type, Union
+from typing import Callable, Type, Union
 
 logger = logging.getLogger(__name__)
 
 
-def _get_model_type(pretrained_model_name_or_path: str, trust_remote_code: bool = False) -> Optional[str]:
+def _get_model_type(pretrained_model_name_or_path: str, trust_remote_code: bool = False) -> str | None:
     """
     Determine the model type from the config.
 

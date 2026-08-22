@@ -29,10 +29,10 @@ from nemo_automodel._transformers.model_init import (
     _FP8_PREFLIGHT_FOOTPRINT_THRESHOLD,
     _check_fp8_dequantize_will_fit,
     _get_hf_param_count_estimate,
+    _has_streaming_fp8_checkpoint_load,
     _param_count_from_local_safetensors,
     _quant_config_is_fp8_full_materialize,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -154,17 +154,19 @@ class TestGetHfParamCountEstimate:
     def test_mha_matches_legacy_4hh_formula(self):
         # When head_dim == H / n_heads and n_kv == n_heads, the GQA-aware term
         # collapses to the original 4*H*H attention estimate.
-        H, L, V, I, n = 4096, 32, 32000, 11008, 32
+        hidden_size, layers, vocab_size, intermediate_size, num_heads = 4096, 32, 32000, 11008, 32
         cfg = SimpleNamespace(
-            num_hidden_layers=L,
-            hidden_size=H,
-            vocab_size=V,
-            intermediate_size=I,
-            num_attention_heads=n,
-            num_key_value_heads=n,
-            head_dim=H // n,
+            num_hidden_layers=layers,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            intermediate_size=intermediate_size,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            head_dim=hidden_size // num_heads,
         )
-        legacy = L * (4 * H * H + 3 * H * I) + V * H
+        legacy = (
+            layers * (4 * hidden_size * hidden_size + 3 * hidden_size * intermediate_size) + vocab_size * hidden_size
+        )
         assert _get_hf_param_count_estimate(cfg) == legacy
 
 
@@ -189,14 +191,58 @@ class TestCheckFp8DequantizeWillFit:
         cfg = _make_hf_config(layers=88, hidden=12288, vocab=131072, inter=28672)
 
         with pytest.raises(RuntimeError) as excinfo:
-            _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "mistralai/Mistral-Medium")
+            _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "mistralai/Mistral-Medium", force_hf=True)
         msg = str(excinfo.value)
         assert "Mistral-Medium" in msg
         assert "BF16 footprint" in msg
         assert "Total CUDA memory" in msg
         assert "issues/2114" in msg
-        assert "mistral3_vlm" in msg
+        assert "force_hf=True selects Transformers' full-materialize loader" in msg
+        assert "no streaming FP8 checkpoint loader registered" in msg
         assert _FP8_PREFLIGHT_DISABLE_ENV in msg
+
+    def test_supported_streaming_route_gives_exact_recovery(self, monkeypatch):
+        monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (_MEM_8GB, _MEM_8GB))
+
+        class _StreamingModel:
+            _supports_streaming_fp8_checkpoint_load = True
+
+        monkeypatch.setattr(model_init, "_resolve_custom_model_cls_for_config", lambda config: _StreamingModel)
+        cfg = _make_hf_config(layers=88, hidden=12288, vocab=131072, inter=28672)
+        cfg.quantization_config = {"quant_method": "fp8", "weight_block_size": None}
+
+        assert _has_streaming_fp8_checkpoint_load(cfg) is True
+        with pytest.raises(RuntimeError) as excinfo:
+            _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "mistralai/Devstral-2", force_hf=True)
+
+        msg = str(excinfo.value)
+        assert "Remove force_hf=True" in msg
+        assert "do not pass FineGrainedFP8Config(dequantize=True)" in msg
+        assert "leave the checkpoint's native FP8 quantization_config unchanged" in msg
+
+    def test_per_block_checkpoint_is_not_claimed_by_per_tensor_streaming_loader(self, monkeypatch):
+        class _StreamingModel:
+            _supports_streaming_fp8_checkpoint_load = True
+
+        monkeypatch.setattr(model_init, "_resolve_custom_model_cls_for_config", lambda config: _StreamingModel)
+        cfg = SimpleNamespace(quantization_config={"quant_method": "fp8", "weight_block_size": [128, 128]})
+
+        assert _has_streaming_fp8_checkpoint_load(cfg) is False
+
+    def test_fallback_route_does_not_claim_force_hf(self, monkeypatch):
+        monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (_MEM_8GB, _MEM_8GB))
+        monkeypatch.setattr(model_init, "_resolve_custom_model_cls_for_config", lambda config: None)
+        cfg = _make_hf_config(layers=88, hidden=12288, vocab=131072, inter=28672)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "unsupported/model", force_hf=False)
+
+        msg = str(excinfo.value)
+        assert "Automodel fell back to Transformers' full-materialize loader" in msg
+        assert "force_hf=True selects" not in msg
+        assert "Remove force_hf=True" not in msg
 
     def test_returns_none_when_footprint_fits(self, monkeypatch):
         monkeypatch.setattr("torch.cuda.is_available", lambda: True)
@@ -315,18 +361,20 @@ class TestCheckFp8DequantizeWillFit:
             _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "any/model", force_hf=False)
         msg = str(excinfo.value)
         assert "force_hf" not in msg
-        assert "no streaming-aware custom implementation" in msg
-        assert "mistral3_vlm" in msg
+        assert "no streaming FP8 checkpoint loader registered" in msg
 
-    def test_force_hf_wording_keeps_the_drop_force_hf_hint(self, monkeypatch):
-        """Default force_hf=True wording still tells the user they can drop force_hf."""
+    def test_force_hf_without_streaming_loader_does_not_offer_unavailable_route(self, monkeypatch):
+        """Dropping force_hf is only actionable when a streaming loader exists."""
         monkeypatch.setattr("torch.cuda.is_available", lambda: True)
         monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (_MEM_8GB, _MEM_8GB))
         cfg = _make_hf_config(layers=88, hidden=12288)
 
         with pytest.raises(RuntimeError) as excinfo:
             _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "any/model")
-        assert "drop force_hf=True" in str(excinfo.value)
+        msg = str(excinfo.value)
+        assert "force_hf=True selects Transformers' full-materialize loader" in msg
+        assert "no streaming FP8 checkpoint loader registered" in msg
+        assert "Remove force_hf=True" not in msg
 
     def test_diagnostic_reports_gib(self, monkeypatch):
         """Sizes are computed with 1024**3, so the label has to be GiB, not GB."""

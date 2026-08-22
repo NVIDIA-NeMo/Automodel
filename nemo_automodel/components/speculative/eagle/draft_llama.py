@@ -93,7 +93,7 @@ P-EAGLE (parallel-drafting EAGLE-3) adds one further optional toggle:
 from __future__ import annotations
 
 import logging
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -939,9 +939,9 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         input_ids: torch.Tensor,
         projected_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        cache_hidden: Optional[list[list[torch.Tensor]]] = None,
-        seq_lens: Optional[torch.Tensor] = None,
+        position_ids: torch.Tensor | None = None,
+        cache_hidden: list[list[torch.Tensor]] | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one full-sequence draft update step.
 

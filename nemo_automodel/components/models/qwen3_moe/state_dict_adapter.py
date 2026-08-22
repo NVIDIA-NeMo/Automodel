@@ -43,6 +43,8 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
       model.layers.{L}.mlp.experts.down_projs         # [n_experts, moe_inter_dim, dim]
     """
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,
@@ -62,7 +64,7 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         return ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
 
     def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+        self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         hf_state_dict = {}
         for fqn, tensor in state_dict.items():
