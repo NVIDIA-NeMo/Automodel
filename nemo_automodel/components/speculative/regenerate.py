@@ -86,6 +86,9 @@ class GenerationConfig:
     max_new_tokens: int
     temperature: float
     top_p: float
+    # 0 disables the truncation. Not sent to the server unless set: the engines
+    # spell "no top-k" as -1, so a literal 0 would be read as "keep 0 tokens".
+    top_k: int = 0
     reasoning: str = "none"
 
 
@@ -111,6 +114,7 @@ def _build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "top_k": getattr(args, "top_k", 0),
         "reasoning": args.reasoning,
     }
 

@@ -172,3 +172,28 @@ def test_load_prompts_context_column_attribute_optional(monkeypatch):
     assert not hasattr(args, "prompt_context_column")
     prompts = _load_prompts(args)
     assert prompts == [[{"role": "user", "content": "Name a color."}]]
+
+
+def test_generation_config_defaults_top_k_to_disabled():
+    """The engines spell "no top-k" as -1, so a literal 0 must never be sent.
+
+    OpenAI's chat-completions schema has no ``top_k``; SGLang and vLLM accept it
+    as an extra where ``-1`` disables it. Our default of 0 therefore means
+    "omit the key", which ``_run_workload`` relies on.
+    """
+    from nemo_automodel.components.speculative.regenerate import GenerationConfig
+
+    unset = GenerationConfig(model="m", max_new_tokens=8, temperature=1.0, top_p=0.95)
+    assert unset.top_k == 0
+    assert GenerationConfig(model="m", max_new_tokens=8, temperature=1.0, top_p=0.95, top_k=20).top_k == 20
+
+
+def test_bench_entrypoints_expose_top_k():
+    """The DFlash 2 evaluations quote acceptance length at top-p 0.95 / top-k 20,
+    so the benchmark harness has to be able to express top-k at all."""
+    from nemo_automodel.components.speculative import bench_sglang, bench_sweep, bench_vllm
+
+    for module in (bench_sglang, bench_vllm, bench_sweep):
+        parser = module._build_parser()
+        assert parser.get_default("top_k") == 0, f"{module.__name__} must register --top-k, disabled by default"
+        assert parser.get_default("top_p") == 1.0, f"{module.__name__} must still register --top-p"
