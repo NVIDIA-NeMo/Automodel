@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
-
-import pytest
 
 from nemo_automodel.components.models.common.utils import get_is_optim_step, set_is_optim_step
 from nemo_automodel.components.moe.fsdp_mixin import (
@@ -767,25 +764,10 @@ class TestPatchedBackwardMaybeWithNosync:
                 assert grads == ((), None)
                 assert param_groups is None
 
-    @pytest.mark.parametrize(
-        ("stage_finalize", "global_optim_step", "expect_post_backward"),
-        [
-            pytest.param(True, False, True, id="stage-final-overrides-global-false"),
-            pytest.param(False, True, False, id="stage-nonfinal-overrides-global-true"),
-            pytest.param(None, True, True, id="legacy-stage-falls-back-to-global"),
-        ],
-    )
     @patch("nemo_automodel.components.moe.fsdp_mixin.get_is_optim_step")
     @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
-    def test_moe_fsdp_mixin_pipeline_boundary_is_authoritative(
-        self,
-        mock_isinstance,
-        mock_get_optim,
-        stage_finalize,
-        global_optim_step,
-        expect_post_backward,
-    ):
-        """Effective stage finalization overrides the legacy global flag."""
+    def test_moe_fsdp_mixin_last_backward_with_optim_step(self, mock_isinstance, mock_get_optim):
+        """Test MoEFSDPSyncMixin path with last_backward=True and IS_OPTIM_STEP=True."""
 
         def isinstance_side_effect(obj, cls):
             if cls == MoEFSDPSyncMixin:
@@ -795,13 +777,12 @@ class TestPatchedBackwardMaybeWithNosync:
             return False
 
         mock_isinstance.side_effect = isinstance_side_effect
-        mock_get_optim.return_value = global_optim_step
+        mock_get_optim.return_value = True
 
+        mock_stage = Mock()
         model = MockFSDPModule()
         moe_model = MockMoEModel(MockBackend(), model)
-        mock_stage = SimpleNamespace(submod=moe_model)
-        if stage_finalize is not None:
-            mock_stage._nemo_finalize_backward = stage_finalize
+        mock_stage.submod = moe_model
 
         bwd_kwargs = {
             "stage_output": Mock(),
@@ -815,14 +796,8 @@ class TestPatchedBackwardMaybeWithNosync:
 
                 result = patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=True)
 
-                if expect_post_backward:
-                    mock_run_post.assert_called_once_with(moe_model)
-                else:
-                    mock_run_post.assert_not_called()
-                if stage_finalize is None:
-                    mock_get_optim.assert_called_once_with()
-                else:
-                    mock_get_optim.assert_not_called()
+                # Verify post backward was called
+                mock_run_post.assert_called_once_with(moe_model)
                 grads, param_groups = result
                 assert grads == ((), None)
                 assert param_groups is None

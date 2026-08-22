@@ -48,6 +48,31 @@ def _toy_datums():
     ]
 
 
+def _routed_datums():
+    """Build ragged Datums with per-token routing metadata.
+
+    Returns:
+        Two Datums whose routed-expert tensors use the
+        ``[tokens, layers, topk]`` layout and ``torch.int16`` dtype.
+    """
+    first_routes = torch.arange(3 * 2 * 2, dtype=torch.int16).reshape(3, 2, 2)
+    second_routes = torch.arange(100, 100 + 2 * 2 * 2, dtype=torch.int16).reshape(2, 2, 2)
+    return [
+        Datum(
+            input_ids=torch.tensor([10, 11, 12]),
+            loss_fn_inputs={"weights": torch.ones(3), "routed_experts": first_routes},
+            loss_fn_input_layouts={"routed_experts": LossInputLayout.PER_TOKEN},
+            loss_fn_input_pad_values={"routed_experts": -1},
+        ),
+        Datum(
+            input_ids=torch.tensor([20, 21]),
+            loss_fn_inputs={"weights": torch.ones(2), "routed_experts": second_routes},
+            loss_fn_input_layouts={"routed_experts": LossInputLayout.PER_TOKEN},
+            loss_fn_input_pad_values={"routed_experts": -1},
+        ),
+    ]
+
+
 # ── Datum ─────────────────────────────────────────────────────────────────
 
 
@@ -103,6 +128,21 @@ def test_datum_rejects_invalid_loss_input_layouts():
             input_ids=torch.tensor([1]),
             loss_fn_inputs={"weights": torch.ones(1)},
             loss_fn_input_layouts={"weights": "per_token"},  # type: ignore[dict-item]
+        )
+
+
+def test_datum_validates_loss_input_pad_value_metadata():
+    with pytest.raises(ValueError, match="unknown loss inputs"):
+        Datum(
+            input_ids=torch.tensor([1]),
+            loss_fn_inputs={"weights": torch.ones(1)},
+            loss_fn_input_pad_values={"missing": -1},
+        )
+    with pytest.raises(TypeError, match="bool, int, or float"):
+        Datum(
+            input_ids=torch.tensor([1]),
+            loss_fn_inputs={"weights": torch.ones(1)},
+            loss_fn_input_pad_values={"weights": object()},  # type: ignore[dict-item]
         )
 
 
@@ -173,6 +213,46 @@ def test_collate_packed_side_inputs_ride_the_flat_axis():
     assert [t.tolist() for t in split] == [pytest.approx([0.5, 0.5, 0.5]), pytest.approx([0.9, 0.9])]
 
 
+def test_collate_padded_per_token_trailing_dims_use_the_declared_pad_value():
+    datums = _routed_datums()
+
+    _, loss_inputs = collate_datums(datums)
+
+    routes = loss_inputs["routed_experts"]
+    assert routes.shape == (2, 3, 2, 2)
+    assert routes.dtype == torch.int16
+    torch.testing.assert_close(routes[0], datums[0].loss_fn_inputs["routed_experts"])
+    torch.testing.assert_close(routes[1, :2], datums[1].loss_fn_inputs["routed_experts"])
+    assert torch.equal(routes[1, 2], torch.full((2, 2), -1, dtype=torch.int16))
+    assert loss_inputs.layouts["routed_experts"] is LossInputLayout.PER_TOKEN
+    assert loss_inputs.pad_values == {"routed_experts": -1}
+
+
+def test_collate_requires_explicit_layout_for_trailing_token_features():
+    datums = _routed_datums()
+    for datum in datums:
+        datum.loss_fn_input_layouts.clear()
+
+    with pytest.raises(ValueError, match="declare an explicit layout for 'routed_experts'"):
+        collate_datums(datums)
+
+
+def test_collate_packed_per_token_trailing_dims_preserve_token_order_and_metadata():
+    datums = _routed_datums()
+
+    model_inputs, loss_inputs = collate_datums(datums, packed=True)
+
+    routes = loss_inputs["routed_experts"]
+    assert model_inputs["input_ids"].tolist() == [[10, 11, 12, 20, 21]]
+    assert routes.shape == (1, 5, 2, 2)
+    torch.testing.assert_close(
+        routes[0],
+        torch.cat([datum.loss_fn_inputs["routed_experts"] for datum in datums]),
+    )
+    assert loss_inputs.layouts["routed_experts"] is LossInputLayout.PER_TOKEN
+    assert loss_inputs.pad_values == {"routed_experts": -1}
+
+
 def test_collate_packed_per_sample_side_input_is_one_per_datum():
     datums = [
         Datum(model_inputs={"input_ids": torch.tensor([1, 2])}, loss_fn_inputs={"advantages": torch.tensor([0.5])}),
@@ -207,6 +287,21 @@ def test_collated_loss_inputs_copy_preserves_side_channel_and_dict_compatibility
         assert copied.item_to_datum == loss_inputs.item_to_datum
 
 
+def test_collated_loss_inputs_copy_preserves_read_only_pad_values():
+    loss_inputs = collate_datums(_routed_datums())[1]
+
+    for copied in (
+        loss_inputs.copy(),
+        copy(loss_inputs),
+        deepcopy(loss_inputs),
+        pickle.loads(pickle.dumps(loss_inputs)),  # noqa: S301 - trusted in-process round trip
+    ):
+        assert isinstance(copied, CollatedLossInputs)
+        assert copied.pad_values == {"routed_experts": -1}
+        with pytest.raises(TypeError):
+            copied.pad_values["routed_experts"] = 0  # type: ignore[index]
+
+
 def test_collated_loss_inputs_requires_complete_read_only_layouts():
     with pytest.raises(ValueError, match="exactly"):
         CollatedLossInputs(
@@ -223,6 +318,60 @@ def test_collated_loss_inputs_requires_complete_read_only_layouts():
     assert loss_inputs.item_to_datum == (0,)
     with pytest.raises(TypeError):
         loss_inputs.layouts["weights"] = LossInputLayout.REPLICATED  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("layouts", "pad_values", "error", "message"),
+    [
+        (
+            {"weights": LossInputLayout.PER_TOKEN},
+            {"missing": -1},
+            ValueError,
+            "unknown loss inputs",
+        ),
+        (
+            {"weights": LossInputLayout.PER_DATUM},
+            {"weights": -1},
+            ValueError,
+            "only valid for PER_TOKEN",
+        ),
+        (
+            {"weights": LossInputLayout.PER_TOKEN},
+            {"weights": object()},
+            TypeError,
+            "bool, int, or float",
+        ),
+    ],
+)
+def test_collated_loss_inputs_validates_pad_value_metadata(layouts, pad_values, error, message):
+    with pytest.raises(error, match=message):
+        CollatedLossInputs(
+            {"weights": torch.ones(1)},
+            layouts=layouts,
+            item_to_datum=(0,),
+            pad_values=pad_values,
+        )
+
+
+def test_collate_requires_consistent_per_token_pad_value_metadata():
+    partial = _routed_datums()
+    partial[1].loss_fn_input_pad_values.clear()
+    with pytest.raises(ValueError, match="every Datum must declare the pad value"):
+        collate_datums(partial)
+
+    conflicting = _routed_datums()
+    conflicting[1].loss_fn_input_pad_values["routed_experts"] = -2
+    with pytest.raises(ValueError, match="same pad value"):
+        collate_datums(conflicting)
+
+    non_token = Datum(
+        input_ids=torch.tensor([1]),
+        loss_fn_inputs={"sample_id": torch.tensor(7)},
+        loss_fn_input_layouts={"sample_id": LossInputLayout.PER_DATUM},
+        loss_fn_input_pad_values={"sample_id": -1},
+    )
+    with pytest.raises(ValueError, match="does not use the PER_TOKEN layout"):
+        collate_datums([non_token])
 
 
 def test_collate_explicit_per_datum_overrides_single_token_shape_inference():

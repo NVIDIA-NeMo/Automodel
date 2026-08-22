@@ -408,9 +408,10 @@ class ContextParallelSharder:
         caller may pass tensors in its own coordinates and the verb applies the
         same transform the batch went through:
 
-        - ``[B, S_in]`` tensors on a repositioned-row layout (reported position
-          map, e.g. DSV4 packed repad) are scattered into the padded rows,
-          ``fill`` filling the pad slots;
+        - ``[B, S_in, ...]`` tensors on a repositioned-row layout (reported
+          position map, e.g. DSV4 packed repad) are scattered into the padded
+          rows, ``fill`` filling the pad slots while trailing feature axes are
+          preserved;
         - tensors matching the reported pre-flatten ``input_row_shape`` on a
           flat-stream (THD) layout are flattened first (the returned shard is
           in the model's local stream coordinate);
@@ -421,15 +422,19 @@ class ContextParallelSharder:
         Any other length raises instead of silently sharding the wrong slice.
         """
         layout = self.shard_layout or _NO_SHARD_LAYOUT
-        if layout.input_token_stream_positions is not None and tuple(tensor.shape) == tuple(
-            layout.input_token_stream_positions.shape
-        ):
+        position_shape = (
+            tuple(layout.input_token_stream_positions.shape) if layout.input_token_stream_positions is not None else ()
+        )
+        if position_shape and tuple(tensor.shape[: len(position_shape)]) == position_shape:
             if fill is None:
                 raise ValueError("sharding an input-coordinate tensor on a repositioned layout requires `fill`")
             positions = layout.input_token_stream_positions.to(tensor.device)
             valid = positions >= 0
             padded = torch.full(
-                (tensor.shape[0], layout.padded_seq_len), fill, dtype=tensor.dtype, device=tensor.device
+                (tensor.shape[0], layout.padded_seq_len, *tensor.shape[len(position_shape) :]),
+                fill,
+                dtype=tensor.dtype,
+                device=tensor.device,
             )
             padded[valid.nonzero(as_tuple=True)[0], positions[valid]] = tensor[valid]
             tensor, seq_dim = padded, 1

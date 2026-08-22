@@ -129,7 +129,7 @@ def _per_token_identity_loss(output: torch.Tensor, loss_inputs: dict[str, torch.
 
     Returns:
         Per-token losses with shape ``[batch=1, sequence=4]``. Engine applies
-        ``weights`` and the complete planned-window denominator.
+        ``weights`` and the complete-window denominator.
     """
     assert output.shape == loss_inputs["weights"].shape
     return output
@@ -139,8 +139,8 @@ def _run_mode(
     mesh_context: MeshContext,
     *,
     summed_gradients: bool,
-) -> tuple[tuple[float, ...], float, dict[str, torch.Tensor]]:
-    """Run one planned update through a real MegatronFSDP reduction mode.
+) -> tuple[tuple[float, float, float], float, dict[str, torch.Tensor]]:
+    """Run one complete update through a real MegatronFSDP reduction mode.
 
     Args:
         mesh_context: Two-rank ``[dp=2, cp=1, tp=1]`` CUDA mesh.
@@ -148,8 +148,9 @@ def _run_mode(
             selects SUM gradient collectives; false selects averaged gradients.
 
     Returns:
-        Call-local loss sums, weight sums, and normalized losses; the global
-        gradient norm; and float32 local parameter shards after the update.
+        The complete-window loss sum, weight sum, and normalized loss; the
+        global gradient norm; and float32 local parameter shards after the
+        update.
     """
     torch.manual_seed(1234)
     model = TinyTokenModel().cuda()
@@ -171,18 +172,13 @@ def _run_mode(
         max_grad_norm=1e9,
     )
     window_a, window_b = _windows(dist.get_rank())
-    engine.begin_accumulation([window_a, window_b])
-    result_a = engine.forward_backward(window_a, _per_token_identity_loss)
-    result_b = engine.forward_backward(window_b, _per_token_identity_loss)
+    result = engine.forward_backward(window_a + window_b, _per_token_identity_loss)
     step_result = engine.optim_step()
 
     statistics = (
-        result_a.loss_sum.item(),
-        result_a.weight_sum.item(),
-        result_a.loss.item(),
-        result_b.loss_sum.item(),
-        result_b.weight_sum.item(),
-        result_b.loss.item(),
+        result.loss_sum.item(),
+        result.weight_sum.item(),
+        result.loss.item(),
     )
     return statistics, float(step_result.grad_norm), _local_parameters(model)
 
@@ -208,8 +204,7 @@ def main() -> None:
     assert math.isfinite(summed[1]) and summed[1] > 0
     torch.testing.assert_close(torch.tensor(summed[0]), torch.tensor(averaged[0]), rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(torch.tensor(summed[1]), torch.tensor(averaged[1]), rtol=1e-5, atol=1e-5)
-    assert summed[0][1] == 3.0
-    assert summed[0][4] == 4.0
+    assert summed[0][1] == 7.0
     assert set(summed[2]) == set(averaged[2])
     for name in sorted(averaged[2]):
         torch.testing.assert_close(summed[2][name], averaged[2][name], rtol=1e-5, atol=1e-5)

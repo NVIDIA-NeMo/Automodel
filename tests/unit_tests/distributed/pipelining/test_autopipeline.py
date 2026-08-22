@@ -18,9 +18,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.pipelining.microbatch import TensorChunkSpec, split_args_kwargs_into_chunks
 
-import nemo_automodel.components.distributed.pipelining.functional as pipeline_functional
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import (
     generate_hf_model_fqn_per_model_part,
@@ -230,29 +228,13 @@ class TestAutoPipelineValidation:
         assert ap.pp_mesh is not None
 
 
-class _KwargsChunkHookPart(nn.Module):
-    def __init__(self, chunk_dims: dict[str, int]):
-        super().__init__()
-        self.chunk_dims = chunk_dims
-
-    def get_pipeline_kwargs_chunk_dims(self, kwargs):
-        return {key: dim for key, dim in self.chunk_dims.items() if key in kwargs}
-
-
-class _UnknownKwargsChunkHookPart(nn.Module):
-    def get_pipeline_kwargs_chunk_dims(self, kwargs):
-        return {"unknown": 0}
-
-
-class _KwargsChunkSchedule:
+class _PreparedMicrobatchSchedule:
     def __init__(self, *, fail_on_step: bool = False, invoke_loss: bool = False):
-        self._kwargs_chunk_spec = None
         self._loss_fn = Mock(return_value=torch.tensor(0.0))
         self.fail_on_step = fail_on_step
         self.invoke_loss = invoke_loss
         self.args_during_step = None
         self.args_split = None
-        self.kwargs_chunk_spec_during_step = None
         self.loss_fn_during_step = None
         self.split_inputs_during_step = None
         self.kwargs_split = None
@@ -265,12 +247,7 @@ class _KwargsChunkSchedule:
         self.split_inputs_calls = 0
 
     def _split_inputs(self, args, kwargs=None):
-        return split_args_kwargs_into_chunks(
-            args,
-            kwargs,
-            2,
-            kwargs_chunk_spec=self._kwargs_chunk_spec,
-        )
+        raise AssertionError("prepared microbatch split was not installed")
 
     def _run_schedule(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
         """Split schedule inputs using the chunk spec active during the call.
@@ -289,7 +266,6 @@ class _KwargsChunkSchedule:
             A sentinel string identifying the schedule result.
         """
         self.args_during_step = args
-        self.kwargs_chunk_spec_during_step = self._kwargs_chunk_spec
         self.loss_fn_during_step = self._loss_fn
         self.split_inputs_during_step = self._split_inputs
         self.target_during_step = target
@@ -327,7 +303,7 @@ class _KwargsChunkSchedule:
         )
 
 
-class _LegacyStepSchedule(_KwargsChunkSchedule):
+class _LegacyStepSchedule(_PreparedMicrobatchSchedule):
     """Schedule with the PyTorch 2.6-2.9 step signature."""
 
     def __init__(self):
@@ -352,7 +328,7 @@ class _LegacyEvalSchedule(_LegacyStepSchedule):
         return self._run_schedule(*args, target=target, losses=losses, **kwargs)
 
 
-class _ForwardingEvalSchedule(_KwargsChunkSchedule):
+class _ForwardingEvalSchedule(_PreparedMicrobatchSchedule):
     """Current PyTorch shape: eval forwards kwargs to a newer step API."""
 
     def eval(self, *args, target=None, losses=None, **kwargs):
@@ -366,59 +342,12 @@ class _NoEvalSchedule(_LegacyStepSchedule):
     eval = None
 
 
-class _FinalizationStage:
-    """Record the two schedule-local gradient-finalization signals."""
-
-    def __init__(self, submod=None):
-        self.events = []
-        self.finalize_backward_states = []
-        self.submod = nn.Module() if submod is None else submod
-
-    def backward_maybe_with_nosync(self, _backward_type, _bwd_kwargs, *, last_backward=False):
-        self.finalize_backward_states.append(getattr(self, "_nemo_finalize_backward", None))
-        self.events.append(("backward", last_backward))
-        return (), None
-
-    def perform_reduce_grad(self, divisor):
-        self.events.append(("reduce", divisor))
-        set_requires_gradient_sync = getattr(self.submod, "set_requires_gradient_sync", None)
-        if callable(set_requires_gradient_sync):
-            set_requires_gradient_sync(True)
-        self.scale_grads(divisor)
-
-    def scale_grads(self, divisor):
-        self.events.append(("scale", divisor))
-
-
-class _FinalizationSchedule(_KwargsChunkSchedule):
-    """Model the final backward and reduce calls made by a PyTorch schedule."""
-
-    def __init__(self, stage):
-        super().__init__()
-        self._stage = stage
-        self._stages = [stage]
-
-    def step(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
-        result = super().step(
-            *args,
-            target=target,
-            losses=losses,
-            return_outputs=return_outputs,
-            **kwargs,
-        )
-        self._stage.backward_maybe_with_nosync("full", {}, last_backward=True)
-        self._stage.perform_reduce_grad(2)
-        return result
-
-
-class TestAutoPipelineKwargsChunkSpec:
+class TestAutoPipelinePreparedMicrobatches:
     def _pipeline_with_parts(
         self,
         *parts: nn.Module,
         schedule=None,
         has_first_stage: bool = True,
-        defer_fsdp_grad_sync: bool = True,
-        scale_grads_in_schedule: bool = False,
     ):
         ap = AutoPipeline(
             world_mesh=FakeDeviceMesh(),
@@ -427,53 +356,14 @@ class TestAutoPipelineKwargsChunkSpec:
             pp_microbatch_size=1,
             pp_batch_size=2,
             device=torch.device("cpu"),
-            defer_fsdp_grad_sync=defer_fsdp_grad_sync,
-            scale_grads_in_schedule=scale_grads_in_schedule,
         )
-        ap._info.schedule = schedule or _KwargsChunkSchedule()
+        ap._info.schedule = schedule or _PreparedMicrobatchSchedule()
         ap._info.model_parts = list(parts)
         ap._info.has_first_stage = has_first_stage
         return ap
 
-    def test_step_splits_mrope_position_ids_on_model_owned_batch_axis(self):
-        """AutoPipeline.step keeps all mRoPE axes in every microbatch."""
-        input_ids = torch.zeros(2, 8, dtype=torch.long)
-        position_ids = torch.arange(8, dtype=torch.long).view(1, 1, -1).expand(3, 2, -1).clone()
-        kwargs = {
-            "position_ids": position_ids,
-            "attention_mask": torch.ones(2, 8, dtype=torch.bool),
-            "qkv_format": "thd",
-        }
-
-        _, default_kwargs_split = split_args_kwargs_into_chunks((input_ids,), kwargs, 2)
-        assert default_kwargs_split[0]["position_ids"].shape == (2, 2, 8)
-
-        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}))
-        result = ap.step(input_ids, **kwargs)
-
-        fixed_kwargs_split = ap.info.schedule.kwargs_split
-        assert result == "schedule-result"
-        assert fixed_kwargs_split[0]["position_ids"].shape == (3, 1, 8)
-        assert fixed_kwargs_split[1]["position_ids"].shape == (3, 1, 8)
-        torch.testing.assert_close(fixed_kwargs_split[0]["position_ids"], position_ids[:, :1])
-        torch.testing.assert_close(fixed_kwargs_split[1]["position_ids"], position_ids[:, 1:])
-        assert fixed_kwargs_split[0]["attention_mask"].shape == (1, 8)
-        assert fixed_kwargs_split[0]["qkv_format"] == "thd"
-        assert fixed_kwargs_split[1]["qkv_format"] == "thd"
-        assert ap.info.schedule.args_during_step == (input_ids,)
-        assert ap.info.schedule._kwargs_chunk_spec is None
-
-    def test_step_without_model_hook_uses_pytorch_default_chunking(self):
-        ap = self._pipeline_with_parts(nn.Module())
-
-        ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
-
-        assert ap.info.schedule.kwargs_chunk_spec_during_step is None
-        assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
-        assert ap.info.schedule._kwargs_chunk_spec is None
-
     def test_step_microbatches_passes_prepared_inputs_without_resplitting(self):
-        schedule = _KwargsChunkSchedule(invoke_loss=True)
+        schedule = _PreparedMicrobatchSchedule(invoke_loss=True)
         ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
         input_ids = [torch.full((1, 8), index, dtype=torch.long) for index in range(2)]
         position_ids = [torch.full((3, 1, 8), index, dtype=torch.long) for index in range(2)]
@@ -515,7 +405,7 @@ class TestAutoPipelineKwargsChunkSpec:
         assert model_inputs[1]["input_ids"] is input_ids[1]
 
     def test_step_microbatches_omits_primary_args_on_nonfirst_stage(self):
-        schedule = _KwargsChunkSchedule()
+        schedule = _PreparedMicrobatchSchedule()
         ap = self._pipeline_with_parts(nn.Module(), schedule=schedule, has_first_stage=False)
         model_inputs = [{"inputs_embeds": torch.zeros(1, 8, 4), "position_ids": torch.zeros(1, 8)} for _ in range(2)]
 
@@ -523,137 +413,6 @@ class TestAutoPipelineKwargsChunkSpec:
 
         assert schedule.args_split == [(), ()]
         assert all("inputs_embeds" not in kwargs for kwargs in schedule.kwargs_split)
-
-    def test_step_microbatches_defers_schedule_finalization_until_the_logical_last_call(self):
-        stage = _FinalizationStage()
-        schedule = _FinalizationSchedule(stage)
-        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
-        pipeline_functional._make_pipeline_stages_accumulation_aware(
-            [stage],
-            reduce_grad_per_microbatch=False,
-        )
-        ap._info.stages = [stage]
-        model_inputs = [{"input_ids": torch.zeros(1, 8)} for _ in range(2)]
-
-        ap.step_microbatches(model_inputs, loss_fn=Mock(), finalize_backward=False)
-        assert stage.events == [("backward", False), ("scale", 2)]
-        assert stage.finalize_backward_states == [False]
-        assert stage._nemo_finalize_backward is True
-
-        ap.step_microbatches(model_inputs, loss_fn=Mock(), finalize_backward=True)
-        assert stage.events == [
-            ("backward", False),
-            ("scale", 2),
-            ("backward", True),
-            ("reduce", 2),
-            ("scale", 2),
-        ]
-        assert stage.finalize_backward_states == [False, True]
-
-    def test_step_microbatches_preserves_requested_per_microbatch_gradient_reduction(self):
-        stage = _FinalizationStage()
-        schedule = _FinalizationSchedule(stage)
-        ap = self._pipeline_with_parts(
-            nn.Module(),
-            schedule=schedule,
-            defer_fsdp_grad_sync=False,
-        )
-        pipeline_functional._make_pipeline_stages_accumulation_aware(
-            [stage],
-            reduce_grad_per_microbatch=True,
-        )
-        ap._info.stages = [stage]
-
-        ap.step_microbatches(
-            [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
-            loss_fn=Mock(),
-            finalize_backward=False,
-        )
-
-        assert stage.events == [("backward", True), ("reduce", 2), ("scale", 2)]
-        assert stage.finalize_backward_states == [True]
-
-    def test_step_microbatches_rejects_cross_call_schedule_gradient_scaling(self):
-        schedule = _KwargsChunkSchedule()
-        ap = self._pipeline_with_parts(
-            nn.Module(),
-            schedule=schedule,
-            scale_grads_in_schedule=True,
-        )
-
-        with pytest.raises(ValueError, match="scale_grads_in_schedule=False"):
-            ap.step_microbatches(
-                [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
-                loss_fn=Mock(),
-                finalize_backward=False,
-            )
-
-        assert schedule.step_calls == 0
-
-    @pytest.mark.parametrize("stage_state", [None, "unwrapped"])
-    def test_step_microbatches_requires_accumulation_aware_stages_for_nonfinal_call(self, stage_state):
-        schedule = _KwargsChunkSchedule()
-        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
-        ap._info.stages = None if stage_state is None else [_FinalizationStage()]
-
-        with pytest.raises(RuntimeError, match="accumulation-aware pipeline stages"):
-            ap.step_microbatches(
-                [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
-                loss_fn=Mock(),
-                finalize_backward=False,
-            )
-
-        assert schedule.step_calls == 0
-
-    def test_nonfinal_fully_sharded_stage_runs_post_backward_without_sync(self, monkeypatch):
-        fsdp_events = []
-
-        class FakeFSDPModule:
-            def set_is_last_backward(self, value):
-                fsdp_events.append(("last", value))
-
-            def set_reshard_after_backward(self, value):
-                fsdp_events.append(("reshard", value))
-
-            def set_requires_gradient_sync(self, value):
-                fsdp_events.append(("sync", value))
-
-        parameter_group = types.SimpleNamespace(post_backward=lambda: fsdp_events.append(("post", None)))
-        fsdp_state = types.SimpleNamespace(
-            _state_ctx=types.SimpleNamespace(
-                all_states=[types.SimpleNamespace(_fsdp_param_group=parameter_group)],
-            ),
-            _root_post_backward_final_callback=lambda: fsdp_events.append(("root", None)),
-        )
-        import torch.distributed.fsdp as torch_fsdp
-
-        monkeypatch.setattr(torch_fsdp, "FSDPModule", FakeFSDPModule)
-        monkeypatch.setattr(torch_fsdp.fully_shard, "state", lambda _module: fsdp_state)
-
-        stage = _FinalizationStage(FakeFSDPModule())
-        pipeline_functional._make_pipeline_stages_accumulation_aware(
-            [stage],
-            reduce_grad_per_microbatch=False,
-        )
-        stage._nemo_finalize_backward = False
-        stage.perform_reduce_grad(2)
-
-        assert fsdp_events == [
-            ("last", True),
-            ("reshard", True),
-            ("sync", False),
-            ("post", None),
-            ("root", None),
-        ]
-        assert stage.events == [("scale", 2)]
-
-        fsdp_events.clear()
-        stage.events.clear()
-        stage._nemo_finalize_backward = True
-        stage.perform_reduce_grad(2)
-
-        assert fsdp_events == [("sync", True)]
-        assert stage.events == [("reduce", 2), ("scale", 2)]
 
     @pytest.mark.parametrize(
         ("method_name", "schedule_cls"),
@@ -679,7 +438,7 @@ class TestAutoPipelineKwargsChunkSpec:
         assert schedule.received_return_outputs is False
 
     def test_eval_microbatches_uses_forward_only_schedule_with_exact_prepared_split(self):
-        schedule = _KwargsChunkSchedule(invoke_loss=True)
+        schedule = _PreparedMicrobatchSchedule(invoke_loss=True)
         ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
         input_ids = [torch.full((1, 8), index, dtype=torch.long) for index in range(2)]
         metadata = [object(), object()]
@@ -758,7 +517,7 @@ class TestAutoPipelineKwargsChunkSpec:
 
     @pytest.mark.parametrize("method_name", ["step_microbatches", "eval_microbatches"])
     def test_prepared_microbatches_restore_schedule_state_after_failure(self, method_name):
-        schedule = _KwargsChunkSchedule(fail_on_step=True)
+        schedule = _PreparedMicrobatchSchedule(fail_on_step=True)
         original_split_inputs = schedule._split_inputs
         original_loss_fn = schedule._loss_fn
         ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
@@ -776,50 +535,14 @@ class TestAutoPipelineKwargsChunkSpec:
         assert schedule._split_inputs == original_split_inputs
         assert schedule._loss_fn is original_loss_fn
 
-    def test_only_canonical_model_part_supplies_chunk_policy(self):
-        ap = self._pipeline_with_parts(
-            _KwargsChunkHookPart({"position_ids": 1}),
-            _KwargsChunkHookPart({"position_ids": 0}),
-        )
-
-        ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8))
-
-        assert ap.info.schedule.kwargs_split[0]["position_ids"].shape == (3, 1, 8)
-
-    def test_nonfirst_stage_ignores_model_input(self):
-        ap = self._pipeline_with_parts(nn.Module(), has_first_stage=False)
-
-        ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
-
-        assert ap.info.schedule.args_during_step == ()
-        assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
-
-    def test_step_restores_schedule_chunk_spec_after_failure(self):
-        schedule = _KwargsChunkSchedule(fail_on_step=True)
-        original_chunk_spec = {"position_ids": TensorChunkSpec(0)}
-        schedule._kwargs_chunk_spec = original_chunk_spec
-        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}), schedule=schedule)
-
-        with pytest.raises(RuntimeError, match="schedule failed"):
-            ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8))
-
-        assert schedule.kwargs_chunk_spec_during_step["position_ids"].split_dim == 1
-        assert schedule._kwargs_chunk_spec is original_chunk_spec
-
-    def test_model_hook_cannot_configure_unknown_kwarg(self):
-        ap = self._pipeline_with_parts(_UnknownKwargsChunkHookPart())
-
-        with pytest.raises(ValueError, match="unknown kwarg"):
-            ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
-
 
 # -----------------------------
-# Core build/materialize/step tests
+# Core build/materialize tests
 # -----------------------------
 
 
-class TestAutoPipelineBuildAndStep:
-    """Test AutoPipeline build, materialize, and step functionality."""
+class TestAutoPipelineBuild:
+    """Test AutoPipeline build and materialize functionality."""
 
     def test_autopipeline_basic_creation(self):
         """Test basic AutoPipeline creation without full build process."""
@@ -839,8 +562,8 @@ class TestAutoPipelineBuildAndStep:
 
     @pytest.mark.parametrize("pp_size", [2, 4])
     @pytest.mark.parametrize("local_rank", [0, 1, 2, 3])
-    def test_autopipeline_build_split_materialize_and_step(self, monkeypatch, pp_size, local_rank):
-        """Test complete AutoPipeline build, materialize, and step workflow."""
+    def test_autopipeline_build_split_and_materialize(self, monkeypatch, pp_size, local_rank):
+        """Test complete AutoPipeline build, split, and materialize workflow."""
         _patch_autopipeline_monkey(monkeypatch)
         if local_rank >= pp_size:
             pytest.skip("local_rank not part of this pp_size")
@@ -954,11 +677,6 @@ class TestAutoPipelineBuildAndStep:
         # Should return self for method chaining
         assert result is ap
         assert ap._info.enabled is True
-
-    def test_autopipeline_step_workflow(self, monkeypatch):
-        """Test AutoPipeline step functionality."""
-        # Skip this complex test - the step method requires extensive pipeline setup
-        pytest.skip("Complex step test requires extensive pipeline mocking")
 
     def test_autopipeline_build_assertions(self, monkeypatch):
         """Test AutoPipeline build method assertion errors."""

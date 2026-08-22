@@ -514,125 +514,6 @@ def _run_thd_layout(
     return pipeline
 
 
-def _run_planned_accumulation_parity(
-    device: torch.device,
-    mesh_context: MeshContext,
-    raw_inputs: dict[str, object],
-    labels: torch.Tensor,
-    weights: torch.Tensor,
-) -> None:
-    """Compare two PP schedule calls in one plan with one complete Engine window.
-
-    Args:
-        device: CUDA device for this physical pipeline rank.
-        mesh_context: Runtime PP2 topology; this check runs with CP size one.
-        raw_inputs: Raw THD mapping whose token and position tensors have shape
-            ``[batch, sequence]`` before Engine preparation.
-        labels: Target token IDs shaped ``[batch, sequence]``.
-        weights: Base token weights shaped ``[batch, sequence]``; the two
-            planned calls derive unequal denominators from this tensor.
-    """
-
-    def make_windows() -> tuple[list[Datum], list[Datum]]:
-        """Clone two prebatched Datum windows with ``[batch, sequence]`` tensors."""
-        weights_a = weights.clone()
-        weights_a[:, 1::2] = 0
-        weights_b = weights.clone().mul(1.5)
-        weights_b[:, ::2] = 0
-        return (
-            [
-                Datum(
-                    model_inputs=_clone_mapping(raw_inputs),
-                    loss_fn_inputs={"labels": labels.clone(), "weights": weights_a},
-                )
-            ],
-            [
-                Datum(
-                    model_inputs=_clone_mapping(raw_inputs),
-                    loss_fn_inputs={"labels": labels.clone(), "weights": weights_b},
-                )
-            ],
-        )
-
-    reference_pipeline = _build_pipeline(device, mesh_context)
-    reference_parameters = [parameter for part in reference_pipeline.parts for parameter in part.parameters()]
-    reference_optimizer = torch.optim.SGD(reference_parameters, lr=0.05)
-    reference_engine = Engine(
-        reference_pipeline,
-        device=device,
-        mesh_context=mesh_context,
-        collate_fn=collate_prebatched,
-        optimizers=reference_optimizer,
-        max_grad_norm=1e6,
-    )
-    reference_window_a, reference_window_b = make_windows()
-    reference_result = reference_engine.forward_backward(
-        reference_window_a + reference_window_b,
-        _token_losses,
-    )
-    reference_grads = [parameter.grad.detach().clone() for parameter in reference_parameters]
-    reference_step = reference_engine.optim_step()
-
-    planned_pipeline = _build_pipeline(device, mesh_context)
-    planned_parameters = [parameter for part in planned_pipeline.parts for parameter in part.parameters()]
-    planned_optimizer = torch.optim.SGD(planned_parameters, lr=0.05)
-    planned_engine = Engine(
-        planned_pipeline,
-        device=device,
-        mesh_context=mesh_context,
-        collate_fn=collate_prebatched,
-        optimizers=planned_optimizer,
-        max_grad_norm=1e6,
-    )
-    planned_window_a, planned_window_b = make_windows()
-    planned_engine.begin_accumulation([planned_window_a, planned_window_b])
-    planned_result_a = planned_engine.forward_backward(planned_window_a, _token_losses)
-    planned_result_b = planned_engine.forward_backward(planned_window_b, _token_losses)
-
-    if not reference_parameters or len(reference_parameters) != len(planned_parameters):
-        raise AssertionError(
-            f"planned/reference PP parameter mismatch: {len(planned_parameters)} != {len(reference_parameters)}"
-        )
-    if planned_result_a.weight_sum.item() == planned_result_b.weight_sum.item():
-        raise AssertionError("planned PP accumulation fixture must use unequal call denominators")
-    torch.testing.assert_close(
-        planned_result_a.loss_sum + planned_result_b.loss_sum,
-        reference_result.loss_sum,
-        atol=4e-2,
-        rtol=2e-3,
-    )
-    torch.testing.assert_close(
-        planned_result_a.weight_sum + planned_result_b.weight_sum,
-        reference_result.weight_sum,
-        atol=0,
-        rtol=0,
-    )
-    combined_loss = (planned_result_a.loss_sum + planned_result_b.loss_sum) / (
-        planned_result_a.weight_sum + planned_result_b.weight_sum
-    )
-    torch.testing.assert_close(combined_loss, reference_result.loss, atol=4e-2, rtol=2e-3)
-    for planned_parameter, reference_grad in zip(planned_parameters, reference_grads):
-        if planned_parameter.grad is None:
-            raise AssertionError("planned PP accumulation left a local parameter without a gradient")
-        torch.testing.assert_close(planned_parameter.grad.float(), reference_grad.float(), atol=5e-3, rtol=5e-2)
-
-    planned_step = planned_engine.optim_step()
-    torch.testing.assert_close(planned_step.grad_norm.float(), reference_step.grad_norm.float(), atol=5e-3, rtol=5e-2)
-    for planned_parameter, reference_parameter in zip(planned_parameters, reference_parameters):
-        torch.testing.assert_close(
-            planned_parameter.float(),
-            reference_parameter.float(),
-            atol=5e-3,
-            rtol=5e-2,
-        )
-
-    if dist.get_rank() == 0:
-        print(
-            "PP2 planned two-call accumulation matched one complete window "
-            f"(weights={planned_result_a.weight_sum.item():.1f}+{planned_result_b.weight_sum.item():.1f})"
-        )
-
-
 def _run_explicit_loss_layout(
     pipeline: AutoPipeline,
     layout: str,
@@ -854,10 +735,6 @@ def main() -> None:
         _run_explicit_loss_layout(final_pipeline, "final", "forward", device, mesh_context)
         dist.barrier()
         _run_padded_output_broadcast(final_pipeline, device, mesh_context)
-        dist.barrier()
-        del final_pipeline
-        torch.cuda.empty_cache()
-        _run_planned_accumulation_parity(device, mesh_context, raw_inputs, labels, weights)
         dist.barrier()
     finally:
         dist.destroy_process_group()

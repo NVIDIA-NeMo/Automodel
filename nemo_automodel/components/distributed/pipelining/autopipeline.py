@@ -20,11 +20,8 @@ from typing import Any, Callable, Literal
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.pipelining.microbatch import BlockMask, TensorChunkSpec
-from torch.distributed.pipelining.microbatch import _Replicate as ReplicateChunkSpec
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 from torch.distributed.pipelining.stage import PipelineStage
-from torch.utils._pytree import tree_map
 
 from nemo_automodel.components.distributed.pipelining.functional import (
     ParallelizeFnProtocol,
@@ -36,7 +33,6 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 )
 
 logger = logging.getLogger(__name__)
-_MISSING_STAGE_STATE = object()
 
 
 @dataclass
@@ -256,101 +252,6 @@ class AutoPipeline:
             effective_microbatch_size,
         )
 
-    def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
-        """Build pipeline microbatch chunking metadata for keyword inputs.
-
-        PyTorch's default schedule chunking splits every tensor kwarg on dim 0.
-        Most AutoModel batch tensors are batch-major and should keep that
-        default, but some model-owned input layouts place batch on another axis.
-        The canonical local model part can declare those exceptions by implementing
-        ``get_pipeline_kwargs_chunk_dims(kwargs) -> dict[str, int]``.
-
-        Args:
-            kwargs: Mapping passed to the pipeline schedule. Tensor values may
-                have arbitrary model-defined layouts; the model hook identifies
-                any nonstandard batch axis.
-
-        Returns:
-            A chunk-spec mapping with the same nested structure as ``kwargs``,
-            or ``None`` when PyTorch's default chunking applies.
-        """
-        model_parts = self._info.model_parts
-        if not model_parts:
-            raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
-
-        hook = getattr(model_parts[0], "get_pipeline_kwargs_chunk_dims", None)
-        if hook is None:
-            return None
-
-        custom_chunk_dims = hook(kwargs) or {}
-        for key in custom_chunk_dims:
-            if key not in kwargs:
-                raise ValueError(f"Model PP chunk hook returned unknown kwarg: {key}")
-
-        if not custom_chunk_dims:
-            return None
-
-        def default_spec(value):
-            if isinstance(value, (torch.Tensor, BlockMask)):
-                return TensorChunkSpec(0)
-            return ReplicateChunkSpec()
-
-        kwargs_chunk_spec = tree_map(default_spec, kwargs, is_leaf=lambda value: isinstance(value, BlockMask))
-        for key, split_dim in custom_chunk_dims.items():
-            kwargs_chunk_spec[key] = TensorChunkSpec(split_dim)
-        return kwargs_chunk_spec
-
-    def step(
-        self,
-        model_input: torch.Tensor,
-        *,
-        target: torch.Tensor | None = None,
-        losses: list[torch.Tensor] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        """Run one pipeline schedule step with model-owned input chunking.
-
-        Args:
-            model_input: Tensor of shape [batch, ...] containing the first
-                pipeline stage's input. Ignored on ranks without the first stage.
-            target: Tensor with a model-defined target layout, or ``None`` on
-                ranks without the last pipeline stage.
-            losses: Mutable list populated with scalar loss tensors, or ``None``
-                on ranks without the last pipeline stage.
-            **kwargs: Keyword schedule inputs. Tensor values may have arbitrary
-                model-defined layouts; model-owned metadata identifies any
-                nonstandard batch axis.
-
-        Returns:
-            The value returned by the underlying PyTorch pipeline schedule.
-        """
-        schedule = self._info.schedule
-        if schedule is None:
-            raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
-
-        schedule_args = (model_input,) if self._info.has_first_stage else ()
-        kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
-
-        if kwargs_chunk_spec is None:
-            return schedule.step(
-                *schedule_args,
-                target=target,
-                losses=losses,
-                **kwargs,
-            )
-
-        previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
-        schedule._kwargs_chunk_spec = kwargs_chunk_spec
-        try:
-            return schedule.step(
-                *schedule_args,
-                target=target,
-                losses=losses,
-                **kwargs,
-            )
-        finally:
-            schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
-
     def step_microbatches(
         self,
         model_inputs: list[dict[str, Any]],
@@ -358,7 +259,6 @@ class AutoPipeline:
         loss_fn: Callable[[Any, int], Any],
         losses: list[torch.Tensor] | None = None,
         return_outputs: bool = False,
-        finalize_backward: bool = True,
     ) -> Any:
         """Run a schedule step over already prepared model microbatches.
 
@@ -376,41 +276,16 @@ class AutoPipeline:
             losses: Mutable list populated by the schedule on the last stage.
             return_outputs: Whether the last stage returns merged model outputs
                 when supported by the installed PyTorch version.
-            finalize_backward: Whether this schedule invocation ends the
-                optimizer's backward window. ``False`` keeps DDP in no-sync
-                mode and completes local FSDP post-backward state while
-                deferring its gradient collective; per-microbatch gradient
-                reduction remains authoritative when configured.
 
         Returns:
             The value returned by the underlying PyTorch pipeline schedule.
-
-        Raises:
-            ValueError: If a non-final call would use schedule-local gradient
-                scaling and rescale gradients accumulated by earlier calls.
-            RuntimeError: If a non-final call is attempted before
-                accumulation-aware pipeline stages have been built.
         """
-        if not finalize_backward and self.scale_grads_in_schedule:
-            raise ValueError(
-                "planned pipeline accumulation requires scale_grads_in_schedule=False; "
-                "schedule-local scaling would rescale gradients from earlier calls"
-            )
-        if not finalize_backward and (
-            not self._info.stages
-            or any(not vars(stage).get("_nemo_accumulation_aware", False) for stage in self._info.stages)
-        ):
-            raise RuntimeError(
-                "finalize_backward=False requires accumulation-aware pipeline stages; "
-                "build the AutoPipeline before running planned accumulation"
-            )
         return self._run_prepared_microbatches(
             model_inputs,
             loss_fn=loss_fn,
             losses=losses,
             return_outputs=return_outputs,
             schedule_method="step",
-            finalize_backward=finalize_backward,
         )
 
     def eval_microbatches(
@@ -452,7 +327,6 @@ class AutoPipeline:
             losses=losses,
             return_outputs=return_outputs,
             schedule_method="eval",
-            finalize_backward=True,
         )
 
     def _run_prepared_microbatches(
@@ -463,7 +337,6 @@ class AutoPipeline:
         losses: list[torch.Tensor] | None,
         return_outputs: bool,
         schedule_method: Literal["step", "eval"],
-        finalize_backward: bool,
     ) -> Any:
         """Run one schedule method with an exact prepared-microbatch split."""
         schedule = self._info.schedule
@@ -509,13 +382,6 @@ class AutoPipeline:
         )
         previous_split_inputs = schedule._split_inputs
         previous_loss_fn = schedule._loss_fn
-        previous_stage_state: list[tuple[PipelineStage, object]] = []
-        if schedule_method == "step":
-            for stage in self._info.stages or ():
-                previous_stage_state.append((stage, vars(stage).get("_nemo_finalize_backward", _MISSING_STAGE_STATE)))
-                stage._nemo_finalize_backward = finalize_backward or getattr(
-                    stage, "_reduce_grad_per_microbatch", False
-                )
         schedule._split_inputs = lambda _args, _kwargs=None: (model_args_chunks, model_kwargs_chunks)
         schedule._loss_fn = indexed_loss
         try:
@@ -527,11 +393,6 @@ class AutoPipeline:
         finally:
             schedule._loss_fn = previous_loss_fn
             schedule._split_inputs = previous_split_inputs
-            for stage, previous in previous_stage_state:
-                if previous is _MISSING_STAGE_STATE:
-                    del stage._nemo_finalize_backward
-                else:
-                    stage._nemo_finalize_backward = previous
 
     @property
     def parts(self) -> list[nn.Module]:

@@ -49,15 +49,27 @@ layer order, so ``collect()`` and ``replay()`` line the per-layer tensors up by
 position. This assumes single-threaded model construction (the norm for recipe
 training); call :meth:`RouterReplay.clear_registry` before building a second
 model in the same process.
+
+For rollout-provided routing, :class:`RouterReplayAdapter` is the preferred
+eager Engine interface. It maps global decoder-layer ids without using the
+registry and consumes ``routed_experts`` only after the Engine has applied its
+packing and context-parallel token transform. This adapter intentionally
+supports PP=1 only.
 """
 
-from contextlib import contextmanager
+from collections.abc import Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from enum import Enum
-from typing import Iterator, List
+from math import prod
+from typing import Any
 
 import torch
+from torch import nn
 
-__all__ = ["RouterReplayMode", "RouterReplay", "replay_selection"]
+from nemo_automodel.shared.model_utils import iter_transformer_blocks
+
+__all__ = ["RouterReplayMode", "RouterReplay", "RouterReplayAdapter", "replay_selection"]
 
 
 class RouterReplayMode(Enum):
@@ -76,14 +88,16 @@ class RouterReplay:
     ``replay`` context managers).
     """
 
-    _registry: List["RouterReplay"] = []
+    _registry: list["RouterReplay"] = []
 
-    def __init__(self) -> None:
-        """Create a handle and register it in construction (i.e. layer) order."""
+    def __init__(self, *, register: bool = True) -> None:
+        """Create a handle, optionally registering it for legacy global control."""
         self.mode: RouterReplayMode | None = None
         self.recorded_indices: torch.Tensor | None = None
         self.target_indices: torch.Tensor | None = None
-        RouterReplay._registry.append(self)
+        self._allow_trailing_live_tokens = False
+        if register:
+            RouterReplay._registry.append(self)
 
     def apply(self, indices: torch.Tensor) -> torch.Tensor:
         """Record or replay ``indices`` according to the current mode.
@@ -95,6 +109,8 @@ class RouterReplay:
         Returns:
             ``indices`` unchanged when no mode is active or while recording; the
             stored target indices (moved to ``indices.device``) while replaying.
+            A target row containing ``-1`` keeps that token's complete live
+            top-k selection, preserving unique expert ids.
         """
         if self.mode == RouterReplayMode.RECORD:
             # Indices are integer selection ids carrying no gradient; detach so the
@@ -107,13 +123,28 @@ class RouterReplay:
                     "RouterReplay is in REPLAY mode but no target indices were set for this layer. "
                     "Call RouterReplay.replay(indices) / set_replay_indices(...) with one tensor per MoE layer."
                 )
-            target = self.target_indices.to(indices.device)
-            if target.shape != indices.shape:
-                raise ValueError(
-                    f"Replay indices shape {tuple(target.shape)} does not match the current "
-                    f"selection shape {tuple(indices.shape)}; replay must run on the same tokens and topk."
+            if self.target_indices.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64}:
+                raise TypeError(
+                    f"RouterReplay target indices must use a signed integer dtype, got {self.target_indices.dtype}"
                 )
-            return target
+            target = self.target_indices.to(device=indices.device, dtype=indices.dtype)
+            if target.shape != indices.shape:
+                if (
+                    self._allow_trailing_live_tokens
+                    and target.ndim == 2
+                    and indices.ndim == 2
+                    and target.shape[1] == indices.shape[1]
+                    and target.shape[0] < indices.shape[0]
+                ):
+                    trailing = target.new_full((indices.shape[0] - target.shape[0], target.shape[1]), -1)
+                    target = torch.cat((target, trailing), dim=0)
+                else:
+                    raise ValueError(
+                        f"Replay indices shape {tuple(target.shape)} does not match the current "
+                        f"selection shape {tuple(indices.shape)}; replay must run on the same tokens and topk."
+                    )
+            keep_live = (target == -1).any(dim=-1, keepdim=True)
+            return torch.where(keep_live, indices, target)
         return indices
 
     # -- per-instance state -------------------------------------------------
@@ -130,7 +161,7 @@ class RouterReplay:
     # -- global control over every registered instance ---------------------
 
     @staticmethod
-    def instances() -> List["RouterReplay"]:
+    def instances() -> list["RouterReplay"]:
         """Return the registered instances in construction (layer) order."""
         return RouterReplay._registry
 
@@ -141,7 +172,7 @@ class RouterReplay:
             inst.mode = mode
 
     @staticmethod
-    def set_replay_indices(all_layers_indices: List[torch.Tensor]) -> None:
+    def set_replay_indices(all_layers_indices: list[torch.Tensor]) -> None:
         """Distribute one selection tensor per layer to the registered instances.
 
         Args:
@@ -162,14 +193,14 @@ class RouterReplay:
             inst.set_target(indices)
 
     @staticmethod
-    def collect() -> List[torch.Tensor]:
+    def collect() -> list[torch.Tensor]:
         """Collect the recorded selection from every registered instance, in layer order.
 
         Raises:
             RuntimeError: If any instance has no recorded selection (i.e. a forward
                 pass was not run under :meth:`record`).
         """
-        collected: List[torch.Tensor] = []
+        collected: list[torch.Tensor] = []
         for layer_idx, inst in enumerate(RouterReplay._registry):
             if inst.recorded_indices is None:
                 raise RuntimeError(
@@ -204,7 +235,7 @@ class RouterReplay:
 
     @classmethod
     @contextmanager
-    def replay(cls, all_layers_indices: List[torch.Tensor]) -> Iterator[None]:
+    def replay(cls, all_layers_indices: list[torch.Tensor]) -> Iterator[None]:
         """Replay ``all_layers_indices`` (one tensor per layer) for the duration of the block.
 
         Target selections are cleared on exit so a stale replay never leaks into a
@@ -218,6 +249,283 @@ class RouterReplay:
             cls.set_mode(None)
             for inst in cls._registry:
                 inst.target_indices = None
+
+
+@dataclass(frozen=True)
+class _RouterReplayBinding:
+    """One decoder layer's model-scoped replay handle."""
+
+    layer_idx: int
+    replay: RouterReplay
+    topk: int
+    num_experts: int | None
+
+
+class RouterReplayAdapter:
+    """Bind rollout routes to one model's MoE gates for eager Engine execution.
+
+    The adapter is both the model-aware route formatter and the callable passed
+    as ``Engine(batch_context_fn=...)``. It deliberately ignores the legacy
+    process-global registry: decoder-layer ids determine the mapping, so sparse
+    hybrid MoE stacks and multiple models in one process remain unambiguous.
+    Do not nest the legacy process-global ``record``/``replay`` contexts around
+    an active adapter context when the same gate handles are registered.
+    AutoPipeline is not supported by this adapter; the Engine rejects that
+    combination before execution.
+
+    Args:
+        model: Complete PP=1 model. Its primary decoder blocks must expose
+            numeric child ids or a consistent integer ``layer_idx``. A block
+            may contain at most one module with a ``router_replay`` slot.
+    """
+
+    field_name = "routed_experts"
+
+    def __init__(self, model: nn.Module) -> None:
+        block_root = model
+        visited_roots: set[int] = set()
+        blocks: tuple[tuple[nn.Module, str, nn.Module], ...] = ()
+        while id(block_root) not in visited_roots:
+            visited_roots.add(id(block_root))
+            blocks = tuple(iter_transformer_blocks(block_root))
+            if blocks:
+                break
+            wrapped = getattr(block_root, "module", None)
+            if not isinstance(wrapped, nn.Module):
+                break
+            block_root = wrapped
+
+        bindings: list[_RouterReplayBinding] = []
+        seen_replays: set[int] = set()
+        for _parent, child_name, block in blocks:
+            slots = [module for module in block.modules() if hasattr(module, "router_replay")]
+            if not slots:
+                continue
+            if len(slots) != 1:
+                raise ValueError(
+                    f"decoder block {child_name!r} has {len(slots)} router_replay slots; "
+                    "RouterReplayAdapter requires one gate per routed layer"
+                )
+
+            declared_ids = {
+                layer_idx
+                for module in block.modules()
+                if isinstance((layer_idx := getattr(module, "layer_idx", None)), int)
+                and not isinstance(layer_idx, bool)
+            }
+            if len(declared_ids) > 1:
+                raise ValueError(
+                    f"decoder block {child_name!r} contains conflicting layer_idx values {sorted(declared_ids)}"
+                )
+            child_idx = int(child_name) if child_name.isdecimal() else None
+            declared_idx = next(iter(declared_ids), None)
+            if child_idx is not None and declared_idx is not None and child_idx != declared_idx:
+                raise ValueError(f"decoder block key {child_idx} disagrees with its layer_idx {declared_idx}")
+            layer_idx = declared_idx if declared_idx is not None else child_idx
+            if layer_idx is None:
+                raise ValueError(f"cannot resolve the global layer id for routed decoder block {child_name!r}")
+            if layer_idx < 0:
+                raise ValueError(f"routed decoder block {child_name!r} has negative layer_idx {layer_idx}")
+
+            gate = slots[0]
+            topk = getattr(gate, "topk", None)
+            if not isinstance(topk, int) or isinstance(topk, bool) or topk <= 0:
+                raise ValueError(f"decoder block {layer_idx} replay gate must expose a positive integer topk")
+            num_experts = getattr(gate, "n_experts", getattr(gate, "num_experts", None))
+            if num_experts is not None and (
+                not isinstance(num_experts, int) or isinstance(num_experts, bool) or num_experts <= 0
+            ):
+                raise ValueError(f"decoder block {layer_idx} replay gate has invalid expert count {num_experts!r}")
+            if getattr(gate, "use_routing_core", False):
+                raise RuntimeError(
+                    "RouterReplayAdapter is incompatible with partial MoE router CUDA graphs; "
+                    "disable the 'moe_router' graph module before enabling routing replay"
+                )
+            replay = gate.router_replay
+            if replay is None:
+                replay = RouterReplay(register=False)
+                gate.router_replay = replay
+            if not isinstance(replay, RouterReplay):
+                raise TypeError(
+                    f"decoder block {layer_idx} router_replay must be RouterReplay or None, got {type(replay).__name__}"
+                )
+            if id(replay) in seen_replays:
+                raise ValueError("one RouterReplay handle is attached to more than one decoder block")
+            seen_replays.add(id(replay))
+            bindings.append(_RouterReplayBinding(layer_idx, replay, topk, num_experts))
+
+        if not bindings:
+            raise ValueError("RouterReplayAdapter found no MoE gate with a router_replay slot in the primary decoder")
+        bindings.sort(key=lambda binding: binding.layer_idx)
+        layer_ids = [binding.layer_idx for binding in bindings]
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError(f"multiple replay gates map to the same global decoder layer: {layer_ids}")
+        topks = {binding.topk for binding in bindings}
+        if len(topks) != 1:
+            raise ValueError(f"all replay gates must use one topk, got {sorted(topks)}")
+        self._bindings = tuple(bindings)
+        self._layer_ids = tuple(layer_ids)
+        self._topk = next(iter(topks))
+        self._topology_tensors: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    @property
+    def layer_ids(self) -> tuple[int, ...]:
+        """Global decoder-layer ids, in the model's replay order."""
+        return self._layer_ids
+
+    def prepare_routed_experts(self, routed_experts: torch.Tensor) -> torch.Tensor:
+        """Convert rollout routes from sequence-last to Engine PER_TOKEN layout.
+
+        Args:
+            routed_experts: Signed integer expert ids with shape
+                ``[batch, global_layers, topk, sequence]``. ``-1`` means that
+                the training gate should keep the token's complete live top-k;
+                a missing route row must therefore contain only ``-1``. A
+                replay row contains unique expert ids.
+
+        Returns:
+            A contiguous tensor with shape
+            ``[batch, sequence, global_layers, topk]``. Declare it as a
+            ``PER_TOKEN`` Datum field with pad value ``-1``.
+        """
+        self._validate_integral_routes(routed_experts)
+        if routed_experts.ndim != 4:
+            raise ValueError("sequence-last routed_experts must have shape [batch, global_layers, topk, sequence]")
+        return routed_experts.permute(0, 3, 1, 2).contiguous()
+
+    def __call__(
+        self,
+        model_inputs: Mapping[str, Any],
+        loss_fn_inputs: Mapping[str, Any],
+    ) -> AbstractContextManager[None]:
+        """Create replay context from one CP/packing-prepared Engine batch.
+
+        Args:
+            model_inputs: CP-local model inputs. ``input_ids`` has token shape
+                ``[batch, local_sequence]`` or ``[local_tokens]``;
+                ``inputs_embeds`` adds one trailing hidden axis.
+            loss_fn_inputs: CP-local loss/side-channel mapping. Optional
+                ``routed_experts`` has shape ``[batch, local_sequence,
+                global_layers, topk]`` or ``[local_tokens, global_layers,
+                topk]`` and signed integer dtype. The token axes are validated
+                against prepared ``weights`` when present, because models that
+                shard after embedding may retain full-length ``input_ids``.
+
+        Returns:
+            A context that replays this model's layer targets through forward,
+            loss, backward, and activation-checkpoint recomputation. Missing
+            ``routed_experts`` selects live routing and returns a no-op context.
+        """
+        routed_experts = loss_fn_inputs.get(self.field_name)
+        if routed_experts is None:
+            return nullcontext()
+        if not isinstance(routed_experts, torch.Tensor):
+            raise TypeError("routed_experts must be a Tensor")
+        self._validate_integral_routes(routed_experts)
+        if routed_experts.ndim < 3:
+            raise ValueError("prepared routed_experts must have token axes followed by [global_layers, topk]")
+
+        weights = loss_fn_inputs.get("weights")
+        if isinstance(weights, torch.Tensor) and weights.ndim > 0:
+            token_shape = tuple(weights.shape)
+            if routed_experts.ndim < weights.ndim + 2 or tuple(routed_experts.shape[: weights.ndim]) != token_shape:
+                raise ValueError(
+                    f"routed_experts token axes {tuple(routed_experts.shape[:-2])} do not match "
+                    f"the prepared loss weights {token_shape}"
+                )
+            expected_tokens = weights.numel()
+        else:
+            primary = model_inputs.get("input_ids")
+            if isinstance(primary, torch.Tensor):
+                expected_tokens = primary.numel()
+            else:
+                primary = model_inputs.get("inputs_embeds")
+                if not isinstance(primary, torch.Tensor) or primary.ndim < 2:
+                    raise ValueError(
+                        "loss inputs must contain token-shaped weights, or model inputs must contain input_ids "
+                        "or inputs_embeds"
+                    )
+                expected_tokens = prod(primary.shape[:-1])
+        route_tokens = prod(routed_experts.shape[:-2])
+        if route_tokens != expected_tokens:
+            raise ValueError(
+                f"routed_experts describes {route_tokens} tokens but the prepared model batch has {expected_tokens}"
+            )
+
+        num_layers, route_topk = routed_experts.shape[-2:]
+        max_layer_idx = self._bindings[-1].layer_idx
+        if num_layers <= max_layer_idx:
+            raise ValueError(
+                f"routed_experts has {num_layers} global layers but this model requires layer {max_layer_idx}"
+            )
+        per_token = routed_experts.reshape(route_tokens, num_layers, route_topk)
+        if route_topk != self._topk:
+            raise ValueError(f"routed_experts topk {route_topk} does not match model topk {self._topk}")
+        topology = self._topology_tensors.get(per_token.device)
+        if topology is None:
+            layer_indices = torch.tensor(self.layer_ids, device=per_token.device, dtype=torch.long)
+            expert_limits = torch.tensor(
+                [
+                    binding.num_experts if binding.num_experts is not None else torch.iinfo(torch.long).max
+                    for binding in self._bindings
+                ],
+                device=per_token.device,
+                dtype=torch.long,
+            ).view(1, -1, 1)
+            topology = (layer_indices, expert_limits)
+            self._topology_tensors[per_token.device] = topology
+        layer_indices, expert_limits = topology
+        selected = per_token.index_select(1, layer_indices)
+        missing_rows = (selected == -1).all(dim=-1)
+        valid_rows = ((selected >= 0) & (selected < expert_limits)).all(dim=-1)
+        unique_rows = torch.ones_like(missing_rows)
+        for offset in range(1, route_topk):
+            unique_rows &= (selected[..., :-offset] != selected[..., offset:]).all(dim=-1)
+        torch._assert_async(
+            (missing_rows | (valid_rows & unique_rows)).all(),
+            "each routed_experts row must be all -1 or contain unique valid model expert ids",
+        )
+        targets = list(selected.unbind(dim=1))
+        return self._activate(targets)
+
+    @staticmethod
+    def _validate_integral_routes(routed_experts: torch.Tensor) -> None:
+        """Validate a route tensor without changing its token or layer layout.
+
+        Args:
+            routed_experts: Signed integer expert ids with arbitrary token axes
+                followed by ``[global_layers, topk]``.
+        """
+        if routed_experts.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64}:
+            raise TypeError(f"routed_experts must use a signed integer dtype, got {routed_experts.dtype}")
+
+    @contextmanager
+    def _activate(self, targets: list[torch.Tensor]) -> Iterator[None]:
+        """Temporarily install one ``[tokens, topk]`` target per binding.
+
+        Args:
+            targets: Model-scoped replay targets in ``self._bindings`` order.
+                Every tensor has shape ``[tokens, topk]``.
+
+        Yields:
+            ``None`` while replay is active. Previous handle state is restored
+            on normal exit or exception.
+        """
+        previous = [
+            (binding.replay.mode, binding.replay.target_indices, binding.replay._allow_trailing_live_tokens)
+            for binding in self._bindings
+        ]
+        try:
+            for binding, target in zip(self._bindings, targets):
+                binding.replay.target_indices = target
+                binding.replay._allow_trailing_live_tokens = True
+                binding.replay.mode = RouterReplayMode.REPLAY
+            yield
+        finally:
+            for binding, (mode, target, allow_trailing) in zip(self._bindings, previous):
+                binding.replay.mode = mode
+                binding.replay.target_indices = target
+                binding.replay._allow_trailing_live_tokens = allow_trailing
 
 
 def replay_selection(router_replay: RouterReplay | None, indices: torch.Tensor) -> torch.Tensor:

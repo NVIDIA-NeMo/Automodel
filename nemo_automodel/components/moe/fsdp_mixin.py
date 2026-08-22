@@ -303,11 +303,7 @@ def patched_backward_maybe_with_nosync(
     elif isinstance(self.submod, MoEFSDPSyncMixin):
         _disable_fsdp_for_moe_module(self.submod)
         result = perform_backward(backward_type)()
-        if hasattr(self, "_nemo_finalize_backward"):
-            finalize_backward = self._nemo_finalize_backward
-        else:
-            finalize_backward = get_is_optim_step()
-        if last_backward and finalize_backward:
+        if last_backward and get_is_optim_step():
             _run_post_backward_for_moe_module(self.submod)
     else:
         # Non-DP submodule, regular backward

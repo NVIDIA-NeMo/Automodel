@@ -219,6 +219,54 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
         gather_sharder.gather_token_tensor(full_rows, trim=True)
 
 
+def test_sharder_repositioned_layout_scatter_gather_preserves_trailing_token_features():
+    """Preserve routing features through DSV4-style repositioning.
+
+    The input uses the ``[batch, sequence, layers, topk]`` layout. Only the
+    first two axes participate in repositioning; both trailing axes are
+    preserved. Dropped input slots and introduced pad columns retain the fill
+    sentinel.
+    """
+    positions = torch.tensor(
+        [
+            [2, 0, -1],
+            [1, 3, -1],
+        ]
+    )
+    layout = cs.ShardLayout(padded_seq_len=4, input_token_stream_positions=positions)
+    routes = torch.arange(2 * 3 * 2 * 2, dtype=torch.int16).reshape(2, 3, 2, 2)
+    expected_padded = torch.full((2, 4, 2, 2), -1, dtype=torch.int16)
+    expected_padded[0, 2] = routes[0, 0]
+    expected_padded[0, 0] = routes[0, 1]
+    expected_padded[1, 1] = routes[1, 0]
+    expected_padded[1, 3] = routes[1, 1]
+
+    local_parts = []
+    for rank in range(2):
+        sharder = cs.ContextParallelSharder(
+            device_mesh=_FakeDeviceMesh(_FakeMesh(2, rank)),
+            shard_batch=cs.shard_batch_identity,
+            local_token_global_indices=cs.contiguous_local_indices,
+            shard_layout=layout,
+        )
+        local_parts.append(sharder.shard_token_tensor(routes, fill=-1))
+
+    assert all(part.shape == (2, 2, 2, 2) for part in local_parts)
+    torch.testing.assert_close(torch.cat(local_parts, dim=1), expected_padded)
+
+    gather_sharder = cs.ContextParallelSharder(
+        device_mesh=_FakeDeviceMesh(_FakeMesh(1)),
+        shard_batch=cs.shard_batch_identity,
+        local_token_global_indices=cs.contiguous_local_indices,
+        shard_layout=layout,
+    )
+    restored = gather_sharder.gather_token_tensor(expected_padded, trim=True, fill=-1)
+    expected_restored = routes.clone()
+    expected_restored[:, 2] = -1
+    assert restored.shape == routes.shape
+    torch.testing.assert_close(restored, expected_restored)
+
+
 def test_gather_trim_raises_without_captured_facts():
     sharder = cs.ContextParallelSharder(
         device_mesh=_FakeDeviceMesh(_FakeMesh(1)),
