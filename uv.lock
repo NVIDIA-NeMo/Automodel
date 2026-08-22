@@ -59,7 +59,7 @@ constraints = [
     { name = "cryptography", specifier = ">=48.0.1" },
     { name = "diffusers", specifier = ">=0.38.0" },
     { name = "fonttools", specifier = ">=4.60.2" },
-    { name = "gitpython", specifier = ">=3.1.50" },
+    { name = "gitpython", specifier = ">=3.1.59" },
     { name = "jaraco-context", specifier = ">=6.1.0" },
     { name = "mako", specifier = ">=1.3.11" },
     { name = "mlflow", specifier = ">=3.15.1" },
@@ -74,7 +74,7 @@ constraints = [
     { name = "pytest", specifier = ">=8.4.3" },
     { name = "ray", specifier = ">=2.56.0" },
     { name = "setuptools", specifier = ">=80.10.2" },
-    { name = "starlette", specifier = ">=0.49.1" },
+    { name = "starlette", specifier = ">=1.3.1" },
     { name = "thrift", specifier = ">=0.24.0" },
     { name = "tornado", specifier = ">=6.5.5" },
     { name = "urllib3", specifier = ">=2.7.0" },
@@ -82,6 +82,7 @@ constraints = [
 ]
 overrides = [
     { name = "nvidia-cublas", marker = "sys_platform == 'linux'", specifier = "==13.4.1.1" },
+    { name = "prometheus-fastapi-instrumentator", specifier = ">=8.1.0" },
     { name = "urllib3", specifier = ">=2.7.0" },
 ]
 
@@ -1794,17 +1795,18 @@ wheels = [
 
 [[package]]
 name = "fastapi"
-version = "0.121.0"
+version = "0.141.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
     { name = "pydantic" },
     { name = "starlette" },
     { name = "typing-extensions" },
+    { name = "typing-inspection" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8c/e3/77a2df0946703973b9905fd0cde6172c15e0781984320123b4f5079e7113/fastapi-0.121.0.tar.gz", hash = "sha256:06663356a0b1ee93e875bbf05a31fb22314f5bed455afaaad2b2dad7f26e98fa", size = 342412, upload-time = "2025-11-03T10:25:54.818Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8a/02/91e3416a8fdd715abb903a952a6bec7cdd8d14eed55d415fc8595524c319/fastapi-0.141.1.tar.gz", hash = "sha256:e8822fc40db1e1858054d7a949a888695bc9bdce70139178e33bd2871a453ca1", size = 425799, upload-time = "2026-07-29T17:18:05.568Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/dd/2c/42277afc1ba1a18f8358561eee40785d27becab8f80a1f945c0a3051c6eb/fastapi-0.121.0-py3-none-any.whl", hash = "sha256:8bdf1b15a55f4e4b0d6201033da9109ea15632cb76cf156e7b8b4019f2172106", size = 109183, upload-time = "2025-11-03T10:25:53.27Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/03/10388a42375ee7e4ac9b94eb2c5c569c8b5795e377e701c9ac3ad63de890/fastapi-0.141.1-py3-none-any.whl", hash = "sha256:bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3", size = 131954, upload-time = "2026-07-29T17:18:04.364Z" },
 ]
 
 [[package]]
@@ -2166,14 +2168,14 @@ wheels = [
 
 [[package]]
 name = "gitpython"
-version = "3.1.50"
+version = "3.1.59"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "gitdb" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/33/f6/354ae6491228b5eb40e10d89c4d13c651fe1cf7556e35ebdded50cff57ce/gitpython-3.1.50.tar.gz", hash = "sha256:80da2d12504d52e1f998772dc5baf6e553f8d2fcfe1fcc226c9d9a2ee3372dcc", size = 219798, upload-time = "2026-05-06T04:01:26.571Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ca/dc/126b28e76b24a9268ba931ad3e012f71ebdadf62fd9f17758f7074bb0b20/gitpython-3.1.59.tar.gz", hash = "sha256:0a1475cfdc38a5bfba1a3e9a4a9da52a39749ecec322b772915c019f94e5b7e4", size = 230445, upload-time = "2026-08-10T12:03:20.271Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/20/7a/1c6e3562dfd8950adbb11ffbc65d21e7c89d01a6e4f137fa981056de25c5/gitpython-3.1.50-py3-none-any.whl", hash = "sha256:d352abe2908d07355014abdd21ddf798c2a961469239afec4962e9da884858f9", size = 212507, upload-time = "2026-05-06T04:01:23.799Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/ed/ae57eb7d344f43f87b74b3a281ead6ec7d6394eef72a7b1dcb28dd089550/gitpython-3.1.59-py3-none-any.whl", hash = "sha256:67a82f537384578643624c8b2c531938a9b82be431663e575dcf638526631d4c", size = 220996, upload-time = "2026-08-10T12:03:18.804Z" },
 ]
 
 [[package]]
@@ -5578,15 +5580,15 @@ wheels = [
 
 [[package]]
 name = "prometheus-fastapi-instrumentator"
-version = "7.0.0"
+version = "8.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "prometheus-client" },
     { name = "starlette" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0e/42/eeb55ea9b0eae7d6854bef6aef3ecd34674f85813bc3877efdaeb582ab7e/prometheus_fastapi_instrumentator-7.0.0.tar.gz", hash = "sha256:5ba67c9212719f244ad7942d75ded80693b26331ee5dfc1e7571e4794a9ccbed", size = 20077, upload-time = "2024-03-13T16:25:08.564Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/95/f4/cdcebf7094b03b99fba71ac8f56bd6f227973642662f49d272332d8419b3/prometheus_fastapi_instrumentator-8.1.0.tar.gz", hash = "sha256:b77f3043665e8d28e2bbd21017506195a43d9adf1d402d01bf95b494b7e560e1", size = 20492, upload-time = "2026-07-26T11:12:44.202Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/59/66/2e93a8f56adb51ede41d0ef5f4f0277522acc4adc87937f5457b7b5692a8/prometheus_fastapi_instrumentator-7.0.0-py3-none-any.whl", hash = "sha256:96030c43c776ee938a3dae58485ec24caed7e05bfc60fe067161e0d5b5757052", size = 19005, upload-time = "2024-03-13T16:25:03.687Z" },
+    { url = "https://files.pythonhosted.org/packages/44/b9/91a2246e6cf01b7ccb14479803c8a50f9c258ae5c6a0f16ba3294820632b/prometheus_fastapi_instrumentator-8.1.0-py3-none-any.whl", hash = "sha256:b9f40b2cff3f7891ca0610b3ae4fc6ec723fd326b04bb659819aaeb821a0fc7d", size = 19649, upload-time = "2026-07-26T11:12:45.168Z" },
 ]
 
 [[package]]
@@ -7750,15 +7752,15 @@ wheels = [
 
 [[package]]
 name = "starlette"
-version = "0.49.3"
+version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/de/1a/608df0b10b53b0beb96a37854ee05864d182ddd4b1156a22f1ad3860425a/starlette-0.49.3.tar.gz", hash = "sha256:1c14546f299b5901a1ea0e34410575bc33bbd741377a10484a54445588d00284", size = 2655031, upload-time = "2025-11-01T15:12:26.13Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b5/b4/205b0d5241d934e8add0c38aa924c4f9fb7330834ff11e5444db964ec3f9/starlette-1.6.0.tar.gz", hash = "sha256:d4e3ac5e546444960c710297a3c9fc3f7ebae1b7e963f3d36173b49da535be9b", size = 2716969, upload-time = "2026-08-08T18:27:57.512Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/e0/021c772d6a662f43b63044ab481dc6ac7592447605b5b35a957785363122/starlette-0.49.3-py3-none-any.whl", hash = "sha256:b579b99715fdc2980cf88c8ec96d3bf1ce16f5a8051a7c2b84ef9b1cdecaea2f", size = 74340, upload-time = "2025-11-01T15:12:24.387Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/cb/6a6a47d5b464bd08695d254f3da6e7986cc70c9fa5d778eda57538edfe56/starlette-1.6.0-py3-none-any.whl", hash = "sha256:a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c", size = 75969, upload-time = "2026-08-08T18:27:56.196Z" },
 ]
 
 [[package]]

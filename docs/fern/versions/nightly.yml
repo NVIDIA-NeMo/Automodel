@@ -76,6 +76,8 @@ navigation:
             path: ../../model-coverage/llm/qwen/qwen3.mdx
           - page: "Qwen3 MoE"
             path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
+          - page: "Qwen3.8-Max"
+            path: ../../model-coverage/llm/qwen/qwen3-8-max.mdx
           - page: "Qwen3-Next"
             path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - page: "ERNIE 4.5"
@@ -214,6 +216,9 @@ navigation:
             path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - page: "Kimi-K3"
             path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
+          - page: "North Micro Vision"
+            path: ../../model-coverage/vlm/coherelabs/north-micro-vision.mdx
+            slug: north-micro-vision
           - page: "Inkling"
             path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
           - page: "Gemma 3 / Gemma 3n"
