@@ -141,12 +141,25 @@ def test_saved_draft_config_declares_it_is_not_causal():
     ``sliding_attention``, so omitting the key serves the draft causally after it
     was trained non-causally.
     """
-    import inspect
+    from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 
-    from nemo_automodel.recipes.llm import train_dflash
-
-    source = inspect.getsource(train_dflash.TrainDFlashRecipe.setup)
-    assert 'draft_config["is_causal"] = False' in source
+    # Drive the recipe's own derivation rather than grepping its source, so the
+    # assertion survives the code moving between methods.
+    recipe = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    recipe.block_size = 8
+    recipe.mask_token_id = 248070
+    recipe.draft_sliding_window = 2048
+    built = recipe._build_qwen3_draft_config(
+        {},
+        target_text_config=Qwen3Config(vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=64),
+        draft_cls=Qwen3DFlash2DraftModel,
+        draft_num_hidden_layers=5,
+        num_target_layers=64,
+        target_layer_ids=[5, 19, 33, 47, 61],
+        attention_backend="sdpa",
+    ).to_dict()
+    assert built["is_causal"] is False
+    assert built["layer_types"] == ["sliding_attention"] * 5
 
     def reference_is_causal(config: dict, layer_idx: int) -> bool:
         """Verbatim rule from z-lab/dflash's Qwen3DFlashAttention.__init__."""
