@@ -317,7 +317,7 @@ def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
 
 
 def test_glm_4_7_flash_uses_hf_aligned_router_precision(tmp_path):
-    """GLM 4.7 Flash keeps router projection and selected weights in float32."""
+    """GLM 4.7 Flash keeps aligned router precision and calibrated HF parity profiles."""
     recipe_path = REPO_ROOT / "examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml"
     out = tmp_path / "resolved.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
@@ -325,6 +325,10 @@ def test_glm_4_7_flash_uses_hf_aligned_router_precision(tmp_path):
 
     resolved = yaml.load(out.open())
     assert resolved["model"]["backend"]["gate_precision"] == "float32"
+    assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile_overrides"] == {
+        "source_load": "relaxed",
+        "hf_reload": "relaxed",
+    }
 
 
 @pytest.mark.parametrize(
