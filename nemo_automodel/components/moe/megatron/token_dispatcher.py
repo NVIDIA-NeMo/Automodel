@@ -654,6 +654,11 @@ class MoEFlexTokenDispatcher:
                 f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
             )
 
+    @property
+    def requires_uniform_token_count(self) -> bool:
+        """Return whether every rank in this dispatcher's EP group needs the same token extent."""
+        return self.config.moe_flex_dispatcher_backend == "hybridep"
+
     def _initialize_metadata(self, num_local_tokens: int, probs: torch.Tensor) -> torch.Tensor:
         """
         Initialize the routing map and probs to a unified format covering the TPxEP group.

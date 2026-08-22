@@ -653,6 +653,9 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    # The model-owned CP sharder repads after DSV4 compression and performs
+    # HybridEP token-width synchronization at that final physical layout.
+    owns_hybridep_packed_cp_equalization = True
     # Keep HC mixers and the MoE gate's correction bias in fp32 regardless of
     # the outer cast policy.  Matches HF PR 45616's
     # ``DeepseekV4PreTrainedModel._keep_in_fp32_modules_strict`` (lines 890-900

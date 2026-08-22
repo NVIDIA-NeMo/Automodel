@@ -112,6 +112,49 @@ def _as_tuple(value: _T | Sequence[_T] | None) -> tuple[_T, ...]:
     return (value,)
 
 
+def _uses_uniform_packed_token_dispatch(model_parts: Sequence[nn.Module]) -> bool:
+    """Return whether a model part owns a live dispatcher that requires uniform token extents."""
+    for part in model_parts:
+        modules = getattr(part, "modules", None)
+        if not callable(modules):
+            continue
+        for module in modules():
+            dispatcher = getattr(module, "token_dispatcher", None)
+            if getattr(dispatcher, "requires_uniform_token_count", False) is True:
+                return True
+    return False
+
+
+def _owns_hybridep_packed_cp_equalization(model_parts: Sequence[nn.Module]) -> bool:
+    """Return whether a model explicitly owns packed HybridEP equalization after CP preparation."""
+    return any(
+        bool(getattr(module, "owns_hybridep_packed_cp_equalization", False))
+        for part in model_parts
+        for module in (part.modules() if callable(getattr(part, "modules", None)) else ())
+    )
+
+
+def _resolve_hybridep_ep_group(
+    uses_hybridep: bool,
+    mesh_context: MeshContext | None,
+) -> tuple[dist.ProcessGroup | None, int]:
+    """Resolve the canonical EP group for a live HybridEP token dispatcher."""
+
+    if not uses_hybridep:
+        return None, 1
+    moe_mesh = mesh_context.moe_mesh if mesh_context is not None else None
+    mesh_names = getattr(moe_mesh, "mesh_dim_names", ()) or ()
+    if moe_mesh is None or "ep" not in mesh_names:
+        raise ValueError("a live HybridEP dispatcher requires mesh_context.moe_mesh with an 'ep' axis")
+    ep_mesh = moe_mesh["ep"]
+    ep_size = int(ep_mesh.size())
+    if ep_size <= 1:
+        raise ValueError("a live HybridEP dispatcher requires ep_size > 1")
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("a live HybridEP dispatcher requires initialized torch.distributed process groups")
+    return ep_mesh.get_group(), ep_size
+
+
 def _resolve_summed_gradient_reduction(model_parts: Sequence[nn.Module]) -> bool:
     """Resolve whether every local model part uses summed gradient collectives.
 
@@ -252,6 +295,7 @@ class _OutputRestorePlan:
     real_lengths: tuple[int, ...] | None
     padded_lengths: tuple[int, ...] | None
     token_mask: torch.Tensor | None
+    synthetic_suffix_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -427,6 +471,25 @@ class Engine:
         )
         self.device = torch.device(device)
         self.mesh_context = mesh_context
+        uses_hybridep = _uses_uniform_packed_token_dispatch(self.model_parts)
+        pipeline_uses_hybridep = uses_hybridep
+        if (
+            self.pipeline is not None
+            and mesh_context is not None
+            and mesh_context.pp_size > 1
+            and getattr(mesh_context, "ep_size", 1) > 1
+        ):
+            if not dist.is_available() or not dist.is_initialized():
+                raise RuntimeError("pipeline HybridEP capability validation requires initialized process groups")
+            any_hybridep = torch.tensor(int(uses_hybridep), dtype=torch.int64, device=self.device)
+            dist.all_reduce(any_hybridep, op=dist.ReduceOp.MAX, group=self.pipeline.pp_mesh.get_group())
+            pipeline_uses_hybridep = int(any_hybridep.item()) != 0
+        self._pipeline_uses_hybridep = pipeline_uses_hybridep
+        self._hybridep_ep_group, self._hybridep_ep_size = _resolve_hybridep_ep_group(
+            uses_hybridep,
+            mesh_context,
+        )
+        self._model_owns_hybridep_packed_cp_equalization = _owns_hybridep_packed_cp_equalization(self.model_parts)
         self.microbatch_size = microbatch_size
         self.collate_fn = collate_fn
         self.padding_token_id = padding_token_id
@@ -926,6 +989,67 @@ class Engine:
             list(datums[start : start + self.microbatch_size]) for start in range(0, len(datums), self.microbatch_size)
         ]
 
+    def _hybridep_packed_token_target(self, model_inputs: Mapping[str, Any]) -> int | None:
+        """Return the EP-wide raw-THD token width required by HybridEP.
+
+        Every rank enters one fixed-size metadata collective before local THD
+        validation. This makes a packed/non-packed or raw/final-THD mismatch a
+        group-wide error instead of letting one rank enter HybridEP with a
+        different routing-map shape. This path deliberately owns only the
+        CP=1 layout used by MOLT and the canonical Datum collaters; DSV4 keeps
+        its existing model-owned CP>1 equalization path.
+        """
+        if self.pipeline is not None and self._pipeline_uses_hybridep:
+            if model_inputs.get("qkv_format") == "thd":
+                raise NotImplementedError("HybridEP packed token equalization currently supports eager PP size 1 only")
+            return None
+        if self._hybridep_ep_group is None:
+            return None
+
+        packed = model_inputs.get("qkv_format") == "thd"
+        primary_names = [name for name in ("input_ids", "inputs_embeds") if name in model_inputs]
+        primary = model_inputs.get(primary_names[0]) if len(primary_names) == 1 else None
+        primary_valid = isinstance(primary, torch.Tensor) and (
+            (primary_names == ["input_ids"] and primary.ndim == 2)
+            or (primary_names == ["inputs_embeds"] and primary.ndim == 3)
+        )
+        batch_size = int(primary.shape[0]) if primary_valid else 0
+        token_width = int(primary.shape[1]) if primary_valid else 0
+        raw_thd = packed and all(
+            isinstance(model_inputs.get(name), torch.Tensor) for name in ("seq_lens", "seq_lens_padded")
+        )
+        local = torch.tensor(
+            (int(packed), int(raw_thd), int(primary_valid), batch_size, token_width),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        gathered = [torch.empty_like(local) for _ in range(self._hybridep_ep_size)]
+        dist.all_gather(gathered, local, group=self._hybridep_ep_group)
+        metadata = torch.stack(gathered).cpu().tolist()
+
+        packed_flags = {row[0] for row in metadata}
+        if len(packed_flags) != 1:
+            raise ValueError("HybridEP ranks must all use packed THD inputs or all use non-packed inputs")
+        if packed_flags == {0}:
+            return None
+        if self._cp_size() > 1:
+            if self._model_owns_hybridep_packed_cp_equalization:
+                return None
+            raise NotImplementedError(
+                "generic HybridEP packed token equalization currently supports CP size 1 only; "
+                "DSV4 retains its model-owned CP equalization path"
+            )
+        if any(row[1] != 1 for row in metadata):
+            raise NotImplementedError(
+                "HybridEP packed token equalization currently requires raw THD seq_lens/seq_lens_padded inputs"
+            )
+        if any(row[2] != 1 or row[3] != 1 or row[4] <= 0 for row in metadata):
+            raise ValueError(
+                "HybridEP packed token equalization requires one non-empty raw THD token row per EP rank; "
+                f"got metadata {metadata}"
+            )
+        return max(row[4] for row in metadata)
+
     @staticmethod
     def _resolve_loss_batch_layout(
         datums: list[Datum],
@@ -1071,6 +1195,13 @@ class Engine:
             model-owned local sequence layout.
         """
         model_inputs, collated_loss_inputs = self.collate_fn(datums)
+        hybridep_target_tokens = self._hybridep_packed_token_target(model_inputs)
+        hybridep_suffix_tokens = 0
+        if hybridep_target_tokens is not None:
+            token_template = _model_token_template(model_inputs)
+            if token_template.ndim != 2:
+                raise ValueError("HybridEP raw THD equalization requires a two-dimensional token template")
+            hybridep_suffix_tokens = hybridep_target_tokens - int(token_template.shape[1])
         loss_batch_layout = self._resolve_loss_batch_layout(datums, model_inputs, collated_loss_inputs)
         loss_inputs = dict(collated_loss_inputs)
         weight_layout = loss_batch_layout.fields.get("weights")
@@ -1087,6 +1218,18 @@ class Engine:
             loss_inputs,
             loss_batch_layout.fields,
         )
+        if hybridep_target_tokens is not None:
+            if loss_seq_dim is None:
+                raise ValueError("HybridEP packed token equalization requires token-aligned loss inputs")
+            _pad_hybridep_packed_thd(
+                model_inputs,
+                loss_inputs,
+                loss_batch_layout.fields,
+                loss_batch_layout.pad_values,
+                loss_seq_dim=loss_seq_dim,
+                target_tokens=hybridep_target_tokens,
+                padding_token_id=self.padding_token_id,
+            )
         output_routing = (
             _output_sequence_lengths(
                 datums,
@@ -1236,6 +1379,7 @@ class Engine:
                 real_lengths=real_lengths,
                 padded_lengths=padded_lengths,
                 token_mask=token_mask,
+                synthetic_suffix_tokens=hybridep_suffix_tokens,
             ),
         )
 
@@ -2108,6 +2252,155 @@ def _to_device(value: Any, device: torch.device) -> Any:
     return value
 
 
+def _pad_tensor_axis(tensor: torch.Tensor, *, dim: int, amount: int, value: int | float | bool) -> torch.Tensor:
+    """Right-pad one tensor axis without disturbing trailing feature axes."""
+    if amount <= 0:
+        return tensor
+    shape = list(tensor.shape)
+    shape[dim] = amount
+    suffix = torch.full(shape, value, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat((tensor, suffix), dim=dim)
+
+
+def _pad_hybridep_packed_thd(
+    model_inputs: dict[str, Any],
+    loss_inputs: LossInputs,
+    layouts: Mapping[str, LossInputLayout],
+    pad_values: Mapping[str, int | float | bool],
+    *,
+    loss_seq_dim: int,
+    target_tokens: int,
+    padding_token_id: int,
+) -> None:
+    """Pad one raw THD row to the HybridEP group token width in place.
+
+    Args:
+        model_inputs: Raw packed mapping whose primary token stream is
+            ``input_ids [1, T]`` or ``inputs_embeds [1, T, H]``. Standard and
+            multi-axis position ids use ``[1, T]`` and ``[A, 1, T]``.
+        loss_inputs: Collated loss mapping. Every ``PER_TOKEN`` tensor has
+            token axes ``[1, T, ...]``.
+        layouts: Semantic layout for every loss field.
+        pad_values: Explicit per-token fill values such as ``-1`` for routing
+            replay. Undeclared fields use zero, except labels use ``-100``.
+        loss_seq_dim: Sequence axis shared by all per-token loss tensors.
+        target_tokens: EP-wide physical token width after equalization.
+        padding_token_id: Fill value for synthetic ``input_ids`` tokens.
+
+    Returns:
+        None. The mappings are updated in place; real sequence lengths stay
+        unchanged and only the final padded document extent grows.
+    """
+    token_template = _model_token_template(model_inputs)
+    if token_template.ndim != 2 or token_template.shape[0] != 1:
+        raise ValueError("HybridEP packed token equalization requires a raw THD primary tensor with token shape [1, T]")
+    local_tokens = int(token_template.shape[1])
+    if target_tokens < local_tokens:
+        raise ValueError(f"HybridEP target width {target_tokens} is smaller than local width {local_tokens}")
+    amount = target_tokens - local_tokens
+
+    seq_lens = model_inputs.get("seq_lens")
+    seq_lens_padded = model_inputs.get("seq_lens_padded")
+    if not isinstance(seq_lens, torch.Tensor) or not isinstance(seq_lens_padded, torch.Tensor):
+        raise ValueError("raw THD equalization requires Tensor seq_lens and seq_lens_padded")
+    if seq_lens.shape != seq_lens_padded.shape or seq_lens.ndim != 2 or seq_lens.shape[0] != 1:
+        raise ValueError(
+            "raw THD seq_lens and seq_lens_padded must have matching shape [1, documents]; "
+            f"got {tuple(seq_lens.shape)} and {tuple(seq_lens_padded.shape)}"
+        )
+    valid = seq_lens_padded[0] != -1000
+    valid_indices = valid.nonzero(as_tuple=False).flatten()
+    if valid_indices.numel() == 0:
+        raise ValueError("raw THD metadata must describe at least one packed document")
+    real_values = seq_lens[0, valid].to(torch.long)
+    original_padded_values = seq_lens_padded[0, valid].to(torch.long)
+    if bool((real_values < 0).any()) or bool((real_values > original_padded_values).any()):
+        raise ValueError("raw THD metadata requires 0 <= seq_lens <= seq_lens_padded")
+    if int(original_padded_values.sum()) != local_tokens:
+        raise ValueError(
+            "raw THD seq_lens_padded must cover the original physical token row; "
+            f"got {int(original_padded_values.sum())} and {local_tokens}"
+        )
+
+    model_token_fields = {
+        "input_ids": padding_token_id,
+        "inputs_embeds": 0,
+        "attention_mask": 0,
+        "mm_token_type_ids": 0,
+        "token_type_ids": 0,
+        "_packed_seq_ids": 0,
+        "packed_seq_ids": 0,
+    }
+    model_replacements: dict[str, torch.Tensor] = {}
+    for name, fill in model_token_fields.items():
+        tensor = model_inputs.get(name)
+        if tensor is None:
+            continue
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim < 2 or tensor.shape[1] != local_tokens:
+            shape = tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else type(tensor).__name__
+            raise ValueError(f"packed model field {name!r} must use token axis [1, {local_tokens}, ...], got {shape}")
+        model_replacements[name] = _pad_tensor_axis(tensor, dim=1, amount=amount, value=fill)
+
+    position_ids = model_inputs.get("position_ids")
+    if position_ids is not None:
+        if not isinstance(position_ids, torch.Tensor):
+            raise TypeError("packed position_ids must be a Tensor")
+        position_seq_dim = 2 if position_ids.ndim == 3 else 1
+        expected_batch = position_ids.shape[1] if position_ids.ndim == 3 else position_ids.shape[0]
+        if (
+            position_ids.ndim not in {2, 3}
+            or expected_batch != 1
+            or position_ids.shape[position_seq_dim] != local_tokens
+        ):
+            raise ValueError(
+                "packed position_ids must have shape [1, T] or [axes, 1, T]; "
+                f"got {tuple(position_ids.shape)} for T={local_tokens}"
+            )
+        if amount:
+            increment_shape = [1] * position_ids.ndim
+            increment_shape[position_seq_dim] = amount
+            increments = torch.arange(
+                1,
+                amount + 1,
+                dtype=position_ids.dtype,
+                device=position_ids.device,
+            ).reshape(increment_shape)
+            suffix = position_ids.narrow(position_seq_dim, local_tokens - 1, 1) + increments
+            model_replacements["position_ids"] = torch.cat((position_ids, suffix), dim=position_seq_dim)
+        else:
+            model_replacements["position_ids"] = position_ids
+
+    loss_replacements: dict[str, torch.Tensor] = {}
+    for name, layout in layouts.items():
+        if layout is not LossInputLayout.PER_TOKEN:
+            continue
+        tensor = loss_inputs[name]
+        if not isinstance(tensor, torch.Tensor) or tensor.shape[loss_seq_dim] != local_tokens:
+            shape = tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else type(tensor).__name__
+            raise ValueError(f"packed per-token loss field {name!r} has incompatible shape {shape}")
+        fill = pad_values.get(name, -100 if name == "labels" else 0)
+        loss_replacements[name] = _pad_tensor_axis(tensor, dim=loss_seq_dim, amount=amount, value=fill)
+
+    padded = seq_lens_padded.clone()
+    padded[0, int(valid_indices[-1])] += amount
+    padded_values = padded[0, valid].to(torch.long)
+    if int(padded_values.sum()) != target_tokens:
+        raise ValueError(
+            "raw THD seq_lens_padded must cover the physical token row after HybridEP equalization; "
+            f"got {int(padded_values.sum())} and {target_tokens}"
+        )
+    padding_mask = torch.ones((1, target_tokens), dtype=torch.bool, device=token_template.device)
+    offset = 0
+    for real, padded_length in zip(real_values.tolist(), padded_values.tolist()):
+        padding_mask[0, offset : offset + real] = False
+        offset += padded_length
+
+    model_inputs.update(model_replacements)
+    loss_inputs.update(loss_replacements)
+    model_inputs["seq_lens_padded"] = padded
+    model_inputs["padding_mask"] = padding_mask
+
+
 def _model_token_template(model_inputs: Mapping[str, Any]) -> torch.Tensor:
     """Return a tensor with exactly the primary model input's token axes."""
     primary_name = _primary_name(model_inputs)
@@ -2509,6 +2802,14 @@ def _split_restored_token_output(
     if plan.item_to_datum is None:
         if datum_indices != (0,):
             raise NotImplementedError("prebatched token outputs can only produce their single outer Datum record")
+        if plan.synthetic_suffix_tokens:
+            restored_width = int(tensor.shape[seq_dim])
+            if plan.synthetic_suffix_tokens >= restored_width:
+                raise ValueError(
+                    "HybridEP synthetic output suffix must be shorter than the restored token stream; "
+                    f"got suffix={plan.synthetic_suffix_tokens}, width={restored_width}"
+                )
+            tensor = tensor.narrow(seq_dim, 0, restored_width - plan.synthetic_suffix_tokens).contiguous()
         return [tensor]
     if plan.real_lengths is None or plan.padded_lengths is None:
         raise RuntimeError("token output routing metadata is incomplete")
@@ -2768,6 +3069,7 @@ def _loss_fn_output_restore_contract(
             plan.real_lengths,
             plan.padded_lengths,
             _token_mask_schema(plan.token_mask),
+            plan.synthetic_suffix_tokens,
             seq_dim,
             tuple(weights.shape),
             layout_schema,

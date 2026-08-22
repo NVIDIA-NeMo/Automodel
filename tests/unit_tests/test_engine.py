@@ -42,7 +42,7 @@ from nemo_automodel.components.datasets.datum import (
     collate_vlm_datums,
 )
 from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, stage_vlm_media_for_pp
-from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
@@ -81,6 +81,14 @@ class _MainAndAuxScaleModel(nn.Module):
         self.forward_calls += 1
         output = input_ids.to(torch.float32) * self.main_weight
         return MoEAuxLossAutoScaler.apply(output, self.aux_weight)
+
+
+class _UniformTokenDispatcherProbe(nn.Module):
+    """Expose the live-dispatcher capability Engine resolves after EP setup."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.token_dispatcher = SimpleNamespace(requires_uniform_token_count=True)
 
 
 class _SubMesh:
@@ -750,6 +758,98 @@ def test_forward_backward_groups_flat_datums_by_microbatch_size():
     assert group_sizes == [2, 2, 1]
     assert model.forward_calls == 3
     assert result.loss.item() == pytest.approx(3.0)
+
+
+def test_hybridep_padding_extends_only_the_physical_thd_extent():
+    """Synthetic EP padding preserves documents and every side-channel sentinel."""
+    model_inputs = {
+        "input_ids": torch.tensor([[7, 99, 8]]),
+        "attention_mask": torch.tensor([[1, 0, 1]]),
+        "position_ids": torch.tensor([[[0, 0, 1]], [[10, 0, 11]], [[20, 0, 21]]]),
+        "mm_token_type_ids": torch.tensor([[1, 0, 0]]),
+        "seq_lens": torch.tensor([[1, 1, -1000]], dtype=torch.int32),
+        "seq_lens_padded": torch.tensor([[2, 1, -1000]], dtype=torch.int32),
+        "qkv_format": "thd",
+    }
+    loss_inputs = {
+        "weights": torch.tensor([[1.0, 0.0, 1.0]]),
+        "labels": torch.tensor([[8, -100, 9]]),
+        "routed_experts": torch.tensor([[[[2]], [[-1]], [[3]]]], dtype=torch.int16),
+        "sequence_ids": torch.tensor([[0, -1, 1]]),
+        "global_scale": torch.tensor(0.25),
+    }
+    layouts = {
+        "weights": LossInputLayout.PER_TOKEN,
+        "labels": LossInputLayout.PER_TOKEN,
+        "routed_experts": LossInputLayout.PER_TOKEN,
+        "sequence_ids": LossInputLayout.PER_TOKEN,
+        "global_scale": LossInputLayout.REPLICATED,
+    }
+
+    engine_module._pad_hybridep_packed_thd(
+        model_inputs,
+        loss_inputs,
+        layouts,
+        {"routed_experts": -1, "sequence_ids": -1},
+        loss_seq_dim=1,
+        target_tokens=5,
+        padding_token_id=99,
+    )
+
+    torch.testing.assert_close(model_inputs["input_ids"], torch.tensor([[7, 99, 8, 99, 99]]))
+    torch.testing.assert_close(model_inputs["attention_mask"], torch.tensor([[1, 0, 1, 0, 0]]))
+    torch.testing.assert_close(model_inputs["mm_token_type_ids"], torch.tensor([[1, 0, 0, 0, 0]]))
+    torch.testing.assert_close(
+        model_inputs["position_ids"],
+        torch.tensor([[[0, 0, 1, 2, 3]], [[10, 0, 11, 12, 13]], [[20, 0, 21, 22, 23]]]),
+    )
+    torch.testing.assert_close(model_inputs["seq_lens"], torch.tensor([[1, 1, -1000]], dtype=torch.int32))
+    torch.testing.assert_close(model_inputs["seq_lens_padded"], torch.tensor([[2, 3, -1000]], dtype=torch.int32))
+    torch.testing.assert_close(model_inputs["padding_mask"], torch.tensor([[False, True, False, True, True]]))
+    torch.testing.assert_close(loss_inputs["weights"], torch.tensor([[1.0, 0.0, 1.0, 0.0, 0.0]]))
+    torch.testing.assert_close(loss_inputs["labels"], torch.tensor([[8, -100, 9, -100, -100]]))
+    torch.testing.assert_close(
+        loss_inputs["routed_experts"],
+        torch.tensor([[[[2]], [[-1]], [[3]], [[-1]], [[-1]]]], dtype=torch.int16),
+    )
+    torch.testing.assert_close(loss_inputs["sequence_ids"], torch.tensor([[0, -1, 1, -1, -1]]))
+    torch.testing.assert_close(loss_inputs["global_scale"], torch.tensor(0.25))
+
+    real, padded, token_mask = engine_module._output_sequence_lengths(
+        [_datum([7]), _datum([8])],
+        model_inputs,
+        loss_inputs,
+        (0, 1),
+        is_thd=True,
+    )
+    assert real == (1, 1)
+    assert padded == (2, 3)
+    assert token_mask is None
+
+
+def test_hybridep_resolver_uses_the_moe_mesh_ep_group(monkeypatch):
+    """The equalization collective is scoped to the canonical MoE EP axis."""
+    expected_group = object()
+    calls = 0
+
+    class _EPGroupMesh:
+        def size(self):
+            return 2
+
+        def get_group(self):
+            nonlocal calls
+            calls += 1
+            return expected_group
+
+    mesh_context = SimpleNamespace(moe_mesh=_NamedMesh(("ep",), ep=_EPGroupMesh()))
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    group, size = engine_module._resolve_hybridep_ep_group(True, mesh_context)
+
+    assert group is expected_group
+    assert size == 2
+    assert calls == 1
 
 
 def test_raw_thd_packed_collater_is_prepared_by_context_parallel_sharder():
@@ -3221,6 +3321,120 @@ def _distributed_worker(rank: int, world_size: int, init_file: str) -> None:
         dist.destroy_process_group()
 
 
+def _hybridep_packed_equalization_worker(rank: int, world_size: int, init_file: str) -> None:
+    """Compare unequal packed EP ranks after one physical-width equalization.
+
+    Args:
+        rank: Current Gloo process rank.
+        world_size: Number of ranks in the shared DP/EP topology.
+        init_file: Shared file-store path used to initialize the process group.
+    """
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        mesh_context = MeshContext.build(
+            FSDP2Config(),
+            ParallelismSizes(ep_size=world_size),
+            world_size=world_size,
+        )
+        model = ScaleModel()
+        model.backend = SimpleNamespace(attn="te")
+        model.hybridep_probe = _UniformTokenDispatcherProbe()
+        model = nn.parallel.DistributedDataParallel(model)
+        model.backend = SimpleNamespace(attn="te")
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        token_ids = torch.tensor([1, 2] if rank == 0 else [3, 4, 5, 6])
+        routes = torch.arange(token_ids.numel(), dtype=torch.int16).view(1, -1, 1, 1)
+        datum = Datum(
+            model_inputs={
+                "input_ids": token_ids.unsqueeze(0),
+                "attention_mask": torch.ones(1, token_ids.numel(), dtype=torch.long),
+                "position_ids": torch.arange(token_ids.numel()).unsqueeze(0),
+                "seq_lens": torch.tensor([[token_ids.numel()]], dtype=torch.int32),
+                "seq_lens_padded": torch.tensor([[token_ids.numel()]], dtype=torch.int32),
+                "qkv_format": "thd",
+            },
+            loss_fn_inputs={
+                "weights": torch.ones(1, token_ids.numel()),
+                "labels": token_ids.unsqueeze(0).clone(),
+                "routed_experts": routes,
+            },
+            loss_fn_input_layouts={
+                "weights": LossInputLayout.PER_TOKEN,
+                "labels": LossInputLayout.PER_TOKEN,
+                "routed_experts": LossInputLayout.PER_TOKEN,
+            },
+            loss_fn_input_pad_values={"labels": -100, "routed_experts": -1},
+        )
+
+        @contextmanager
+        def batch_context(model_inputs, loss_inputs):
+            """Assert final THD tensors use the EP-wide four-token extent.
+
+            Args:
+                model_inputs: Final THD model tensors with token shape ``[4]``.
+                loss_inputs: Final THD loss tensors with token-leading shape
+                    ``[4, ...]``.
+
+            Yields:
+                None while forward, loss, and backward consume the batch.
+            """
+            assert model_inputs["input_ids"].shape == (4,)
+            assert model_inputs["padding_mask"].shape == (4,)
+            assert loss_inputs["routed_experts"].shape == (4, 1, 1)
+            if rank == 0:
+                torch.testing.assert_close(model_inputs["input_ids"], torch.tensor([1, 2, 0, 0]))
+                torch.testing.assert_close(model_inputs["padding_mask"], torch.tensor([False, False, True, True]))
+                torch.testing.assert_close(loss_inputs["weights"], torch.tensor([1.0, 1.0, 0.0, 0.0]))
+                torch.testing.assert_close(
+                    loss_inputs["routed_experts"],
+                    torch.tensor([[[0]], [[1]], [[-1]], [[-1]]], dtype=torch.int16),
+                )
+            else:
+                assert not bool(model_inputs["padding_mask"].any())
+                torch.testing.assert_close(loss_inputs["weights"], torch.ones(4))
+            yield
+
+        def loss_with_tokens(output, _loss_inputs):
+            """Return the scaled tokens as both loss and a restorable stream.
+
+            Args:
+                output: Final THD model output with shape ``[4]``.
+                _loss_inputs: Final THD loss mapping on the same token axis.
+
+            Returns:
+                Per-token losses and a typed token output batch.
+            """
+            return output, LossFnOutputBatch(per_token={"tokens": PerTokenOutput(output)})
+
+        engine = Engine(
+            model,
+            device="cpu",
+            mesh_context=mesh_context,
+            collate_fn=collate_prebatched,
+            optimizers=optimizer,
+            max_grad_norm=None,
+            batch_context_fn=batch_context,
+        )
+        result = engine.forward_backward([datum], loss_with_tokens)
+
+        assert result.loss.item() == pytest.approx(3.5)
+        assert result.loss_sum.item() == pytest.approx(21.0)
+        assert result.weight_sum.item() == pytest.approx(6.0)
+        assert model.module.weight.grad.item() == pytest.approx(3.5)
+        torch.testing.assert_close(result.loss_fn_outputs[0]["tokens"], token_ids.to(torch.float32).unsqueeze(0))
+
+        engine.optim_step()
+        assert model.module.weight.item() == pytest.approx(0.65)
+    finally:
+        dist.destroy_process_group()
+
+
 def _batch_context_cp_worker(rank: int, world_size: int, init_file: str) -> None:
     """Validate prepared replay side inputs on a real two-rank Gloo CP mesh.
 
@@ -3646,6 +3860,15 @@ def test_data_parallel_window_uses_global_numerator_and_denominator(tmp_path):
     mp.spawn(
         _distributed_worker,
         args=(2, str(tmp_path / "engine_dist_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_hybridep_packed_ranks_equalize_physical_token_extents(tmp_path):
+    mp.spawn(
+        _hybridep_packed_equalization_worker,
+        args=(2, str(tmp_path / "engine_hybridep_packed_init")),
         nprocs=2,
         join=True,
     )
