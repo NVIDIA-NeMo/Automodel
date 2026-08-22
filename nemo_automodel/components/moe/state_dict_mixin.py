@@ -928,10 +928,12 @@ class MoESplitExpertsStateDictMixin:
                     else:
                         w_up = checkpoint_load_destination(w.transpose(0, 1), w)
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
+            # These split views were created during this conversion. Check only newly created Python objects before
+            # releasing unused CUDA blocks; scanning every long-lived model object for each layer makes exports slow.
             del splits
             if not inplace_ok and isinstance(tensor, torch.Tensor) and not tensor.is_meta and torch.cuda.is_available():
                 if tensor.is_cuda and not reused_checkpoint_load_views:
-                    gc.collect()
+                    gc.collect(0)
                     torch.cuda.empty_cache()
             return result
 
@@ -974,7 +976,7 @@ class MoESplitExpertsStateDictMixin:
             del splits
             if not inplace_ok and isinstance(tensor, torch.Tensor) and not tensor.is_meta and torch.cuda.is_available():
                 if tensor.is_cuda and not reused_checkpoint_load_views:
-                    gc.collect()
+                    gc.collect(0)
                     torch.cuda.empty_cache()
             return result
 
