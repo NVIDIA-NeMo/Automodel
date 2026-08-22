@@ -14,12 +14,38 @@
 
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
+
+
+@dataclass
+class CheckpointLoadPart:
+    """One part of a checkpoint that is loaded and finished before the next part.
+
+    DCP fills ``checkpoint_tensors`` using their Hugging Face names and layouts. ``finish`` then converts any
+    temporary checkpoint tensors into the final model tensors named by ``model_keys`` before the loader advances to
+    the next part. Tensors that already have the model's exact dtype and layout may point directly at model storage.
+
+    Attributes:
+        checkpoint_tensors: Hugging Face checkpoint names mapped to DCP destinations. Destinations may use final model
+            storage or temporary storage owned by this part.
+        model_keys: Native model state-dict names completed after ``finish`` returns.
+        temporary_checkpoint_keys: Names in ``checkpoint_tensors`` whose destinations use temporary storage rather
+            than final model storage. The loader uses these keys to report the largest per-rank temporary allocation.
+        finish: Callback that installs temporary checkpoint tensors into final model storage. It must not save those
+            temporary tensors anywhere outside this load part.
+    """
+
+    checkpoint_tensors: dict[str, torch.Tensor]
+    model_keys: frozenset[str]
+    temporary_checkpoint_keys: frozenset[str]
+    finish: Callable[[], None]
 
 
 class StateDictAdapter(ABC):
@@ -40,6 +66,29 @@ class StateDictAdapter(ABC):
         safely below a full model copy, including when loading on one GPU.
         """
         return self._supports_low_memory_dcp_load
+
+    def iter_checkpoint_load_parts(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+        device_mesh: Optional["DeviceMesh"] = None,
+    ) -> Iterator[CheckpointLoadPart] | None:
+        """Optionally load and finish a quantized checkpoint in small parts.
+
+        Ordinary adapters do not need to implement this method. It is only for adapters that cannot let DCP write
+        checkpoint tensors directly into model storage because a dtype or layout conversion is required, but can
+        complete that conversion for one small part of the model at a time.
+
+        Args:
+            model_state_dict: Native model names mapped to the final parameter and persistent-buffer tensors that the
+                checkpoint must populate. Tensors retain their model-specific shapes, axis orders, dtypes, devices,
+                strides, distributed placements, and storage.
+            device_mesh: Optional device mesh describing distributed model storage.
+
+        Returns:
+            An iterator of dependency-complete load parts, or ``None`` when the adapter does not support this path.
+            Across all parts, ``model_keys`` must cover ``model_state_dict`` exactly once.
+        """
+        return None
 
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
