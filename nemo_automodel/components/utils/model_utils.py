@@ -213,7 +213,7 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         if p.requires_grad:
             trainable_params += n
         try:
-            local_sq_norm += p.detach().norm(2) ** 2
+            local_sq_norm += p.detach().norm(2, dtype=torch.promote_types(p.dtype, torch.float32)) ** 2
         except Exception:
             pass
     if isinstance(local_sq_norm, torch.Tensor):
