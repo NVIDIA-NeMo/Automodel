@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import pathlib
@@ -53,6 +54,8 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner, resolve_decode_eval_config
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
@@ -76,6 +79,84 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
 
 logger = logging.getLogger(__name__)
+
+# Kimi K3 text backbone. Dispatch keys on the *text* config, which both a text-only
+# checkpoint and the text sub-config of a vision-language one report as "kimi_linear".
+# Read it from the config class so a rename stays in sync.
+KIMI_K3_MODEL_TYPE = KimiK3TextConfig.model_type
+
+
+def _validate_kimi_k3_gates(
+    *,
+    backend: str,
+    cp_size: int,
+    tp_size: int,
+    pp_size: int,
+    packed_sequence_size: int,
+    parallel_drafting: bool,
+    target_force_hf: bool,
+) -> None:
+    """Reject the combinations a Kimi K3 target cannot serve, before it is loaded.
+
+    Args:
+        backend: ``recipe_args.target_model_backend``.
+        cp_size: ``distributed.cp_size``.
+        tp_size: ``distributed.tp_size``.
+        pp_size: ``distributed.pp_size``.
+        packed_sequence_size: ``recipe_args.packed_sequence_size``.
+        parallel_drafting: ``recipe_args.parallel_drafting`` (P-EAGLE).
+        target_force_hf: ``recipe_args.target_force_hf``.
+    """
+    if backend != "colocated":
+        # Only the colocated path builds K3 through its expert-parallel custom impl;
+        # SGLang / vLLM / serve_target have no Kimi K3 implementation to serve.
+        raise NotImplementedError(
+            f"Kimi K3 EAGLE-3 training requires target_model_backend='colocated', got {backend!r}."
+        )
+    if target_force_hf:
+        raise ValueError("target_force_hf is not supported for Kimi K3: there is no HuggingFace implementation.")
+    if cp_size > 1 or tp_size > 1:
+        # The EAGLE-3 CP path shards the target by intercepting its
+        # ``F.scaled_dot_product_attention`` call, which K3 does not make: it owns
+        # context parallelism end to end. K3 declares ``supports_tp=False``.
+        raise NotImplementedError(
+            "Kimi K3 EAGLE-3 training supports neither context nor tensor parallelism; "
+            "shard the target with expert parallelism (distributed.ep_size) and set cp_size=tp_size=1."
+        )
+    if pp_size > 1:
+        # Online supervision hooks one complete target forward: a pipelined target holds
+        # only its stage's layers (keyed by global index), so aux-layer capture either
+        # raises a KeyError or silently captures nothing.
+        raise NotImplementedError(
+            "Pipeline parallelism (distributed.pp_size > 1) is not supported for the Kimi K3 "
+            "EAGLE-3 target; the aux hidden states are captured from one non-pipelined forward."
+        )
+    if packed_sequence_size > 0:
+        # K3 owns packed attention itself (its document layout comes from the 2D mask /
+        # cu_seqlens), while the EAGLE-3 wrapper hands packed batches a [B, 1, T, T]
+        # block-causal mask that K3's forward does not accept.
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size > 0) is not supported for the Kimi K3 EAGLE-3 target."
+        )
+    if parallel_drafting:
+        raise NotImplementedError("Parallel drafting (P-EAGLE) is not implemented for the Kimi K3 draft.")
+
+
+def _build_kimi_k3_target_backend(recipe_cfg) -> BackendConfig:
+    """Build the backend used by the frozen expert-parallel Kimi K3 target."""
+    return BackendConfig(
+        attn=str(recipe_cfg.get("target_attn_backend", "eager")),
+        linear="torch",
+        rms_norm="torch_fp32",
+        rope_fusion=False,
+        # ``torch`` is the dispatcher K3's own SFT reference config runs expert parallelism
+        # with; the DeepEP-family dispatchers need a matching DeepEP build, so they are opt-in
+        # through ``target_dispatcher`` rather than the default.
+        dispatcher=str(recipe_cfg.get("target_dispatcher", "torch")),
+        experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+        enable_hf_state_dict_adapter=True,
+        enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+    )
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -943,6 +1024,19 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             cp_mode=self.cp_mode,
         )
         _validate_tp_gates(tp_size, backend, cp_size)
+        # ``draft_base_config`` is None on the paths that never build a draft
+        # (the non-colocated backends dispatch before reading it), so the K3
+        # gate has to tolerate its absence.
+        if getattr(draft_base_config, "model_type", None) == KIMI_K3_MODEL_TYPE:
+            _validate_kimi_k3_gates(
+                backend=backend,
+                cp_size=cp_size,
+                tp_size=tp_size,
+                pp_size=int(self.cfg.get("distributed.pp_size", 1) or 1),
+                packed_sequence_size=int(packed_sequence_size or 0),
+                parallel_drafting=bool(recipe_cfg.get("parallel_drafting", False)),
+                target_force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            )
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "sglang":
@@ -950,7 +1044,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         elif backend == "vllm":
             self._setup_vllm_target(recipe_cfg, target_path)
         else:  # colocated
-            self._setup_colocated_target(recipe_cfg, target_path)
+            self._setup_colocated_target(recipe_cfg, target_path, draft_base_config)
 
         self.train_dataloader = self._build_train_dataloader(
             recipe_cfg.train_data_path,
@@ -998,7 +1092,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_wrapper.set_vocab_mapping(selected_token_ids, selected_token_mask)
         return selected_token_ids, selected_token_mask
 
-    def _setup_colocated_target(self, recipe_cfg, target_path):
+    def _setup_colocated_target(self, recipe_cfg, target_path, draft_base_config):
         """Load the target on this GPU and capture supervision in-process."""
         # Optional ``distributed:`` YAML section. Required for targets that do
         # not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). ``force_hf`` is
@@ -1032,7 +1126,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             target_kwargs.update(
                 distributed_setup=self.dist_setup,
             )
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        if draft_base_config.model_type == KIMI_K3_MODEL_TYPE:
+            self.target_model = self._load_kimi_k3_target(recipe_cfg, target_path, draft_base_config)
+        else:
+            self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
         # re-trigger ``BaseRecipe.__setattr__`` state-tracking and raise.
         if self.dist_setup is None:
@@ -1051,6 +1148,50 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
             cp_mesh=target_cp_mesh,
+        )
+
+    def _load_kimi_k3_target(self, recipe_cfg, target_path, text_config):
+        """Load Kimi K3 as a frozen expert-parallel target.
+
+        Kimi K3 has no HuggingFace implementation and its 896 routed experts do not
+        fit on one GPU, so the target is built from the (possibly nested) text config
+        through AutoModel's custom path with an explicit expert-parallel backend
+        instead of the generic ``from_pretrained`` call. The EAGLE-3 draft only ever
+        consumes the text decoder's hidden states, so a vision-language checkpoint is
+        loaded as its text-only ``KimiK3ForCausalLM``.
+
+        Args:
+            recipe_cfg: ``recipe_args`` config node.
+            target_path: Checkpoint path or hub id of the frozen target.
+            text_config: The target's text config (``config.text_config`` when the
+                checkpoint is vision-language, otherwise the config itself).
+
+        Returns:
+            The frozen Kimi K3 target model.
+        """
+        if self.device.type != "cuda":
+            raise RuntimeError(
+                "Kimi K3 EAGLE-3 target requires CUDA: the target is loaded with the "
+                "expert-parallel / FSDP distributed path."
+            )
+        if self.dist_setup is None:
+            raise ValueError(
+                "Kimi K3 EAGLE-3 training requires a `distributed:` section (the target's "
+                "routed experts are sharded with expert parallelism); none was configured."
+            )
+        # The loaded target config is the recipe's own draft base config, so build the
+        # target from a copy: the draft config is serialized into the draft's config.json
+        # and must not inherit the target's architecture / checkpoint path.
+        target_config = copy.deepcopy(text_config)
+        target_config.architectures = ["KimiK3ForCausalLM"]
+        target_config.name_or_path = target_path
+        return NeMoAutoModelForCausalLM.from_config(
+            config=target_config,
+            backend=_build_kimi_k3_target_backend(recipe_cfg),
+            distributed_setup=self.dist_setup,
+            load_base_model=True,
+            torch_dtype=self.compute_dtype,
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
 
     def _setup_sglang_target(self, recipe_cfg, target_path):

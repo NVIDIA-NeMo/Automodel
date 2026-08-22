@@ -1,0 +1,125 @@
+# Full-epoch LoRA fine-tune of Cohere North Micro Vision Instruct on
+# the complete Shopify/product-catalogue train split (38,631 rows).
+#
+#   automodel north_micro_vision_shopify_full.yaml --nproc-per-node 2
+#
+# Sizing: 38,631 rows / global_batch_size 16 = 2,414 optimizer steps.
+# Measured throughput on 2x RTX PRO 6000 is ~1.4 s/step, so ~56 min of training
+# plus ~10 validation passes and checkpoint saves => ~1 hour wall clock.
+#
+# Requires transformers 5.15.0.dev0. Pin the exact validated commit:
+#   uv pip install --no-deps \
+#     "git+https://github.com/huggingface/transformers.git@71c6f699ac9b3f8fc42a6a3e9dc59034c349a678"
+# nemo-automodel==0.5.0 pins transformers==5.8.1; that pin is deliberately
+# violated (the model's remote code needs 5.15 APIs). `uv pip check` will flag it.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 2
+  ckpt_every_steps: 250
+  val_every_steps: 250
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
+  attn_implementation: sdpa
+  trust_remote_code: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints_shopify_full/
+  model_save_format: safetensors
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_shopify_product_catalogue_dataset
+  path_or_dataset: Shopify/product-catalogue
+  split: train
+  # No `limit` -- full 38,631-row train split.
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_shopify_product_catalogue_dataset
+  path_or_dataset: Shopify/product-catalogue
+  split: test
+  # Capped: the full 9,658-row test split at every val would dominate wall clock.
+  limit_dataset_samples: 500
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  collate_fn:
+    # No max_length => dynamic padding (images capped to 768px => ~620 tok max).
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+# Previous runs logged "LR scheduler: <unavailable>" and held LR flat at 1e-4.
+# Fine for 125 steps, not for a full epoch. Unset fields are derived from the
+# step schedule and the optimizer's base LR.
+lr_scheduler:
+  lr_warmup_steps: 100
+  lr_decay_style: cosine
+  min_lr: 1.0e-5
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  target_modules:
+    - "*q_proj"
+    - "*k_proj"
+    - "*v_proj"
+    - "*o_proj"
+    - "*gate_proj"
+    - "*up_proj"
+    - "*down_proj"
+  dim: 16
+  alpha: 32
+  dropout: 0.05
+  use_triton: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: false
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:10:00"
+  nodes: 1
