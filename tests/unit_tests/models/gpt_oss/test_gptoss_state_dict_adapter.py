@@ -457,6 +457,113 @@ class TestGPTOSSStateDictAdapter:
         assert "model.layers.0.mlp.router.weight" in out
 
 
+class TestBoundedMXFP4CheckpointLoad:
+    def _make_adapter(self, num_hidden_layers=2):
+        config = Mock(spec=GptOssConfig)
+        config.num_hidden_layers = num_hidden_layers
+        backend = Mock(spec=BackendConfig)
+        backend.attn = "flex"
+        return GPTOSSStateDictAdapter(config=config, moe_config=Mock(spec=MoEConfig), backend=backend)
+
+    def _make_model_state(self, dtype=torch.bfloat16, num_hidden_layers=2):
+        state = {
+            "model.embed_tokens.weight": torch.zeros(4, 4, dtype=dtype),
+            "model.layers.0.self_attn.q_proj._extra_state": torch.empty(0, dtype=torch.uint8),
+        }
+        for layer_idx in range(num_hidden_layers):
+            prefix = f"model.layers.{layer_idx}"
+            state[f"{prefix}.self_attn.q_proj.weight"] = torch.zeros(4, 4, dtype=dtype)
+            state[f"{prefix}.mlp.gate.weight"] = torch.zeros(2, 4, dtype=dtype)
+            state[f"{prefix}.mlp.experts.gate_and_up_projs"] = torch.zeros(1, 32, 64, dtype=dtype)
+            state[f"{prefix}.mlp.experts.down_projs"] = torch.zeros(1, 32, 64, dtype=dtype)
+        return state
+
+    def test_loads_direct_tensors_and_decodes_one_layer_at_a_time(self):
+        adapter = self._make_adapter()
+        model_state = self._make_model_state()
+
+        parts = adapter.iter_checkpoint_load_parts(model_state)
+        assert parts is not None
+
+        direct_part = next(parts)
+        assert direct_part.temporary_checkpoint_keys == frozenset()
+        assert "model.layers.0.mlp.router.weight" in direct_part.checkpoint_tensors
+        assert "model.layers.0.mlp.gate.weight" not in direct_part.checkpoint_tensors
+        assert "model.layers.0.self_attn.q_proj._extra_state" not in direct_part.checkpoint_tensors
+        assert "model.layers.0.self_attn.q_proj._extra_state" in direct_part.model_keys
+        for destination in direct_part.checkpoint_tensors.values():
+            destination.fill_(7)
+        direct_part.finish()
+
+        completed_model_keys = set(direct_part.model_keys)
+        for layer_idx in range(2):
+            layer_part = next(parts)
+            completed_model_keys.update(layer_part.model_keys)
+            assert layer_part.model_keys == frozenset(
+                {
+                    f"model.layers.{layer_idx}.mlp.experts.gate_and_up_projs",
+                    f"model.layers.{layer_idx}.mlp.experts.down_projs",
+                }
+            )
+            assert layer_part.temporary_checkpoint_keys == frozenset(layer_part.checkpoint_tensors)
+            assert len(layer_part.checkpoint_tensors) == 4
+
+            packed_byte = 0x12 if layer_idx == 0 else 0x43
+            scale = 127 if layer_idx == 0 else 128
+            for checkpoint_key, destination in layer_part.checkpoint_tensors.items():
+                destination.fill_(scale if checkpoint_key.endswith("_scales") else packed_byte)
+            layer_part.finish()
+
+        assert next(parts, None) is None
+        assert completed_model_keys == set(model_state)
+        assert torch.count_nonzero(model_state["model.embed_tokens.weight"] != 7) == 0
+        assert torch.count_nonzero(model_state["model.layers.1.mlp.gate.weight"] != 7) == 0
+
+        layer0_expected = torch.tensor([1.0, 0.5] * 16, dtype=torch.bfloat16).view(1, 32, 1).expand(1, 32, 64)
+        layer1_expected = torch.tensor([3.0, 4.0] * 16, dtype=torch.bfloat16).view(1, 32, 1).expand(1, 32, 64)
+        for projection in ("gate_and_up_projs", "down_projs"):
+            torch.testing.assert_close(model_state[f"model.layers.0.mlp.experts.{projection}"], layer0_expected)
+            torch.testing.assert_close(model_state[f"model.layers.1.mlp.experts.{projection}"], layer1_expected)
+
+    def test_supports_fp32_model_weights(self):
+        adapter = self._make_adapter(num_hidden_layers=1)
+        model_state = self._make_model_state(dtype=torch.float32, num_hidden_layers=1)
+
+        parts = adapter.iter_checkpoint_load_parts(model_state)
+        assert parts is not None
+        next(parts)
+        expert_part = next(parts)
+        for checkpoint_key, destination in expert_part.checkpoint_tensors.items():
+            destination.fill_(127 if checkpoint_key.endswith("_scales") else 0x12)
+        expert_part.finish()
+
+        expected = torch.tensor([1.0, 0.5] * 16).view(1, 32, 1).expand(1, 32, 64)
+        torch.testing.assert_close(model_state["model.layers.0.mlp.experts.gate_and_up_projs"], expected)
+        assert model_state["model.layers.0.mlp.experts.gate_and_up_projs"].dtype == torch.float32
+
+    def test_returns_none_for_partial_decoder(self):
+        adapter = self._make_adapter(num_hidden_layers=2)
+        model_state = self._make_model_state(num_hidden_layers=1)
+
+        assert adapter.iter_checkpoint_load_parts(model_state) is None
+
+    def test_returns_none_for_unsupported_expert_dtype(self):
+        adapter = self._make_adapter(num_hidden_layers=1)
+        model_state = self._make_model_state(dtype=torch.float16, num_hidden_layers=1)
+
+        assert adapter.iter_checkpoint_load_parts(model_state) is None
+
+    def test_returns_none_for_distributed_load(self):
+        adapter = self._make_adapter(num_hidden_layers=1)
+        model_state = self._make_model_state(num_hidden_layers=1)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+        ):
+            assert adapter.iter_checkpoint_load_parts(model_state) is None
+
+
 class TestConvertMoePackedTensors:
     def _make_adapter(self):
         backend = Mock(spec=BackendConfig)
