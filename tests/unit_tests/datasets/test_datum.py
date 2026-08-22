@@ -106,6 +106,60 @@ def _vlm_datum(input_ids, weights, **media_inputs):
     )
 
 
+def _vlm_rl_datums():
+    """Build ragged VLM Datums with prediction-aligned RL side channels.
+
+    Returns:
+        Two Datums whose target scores use the unshifted
+        ``[sequence, objectives]`` axis, routed experts use the already-shifted
+        ``[sequence - 1, layers, topk]`` axis, and scalar metadata uses
+        per-Datum or replicated layouts.
+    """
+    datums = [
+        _vlm_datum([1, 2, 3, 4], [0, 1, 1, 1]),
+        _vlm_datum([5, 6, 7], [0, 1, 1]),
+    ]
+    target_scores = [
+        torch.arange(8, dtype=torch.float32).reshape(4, 2),
+        torch.arange(20, 26, dtype=torch.float32).reshape(3, 2),
+    ]
+    routed_experts = [
+        torch.arange(12, dtype=torch.int16).reshape(3, 2, 2),
+        torch.arange(100, 108, dtype=torch.int16).reshape(2, 2, 2),
+    ]
+    sequence_scores = [torch.tensor(0.25), torch.tensor(0.75)]
+    sampling_policy = torch.tensor([0.9, 0.1])
+    for datum, scores, routes, sequence_score in zip(
+        datums,
+        target_scores,
+        routed_experts,
+        sequence_scores,
+    ):
+        datum.loss_fn_inputs.update(
+            {
+                "target_scores": scores,
+                "routed_experts": routes,
+                "sequence_score": sequence_score,
+                "sampling_policy": sampling_policy.clone(),
+            }
+        )
+        datum.loss_fn_input_layouts.update(
+            {
+                "target_scores": LossInputLayout.PER_TOKEN,
+                "routed_experts": LossInputLayout.PER_TOKEN,
+                "sequence_score": LossInputLayout.PER_DATUM,
+                "sampling_policy": LossInputLayout.REPLICATED,
+            }
+        )
+        datum.loss_fn_input_pad_values.update(
+            {
+                "target_scores": -7.5,
+                "routed_experts": -1,
+            }
+        )
+    return datums
+
+
 # ── Datum ─────────────────────────────────────────────────────────────────
 
 
@@ -343,10 +397,14 @@ def test_to_features_native_python_ints():
 
 
 def test_collate_vlm_datums_delegates_padding_and_preserves_processor_fields():
-    processor = SimpleNamespace(image_processor=object(), tokenizer=SimpleNamespace(pad_token_id=9))
+    processor = SimpleNamespace(
+        image_token_id=99,
+        image_processor=SimpleNamespace(merge_size=2),
+        tokenizer=SimpleNamespace(pad_token_id=9),
+    )
     datums = [
         _vlm_datum(
-            [1, 2, 3],
+            [1, 99, 3],
             [0, 1, 1],
             pixel_values=torch.tensor([[1.0, 2.0]]),
             image_grid_thw=torch.tensor([[1, 2, 2]]),
@@ -358,9 +416,9 @@ def test_collate_vlm_datums_delegates_padding_and_preserves_processor_fields():
 
     model_inputs, loss_inputs = collate_vlm_datums(datums, processor=processor)
 
-    torch.testing.assert_close(model_inputs["input_ids"], torch.tensor([[1, 2], [4, 5]]))
-    torch.testing.assert_close(model_inputs["attention_mask"], torch.tensor([[1, 1], [1, 1]]))
-    torch.testing.assert_close(loss_inputs["labels"], torch.tensor([[2, 3], [5, -100]]))
+    torch.testing.assert_close(model_inputs["input_ids"], torch.tensor([[1, 99], [4, 5]]))
+    torch.testing.assert_close(model_inputs["attention_mask"], torch.tensor([[1, 1], [1, 0]]))
+    torch.testing.assert_close(loss_inputs["labels"], torch.tensor([[99, 3], [5, -100]]))
     torch.testing.assert_close(loss_inputs["weights"], torch.tensor([[True, True], [True, False]]))
     torch.testing.assert_close(model_inputs["image_flags"], torch.tensor([[1]]))
     torch.testing.assert_close(model_inputs["imgs_sizes"], torch.tensor([[32, 64]]))
@@ -373,12 +431,281 @@ def test_collate_vlm_datums_delegates_padding_and_preserves_processor_fields():
     assert loss_inputs.pad_values == {"labels": CROSS_ENTROPY_IGNORE_IDX}
 
 
+def test_collate_vlm_datums_pads_s_and_s_minus_one_side_channels_with_layouts():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = _vlm_rl_datums()
+
+    _, loss_inputs = collate_vlm_datums(datums, processor=processor)
+
+    torch.testing.assert_close(
+        loss_inputs["target_scores"],
+        torch.tensor(
+            [
+                [[2.0, 3.0], [4.0, 5.0], [6.0, 7.0]],
+                [[22.0, 23.0], [24.0, 25.0], [-7.5, -7.5]],
+            ]
+        ),
+    )
+    assert loss_inputs["routed_experts"].shape == (2, 3, 2, 2)
+    torch.testing.assert_close(loss_inputs["routed_experts"][0], datums[0].loss_fn_inputs["routed_experts"])
+    torch.testing.assert_close(loss_inputs["routed_experts"][1, :2], datums[1].loss_fn_inputs["routed_experts"])
+    assert torch.equal(loss_inputs["routed_experts"][1, 2], torch.full((2, 2), -1, dtype=torch.int16))
+    torch.testing.assert_close(loss_inputs["sequence_score"], torch.tensor([0.25, 0.75]))
+    torch.testing.assert_close(loss_inputs["sampling_policy"], torch.tensor([0.9, 0.1]))
+    assert loss_inputs.layouts == {
+        "labels": LossInputLayout.PER_TOKEN,
+        "routed_experts": LossInputLayout.PER_TOKEN,
+        "sampling_policy": LossInputLayout.REPLICATED,
+        "sequence_score": LossInputLayout.PER_DATUM,
+        "target_scores": LossInputLayout.PER_TOKEN,
+        "weights": LossInputLayout.PER_TOKEN,
+    }
+    assert loss_inputs.pad_values == {
+        "labels": CROSS_ENTROPY_IGNORE_IDX,
+        "routed_experts": -1,
+        "target_scores": -7.5,
+    }
+    assert loss_inputs.item_to_datum == (0, 1)
+
+
+def test_collate_vlm_datums_keeps_prediction_aligned_s_minus_one_weights():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = [
+        _vlm_datum([1, 2, 3, 4], [0, 1, 1, 1]),
+        _vlm_datum([5, 6, 7], [0, 1, 1]),
+    ]
+    datums[0].loss_fn_inputs["weights"] = torch.tensor([True, False, True])
+    datums[1].loss_fn_inputs["weights"] = torch.tensor([True, True])
+
+    _, loss_inputs = collate_vlm_datums(datums, processor=processor)
+
+    torch.testing.assert_close(
+        loss_inputs["weights"],
+        torch.tensor([[True, False, True], [True, True, False]]),
+    )
+    assert int(loss_inputs["weights"].sum()) == 4
+
+
+def test_collate_vlm_datums_packs_side_channels_with_each_document_alignment():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=9))
+    datums = _vlm_rl_datums()
+
+    model_inputs, loss_inputs = collate_vlm_datums(
+        datums,
+        processor=processor,
+        packed=True,
+        sequence_alignment=4,
+    )
+
+    torch.testing.assert_close(model_inputs["seq_lens"], torch.tensor([[3, 2]]))
+    torch.testing.assert_close(model_inputs["seq_lens_padded"], torch.tensor([[4, 4]]))
+    torch.testing.assert_close(
+        loss_inputs["target_scores"],
+        torch.tensor(
+            [
+                [
+                    [2.0, 3.0],
+                    [4.0, 5.0],
+                    [6.0, 7.0],
+                    [-7.5, -7.5],
+                    [22.0, 23.0],
+                    [24.0, 25.0],
+                    [-7.5, -7.5],
+                    [-7.5, -7.5],
+                ]
+            ]
+        ),
+    )
+    expected_routes = torch.cat(
+        [
+            torch.cat([datums[0].loss_fn_inputs["routed_experts"], torch.full((1, 2, 2), -1, dtype=torch.int16)]),
+            torch.cat([datums[1].loss_fn_inputs["routed_experts"], torch.full((2, 2, 2), -1, dtype=torch.int16)]),
+        ]
+    ).unsqueeze(0)
+    torch.testing.assert_close(loss_inputs["routed_experts"], expected_routes)
+    torch.testing.assert_close(loss_inputs["sequence_score"], torch.tensor([0.25, 0.75]))
+    torch.testing.assert_close(loss_inputs["sampling_policy"], torch.tensor([0.9, 0.1]))
+    assert loss_inputs.item_to_datum == (0, 1)
+
+
+@pytest.mark.parametrize("field", ["mm_token_type_ids", "token_type_ids"])
+@pytest.mark.parametrize("packed", [False, True])
+def test_collate_vlm_datums_aligns_token_type_model_inputs(field, packed):
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=9))
+    datums = [
+        _vlm_datum([1, 2, 3, 4], [0, 1, 1, 1], **{field: torch.tensor([0, 1, 2, 0])}),
+        _vlm_datum([5, 6, 7], [0, 1, 1], **{field: torch.tensor([2, 1, 0])}),
+    ]
+
+    model_inputs, _ = collate_vlm_datums(
+        datums,
+        processor=processor,
+        packed=packed,
+        sequence_alignment=4 if packed else 1,
+    )
+
+    if packed:
+        expected = torch.tensor([[0, 1, 2, 0, 2, 1, 0, 0]])
+    else:
+        expected = torch.tensor([[0, 1, 2], [2, 1, 0]])
+    torch.testing.assert_close(model_inputs[field], expected)
+    assert model_inputs[field].shape == model_inputs["input_ids"].shape
+
+
 def test_collate_vlm_datums_rejects_invalid_unshifted_contract():
     processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
     with pytest.raises(ValueError, match="at least one"):
         collate_vlm_datums([], processor=processor)
     with pytest.raises(ValueError, match="target position zero"):
         collate_vlm_datums([_vlm_datum([1, 2], [1, 1])], processor=processor)
+
+
+def test_collate_vlm_datums_rejects_per_token_side_channel_outside_s_or_s_minus_one():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datum = _vlm_datum([1, 2, 3, 4], [0, 1, 1, 1])
+    datum.loss_fn_inputs["advantages"] = torch.ones(2)
+    datum.loss_fn_input_layouts["advantages"] = LossInputLayout.PER_TOKEN
+
+    with pytest.raises(ValueError, match=r"advantages.*S or S-1"):
+        collate_vlm_datums([datum], processor=processor)
+
+
+@pytest.mark.parametrize("field", ["labels", "weights"])
+def test_collate_vlm_datums_requires_token_layout_for_canonical_loss_fields(field):
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datum = _vlm_datum([1, 2, 3], [0, 1, 1])
+    datum.loss_fn_input_layouts[field] = LossInputLayout.REPLICATED
+    if field == "labels":
+        datum.loss_fn_input_pad_values.pop("labels")
+
+    with pytest.raises(ValueError, match=rf"VLM {field} must use the PER_TOKEN layout"):
+        collate_vlm_datums([datum], processor=processor)
+
+
+def test_collate_vlm_datums_rejects_mixed_s_and_s_minus_one_conventions_for_one_field():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = _vlm_rl_datums()
+    datums[1].loss_fn_inputs["target_scores"] = datums[1].loss_fn_inputs["target_scores"][1:]
+
+    with pytest.raises(ValueError, match="target_scores"):
+        collate_vlm_datums(datums, processor=processor)
+
+
+def test_collate_vlm_datums_rejects_per_token_trailing_shape_mismatch():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = _vlm_rl_datums()
+    datums[1].loss_fn_inputs["target_scores"] = torch.ones(3, 3)
+
+    with pytest.raises(ValueError, match="target_scores"):
+        collate_vlm_datums(datums, processor=processor)
+
+
+def test_collate_vlm_datums_rejects_per_token_dtype_mismatch():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = _vlm_rl_datums()
+    datums[1].loss_fn_inputs["target_scores"] = datums[1].loss_fn_inputs["target_scores"].to(torch.float64)
+
+    with pytest.raises(ValueError, match="target_scores"):
+        collate_vlm_datums(datums, processor=processor)
+
+
+def test_collate_vlm_datums_requires_matching_loss_keys():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = _vlm_rl_datums()
+    del datums[1].loss_fn_inputs["target_scores"]
+    del datums[1].loss_fn_input_layouts["target_scores"]
+    del datums[1].loss_fn_input_pad_values["target_scores"]
+
+    with pytest.raises(ValueError, match="same loss_fn_inputs keys"):
+        collate_vlm_datums(datums, processor=processor)
+
+
+@pytest.mark.parametrize(
+    ("metadata_name", "second_value", "message"),
+    [
+        ("loss_fn_input_layouts", LossInputLayout.REPLICATED, "same explicit layout"),
+        ("loss_fn_input_pad_values", -8.0, "same pad value"),
+    ],
+)
+def test_collate_vlm_datums_requires_consistent_side_channel_metadata(metadata_name, second_value, message):
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = _vlm_rl_datums()
+    getattr(datums[1], metadata_name)["target_scores"] = second_value
+
+    with pytest.raises(ValueError, match=message):
+        collate_vlm_datums(datums, processor=processor)
+
+
+@pytest.mark.parametrize(
+    ("metadata_name", "message"),
+    [
+        ("loss_fn_input_layouts", "every Datum must declare the layout"),
+        ("loss_fn_input_pad_values", "every Datum must declare the pad value"),
+    ],
+)
+def test_collate_vlm_datums_rejects_partially_declared_side_channel_metadata(metadata_name, message):
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = _vlm_rl_datums()
+    del getattr(datums[1], metadata_name)["target_scores"]
+
+    with pytest.raises(ValueError, match=message):
+        collate_vlm_datums(datums, processor=processor)
+
+
+def test_collate_vlm_datums_rejects_explicit_padding_in_packed_input():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datum = _vlm_datum([1, 2, 0], [0, 1, 0])
+    datum.model_inputs["attention_mask"][-1] = 0
+
+    with pytest.raises(ValueError, match=r"packed VLM Datums.*attention_mask padding"):
+        collate_vlm_datums([datum], processor=processor, packed=True)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_collate_vlm_datums_rejects_resolvable_media_token_mismatch(packed):
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        image_token_id=99,
+        image_processor=SimpleNamespace(merge_size=2),
+    )
+    datum = _vlm_datum(
+        [1, 99, 2],
+        [0, 1, 1],
+        image_grid_thw=torch.tensor([[1, 4, 4]]),
+        pixel_values=torch.ones(4, 2),
+    )
+
+    with pytest.raises(ValueError, match=r"media token mismatch.*image tokens=1, expected=4"):
+        collate_vlm_datums([datum], processor=processor, packed=packed)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_collate_vlm_datums_rejects_media_removed_by_autoregressive_shift(packed):
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        image_token_id=99,
+        image_processor=SimpleNamespace(merge_size=2),
+    )
+    datum = _vlm_datum(
+        [1, 2, 99],
+        [0, 1, 1],
+        image_grid_thw=torch.tensor([[1, 2, 2]]),
+        pixel_values=torch.ones(1, 2),
+    )
+
+    with pytest.raises(ValueError, match="media token mismatch"):
+        collate_vlm_datums([datum], processor=processor, packed=packed)
+
+
+def test_collate_vlm_datums_rejects_unconcatenable_processor_media_field():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = [
+        _vlm_datum([1, 2, 3], [0, 1, 1], auxiliary_media=torch.ones(1, 2)),
+        _vlm_datum([4, 5, 6], [0, 1, 1], auxiliary_media=torch.ones(1, 3)),
+    ]
+
+    with pytest.raises(ValueError, match=r"processor field 'auxiliary_media'.*cannot be concatenated"):
+        collate_vlm_datums(datums, processor=processor)
 
 
 def test_collate_vlm_datums_packs_aligned_thd_documents():

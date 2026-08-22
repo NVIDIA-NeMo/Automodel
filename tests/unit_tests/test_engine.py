@@ -39,6 +39,7 @@ from nemo_automodel.components.datasets.datum import (
     Datum,
     LossInputLayout,
     collate_datums,
+    collate_vlm_datums,
 )
 from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
@@ -2937,6 +2938,67 @@ def test_model_specific_collater_keeps_multimodal_inputs_and_gradients():
     assert model.text.weight.grad.abs().sum() > 0
     assert model.vision.weight.grad is not None
     assert model.vision.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_vlm_datum_collater_restores_prediction_aligned_outputs_without_padding(packed):
+    """VLM outputs use each Datum's shifted ``S-1`` token length."""
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = []
+    for input_ids, routes in (
+        ([1, 2, 3, 4], [10, 11, 12]),
+        ([5, 6, 7], [20, 21]),
+    ):
+        input_ids = torch.tensor(input_ids)
+        weights = torch.cat((torch.zeros(1), torch.ones(input_ids.numel() - 1)))
+        datums.append(
+            Datum(
+                model_inputs={"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)},
+                loss_fn_inputs={
+                    "labels": input_ids.clone(),
+                    "weights": weights,
+                    "routed_experts": torch.tensor(routes),
+                },
+                loss_fn_input_layouts={
+                    "labels": LossInputLayout.PER_TOKEN,
+                    "weights": LossInputLayout.PER_TOKEN,
+                    "routed_experts": LossInputLayout.PER_TOKEN,
+                },
+                loss_fn_input_pad_values={"labels": -100, "routed_experts": -1},
+            )
+        )
+
+    def loss_with_routes(output, loss_inputs):
+        """Return model loss and prediction-aligned route ids.
+
+        Args:
+            output: Model values with shape ``[batch, prediction_tokens]``.
+            loss_inputs: Collated loss tensors on the same token axes.
+
+        Returns:
+            The per-token loss and typed route output batch.
+        """
+        return output, LossFnOutputBatch(
+            per_token={"routes": PerTokenOutput(loss_inputs["routed_experts"], fill_value=-1)}
+        )
+
+    model = ScaleModel()
+    if packed:
+        model.backend = SimpleNamespace(attn="te")
+    result = Engine(
+        model,
+        device="cpu",
+        microbatch_size=2,
+        collate_fn=partial(
+            collate_vlm_datums,
+            processor=processor,
+            packed=packed,
+            sequence_alignment=4 if packed else 1,
+        ),
+    ).forward(datums, loss_with_routes)
+
+    torch.testing.assert_close(result.loss_fn_outputs[0]["routes"], torch.tensor([10, 11, 12]))
+    torch.testing.assert_close(result.loss_fn_outputs[1]["routes"], torch.tensor([20, 21]))
 
 
 def test_prebatched_datum_keeps_existing_recipe_batch_layout():

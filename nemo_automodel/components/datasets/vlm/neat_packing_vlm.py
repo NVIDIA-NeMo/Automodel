@@ -65,6 +65,8 @@ MEDIA_KEYS = (
     "second_per_grid_ts",
 )
 
+_TOKEN_TYPE_KEYS = ("mm_token_type_ids", "token_type_ids")
+
 # ---------------------------------------------------------------------------
 # Visual-token-balanced greedy knapsack
 # ---------------------------------------------------------------------------
@@ -345,9 +347,10 @@ def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
     out["labels"] = sample["labels"][1:]
     out["attention_mask"] = sample["attention_mask"][:-1]
 
-    if (mm_ttids := sample.get("mm_token_type_ids")) is not None:
-        mm_ttids = torch.as_tensor(mm_ttids)
-        out["mm_token_type_ids"] = mm_ttids[0, :-1] if mm_ttids.ndim == 2 else mm_ttids[:-1]
+    for key in _TOKEN_TYPE_KEYS:
+        if (token_types := sample.get(key)) is not None:
+            token_types = torch.as_tensor(token_types)
+            out[key] = token_types[0, :-1] if token_types.ndim == 2 else token_types[:-1]
 
     if has_mrope and "position_ids" in sample and sample["position_ids"] is not None:
         out["position_ids"] = sample["position_ids"][:, :-1]
@@ -379,7 +382,10 @@ def _build_packed_vlm_sample(
     all_input_ids: list[int] = []
     all_labels: list[int] = []
     all_attention_mask: list[int] = []
-    all_mm_token_type_ids: list[int] = []
+    all_token_type_ids: dict[str, list[int]] = {key: [] for key in _TOKEN_TYPE_KEYS}
+    present_token_type_keys = tuple(
+        key for key in _TOKEN_TYPE_KEYS if any(sample.get(key) is not None for sample in samples)
+    )
     all_position_ids_1d: list[int] = []
     mrope_position_ids_list: list[torch.Tensor] = []
     seq_lens: list[int] = []
@@ -411,12 +417,17 @@ def _build_packed_vlm_sample(
         all_labels.extend(labs + [-100] * pad)
         all_attention_mask.extend([seq_idx] * padded_seq_len)
 
-        mm_ttids = sample.get("mm_token_type_ids")
-        if mm_ttids is not None:
-            mm_ttids = mm_ttids.tolist() if isinstance(mm_ttids, torch.Tensor) else list(mm_ttids)
-            all_mm_token_type_ids.extend(mm_ttids + [0] * pad)
-        else:
-            all_mm_token_type_ids.extend([0] * padded_seq_len)
+        for key in present_token_type_keys:
+            token_types = sample.get(key)
+            if token_types is None:
+                all_token_type_ids[key].extend([0] * padded_seq_len)
+                continue
+            token_types = torch.as_tensor(token_types).reshape(-1).tolist()
+            if len(token_types) != seq_len:
+                raise ValueError(
+                    f"Packed VLM {key} must match the shifted token length; got {len(token_types)} and {seq_len}."
+                )
+            all_token_type_ids[key].extend(token_types + [0] * pad)
 
         if has_mrope and "position_ids" in sample:
             mrope_position_ids_list.append(sample["position_ids"])
@@ -443,12 +454,13 @@ def _build_packed_vlm_sample(
         "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
         "labels": torch.tensor(all_labels, dtype=torch.long),
         "attention_mask": torch.tensor(all_attention_mask, dtype=torch.long),
-        "mm_token_type_ids": torch.tensor(all_mm_token_type_ids, dtype=torch.long),
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
         "n_images": n_images,
         "n_videos": n_videos,
     }
+    for key in present_token_type_keys:
+        packed[key] = torch.tensor(all_token_type_ids[key], dtype=torch.long)
 
     if has_mrope and mrope_position_ids_list:
         packed["position_ids"] = torch.cat(mrope_position_ids_list, dim=1)
