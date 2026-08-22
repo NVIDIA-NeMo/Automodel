@@ -14,6 +14,7 @@
 
 import pickle
 from copy import copy, deepcopy
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -76,6 +77,20 @@ def _routed_datums():
 # ── Datum ─────────────────────────────────────────────────────────────────
 
 
+def _clone_instead_of_pinning(tensor: torch.Tensor, _device: str | None = None) -> torch.Tensor:
+    """Return an observable CPU-safe stand-in for ``Tensor.pin_memory``.
+
+    Args:
+        tensor: Tensor of arbitrary shape and dtype.
+        _device: Optional accelerator identifier accepted by PyTorch's pinning
+            dispatcher. It does not affect this CPU-safe test double.
+
+    Returns:
+        Tensor of the same shape and dtype with independent storage.
+    """
+    return tensor.clone()
+
+
 def test_datum_keeps_old_input_ids_convenience():
     d = Datum(input_ids=[1, 2, 3], loss_fn_inputs={"weights": [1, 1, 0]})
     assert isinstance(d.input_ids, torch.Tensor)
@@ -105,6 +120,133 @@ def test_datum_accepts_model_specific_inputs():
     )
     assert datum.model_inputs["pixel_values"].shape == (1, 3, 4, 4)
     assert datum.seq_len == 2
+
+
+def test_datum_pin_memory_handles_molt_prebatched_inputs(monkeypatch):
+    datum = Datum(
+        model_inputs={
+            "input_ids": torch.tensor([[10, 11, 12], [20, 21, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1], [1, 1, 0]]),
+            "position_ids": torch.tensor([[0, 1, 2], [0, 1, 1]]),
+        },
+        loss_fn_inputs={
+            "labels": torch.tensor([[11, 12, -100], [21, -100, -100]]),
+            "weights": torch.tensor([[True, True, False], [True, False, False]]),
+        },
+        loss_fn_input_layouts={
+            "labels": LossInputLayout.PER_TOKEN,
+            "weights": LossInputLayout.PER_TOKEN,
+        },
+        loss_fn_input_pad_values={"labels": -100},
+    )
+    original_model_tensors = dict(datum.model_inputs)
+    original_loss_tensors = dict(datum.loss_fn_inputs)
+    original_layouts = datum.loss_fn_input_layouts
+    original_pad_values = datum.loss_fn_input_pad_values
+    monkeypatch.setattr(torch.Tensor, "pin_memory", _clone_instead_of_pinning)
+
+    result = datum.pin_memory()
+
+    assert result is datum
+    for key, original in original_model_tensors.items():
+        assert datum.model_inputs[key] is not original
+        torch.testing.assert_close(datum.model_inputs[key], original)
+    for key, original in original_loss_tensors.items():
+        assert datum.loss_fn_inputs[key] is not original
+        torch.testing.assert_close(datum.loss_fn_inputs[key], original)
+    assert datum.loss_fn_input_layouts is original_layouts
+    assert datum.loss_fn_input_layouts == {
+        "labels": LossInputLayout.PER_TOKEN,
+        "weights": LossInputLayout.PER_TOKEN,
+    }
+    assert datum.loss_fn_input_pad_values is original_pad_values
+    assert datum.loss_fn_input_pad_values == {"labels": -100}
+
+
+def test_datum_pin_memory_uses_dataloader_recursion_for_model_inputs(monkeypatch):
+    custom_leaf = Mock()
+    pinned_custom_leaf = object()
+    custom_leaf.pin_memory.return_value = pinned_custom_leaf
+    image = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
+    grid = torch.tensor([[1, 2, 3]])
+    auxiliary = torch.tensor([4.0, 5.0])
+    datum = Datum(
+        model_inputs={
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "media": {
+                "images": [image, None],
+                "details": (grid, {"auxiliary": auxiliary}),
+                "custom": custom_leaf,
+            },
+            "batch_size": 1,
+            "qkv_format": "bshd",
+        },
+        loss_fn_inputs={"weights": torch.ones(1, 3)},
+        loss_fn_input_layouts={"weights": LossInputLayout.PER_TOKEN},
+    )
+    monkeypatch.setattr(torch.Tensor, "pin_memory", _clone_instead_of_pinning)
+
+    result = datum.pin_memory()
+
+    assert result is datum
+    assert isinstance(datum.model_inputs["media"], dict)
+    assert isinstance(datum.model_inputs["media"]["images"], list)
+    assert isinstance(datum.model_inputs["media"]["details"], tuple)
+    pinned_image = datum.model_inputs["media"]["images"][0]
+    pinned_grid = datum.model_inputs["media"]["details"][0]
+    pinned_auxiliary = datum.model_inputs["media"]["details"][1]["auxiliary"]
+    for pinned, original in ((pinned_image, image), (pinned_grid, grid), (pinned_auxiliary, auxiliary)):
+        assert pinned is not original
+        torch.testing.assert_close(pinned, original)
+    assert datum.model_inputs["media"]["images"][1] is None
+    assert datum.model_inputs["batch_size"] == 1
+    assert datum.model_inputs["qkv_format"] == "bshd"
+    assert datum.model_inputs["media"]["custom"] is pinned_custom_leaf
+    custom_leaf.pin_memory.assert_called_once_with()
+
+
+def test_datum_pin_memory_does_not_partially_commit_on_failure(monkeypatch):
+    model_tensor = torch.tensor([[1, 2, 3]])
+    loss_tensor = torch.ones(1, 3)
+    datum = Datum(
+        model_inputs={"input_ids": model_tensor, "metadata": {"source": "molt"}},
+        loss_fn_inputs={"weights": loss_tensor},
+        loss_fn_input_layouts={"weights": LossInputLayout.PER_TOKEN},
+    )
+    original_model_inputs = datum.model_inputs
+    original_loss_fn_inputs = datum.loss_fn_inputs
+    original_layouts = datum.loss_fn_input_layouts
+
+    def fail_for_loss_tensor(tensor: torch.Tensor, _device: str | None = None) -> torch.Tensor:
+        """Fail after model-input pinning reaches the loss-input mapping.
+
+        Args:
+            tensor: Tensor of arbitrary shape and dtype.
+            _device: Optional accelerator identifier accepted by PyTorch's
+                pinning dispatcher.
+
+        Returns:
+            An independent tensor when ``tensor`` is a model input.
+
+        Raises:
+            RuntimeError: If ``tensor`` is the selected loss input.
+        """
+        if tensor is loss_tensor:
+            raise RuntimeError("injected pin-memory failure")
+        return tensor.clone()
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", fail_for_loss_tensor)
+
+    with pytest.raises(RuntimeError, match="injected pin-memory failure"):
+        datum.pin_memory()
+
+    assert datum.model_inputs is original_model_inputs
+    assert datum.loss_fn_inputs is original_loss_fn_inputs
+    assert datum.model_inputs["input_ids"] is model_tensor
+    assert datum.model_inputs["metadata"] == {"source": "molt"}
+    assert datum.loss_fn_inputs["weights"] is loss_tensor
+    assert datum.loss_fn_input_layouts is original_layouts
+    assert datum.loss_fn_input_layouts == {"weights": LossInputLayout.PER_TOKEN}
 
 
 def test_datum_accepts_optional_loss_input_layouts():
