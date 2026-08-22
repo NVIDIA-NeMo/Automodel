@@ -124,9 +124,10 @@ ci:
   checkpoint_robustness:
     # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
     step_scheduler.local_batch_size: 4
-    # The original source and AutoModel reload pass standard. Only the PP4/EP8
-    # post-training HF reload has measured long-context BF16 drift.
+    # Independent-process AutoModel and HF reloads show measured long-context
+    # BF16 drift for this PP4/EP8 routed-MoE topology; source parity stays standard.
     parity_tolerance_profile_overrides:
+      automodel_reload: relaxed
       hf_reload: relaxed
     hf_device_map_auto: true
     # Transformers' load-time dequantization leaves Mistral4 expert weights in
