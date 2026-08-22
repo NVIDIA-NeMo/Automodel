@@ -132,18 +132,19 @@ class TestDequantizeFromFp8:
         assert torch.equal(out, expected)
         assert not torch.equal(out, low_precision)
 
+    @pytest.mark.parametrize("target_dtype", [torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("scale_value", [1e-5, 0.125, 1.0, 3.5, 1000.0])
-    def test_direct_destination_matches_existing_conversion(self, scale_value):
+    def test_direct_destination_matches_existing_conversion(self, scale_value, target_dtype):
         weight_fp8 = torch.tensor(
             [-448.0, -13.0, -0.03125, 0.0, 0.0703125, 7.5, 96.0, 448.0],
             dtype=torch.float8_e4m3fn,
         )
         scale = torch.tensor(scale_value, dtype=torch.bfloat16)
-        target = torch.empty_like(weight_fp8, dtype=torch.bfloat16)
+        target = torch.empty_like(weight_fp8, dtype=target_dtype)
 
         _dequantize_from_fp8_into(target, weight_fp8, scale)
 
-        assert torch.equal(target, _dequantize_from_fp8(weight_fp8, scale))
+        assert torch.equal(target, _dequantize_from_fp8(weight_fp8, scale, target_dtype=target_dtype))
 
 
 # --------------------------------------------------------------------------- #
@@ -197,15 +198,16 @@ class TestForCausalLmFactory:
 
         assert converted == {key: value}
 
-    def test_checkpoint_load_parts_dequantize_bounded_layer_groups_into_model_storage(self):
+    @pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float32])
+    def test_checkpoint_load_parts_dequantize_bounded_layer_groups_into_model_storage(self, model_dtype):
         adapter = Mistral3FP8StateDictAdapter.for_causal_lm({"num_hidden_layers": 2})
         model_state = {
-            "model.embed_tokens.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
-            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
-            "model.layers.0.mlp.down_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
-            "model.layers.1.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
-            "model.norm.weight": torch.zeros(2, dtype=torch.bfloat16),
-            "lm_head.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+            "model.embed_tokens.weight": torch.zeros(2, 2, dtype=model_dtype),
+            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=model_dtype),
+            "model.layers.0.mlp.down_proj.weight": torch.zeros(2, 2, dtype=model_dtype),
+            "model.layers.1.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=model_dtype),
+            "model.norm.weight": torch.zeros(2, dtype=model_dtype),
+            "lm_head.weight": torch.zeros(2, 2, dtype=model_dtype),
         }
 
         load_parts = adapter.iter_checkpoint_load_parts(model_state)
@@ -236,32 +238,32 @@ class TestForCausalLmFactory:
 
         torch.testing.assert_close(
             model_state["model.layers.0.self_attn.q_proj.weight"],
-            torch.ones(2, 2, dtype=torch.bfloat16),
+            torch.ones(2, 2, dtype=model_dtype),
         )
         torch.testing.assert_close(
             model_state["model.layers.0.mlp.down_proj.weight"],
-            torch.ones(2, 2, dtype=torch.bfloat16),
+            torch.ones(2, 2, dtype=model_dtype),
         )
         torch.testing.assert_close(
             model_state["model.layers.1.self_attn.q_proj.weight"],
-            torch.ones(2, 2, dtype=torch.bfloat16),
+            torch.ones(2, 2, dtype=model_dtype),
         )
         torch.testing.assert_close(
             model_state["model.embed_tokens.weight"],
-            torch.full((2, 2), 7.0, dtype=torch.bfloat16),
+            torch.full((2, 2), 7.0, dtype=model_dtype),
         )
         torch.testing.assert_close(
             model_state["model.norm.weight"],
-            torch.full((2,), 7.0, dtype=torch.bfloat16),
+            torch.full((2,), 7.0, dtype=model_dtype),
         )
         torch.testing.assert_close(
             model_state["lm_head.weight"],
-            torch.full((2, 2), 7.0, dtype=torch.bfloat16),
+            torch.full((2, 2), 7.0, dtype=model_dtype),
         )
 
-    def test_non_bf16_model_keeps_existing_one_pass_dcp_load(self):
+    def test_unsupported_model_dtype_keeps_existing_one_pass_dcp_load(self):
         adapter = Mistral3FP8StateDictAdapter.for_causal_lm({"num_hidden_layers": 1})
-        model_state = {"model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2)}
+        model_state = {"model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.float16)}
 
         assert adapter.iter_checkpoint_load_parts(model_state) is None
 
