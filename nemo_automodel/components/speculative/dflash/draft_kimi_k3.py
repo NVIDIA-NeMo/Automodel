@@ -43,7 +43,7 @@ additive DFlash mask (``attention_backend='sdpa'``).
 from __future__ import annotations
 
 import copy
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -77,7 +77,7 @@ class KimiK3DFlashAttention(KimiMLAAttention):
         self,
         hidden_states: torch.Tensor,
         target_hidden: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Attend the draft block over ``[context | noise]``.
@@ -161,7 +161,7 @@ class KimiK3DFlashDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         target_hidden: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one draft layer.
 
@@ -226,10 +226,10 @@ class KimiK3DFlashDraftModel(nn.Module):
 
     def forward(
         self,
-        position_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden: Optional[torch.Tensor] = None,
+        position_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Predict the draft blocks' hidden states.
