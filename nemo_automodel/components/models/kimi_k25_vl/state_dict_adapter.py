@@ -14,7 +14,7 @@
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -171,7 +171,7 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         self._quant_shapes_cache: dict[str, tuple] | None = None
 
     def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+        self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
 

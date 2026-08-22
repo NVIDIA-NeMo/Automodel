@@ -16,14 +16,14 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_chat_template(chat_template: Optional[str]) -> Optional[str]:
+def _resolve_chat_template(chat_template: str | None) -> str | None:
     """Resolve a chat template string that may be a file path.
 
     If *chat_template* points to an existing file, its contents are returned.
@@ -64,9 +64,9 @@ def _tokenize_chat(
     tokenizer: "PreTrainedTokenizer",
     messages: List[Dict[str, Any]],
     *,
-    tools: Optional[List[Dict]] = None,
+    tools: List[Dict] | None = None,
     truncation: Union[str, bool] = "do_not_truncate",
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
 ) -> List[int]:
     """Tokenize chat messages without padding and return input ids."""
     tokenized_chat = tokenizer.apply_chat_template(
@@ -86,9 +86,9 @@ def _tokenized_chat_length(
     tokenizer: "PreTrainedTokenizer",
     messages: List[Dict[str, str]],
     *,
-    tools: Optional[List[Dict]] = None,
+    tools: List[Dict] | None = None,
     truncation: Union[str, bool] = "do_not_truncate",
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
 ) -> int:
     """Return the tokenized chat length for a message prefix without padding."""
     return len(_tokenize_chat(tokenizer, messages, tools=tools, truncation=truncation, seq_length=seq_length))
@@ -97,7 +97,7 @@ def _tokenized_chat_length(
 def _maybe_shift_mask_for_left_padding(
     mask: List[int],
     tokenizer: "PreTrainedTokenizer",
-    attention_mask: Optional[List[int]],
+    attention_mask: List[int] | None,
 ) -> List[int]:
     """Shift a token-level mask right when the tokenizer uses left padding.
 
@@ -146,9 +146,9 @@ def _build_multiturn_assistant_mask(
     formatted_text: List[Dict[str, Any]],
     input_ids: List[int],
     *,
-    tools: Optional[List[Dict]] = None,
+    tools: List[Dict] | None = None,
     truncation: Union[str, bool] = "do_not_truncate",
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     unpadded_full_ids: "list[int] | None" = None,
 ) -> List[int]:
     """Build a fallback loss mask that supervises every assistant turn.
@@ -231,7 +231,7 @@ def _masked_reasoning_message(message: Dict[str, Any]) -> Dict[str, Any]:
     return masked
 
 
-def _find_reasoning_span(full_segment: List[int], masked_segment: List[int]) -> Optional[tuple[int, int]]:
+def _find_reasoning_span(full_segment: List[int], masked_segment: List[int]) -> tuple[int, int] | None:
     """Locate the contiguous token span attributable to reasoning content."""
     prefix_len = 0
     while (
@@ -258,9 +258,9 @@ def _build_reasoning_mask(
     formatted_text: List[Dict[str, Any]],
     input_ids: List[int],
     *,
-    tools: Optional[List[Dict]] = None,
+    tools: List[Dict] | None = None,
     truncation: Union[str, bool] = "do_not_truncate",
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     unpadded_full_ids: "list[int] | None" = None,
 ) -> List[int]:
     """Build a token mask for reasoning_content spans inside assistant turns.
@@ -587,7 +587,7 @@ def format_prompt_completion(
     answer: str,
     eos_token_id: int,
     pad_token_id: int,
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     padding: Union[str, bool] = "do_not_pad",
     truncation: Union[str, bool] = "do_not_truncate",
     answer_only_loss_mask: bool = True,
@@ -667,10 +667,10 @@ def format_chat_template(
     formatted_text: List[Dict[str, Any]],
     eos_token_id: int,
     pad_token_id: int,
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     padding: Union[str, bool] = "do_not_pad",
     truncation: Union[str, bool] = "do_not_truncate",
-    tools: Optional[List[Dict]] = None,
+    tools: List[Dict] | None = None,
     answer_only_loss_mask: bool = True,
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,

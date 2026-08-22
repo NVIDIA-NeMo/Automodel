@@ -23,6 +23,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
+    _sliding_window_mask,
     build_target_layer_ids,
     extract_context_feature,
 )
@@ -183,3 +184,74 @@ def test_spec_generate_keeps_generated_tokens_equal_to_the_mask_id():
     torch.testing.assert_close(out[:, : prompt.shape[1]], prompt)
     generated = out[0, prompt.shape[1] :]
     assert torch.all(generated == cfg.dflash_config["mask_token_id"])
+
+
+def test_sliding_attention_layers_pick_up_the_window():
+    """``layer_types`` decides whether a draft layer is windowed at decode time.
+
+    Training enforces the same window through the block mask; the attention module
+    covers ``spec_generate``, where no explicit mask is passed. A draft left on
+    ``full_attention`` must stay unwindowed.
+    """
+    cfg = _draft_cfg()
+    cfg.layer_types = ["sliding_attention"] * cfg.num_hidden_layers
+    cfg.sliding_window = 32
+    assert all(layer.self_attn.sliding_window == 32 for layer in Qwen3DFlashDraftModel(cfg).layers)
+
+    full = _draft_cfg()
+    full.layer_types = ["full_attention"] * full.num_hidden_layers
+    full.sliding_window = 32
+    assert all(layer.self_attn.sliding_window is None for layer in Qwen3DFlashDraftModel(full).layers)
+
+
+def test_sliding_window_mask_is_a_symmetric_band_around_the_query_position():
+    """Queries are the trailing rows of the ``[context | noise-block]`` key axis.
+
+    A query at row ``i`` therefore sits at key position ``k_len - q_len + i``, and
+    both bounds are strict -- the convention shared by transformers'
+    ``sliding_window_overlay`` and the reference DFlash decode mask.
+    """
+    q_len, k_len, window = 3, 10, 4
+    mask = _sliding_window_mask(torch.zeros(1, 1, q_len, 8), torch.zeros(1, 1, k_len, 8), window)
+    assert mask.shape == (1, 1, q_len, k_len)
+    assert mask.dtype == torch.float32
+    for i in range(q_len):
+        q_pos = k_len - q_len + i
+        expected = [abs(q_pos - k) < window for k in range(k_len)]
+        assert (mask[0, 0, i] == 0).tolist() == expected
+        assert torch.isneginf(mask[0, 0, i][torch.tensor(expected).logical_not()]).all()
+
+
+def test_windowed_decode_forward_matches_an_explicit_additive_mask():
+    """The implicit decode mask must match an additive reference on real backends.
+
+    The trainer supplies an explicit mask, while decoding reaches the implicit
+    sliding-window path by passing ``attention_mask=None``. Compare that path
+    against an independently constructed ``0``/``-inf`` mask on both eager and
+    SDPA; this catches a boolean keep mask being misread as ``+1``/``0`` by eager.
+    """
+    torch.manual_seed(7)
+    noise = torch.randn(1, 4, 32)
+    target_hidden = torch.randn(1, 8, 3 * 32)
+    position_ids = torch.arange(12).unsqueeze(0)
+    query_position = torch.arange(4).unsqueeze(-1) + 8
+    key_position = torch.arange(12).unsqueeze(0)
+    distance = query_position - key_position
+    keep = ((distance < 4) & (-distance < 4))[None, None]
+    explicit_mask = torch.where(keep, torch.tensor(0.0), torch.tensor(float("-inf")))
+
+    for backend in ("eager", "sdpa"):
+        cfg = _draft_cfg()
+        cfg.layer_types = ["sliding_attention"] * cfg.num_hidden_layers
+        cfg.sliding_window = 4
+        cfg._attn_implementation = backend
+        draft = Qwen3DFlashDraftModel(cfg).eval()
+        with torch.inference_mode():
+            implicit = draft(position_ids=position_ids, noise_embedding=noise, target_hidden=target_hidden)
+            explicit = draft(
+                position_ids=position_ids,
+                attention_mask=explicit_mask,
+                noise_embedding=noise,
+                target_hidden=target_hidden,
+            )
+        torch.testing.assert_close(implicit, explicit)
