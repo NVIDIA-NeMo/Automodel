@@ -389,7 +389,8 @@ class Engine:
             eager models, an initialized default process group is treated as
             pure data parallelism when omitted.
         microbatch_size: Number of Datum items collated into each outer batch.
-            Use one with :func:`collate_prebatched`.
+            Use one with :func:`collate_prebatched`. A call may override this
+            fixed grouping with explicit ``microbatch_sizes``.
         collate_fn: Batches one microbatch of Datums into separate model and
             loss inputs. The default supports padded and packed text. VLMs pass
             a model-specific collater. Existing recipes whose dataloaders
@@ -426,9 +427,12 @@ class Engine:
         :class:`ContextParallelSharder`. With an :class:`AutoPipeline`, the
         pipeline schedule owns execution order and backward calls; the Engine
         owns exact microbatch materialization, the complete outer accumulation
-        window, and loss normalization. Pipeline output mappings are
-        synchronized to every physical PP rank. Magi's current packed contract
-        uses one inner pipeline microbatch; recipes enforce that configuration.
+        window, and loss normalization. Per-call ``microbatch_sizes`` changes
+        only those outer Datum groups; each group must still satisfy the
+        AutoPipeline schedule's fixed inner microbatch constraints. Pipeline
+        output mappings are synchronized to every physical PP rank. Magi's
+        current packed contract uses one inner pipeline microbatch; recipes
+        enforce that configuration.
         Packed pipeline batches with multiple inner microbatches must split at
         sequence boundaries into equal-width token chunks. Token-aligned loss
         fields follow those chunks. Layout-aware collaters may additionally
@@ -511,6 +515,8 @@ class Engine:
         self,
         datums: Sequence[Datum],
         loss_fn: LossFn,
+        *,
+        microbatch_sizes: Sequence[int] | None = None,
     ) -> ForwardResult:
         """Run a forward-only Datum window.
 
@@ -535,6 +541,11 @@ class Engine:
                 inputs. It may additionally return opaque mappings per Datum,
                 or a :class:`LossFnOutputBatch` whose explicitly typed token
                 streams the Engine restores across CP.
+            microbatch_sizes: Optional explicit partition of the flat Datum
+                sequence. For example, ``[1, 3]`` collates the first Datum
+                alone and the next three together, overriding
+                ``microbatch_size`` for this call without changing Datum
+                order.
 
         Returns:
             Detached model-parallel-complete loss statistics and per-Datum
@@ -543,7 +554,7 @@ class Engine:
             record per hidden inner sample, and cannot produce records when PP
             splits it into multiple inner microbatches.
         """
-        microbatches = self._group_datums(datums)
+        microbatches = self._group_datums(datums, microbatch_sizes=microbatch_sizes)
         self._validate_execution_parallelism()
         cp_group, cp_size = self._cp_group_and_size()
         self._validate_window_size_across_group(len(microbatches), cp_group, cp_size)
@@ -632,12 +643,28 @@ class Engine:
         self,
         datums: Sequence[Datum],
         loss_fn: LossFn,
+        *,
+        microbatch_sizes: Sequence[int] | None = None,
     ) -> ForwardBackwardResult:
         """Run one complete optimizer accumulation window.
 
         A second call with configured optimizers is rejected until
         :meth:`optim_step` consumes the first call's gradients. A failed
         partial backward poisons the window so its gradients cannot be reused.
+
+        Args:
+            datums: Flat sequence of Datum items in the complete optimizer
+                accumulation window.
+            loss_fn: Computes a per-element loss tensor or scalar local
+                weighted numerator from the raw model output and CP-local loss
+                inputs.
+            microbatch_sizes: Optional explicit partition of the flat Datum
+                sequence. It overrides ``microbatch_size`` for this call while
+                preserving one global loss denominator and optimizer window.
+
+        Returns:
+            Globally normalized loss statistics and per-Datum outputs for the
+            complete optimizer window.
         """
         if self.optimizers:
             if self._backward_status == "ready":
@@ -653,7 +680,7 @@ class Engine:
         if self.optimizers:
             self._backward_status = "running"
         try:
-            result = self._forward_backward_window(datums, loss_fn)
+            result = self._forward_backward_window(datums, loss_fn, microbatch_sizes=microbatch_sizes)
         except BaseException:
             if self.optimizers:
                 self._backward_status = "broken"
@@ -669,6 +696,8 @@ class Engine:
         self,
         datums: Sequence[Datum],
         loss_fn: LossFn,
+        *,
+        microbatch_sizes: Sequence[int] | None = None,
     ) -> ForwardBackwardResult:
         """Accumulate gradients for a complete optimizer window.
 
@@ -707,6 +736,10 @@ class Engine:
             loss_fn: Computes either that per-token loss tensor or a scalar
                 local weighted-sum numerator from the raw model output and
                 collated loss inputs.
+            microbatch_sizes: Optional explicit partition of ``datums`` that
+                overrides the configured fixed ``microbatch_size`` for this
+                optimizer window. The groups share one global loss
+                denominator and one backward lifecycle.
 
         Returns:
             Structured loss statistics and callback outputs. ``loss_sum`` is
@@ -720,7 +753,7 @@ class Engine:
             parameters are unchanged, but their gradients contain the complete
             window's globally normalized backward result.
         """
-        microbatches = self._group_datums(datums)
+        microbatches = self._group_datums(datums, microbatch_sizes=microbatch_sizes)
         self._validate_parallelism()
         dp_group, dp_size = self._dp_group_and_size()
         grad_group, grad_group_size = self._gradient_group_and_size(dp_group, dp_size)
@@ -980,14 +1013,53 @@ class Engine:
         self._backward_status = "idle"
         return OptimStepResult(grad_norm=grad_norm, learning_rates=learning_rates)
 
-    def _group_datums(self, datums: Sequence[Datum]) -> list[list[Datum]]:
+    def _group_datums(
+        self,
+        datums: Sequence[Datum],
+        *,
+        microbatch_sizes: Sequence[int] | None = None,
+    ) -> list[list[Datum]]:
+        """Partition a flat Datum window into ordered outer microbatches.
+
+        Args:
+            datums: Non-empty flat sequence of Datum items.
+            microbatch_sizes: Optional positive sizes whose sum must equal the
+                number of Datums. When omitted, the Engine's fixed
+                ``microbatch_size`` is used.
+
+        Returns:
+            Ordered non-empty Datum groups. Explicit sizes may differ across
+            data-parallel replicas, but model-parallel replicas must provide
+            matching groups and every replica must execute the same number of
+            groups.
+        """
         if not isinstance(datums, Sequence) or isinstance(datums, (str, bytes)) or not datums:
             raise ValueError("Engine requires a non-empty flat sequence of Datum")
         if not all(isinstance(datum, Datum) for datum in datums):
             raise TypeError("Engine received a value that is not a Datum")
-        return [
-            list(datums[start : start + self.microbatch_size]) for start in range(0, len(datums), self.microbatch_size)
-        ]
+        if microbatch_sizes is None:
+            return [
+                list(datums[start : start + self.microbatch_size])
+                for start in range(0, len(datums), self.microbatch_size)
+            ]
+        if not isinstance(microbatch_sizes, Sequence) or isinstance(microbatch_sizes, (str, bytes)):
+            raise TypeError("microbatch_sizes must be a non-empty sequence of positive integers")
+        sizes = tuple(microbatch_sizes)
+        if not sizes:
+            raise ValueError("microbatch_sizes must be non-empty")
+        if any(isinstance(size, bool) or not isinstance(size, int) for size in sizes):
+            raise TypeError(f"microbatch_sizes must contain only positive integers, got {sizes!r}")
+        if any(size <= 0 for size in sizes):
+            raise ValueError(f"microbatch_sizes must contain only positive integers, got {sizes!r}")
+        if sum(sizes) != len(datums):
+            raise ValueError(f"microbatch_sizes {sizes!r} sum to {sum(sizes)}, but received {len(datums)} Datums")
+
+        result: list[list[Datum]] = []
+        start = 0
+        for size in sizes:
+            result.append(list(datums[start : start + size]))
+            start += size
+        return result
 
     def _hybridep_packed_token_target(self, model_inputs: Mapping[str, Any]) -> int | None:
         """Return the EP-wide raw-THD token width required by HybridEP.

@@ -760,6 +760,88 @@ def test_forward_backward_groups_flat_datums_by_microbatch_size():
     assert result.loss.item() == pytest.approx(3.0)
 
 
+@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+def test_explicit_microbatch_sizes_override_fixed_grouping(execution):
+    groups = []
+
+    def recording_collate(datums):
+        """Record and collate one explicit group of ``[S]`` token Datums."""
+        groups.append(tuple(int(datum.model_inputs["input_ids"].item()) for datum in datums))
+        return collate_datums(datums)
+
+    def loss_with_outputs(output, _loss_inputs):
+        """Return ``[B, S]`` losses and one scalar record per Datum."""
+        return output, [{"value": row.flatten()[0]} for row in output]
+
+    model = ScaleModel()
+    result = getattr(Engine(model, device="cpu", microbatch_size=1, collate_fn=recording_collate), execution)(
+        [_datum([value]) for value in range(1, 5)],
+        loss_with_outputs,
+        microbatch_sizes=[1, 3],
+    )
+
+    assert groups == [(1,), (2, 3, 4)]
+    assert model.forward_calls == 2
+    assert [item["value"].item() for item in result.loss_fn_outputs] == [1.0, 2.0, 3.0, 4.0]
+
+
+@pytest.mark.parametrize(
+    ("microbatch_sizes", "error_type"),
+    [
+        pytest.param(1, TypeError, id="not-a-sequence"),
+        pytest.param([], ValueError, id="empty"),
+        pytest.param([0, 4], ValueError, id="zero"),
+        pytest.param([-1, 5], ValueError, id="negative"),
+        pytest.param([True, 3], TypeError, id="bool"),
+        pytest.param([1.5, 2.5], TypeError, id="non-integer"),
+        pytest.param([1, 2], ValueError, id="sum-too-small"),
+        pytest.param([1, 4], ValueError, id="sum-too-large"),
+    ],
+)
+def test_explicit_microbatch_sizes_fail_before_collation(microbatch_sizes, error_type):
+    def unexpected_collate(_datums):
+        pytest.fail("invalid explicit microbatch sizes must fail before collation")
+
+    model = ScaleModel()
+    with pytest.raises(error_type):
+        Engine(model, device="cpu", collate_fn=unexpected_collate).forward(
+            [_datum([value]) for value in range(1, 5)],
+            _identity_loss,
+            microbatch_sizes=microbatch_sizes,
+        )
+
+    assert model.forward_calls == 0
+
+
+def test_explicit_microbatch_sizes_use_one_weighted_optimizer_window():
+    model = ScaleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    datums = [
+        _datum([2, 100], [3.0, 0.0]),
+        _datum([4], [1.0]),
+        _datum([6, 8], [2.0, 1.0]),
+        _datum([10], [3.0]),
+    ]
+    engine = Engine(
+        model,
+        device="cpu",
+        microbatch_size=1,
+        optimizers=optimizer,
+        max_grad_norm=None,
+    )
+
+    result = engine.forward_backward(datums, _identity_loss, microbatch_sizes=(1, 3))
+
+    assert model.forward_calls == 2
+    assert result.loss_sum.item() == pytest.approx(60.0)
+    assert result.weight_sum.item() == pytest.approx(10.0)
+    assert result.loss.item() == pytest.approx(6.0)
+    assert model.weight.grad.item() == pytest.approx(6.0)
+
+    engine.optim_step()
+    assert model.weight.item() == pytest.approx(0.4)
+
+
 def test_hybridep_padding_extends_only_the_physical_thd_extent():
     """Synthetic EP padding preserves documents and every side-channel sentinel."""
     model_inputs = {
@@ -3040,6 +3122,110 @@ def test_model_specific_collater_keeps_multimodal_inputs_and_gradients():
     assert model.vision.weight.grad.abs().sum() > 0
 
 
+def test_explicit_microbatch_sizes_preserve_packed_vlm_group_boundaries():
+    processor = SimpleNamespace(
+        image_token_id=99,
+        image_processor=SimpleNamespace(merge_size=2),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+    )
+    datums = []
+    for sample_id in (10, 20, 30, 40):
+        input_ids = torch.tensor([sample_id, 99, sample_id + 1])
+        datums.append(
+            Datum(
+                model_inputs={
+                    "input_ids": input_ids,
+                    "attention_mask": torch.ones_like(input_ids),
+                    "pixel_values": torch.tensor([[float(sample_id), float(sample_id) + 0.5]]),
+                    "image_grid_thw": torch.tensor([[1, 2, 2]]),
+                },
+                loss_fn_inputs={
+                    "labels": input_ids[1:].clone(),
+                    "weights": torch.ones(2),
+                    "routed_experts": torch.tensor([sample_id, sample_id + 1], dtype=torch.int16).view(2, 1, 1),
+                },
+                loss_fn_input_layouts={
+                    "labels": LossInputLayout.PER_TOKEN,
+                    "weights": LossInputLayout.PER_TOKEN,
+                    "routed_experts": LossInputLayout.PER_TOKEN,
+                },
+                loss_fn_input_pad_values={"labels": -100, "routed_experts": -1},
+            )
+        )
+
+    collate_groups = []
+    collated_routes = []
+    prepared_groups = []
+    canonical_collate = partial(
+        collate_vlm_datums,
+        processor=processor,
+        packed=True,
+        sequence_alignment=4,
+    )
+
+    def recording_collate(group):
+        """Pack one explicit VLM group of processor-ready ``[S]`` Datums."""
+        collate_groups.append(tuple(int(datum.model_inputs["input_ids"][0]) for datum in group))
+        model_inputs, loss_inputs = canonical_collate(group)
+        collated_routes.append(loss_inputs["routed_experts"].detach().clone())
+        return model_inputs, loss_inputs
+
+    @contextmanager
+    def record_prepared_group(model_inputs, loss_inputs):
+        """Capture final THD ``[T]`` metadata, media, and ``[T, L, K]`` routes."""
+        prepared_groups.append(
+            {
+                "cu_seqlens": loss_inputs["cu_seqlens"].detach().clone(),
+                "pixel_values": model_inputs["pixel_values"].detach().clone(),
+                "routed_experts": loss_inputs["routed_experts"].detach().clone(),
+            }
+        )
+        yield
+
+    def loss_with_routes(output, loss_inputs):
+        """Return ``[T]`` losses and restorable ``[T, L, K]`` routes."""
+        return output, LossFnOutputBatch(
+            per_token={
+                "routes": PerTokenOutput(loss_inputs["routed_experts"], fill_value=-1),
+            }
+        )
+
+    model = ScaleModel()
+    model.backend = SimpleNamespace(attn="te")
+    result = Engine(
+        model,
+        device="cpu",
+        microbatch_size=1,
+        collate_fn=recording_collate,
+        batch_context_fn=record_prepared_group,
+    ).forward(datums, loss_with_routes, microbatch_sizes=[1, 3])
+
+    assert collate_groups == [(10,), (20, 30, 40)]
+    assert [group["cu_seqlens"].numel() - 1 for group in prepared_groups] == [1, 3]
+    assert [group["pixel_values"].shape[0] for group in prepared_groups] == [1, 3]
+    assert collated_routes[0].flatten().tolist() == [10, 11, -1, -1]
+    assert collated_routes[1].flatten().tolist() == [
+        20,
+        21,
+        -1,
+        -1,
+        30,
+        31,
+        -1,
+        -1,
+        40,
+        41,
+        -1,
+        -1,
+    ]
+    assert [record["routes"].flatten().tolist() for record in result.loss_fn_outputs] == [
+        [10, 11],
+        [20, 21],
+        [30, 31],
+        [40, 41],
+    ]
+
+
 @pytest.mark.parametrize("packed", [False, True])
 def test_vlm_datum_collater_restores_prediction_aligned_outputs_without_padding(packed):
     """VLM outputs use each Datum's shifted ``S-1`` token length."""
@@ -3317,6 +3503,25 @@ def _distributed_worker(rank: int, world_size: int, init_file: str) -> None:
         assert result.weight_sum.item() == pytest.approx(6.0)
         assert result.loss_fn_outputs == []
         assert model.module.weight.grad.item() == pytest.approx(3.5)
+
+        # Dynamic token balancing keeps the number of forwards rank-symmetric,
+        # but the number of Datums packed into each forward may differ by DP
+        # rank. Those local partitions must still produce one global mean.
+        variable_model = nn.parallel.DistributedDataParallel(ScaleModel())
+        first_value = rank * 4 + 1
+        variable_window = [_datum([value]) for value in range(first_value, first_value + 4)]
+        variable_sizes = [1, 3] if rank == 0 else [2, 2]
+        variable_result = Engine(variable_model, device="cpu", microbatch_size=1).forward_backward(
+            variable_window,
+            _identity_loss,
+            microbatch_sizes=variable_sizes,
+        )
+
+        assert variable_model.module.forward_calls == 2
+        assert variable_result.loss.item() == pytest.approx(4.5)
+        assert variable_result.loss_sum.item() == pytest.approx(36.0)
+        assert variable_result.weight_sum.item() == pytest.approx(8.0)
+        assert variable_model.module.weight.grad.item() == pytest.approx(4.5)
     finally:
         dist.destroy_process_group()
 
