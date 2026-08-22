@@ -777,7 +777,9 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
         "    skip_automodel_reload_logit_parity: true\n"
         "    skip_hf_reload_logit_parity: true\n"
         "    trust_remote_code: false\n"
+        "    capture_router_diagnostics: true\n"
         "    parity_sequence_length: 1024\n"
+        "    cross_framework_gate_sequence_length: 256\n"
         "    parity_tolerance_profile: relaxed\n"
         "    parity_tolerance_profile_overrides:\n"
         "      source_load: strict\n"
@@ -798,7 +800,9 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert custom["skip_automodel_reload_logit_parity"] is True
     assert custom["skip_hf_reload_logit_parity"] is True
     assert custom["trust_remote_code"] is False
+    assert custom["capture_router_diagnostics"] is True
     assert custom["parity_sequence_length"] == "1024"
+    assert custom["cross_framework_gate_sequence_length"] == "256"
     assert custom["parity_tolerance_profile"] == "relaxed"
     assert custom["parity_tolerance_profile_overrides"] == {
         "source_load": "strict",
@@ -819,6 +823,20 @@ def test_extract_custom_args_rejects_removed_config_fields(tmp_path):
     config_path.write_text("ci:\n  checkpoint_robustness:\n    hf_kl_threshold: 0.01\n")
 
     with pytest.raises(ValueError, match="Removed checkpoint-robustness fields.*hf_kl_threshold"):
+        _extract_custom_args(["--config", str(config_path)])
+
+
+@pytest.mark.parametrize("gate_sequence_length", [0, 1025])
+def test_extract_custom_args_rejects_invalid_cross_framework_gate_length(tmp_path, gate_sequence_length):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        "ci:\n"
+        "  checkpoint_robustness:\n"
+        "    parity_sequence_length: 1024\n"
+        f"    cross_framework_gate_sequence_length: {gate_sequence_length}\n"
+    )
+
+    with pytest.raises(ValueError, match="cross_framework_gate_sequence_length"):
         _extract_custom_args(["--config", str(config_path)])
 
 
@@ -1083,6 +1101,7 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         hf_device_map_auto=True,
         hf_source_post_load_dequantize=False,
         parity_tolerance_profile="standard",
+        capture_router_diagnostics=False,
     )
     persisted_logits = torch.load(
         tmp_path / ".checkpoint_robustness" / "source_load_reference_logits.pt",
@@ -1364,6 +1383,7 @@ def test_repeatability_policy_is_same_implementation_and_informational():
 def test_parity_policies_use_structured_per_comparison_profile_and_threshold_overrides():
     custom_args = {
         "parity_tolerance_profile": "standard",
+        "cross_framework_gate_sequence_length": "128",
         "parity_tolerance_profile_overrides": {
             "source_load": "strict",
             "hf_reload": "relaxed",
@@ -1384,13 +1404,17 @@ def test_parity_policies_use_structured_per_comparison_profile_and_threshold_ove
 
     assert source.profile == "strict"
     assert source.mean_kl_threshold_override == 0.01
+    assert source.gate_sequence_length == 128
     assert automodel.profile == "standard"
+    assert automodel.gate_sequence_length is None
     assert automodel.mean_kl_threshold_override == 0.04
     assert automodel.p95_kl_threshold_override is None
     assert automodel.cosine_threshold_override == 0.99
     assert hf.profile == "relaxed"
     assert hf.p95_kl_threshold_override == 0.08
+    assert hf.gate_sequence_length == 128
     assert cross_tp.profile == "relaxed"
+    assert cross_tp.gate_sequence_length is None
     assert cross_tp.cosine_threshold_override == 0.997
 
 
@@ -1407,7 +1431,7 @@ def test_compare_logits_persists_machine_readable_metrics(tmp_path):
 
     assert failure is None
     payload = json.loads((tmp_path / "parity_metrics/phase_2_automodel_model_reload.json").read_text())
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["parity_document_sha256"] == _PARITY_DOCUMENT_SHA256
     assert payload["threshold_mode"] == "profile"
     assert payload["passed"] is True
@@ -1415,11 +1439,41 @@ def test_compare_logits_persists_machine_readable_metrics(tmp_path):
     assert payload["would_pass_profile"] is True
     assert payload["reference_logits"] == {"dtype": "torch.float32", "shape": [1, 2, 2]}
     assert payload["candidate_logits"] == {"dtype": "torch.float32", "shape": [1, 2, 2]}
+    assert payload["full_sequence_length"] == 2
+    assert payload["gate_sequence_length"] == 2
+    assert payload["uses_gate_prefix"] is False
     assert payload["metrics"]["token_count"] == 2
+    assert payload["gate_metrics"] == payload["metrics"]
     assert payload["metrics"]["mean_kl"] == pytest.approx(0.0, abs=1e-8)
     assert payload["metrics"]["mean_jsd"] == pytest.approx(0.0, abs=5e-8)
     assert payload["metrics"]["p95_jsd"] == pytest.approx(0.0, abs=5e-8)
     assert payload["metrics"]["max_jsd"] == pytest.approx(0.0, abs=5e-8)
+
+
+def test_compare_logits_gates_cross_framework_prefix_and_reports_full_sequence(tmp_path):
+    reference_logits = torch.tensor([[[20.0, -20.0], [10.0, -10.0], [20.0, -20.0]]])
+    candidate_logits = reference_logits.clone()
+    candidate_logits[:, 2, :] = -candidate_logits[:, 2, :]
+    policy = _LogitParityPolicy(
+        phase="phase_0",
+        comparison="source_load",
+        comparison_kind="cross_framework",
+        profile="strict",
+        gate_sequence_length=2,
+    )
+
+    failure = _compare_logits(tmp_path, reference_logits, candidate_logits, policy)
+
+    assert failure is None
+    payload = json.loads((tmp_path / "parity_metrics/phase_0_source_load.json").read_text())
+    assert payload["passed"] is True
+    assert payload["uses_gate_prefix"] is True
+    assert payload["full_sequence_length"] == 3
+    assert payload["gate_sequence_length"] == 2
+    assert payload["gate_metrics"]["token_count"] == 2
+    assert payload["metrics"]["token_count"] == 3
+    assert payload["threshold_failures"] == []
+    assert payload["full_sequence_threshold_failures"]
 
 
 def test_compare_logits_marks_skipped_gate_as_informational(tmp_path):

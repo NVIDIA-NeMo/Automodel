@@ -124,6 +124,7 @@ class _LogitParityPolicy:
     mean_kl_threshold_override: float | None = None
     p95_kl_threshold_override: float | None = None
     cosine_threshold_override: float | None = None
+    gate_sequence_length: int | None = None
 
 
 def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]:
@@ -141,6 +142,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         "--max_cpu_gb",
         "--training_reproducibility_loss_threshold",
         "--parity_sequence_length",
+        "--cross_framework_gate_sequence_length",
         "--parity_threshold_overrides",
         "--parity_tolerance_profile",
         "--parity_tolerance_profile_overrides",
@@ -154,6 +156,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         "--check_phantom_keys",
         "--hf_device_map_auto",
         "--hf_source_post_load_dequantize",
+        "--capture_router_diagnostics",
         "--skip_resume",
         "--skip_source_load_parity",
         "--skip_source_load_logit_parity",
@@ -257,6 +260,17 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
     parity_sequence_length = int(custom.get("parity_sequence_length", "2048"))
     if parity_sequence_length <= 0:
         raise ValueError(f"parity_sequence_length must be positive, got {parity_sequence_length}")
+    if "cross_framework_gate_sequence_length" in custom:
+        cross_framework_gate_sequence_length = int(custom["cross_framework_gate_sequence_length"])
+        if cross_framework_gate_sequence_length <= 0:
+            raise ValueError(
+                f"cross_framework_gate_sequence_length must be positive, got {cross_framework_gate_sequence_length}"
+            )
+        if cross_framework_gate_sequence_length > parity_sequence_length:
+            raise ValueError(
+                "cross_framework_gate_sequence_length must not exceed parity_sequence_length "
+                f"({cross_framework_gate_sequence_length} > {parity_sequence_length})"
+            )
     if "hf_reload_timeout_seconds" in custom and int(custom["hf_reload_timeout_seconds"]) <= 0:
         raise ValueError("hf_reload_timeout_seconds must be positive")
     _resolve_parity_thresholds(str(custom.get("parity_tolerance_profile", "standard")), "same_implementation")
@@ -511,6 +525,25 @@ def _compare_logits(
         A failure message when an enforced gate fails, otherwise ``None``.
     """
     metrics = _compute_parity_metrics(reference_logits, candidate_logits)
+    full_sequence_length = reference_logits.shape[-2]
+    gate_sequence_length = full_sequence_length if policy.gate_sequence_length is None else policy.gate_sequence_length
+    if gate_sequence_length <= 0:
+        raise ValueError(f"{policy.comparison} gate_sequence_length must be positive, got {gate_sequence_length}")
+    if policy.gate_sequence_length is not None and policy.comparison_kind != "cross_framework":
+        raise ValueError("gate_sequence_length is supported only for cross-framework comparisons")
+    if gate_sequence_length > full_sequence_length:
+        raise ValueError(
+            f"{policy.comparison} gate_sequence_length={gate_sequence_length} exceeds the captured "
+            f"sequence length {full_sequence_length}"
+        )
+    uses_gate_prefix = gate_sequence_length < full_sequence_length
+    if uses_gate_prefix:
+        gate_metrics = _compute_parity_metrics(
+            reference_logits[..., :gate_sequence_length, :],
+            candidate_logits[..., :gate_sequence_length, :],
+        )
+    else:
+        gate_metrics = metrics
     profile_thresholds = _resolve_parity_thresholds(policy.profile, policy.comparison_kind)
     threshold_overrides = {
         "mean_kl": policy.mean_kl_threshold_override,
@@ -524,11 +557,13 @@ def _compare_logits(
         p95_kl=policy.p95_kl_threshold_override,
         cosine_similarity=policy.cosine_threshold_override,
     )
-    profile_failures = _parity_failures(metrics, profile_thresholds)
-    active_failures = _parity_failures(metrics, active_profile_thresholds)
+    profile_failures = _parity_failures(gate_metrics, profile_thresholds)
+    active_failures = _parity_failures(gate_metrics, active_profile_thresholds)
+    full_sequence_profile_failures = _parity_failures(metrics, profile_thresholds)
+    full_sequence_active_failures = _parity_failures(metrics, active_profile_thresholds)
     threshold_mode = "profile_with_numeric_overrides" if uses_threshold_overrides else "profile"
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "parity_document_sha256": _PARITY_DOCUMENT_SHA256,
         "phase": policy.phase,
         "comparison": policy.comparison,
@@ -542,9 +577,16 @@ def _compare_logits(
         "passed": not policy.enforce or not active_failures,
         "within_active_thresholds": not active_failures,
         "would_pass_profile": not profile_failures,
+        "full_sequence_within_active_thresholds": not full_sequence_active_failures,
+        "full_sequence_would_pass_profile": not full_sequence_profile_failures,
         "failures": list(active_failures) if policy.enforce else [],
         "threshold_failures": list(active_failures),
         "profile_failures": list(profile_failures),
+        "full_sequence_threshold_failures": list(full_sequence_active_failures),
+        "full_sequence_profile_failures": list(full_sequence_profile_failures),
+        "full_sequence_length": full_sequence_length,
+        "gate_sequence_length": gate_sequence_length,
+        "uses_gate_prefix": uses_gate_prefix,
         "reference_logits": {
             "dtype": str(reference_logits.dtype),
             "shape": list(reference_logits.shape),
@@ -554,6 +596,7 @@ def _compare_logits(
             "shape": list(candidate_logits.shape),
         },
         "metrics": metrics.to_dict(),
+        "gate_metrics": gate_metrics.to_dict(),
     }
     report_dir = artifact_dir / "parity_metrics"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -571,7 +614,8 @@ def _compare_logits(
         return None
     if not active_failures:
         return None
-    return f"{policy.comparison} parity failed: " + "; ".join(active_failures)
+    gate_scope = f"first {gate_sequence_length} tokens" if uses_gate_prefix else "full sequence"
+    return f"{policy.comparison} parity failed on {gate_scope}: " + "; ".join(active_failures)
 
 
 def _comparison_threshold_overrides(custom_args: dict[str, object], comparison: str) -> dict[str, float]:
@@ -601,6 +645,11 @@ def _source_load_parity_policy(custom_args: dict[str, object], *, enforce: bool 
         mean_kl_threshold_override=overrides.get("mean_kl"),
         p95_kl_threshold_override=overrides.get("p95_kl"),
         cosine_threshold_override=overrides.get("cosine_similarity"),
+        gate_sequence_length=(
+            int(custom_args["cross_framework_gate_sequence_length"])
+            if "cross_framework_gate_sequence_length" in custom_args
+            else None
+        ),
     )
 
 
@@ -642,6 +691,11 @@ def _hf_reload_parity_policy(custom_args: dict[str, object]) -> _LogitParityPoli
         mean_kl_threshold_override=overrides.get("mean_kl"),
         p95_kl_threshold_override=overrides.get("p95_kl"),
         cosine_threshold_override=overrides.get("cosine_similarity"),
+        gate_sequence_length=(
+            int(custom_args["cross_framework_gate_sequence_length"])
+            if "cross_framework_gate_sequence_length" in custom_args
+            else None
+        ),
     )
 
 
@@ -1375,6 +1429,7 @@ def _prepare_source_load_reference(
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
     parity_tolerance_profile: str = "standard",
+    capture_router_diagnostics: bool = False,
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
     """Compute vanilla HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
@@ -1402,6 +1457,7 @@ def _prepare_source_load_reference(
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
             parity_tolerance_profile=parity_tolerance_profile,
+            capture_router_diagnostics=capture_router_diagnostics,
         )
     except Exception:
         if fail_path is not None:
@@ -1423,12 +1479,16 @@ def _prepare_source_load_reference_rank0(
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
     parity_tolerance_profile: str = "standard",
+    capture_router_diagnostics: bool = False,
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
     """Rank-0 implementation of vanilla HF source-load reference capture."""
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 
     apply_cache_compatibility_patches()
     _patch_remote_masking_api_compatibility()
+    if capture_router_diagnostics:
+        for router_path in _router_diagnostic_paths(_robustness_artifact_dir(cfg)):
+            router_path.unlink(missing_ok=True)
 
     model_kwargs = _model_kwargs_from_config(cfg.model)
     original_pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
@@ -1513,7 +1573,13 @@ def _prepare_source_load_reference_rank0(
         if should_fix_rotary_embeddings([hf_model]):
             fix_rotary_embeddings([hf_model])
 
-    hf_logits = _get_logits(hf_model, input_ids, device)
+    with _router_diagnostic_capture_context(
+        hf_model,
+        _robustness_artifact_dir(cfg),
+        framework="hf",
+        enabled=capture_router_diagnostics,
+    ):
+        hf_logits = _get_logits(hf_model, input_ids, device)
     repeated_hf_logits = _get_logits(hf_model, input_ids, device)
     _compare_logits(
         _robustness_artifact_dir(cfg),
@@ -1565,6 +1631,24 @@ def _compare_source_load_parity(
                 f"{candidate_logits.shape}"
             )
             parity_failure = _compare_logits(artifact_dir, hf_logits, candidate_logits, policy)
+            hf_router_capture, automodel_router_capture, router_report = _router_diagnostic_paths(artifact_dir)
+            if hf_router_capture.exists() or automodel_router_capture.exists():
+                if not hf_router_capture.exists() or not automodel_router_capture.exists():
+                    raise AssertionError(
+                        "Incomplete Phase 0 router diagnostics: expected both HF and AutoModel captures, got "
+                        f"hf={hf_router_capture.exists()} automodel={automodel_router_capture.exists()}"
+                    )
+                from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
+                    compare_glm_router_captures,
+                )
+
+                compare_glm_router_captures(
+                    hf_router_capture,
+                    automodel_router_capture,
+                    router_report,
+                    reference_logits=hf_logits,
+                    candidate_logits=candidate_logits,
+                )
             if parity_failure is not None:
                 raise AssertionError(parity_failure)
             print(
@@ -2141,6 +2225,33 @@ def _robustness_artifact_dir(cfg) -> Path:
     return Path(cfg.checkpoint.checkpoint_dir) / ".checkpoint_robustness"
 
 
+def _router_diagnostic_paths(artifact_dir: Path) -> tuple[Path, Path, Path]:
+    """Return the Phase 0 HF capture, AutoModel capture, and summary paths."""
+    router_dir = artifact_dir / "router_diagnostics"
+    return router_dir / "phase_0_hf.pt", router_dir / "phase_0_automodel.pt", router_dir / "phase_0_summary.json"
+
+
+def _router_diagnostic_capture_context(
+    model: torch.nn.Module,
+    artifact_dir: Path,
+    *,
+    framework: Literal["hf", "automodel"],
+    enabled: bool,
+) -> AbstractContextManager[None]:
+    """Return an opt-in GLM router capture context for one Phase 0 forward."""
+    if not enabled:
+        return nullcontext()
+    from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
+        capture_glm_automodel_routers,
+        capture_glm_hf_routers,
+    )
+
+    hf_path, automodel_path, _report_path = _router_diagnostic_paths(artifact_dir)
+    if framework == "hf":
+        return capture_glm_hf_routers(model, hf_path)
+    return capture_glm_automodel_routers(model, automodel_path)
+
+
 def _source_load_artifact_paths(cfg) -> tuple[Path, Path]:
     """Return the persisted Phase 0 reference-logit and metadata paths."""
     artifact_dir = _robustness_artifact_dir(cfg)
@@ -2256,6 +2367,7 @@ def _run_process_isolated_checkpoint_phase(
             hf_device_map_auto=bool(custom_args.get("hf_device_map_auto", False)),
             hf_source_post_load_dequantize=bool(custom_args.get("hf_source_post_load_dequantize", False)),
             parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
+            capture_router_diagnostics=bool(custom_args.get("capture_router_diagnostics", False)),
         )
         if _preinit_global_rank() == 0:
             assert source_load_reference is not None, "rank 0 source-load reference was not captured"
@@ -2316,12 +2428,18 @@ def _run_process_isolated_checkpoint_phase(
             _barrier()
 
         device = next(source_trainer.model_parts[0].parameters()).device
-        trainer_source_logits = _get_logits(
+        with _router_diagnostic_capture_context(
             source_trainer.model_parts[0],
-            input_ids,
-            device,
-            trainer=source_trainer,
-        )
+            _robustness_artifact_dir(cfg),
+            framework="automodel",
+            enabled=bool(custom_args.get("capture_router_diagnostics", False)),
+        ):
+            trainer_source_logits = _get_logits(
+                source_trainer.model_parts[0],
+                input_ids,
+                device,
+                trainer=source_trainer,
+            )
         source_load_reference = None
         if _rank0():
             metadata = json.loads(metadata_path.read_text())
@@ -2817,6 +2935,7 @@ def run_checkpoint_robustness(
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
             parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
+            capture_router_diagnostics=bool(custom_args.get("capture_router_diagnostics", False)),
         )
         _barrier()
         _report_phase("Phase 0: vanilla-HF source-load reference complete")
@@ -2837,7 +2956,13 @@ def run_checkpoint_robustness(
     if source_load_parity_enabled:
         _report_phase("Phase 0: starting constructed-trainer parity forward")
         device = next(trainer.model_parts[0].parameters()).device
-        trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        with _router_diagnostic_capture_context(
+            trainer.model_parts[0],
+            _robustness_artifact_dir(cfg),
+            framework="automodel",
+            enabled=bool(custom_args.get("capture_router_diagnostics", False)),
+        ):
+            trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
         source_load_failure = _compare_source_load_parity(
             source_load_reference,
             trainer_source_logits,

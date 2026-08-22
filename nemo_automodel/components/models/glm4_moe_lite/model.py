@@ -47,7 +47,9 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 class Block(nn.Module):
     def __init__(self, layer_idx: int, config: Any, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
-        self.self_attn = MLA(config, backend)
+        # The upstream GLM implementation fixes the two MLA latent RMSNorms at
+        # 1e-6 independently of the model-wide rms_norm_eps=1e-5.
+        self.self_attn = MLA(config, backend, latent_norm_eps=1e-6)
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
@@ -154,6 +156,7 @@ class Glm4MoeLiteModel(nn.Module):
             expert_activation="swiglu",
             apply_router_weight_after_down=True,
             softmax_before_topk=False,  # GLM4 uses sigmoid, not softmax
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
