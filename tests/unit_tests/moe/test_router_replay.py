@@ -391,6 +391,34 @@ def test_adapter_finds_decoder_below_module_wrapper():
     assert isinstance(_adapter_gate(model, 1).router_replay, RouterReplay)
 
 
+def test_adapter_binds_sparse_layers_across_pipeline_model_parts():
+    first_part = _AdapterModel(num_layers=2, routed_layers=(1,))
+    last_part = _AdapterModel(num_layers=5, routed_layers=(3,))
+    adapter = RouterReplayAdapter([first_part, last_part])
+    routes = torch.full((2, 5, 2), -1, dtype=torch.int16)
+    routes[:, 1] = torch.tensor([[1, 2], [3, 4]], dtype=torch.int16)
+    routes[:, 3] = torch.tensor([[5, 6], [7, 0]], dtype=torch.int16)
+
+    assert adapter.layer_ids == (1, 3)
+    with adapter(
+        {"input_ids": torch.zeros(2, dtype=torch.long)},
+        {"routed_experts": routes},
+    ):
+        torch.testing.assert_close(_adapter_gate(first_part, 1).router_replay.target_indices, routes[:, 1])
+        torch.testing.assert_close(_adapter_gate(last_part, 3).router_replay.target_indices, routes[:, 3])
+
+
+def test_adapter_allows_pipeline_rank_without_local_moe_layer():
+    adapter = RouterReplayAdapter([_AdapterModel(num_layers=2, routed_layers=())])
+
+    assert adapter.layer_ids == ()
+    with adapter(
+        {"input_ids": torch.zeros(2, dtype=torch.long)},
+        {"routed_experts": torch.zeros(2, 3, 2, dtype=torch.int16)},
+    ):
+        pass
+
+
 def test_adapter_rejects_partial_moe_router_cuda_graph_before_installing_handle():
     model = _AdapterModel(num_layers=3, routed_layers=(1,))
     gate = _adapter_gate(model, 1)

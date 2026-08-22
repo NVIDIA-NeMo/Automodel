@@ -51,13 +51,13 @@ training); call :meth:`RouterReplay.clear_registry` before building a second
 model in the same process.
 
 For rollout-provided routing, :class:`RouterReplayAdapter` is the preferred
-eager Engine interface. It maps global decoder-layer ids without using the
-registry and consumes ``routed_experts`` only after the Engine has applied its
-packing and context-parallel token transform. This adapter intentionally
-supports PP=1 only.
+Engine interface. It maps global decoder-layer ids without using the registry
+and consumes ``routed_experts`` only after the Engine has applied its packing
+and context-parallel token transform. It can bind either one eager model or the
+rank-local model parts of an AutoPipeline.
 """
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
@@ -262,7 +262,7 @@ class _RouterReplayBinding:
 
 
 class RouterReplayAdapter:
-    """Bind rollout routes to one model's MoE gates for eager Engine execution.
+    """Bind rollout routes to model-scoped MoE gates for Engine execution.
 
     The adapter is both the model-aware route formatter and the callable passed
     as ``Engine(batch_context_fn=...)``. It deliberately ignores the legacy
@@ -270,102 +270,112 @@ class RouterReplayAdapter:
     hybrid MoE stacks and multiple models in one process remain unambiguous.
     Do not nest the legacy process-global ``record``/``replay`` contexts around
     an active adapter context when the same gate handles are registered.
-    AutoPipeline is not supported by this adapter; the Engine rejects that
-    combination before execution.
 
     Args:
-        model: Complete PP=1 model. Its primary decoder blocks must expose
-            numeric child ids or a consistent integer ``layer_idx``. A block
-            may contain at most one module with a ``router_replay`` slot.
+        model: One complete eager model, or the rank-local model parts of an
+            AutoPipeline. Primary decoder blocks must expose numeric child ids
+            or a consistent integer ``layer_idx``. A block may contain at most
+            one module with a ``router_replay`` slot. An explicit model-part
+            sequence may contain no local routed layers (for example an
+            embedding-only or LM-head-only pipeline rank).
     """
 
     field_name = "routed_experts"
 
-    def __init__(self, model: nn.Module) -> None:
-        block_root = model
-        visited_roots: set[int] = set()
-        blocks: tuple[tuple[nn.Module, str, nn.Module], ...] = ()
-        while id(block_root) not in visited_roots:
-            visited_roots.add(id(block_root))
-            blocks = tuple(iter_transformer_blocks(block_root))
-            if blocks:
-                break
-            wrapped = getattr(block_root, "module", None)
-            if not isinstance(wrapped, nn.Module):
-                break
-            block_root = wrapped
+    def __init__(self, model: nn.Module | Sequence[nn.Module]) -> None:
+        is_model_parts = not isinstance(model, nn.Module)
+        model_parts = tuple(model) if is_model_parts else (model,)
+        if not model_parts:
+            raise ValueError("RouterReplayAdapter requires at least one model part")
+        if not all(isinstance(part, nn.Module) for part in model_parts):
+            raise TypeError("RouterReplayAdapter model parts must all be nn.Module instances")
 
         bindings: list[_RouterReplayBinding] = []
         seen_replays: set[int] = set()
-        for _parent, child_name, block in blocks:
-            slots = [module for module in block.modules() if hasattr(module, "router_replay")]
-            if not slots:
-                continue
-            if len(slots) != 1:
-                raise ValueError(
-                    f"decoder block {child_name!r} has {len(slots)} router_replay slots; "
-                    "RouterReplayAdapter requires one gate per routed layer"
-                )
+        for model_part in model_parts:
+            block_root = model_part
+            visited_roots: set[int] = set()
+            blocks: tuple[tuple[nn.Module, str, nn.Module], ...] = ()
+            while id(block_root) not in visited_roots:
+                visited_roots.add(id(block_root))
+                blocks = tuple(iter_transformer_blocks(block_root))
+                if blocks:
+                    break
+                wrapped = getattr(block_root, "module", None)
+                if not isinstance(wrapped, nn.Module):
+                    break
+                block_root = wrapped
 
-            declared_ids = {
-                layer_idx
-                for module in block.modules()
-                if isinstance((layer_idx := getattr(module, "layer_idx", None)), int)
-                and not isinstance(layer_idx, bool)
-            }
-            if len(declared_ids) > 1:
-                raise ValueError(
-                    f"decoder block {child_name!r} contains conflicting layer_idx values {sorted(declared_ids)}"
-                )
-            child_idx = int(child_name) if child_name.isdecimal() else None
-            declared_idx = next(iter(declared_ids), None)
-            if child_idx is not None and declared_idx is not None and child_idx != declared_idx:
-                raise ValueError(f"decoder block key {child_idx} disagrees with its layer_idx {declared_idx}")
-            layer_idx = declared_idx if declared_idx is not None else child_idx
-            if layer_idx is None:
-                raise ValueError(f"cannot resolve the global layer id for routed decoder block {child_name!r}")
-            if layer_idx < 0:
-                raise ValueError(f"routed decoder block {child_name!r} has negative layer_idx {layer_idx}")
+            for _parent, child_name, block in blocks:
+                slots = [module for module in block.modules() if hasattr(module, "router_replay")]
+                if not slots:
+                    continue
+                if len(slots) != 1:
+                    raise ValueError(
+                        f"decoder block {child_name!r} has {len(slots)} router_replay slots; "
+                        "RouterReplayAdapter requires one gate per routed layer"
+                    )
 
-            gate = slots[0]
-            topk = getattr(gate, "topk", None)
-            if not isinstance(topk, int) or isinstance(topk, bool) or topk <= 0:
-                raise ValueError(f"decoder block {layer_idx} replay gate must expose a positive integer topk")
-            num_experts = getattr(gate, "n_experts", getattr(gate, "num_experts", None))
-            if num_experts is not None and (
-                not isinstance(num_experts, int) or isinstance(num_experts, bool) or num_experts <= 0
-            ):
-                raise ValueError(f"decoder block {layer_idx} replay gate has invalid expert count {num_experts!r}")
-            if getattr(gate, "use_routing_core", False):
-                raise RuntimeError(
-                    "RouterReplayAdapter is incompatible with partial MoE router CUDA graphs; "
-                    "disable the 'moe_router' graph module before enabling routing replay"
-                )
-            replay = gate.router_replay
-            if replay is None:
-                replay = RouterReplay(register=False)
-                gate.router_replay = replay
-            if not isinstance(replay, RouterReplay):
-                raise TypeError(
-                    f"decoder block {layer_idx} router_replay must be RouterReplay or None, got {type(replay).__name__}"
-                )
-            if id(replay) in seen_replays:
-                raise ValueError("one RouterReplay handle is attached to more than one decoder block")
-            seen_replays.add(id(replay))
-            bindings.append(_RouterReplayBinding(layer_idx, replay, topk, num_experts))
+                declared_ids = {
+                    layer_idx
+                    for module in block.modules()
+                    if isinstance((layer_idx := getattr(module, "layer_idx", None)), int)
+                    and not isinstance(layer_idx, bool)
+                }
+                if len(declared_ids) > 1:
+                    raise ValueError(
+                        f"decoder block {child_name!r} contains conflicting layer_idx values {sorted(declared_ids)}"
+                    )
+                child_idx = int(child_name) if child_name.isdecimal() else None
+                declared_idx = next(iter(declared_ids), None)
+                if child_idx is not None and declared_idx is not None and child_idx != declared_idx:
+                    raise ValueError(f"decoder block key {child_idx} disagrees with its layer_idx {declared_idx}")
+                layer_idx = declared_idx if declared_idx is not None else child_idx
+                if layer_idx is None:
+                    raise ValueError(f"cannot resolve the global layer id for routed decoder block {child_name!r}")
+                if layer_idx < 0:
+                    raise ValueError(f"routed decoder block {child_name!r} has negative layer_idx {layer_idx}")
 
-        if not bindings:
+                gate = slots[0]
+                topk = getattr(gate, "topk", None)
+                if not isinstance(topk, int) or isinstance(topk, bool) or topk <= 0:
+                    raise ValueError(f"decoder block {layer_idx} replay gate must expose a positive integer topk")
+                num_experts = getattr(gate, "n_experts", getattr(gate, "num_experts", None))
+                if num_experts is not None and (
+                    not isinstance(num_experts, int) or isinstance(num_experts, bool) or num_experts <= 0
+                ):
+                    raise ValueError(f"decoder block {layer_idx} replay gate has invalid expert count {num_experts!r}")
+                if getattr(gate, "use_routing_core", False):
+                    raise RuntimeError(
+                        "RouterReplayAdapter is incompatible with partial MoE router CUDA graphs; "
+                        "disable the 'moe_router' graph module before enabling routing replay"
+                    )
+                replay = gate.router_replay
+                if replay is None:
+                    replay = RouterReplay(register=False)
+                    gate.router_replay = replay
+                if not isinstance(replay, RouterReplay):
+                    raise TypeError(
+                        f"decoder block {layer_idx} router_replay must be RouterReplay or None, "
+                        f"got {type(replay).__name__}"
+                    )
+                if id(replay) in seen_replays:
+                    raise ValueError("one RouterReplay handle is attached to more than one decoder block")
+                seen_replays.add(id(replay))
+                bindings.append(_RouterReplayBinding(layer_idx, replay, topk, num_experts))
+
+        if not bindings and not is_model_parts:
             raise ValueError("RouterReplayAdapter found no MoE gate with a router_replay slot in the primary decoder")
         bindings.sort(key=lambda binding: binding.layer_idx)
         layer_ids = [binding.layer_idx for binding in bindings]
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError(f"multiple replay gates map to the same global decoder layer: {layer_ids}")
         topks = {binding.topk for binding in bindings}
-        if len(topks) != 1:
+        if bindings and len(topks) != 1:
             raise ValueError(f"all replay gates must use one topk, got {sorted(topks)}")
         self._bindings = tuple(bindings)
         self._layer_ids = tuple(layer_ids)
-        self._topk = next(iter(topks))
+        self._topk = next(iter(topks), None)
         self._topology_tensors: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @property
@@ -424,6 +434,8 @@ class RouterReplayAdapter:
         self._validate_integral_routes(routed_experts)
         if routed_experts.ndim < 3:
             raise ValueError("prepared routed_experts must have token axes followed by [global_layers, topk]")
+        if not self._bindings:
+            return nullcontext()
 
         weights = loss_fn_inputs.get("weights")
         if isinstance(weights, torch.Tensor) and weights.ndim > 0:
