@@ -13,7 +13,6 @@
 # limitations under the License.
 import warnings
 from functools import partial
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -147,8 +146,8 @@ class FakeBalancedGate(nn.Module):
         self,
         x: torch.Tensor,
         token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        cp_mesh: DeviceMesh | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the gating mechanism.
 
@@ -218,7 +217,7 @@ class _GateRoutingCore(nn.Module):
     independent, parameterless CUDA graph boundary and survives model copies.
     """
 
-    def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Select experts and compute routing probabilities from projected scores."""
         return gate._route_scores(scores)
 
@@ -296,16 +295,16 @@ class Gate(nn.Module):
         # Cumulative expert load is a tensor representing the number of tokens
         # routed to each expert on the current rank, accumulated across gradient
         # accumulation steps.
-        self._cumulative_expert_load: Optional[torch.Tensor] = None
+        self._cumulative_expert_load: torch.Tensor | None = None
 
         # Load balance tracking (enabled externally via enable_load_balance_tracking)
         self._track_load_balance: bool = False
-        self._last_expert_load: Optional[torch.Tensor] = None
-        self._last_aux_loss: Optional[torch.Tensor] = None
+        self._last_expert_load: torch.Tensor | None = None
+        self._last_aux_loss: torch.Tensor | None = None
 
         # Rollout Routing Replay (R3): owns a handle only when enabled so the
         # default routing path stays a no-op.
-        self.router_replay: Optional[RouterReplay] = (
+        self.router_replay: RouterReplay | None = (
             RouterReplay() if getattr(config, "enable_routing_replay", False) else None
         )
         self.routing_core = _GateRoutingCore()
@@ -390,7 +389,7 @@ class Gate(nn.Module):
             return self.e_score_correction_bias.to_local()
         return self.e_score_correction_bias
 
-    def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Apply fixed-shape expert selection and probability math to router logits.
 
         Args:
@@ -517,8 +516,8 @@ class Gate(nn.Module):
         self,
         x: torch.Tensor,
         token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        cp_mesh: DeviceMesh | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the gating mechanism.
 
@@ -673,7 +672,7 @@ class Gate(nn.Module):
         original_scores: torch.Tensor,
         expert_load: torch.Tensor,
         token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
+        cp_mesh: DeviceMesh | None,
     ) -> torch.Tensor:
         """
         Computes the auxiliary loss for load balancing.
@@ -833,13 +832,13 @@ class MoE(nn.Module):
             self.fc2_latent_proj = None
 
         # Set during model parallelization (see parallelizer.apply_cp)
-        self.cp_mesh: Optional[DeviceMesh] = None
+        self.cp_mesh: DeviceMesh | None = None
 
     def forward(
         self,
         x: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        cp_mesh: Optional[DeviceMesh] = None,
+        padding_mask: torch.Tensor | None = None,
+        cp_mesh: DeviceMesh | None = None,
     ) -> torch.Tensor:
         """Route tokens through shared and routed experts.
 

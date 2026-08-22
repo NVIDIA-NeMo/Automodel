@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -344,7 +344,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         use_audio_in_video: bool | None = None,
         video_second_per_grid: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor | dict | CausalLMOutputWithPast:
         """Forward pass with multimodal fusion.

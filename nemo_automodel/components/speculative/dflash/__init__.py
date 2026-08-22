@@ -28,6 +28,10 @@ from nemo_automodel.components.speculative.dflash.core import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
+from nemo_automodel.components.speculative.dflash.dflash2_core import (
+    DFlash2StepMetrics,
+    DFlash2TrainerModule,
+)
 from nemo_automodel.components.speculative.dflash.domino_core import (
     DominoStepMetrics,
     DominoTrainerModule,
@@ -38,6 +42,11 @@ from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
     build_target_layer_ids,
     extract_context_feature,
+)
+from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import (
+    CandidateSelector,
+    GroupedDynamicCausalConv,
+    Qwen3DFlash2DraftModel,
 )
 from nemo_automodel.components.speculative.dflash.registry import (
     DFLASH_DRAFT_REGISTRY,
@@ -54,10 +63,15 @@ __all__ = [
     "create_dflash_sdpa_mask",
     "DominoTrainerModule",
     "DominoStepMetrics",
+    "DFlash2TrainerModule",
+    "DFlash2StepMetrics",
     "compute_accept_len",
     "get_lambda_base",
     "Qwen3DFlashDraftModel",
     "KimiK3DFlashDraftModel",
+    "Qwen3DFlash2DraftModel",
+    "CandidateSelector",
+    "GroupedDynamicCausalConv",
     "build_target_layer_ids",
     "extract_context_feature",
     "HFDFlashTargetModel",

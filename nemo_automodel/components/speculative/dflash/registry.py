@@ -37,6 +37,7 @@ from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
     build_qwen3_dflash_draft_config,
 )
+from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import Qwen3DFlash2DraftModel
 
 
 def _no_target_kwargs(recipe_cfg) -> dict:
@@ -51,6 +52,11 @@ class DFlashDraftSpec:
 
     Attributes:
         draft_cls: The draft model class.
+        draft2_cls: The DFlash 2 draft class for this target: the same backbone
+            plus the in-block convolutions and the candidate selector. ``None``
+            when the family has no DFlash 2 draft, which makes the DFlash 2
+            recipe reject the target rather than silently training the plain
+            DFlash architecture under a DFlash 2 config.
         build_draft_config: Builds the draft config from the target's text
             config; called with the keyword arguments ``num_draft_layers``,
             ``num_target_layers``, ``block_size``, ``dflash_config``, and
@@ -72,7 +78,11 @@ class DFlashDraftSpec:
     """
 
     draft_cls: type[nn.Module]
-    build_draft_config: Callable[..., PretrainedConfig]
+    # ``None`` keeps the recipe's own inline draft-config derivation, which is
+    # what the Qwen3 path (including the DFlash 2 options) is built and tested
+    # around. A family whose draft is shaped differently registers a builder.
+    build_draft_config: Callable[..., PretrainedConfig] | None = None
+    draft2_cls: type[nn.Module] | None = None
     build_target_kwargs: Callable[[Any], dict] = _no_target_kwargs
     attention_backends: tuple[str, ...] = ("flex_attention", "sdpa", "eager")
     supports_context_parallel: bool = True
@@ -84,6 +94,14 @@ class DFlashDraftSpec:
 _QWEN3_ARCHITECTURES: tuple[str, ...] = (
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    # Qwen3.5-family targets, which is what ``Qwen/Qwen3.8-27B`` ships as
+    # (``model_type: qwen3_5``). The ``*ForConditionalGeneration`` variants keep
+    # their decoder hyper-parameters on a nested ``text_config``; the recipe and
+    # the target wrapper unwrap it via ``resolve_text_config``.
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
 )
 # Kimi K3. Both the text-only causal LM and the multimodal wrapper map to the same
 # dense MLA draft: DFlash captures hidden states from the text backbone only, so the
@@ -99,6 +117,7 @@ DFLASH_DRAFT_REGISTRY: dict[str, DFlashDraftSpec] = {
     **{
         arch: DFlashDraftSpec(
             draft_cls=Qwen3DFlashDraftModel,
+            draft2_cls=Qwen3DFlash2DraftModel,
             build_draft_config=build_qwen3_dflash_draft_config,
         )
         for arch in _QWEN3_ARCHITECTURES

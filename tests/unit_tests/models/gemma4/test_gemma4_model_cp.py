@@ -514,7 +514,7 @@ def test_prepare_model_inputs_consumes_nothing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# get_capabilities: dense 31B supports CP; E2B/E4B (audio) does not; MoE does
+# get_capabilities: dense 31B and E2B/E4B support TP/CP; MoE supports CP/EP
 # ---------------------------------------------------------------------------
 def test_get_capabilities_plain_dense_supports_cp():
     caps = Gemma4ForConditionalGeneration.get_capabilities(_cfg(enable_moe_block=False))
@@ -525,13 +525,13 @@ def test_get_capabilities_plain_dense_supports_cp():
 
 
 def test_get_capabilities_dense_audio_variant_supports_cp():
-    # E2B/E4B: dense + audio_config present -> CP supported (kv-sharing +
-    # per-layer-inputs flow through the model-owned ring). TP/PP/EP stay off.
+    # E2B/E4B: dense + audio_config present -> TP/CP supported (kv-sharing +
+    # per-layer-inputs flow through model-owned distributed paths). PP/EP stay off.
     cfg = _cfg(enable_moe_block=False)
     cfg.audio_config = {}  # non-None marks the dense+audio variant (E2B/E4B)
     caps = Gemma4ForConditionalGeneration.get_capabilities(cfg)
     assert caps.supports_cp is True
-    assert caps.supports_tp is False
+    assert caps.supports_tp is True
     assert caps.supports_pp is False
     assert caps.supports_ep is False
 
@@ -557,6 +557,7 @@ def test_dense_init_attaches_ring_to_self_attention():
             "_packed_seq_ids",
             "padding_mask",
             "_gemma4_vision_group_ids",
+            "_gemma4_has_vision_tokens",
         )
         assert callable(m.setup_cp_attention)
 
@@ -664,8 +665,31 @@ def test_forward_dense_cp_stashes_metadata_on_ring_modules():
     assert hooked, "expected ring-hooked self_attn modules"
     for m in hooked:
         meta = m._cp_dense_metadata
-        assert set(meta) == {"mm_token_type_ids", "padding_mask", "_packed_seq_ids", "_gemma4_vision_group_ids"}
+        assert set(meta) == {
+            "mm_token_type_ids",
+            "padding_mask",
+            "_packed_seq_ids",
+            "_gemma4_vision_group_ids",
+            "_gemma4_has_vision_tokens",
+        }
         assert torch.equal(meta["_packed_seq_ids"], packed)
+        assert meta["_gemma4_has_vision_tokens"] is False
+
+    mm_token_type_ids = torch.tensor([[0, 1, 1, 0]])
+    with mock.patch.object(
+        model.model.language_model,
+        "forward",
+        return_value=SimpleNamespace(
+            last_hidden_state=hidden, past_key_values=None, hidden_states=None, attentions=None
+        ),
+    ):
+        model(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            mm_token_type_ids=mm_token_type_ids,
+            _packed_seq_ids=packed,
+        )
+    for m in hooked:
+        assert m._cp_dense_metadata["_gemma4_has_vision_tokens"] is True
 
 
 def test_forward_dense_cp_injects_kv_share_holder():
