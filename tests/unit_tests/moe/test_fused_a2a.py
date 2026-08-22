@@ -12,23 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for DeepEP buffer teardown (``fused_a2a.free_buffer``)."""
+"""Unit tests for DeepEP and HybridEP autograd wiring."""
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
 import nemo_automodel.components.moe.megatron.fused_a2a as fused_a2a
 
 
 @pytest.fixture(autouse=True)
 def _restore_buffer():
-    """Save/restore the module-global ``_buffer`` so tests don't leak state."""
+    """Save/restore module-global buffers so tests don't leak state."""
     saved = fused_a2a._buffer
+    saved_hybrid_ep = fused_a2a._hybrid_ep_buffer
     try:
         yield
     finally:
         fused_a2a._buffer = saved
+        fused_a2a._hybrid_ep_buffer = saved_hybrid_ep
 
 
 def test_free_buffer_destroys_and_clears():
@@ -60,3 +64,38 @@ def test_free_buffer_swallows_destroy_errors():
 
     boom.destroy.assert_called_once_with()
     assert fused_a2a._buffer is None
+
+
+def test_hybridep_autograd_forwards_permute_fusion_in_both_directions():
+    buffer = mock.MagicMock()
+    hidden = torch.randn(4, 8)
+    probs = torch.randn(4, 2)
+    routing_map = torch.ones(4, 2, dtype=torch.bool)
+    tokens_per_expert = torch.tensor([2, 2])
+    handle = object()
+    buffer.dispatch_with_permute.return_value = (hidden, probs, None, tokens_per_expert, handle)
+    buffer.combine_with_unpermute.return_value = (hidden, probs)
+    fused_a2a._hybrid_ep_buffer = buffer
+
+    dispatch_ctx = SimpleNamespace()
+    fused_a2a.HybridEPDispatch.forward(
+        dispatch_ctx,
+        hidden,
+        routing_map,
+        probs,
+        None,
+        2,
+        permute_fusion=True,
+    )
+    dispatch_grads = fused_a2a.HybridEPDispatch.backward(dispatch_ctx, hidden, probs, None, None, None)
+
+    combine_ctx = SimpleNamespace()
+    fused_a2a.HybridEPCombine.forward(combine_ctx, hidden, handle, permute_fusion=True)
+    combine_grads = fused_a2a.HybridEPCombine.backward(combine_ctx, hidden)
+
+    assert buffer.dispatch_with_permute.call_args_list[0].kwargs["fuse_permute_dispatch"] is True
+    assert buffer.dispatch_with_permute.call_args_list[1].kwargs["fuse_permute_dispatch"] is True
+    assert buffer.combine_with_unpermute.call_args_list[0].kwargs["fuse_unpermute_combine"] is True
+    assert buffer.combine_with_unpermute.call_args_list[1].kwargs["fuse_unpermute_combine"] is True
+    assert len(dispatch_grads) == 10
+    assert len(combine_grads) == 5
