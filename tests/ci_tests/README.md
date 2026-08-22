@@ -156,7 +156,8 @@ Jensen-Shannon divergence (natural log, bounded by `ln(2)`); whole-tensor cosine
 logit difference. The full record is printed as `CHECKPOINT_PARITY_METRICS <json>` and saved under
 `<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`. Named profiles gate mean KL, p95 KL, and cosine similarity.
 JSD, max KL, and absolute logit differences remain diagnostics, allowing their usefulness to be evaluated without
-changing pass/fail policy.
+changing pass/fail policy. Record schema version 2 adds `mean_jsd`, `p95_jsd`, and `max_jsd` under `metrics`; existing
+version 1 fields retain their meaning.
 
 Each vanilla-HF reference is forwarded twice through the same loaded model. The resulting `hf_source_self_repeat`
 or `hf_export_self_repeat` record is informational and distinguishes cross-framework drift from an unstable reference.
