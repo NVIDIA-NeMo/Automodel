@@ -14,26 +14,25 @@
 
 """State dict adapter for Llama model.
 
-The model uses separate q_proj / k_proj / v_proj / gate_proj / up_proj that match
-HuggingFace key names exactly, so the adapter is a passthrough (only tied-weight
-handling is applied in from_hf).
+The model uses separate q_proj / k_proj / v_proj / gate_proj / up_proj whose keys and tensor representations match
+Hugging Face exactly, so the adapter is a passthrough (only tied-weight handling is applied in ``from_hf``).
 """
 
 import logging
-import re
 from typing import Any
 
 from transformers import LlamaConfig
 
+from nemo_automodel.components.checkpoint.state_dict_adapter import PassthroughStateDictAdapter
+
 logger = logging.getLogger(__name__)
 
 
-class LlamaStateDictAdapter:
+class LlamaStateDictAdapter(PassthroughStateDictAdapter):
     """State dict adapter for Llama models.
 
-    Uses separate projections that match HuggingFace key names exactly, so
-    from_hf / to_hf are simple passthroughs (only tied-weight handling in
-    from_hf).
+    Separate projections already match Hugging Face keys and tensor representations exactly, so ``from_hf`` and
+    ``to_hf`` do not transform tensor data. ``from_hf`` only adds the missing output-weight alias for tied embeddings.
 
     Example:
         from transformers import LlamaConfig
@@ -64,14 +63,3 @@ class LlamaStateDictAdapter:
                 logger.info(f"Tying lm_head.weight to {embed_key} (HuggingFace checkpoint has tied weights)")
                 custom_state_dict[lm_head_key] = custom_state_dict[embed_key]
         return custom_state_dict
-
-    def to_hf(
-        self,
-        state_dict: dict[str, Any],
-        exclude_key_regex: str | None = None,
-        **kwargs,
-    ) -> dict[str, Any]:
-        # Model keys are already in HF format.
-        if exclude_key_regex is not None:
-            return {k: v for k, v in state_dict.items() if not re.search(exclude_key_regex, k)}
-        return dict(state_dict)
