@@ -576,6 +576,7 @@ checkpoint cadence: `ckpt_every_steps`, `save_checkpoint_every_epoch`.
 | `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k`, `selector_loss_weight` | DFlash 2 | Convolution and path-selector knobs on top of the DFlash set. |
 | `draft_sliding_window` | DFlash family | Bounds how far back a block reads the target context; unset attends over the whole prefix. |
 | `draft_num_attention_heads`, `draft_num_key_value_heads`, `draft_head_dim` | DFlash family | Size the draft's attention independently of the target's; default to the target's shape. |
+| `output_multiplier`, `final_logit_softcapping`, `input_embedding_scale` | DFlash family | The target's logit/embedding transforms, applied in both training and decoding. Identity unless set; the published Muse Glimmer drafter ships a multiplier and a softcap. |
 | `emb_dim`, `gru_hidden_dim`, `pure_draft_prefix_len`, `shift_label` | Domino | Correction-head knobs on top of the DFlash set. |
 | `kd_temperature`, `kd_chunk_size` | JetSpec | Forward-KL distillation knobs on top of the DFlash set. |
 | `markov_rank`, `markov_head_type`, `confidence_head_alpha`, `confidence_head_with_markov`, `ce_loss_alpha` | DSpark | Markov / confidence-head knobs on top of the block-drafting set (`block_size`, `num_anchors`, `mask_token_id`, `target_layer_ids`, and so on). |

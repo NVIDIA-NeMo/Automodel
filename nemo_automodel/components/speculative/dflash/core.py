@@ -548,7 +548,9 @@ class DFlashTrainerModule(nn.Module):
         )
         # A tensor-parallel target's lm_head is column-parallel and returns
         # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.
-        logits = _to_full_tensor(self.lm_head(output_hidden))
+        # ``compute_logits`` applies the target's output transform (multiplier /
+        # softcapping) so training supervises the distribution serving produces.
+        logits = _to_full_tensor(self.draft_model.compute_logits(output_hidden, self.lm_head))
 
         n = anchor_positions.size(1)
         bs = self.block_size

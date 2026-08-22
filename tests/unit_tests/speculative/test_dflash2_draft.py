@@ -412,6 +412,12 @@ class _ConstantTarget(torch.nn.Module):
         self.forced_token_id = forced_token_id
         self.device = torch.device("cpu")
 
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
     def forward(
         self,
         input_ids,
@@ -549,3 +555,30 @@ def test_spec_generate_stops_at_a_stop_token():
 
     assert out[0, -1].item() == 9
     assert out.shape[1] == prompt.shape[1] + 1
+
+
+def test_spec_generate_honours_top_k_on_the_targets_distribution():
+    """``top_k=1`` collapses the target distribution onto its argmax.
+
+    Sampled decoding must then emit that token every step, which pins the knob to
+    the *target's* distribution -- where rejection sampling reads it -- rather than
+    it being accepted and dropped. The blog evaluates at top-p 0.95 / top-k 20, so
+    without this the published acceptance numbers are not reproducible.
+    """
+    torch.manual_seed(0)
+    cfg = _draft_cfg()
+    draft = Qwen3DFlash2DraftModel(cfg)
+    target = _ConstantTarget(cfg, forced_token_id=6)
+
+    prompt = torch.tensor([[1, 2, 3]])
+    out = draft.spec_generate(target, prompt, 6, stop_token_ids=None, temperature=1.0, top_k=1)
+
+    assert torch.all(out[0, prompt.shape[1] :] == 6)
+
+
+def test_spec_generate_rejects_invalid_sampling_parameters():
+    cfg = _draft_cfg()
+    draft = Qwen3DFlash2DraftModel(cfg)
+    target = _ConstantTarget(cfg, forced_token_id=3)
+    with pytest.raises(ValueError, match="sampling parameters"):
+        draft.spec_generate(target, torch.tensor([[1, 2]]), 4, stop_token_ids=None, temperature=1.0, top_p=1.5)
