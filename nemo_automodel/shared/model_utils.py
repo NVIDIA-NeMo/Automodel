@@ -21,12 +21,11 @@ from torch import nn
 _TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
 
 
-def iter_transformer_and_mtp_blocks(model: nn.Module) -> Iterator[tuple[nn.Module, str, nn.Module]]:
-    """Yield transformer and MTP blocks without depending on a recipe or component.
+def iter_transformer_blocks(model: nn.Module) -> Iterator[tuple[nn.Module, str, nn.Module]]:
+    """Yield primary decoder blocks without depending on a model family.
 
     Args:
-        model: Model root containing a transformer layer collection and optional
-            multi-token-prediction layers.
+        model: Model root containing a transformer layer collection.
 
     Yields:
         Tuples containing the parent layer collection, child name, and block.
@@ -44,6 +43,19 @@ def iter_transformer_and_mtp_blocks(model: nn.Module) -> Iterator[tuple[nn.Modul
     if layers is not None:
         for layer_id, block in layers.named_children():
             yield layers, layer_id, block
+
+
+def iter_transformer_and_mtp_blocks(model: nn.Module) -> Iterator[tuple[nn.Module, str, nn.Module]]:
+    """Yield primary decoder and MTP blocks without model-family branches.
+
+    Args:
+        model: Model root containing a transformer layer collection and optional
+            multi-token-prediction layers.
+
+    Yields:
+        Tuples containing the parent layer collection, child name, and block.
+    """
+    yield from iter_transformer_blocks(model)
 
     mtp_layers = getattr(getattr(model, "mtp", None), "layers", None)
     if mtp_layers is not None:

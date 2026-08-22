@@ -456,6 +456,28 @@ class TestMaybeAddDrafterLoss:
         # pin the exact floats since they depend on the toy loss arithmetic.
         assert any("[joint-drafter]" in r.getMessage() for r in caplog.records)
 
+    def test_log_denominator_reports_means_for_engine_sums(self, caplog):
+        import logging
+
+        recipe = self._make_recipe()
+        recipe.loss_fn = lambda *, logits, **_kwargs: logits.sum()
+        out = _FakeJointOut(drafter_logits=[torch.zeros((1, 2, 3))], drafter_loss_weight=0.01)
+        with caplog.at_level(logging.INFO, logger="nemo_automodel.recipes.vlm.finetune"):
+            FinetuneRecipeForVLM._maybe_add_drafter_loss(
+                recipe,
+                out=out,
+                base_loss=torch.tensor(4.0),
+                labels=torch.tensor([[1, 2]]),
+                model=MagicMock(),
+                num_label_tokens=None,
+                log=True,
+                log_denominator=2,
+            )
+
+        message = next(record.getMessage() for record in caplog.records if "[joint-drafter]" in record.getMessage())
+        assert "L_base=2.0000" in message
+        assert "L_total=2.0000" in message
+
     def test_log_off_main_rank_emits_nothing(self, caplog):
         """``log=True`` but ``dist_env.is_main=False`` (off-main rank): no
         log record from the joint-drafter path."""

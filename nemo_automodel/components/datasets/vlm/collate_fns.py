@@ -1434,8 +1434,8 @@ def pad_collate_fn(
         "attention_mask": torch.stack(padded_attention_mask),
     }
 
-    # Pad sequence-length tensors that mirror input_ids (e.g. mm_token_type_ids)
-    for seq_key in ("mm_token_type_ids",):
+    # Pad sequence-length tensors that mirror input_ids.
+    for seq_key in ("mm_token_type_ids", "token_type_ids"):
         if any(seq_key in ex for ex in examples):
             padded = []
             for ex in examples:
@@ -1670,8 +1670,9 @@ def packed_sequence_thd_vlm_collater(
             (default -1000); filtered downstream in ``process_input_for_thd``.
 
     Returns:
-        Dict with ``input_ids``/``labels`` ``[batch, seq]``, ``position_ids``
-        ``[batch, seq]`` or ``[3, batch, seq]``, ``seq_lens``/``seq_lens_padded``
+        Dict with ``input_ids``/``labels`` ``[batch, seq]``, optional token-type
+        fields ``[batch, seq]``, ``position_ids`` ``[batch, seq]`` or
+        ``[3, batch, seq]``, ``seq_lens``/``seq_lens_padded``
         ``[batch, max_packs]``, ``qkv_format='thd'``, and concatenated media tensors.
     """
     if not batch:
@@ -1756,6 +1757,14 @@ def packed_sequence_thd_vlm_collater(
         "seq_lens_padded": seq_lens_padded,
         "qkv_format": "thd",
     }
+
+    for key in ("mm_token_type_ids", "token_type_ids"):
+        if any(key in item and item[key] is not None for item in batch):
+            values = [
+                item[key] if item.get(key) is not None else torch.zeros_like(torch.as_tensor(item["input_ids"]))
+                for item in batch
+            ]
+            result[key] = torch.stack([_pad_seq(value, 0, max_len) for value in values])
 
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]

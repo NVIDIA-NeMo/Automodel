@@ -143,6 +143,44 @@ class TestResolveMeshContext:
 
 
 class TestFromPretrainedDeviceMesh:
+    def test_forwards_pre_fsdp_hook_configuration_to_build_model(self):
+        hook = MagicMock()
+        task_head_prefixes = ("value_head.",)
+
+        with (
+            patch("torch.cuda.current_device", return_value=0),
+            patch("nemo_automodel._transformers.auto_model.instantiate_infrastructure") as mock_infra,
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=MagicMock()),
+            patch("nemo_automodel._transformers.auto_model.get_is_hf_model", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.resolve_sdpa_method", return_value=None),
+            patch.object(NeMoAutoModelForCausalLM, "_build_model", return_value=MagicMock()) as mock_build,
+        ):
+            mock_infra.return_value = (None, None, None, None)
+
+            NeMoAutoModelForCausalLM.from_pretrained(
+                "test-model",
+                pre_fsdp_hook=hook,
+                skip_task_head_prefixes_for_base_model=task_head_prefixes,
+            )
+
+        assert mock_build.call_args.kwargs["pre_fsdp_hook"] is hook
+        assert mock_build.call_args.kwargs["skip_task_head_prefixes_for_base_model"] is task_head_prefixes
+
+    def test_from_config_forwards_pre_fsdp_hook_configuration_to_build_model(self):
+        hook = MagicMock()
+        task_head_prefixes = ("value_head.",)
+
+        with patch.object(_BaseNeMoAutoModelClass, "_build_model", return_value=MagicMock()) as mock_build:
+            _BaseNeMoAutoModelClass.from_config(
+                config=MagicMock(name_or_path="test"),
+                trust_remote_code=False,
+                pre_fsdp_hook=hook,
+                skip_task_head_prefixes_for_base_model=task_head_prefixes,
+            )
+
+        assert mock_build.call_args.kwargs["pre_fsdp_hook"] is hook
+        assert mock_build.call_args.kwargs["skip_task_head_prefixes_for_base_model"] is task_head_prefixes
+
     def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
         sentinel_model = object()
@@ -1538,6 +1576,12 @@ class TestBuildModelRetryDepth:
         """When the retried call succeeds, the model is returned normally."""
         build_kwargs, mock_config = self._make_build_kwargs()
         sentinel_model = MagicMock()
+        hook = MagicMock()
+        task_head_prefixes = ("value_head.",)
+        build_kwargs.update(
+            pre_fsdp_hook=hook,
+            skip_task_head_prefixes_for_base_model=task_head_prefixes,
+        )
         with (
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
             patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
@@ -1547,7 +1591,9 @@ class TestBuildModelRetryDepth:
                 "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
                 return_value=sentinel_model,
             ),
-            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model
+            ) as mock_apply,
             patch("torch.cuda.current_device", return_value=0),
         ):
             mock_init.side_effect = [
@@ -1557,6 +1603,8 @@ class TestBuildModelRetryDepth:
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert result is sentinel_model
             assert mock_init.call_count == 2
+            assert mock_apply.call_args.kwargs["pre_fsdp_hook"] is hook
+            assert mock_apply.call_args.kwargs["skip_task_head_prefixes_for_base_model"] is task_head_prefixes
 
     def test_build_model_applies_runtime_patches_before_infrastructure(self):
         """Model runtime hooks run after construction and before sharding/checkpoint infra."""

@@ -40,6 +40,11 @@ from .package_info import __package_name__, __version__
 _SUBMODULES = {"recipes", "shared", "components", "models"}
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    "CollatedLossInputs": ("nemo_automodel.components.datasets.datum", "CollatedLossInputs"),
+    "Datum": ("nemo_automodel.components.datasets.datum", "Datum"),
+    "Engine": ("nemo_automodel.engine", "Engine"),
+    "LossInputLayout": ("nemo_automodel.components.datasets.datum", "LossInputLayout"),
+    "LossFnOutputBatch": ("nemo_automodel.engine.outputs", "LossFnOutputBatch"),
     "NeMoAutoModelForCausalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCausalLM"),
     "NeMoAutoModelForImageTextToText": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForImageTextToText"),
     "NeMoAutoModelForMultimodalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForMultimodalLM"),
@@ -56,6 +61,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoModelBiEncoder": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelBiEncoder"),
     "NeMoAutoModelCrossEncoder": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelCrossEncoder"),
     "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
+    "PerTokenOutput": ("nemo_automodel.engine.outputs", "PerTokenOutput"),
+    "PreFSDPHookResult": ("nemo_automodel.shared.task_heads", "PreFSDPHookResult"),
     "NeMoAutoDiffusionPipeline": ("nemo_automodel._diffusers.auto_diffusion_pipeline", "NeMoAutoDiffusionPipeline"),
     "ModelCapabilities": ("nemo_automodel._transformers.model_capabilities", "ModelCapabilities"),
     "query_capabilities": ("nemo_automodel._transformers.model_capabilities", "query_capabilities"),

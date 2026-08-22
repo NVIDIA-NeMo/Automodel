@@ -154,9 +154,13 @@ def _install_torch_and_layers_stubs(monkeypatch):
     # fsdp
     fsdp_stub = types.ModuleType("torch.distributed.fsdp")
 
+    class FSDPModule:
+        pass
+
     def fully_shard(*args, **kwargs):
         return None
 
+    fsdp_stub.FSDPModule = FSDPModule
     fsdp_stub.fully_shard = fully_shard
 
     fsdp_fully_stub = types.ModuleType("torch.distributed.fsdp._fully_shard")
@@ -225,6 +229,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
         REENTRANT = "reentrant"
 
     cpw_stub.checkpoint_wrapper = checkpoint_wrapper
+    cpw_stub._CHECKPOINT_PREFIX = "_checkpoint_wrapped_module."
     # components/distributed/activation_checkpointing.py imports this at module
     # scope; without it that module only imports when an earlier test happened to
     # cache it under real torch, making this file order-dependent.
@@ -340,6 +345,14 @@ def _install_torch_and_layers_stubs(monkeypatch):
     experts_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
     experts_stub.GroupedExpertsTE = GroupedExpertsTE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.experts", experts_stub)
+
+    mok_experts_stub = types.ModuleType("nemo_automodel.components.moe.mok_experts")
+
+    class GroupedExpertsMoK:
+        pass
+
+    mok_experts_stub.GroupedExpertsMoK = GroupedExpertsMoK
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.mok_experts", mok_experts_stub)
 
 
 def _import_parallelizer_with_stubs(monkeypatch):
@@ -463,8 +476,8 @@ def _import_parallelizer_with_stubs(monkeypatch):
     activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
     activation_checkpointing_stub.ensure_fsdp_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
-    activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = (
-        lambda context_fn=None: context_fn() if context_fn is not None else (nullcontext(), nullcontext())
+    activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: (
+        context_fn() if context_fn is not None else (nullcontext(), nullcontext())
     )
     monkeypatch.setitem(
         sys.modules,
@@ -964,6 +977,31 @@ def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):
 
     outer_call = _find_call_by_first_arg(fully_shard_mock, outer_model)
     assert outer_call is not None and outer_call[1]["mesh"] is fsdp_mesh
+
+
+def test_apply_fsdp_does_not_double_wrap_pre_wrapped_task_head(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    task_head = P.FSDPModule()
+    model = DummyModel([block], lm_head=task_head)
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=True,
+        ep_shard_enabled=False,
+    )
+
+    assert _find_call_by_first_arg(fully_shard_mock, task_head) is None
+    assert _find_call_by_first_arg(fully_shard_mock, block) is not None
+    assert _find_call_by_first_arg(fully_shard_mock, model) is not None
 
 
 def test_apply_fsdp_rejects_cross_root_tied_embeddings_without_outer_wrap(monkeypatch):

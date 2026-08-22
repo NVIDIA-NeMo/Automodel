@@ -74,6 +74,7 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
+from nemo_automodel.shared.task_heads import PreFSDPHookResult, register_task_head_module
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
@@ -906,6 +907,36 @@ def test_model_state_refreshes_tied_lm_head_before_dropping_key():
     assert "model.embed_tokens.weight" in saved_state_dict
 
 
+def test_peft_model_state_saves_lora_and_managed_task_head():
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Linear(2, 2)
+    model.backbone.weight.requires_grad_(False)
+    model.backbone.bias.requires_grad_(False)
+    model.backbone.register_parameter("lora_A", torch.nn.Parameter(torch.ones(1)))
+
+    pre_hook_module_ids = {id(module) for module in model.modules()}
+    pre_hook_parameter_ids = {id(parameter) for parameter in model.parameters()}
+    model.task_head = torch.nn.Linear(2, 1)
+    register_task_head_module(
+        model,
+        PreFSDPHookResult(task_module=model.task_head),
+        pre_hook_module_ids=pre_hook_module_ids,
+        pre_hook_parameter_ids=pre_hook_parameter_ids,
+    )
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_model_state_dict",
+        return_value=model.state_dict(),
+    ):
+        saved_state_dict = ModelState(model, is_peft=True).state_dict()
+
+    assert set(saved_state_dict) == {
+        "base_model.model.backbone.lora_A",
+        "base_model.model.task_head.bias",
+        "base_model.model.task_head.weight",
+    }
+
+
 @pytest.mark.parametrize("cpu_offload", [False, True])
 def test_model_state_passes_cpu_offload_to_dcp(cpu_offload):
     model = torch.nn.Linear(2, 2)
@@ -1527,6 +1558,96 @@ class TestLoadModelCustomModelGuard:
 
         mock_load_full.assert_called_once()
         mock_dcp_load.assert_not_called()
+
+    @pytest.mark.parametrize("checkpoint_format", ["safetensors", "bin"])
+    def test_base_checkpoint_fast_path_preserves_skipped_task_head(self, checkpoint_format):
+        """Base checkpoint loading keeps task-head initialization for both HF fast paths."""
+        checkpointer = self._make_checkpointer()
+        checkpointer.config.skip_task_head_prefixes_for_base_model = ["task_head."]
+
+        model = torch.nn.Module()
+        model.backbone = torch.nn.Linear(4, 4)
+        model.task_head = torch.nn.Linear(4, 1)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.fill_(1.0)
+
+        checkpoint_state = {
+            name: torch.full_like(tensor, 2.0 if name.startswith("backbone.") else 3.0)
+            for name, tensor in model.state_dict().items()
+        }
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint",
+                return_value=checkpoint_format == "safetensors",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._is_bin_checkpoint",
+                return_value=checkpoint_format == "bin",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype",
+                return_value=checkpoint_state,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model",
+                side_effect=lambda model_parts, state_dict: model_parts[0].load_state_dict(state_dict, strict=False),
+            ) as mock_load_full,
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        loaded_state = mock_load_full.call_args.args[1]
+        assert set(loaded_state) == {"backbone.weight", "backbone.bias"}
+        assert all(torch.equal(parameter, torch.full_like(parameter, 2.0)) for parameter in model.backbone.parameters())
+        assert all(
+            torch.equal(parameter, torch.full_like(parameter, 1.0)) for parameter in model.task_head.parameters()
+        )
+        mock_dcp_load.assert_not_called()
+
+    def test_training_checkpoint_restore_does_not_skip_task_head(self):
+        """Training checkpoint restore loads task heads even when base-load filtering is configured."""
+        checkpointer = self._make_checkpointer()
+        checkpointer.config.skip_task_head_prefixes_for_base_model = ["task_head."]
+
+        model = torch.nn.Module()
+        model.backbone = torch.nn.Linear(4, 4)
+        model.task_head = torch.nn.Linear(4, 1)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.fill_(1.0)
+
+        checkpoint_state = {
+            name: torch.full_like(tensor, 2.0 if name.startswith("backbone.") else 3.0)
+            for name, tensor in model.state_dict().items()
+        }
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint",
+                return_value=True,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype"
+            ) as mock_load_hf,
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model"
+            ) as mock_load_full,
+            patch.object(checkpointer, "_get_storage_reader", return_value=None),
+            patch.object(checkpointer, "_do_load", return_value=checkpoint_state) as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=False)
+
+        assert all(torch.equal(parameter, torch.full_like(parameter, 2.0)) for parameter in model.backbone.parameters())
+        assert all(
+            torch.equal(parameter, torch.full_like(parameter, 3.0)) for parameter in model.task_head.parameters()
+        )
+        mock_dcp_load.assert_called_once()
+        mock_load_hf.assert_not_called()
+        mock_load_full.assert_not_called()
 
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")

@@ -208,8 +208,63 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     )
     out = gather_sharder.gather_token_tensor(full_rows, trim=True, fill=-5.0)
     assert torch.equal(out, torch.tensor([[10.0, 20.0, -5.0]]))
+
+    full_features = torch.tensor([[[10.0, 110.0], [20.0, 120.0], [7.0, 8.0], [9.0, 10.0]]])
+    feature_out = gather_sharder.gather_token_tensor(full_features, trim=True, fill=-5.0)
+    assert torch.equal(
+        feature_out,
+        torch.tensor([[[10.0, 110.0], [20.0, 120.0], [-5.0, -5.0]]]),
+    )
     with pytest.raises(ValueError, match="fill"):
         gather_sharder.gather_token_tensor(full_rows, trim=True)
+
+
+def test_sharder_repositioned_layout_scatter_gather_preserves_trailing_token_features():
+    """Preserve routing features through DSV4-style repositioning.
+
+    The input uses the ``[batch, sequence, layers, topk]`` layout. Only the
+    first two axes participate in repositioning; both trailing axes are
+    preserved. Dropped input slots and introduced pad columns retain the fill
+    sentinel.
+    """
+    positions = torch.tensor(
+        [
+            [2, 0, -1],
+            [1, 3, -1],
+        ]
+    )
+    layout = cs.ShardLayout(padded_seq_len=4, input_token_stream_positions=positions)
+    routes = torch.arange(2 * 3 * 2 * 2, dtype=torch.int16).reshape(2, 3, 2, 2)
+    expected_padded = torch.full((2, 4, 2, 2), -1, dtype=torch.int16)
+    expected_padded[0, 2] = routes[0, 0]
+    expected_padded[0, 0] = routes[0, 1]
+    expected_padded[1, 1] = routes[1, 0]
+    expected_padded[1, 3] = routes[1, 1]
+
+    local_parts = []
+    for rank in range(2):
+        sharder = cs.ContextParallelSharder(
+            device_mesh=_FakeDeviceMesh(_FakeMesh(2, rank)),
+            shard_batch=cs.shard_batch_identity,
+            local_token_global_indices=cs.contiguous_local_indices,
+            shard_layout=layout,
+        )
+        local_parts.append(sharder.shard_token_tensor(routes, fill=-1))
+
+    assert all(part.shape == (2, 2, 2, 2) for part in local_parts)
+    torch.testing.assert_close(torch.cat(local_parts, dim=1), expected_padded)
+
+    gather_sharder = cs.ContextParallelSharder(
+        device_mesh=_FakeDeviceMesh(_FakeMesh(1)),
+        shard_batch=cs.shard_batch_identity,
+        local_token_global_indices=cs.contiguous_local_indices,
+        shard_layout=layout,
+    )
+    restored = gather_sharder.gather_token_tensor(expected_padded, trim=True, fill=-1)
+    expected_restored = routes.clone()
+    expected_restored[:, 2] = -1
+    assert restored.shape == routes.shape
+    torch.testing.assert_close(restored, expected_restored)
 
 
 def test_gather_trim_raises_without_captured_facts():
@@ -220,6 +275,65 @@ def test_gather_trim_raises_without_captured_facts():
     )
     with pytest.raises(NotImplementedError, match="no shard layout to trim to"):
         sharder.gather_token_tensor(torch.zeros(1, 4), trim=True)
+
+
+def test_gather_token_tensor_selects_one_chunk_layout(monkeypatch):
+    chunk_layouts = (
+        cs.ShardLayout(
+            local_token_global_indices=torch.tensor([0, 3]),
+            original_seq_len=4,
+            padded_seq_len=4,
+        ),
+        cs.ShardLayout(
+            local_token_global_indices=torch.tensor([1, 2]),
+            original_seq_len=4,
+            padded_seq_len=4,
+        ),
+    )
+    sharder = cs.ContextParallelSharder(
+        device_mesh=_FakeDeviceMesh(_FakeMesh(2)),
+        shard_batch=cs.shard_batch_identity,
+        shard_layout=cs.ShardLayout(chunk_layouts=chunk_layouts),
+    )
+    seen_indices = []
+
+    def fake_gather(_mesh, _tensor, local_indices, seq_dim=1):
+        assert seq_dim == 0
+        seen_indices.append(local_indices.clone())
+        return torch.arange(4.0)
+
+    monkeypatch.setattr(cs, "gather_token_tensor_by_indices", fake_gather)
+
+    gathered = sharder.gather_token_tensor(
+        torch.tensor([10.0, 40.0]),
+        seq_dim=0,
+        trim=True,
+        chunk_index=0,
+    )
+
+    assert torch.equal(gathered, torch.arange(4.0))
+    assert len(seen_indices) == 1
+    assert torch.equal(seen_indices[0], torch.tensor([0, 3]))
+
+
+def test_gather_token_tensor_requires_a_valid_chunk_index():
+    sharder = cs.ContextParallelSharder(
+        device_mesh=_FakeDeviceMesh(_FakeMesh(1)),
+        shard_batch=cs.shard_batch_identity,
+        local_token_global_indices=cs.identity_local_indices,
+        shard_layout=cs.ShardLayout(
+            chunk_layouts=(cs.ShardLayout(original_seq_len=2, padded_seq_len=2),),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="chunk_index is required"):
+        sharder.gather_token_tensor(torch.zeros(2), seq_dim=0)
+    with pytest.raises(IndexError, match="out of range"):
+        sharder.gather_token_tensor(torch.zeros(2), seq_dim=0, chunk_index=1)
+
+    sharder.shard_layout = cs.ShardLayout(original_seq_len=2, padded_seq_len=2)
+    with pytest.raises(ValueError, match="only valid for a chunked"):
+        sharder.gather_token_tensor(torch.zeros(2), seq_dim=0, chunk_index=0)
 
 
 def test_reported_indices_validate_stream_length():

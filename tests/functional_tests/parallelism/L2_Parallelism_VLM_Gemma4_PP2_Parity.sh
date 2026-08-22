@@ -17,8 +17,9 @@
 #
 # Runs the Gemma4 31B proxy twice with the same seed and data order -- once on a
 # single rank, once at pp_size=2 -- and asserts both follow the same loss and
-# gradient-norm trajectory. `dp_size` is 1 in both runs, so the dataloader yields
-# identical batches and any divergence is attributable to the pipeline split.
+# gradient-norm trajectory and validation loss. `dp_size` is 1 in both runs, so
+# the dataloader yields identical batches and any divergence is attributable to
+# the pipeline split.
 #
 # Covers the gap from PR #2983 (commit 00f40419).
 #
@@ -55,8 +56,10 @@ COMMON_ARGS=(
     --validation_dataset.split validation
     --validation_dataset.limit_dataset_samples 8
     --step_scheduler.max_steps 6
+    --step_scheduler.val_every_steps 2
     --step_scheduler.global_batch_size 2
     --step_scheduler.local_batch_size 2
+    --validation_dataloader.drop_last true
 )
 
 # --- Baseline: single rank, no parallelism ---
@@ -94,3 +97,12 @@ python tests/functional_tests/parallelism/compare_parallel_parity.py \
     --axis pp \
     --loss-tol 0.05 \
     --grad-norm-rtol 0.20
+
+# Both runs must execute recipe-owned validation. The parity helper also rejects
+# empty validation logs, so a stale PP validation skip cannot pass this check.
+python tests/functional_tests/parallelism/compare_parallel_parity.py \
+    "$RUN_DIR/baseline/validation.jsonl" \
+    "$RUN_DIR/pp2/validation.jsonl" \
+    --axis pp \
+    --metric val_loss \
+    --loss-tol 0.05

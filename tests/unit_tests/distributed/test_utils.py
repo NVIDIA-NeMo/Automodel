@@ -146,3 +146,23 @@ def test_get_sync_ctx(monkeypatch, patch_dist):
     # entering/exiting the context must be a no-op
     with ctx:
         pass
+
+
+def test_get_sync_ctx_uses_no_sync_capability_for_non_final_microbatch(patch_dist):
+    class NoSyncModel:
+        def __init__(self):
+            self.no_sync_calls = 0
+
+        def no_sync(self):
+            self.no_sync_calls += 1
+            return du.nullcontext()
+
+    model = NoSyncModel()
+
+    with du.get_sync_ctx(model, is_optim_step=False, defer_fsdp_grad_sync=False):
+        pass
+    assert model.no_sync_calls == 1
+
+    with du.get_sync_ctx(model, is_optim_step=True, defer_fsdp_grad_sync=False):
+        pass
+    assert model.no_sync_calls == 1

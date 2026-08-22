@@ -121,6 +121,66 @@ class TestCreatePipelineForwardInner:
 
         assert isinstance(output, torch.Tensor)
 
+    def test_forward_packed_thd_uses_document_boundaries(self):
+        class TokenEmbedding(nn.Module):
+            def forward(self, input_ids):
+                return input_ids.to(torch.float32).unsqueeze(-1)
+
+        class RecordingRotary(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.kwargs = None
+
+            def forward(self, hidden_states, position_ids, **kwargs):
+                self.kwargs = kwargs
+                return hidden_states, position_ids
+
+        class DocumentLocalCumsum(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attention_mask = "not-called"
+                self.cu_seqlens = None
+                self.max_seqlen = None
+
+            def forward(self, hidden_states, attention_mask=None, **kwargs):
+                self.attention_mask = attention_mask
+                self.cu_seqlens = kwargs["cu_seqlens"]
+                self.max_seqlen = kwargs["max_seqlen"]
+                boundaries = self.cu_seqlens.tolist()
+                documents = [
+                    hidden_states[start:end].cumsum(dim=0) for start, end in zip(boundaries[:-1], boundaries[1:])
+                ]
+                return torch.cat(documents)
+
+        class PackedDecoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = TokenEmbedding()
+                self.rotary_emb = RecordingRotary()
+                self.layers = nn.ModuleList([DocumentLocalCumsum()])
+                self.norm = None
+
+        model = PackedDecoder()
+        forward_fn = create_pipeline_forward_inner("PipelineStage")
+        output = forward_fn(
+            model,
+            input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+            attention_mask=torch.ones(1, 5),
+            position_ids=torch.tensor([[0, 1, 0, 1, 2]]),
+            qkv_format="thd",
+            cu_seqlens=torch.tensor([[0, 2, 5, -1000]], dtype=torch.int32),
+            max_seqlen=torch.tensor([3], dtype=torch.int32),
+            padding_mask=torch.zeros(1, 5, dtype=torch.bool),
+        )
+
+        # Each packed document starts a fresh causal history: [1, 2] and [3, 4, 5].
+        torch.testing.assert_close(output, torch.tensor([[[1.0], [3.0], [3.0], [7.0], [12.0]]]))
+        layer = model.layers[0]
+        assert layer.attention_mask is None
+        torch.testing.assert_close(layer.cu_seqlens, torch.tensor([0, 2, 5], dtype=torch.int32))
+        assert layer.max_seqlen == 3
+        assert model.rotary_emb.kwargs == {"qkv_format": "thd", "cp_size": 1}
+
 
 class TestCreatePipelineForwardCausalLM:
     """Test create_pipeline_forward_causal_lm function."""

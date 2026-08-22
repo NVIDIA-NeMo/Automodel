@@ -14,11 +14,12 @@
 
 """cp2xpp2 layer-2 verification for the sunk pre-embed path (L1, 2/4 GPUs).
 
-Drives the REAL AutoPipeline split + schedule.step under cp2xpp2 (4 GPUs) and
-cp2xpp1 (2 GPUs) with a tiny random-init text-only config, exercising the whole
+Drives the real Datum Engine over an AutoPipeline under cp2xpp2 (4 GPUs) and
+an eager model under cp2xpp1 (2 GPUs) with a tiny random-init text-only config,
+exercising the whole
 sunk layer-2 contract: the sharder-only hook, the in-forward embed +
 shard_sequence_for_cp_round_robin, the asymmetric get_pipeline_stage_metas (full-length
-first-stage ids, local sharded outputs), and per-microbatch backward. Asserts:
+first-stage ids, local sharded outputs), and Engine-owned microbatch backward. Asserts:
 
   (1) 20 steps run clean -- no "backward through the graph a second time"
       (the double-backward the old shared pre-embed graph caused under PP*CP);
@@ -53,17 +54,47 @@ def build_step3p7(device):
 
     layers = 4
     cfg = Step3p7Config(
-        vision_config={"width": 8, "layers": 0, "heads": 2, "num_channels": 3, "image_size": 8, "patch_size": 2,
-                       "mlp_ratio": 2.0, "hidden_act": "gelu", "use_ln_pre": False, "use_ln_post": False,
-                       "use_abs_posemb": False, "use_rope2d": False},
-        text_config={"hidden_size": 16, "intermediate_size": 32, "num_attention_heads": 4, "num_attention_groups": 2,
-                     "num_hidden_layers": layers, "vocab_size": 32, "moe_num_experts": 2, "moe_top_k": 1,
-                     "moe_intermediate_size": 8, "share_expert_dims": 8, "head_dim": 4, "torch_dtype": "bfloat16",
-                     "moe_layers_enum": (), "layer_types": ["full_attention"] * layers, "num_nextn_predict_layers": 1},
+        vision_config={
+            "width": 8,
+            "layers": 0,
+            "heads": 2,
+            "num_channels": 3,
+            "image_size": 8,
+            "patch_size": 2,
+            "mlp_ratio": 2.0,
+            "hidden_act": "gelu",
+            "use_ln_pre": False,
+            "use_ln_post": False,
+            "use_abs_posemb": False,
+            "use_rope2d": False,
+        },
+        text_config={
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "num_attention_groups": 2,
+            "num_hidden_layers": layers,
+            "vocab_size": 32,
+            "moe_num_experts": 2,
+            "moe_top_k": 1,
+            "moe_intermediate_size": 8,
+            "share_expert_dims": 8,
+            "head_dim": 4,
+            "torch_dtype": "bfloat16",
+            "moe_layers_enum": (),
+            "layer_types": ["full_attention"] * layers,
+            "num_nextn_predict_layers": 1,
+        },
         image_token_id=31,
     )
-    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", dispatcher="torch",
-                            rope_fusion=False, enable_hf_state_dict_adapter=False)
+    backend = BackendConfig(
+        attn="sdpa",
+        linear="torch",
+        rms_norm="torch",
+        dispatcher="torch",
+        rope_fusion=False,
+        enable_hf_state_dict_adapter=False,
+    )
     model = Step3p7ForConditionalGeneration(cfg, backend=backend)
     model.initialize_weights(dtype=torch.bfloat16)
     return model.to(device).to(torch.bfloat16)
@@ -75,23 +106,63 @@ def build_minimax(device):
     from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
 
     tiny = dict(
-        hidden_size=64, intermediate_size=32, dense_intermediate_size=48, shared_intermediate_size=32,
-        num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=16, rotary_dim=8,
-        partial_rotary_factor=0.5, vocab_size=128, max_position_embeddings=512, rms_norm_eps=1e-6,
-        rope_theta=10000.0, num_local_experts=4, num_experts_per_tok=2, n_shared_experts=1,
-        moe_layer_freq=[0, 1, 1, 1], use_gemma_norm=True, use_qk_norm=True, qk_norm_type="per_head",
-        scoring_func="sigmoid", use_routing_bias=True, routed_scaling_factor=2.0, swiglu_alpha=1.702,
-        swiglu_limit=7.0, num_mtp_modules=0, sparse_attention_config=dict(use_sparse_attention=False),
+        hidden_size=64,
+        intermediate_size=32,
+        dense_intermediate_size=48,
+        shared_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rotary_dim=8,
+        partial_rotary_factor=0.5,
+        vocab_size=128,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        moe_layer_freq=[0, 1, 1, 1],
+        use_gemma_norm=True,
+        use_qk_norm=True,
+        qk_norm_type="per_head",
+        scoring_func="sigmoid",
+        use_routing_bias=True,
+        routed_scaling_factor=2.0,
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        num_mtp_modules=0,
+        sparse_attention_config=dict(use_sparse_attention=False),
     )
     vision = dict(
-        hidden_size=32, num_attention_heads=4, num_hidden_layers=2, intermediate_size=64, patch_size=2,
-        num_channels=3, rope_theta=10000.0, hidden_act="gelu", layer_norm_eps=1e-5,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        patch_size=2,
+        num_channels=3,
+        rope_theta=10000.0,
+        hidden_act="gelu",
+        layer_norm_eps=1e-5,
         img_token_compression_config={"spatial_merge_size": 2, "temporal_patch_size": 2},
     )
-    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", rope_fusion=False,
-                            dispatcher="torch", fake_balanced_gate=False, enable_hf_state_dict_adapter=False)
-    cfg = MiniMaxM3VLConfig(vision_config=dict(vision), text_config={**tiny, "torch_dtype": "bfloat16"},
-                            image_token_index=100, video_token_index=101, projector_hidden_size=tiny["hidden_size"])
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        rope_fusion=False,
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+    cfg = MiniMaxM3VLConfig(
+        vision_config=dict(vision),
+        text_config={**tiny, "torch_dtype": "bfloat16"},
+        image_token_index=100,
+        video_token_index=101,
+        projector_hidden_size=tiny["hidden_size"],
+    )
     model = MiniMaxM3SparseForConditionalGeneration(cfg, backend=backend)
     model.initialize_weights(dtype=torch.bfloat16)
     return model.to(device).to(torch.bfloat16)
@@ -103,16 +174,24 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
 
-    from torch.distributed.device_mesh import init_device_mesh
-
-    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+    from nemo_automodel.components.datasets.datum import Datum
+    from nemo_automodel.components.distributed.config import FSDP2Config
+    from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.moe.parallelizer import apply_cp
+    from nemo_automodel.engine import Engine, collate_prebatched
 
     pp1 = bool(os.environ.get("NEMO_CP_PP_TEST_PP1"))  # cp2xpp1 comparison leg
     pp_size = 1 if pp1 else 2
     cp_size = world // pp_size
-    mesh = init_device_mesh("cuda", (pp_size, 1, cp_size), mesh_dim_names=("pp", "dp", "cp"))
+    mesh_context = MeshContext.build(
+        FSDP2Config(),
+        ParallelismSizes(dp_size=1, pp_size=pp_size, cp_size=cp_size),
+        world_size=world,
+    )
+    mesh = mesh_context.device_mesh
+    if mesh is None:
+        raise RuntimeError("FSDP2 CP/PP validation requires a device mesh")
 
     which = os.environ.get("NEMO_CP_PP_MODEL", "minimax")
     torch.manual_seed(0)
@@ -125,7 +204,20 @@ def main():
     vocab = model.config.text_config.vocab_size
     mtp_used = {"any": False}
 
-    def loss_fn(output, labels):
+    def loss_fn(output, loss_inputs):
+        """Return token losses in the Engine's CP-local token layout.
+
+        Args:
+            output: Model output whose logits have shape [batch, sequence, vocab].
+                MTP models may return one additional logits tensor of the same
+                shape per prediction depth.
+            loss_inputs: Mapping containing labels and weights with shape
+                [batch, sequence] in the same CP-local layout as the logits.
+
+        Returns:
+            Tensor of shape [batch, sequence] containing the summed causal-LM
+            loss over the base and optional MTP prediction depths.
+        """
         # step3p7's last PP stage emits (logits, *mtp_per_depth_logits); minimax
         # emits a bare logits tensor. Handle both, threading the MTP depths.
         if isinstance(output, tuple):
@@ -133,10 +225,16 @@ def main():
         else:
             logits = getattr(output, "logits", output)
             mtp = list(getattr(output, "mtp_per_depth_logits", None) or [])
-        loss = F.cross_entropy(logits.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100)
+        labels = loss_inputs["labels"]
+        weights = loss_inputs["weights"]
+        loss = F.cross_entropy(
+            logits.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100, reduction="none"
+        ).reshape_as(weights)
         for m in mtp:
             mtp_used["any"] = True
-            loss = loss + F.cross_entropy(m.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100)
+            loss = loss + F.cross_entropy(
+                m.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100, reduction="none"
+            ).reshape_as(weights)
         return loss
 
     def cp_only_parallelize(m, world_mesh, moe_mesh, *, dp_axis_names, cp_axis_name=None, **kw):
@@ -146,14 +244,29 @@ def main():
     seqlen = 32
     if pp_size > 1:
         pp = AutoPipeline(
-            world_mesh=mesh, moe_mesh=None, pp_axis_name="pp", dp_axis_names=("dp",), cp_axis_name="cp",
-            pp_schedule="1f1b", pp_microbatch_size=1, pp_batch_size=2, device=device, dtype=torch.bfloat16,
+            world_mesh=mesh,
+            moe_mesh=None,
+            **mesh_context.pipeline_axis_kwargs(),
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            device=device,
+            dtype=torch.bfloat16,
             pp_seq_len=seqlen,
         ).build(model, loss_fn=loss_fn, parallelize_fn=cp_only_parallelize)
-        model_part0, has_last, has_first = pp.parts[0], pp.info.has_last_stage, pp.info.has_first_stage
+        model_part0 = pp.parts[0]
+        engine_model = pp
     else:
-        cp_only_parallelize(model, mesh, None, dp_axis_names=("dp",), cp_axis_name="cp")
+        cp_only_parallelize(model, mesh, None, **mesh_context.parallelize_axis_kwargs())
         model_part0 = model
+        engine_model = model
+
+    engine = Engine(
+        engine_model,
+        device=device,
+        mesh_context=mesh_context,
+        collate_fn=collate_prebatched,
+    )
 
     losses = []
     for step in range(20):
@@ -161,28 +274,13 @@ def main():
         input_ids = torch.randint(2, vocab, (2, seqlen), device=device)
         dist.broadcast(input_ids, src=0)
         pos = torch.arange(seqlen, device=device).unsqueeze(0).expand(2, -1).contiguous()
-        batch = {"input_ids": input_ids.clone(), "labels": input_ids.clone(), "position_ids": pos.clone()}
-        cp_sharder = ContextParallelSharder(model_part0, mesh, batch)
-        train_ctx, batch = cp_sharder.shard(batch)
-        labels = batch.pop("labels")
-        if pp_size > 1:
-            with train_ctx():
-                step_losses = [] if has_last else None
-                model_input = batch.pop("input_ids")
-                pp.update_seq_len(model_input.shape[1])
-                if has_first:
-                    pp.info.schedule.step(model_input, target=labels, losses=step_losses, **batch)
-                else:
-                    pp.info.schedule.step(target=labels, losses=step_losses, **batch)
-            # Per-microbatch loss_fn returns the microbatch mean; averaging over
-            # microbatches gives the batch mean, comparable to the cp2xpp1 leg.
-            local = torch.stack(step_losses).mean() if has_last else torch.tensor(0.0, device=device)
-        else:
-            with train_ctx():
-                out = model(input_ids=batch["input_ids"], position_ids=batch["position_ids"])
-                local = loss_fn(out, labels)  # full output so MTP depths are included
-                local.backward()
-        losses.append(float(local.detach()))
+        labels = input_ids.clone()
+        datum = Datum(
+            model_inputs={"input_ids": input_ids.clone(), "position_ids": pos.clone()},
+            loss_fn_inputs={"labels": labels, "weights": torch.ones_like(labels, dtype=torch.float32)},
+        )
+        result = engine.forward_backward([datum], loss_fn)
+        losses.append(float(result.loss.detach()))
 
     # (3) embeddings receive gradients -- only the first PP stage owns embed_tokens.
     embed = model_part0.get_input_embeddings()
@@ -196,7 +294,7 @@ def main():
     last = torch.tensor(losses[-1], device=device)
     gflag = torch.tensor(1.0 if embed_grad else 0.0, device=device)
     mflag = torch.tensor(1.0 if mtp_used["any"] else 0.0, device=device)
-    dist.all_reduce(last, op=dist.ReduceOp.MAX)  # last stage holds the real loss
+    dist.all_reduce(last, op=dist.ReduceOp.MAX)  # Engine synchronizes loss; MAX is a cross-rank sanity check.
     dist.all_reduce(gflag, op=dist.ReduceOp.MAX)  # first stage owns embeddings
     dist.all_reduce(mflag, op=dist.ReduceOp.MAX)  # last stage owns the MTP heads
 

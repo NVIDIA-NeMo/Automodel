@@ -35,6 +35,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoModelCrossEncoder": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelCrossEncoder"),
     "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
     "AutoMFU": ("nemo_automodel._transformers.mfu", "AutoMFU"),
+    "PreFSDPHookResult": ("nemo_automodel.shared.task_heads", "PreFSDPHookResult"),
     "RetrieverStudentWithProjection": (
         "nemo_automodel._transformers.retrieval",
         "RetrieverStudentWithProjection",
@@ -57,6 +58,7 @@ __all__ = [
     "NeMoAutoModelCrossEncoder",
     "NeMoAutoTokenizer",
     "AutoMFU",
+    "PreFSDPHookResult",
     "RetrieverStudentWithProjection",
     "RetrieverTeacherEmbeddingEncoder",
 ]

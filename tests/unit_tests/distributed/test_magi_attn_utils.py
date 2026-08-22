@@ -22,7 +22,8 @@ CPU CI runner. The FFA kernel parity tests at the bottom are gated behind CUDA +
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -77,6 +78,13 @@ class _VLM(nn.Module):
         super().__init__()
         self.language_model = _LM()
         self.visual = nn.Linear(4, 4)  # vision tower: must NOT be stamped
+
+
+class _CausalLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(num_attention_heads=2, num_key_value_heads=2, head_dim=4)
+        self.self_attn = _FakeAttention()
 
 
 # --------------------------------------------------------------------------- #
@@ -165,6 +173,83 @@ class TestMagiState:
         finally:
             mu.set_active_attn_spec(None)
 
+    def test_prepare_llm_batch_refreshes_prefix_spec_for_each_outer_pipeline_batch(self, monkeypatch):
+        """A one-microbatch PP call cannot leak its mask into the next GA call."""
+        active_groups = []
+        monkeypatch.setattr(mu, "set_active_cp_group", active_groups.append)
+        st = MagiState(enabled=True, custom=True, cp_group=None, cp_size=1)
+
+        first = {
+            "input_ids": torch.zeros(1, 4, dtype=torch.long),
+            "prefix_tree": ([2, 2], [[0, 1]]),
+        }
+        try:
+            st.make_cp_batch(None, first, model=None, return_local_indices=True)
+            first_spec = mu.get_active_attn_spec()
+            assert first_spec is not None
+            assert first_spec.fingerprint() == AttnMaskSpec.prefix_tree([2, 2], [[0, 1]])[0].fingerprint()
+
+            # With pp_batch_size == pp_microbatch_size == 1, Engine enters the
+            # schedule once per outer GA item. Preparing the next item must
+            # clear the prior prefix-tree mask before that forward starts.
+            st.make_cp_batch(
+                None,
+                {"input_ids": torch.zeros(1, 4, dtype=torch.long)},
+                model=None,
+                return_local_indices=True,
+            )
+            assert mu.get_active_attn_spec() is None
+            assert active_groups == [None, None]
+        finally:
+            mu.set_active_attn_spec(None)
+
+    def test_prepare_llm_batch_custom_cp2_causal_dispatches(self, monkeypatch):
+        group = _FakeGroup(2)
+        expected_batch = {"input_ids": torch.tensor([[1, 3]]), "labels": torch.tensor([[11, 13]])}
+        expected_indices = torch.tensor([[0, 2]])
+        calls = []
+
+        def prepare(model, batch, cp_group, *, return_local_indices):
+            calls.append((model, batch, cp_group, return_local_indices))
+            return expected_batch, object(), expected_indices
+
+        monkeypatch.setattr(mu, "magi_prepare_batch", prepare)
+        st = MagiState(enabled=True, custom=True, cp_group=group, cp_size=2)
+        model = object()
+        batch = {"input_ids": torch.arange(4).view(1, 4), "labels": torch.arange(10, 14).view(1, 4)}
+
+        train_ctx, out, local_indices = st.prepare_llm_batch(
+            model,
+            batch,
+            device_mesh=None,
+            is_thd=False,
+            pad_id=0,
+            num_chunks=1,
+        )
+
+        from contextlib import nullcontext
+
+        assert train_ctx is nullcontext
+        assert out is expected_batch
+        assert local_indices is expected_indices
+        assert calls == [(model, batch, group, True)]
+
+    def test_prepare_llm_batch_hf_packed_rejects_lost_document_boundaries(self):
+        st = MagiState(enabled=True, custom=False, cp_group=None, cp_size=1)
+        batch = {
+            "input_ids": torch.zeros(1, 8, dtype=torch.long),
+            "labels": torch.zeros(1, 8, dtype=torch.long),
+            "seq_lens": torch.tensor([4, 4]),
+        }
+        with pytest.raises(NotImplementedError, match="cannot preserve packed document boundaries"):
+            st.prepare_llm_batch(model=None, batch=batch, device_mesh=None, is_thd=True, pad_id=0, num_chunks=1)
+
+    def test_prepare_llm_batch_prefix_tree_cp2_rejects_undispatched_spec(self):
+        st = MagiState(enabled=True, custom=True, cp_group=_FakeGroup(2), cp_size=2)
+        batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long), "prefix_tree": ([2, 2], [[0, 1]])}
+        with pytest.raises(NotImplementedError, match="requires cp_size=1"):
+            st.prepare_llm_batch(model=None, batch=batch, device_mesh=None, is_thd=False, pad_id=0, num_chunks=1)
+
 
 # --------------------------------------------------------------------------- #
 # setup_magi
@@ -252,6 +337,54 @@ class TestStampCpGroup:
         assert mods == [model.language_model.self_attn]
 
 
+class TestMagiPrepareBatch:
+    def test_dispatches_inputs_labels_and_loss_indices_with_one_layout(self, monkeypatch):
+        """HF/custom causal CP keeps loss tokens aligned for a PP microbatch."""
+        expected_key = object()
+        order = torch.tensor([2, 5, 6, 7])
+        dispatch_calls = []
+
+        def dispatch(value, *, key, pad_value=0):
+            assert key is expected_key
+            dispatch_calls.append((value.clone(), pad_value))
+            padded = torch.cat((value, value.new_full((2,), pad_value)))
+            return padded.index_select(0, order)
+
+        api = ModuleType("magi_attention.api")
+        api.dispatch = dispatch
+        api.get_position_ids = lambda key: torch.tensor([2, 5, 0, 0])
+        api.magi_attn_varlen_key = lambda **kwargs: expected_key
+        functools = ModuleType("magi_attention.api.functools")
+        functools.compute_pad_size = lambda *args, **kwargs: 2
+        package = ModuleType("magi_attention")
+        package.api = api
+        monkeypatch.setitem(sys.modules, "magi_attention", package)
+        monkeypatch.setitem(sys.modules, "magi_attention.api", api)
+        monkeypatch.setitem(sys.modules, "magi_attention.api.functools", functools)
+
+        model = _CausalLM()
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15]]),
+            "labels": torch.tensor([[20, 21, 22, 23, 24, 25]]),
+            "attention_mask": torch.ones(1, 6),
+        }
+        out, returned_key, local_indices = mu.magi_prepare_batch(
+            model,
+            batch,
+            _FakeGroup(2),
+            return_local_indices=True,
+        )
+
+        assert returned_key is expected_key
+        assert torch.equal(out["input_ids"], torch.tensor([[12, 15, 0, 0]]))
+        assert torch.equal(out["labels"], torch.tensor([[22, 25, -100, -100]]))
+        assert torch.equal(local_indices, torch.tensor([[2, 5, 6, 6]]))
+        assert torch.equal(out["position_ids"], torch.tensor([[2, 5, 0, 0]]))
+        assert "attention_mask" not in out
+        assert model.self_attn.cp_group.size() == 2
+        assert any(torch.equal(value, torch.arange(6)) and pad_value == 6 for value, pad_value in dispatch_calls)
+
+
 class TestMagiPrepareVlm:
     """magi_prepare_vlm is pure Python (no magi import) for the cp_size==1 path."""
 
@@ -324,6 +457,48 @@ class TestPackedCpDocSeqlens:
         batch = {"cu_seqlens": torch.tensor([0, 400, 944])}
         with pytest.raises(ValueError, match="!= flat input length 1024"):
             mu._packed_cp_doc_seqlens(batch, 1024)
+
+    def test_packed_dispatch_returns_token_indices_not_rope_positions(self, monkeypatch):
+        """The sharder map follows dispatch itself, not per-document RoPE ids."""
+        expected_key = object()
+        order = torch.tensor([2, 5, 6, 7])
+        dispatch_calls = []
+
+        def dispatch(value, *, key, pad_value=0):
+            assert key is expected_key
+            dispatch_calls.append((value.clone(), pad_value))
+            padding = value.new_full((2,), pad_value)
+            return torch.cat((value, padding)).index_select(0, order)
+
+        api = ModuleType("magi_attention.api")
+        api.dispatch = dispatch
+        api.get_position_ids = lambda key: torch.tensor([2, 0, 1, 0])
+        package = ModuleType("magi_attention")
+        package.api = api
+        monkeypatch.setitem(sys.modules, "magi_attention", package)
+        monkeypatch.setitem(sys.modules, "magi_attention.api", api)
+        monkeypatch.setattr(mu, "build_flex_key", lambda *args, **kwargs: expected_key)
+
+        model = SimpleNamespace(config=SimpleNamespace(num_attention_heads=2, num_key_value_heads=2, head_dim=4))
+        batch = {
+            "input_ids": torch.tensor([10, 11, 12, 13, 14, 15]),
+            "labels": torch.tensor([20, 21, 22, 23, 24, 25]),
+            "cu_seqlens_padded": torch.tensor([0, 3, 6]),
+        }
+        default_result = mu.magi_prepare_packed_cp(model, batch, _FakeGroup(2))
+        assert len(default_result) == 2
+        assert not any(torch.equal(value, torch.arange(6)) and pad_value == 6 for value, pad_value in dispatch_calls)
+
+        dispatch_calls.clear()
+        out, returned_key, local_indices = mu.magi_prepare_packed_cp(
+            model, batch, _FakeGroup(2), return_local_indices=True
+        )
+
+        assert returned_key is expected_key
+        assert torch.equal(out["position_ids"], torch.tensor([2, 0, 1, 0]))
+        assert torch.equal(local_indices, torch.tensor([2, 5, 6, 6]))
+        assert torch.equal(out["labels"], torch.tensor([22, 25, -100, -100]))
+        assert any(torch.equal(value, torch.arange(6)) and pad_value == 6 for value, pad_value in dispatch_calls)
 
 
 class TestActiveStateAccessors:

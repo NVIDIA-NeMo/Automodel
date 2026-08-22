@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import types
+from contextlib import contextmanager
 from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.pipelining.microbatch import TensorChunkSpec, split_args_kwargs_into_chunks
 
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import (
@@ -118,6 +118,12 @@ class DummyPipelineStage:
         # record the last divisor for verification if needed
         self._scaled = divisor
 
+    def backward_maybe_with_nosync(self, _backward_type, _bwd_kwargs, last_backward=False):
+        return (), None
+
+    def perform_reduce_grad(self, divisor: int):
+        self.scale_grads(divisor)
+
 
 class FakeSchedule:
     def __init__(self, stages: list[DummyPipelineStage], n_microbatches: int = 1):
@@ -161,6 +167,7 @@ class TestAutoPipelineValidation:
         assert ap.pp_schedule == "1f1b"
         assert ap.pp_microbatch_size == 1
         assert ap.pp_batch_size == 4
+        assert ap.num_microbatches == 4
         assert ap._device == torch.device("cpu")
 
     def test_invalid_batch_size(self):
@@ -222,59 +229,160 @@ class TestAutoPipelineValidation:
         assert ap.pp_mesh is not None
 
 
-class _KwargsChunkHookPart(nn.Module):
-    def __init__(self, chunk_dims: dict[str, int]):
-        super().__init__()
-        self.chunk_dims = chunk_dims
-
-    def get_pipeline_kwargs_chunk_dims(self, kwargs):
-        return {key: dim for key, dim in self.chunk_dims.items() if key in kwargs}
-
-
-class _UnknownKwargsChunkHookPart(nn.Module):
-    def get_pipeline_kwargs_chunk_dims(self, kwargs):
-        return {"unknown": 0}
-
-
-class _KwargsChunkSchedule:
-    def __init__(self, *, fail_on_step: bool = False):
-        self._kwargs_chunk_spec = None
+class _PreparedMicrobatchSchedule:
+    def __init__(self, *, fail_on_step: bool = False, invoke_loss: bool = False):
+        self._loss_fn = Mock(return_value=torch.tensor(0.0))
         self.fail_on_step = fail_on_step
+        self.invoke_loss = invoke_loss
         self.args_during_step = None
-        self.kwargs_chunk_spec_during_step = None
+        self.args_split = None
+        self.loss_fn_during_step = None
+        self.split_inputs_during_step = None
         self.kwargs_split = None
+        self.target_during_step = None
+        self.losses_during_step = None
+        self.return_outputs_during_step = None
+        self.loss_results = []
+        self.step_calls = 0
+        self.eval_calls = 0
+        self.split_inputs_calls = 0
 
-    def step(self, *args, target=None, losses=None, **kwargs):
+    def _split_inputs(self, args, kwargs=None):
+        raise AssertionError("prepared microbatch split was not installed")
+
+    def _run_schedule(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
         """Split schedule inputs using the chunk spec active during the call.
 
         Args:
             *args: Positional schedule inputs. Tensor values have arbitrary
                 model-defined layouts.
-            target: Optional tensor of shape [batch, sequence] containing loss
-                targets.
+            target: Optional tensor of shape [batch, ...] containing loss targets
+                or prepared-input microbatch IDs.
             losses: Optional mutable list populated with scalar loss tensors.
+            return_outputs: Whether to return the schedule result.
             **kwargs: Keyword schedule inputs. Tensor values have arbitrary
                 model-defined layouts.
 
         Returns:
             A sentinel string identifying the schedule result.
         """
-        del target, losses
         self.args_during_step = args
-        self.kwargs_chunk_spec_during_step = self._kwargs_chunk_spec
+        self.loss_fn_during_step = self._loss_fn
+        self.split_inputs_during_step = self._split_inputs
+        self.target_during_step = target
+        self.losses_during_step = losses
+        self.return_outputs_during_step = return_outputs
         if self.fail_on_step:
             raise RuntimeError("schedule failed")
-        _, self.kwargs_split = split_args_kwargs_into_chunks(
-            args,
-            kwargs,
-            2,
-            kwargs_chunk_spec=self._kwargs_chunk_spec,
+        self.split_inputs_calls += 1
+        self.args_split, self.kwargs_split = self._split_inputs(args, kwargs)
+        if self.invoke_loss:
+            assert target is not None
+            target_chunks = torch.tensor_split(target, 2)
+            for index in (1, 0):
+                self.loss_results.append(self._loss_fn(torch.tensor(float(index)), target_chunks[index]))
+        return "schedule-result"
+
+    def step(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
+        self.step_calls += 1
+        return self._run_schedule(
+            *args,
+            target=target,
+            losses=losses,
+            return_outputs=return_outputs,
+            **kwargs,
         )
+
+    def eval(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
+        self.eval_calls += 1
+        return self._run_schedule(
+            *args,
+            target=target,
+            losses=losses,
+            return_outputs=return_outputs,
+            **kwargs,
+        )
+
+
+class _LegacyStepSchedule(_PreparedMicrobatchSchedule):
+    """Schedule with the PyTorch 2.6-2.9 step signature."""
+
+    def __init__(self):
+        super().__init__()
+        self.received_return_outputs = False
+
+    def step(self, *args, target=None, losses=None, **kwargs):
+        self.received_return_outputs = "return_outputs" in kwargs
+        return super().step(*args, target=target, losses=losses, **kwargs)
+
+
+class _LegacyEvalSchedule(_LegacyStepSchedule):
+    """Schedule with an eval signature that predates return_outputs."""
+
+    def __init__(self):
+        super().__init__()
+        self.received_return_outputs = False
+
+    def eval(self, *args, target=None, losses=None, **kwargs):
+        self.received_return_outputs = "return_outputs" in kwargs
+        self.eval_calls += 1
+        return self._run_schedule(*args, target=target, losses=losses, **kwargs)
+
+
+class _ForwardingEvalSchedule(_PreparedMicrobatchSchedule):
+    """Current PyTorch shape: eval forwards kwargs to a newer step API."""
+
+    def eval(self, *args, target=None, losses=None, **kwargs):
+        self.eval_calls += 1
+        return self._run_schedule(*args, target=target, losses=losses, **kwargs)
+
+
+class _NoEvalSchedule(_LegacyStepSchedule):
+    """PyTorch pipeline schedule shape before forward-only eval existed."""
+
+    eval = None
+
+
+class _ContextAwareStage:
+    def __init__(self, active_microbatch, events):
+        self.active_microbatch = active_microbatch
+        self.events = events
+
+    def _record(self, phase, chunk_id):
+        assert self.active_microbatch == [chunk_id]
+        self.events.append((phase, chunk_id))
+
+    def forward_one_chunk(self, chunk_id, *_args, **_kwargs):
+        self._record("forward", chunk_id)
+
+    def backward_one_chunk(self, chunk_id, *_args, **_kwargs):
+        self._record("backward", chunk_id)
+
+    def backward_weight_one_chunk(self, chunk_id, *_args, **_kwargs):
+        self._record("weight_backward", chunk_id)
+
+
+class _ContextAwareSchedule(_PreparedMicrobatchSchedule):
+    def __init__(self, stage):
+        super().__init__()
+        self.stage = stage
+
+    def _run_schedule(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
+        self.args_split, self.kwargs_split = self._split_inputs(args, kwargs)
+        self.stage.forward_one_chunk(1, (), {})
+        self.stage.forward_one_chunk(0, (), {})
+        self.stage.backward_one_chunk(0, None)
+        self.stage.backward_weight_one_chunk(1)
         return "schedule-result"
 
 
-class TestAutoPipelineKwargsChunkSpec:
-    def _pipeline_with_parts(self, *parts: nn.Module, schedule=None, has_first_stage: bool = True):
+class TestAutoPipelinePreparedMicrobatches:
+    def _pipeline_with_parts(
+        self,
+        *parts: nn.Module,
+        schedule=None,
+        has_first_stage: bool = True,
+    ):
         ap = AutoPipeline(
             world_mesh=FakeDeviceMesh(),
             pp_axis_name="pp",
@@ -283,92 +391,243 @@ class TestAutoPipelineKwargsChunkSpec:
             pp_batch_size=2,
             device=torch.device("cpu"),
         )
-        ap._info.schedule = schedule or _KwargsChunkSchedule()
+        ap._info.schedule = schedule or _PreparedMicrobatchSchedule()
         ap._info.model_parts = list(parts)
         ap._info.has_first_stage = has_first_stage
         return ap
 
-    def test_step_splits_mrope_position_ids_on_model_owned_batch_axis(self):
-        """AutoPipeline.step keeps all mRoPE axes in every microbatch."""
-        input_ids = torch.zeros(2, 8, dtype=torch.long)
-        position_ids = torch.arange(8, dtype=torch.long).view(1, 1, -1).expand(3, 2, -1).clone()
-        kwargs = {
-            "position_ids": position_ids,
-            "attention_mask": torch.ones(2, 8, dtype=torch.bool),
-            "qkv_format": "thd",
+    def test_step_microbatches_passes_prepared_inputs_without_resplitting(self):
+        schedule = _PreparedMicrobatchSchedule(invoke_loss=True)
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+        input_ids = [torch.full((1, 8), index, dtype=torch.long) for index in range(2)]
+        position_ids = [torch.full((3, 1, 8), index, dtype=torch.long) for index in range(2)]
+        metadata = [object(), object()]
+        model_inputs = [
+            {
+                "input_ids": input_ids[index],
+                "position_ids": position_ids[index],
+                "metadata": metadata[index],
+            }
+            for index in range(2)
+        ]
+        original_split_inputs = schedule._split_inputs
+        original_loss_fn = schedule._loss_fn
+        seen = []
+        losses = []
+
+        def loss_fn(output, index):
+            seen.append((output, index))
+            return output
+
+        result = ap.step_microbatches(model_inputs, loss_fn=loss_fn, losses=losses, return_outputs=False)
+
+        assert result == "schedule-result"
+        assert schedule.args_during_step == ()
+        assert schedule.args_split[0][0] is input_ids[0]
+        assert schedule.args_split[1][0] is input_ids[1]
+        assert schedule.kwargs_split[0]["position_ids"] is position_ids[0]
+        assert schedule.kwargs_split[1]["position_ids"] is position_ids[1]
+        assert schedule.kwargs_split[0]["metadata"] is metadata[0]
+        assert schedule.kwargs_split[1]["metadata"] is metadata[1]
+        assert schedule.target_during_step.tolist() == [0, 1]
+        assert schedule.losses_during_step is losses
+        assert schedule.return_outputs_during_step is False
+        assert [(output.item(), index) for output, index in seen] == [(1.0, 1), (0.0, 0)]
+        assert schedule._split_inputs == original_split_inputs
+        assert schedule._loss_fn is original_loss_fn
+        assert model_inputs[0]["input_ids"] is input_ids[0]
+        assert model_inputs[1]["input_ids"] is input_ids[1]
+
+    def test_batch_context_follows_interleaved_stage_chunk_ids_and_restores_methods(self):
+        active_microbatch = []
+        events = []
+        stage = _ContextAwareStage(active_microbatch, events)
+        schedule = _ContextAwareSchedule(stage)
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+        ap._info.stages = [stage]
+        original_methods = {
+            name: getattr(stage, name)
+            for name in ("forward_one_chunk", "backward_one_chunk", "backward_weight_one_chunk")
         }
 
-        _, default_kwargs_split = split_args_kwargs_into_chunks((input_ids,), kwargs, 2)
-        assert default_kwargs_split[0]["position_ids"].shape == (2, 2, 8)
+        def make_context(index):
+            @contextmanager
+            def batch_context():
+                assert not active_microbatch
+                active_microbatch.append(index)
+                events.append(("enter", index))
+                try:
+                    yield
+                finally:
+                    events.append(("exit", index))
+                    active_microbatch.clear()
 
-        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}))
-        result = ap.step(input_ids, **kwargs)
+            return batch_context
 
-        fixed_kwargs_split = ap.info.schedule.kwargs_split
-        assert result == "schedule-result"
-        assert fixed_kwargs_split[0]["position_ids"].shape == (3, 1, 8)
-        assert fixed_kwargs_split[1]["position_ids"].shape == (3, 1, 8)
-        torch.testing.assert_close(fixed_kwargs_split[0]["position_ids"], position_ids[:, :1])
-        torch.testing.assert_close(fixed_kwargs_split[1]["position_ids"], position_ids[:, 1:])
-        assert fixed_kwargs_split[0]["attention_mask"].shape == (1, 8)
-        assert fixed_kwargs_split[0]["qkv_format"] == "thd"
-        assert fixed_kwargs_split[1]["qkv_format"] == "thd"
-        assert ap.info.schedule.args_during_step == (input_ids,)
-        assert ap.info.schedule._kwargs_chunk_spec is None
-
-    def test_step_without_model_hook_uses_pytorch_default_chunking(self):
-        ap = self._pipeline_with_parts(nn.Module())
-
-        ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
-
-        assert ap.info.schedule.kwargs_chunk_spec_during_step is None
-        assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
-        assert ap.info.schedule._kwargs_chunk_spec is None
-
-    def test_only_canonical_model_part_supplies_chunk_policy(self):
-        ap = self._pipeline_with_parts(
-            _KwargsChunkHookPart({"position_ids": 1}),
-            _KwargsChunkHookPart({"position_ids": 0}),
+        result = ap.step_microbatches(
+            [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
+            loss_fn=Mock(),
+            batch_context_fns=[make_context(0), make_context(1)],
         )
 
-        ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8))
+        assert result == "schedule-result"
+        assert events == [
+            ("enter", 1),
+            ("forward", 1),
+            ("exit", 1),
+            ("enter", 0),
+            ("forward", 0),
+            ("exit", 0),
+            ("enter", 0),
+            ("backward", 0),
+            ("exit", 0),
+            ("enter", 1),
+            ("weight_backward", 1),
+            ("exit", 1),
+        ]
+        assert not active_microbatch
+        for name, original in original_methods.items():
+            assert getattr(stage, name) == original
 
-        assert ap.info.schedule.kwargs_split[0]["position_ids"].shape == (3, 1, 8)
+    def test_step_microbatches_omits_primary_args_on_nonfirst_stage(self):
+        schedule = _PreparedMicrobatchSchedule()
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule, has_first_stage=False)
+        model_inputs = [{"inputs_embeds": torch.zeros(1, 8, 4), "position_ids": torch.zeros(1, 8)} for _ in range(2)]
 
-    def test_nonfirst_stage_ignores_model_input(self):
-        ap = self._pipeline_with_parts(nn.Module(), has_first_stage=False)
+        ap.step_microbatches(model_inputs, loss_fn=Mock())
 
-        ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+        assert schedule.args_split == [(), ()]
+        assert all("inputs_embeds" not in kwargs for kwargs in schedule.kwargs_split)
 
-        assert ap.info.schedule.args_during_step == ()
-        assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
+    @pytest.mark.parametrize(
+        ("method_name", "schedule_cls"),
+        [
+            ("step_microbatches", _LegacyStepSchedule),
+            ("eval_microbatches", _LegacyEvalSchedule),
+        ],
+    )
+    def test_prepared_microbatches_do_not_forward_return_outputs_to_older_pytorch(
+        self,
+        method_name,
+        schedule_cls,
+    ):
+        schedule = schedule_cls()
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
 
-    def test_step_restores_schedule_chunk_spec_after_failure(self):
-        schedule = _KwargsChunkSchedule(fail_on_step=True)
-        original_chunk_spec = {"position_ids": TensorChunkSpec(0)}
-        schedule._kwargs_chunk_spec = original_chunk_spec
-        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}), schedule=schedule)
+        getattr(ap, method_name)(
+            [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
+            loss_fn=Mock(),
+            return_outputs=False,
+        )
+
+        assert schedule.received_return_outputs is False
+
+    def test_eval_microbatches_uses_forward_only_schedule_with_exact_prepared_split(self):
+        schedule = _PreparedMicrobatchSchedule(invoke_loss=True)
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+        input_ids = [torch.full((1, 8), index, dtype=torch.long) for index in range(2)]
+        metadata = [object(), object()]
+        model_inputs = [
+            {
+                "input_ids": input_ids[index],
+                "metadata": metadata[index],
+            }
+            for index in range(2)
+        ]
+        original_split_inputs = schedule._split_inputs
+        original_loss_fn = schedule._loss_fn
+        seen = []
+        losses = []
+
+        def loss_fn(output, index):
+            seen.append((output, index))
+            return output
+
+        result = ap.eval_microbatches(model_inputs, loss_fn=loss_fn, losses=losses, return_outputs=False)
+
+        assert result == "schedule-result"
+        assert schedule.eval_calls == 1
+        assert schedule.step_calls == 0
+        assert schedule.split_inputs_calls == 1
+        assert schedule.args_split[0][0] is input_ids[0]
+        assert schedule.args_split[1][0] is input_ids[1]
+        assert schedule.kwargs_split[0]["metadata"] is metadata[0]
+        assert schedule.kwargs_split[1]["metadata"] is metadata[1]
+        assert schedule.target_during_step.tolist() == [0, 1]
+        assert schedule.losses_during_step is losses
+        assert schedule.return_outputs_during_step is False
+        assert [(output.item(), index) for output, index in seen] == [(1.0, 1), (0.0, 0)]
+        assert schedule._split_inputs == original_split_inputs
+        assert schedule._loss_fn is original_loss_fn
+
+    def test_eval_microbatches_uses_step_capability_when_eval_forwards_kwargs(self):
+        schedule = _ForwardingEvalSchedule()
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+
+        ap.eval_microbatches(
+            [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
+            loss_fn=Mock(),
+            return_outputs=False,
+        )
+
+        assert schedule.eval_calls == 1
+        assert schedule.step_calls == 0
+        assert schedule.return_outputs_during_step is False
+
+    def test_eval_microbatches_fails_clearly_when_pytorch_has_no_eval_schedule(self):
+        schedule = _NoEvalSchedule()
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+
+        with pytest.raises(NotImplementedError, match=r"schedule with eval\(\)"):
+            ap.eval_microbatches(
+                [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
+                loss_fn=Mock(),
+            )
+
+        assert schedule.step_calls == 0
+
+    @pytest.mark.parametrize(
+        "model_inputs",
+        [
+            [{"input_ids": torch.zeros(1, 8)}],
+            [{"attention_mask": torch.ones(1, 8)} for _ in range(2)],
+            [{"input_ids": torch.zeros(1, 8), "inputs_embeds": torch.zeros(1, 8, 4)} for _ in range(2)],
+        ],
+    )
+    def test_step_microbatches_validates_prepared_inputs(self, model_inputs):
+        ap = self._pipeline_with_parts(nn.Module())
+
+        with pytest.raises(ValueError, match="Expected 2|exactly one"):
+            ap.step_microbatches(model_inputs, loss_fn=Mock())
+
+    @pytest.mark.parametrize("method_name", ["step_microbatches", "eval_microbatches"])
+    def test_prepared_microbatches_restore_schedule_state_after_failure(self, method_name):
+        schedule = _PreparedMicrobatchSchedule(fail_on_step=True)
+        original_split_inputs = schedule._split_inputs
+        original_loss_fn = schedule._loss_fn
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
 
         with pytest.raises(RuntimeError, match="schedule failed"):
-            ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8))
+            getattr(ap, method_name)(
+                [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
+                loss_fn=Mock(),
+            )
 
-        assert schedule.kwargs_chunk_spec_during_step["position_ids"].split_dim == 1
-        assert schedule._kwargs_chunk_spec is original_chunk_spec
-
-    def test_model_hook_cannot_configure_unknown_kwarg(self):
-        ap = self._pipeline_with_parts(_UnknownKwargsChunkHookPart())
-
-        with pytest.raises(ValueError, match="unknown kwarg"):
-            ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+        assert schedule.eval_calls == int(method_name == "eval_microbatches")
+        assert schedule.step_calls == int(method_name == "step_microbatches")
+        assert schedule.split_inputs_during_step is not original_split_inputs
+        assert schedule.loss_fn_during_step is not original_loss_fn
+        assert schedule._split_inputs == original_split_inputs
+        assert schedule._loss_fn is original_loss_fn
 
 
 # -----------------------------
-# Core build/materialize/step tests
+# Core build/materialize tests
 # -----------------------------
 
 
-class TestAutoPipelineBuildAndStep:
-    """Test AutoPipeline build, materialize, and step functionality."""
+class TestAutoPipelineBuild:
+    """Test AutoPipeline build and materialize functionality."""
 
     def test_autopipeline_basic_creation(self):
         """Test basic AutoPipeline creation without full build process."""
@@ -388,8 +647,8 @@ class TestAutoPipelineBuildAndStep:
 
     @pytest.mark.parametrize("pp_size", [2, 4])
     @pytest.mark.parametrize("local_rank", [0, 1, 2, 3])
-    def test_autopipeline_build_split_materialize_and_step(self, monkeypatch, pp_size, local_rank):
-        """Test complete AutoPipeline build, materialize, and step workflow."""
+    def test_autopipeline_build_split_and_materialize(self, monkeypatch, pp_size, local_rank):
+        """Test complete AutoPipeline build, split, and materialize workflow."""
         _patch_autopipeline_monkey(monkeypatch)
         if local_rank >= pp_size:
             pytest.skip("local_rank not part of this pp_size")
@@ -503,11 +762,6 @@ class TestAutoPipelineBuildAndStep:
         # Should return self for method chaining
         assert result is ap
         assert ap._info.enabled is True
-
-    def test_autopipeline_step_workflow(self, monkeypatch):
-        """Test AutoPipeline step functionality."""
-        # Skip this complex test - the step method requires extensive pipeline setup
-        pytest.skip("Complex step test requires extensive pipeline mocking")
 
     def test_autopipeline_build_assertions(self, monkeypatch):
         """Test AutoPipeline build method assertion errors."""
@@ -1025,18 +1279,43 @@ class TestAutoPipelineUpdateSeqLen:
 
         captured_args = []
 
-        def mock_reset(schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype=None):
-            captured_args.append((schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype))
+        def mock_reset(
+            schedule,
+            stages,
+            model_config,
+            microbatch_size,
+            seq_len,
+            tensor_dtype=None,
+            first_stage_input_meta=None,
+        ):
+            captured_args.append(
+                (schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype, first_stage_input_meta)
+            )
 
         monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", mock_reset)
 
         ap.update_seq_len(256)
 
         assert len(captured_args) == 1
-        _, _, _, mb_size, sl, tensor_dtype = captured_args[0]
+        _, _, _, mb_size, sl, tensor_dtype, first_stage_input_meta = captured_args[0]
         assert mb_size == 2  # pp_microbatch_size
         assert sl == 256
         assert tensor_dtype is ap.dtype
+        assert first_stage_input_meta is None
+
+        # THD materialization collapses source examples into one synthetic
+        # batch row. The same sequence length must still refresh stage metadata
+        # when its effective batch extent changes.
+        ap.update_seq_len(256, microbatch_size=1)
+        assert len(captured_args) == 2
+        assert captured_args[-1][3:5] == (1, 256)
+
+        embeds = torch.empty(1, 256, 32, dtype=torch.bfloat16)
+        ap.update_seq_len(256, microbatch_size=1, input_tensor=embeds)
+        input_meta = captured_args[-1][-1]
+        assert input_meta.device.type == "meta"
+        assert input_meta.shape == embeds.shape
+        assert input_meta.dtype == embeds.dtype
 
     def test_update_seq_len_tracks_current(self, monkeypatch):
         """update_seq_len should track current seq_len and reset on change."""
