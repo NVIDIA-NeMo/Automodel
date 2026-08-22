@@ -103,7 +103,7 @@ def _dequantize_from_fp8_into(
 ) -> None:
     """Dequantize a per-tensor FP8 weight directly into its final model tensor.
 
-    ``target`` keeps its native model shape, BF16 dtype, device, strides, distributed placements, and storage.
+    ``target`` keeps its native model shape, BF16 or FP32 dtype, device, strides, distributed placements, and storage.
     ``weight_fp8`` has the same shape and distributed placements but uses the checkpoint's FP8 dtype and temporary
     storage. ``scale_inv`` is the checkpoint's scalar BF16 inverse scale.
     """
@@ -314,10 +314,10 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load Mistral3 FP8 weights in bounded decoder-layer groups.
 
-        Each quantized model tensor has BF16 model shape and storage. Its load part creates an FP8 destination with
+        Each quantized model tensor has BF16 or FP32 model shape and storage. Its load part creates an FP8 destination with
         the same shape, device, strides, and distributed placements, plus the scalar BF16 ``_scale_inv`` destination
         stored by the checkpoint. After DCP fills both tensors, the part copies and scales the FP8 value directly into
-        the BF16 model tensor. Non-quantized tensors, including VLM vision and projector weights, use their final model
+        the final model tensor. Non-quantized tensors, including VLM vision and projector weights, use their final model
         storage as the DCP destination.
 
         This path requires the complete decoder on every rank. Pipeline-parallel ranks own different layer subsets and
@@ -334,7 +334,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
 
         Returns:
             One direct-load part for tensors outside decoder layers plus bounded temporary-load parts for decoder
-            layers, or ``None`` for tied VLM checkpoints, partial decoders, and non-BF16 model weights.
+            layers, or ``None`` for tied VLM checkpoints, partial decoders, and unsupported model-weight dtypes.
         """
         del device_mesh
         decoder_layer_key = _CAUSAL_LM_DECODER_LAYER_KEY if self._layout_name == "causal_lm" else _VLM_DECODER_LAYER_KEY
@@ -346,7 +346,8 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         if self._num_hidden_layers is None or present_layer_indices != set(range(self._num_hidden_layers)):
             return None
         if any(
-            _is_fp8_weight_key(model_key, self._not_fp8_prefixes) and tensor.dtype != torch.bfloat16
+            _is_fp8_weight_key(model_key, self._not_fp8_prefixes)
+            and tensor.dtype not in (torch.bfloat16, torch.float32)
             for model_key, tensor in model_state_dict.items()
         ):
             return None
@@ -361,7 +362,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
 
         Args:
             model_state_dict: Native model names mapped to final tensors of arbitrary model-defined rank and shape.
-                Quantized linear weights must use BF16 final storage; non-quantized tensors remain direct DCP
+                Quantized linear weights must use BF16 or FP32 final storage; non-quantized tensors remain direct DCP
                 destinations and are mutated in place during the load.
             decoder_layer_key: Pattern that identifies decoder-layer names and captures the zero-based layer index in
                 group 2. It must exclude vision-tower layers from the bounded FP8 groups.
