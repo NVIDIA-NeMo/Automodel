@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from nemo_automodel.components.speculative.bench_common import _extract_prompt_text, _load_prompts
 
 # ---------------------------------------------------------------------------
@@ -188,12 +190,40 @@ def test_generation_config_defaults_top_k_to_disabled():
     assert GenerationConfig(model="m", max_new_tokens=8, temperature=1.0, top_p=0.95, top_k=20).top_k == 20
 
 
-def test_bench_entrypoints_expose_top_k():
-    """The DFlash 2 evaluations quote acceptance length at top-p 0.95 / top-k 20,
-    so the benchmark harness has to be able to express top-k at all."""
+def _bench_modules():
     from nemo_automodel.components.speculative import bench_sglang, bench_sweep, bench_vllm
 
-    for module in (bench_sglang, bench_vllm, bench_sweep):
+    return (bench_sglang, bench_vllm, bench_sweep)
+
+
+@pytest.mark.parametrize("field,expected_default", [("temperature", 0.0), ("top_p", 1.0), ("top_k", 0)])
+def test_every_bench_entrypoint_exposes_the_same_sampling_knobs(field, expected_default):
+    """The three entrypoints must not drift apart on sampling.
+
+    ``top_k`` was missing from all of them, so the DFlash 2 evaluation setting
+    (temperature 1.0, top-p 0.95, top-k 20) could not be expressed at all.
+    Parametrising over the knob set means a knob added to one entrypoint and
+    forgotten in another fails here instead of silently diverging.
+    """
+    for module in _bench_modules():
+        assert module._build_parser().get_default(field) == expected_default, (
+            f"{module.__name__} must expose --{field.replace('_', '-')} defaulting to {expected_default}"
+        )
+
+
+def test_generation_config_sampling_fields_are_all_reachable_from_the_bench_cli():
+    """Every sampling field on the shared config must be settable per entrypoint.
+
+    A field that exists on ``GenerationConfig`` but has no flag is dead weight: it
+    records a constant while looking configurable, which is exactly what
+    ``top_k`` was when it was first added.
+    """
+    import dataclasses
+
+    from nemo_automodel.components.speculative.regenerate import GenerationConfig
+
+    sampling_fields = {f.name for f in dataclasses.fields(GenerationConfig)} & {"temperature", "top_p", "top_k"}
+    for module in _bench_modules():
         parser = module._build_parser()
-        assert parser.get_default("top_k") == 0, f"{module.__name__} must register --top-k, disabled by default"
-        assert parser.get_default("top_p") == 1.0, f"{module.__name__} must still register --top-p"
+        for field in sorted(sampling_fields):
+            assert parser.get_default(field) is not None, f"{module.__name__} does not expose {field}"

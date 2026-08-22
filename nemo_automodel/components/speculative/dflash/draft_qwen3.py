@@ -429,7 +429,12 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         # Output/input transforms some targets apply around the shared embedding
         # and head; identity for every Qwen3-family target (see compute_logits).
-        self.output_multiplier = float(dflash_config.get("output_multiplier", 1.0))
+        multiplier = float(dflash_config.get("output_multiplier", 1.0))
+        if multiplier <= 0:
+            # A non-positive multiplier would flip or flatten the argmax, changing
+            # every greedy pick without raising anywhere.
+            raise ValueError(f"output_multiplier must be > 0 when set, got {multiplier}.")
+        self.output_multiplier = multiplier
         softcap = dflash_config.get("final_logit_softcapping", None)
         if softcap is not None and float(softcap) <= 0:
             raise ValueError(f"final_logit_softcapping must be > 0 when set, got {softcap}.")
