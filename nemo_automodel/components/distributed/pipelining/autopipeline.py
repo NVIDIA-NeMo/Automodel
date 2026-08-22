@@ -14,8 +14,10 @@
 
 import inspect
 import logging
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -33,6 +35,64 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+BatchContextFactory = Callable[[], AbstractContextManager[Any]]
+
+
+@contextmanager
+def _stage_batch_contexts(
+    stages: list[PipelineStage],
+    batch_context_fns: list[BatchContextFactory],
+) -> Iterator[None]:
+    """Apply a repeatable batch context to each pipeline-stage phase.
+
+    PyTorch schedules identify the logical microbatch with the first argument
+    to every stage ``forward_one_chunk``/``backward_*_one_chunk`` call. Wrapping
+    those instance methods keeps the context aligned when schedules interleave
+    microbatches or activation checkpointing recomputes a forward during
+    backward. Original instance state is restored even when the schedule fails.
+
+    Args:
+        stages: Rank-local pipeline stages owned by one AutoPipeline.
+        batch_context_fns: One zero-argument context factory per logical
+            pipeline microbatch.
+
+    Yields:
+        ``None`` while the pipeline schedule executes.
+    """
+    missing = object()
+    originals: list[tuple[PipelineStage, str, Any]] = []
+    method_names = ("forward_one_chunk", "backward_one_chunk", "backward_weight_one_chunk")
+    try:
+        for stage in stages:
+            for method_name in method_names:
+                method = getattr(stage, method_name, None)
+                if not callable(method):
+                    continue
+                previous = getattr(stage, "__dict__", {}).get(method_name, missing)
+
+                def wrapped(
+                    chunk_id: int,
+                    *args: Any,
+                    _method: Callable[..., Any] = method,
+                    **kwargs: Any,
+                ) -> Any:
+                    if isinstance(chunk_id, bool) or not isinstance(chunk_id, int):
+                        raise TypeError(f"pipeline microbatch id must be an integer, got {chunk_id!r}")
+                    if chunk_id < 0 or chunk_id >= len(batch_context_fns):
+                        raise IndexError(f"pipeline microbatch id {chunk_id} is outside [0, {len(batch_context_fns)})")
+                    with batch_context_fns[chunk_id]():
+                        return _method(chunk_id, *args, **kwargs)
+
+                originals.append((stage, method_name, previous))
+                setattr(stage, method_name, wrapped)
+        yield
+    finally:
+        for stage, method_name, previous in reversed(originals):
+            if previous is missing:
+                delattr(stage, method_name)
+            else:
+                setattr(stage, method_name, previous)
 
 
 @dataclass
@@ -259,6 +319,7 @@ class AutoPipeline:
         loss_fn: Callable[[Any, int], Any],
         losses: list[torch.Tensor] | None = None,
         return_outputs: bool = False,
+        batch_context_fns: list[BatchContextFactory] | None = None,
     ) -> Any:
         """Run a schedule step over already prepared model microbatches.
 
@@ -276,6 +337,10 @@ class AutoPipeline:
             losses: Mutable list populated by the schedule on the last stage.
             return_outputs: Whether the last stage returns merged model outputs
                 when supported by the installed PyTorch version.
+            batch_context_fns: Optional repeatable context factory for each
+                logical microbatch. Each factory separately covers that
+                microbatch's stage forward and backward phases. The caller
+                wraps its loss callback with the same factory.
 
         Returns:
             The value returned by the underlying PyTorch pipeline schedule.
@@ -286,6 +351,7 @@ class AutoPipeline:
             losses=losses,
             return_outputs=return_outputs,
             schedule_method="step",
+            batch_context_fns=batch_context_fns,
         )
 
     def eval_microbatches(
@@ -295,6 +361,7 @@ class AutoPipeline:
         loss_fn: Callable[[Any, int], Any],
         losses: list[torch.Tensor] | None = None,
         return_outputs: bool = True,
+        batch_context_fns: list[BatchContextFactory] | None = None,
     ) -> Any:
         """Run forward-only evaluation over already prepared model microbatches.
 
@@ -313,6 +380,10 @@ class AutoPipeline:
             losses: Mutable list populated by the schedule on the last stage.
             return_outputs: Whether the last stage returns merged model outputs
                 when supported by the installed PyTorch version.
+            batch_context_fns: Optional repeatable context factory for each
+                logical microbatch. Each factory separately covers that
+                microbatch's stage forward phase. The caller wraps its loss
+                callback with the same factory.
 
         Returns:
             The value returned by the underlying PyTorch pipeline schedule.
@@ -327,6 +398,7 @@ class AutoPipeline:
             losses=losses,
             return_outputs=return_outputs,
             schedule_method="eval",
+            batch_context_fns=batch_context_fns,
         )
 
     def _run_prepared_microbatches(
@@ -337,6 +409,7 @@ class AutoPipeline:
         losses: list[torch.Tensor] | None,
         return_outputs: bool,
         schedule_method: Literal["step", "eval"],
+        batch_context_fns: list[BatchContextFactory] | None,
     ) -> Any:
         """Run one schedule method with an exact prepared-microbatch split."""
         schedule = self._info.schedule
@@ -344,6 +417,10 @@ class AutoPipeline:
             raise RuntimeError("AutoPipeline.build() must be called before running a prepared PP schedule")
         if len(model_inputs) != self.num_microbatches:
             raise ValueError(f"Expected {self.num_microbatches} model input microbatches, got {len(model_inputs)}")
+        if batch_context_fns is not None and len(batch_context_fns) != self.num_microbatches:
+            raise ValueError(
+                f"Expected {self.num_microbatches} pipeline batch context factories, got {len(batch_context_fns)}"
+            )
 
         model_args_chunks: list[tuple[Any, ...]] = []
         model_kwargs_chunks: list[dict[str, Any]] = []
@@ -385,11 +462,21 @@ class AutoPipeline:
         schedule._split_inputs = lambda _args, _kwargs=None: (model_args_chunks, model_kwargs_chunks)
         schedule._loss_fn = indexed_loss
         try:
-            return run_schedule(
-                target=torch.arange(self.num_microbatches, device=self.device),
-                losses=losses,
-                **schedule_options,
-            )
+            if batch_context_fns is None:
+                return run_schedule(
+                    target=torch.arange(self.num_microbatches, device=self.device),
+                    losses=losses,
+                    **schedule_options,
+                )
+            stages = self._info.stages
+            if stages is None:
+                raise RuntimeError("AutoPipeline.build() must create pipeline stages before using batch contexts")
+            with _stage_batch_contexts(stages, batch_context_fns):
+                return run_schedule(
+                    target=torch.arange(self.num_microbatches, device=self.device),
+                    losses=losses,
+                    **schedule_options,
+                )
         finally:
             schedule._loss_fn = previous_loss_fn
             schedule._split_inputs = previous_split_inputs

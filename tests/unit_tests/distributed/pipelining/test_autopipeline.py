@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import types
+from contextlib import contextmanager
 from unittest.mock import Mock
 
 import pytest
@@ -342,6 +343,39 @@ class _NoEvalSchedule(_LegacyStepSchedule):
     eval = None
 
 
+class _ContextAwareStage:
+    def __init__(self, active_microbatch, events):
+        self.active_microbatch = active_microbatch
+        self.events = events
+
+    def _record(self, phase, chunk_id):
+        assert self.active_microbatch == [chunk_id]
+        self.events.append((phase, chunk_id))
+
+    def forward_one_chunk(self, chunk_id, *_args, **_kwargs):
+        self._record("forward", chunk_id)
+
+    def backward_one_chunk(self, chunk_id, *_args, **_kwargs):
+        self._record("backward", chunk_id)
+
+    def backward_weight_one_chunk(self, chunk_id, *_args, **_kwargs):
+        self._record("weight_backward", chunk_id)
+
+
+class _ContextAwareSchedule(_PreparedMicrobatchSchedule):
+    def __init__(self, stage):
+        super().__init__()
+        self.stage = stage
+
+    def _run_schedule(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
+        self.args_split, self.kwargs_split = self._split_inputs(args, kwargs)
+        self.stage.forward_one_chunk(1, (), {})
+        self.stage.forward_one_chunk(0, (), {})
+        self.stage.backward_one_chunk(0, None)
+        self.stage.backward_weight_one_chunk(1)
+        return "schedule-result"
+
+
 class TestAutoPipelinePreparedMicrobatches:
     def _pipeline_with_parts(
         self,
@@ -403,6 +437,57 @@ class TestAutoPipelinePreparedMicrobatches:
         assert schedule._loss_fn is original_loss_fn
         assert model_inputs[0]["input_ids"] is input_ids[0]
         assert model_inputs[1]["input_ids"] is input_ids[1]
+
+    def test_batch_context_follows_interleaved_stage_chunk_ids_and_restores_methods(self):
+        active_microbatch = []
+        events = []
+        stage = _ContextAwareStage(active_microbatch, events)
+        schedule = _ContextAwareSchedule(stage)
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+        ap._info.stages = [stage]
+        original_methods = {
+            name: getattr(stage, name)
+            for name in ("forward_one_chunk", "backward_one_chunk", "backward_weight_one_chunk")
+        }
+
+        def make_context(index):
+            @contextmanager
+            def batch_context():
+                assert not active_microbatch
+                active_microbatch.append(index)
+                events.append(("enter", index))
+                try:
+                    yield
+                finally:
+                    events.append(("exit", index))
+                    active_microbatch.clear()
+
+            return batch_context
+
+        result = ap.step_microbatches(
+            [{"input_ids": torch.zeros(1, 8)} for _ in range(2)],
+            loss_fn=Mock(),
+            batch_context_fns=[make_context(0), make_context(1)],
+        )
+
+        assert result == "schedule-result"
+        assert events == [
+            ("enter", 1),
+            ("forward", 1),
+            ("exit", 1),
+            ("enter", 0),
+            ("forward", 0),
+            ("exit", 0),
+            ("enter", 0),
+            ("backward", 0),
+            ("exit", 0),
+            ("enter", 1),
+            ("weight_backward", 1),
+            ("exit", 1),
+        ]
+        assert not active_microbatch
+        for name, original in original_methods.items():
+            assert getattr(stage, name) == original
 
     def test_step_microbatches_omits_primary_args_on_nonfirst_stage(self):
         schedule = _PreparedMicrobatchSchedule()

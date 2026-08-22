@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pickle
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
@@ -157,7 +157,15 @@ class _FakeAutoPipeline(AutoPipeline):
         self.updated_microbatch_sizes.append(microbatch_size)
         self.updated_input_shapes.append(tuple(input_tensor.shape) if input_tensor is not None else None)
 
-    def step_microbatches(self, model_inputs, *, loss_fn, losses, return_outputs):
+    def step_microbatches(
+        self,
+        model_inputs,
+        *,
+        loss_fn,
+        losses,
+        return_outputs,
+        batch_context_fns=None,
+    ):
         assert return_outputs is False
         assert len(model_inputs) == self.num_microbatches
         self.prepared_inputs.append(model_inputs)
@@ -169,13 +177,24 @@ class _FakeAutoPipeline(AutoPipeline):
             inputs = dict(model_inputs[index])
             primary_name = "inputs_embeds" if "inputs_embeds" in inputs else "input_ids"
             primary = inputs.pop(primary_name)
-            output = self.compute_model(primary, **inputs)
+            context_fn = nullcontext if batch_context_fns is None else batch_context_fns[index]
+            with context_fn():
+                output = self.compute_model(primary, **inputs)
             scaled_loss = loss_fn(output, index)
             self.callback_losses.append(scaled_loss.detach())
-            scaled_loss.backward()
+            with context_fn():
+                scaled_loss.backward()
             self.backward_calls += 1
 
-    def eval_microbatches(self, model_inputs, *, loss_fn, losses, return_outputs):
+    def eval_microbatches(
+        self,
+        model_inputs,
+        *,
+        loss_fn,
+        losses,
+        return_outputs,
+        batch_context_fns=None,
+    ):
         assert return_outputs is False
         assert len(model_inputs) == self.num_microbatches
         self.prepared_inputs.append(model_inputs)
@@ -187,7 +206,9 @@ class _FakeAutoPipeline(AutoPipeline):
             inputs = dict(model_inputs[index])
             primary_name = "inputs_embeds" if "inputs_embeds" in inputs else "input_ids"
             primary = inputs.pop(primary_name)
-            output = self.compute_model(primary, **inputs)
+            context_fn = nullcontext if batch_context_fns is None else batch_context_fns[index]
+            with context_fn():
+                output = self.compute_model(primary, **inputs)
             loss = loss_fn(output, index)
             self.callback_losses.append(loss.detach())
 
@@ -2797,33 +2818,70 @@ def test_batch_context_covers_activation_checkpoint_recompute():
     assert not active
 
 
-def test_batch_context_rejects_auto_pipeline_at_construction():
-    model = ScaleModel()
-    pipeline = _FakeAutoPipeline(model)
+def test_pipeline_batch_context_tracks_each_microbatch_through_checkpoint_backward():
+    active_route = []
+    block_routes = []
+    context_routes = []
 
-    def unused_batch_context(_model_inputs, _loss_fn_inputs):
-        """Reject any attempted construction of a pipeline batch context.
+    class CheckpointedPipelineModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
 
-        Args:
-            _model_inputs: Pipeline model mapping; this callback must not receive it.
-            _loss_fn_inputs: Pipeline loss mapping; this callback must not receive it.
+        def block(self, values, weight):
+            assert len(active_route) == 1
+            block_routes.append(active_route[0])
+            return values * weight
 
-        Returns:
-            No context because AutoPipeline must fail during Engine construction.
-        """
-        pytest.fail("pipeline batch context must not be constructed")
+        def forward(self, input_ids, **_kwargs):
+            expected_route = int((input_ids[0, 0] - 1) // 2)
+            assert active_route == [expected_route]
+            return checkpoint(self.block, input_ids.float(), self.weight, use_reentrant=False)
 
-    with pytest.raises(NotImplementedError, match="batch_context_fn.*eager PP=1"):
-        Engine(
-            pipeline,
-            device="cpu",
-            mesh_context=_pipeline_mesh_context(),
-            batch_context_fn=unused_batch_context,
-        )
+    model = CheckpointedPipelineModel()
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
 
-    assert pipeline.step_calls == 0
-    assert pipeline.eval_calls == 0
-    assert model.forward_calls == 0
+    @contextmanager
+    def batch_context(_model_inputs, loss_fn_inputs):
+        route = int(loss_fn_inputs["route_id"].flatten()[0])
+        assert not active_route
+        active_route.append(route)
+        context_routes.append(route)
+        try:
+            yield
+        finally:
+            active_route.clear()
+
+    datum = Datum(
+        model_inputs={"input_ids": torch.tensor([[1, 2], [3, 4]])},
+        loss_fn_inputs={
+            "weights": torch.ones(2, 2),
+            "route_id": torch.tensor([[0, 0], [1, 1]]),
+        },
+        loss_fn_input_layouts={
+            "weights": LossInputLayout.PER_TOKEN,
+            "route_id": LossInputLayout.PER_TOKEN,
+        },
+    )
+
+    def loss_fn(output, loss_fn_inputs):
+        route = int(loss_fn_inputs["route_id"].flatten()[0])
+        assert active_route == [route]
+        return output
+
+    result = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+        collate_fn=collate_prebatched,
+        batch_context_fn=batch_context,
+    ).forward_backward([datum], loss_fn)
+
+    assert result.loss.item() == pytest.approx(2.5)
+    assert model.weight.grad.item() == pytest.approx(2.5)
+    assert block_routes == [1, 1, 0, 0]
+    assert context_routes == [1, 1, 1, 0, 0, 0]
+    assert not active_route
 
 
 def test_window_sets_the_same_moe_aux_scale_as_the_recipes(monkeypatch):

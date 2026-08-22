@@ -21,6 +21,7 @@ import pickle
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from math import prod
 from typing import Any, TypeVar
 
@@ -361,8 +362,9 @@ class Engine:
         batch_context_fn: Creates an optional context from the CP/packing-
             prepared model-input and loss/side-channel mappings. It covers
             eager model forward, loss, backward, and activation-checkpoint
-            recomputation. AutoPipeline is intentionally unsupported until it
-            can select one context payload per inner pipeline microbatch.
+            recomputation. With AutoPipeline, the factory is selected by the
+            logical inner-microbatch id and entered separately for every stage
+            forward, loss, and backward phase; it must therefore be repeatable.
             Rank-local callback failures are process-fatal in distributed
             execution, like failures from ``context_fn`` or model forward.
         defer_fsdp_grad_sync: Defer FSDP/DDP gradient synchronization until the
@@ -417,11 +419,6 @@ class Engine:
         if isinstance(mtp_ignore_index, bool) or not isinstance(mtp_ignore_index, int):
             raise ValueError(f"mtp_ignore_index must be an integer, got {mtp_ignore_index!r}")
         self.pipeline = model if isinstance(model, AutoPipeline) else None
-        if self.pipeline is not None and batch_context_fn is not None:
-            raise NotImplementedError(
-                "batch_context_fn currently supports eager PP=1 execution only; "
-                "AutoPipeline needs per-inner-microbatch context routing"
-            )
         self.model_parts = model.parts if self.pipeline is not None else [model]
         self.model = self.model_parts[0]
         self._summed_gradient_reduction = _resolve_summed_gradient_reduction(self.model_parts)
@@ -1396,12 +1393,17 @@ class Engine:
                         batch_size=batch_size,
                     )
                 )
+                batch_context_fns: list[Callable[[], AbstractContextManager[Any]]] = [
+                    partial(self.batch_context_fn, model_inputs_mb, loss_inputs_mb)
+                    for model_inputs_mb, loss_inputs_mb in zip(model_microbatches, loss_microbatches)
+                ]
 
                 def pipeline_loss(output: Any, microbatch_index: int) -> torch.Tensor:
                     loss_inputs_mb = loss_microbatches[microbatch_index]
-                    numerator, batch_outputs, output_parse_error = _parse_loss_result(
-                        loss_fn(output, loss_inputs_mb), loss_inputs_mb["weights"]
-                    )
+                    with batch_context_fns[microbatch_index]():
+                        numerator, batch_outputs, output_parse_error = _parse_loss_result(
+                            loss_fn(output, loss_inputs_mb), loss_inputs_mb["weights"]
+                        )
                     if loss_called_by_microbatch[microbatch_index]:
                         raise RuntimeError(f"pipeline evaluated loss_fn twice for microbatch {microbatch_index}")
                     loss_called_by_microbatch[microbatch_index] = True
@@ -1419,6 +1421,7 @@ class Engine:
                         loss_fn=pipeline_loss,
                         losses=losses,
                         return_outputs=False,
+                        batch_context_fns=batch_context_fns,
                     )
                 else:
                     self.pipeline.step_microbatches(
@@ -1426,6 +1429,7 @@ class Engine:
                         loss_fn=pipeline_loss,
                         losses=losses,
                         return_outputs=False,
+                        batch_context_fns=batch_context_fns,
                     )
 
         outputs: list[dict[str, Any]] = []
