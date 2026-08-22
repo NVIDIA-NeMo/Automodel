@@ -121,8 +121,16 @@ and `val_accept_len`; adding a top-level `wandb:` block uploads all of them.
 | `packed_sequence_size` | enables sequence packing when greater than 0 |
 | `draft_sliding_window` | bounds how far back a block reads the context; unset attends over the whole prefix |
 | `draft_num_attention_heads` / `draft_num_key_value_heads` / `draft_head_dim` | size the draft's attention independently of the target's |
+| `output_multiplier` / `final_logit_softcapping` | the target's logit transform, applied in both training and decoding; identity unless set |
+| `input_embedding_scale` | scales the embedded draft block; identity unless set |
 | `conv_kernel_size` / `conv_group_size` | DFlash 2 convolution taps and channels per dynamic correction |
 | `selector_rank` / `selector_top_k` / `selector_loss_weight` | DFlash 2 path-selector width, candidates scored per position, and objective weight |
+
+`spec_generate` accepts `temperature`, `top_p`, and `top_k`. The truncation
+applies to the *target's* distribution -- the one rejection sampling verifies
+against -- so sampled decoding stays lossless with respect to whatever sampling
+the target would have used on its own. The DFlash 2 evaluations quote acceptance
+lengths at temperature 1.0, top-p 0.95, top-k 20.
 
 Supported targets: Qwen3 and Qwen3.5 (dense and MoE), including the multimodal
 `*ForConditionalGeneration` variants such as `Qwen/Qwen3.8-27B`. DFlash and

@@ -507,6 +507,13 @@ class TrainDFlashRecipe(BaseRecipe):
             "block_size": self.block_size,
             "mask_token_id": self.mask_token_id,
             "target_layer_ids": target_layer_ids,
+            # Output/input transforms the target applies around the shared head and
+            # embedding. Identity for every Qwen3-family target; the published
+            # Muse Glimmer drafter ships a multiplier and a logit softcap, and both
+            # training and decoding must apply whatever is stamped here.
+            "output_multiplier": float(recipe_cfg.get("output_multiplier", 1.0)),
+            "final_logit_softcapping": recipe_cfg.get("final_logit_softcapping", None),
+            "input_embedding_scale": float(recipe_cfg.get("input_embedding_scale", 1.0)),
         }
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
