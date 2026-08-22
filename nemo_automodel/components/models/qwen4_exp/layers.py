@@ -24,14 +24,18 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
+from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelState
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
+from nemo_automodel.components.models.qwen4_exp.cp import Qwen4ExpCPContext, qwen4_cp_all_gather
 from nemo_automodel.components.models.qwen4_exp.qsa import Qwen4ExpQSAIndexer, qsa_gqa_attention
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -100,6 +104,60 @@ class Qwen4ExpGatedDeltaNet(CPAwareGatedDeltaNet):
             eps=float(getattr(config, "rms_norm_eps")),
             activation=output_gate_type,
             dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+        )
+
+    def _forward_with_cp(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None,
+        seq_index: torch.Tensor | None,
+        blockdiag_state: BlockdiagCpModelState | None = None,
+    ) -> torch.Tensor:
+        """Run the inherited FLA CP core in explicit contiguous sequence order.
+
+        Args:
+            hidden_states: Local contiguous states of shape ``[batch,
+                local_sequence, hidden]``. Rank ``r`` owns global positions
+                ``[r * local_sequence, (r + 1) * local_sequence)``.
+            position_ids: Local global positions of shape ``[batch,
+                local_sequence]`` or repeated text-RoPE axes of shape ``[axes,
+                batch, local_sequence]``.
+            seq_index: Optional local positions of shape ``[local_sequence]``
+                or ``[batch, local_sequence]``; ignored because Qwen4-Exp's
+                model-owned layout is always contiguous.
+            blockdiag_state: Packed CP metadata. Qwen4-Exp does not support it.
+
+        Returns:
+            Local GDN output of shape ``[batch, local_sequence, hidden]`` in
+            unchanged contiguous order.
+        """
+        del seq_index
+        if blockdiag_state is not None:
+            raise NotImplementedError("Qwen4-Exp GDN context parallelism does not support packed sequences")
+        if self._cp_mesh is None or self._cp_mesh.size() <= 1:
+            raise RuntimeError("Qwen4-Exp contiguous GDN CP requires an active CP mesh")
+        if position_ids is None:
+            raise ValueError("Qwen4-Exp contiguous GDN CP requires global position_ids")
+
+        cp_group = self._cp_mesh.get_group()
+        global_sequence_length = hidden_states.shape[1] * self._cp_mesh.size()
+        cu_seqlens_cpu = torch.tensor(
+            [0, global_sequence_length],
+            dtype=torch.long,
+            device="cpu",
+        )
+        cu_seqlens = cu_seqlens_cpu.to(hidden_states.device)
+        contiguous_state = BlockdiagCpModelState(
+            group=cp_group,
+            packed_cu_seqlens=cu_seqlens,
+            packed_cu_seqlens_cpu=cu_seqlens_cpu,
+        )
+        return super()._forward_with_cp(
+            hidden_states,
+            position_ids=position_ids,
+            seq_index=None,
+            blockdiag_state=contiguous_state,
         )
 
 
@@ -331,7 +389,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
         self.backend = backend
         self.attn_module = None
         self.attn_func = None
+        self._cp_mesh: DeviceMesh | None = None
         self.indexer = Qwen4ExpQSAIndexer(config, backend)
+
+    def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
+        """Install the contiguous CP mesh used for QSA K/V exchange."""
+        self._cp_mesh = cp_mesh
 
     def forward(
         self,
@@ -339,6 +402,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        cp_context: Qwen4ExpCPContext | None = None,
         **attn_kwargs: object,
     ) -> torch.Tensor:
         """Select compressed blocks and run model-owned sparse GQA.
@@ -349,8 +413,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
                 final axis stores concatenated cosine and sine values.
             attention_mask: Optional token mask of shape ``[batch, sequence]``
                 or backend-specific causal attention mask.
-            **attn_kwargs: Backend attention metadata. Packed and context-
-                parallel layouts are rejected by this stage-1 path.
+            cp_context: Optional contiguous CP metadata. When present, ``x``
+                contains local queries while compressed/main K/V are gathered
+                to global rank order.
+            **attn_kwargs: Backend attention metadata. Packed layouts are
+                rejected.
 
         Returns:
             Attention output with the same shape as ``x``.
@@ -363,20 +430,31 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
             raise ValueError("Qwen4-Exp QSA requires a non-empty sequence")
         if attn_kwargs.get("cu_seqlens") is not None:
             raise NotImplementedError("Qwen4-Exp QSA packed THD attention is not yet supported")
-        if int(attn_kwargs.get("cp_size", 1)) != 1:
-            raise NotImplementedError("Qwen4-Exp QSA context parallelism is not yet supported")
+        cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
+        if cp_active and cp_context is None:
+            raise RuntimeError("Qwen4-Exp QSA has an active CP mesh but did not receive model-owned batch metadata")
+        if cp_context is not None:
+            # QSA discards the inherited dense attention module so the shared
+            # parallelizer installs this model-owned mesh. The batch context is
+            # the authoritative transport metadata; validate both agree.
+            if self._cp_mesh is not None:
+                cp_group = self._cp_mesh.get_group()
+                if cp_context.size != self._cp_mesh.size() or cp_context.rank != dist.get_rank(cp_group):
+                    raise RuntimeError("Qwen4-Exp QSA CP context does not match the installed CP mesh")
 
         selected_token_ids = self.indexer(
             x,
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
+            cp_context=cp_context,
         )
 
         batch_size, sequence_length, _ = x.shape
         # Keep the indexer's fixed-width output hookable for parity while
         # avoiding 2,051 padded gathers on short sequences.  Valid IDs are
         # contiguous and a causal row can never contain more than S tokens.
-        attention_width = min(sequence_length, selected_token_ids.shape[-1])
+        global_sequence_length = cp_context.global_sequence_length if cp_context is not None else sequence_length
+        attention_width = min(global_sequence_length, selected_token_ids.shape[-1])
         selected_token_ids = selected_token_ids[..., :attention_width]
         query = self.q_proj(x).view(batch_size, sequence_length, -1, self.head_dim * 2)
         key = self.k_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
@@ -392,6 +470,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
             format="bshd",
             rope_fusion=False,
         )
+        if cp_context is not None:
+            key = qwen4_cp_all_gather(key, cp_context, sequence_dim=1, differentiable=True)
+            value = qwen4_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
 
         attn_output = qsa_gqa_attention(
             query,
@@ -508,6 +589,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        cp_context: Qwen4ExpCPContext | None = None,
         **attn_kwargs: object,
     ) -> torch.Tensor:
         """Run PLE, attention/GDN, and top-10 MoE updates.
@@ -526,6 +608,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 marks padding for MoE dispatch.
             position_ids: Optional positions of shape ``[batch, sequence]`` or
                 ``[axes, batch, sequence]``.
+            cp_context: Optional contiguous CP metadata. Tensor-bearing fields
+                contain replicated global raw IDs/padding of shape ``[batch,
+                global_sequence]`` and identify this rank's local interval.
             **attn_kwargs: Attention backend metadata.
 
         Returns:
@@ -537,7 +622,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         hidden_states = self._expand_initial_streams(hidden_states)
         if self.ple is not None:
-            hidden_states = hidden_states + self.ple(hidden_states, input_ids)
+            hidden_states = hidden_states + self.ple(hidden_states, input_ids, cp_context=cp_context)
 
         attn_input, attn_residual = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":
@@ -547,10 +632,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 position_ids=position_ids,
             )
         else:
+            qsa_mask = attention_mask
+            if qsa_mask is None and padding_mask is not None:
+                qsa_mask = padding_mask.logical_not()
             attn_output = self.self_attn(
                 x=attn_input,
-                attention_mask=attention_mask,
+                attention_mask=qsa_mask,
                 freqs_cis=freqs_cis,
+                cp_context=cp_context,
                 **attn_kwargs,
             )
         hidden_states = self.attn_hyper_connection.combine(attn_output, attn_residual)

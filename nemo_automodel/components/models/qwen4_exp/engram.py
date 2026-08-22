@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.qwen4_exp.cp import Qwen4ExpCPContext, qwen4_cp_left_halo
 from nemo_automodel.components.models.qwen4_exp.layers import Qwen4ExpGroupedRMSNorm
 from nemo_automodel.shared.owner_sharding import OwnerShardedParameterSpec
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -797,6 +798,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             final axis concatenates bigram heads before trigram heads.
         """
         ngram_ids = self._hash_input_ids(input_ids)
+        return self._lookup_ngram_ids(ngram_ids)
+
+    def _lookup_ngram_ids(self, ngram_ids: torch.Tensor) -> torch.Tensor:
+        """Look up precomputed packed n-gram table rows.
+
+        Args:
+            ngram_ids: Global table row IDs of shape ``[batch, sequence,
+                ngram_heads]``.
+
+        Returns:
+            Concatenated head values of shape ``[batch, sequence,
+            ngram_heads * head_dim]``.
+        """
         head_embeddings = self.ngram_embedding(ngram_ids)
         expected_prefix = ngram_ids.shape
         if head_embeddings.ndim != 4 or head_embeddings.shape[:-1] != expected_prefix:
@@ -806,6 +820,35 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"{tuple(head_embeddings.shape)}"
             )
         return head_embeddings.flatten(start_dim=-2)
+
+    def _forward_global_slice(
+        self,
+        global_input_ids: torch.Tensor,
+        *,
+        sequence_start: int,
+        sequence_end: int,
+    ) -> torch.Tensor:
+        """Hash a complete raw sequence, then look up only one local slice.
+
+        Args:
+            global_input_ids: Replicated raw IDs of shape ``[batch,
+                global_sequence]``. Hashing the full tensor preserves the two
+                preceding raw tokens and EOS resets at a CP boundary.
+            sequence_start: Inclusive global position of the requested shard.
+            sequence_end: Exclusive global position of the requested shard.
+
+        Returns:
+            Local PLE values of shape ``[batch, local_sequence,
+            ngram_heads * head_dim]`` where ``local_sequence`` equals
+            ``sequence_end - sequence_start``.
+        """
+        if sequence_start < 0 or sequence_end < sequence_start or sequence_end > global_input_ids.shape[1]:
+            raise ValueError(
+                "Invalid Qwen4-Exp PLE global slice "
+                f"[{sequence_start}, {sequence_end}) for sequence length {global_input_ids.shape[1]}"
+            )
+        global_ngram_ids = self._hash_input_ids(global_input_ids)
+        return self._lookup_ngram_ids(global_ngram_ids[:, sequence_start:sequence_end])
 
 
 class Qwen4ExpPLELayer(nn.Module):
@@ -915,19 +958,29 @@ class Qwen4ExpPLELayer(nn.Module):
         normalized = norm(hidden_states.flatten(start_dim=-2))
         return normalized.unflatten(-1, (self.hc_count, self.hidden_size))
 
-    def _causal_short_conv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _causal_short_conv(
+        self,
+        hidden_states: torch.Tensor,
+        cp_context: Qwen4ExpCPContext | None = None,
+    ) -> torch.Tensor:
         """Apply the PLE causal depthwise convolution with left zero history.
 
         Args:
             hidden_states: Branch-flattened tensor of shape
                 ``[batch, sequence, hc_count * hidden_size]``.
+            cp_context: Optional contiguous CP metadata. Under CP, ``sequence``
+                is local and the method exchanges only the preceding nine-token
+                boundary required by the released dilation/kernel settings.
 
         Returns:
             Tensor of shape ``[batch, sequence, hc_count * hidden_size]``.
         """
-        channels_first = hidden_states.transpose(1, 2)
         left_padding = (self.conv_kernel_size - 1) * self.short_conv_dilation
-        channels_first = F.pad(channels_first, (left_padding, 0))
+        if cp_context is None:
+            channels_first = F.pad(hidden_states.transpose(1, 2), (left_padding, 0))
+        else:
+            left_halo = qwen4_cp_left_halo(hidden_states, cp_context, history=left_padding)
+            channels_first = torch.cat((left_halo, hidden_states), dim=1).transpose(1, 2)
         convolved = F.conv1d(
             channels_first,
             self.conv1d.weight,
@@ -941,6 +994,8 @@ class Qwen4ExpPLELayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
+        *,
+        cp_context: Qwen4ExpCPContext | None = None,
     ) -> torch.Tensor:
         """Compute the PLE delta injected before the layer's attention HC read.
 
@@ -948,6 +1003,10 @@ class Qwen4ExpPLELayer(nn.Module):
             hidden_states: True HyperConnection state of shape
                 ``[batch, sequence, hc_count * hidden_size]``.
             input_ids: Raw integer tokenizer IDs of shape ``[batch, sequence]``.
+            cp_context: Optional contiguous CP metadata. Its replicated
+                ``global_input_ids`` and ``global_padding_mask`` fields have
+                shape ``[batch, global_sequence]``; ``hidden_states`` and
+                ``input_ids`` remain local ``[batch, sequence, ...]`` tensors.
 
         Returns:
             PLE delta of shape
@@ -970,7 +1029,19 @@ class Qwen4ExpPLELayer(nn.Module):
                 f"{tuple(input_ids.shape)} and {tuple(hidden_states.shape)}"
             )
 
-        embeddings = self.ple_embedding(input_ids)
+        if cp_context is None:
+            embeddings = self.ple_embedding(input_ids)
+        else:
+            if hidden_states.shape[1] != cp_context.local_sequence_length:
+                raise ValueError(
+                    "PLE local sequence length disagrees with its CP context; "
+                    f"got local={hidden_states.shape[1]}, context={cp_context.local_sequence_length}"
+                )
+            embeddings = self.ple_embedding._forward_global_slice(
+                cp_context.global_input_ids,
+                sequence_start=cp_context.local_sequence_start,
+                sequence_end=cp_context.local_sequence_end,
+            )
         if embeddings.shape != (*hidden_states.shape[:2], self.ple_embed_dim):
             raise RuntimeError(
                 f"Expected PLE embeddings with shape {(*hidden_states.shape[:2], self.ple_embed_dim)}, "
@@ -990,7 +1061,7 @@ class Qwen4ExpPLELayer(nn.Module):
         normalized_gated_value = self._apply_branch_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(start_dim=-2)
         normalized_gated_value = normalized_gated_value.flatten(start_dim=-2)
-        return gated_value + self._causal_short_conv(normalized_gated_value)
+        return gated_value + self._causal_short_conv(normalized_gated_value, cp_context=cp_context)
 
     @torch.no_grad()
     def init_weights(self, initializer_range: float = 0.02) -> None:

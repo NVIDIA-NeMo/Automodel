@@ -1,6 +1,6 @@
 ---
 title: "Qwen4-Exp"
-description: "Fine-tune the language-only Qwen4-Exp Engram MoE checkpoint with FSDP2 and expert parallelism."
+description: "Fine-tune the language-only Qwen4-Exp Engram MoE checkpoint with FSDP2, expert parallelism, and context parallelism."
 slug: model-coverage/large-language-models/qwen/qwen4-exp
 ---
 
@@ -43,12 +43,13 @@ loss or straight-through gradient.
 
 | Area | Validated Configuration |
 |---|---|
-| FSDP2 | Backbone training with activation checkpointing; QSA indexers frozen |
-| Expert parallelism | EP64 |
-| Engram ownership | 64 contiguous row-owner shards over the world group |
-| Tensor / context / pipeline parallelism | Disabled |
+| FSDP2 | 47 decoder blocks use whole-layer activation checkpointing; the PLE owner-collective block remains eager; QSA indexers frozen |
+| Expert parallelism | EP64 baseline; EP128 for the CP1/CP8 comparison |
+| Engram ownership | 64 or 128 contiguous row-owner shards over the world group |
+| Context parallelism | CP1 and CP8 at world size 128; CP was disabled in the EP64 baseline run below |
+| Tensor / pipeline parallelism | Disabled |
 | Workload | Non-packed, right-tail-padded HellaSwag next-token prediction |
-| Scale | 8 nodes / 64 H100 GPUs |
+| Scale | 8 nodes / 64 H100 baseline; 16 nodes / 128 H100 CP comparison |
 | Duration | 100 optimizer steps |
 
 The 100-step run reduced training loss from 3.0734 at step 0 to 1.8195 at step
@@ -60,8 +61,8 @@ The PLE table uses contiguous owner sharding. Request ranks group hashed row IDs
 by owner; an equal-capacity All-to-All sends IDs to owners and a second
 autograd-aware All-to-All returns values. Backward reverses the value route so
 only the rank that owns a row stores and updates its gradient. The validated
-cluster run used NCCL's internal IB transport (`NCCL_NET_PLUGIN=none` and
-`NCCL_NET=IB`).
+cluster runs used NCCL's internal IB transport
+(`NCCL_NET_PLUGIN=none` and `NCCL_NET=IB`).
 
 ## Numerical Validation
 
@@ -83,6 +84,17 @@ fused kernel in all 12 QSA layers produced final logits with cosine similarity
 0.99952, relative L2 error 0.03175, and the same top-1 and top-5 tokens as the
 SGLang reference. The eight EP ranks were bitwise identical for every captured
 layer state, routing probe, final hidden state, and final logits.
+
+Two-rank distributed tests compare model-owned CP with CP1 for exact QSA
+routing IDs, QSA and PLE outputs, per-token input gradients, globally summed
+parameter gradients, PLE hashes across an EOS/shard boundary, and the PLE
+convolution's nine-token cross-rank halo. A full 128-GPU, EP128 comparison then
+trained CP1 and CP8 for the same 100 optimizer steps over the same padded
+4,096-token samples. Both runs completed with finite losses and wrote model,
+optimizer, dataloader, scheduler, and RNG checkpoint payloads. Across all 100
+steps, loss-curve cosine similarity was 0.9999992, mean absolute loss difference
+was 0.00054, and the maximum absolute difference was 0.00267. Final losses were
+0.60801 for CP1 and 0.60800 for CP8.
 
 ## Example Recipe
 
@@ -106,10 +118,19 @@ setup.
   and checkpoint define neither an indexer auxiliary loss nor a
   straight-through estimator; main attention Q/K/V and the rest of the
   backbone remain trainable.
-- Packed sequences, left/interior padding, TP, CP, PP, MTP, and vision/video
-  training are not supported by this implementation.
+- Context parallelism uses contiguous rank-ordered sequence shards. QSA keeps
+  queries local and gathers compressed index keys plus differentiable main
+  K/V; GatedDeltaNet uses FLA's contiguous CP recurrence; PLE hashes replicated
+  global raw IDs, looks up only local table rows, and exchanges an exact
+  autograd-aware nine-token convolution halo.
+- Activation checkpointing wraps 47 of the 48 decoder blocks. The block that
+  owns PLE remains eager because replaying its mutable owner-sharded
+  All-to-All collectives during recomputation is not supported.
 - Optimizer checkpoint resume requires the same PLE owner-group size and
   owner-rank-to-row mapping; optimizer-state resharding is not implemented.
+- CP is limited to language-only, non-packed, right-tail-padded inputs with
+  TP=PP=1. Packed sequences, left/interior padding, TP, PP, MTP, and
+  vision/video training remain unsupported.
 
 ## References
 

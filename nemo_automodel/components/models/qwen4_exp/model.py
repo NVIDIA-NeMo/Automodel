@@ -16,15 +16,16 @@
 
 This implementation uses the checkpoint's compressed-block QSA router and a
 fused TileLang sparse-GQA path for CUDA BF16 long-sequence SFT, with a PyTorch
-oracle for CPU and numerical parity. Pipeline, tensor, and context parallelism
-are intentionally not advertised; expert and Engram table parallelism provide
-the storage scaling needed by the released checkpoint.
+oracle for CPU and numerical parity. Pipeline, tensor, and packed-sequence
+parallelism remain unsupported. Context parallelism uses a model-owned
+contiguous sequence shard for QSA, GDN, and PLE.
 """
 
 from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -32,6 +33,10 @@ import torch.distributed as dist
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+)
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -45,6 +50,7 @@ from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .config import Qwen4ExpConfig, Qwen4ExpTextConfig
+from .cp import Qwen4ExpCPContext, shard_batch_for_qwen4_cp
 from .engram import (
     QWEN4_EXP_NGRAM_PADDED_ROWS,
     Qwen4ExpEngramTableConfig,
@@ -241,6 +247,7 @@ class Qwen4ExpTextModelBackend(nn.Module):
         past_key_values: object | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
+        _qwen4_cp_context: Qwen4ExpCPContext | None = None,
         **attn_kwargs: Any,
     ) -> BaseModelOutputWithPast:
         """Run the HC decoder and final HC mixer.
@@ -260,6 +267,10 @@ class Qwen4ExpTextModelBackend(nn.Module):
             use_cache: Cache request; ``True`` is unsupported.
             output_hidden_states: Include embedding, per-layer HC, and final
                 collapsed states for parity diagnostics.
+            _qwen4_cp_context: Internal contiguous CP metadata. Its replicated
+                raw-ID and padding tensors have shape ``[batch,
+                global_sequence]``; model activations remain local
+                ``[batch, sequence, hidden]`` tensors.
             **attn_kwargs: Attention backend metadata.
 
         Returns:
@@ -268,6 +279,31 @@ class Qwen4ExpTextModelBackend(nn.Module):
         """
         if past_key_values is not None or use_cache:
             raise NotImplementedError("Qwen4-Exp training does not support recurrent or KV caches")
+        if getattr(self, "_cp_enabled", False) and _qwen4_cp_context is None:
+            raise RuntimeError(
+                "Qwen4-Exp context parallelism is enabled, but the model-owned contiguous batch context is missing"
+            )
+        if _qwen4_cp_context is not None:
+            packed_keys = (
+                "cu_seqlens",
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_padded",
+                "seq_lens",
+                "seq_lens_padded",
+                "packed_seq_ids",
+                "_packed_seq_ids",
+                "indices",
+                "max_seqlen",
+                "max_seqlen_q",
+                "max_seqlen_kv",
+            )
+            if attn_kwargs.get("qkv_format") == "thd" or any(attn_kwargs.get(key) is not None for key in packed_keys):
+                raise NotImplementedError("Qwen4-Exp context parallelism does not support packed/THD inputs")
+            if attention_mask is not None and attention_mask.ndim != 2:
+                raise NotImplementedError(
+                    "Qwen4-Exp context parallelism requires a non-packed [batch, local_sequence] attention mask"
+                )
         if input_ids is None:
             if self.config.ple_layer_ids:
                 raise ValueError("input_ids are required because Qwen4-Exp PLE hashes raw token IDs")
@@ -279,6 +315,24 @@ class Qwen4ExpTextModelBackend(nn.Module):
             input_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
 
         batch_size, sequence_length, _ = inputs_embeds.shape
+        if _qwen4_cp_context is not None:
+            if sequence_length != _qwen4_cp_context.local_sequence_length:
+                raise ValueError(
+                    "Qwen4-Exp local input length disagrees with its CP context; "
+                    f"got local={sequence_length}, context={_qwen4_cp_context.local_sequence_length}"
+                )
+            if position_ids is None:
+                raise ValueError("Qwen4-Exp context parallelism requires global position_ids from its batch sharder")
+            candidate_positions = (
+                position_ids[1:] if position_ids.ndim == 3 and position_ids.shape[0] == 4 else position_ids
+            )
+            if candidate_positions.ndim == 3 and candidate_positions.shape[0] > 1:
+                repeated_text_positions = candidate_positions[:1].expand_as(candidate_positions)
+                if not bool(torch.equal(candidate_positions, repeated_text_positions)):
+                    raise NotImplementedError(
+                        "Qwen4-Exp CP supports ordinary text positions only; genuinely different multi-axis mRoPE "
+                        "streams and packed THD are unsupported"
+                    )
         if position_ids is None:
             positions = torch.arange(sequence_length, device=inputs_embeds.device)
             position_ids = positions.view(1, 1, -1).expand(3, batch_size, -1)
@@ -304,6 +358,7 @@ class Qwen4ExpTextModelBackend(nn.Module):
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 position_ids=position_ids,
+                cp_context=_qwen4_cp_context,
                 **attn_kwargs,
             )
             if captured_states is not None:
@@ -367,6 +422,7 @@ class Qwen4ExpModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         past_key_values: object | None = None,
         output_hidden_states: bool | None = None,
+        _qwen4_cp_context: Qwen4ExpCPContext | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
         """Run the language-only Qwen4-Exp decoder.
@@ -382,6 +438,8 @@ class Qwen4ExpModel(nn.Module):
                 ``[batch, sequence, hidden_size]``.
             past_key_values: Cache state; unsupported for training.
             output_hidden_states: Capture decoder HC states.
+            _qwen4_cp_context: Internal contiguous CP metadata with replicated
+                raw-ID/padding tensors of shape ``[batch, global_sequence]``.
             **kwargs: Text-attention backend arguments.
 
         Returns:
@@ -395,6 +453,7 @@ class Qwen4ExpModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_hidden_states=output_hidden_states,
+            _qwen4_cp_context=_qwen4_cp_context,
             **kwargs,
         )
 
@@ -404,13 +463,14 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["_fp32_params"]
+    _owns_cp_attention = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Validated distributed features for the QSA sparse-SFT path."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = True
         supports_mtp_cp: bool = False
@@ -522,6 +582,32 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         """Replace the untied LM projection."""
         self.lm_head = value
 
+    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
+        """Return Qwen4-Exp's contiguous model-owned CP batch sharder.
+
+        Args:
+            batch: Full-sequence batch. Token-aligned tensors have shape
+                ``[batch, global_sequence, ...]`` and remain unchanged until
+                the returned sharder is invoked.
+            num_chunks: Accepted for the framework hook contract; Qwen4-Exp
+                shards each non-packed batch directly and does not use it.
+
+        Returns:
+            Mapping containing one unresolved ``cp_sharder``. Once invoked it
+            returns local contiguous token tensors of shape ``[batch,
+            padded_global_sequence / cp_size, ...]``.
+        """
+        del batch, num_chunks
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=partial(
+                    shard_batch_for_qwen4_cp,
+                    pad_multiple=self.config.text_config.indexer_compress_ratio,
+                ),
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -533,6 +619,7 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
+        _qwen4_cp_context: Qwen4ExpCPContext | None = None,
         **kwargs: Any,
     ) -> Qwen4ExpCausalLMOutput:
         """Run language-only generation and project final HC-mixed states.
@@ -552,7 +639,13 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             logits_to_keep: ``0`` for all positions, a positive trailing count,
                 or an integer tensor of shape ``[kept_sequence]`` containing
                 explicit sequence indices.
-            output_hidden_states: Return embedding/per-layer/final states.
+            output_hidden_states: Explicit ``True`` returns the embedding,
+                every per-layer HC state, and the final state. When omitted,
+                ``config.output_hidden_states=True`` returns only the final
+                state for fused linear cross entropy without retaining every
+                decoder activation.
+            _qwen4_cp_context: Internal contiguous CP metadata with replicated
+                raw-ID/padding tensors of shape ``[batch, global_sequence]``.
             **kwargs: Text-attention backend metadata.
 
         Returns:
@@ -562,25 +655,30 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         del labels
         if use_cache:
             raise NotImplementedError("Qwen4-Exp training does not support caches")
+        capture_all_hidden_states = output_hidden_states is True
+        return_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=capture_all_hidden_states,
+            _qwen4_cp_context=_qwen4_cp_context,
             **kwargs,
         )
         lm_output = compute_lm_head_logits(
             self.lm_head,
             outputs.last_hidden_state,
             logits_to_keep,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=return_hidden_states,
         )
         return Qwen4ExpCausalLMOutput(
             logits=lm_output.logits,
             past_key_values=None,
-            hidden_states=outputs.hidden_states,
+            hidden_states=outputs.hidden_states if capture_all_hidden_states else lm_output.hidden_states,
         )
 
     @torch.no_grad()

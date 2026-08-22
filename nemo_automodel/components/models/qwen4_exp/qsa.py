@@ -31,6 +31,7 @@ from torch import nn
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
+from nemo_automodel.components.models.qwen4_exp.cp import Qwen4ExpCPContext, qwen4_cp_all_gather
 from nemo_automodel.components.models.qwen4_exp.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.components.models.qwen4_exp.kernels.sparse_attention import tilelang_sparse_gqa_attention
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -123,6 +124,8 @@ def select_qsa_token_ids(
     token_budget: int,
     compress_ratio: int,
     query_chunk_size: int = 128,
+    query_position_offset: int = 0,
+    global_sequence_length: int | None = None,
 ) -> torch.Tensor:
     """Score compressed blocks and expand gold QSA top-k IDs.
 
@@ -134,24 +137,31 @@ def select_qsa_token_ids(
     are appended.  Invalid slots are ``-1``.
 
     Args:
-        index_queries: Normalized and rotated index queries ``[B, S, H_index, D_index]``.
+        index_queries: Normalized and rotated local index queries
+            ``[B, S_query, H_index, D_index]``.
         compressed_keys: FP32-mean-pooled, normalized, rotated index keys
-            ``[B, floor(S / compress_ratio), 1, D_index]``.
+            ``[B, floor(S_global / compress_ratio), 1, D_index]``.
         sequence_lengths: Right-padded logical lengths ``[B]``.
         token_budget: Maximum number of tokens contributed by complete blocks.
         compress_ratio: Number of consecutive tokens represented by one block.
         query_chunk_size: Query rows scored together.  This bounds the temporary
             FP32 score tensor without changing top-k semantics.
+        query_position_offset: Global position represented by local query row
+            zero. It is zero without CP and ``cp_rank * S_query`` for the
+            contiguous CP layout.
+        global_sequence_length: Padded global physical sequence length. It
+            defaults to the local query length for the non-CP path.
 
     Returns:
-        Logical token IDs ``[B, S, token_budget + compress_ratio - 1]`` in
-        int32.  Valid IDs are contiguous at the start of each row.
+        Global logical token IDs ``[B, S_query, token_budget +
+        compress_ratio - 1]`` in int32. Valid IDs are contiguous at the start
+        of each row.
     """
     if index_queries.ndim != 4:
         raise ValueError(f"index_queries must be [B, S, H, D], got {tuple(index_queries.shape)}")
     if compressed_keys.ndim != 4 or compressed_keys.shape[2] != 1:
         raise ValueError(f"compressed_keys must be [B, P, 1, D], got {tuple(compressed_keys.shape)}")
-    batch_size, sequence_length, num_heads, head_dim = index_queries.shape
+    batch_size, query_sequence_length, num_heads, head_dim = index_queries.shape
     if compressed_keys.shape[0] != batch_size or compressed_keys.shape[-1] != head_dim:
         raise ValueError("QSA query/key batch and head dimensions must match")
     if sequence_lengths.shape != (batch_size,):
@@ -165,10 +175,19 @@ def select_qsa_token_ids(
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
     if num_heads <= 0 or head_dim <= 0:
         raise ValueError("QSA index queries require positive head count and head dimension")
+    if query_position_offset < 0:
+        raise ValueError(f"query_position_offset must be non-negative, got {query_position_offset}")
+    if global_sequence_length is None:
+        global_sequence_length = query_sequence_length
+    if global_sequence_length < query_position_offset + query_sequence_length:
+        raise ValueError(
+            "QSA global sequence does not cover every local query; "
+            f"got global={global_sequence_length}, offset={query_position_offset}, local={query_sequence_length}"
+        )
 
     lengths = sequence_lengths.to(device=index_queries.device, dtype=torch.long)
-    if bool(((lengths < 0) | (lengths > sequence_length)).any()):
-        raise ValueError(f"QSA logical lengths must lie in [0, {sequence_length}]")
+    if bool(((lengths < 0) | (lengths > global_sequence_length)).any()):
+        raise ValueError(f"QSA logical lengths must lie in [0, {global_sequence_length}]")
     required_blocks = torch.div(lengths, compress_ratio, rounding_mode="floor")
     num_blocks = compressed_keys.shape[1]
     if bool((required_blocks > num_blocks).any()):
@@ -180,7 +199,7 @@ def select_qsa_token_ids(
     block_budget = token_budget // compress_ratio
     final_width = token_budget + compress_ratio - 1
     selected_tokens = torch.full(
-        (batch_size, sequence_length, final_width),
+        (batch_size, query_sequence_length, final_width),
         -1,
         dtype=torch.int32,
         device=index_queries.device,
@@ -193,9 +212,14 @@ def select_qsa_token_ids(
         logical_length = int(lengths[batch_idx])
         available_blocks = logical_length // compress_ratio
         keys = compressed_keys[batch_idx, :available_blocks, 0].float()
-        for query_start in range(0, logical_length, query_chunk_size):
-            query_end = min(query_start + query_chunk_size, logical_length)
-            query_positions = torch.arange(query_start, query_end, device=index_queries.device)
+        local_valid_length = min(max(logical_length - query_position_offset, 0), query_sequence_length)
+        for query_start in range(0, local_valid_length, query_chunk_size):
+            query_end = min(query_start + query_chunk_size, local_valid_length)
+            query_positions = torch.arange(
+                query_position_offset + query_start,
+                query_position_offset + query_end,
+                device=index_queries.device,
+            )
             visible_blocks = torch.div(query_positions + 1, compress_ratio, rounding_mode="floor")
             rows = query_end - query_start
             result = torch.full((rows, final_width), -1, dtype=torch.int32, device=index_queries.device)
@@ -466,6 +490,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        cp_context: Qwen4ExpCPContext | None = None,
     ) -> torch.Tensor:
         """Return selected logical token IDs for every physical query row.
 
@@ -474,6 +499,10 @@ class Qwen4ExpQSAIndexer(nn.Module):
             freqs_cis: Composed Qwen4 rotary values ``[B, S, D_rope]`` stored
                 as concatenated cosine/sine halves.
             attention_mask: Optional binary right-tail mask ``[B, S]``.
+            cp_context: Optional contiguous CP metadata. When present,
+                ``hidden_states`` and ``freqs_cis`` contain the local query
+                shard while raw logical lengths and selected IDs use global
+                sequence coordinates.
 
         Returns:
             int32 logical IDs ``[B, S, token_budget + compress_ratio - 1]``.
@@ -482,12 +511,34 @@ class Qwen4ExpQSAIndexer(nn.Module):
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.hidden_size:
             raise ValueError(f"QSA hidden_states must be [B, S, {self.hidden_size}], got {tuple(hidden_states.shape)}")
         batch_size, sequence_length, _ = hidden_states.shape
-        sequence_lengths = right_padded_sequence_lengths(
-            attention_mask,
-            batch_size=batch_size,
-            sequence_length=sequence_length,
-            device=hidden_states.device,
-        )
+        if cp_context is None:
+            sequence_lengths = right_padded_sequence_lengths(
+                attention_mask,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                device=hidden_states.device,
+            )
+            query_position_offset = 0
+            global_sequence_length = sequence_length
+        else:
+            if cp_context.global_input_ids.shape[0] != batch_size:
+                raise ValueError(
+                    "QSA CP batch size disagrees with the global raw-ID context; "
+                    f"got local={batch_size}, global={cp_context.global_input_ids.shape[0]}"
+                )
+            if sequence_length != cp_context.local_sequence_length:
+                raise ValueError(
+                    "QSA local sequence length disagrees with its CP context; "
+                    f"got local={sequence_length}, context={cp_context.local_sequence_length}"
+                )
+            sequence_lengths = cp_context.global_sequence_lengths.to(hidden_states.device)
+            query_position_offset = cp_context.local_sequence_start
+            global_sequence_length = cp_context.global_sequence_length
+            if sequence_length % self.compress_ratio != 0:
+                raise ValueError(
+                    "QSA contiguous CP requires every local sequence shard to be divisible by the compression ratio; "
+                    f"got local={sequence_length}, ratio={self.compress_ratio}"
+                )
 
         projected = self.index_qk_proj(hidden_states)
         query_width = self.num_query_heads * self.head_dim
@@ -500,6 +551,13 @@ class Qwen4ExpQSAIndexer(nn.Module):
         compressed_key = grouped_key.float().mean(dim=2).to(raw_key.dtype)
         compressed_freqs = freqs_cis[:, : num_blocks * self.compress_ratio : self.compress_ratio]
         compressed_key = apply_qsa_rope(self.k_layernorm(compressed_key), compressed_freqs)
+        if cp_context is not None:
+            compressed_key = qwen4_cp_all_gather(
+                compressed_key,
+                cp_context,
+                sequence_dim=1,
+                differentiable=False,
+            )
 
         return select_qsa_token_ids(
             index_query,
@@ -508,6 +566,8 @@ class Qwen4ExpQSAIndexer(nn.Module):
             token_budget=self.token_budget,
             compress_ratio=self.compress_ratio,
             query_chunk_size=self.query_chunk_size,
+            query_position_offset=query_position_offset,
+            global_sequence_length=global_sequence_length,
         )
 
     @torch.no_grad()

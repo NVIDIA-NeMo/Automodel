@@ -149,6 +149,37 @@ def test_tiny_qwen4_exp_forward_backward_and_state_layout() -> None:
     assert "model.language_model.hyper_connection_mixer.block_inject_weight.weight" not in keys
 
 
+def test_output_hidden_states_defaults_to_model_config() -> None:
+    config = _tiny_config()
+    config.output_hidden_states = True
+    model = Qwen4ExpForConditionalGeneration.from_config(
+        config,
+        moe_config=_tiny_moe_config(config.text_config),
+        backend=BackendConfig(
+            linear="torch",
+            attn="sdpa",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
+            enable_hf_state_dict_adapter=False,
+        ),
+    )
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+
+    output = model(input_ids=torch.randint(2, config.text_config.vocab_size, (1, 6)))
+
+    assert isinstance(output.hidden_states, torch.Tensor)
+    assert output.hidden_states.shape == (1, 6, config.text_config.hidden_size)
+
+    explicit_output = model(
+        input_ids=torch.randint(2, config.text_config.vocab_size, (1, 6)),
+        output_hidden_states=True,
+    )
+    assert isinstance(explicit_output.hidden_states, tuple)
+    assert len(explicit_output.hidden_states) == config.text_config.num_hidden_layers + 2
+    assert explicit_output.hidden_states[-1].shape == (1, 6, config.text_config.hidden_size)
+
+
 def test_qsa_sparse_training_runs_above_budget() -> None:
     config = _tiny_config()
     config.text_config.indexer_budget = 4
