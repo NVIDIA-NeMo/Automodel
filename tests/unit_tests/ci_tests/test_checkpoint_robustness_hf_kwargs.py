@@ -1407,7 +1407,7 @@ def test_compare_logits_persists_machine_readable_metrics(tmp_path):
 
     assert failure is None
     payload = json.loads((tmp_path / "parity_metrics/phase_2_automodel_model_reload.json").read_text())
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["parity_document_sha256"] == _PARITY_DOCUMENT_SHA256
     assert payload["threshold_mode"] == "profile"
     assert payload["passed"] is True
@@ -1417,6 +1417,9 @@ def test_compare_logits_persists_machine_readable_metrics(tmp_path):
     assert payload["candidate_logits"] == {"dtype": "torch.float32", "shape": [1, 2, 2]}
     assert payload["metrics"]["token_count"] == 2
     assert payload["metrics"]["mean_kl"] == pytest.approx(0.0, abs=1e-8)
+    assert payload["metrics"]["mean_jsd"] == pytest.approx(0.0, abs=5e-8)
+    assert payload["metrics"]["p95_jsd"] == pytest.approx(0.0, abs=5e-8)
+    assert payload["metrics"]["max_jsd"] == pytest.approx(0.0, abs=5e-8)
 
 
 def test_compare_logits_marks_skipped_gate_as_informational(tmp_path):

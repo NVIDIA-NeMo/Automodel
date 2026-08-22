@@ -551,7 +551,10 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     if "/mistral4/" in recipe_path:
         assert robustness["hf_source_post_load_dequantize"] is True
         assert "parity_tolerance_profile" not in robustness
-        assert robustness["parity_tolerance_profile_overrides"] == {"hf_reload": "relaxed"}
+        assert robustness["parity_tolerance_profile_overrides"] == {
+            "automodel_reload": "relaxed",
+            "hf_reload": "relaxed",
+        }
         for key in (
             "kl_threshold",
             "source_load_kl_threshold",
