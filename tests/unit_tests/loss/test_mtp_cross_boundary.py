@@ -32,6 +32,7 @@ from unittest import mock
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 
@@ -372,3 +373,95 @@ def test_2d_labels_and_3d_hidden_states_unchanged():
 
     for d, h in enumerate(captured_hidden):
         assert h.shape == (B, S, H), f"depth {d}: BSHD path should be unchanged, got {tuple(h.shape)}"
+
+
+def test_mtp_hidden_is_cast_to_fp32_lm_head_dtype():
+    """DeepSeek V4 keeps its LM head in fp32 while the MTP block runs in bf16."""
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    model = torch.nn.Module()
+    model.lm_head = torch.nn.Linear(4, 8, bias=False, dtype=torch.float32)
+    hidden = torch.randn(1, 4, 4, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.tensor([[1, 2, 3, IGNORE]])
+
+    loss = calculate_mtp_loss(
+        MaskedCrossEntropy(),
+        mtp_per_depth_h=[hidden],
+        mtp_per_depth_targets=[labels],
+        labels=labels,
+        model=model,
+    )
+
+    assert loss.dtype == torch.float32
+    loss.backward()
+    assert hidden.grad is not None
+    assert model.lm_head.weight.grad is not None
+
+
+def test_mtp_hidden_uses_fsdp_lm_head_compute_dtype():
+    """Match MTP loss and gradients when the FSDP head stores FP32 but computes in BF16."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
+    try:
+        torch.manual_seed(1234)
+        model = torch.nn.Module()
+        model.lm_head = torch.nn.Linear(4, 8, bias=False, dtype=torch.float32)
+        reference = torch.nn.Module()
+        reference.lm_head = torch.nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
+        reference.lm_head.load_state_dict(model.lm_head.state_dict())
+
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        fully_shard(
+            model.lm_head,
+            mesh=mesh,
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.bfloat16,
+                cast_forward_inputs=False,
+            ),
+        )
+        assert isinstance(model.lm_head, FSDPModule)
+        assert model.lm_head.weight.dtype == torch.float32
+        assert model.lm_head._get_fsdp_state()._mp_policy.param_dtype == torch.bfloat16
+
+        hidden = torch.randn(1, 4, 4, dtype=torch.bfloat16, requires_grad=True)
+        reference_hidden = hidden.detach().clone().requires_grad_(True)
+        labels = torch.tensor([[1, 2, 3, 4]])
+        loss_fn = MaskedCrossEntropy()
+
+        loss = calculate_mtp_loss(
+            loss_fn,
+            mtp_per_depth_h=[hidden],
+            mtp_per_depth_targets=[labels],
+            labels=labels,
+            model=model,
+        )
+        reference_loss = calculate_mtp_loss(
+            loss_fn,
+            mtp_per_depth_h=[reference_hidden],
+            mtp_per_depth_targets=[labels],
+            labels=labels,
+            model=reference,
+        )
+        loss.backward()
+        reference_loss.backward()
+
+        torch.testing.assert_close(loss, reference_loss, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=1e-2, atol=1e-2)
+        head_grad = model.lm_head.weight.grad
+        if hasattr(head_grad, "full_tensor"):
+            head_grad = head_grad.full_tensor()
+        torch.testing.assert_close(
+            head_grad,
+            reference.lm_head.weight.grad,
+            rtol=1e-2,
+            atol=1e-2,
+            check_dtype=False,
+        )
+    finally:
+        dist.destroy_process_group()

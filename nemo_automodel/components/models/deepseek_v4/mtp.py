@@ -233,27 +233,67 @@ class DeepseekV4MTPModule(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.LongTensor | None = None,
+        input_ids_per_depth: tuple[torch.LongTensor, ...] | list[torch.LongTensor] | None = None,
         embed_fn=None,
         embed_inputs: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
         position_ids: torch.LongTensor | None = None,
+        position_ids_per_depth: tuple[torch.LongTensor, ...] | list[torch.LongTensor] | None = None,
         **block_kwargs,
     ) -> list[torch.Tensor]:
+        """Run the DeepSeek V4 MTP prediction depths.
+
+        Args:
+            hidden_states: Backbone hidden states of shape [batch, sequence,
+                hidden]. Under CP, sequence is the per-rank local sequence.
+            input_ids: Optional token IDs of shape [batch, sequence]. Each MTP
+                depth rolls this local tensor by one position; use only without CP.
+            input_ids_per_depth: Optional tuple of ``num_depths`` pre-shifted
+                token-ID tensors, each of shape [batch, sequence]. Under CP,
+                sequence is the per-rank local sequence produced after the global shift.
+            embed_fn: Callable mapping token IDs of shape [batch, sequence] to
+                embeddings of shape [batch, sequence, hidden].
+            embed_inputs: Optional tuple of ``num_depths`` precomputed embedding
+                tensors, each of shape [batch, sequence, hidden]. Under CP,
+                sequence is the per-rank local sequence.
+            position_ids: Optional position IDs of shape [batch, sequence] used
+                for every depth when per-depth positions are not supplied.
+            position_ids_per_depth: Optional tuple of ``num_depths`` position-ID
+                tensors, each of shape [batch, sequence]. Under CP, sequence is
+                the per-rank local sequence produced after the global shift.
+            **block_kwargs: Additional arguments forwarded to each MTP block.
+
+        Returns:
+            List of ``num_depths`` prediction-hidden tensors, each of shape
+            [batch, sequence, hidden]. Under CP, sequence is the per-rank local sequence.
+        """
         per_depth_h: list[torch.Tensor] = []
         cur_input_ids = input_ids
         if embed_inputs is not None and len(embed_inputs) != len(self.layers):
             raise ValueError(f"Expected {len(self.layers)} MTP embedding tensors, got {len(embed_inputs)}")
-        if embed_inputs is None and (cur_input_ids is None or embed_fn is None):
-            raise ValueError("MTP requires either embed_inputs or both input_ids and embed_fn")
+        if input_ids_per_depth is not None and len(input_ids_per_depth) != len(self.layers):
+            raise ValueError(f"Expected {len(self.layers)} MTP input-ID tensors, got {len(input_ids_per_depth)}")
+        if position_ids_per_depth is not None and len(position_ids_per_depth) != len(self.layers):
+            raise ValueError(f"Expected {len(self.layers)} MTP position-ID tensors, got {len(position_ids_per_depth)}")
+        if embed_inputs is not None and input_ids_per_depth is not None:
+            raise ValueError("MTP embed_inputs and input_ids_per_depth are mutually exclusive")
+        if embed_inputs is None and input_ids_per_depth is None and cur_input_ids is None:
+            raise ValueError("MTP requires embed_inputs, input_ids_per_depth, or input_ids")
+        if embed_inputs is None and embed_fn is None:
+            raise ValueError("Token-ID MTP inputs require embed_fn")
 
         for depth, block in enumerate(self.layers):
             if embed_inputs is None:
-                cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
+                if input_ids_per_depth is not None:
+                    cur_input_ids = input_ids_per_depth[depth]
+                else:
+                    cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
                 decoder_input = embed_fn(cur_input_ids)
             else:
                 decoder_input = embed_inputs[depth]
             kwargs = dict(block_kwargs)
-            if position_ids is not None:
-                kwargs["position_ids"] = position_ids
+            depth_position_ids = position_ids_per_depth[depth] if position_ids_per_depth is not None else position_ids
+            if depth_position_ids is not None:
+                kwargs["position_ids"] = depth_position_ids
             hidden_states, prediction_hidden = block(
                 hidden_states,
                 embed_input=decoder_input,

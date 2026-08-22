@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -140,8 +141,11 @@ def test_process_image_input_merges_patches_and_logs(monkeypatch):
     tensor_patches = model._process_image_input(pixel_values[:1], num_patches=torch.tensor([0]))
     assert tensor_patches[0].shape == (1, 8)
 
+    projector_forward = MagicMock(wraps=model.vit_large_projector.forward)
+    monkeypatch.setattr(model.vit_large_projector, "forward", projector_forward)
     merged = model._process_image_input(pixel_values, patch_pixel_values=patch_pixel_values, num_patches=[1, 0])
     assert [item.shape for item in merged] == [torch.Size([2, 8]), torch.Size([1, 8])]
+    projector_forward.assert_called_once()
 
     with pytest.raises(ValueError, match="patch_pixel_values is missing"):
         model._process_image_input(pixel_values, num_patches=[1, 0])
@@ -308,6 +312,95 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     assert sharder.local_token_global_indices is round_robin_local_indices
 
 
+def test_three_depth_mtp_uses_future_positions_and_depth_aligned_rope(monkeypatch):
+    text_config = {
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_attention_heads": 2,
+        "num_attention_groups": 1,
+        "num_hidden_layers": 0,
+        "num_nextn_predict_layers": 3,
+        "mtp_base_layer_idx": 0,
+        "vocab_size": 32,
+        "moe_num_experts": 2,
+        "moe_top_k": 1,
+        "moe_intermediate_size": 4,
+        "share_expert_dims": 4,
+        "head_dim": 4,
+        "torch_dtype": "float32",
+        "moe_layers_enum": (),
+        "layer_types": ["sliding_attention"] * 3,
+        "attention_other_setting": {},
+    }
+    wrapper = Step3p7ForConditionalGeneration(small_config(text_config=text_config), backend=backend())
+    wrapper.model = FakeInnerModel()
+    wrapper.lm_head = nn.Identity()
+    captured = {}
+
+    class CaptureMTP(nn.Module):
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            *,
+            freqs_cis_per_depth: tuple[torch.Tensor, ...],
+            position_ids_per_depth: tuple[torch.LongTensor, ...],
+            **kwargs,
+        ) -> list[torch.Tensor]:
+            """Capture the per-depth tensors passed by the wrapper.
+
+            Args:
+                hidden_states: Tensor of shape [batch, sequence, hidden].
+                freqs_cis_per_depth: Three RoPE tensors of shape [batch,
+                    sequence, rotary].
+                position_ids_per_depth: Three position-ID tensors of shape
+                    [batch, sequence].
+                **kwargs: Remaining MTP arguments, including future-token
+                    embeddings of shape [batch, sequence, hidden].
+
+            Returns:
+                Three tensors of shape [batch, sequence, hidden].
+            """
+            captured["freqs"] = freqs_cis_per_depth
+            captured["positions"] = position_ids_per_depth
+            return [hidden_states for _ in position_ids_per_depth]
+
+    rope_position_ids = []
+
+    def fake_position_ids_to_freqs_cis(rotary_emb, position_ids: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Return a traceable RoPE tensor for the supplied positions.
+
+        Args:
+            rotary_emb: Unused rotary-embedding module.
+            position_ids: Tensor of shape [batch, sequence].
+            **kwargs: Unused RoPE options.
+
+        Returns:
+            Tensor of shape [batch, sequence, rotary], with rotary size one.
+        """
+        del rotary_emb, kwargs
+        rope_position_ids.append(position_ids.detach().clone())
+        return position_ids.float().unsqueeze(-1)
+
+    wrapper.mtp = CaptureMTP()
+    monkeypatch.setattr(step3p7_model, "position_ids_to_freqs_cis", fake_position_ids_to_freqs_cis)
+
+    wrapper(
+        input_ids=torch.tensor([[1, 2, 3, 0]]),
+        position_ids=torch.tensor([[0, 1, 2, 3]]),
+    )
+
+    expected_positions = (
+        torch.tensor([[1, 2, 3, 0]]),
+        torch.tensor([[2, 3, 0, 0]]),
+        torch.tensor([[3, 0, 0, 0]]),
+    )
+    assert len(rope_position_ids) == 3
+    for depth in range(3):
+        torch.testing.assert_close(rope_position_ids[depth], expected_positions[depth])
+        torch.testing.assert_close(captured["positions"][depth], expected_positions[depth])
+        torch.testing.assert_close(captured["freqs"][depth], expected_positions[depth].float().unsqueeze(-1))
+
+
 def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
     """Under CP the first stage input stays full-length token ids while every
     stage output (and the propagated MTP hidden states) is the local shard;
@@ -335,6 +428,37 @@ def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
     assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long
     assert outs[0].shape[1] == 4  # local sequence length on every output
     assert all(o.shape[1] == 4 for o in outs)
+
+
+def test_cp_forward_suspends_ring_dispatcher_for_vision(monkeypatch):
+    class FakeCPMesh:
+        @staticmethod
+        def size():
+            return 2
+
+    wrapper, _ = _wrapper_with_fake_inner()
+    wrapper.cp_mesh = FakeCPMesh()
+    entered = False
+
+    @contextmanager
+    def fake_suspended(mesh):
+        nonlocal entered
+        assert mesh is wrapper.cp_mesh
+        entered = True
+        yield
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.context_parallel.utils.cp_dispatcher_suspended",
+        fake_suspended,
+    )
+    monkeypatch.setattr(step3p7_model, "shard_sequence_for_cp_round_robin", lambda mesh, value, seq_dim: (value, 0, 0))
+
+    wrapper(
+        input_ids=torch.tensor([[31, 1, 2]]),
+        image_embeds=torch.randn(1, 8),
+    )
+
+    assert entered
 
 
 def test_forward_consumes_pp_vlm_chunks_and_drops_mismatched_masks(monkeypatch):
