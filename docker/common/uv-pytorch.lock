@@ -1926,11 +1926,9 @@ name = "flashoptim"
 version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
-    { name = "packaging" },
-    { name = "torch", marker = "sys_platform == 'never'" },
-    { name = "triton", marker = "sys_platform == 'never'" },
+    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
+    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform == 'linux'" },
+    { name = "packaging", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/97/f5/3f463bff2d9f86c230c0ef5c7632ae180e25e4523a4494ad8844ed704879/flashoptim-0.1.3.tar.gz", hash = "sha256:8dc7238224883aa3e8aca40f992d7432e76d5c641255a9dd29c5633741fbfdf1", size = 90240, upload-time = "2026-03-07T09:29:11.414Z" }
 wheels = [
@@ -4058,7 +4056,7 @@ name = "nemo-automodel"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
-    { name = "flashoptim" },
+    { name = "flashoptim", marker = "sys_platform == 'linux'" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extra = ["audio", "hf-hub", "sentencepiece"] },
     { name = "mlflow" },
@@ -4271,7 +4269,7 @@ requires-dist = [
     { name = "ffpa-attn", marker = "extra == 'ffpa'", specifier = ">=0.2.2" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
     { name = "flash-linear-attention", marker = "extra == 'fla'", specifier = ">=0.4.2" },
-    { name = "flashoptim", specifier = ">=0.1.3" },
+    { name = "flashoptim", marker = "sys_platform == 'linux'", specifier = ">=0.1.3" },
     { name = "ftfy", marker = "extra == 'diffusion'" },
     { name = "imageio", marker = "extra == 'diffusion'" },
     { name = "imageio-ffmpeg", marker = "extra == 'diffusion-media'" },
