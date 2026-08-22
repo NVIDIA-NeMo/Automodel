@@ -34,6 +34,7 @@ _MOK_IMPORT_MESSAGE = (
     "dispatcher='mok' requires a built Mixture-of-Kittens installation or an importable mixture-of-kittens checkout."
 )
 _mok_functional = None
+_mok_ops = None
 
 
 def _load_mok_functional():
@@ -52,6 +53,27 @@ def _load_mok_functional():
             raise ImportError(_MOK_IMPORT_MESSAGE)
         _mok_functional = functional
     return _mok_functional
+
+
+def _load_mok_ops():
+    """Import MoK's weight-quantization ops after selecting this process's GPU."""
+    global _mok_ops
+    if _mok_ops is None:
+        available, ops = safe_import("mok.ops", msg=_MOK_IMPORT_MESSAGE)
+        if not available:
+            raise ImportError(_MOK_IMPORT_MESSAGE)
+        _mok_ops = ops
+    return _mok_ops
+
+
+def _mxfp8_weight_both(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prequantize both MoK MXFP8 layouts in one kernel launch."""
+    weight_fp8, weight_scale, weight_t_fp8, weight_t_scale = _load_mok_ops().mxfp8_quantize(weight, True, True)
+    if weight_fp8 is None or weight_scale is None or weight_t_fp8 is None or weight_t_scale is None:
+        raise RuntimeError("MoK MXFP8 quantization did not return both requested weight layouts")
+    return weight_fp8, weight_scale, weight_t_fp8, weight_t_scale
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -135,6 +157,53 @@ class _MoKRuntime:
         self.swiglu_limit = None if swiglu_limit == 0.0 else float(swiglu_limit)
         self.config: object | None = None
         self.ep_group: dist.ProcessGroup | None = None
+        self._mxfp8_cache_key: tuple[object, ...] | None = None
+        self._mxfp8_weights: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...] | None = None
+        self._retain_mxfp8_cache_until_optimizer_step = False
+
+    def _get_workspace(self, x: torch.Tensor, topk: int) -> object:
+        return _mok_functional.get_workspace(
+            self.config,
+            self.ep_group,
+            device=x.device,
+            num_local_tokens=x.shape[0],
+            hidden_size=x.shape[1],
+            topk=topk,
+        )
+
+    @staticmethod
+    def _weight_cache_key(weight: torch.Tensor) -> tuple[object, ...]:
+        """Identify one materialized routed weight without retaining the BF16 tensor."""
+        try:
+            version: int | None = weight._version
+        except RuntimeError:  # Inference tensors do not expose a version counter.
+            version = None
+        return (weight.device, weight.data_ptr(), weight.storage_offset(), weight.shape, weight.stride(), version)
+
+    def _get_mxfp8_weights(
+        self,
+        routed_gate_weights: torch.Tensor,
+        routed_up_weights: torch.Tensor,
+        routed_down_weights: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+        """Prequantize all weight layouts once and reuse them through AC and backward.
+
+        The cache is local to one MoE layer. It is retained through backward and,
+        during training, across microbatches until the optimizer updates the BF16
+        weights. Its key includes storage identity and tensor version so a
+        rematerialized or modified weight cannot reuse stale quantized data.
+        """
+        weights = (routed_gate_weights, routed_up_weights, routed_down_weights)
+        cache_key = tuple(self._weight_cache_key(weight) for weight in weights)
+        if self._mxfp8_weights is None or self._mxfp8_cache_key != cache_key:
+            self._mxfp8_weights = tuple(_mxfp8_weight_both(weight) for weight in weights)
+            self._mxfp8_cache_key = cache_key
+        return self._mxfp8_weights
+
+    def _clear_mxfp8_forward_cache(self) -> None:
+        """Drop runtime references when their BF16 source weights may change."""
+        self._mxfp8_cache_key = None
+        self._mxfp8_weights = None
 
     def initialize(self, ep_mesh: DeviceMesh, *, n_routed_experts: int) -> None:
         """Attach the runtime to the expert-parallel group.
@@ -156,6 +225,8 @@ class _MoKRuntime:
         # Load the CUDA extension only after torchrun has bound this worker to
         # its local device.  This avoids all workers creating a context on GPU 0.
         _load_mok_functional()
+        if self.mok_config.precision == "mxfp8":
+            _load_mok_ops()
         self.config = self.mok_config.build()
         self.ep_group = ep_mesh.get_group()
 
@@ -170,7 +241,12 @@ class _MoKRuntime:
         routed_gate_weights: torch.Tensor,
         routed_up_weights: torch.Tensor,
         routed_down_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, object, object]:
+    ) -> tuple[
+        torch.Tensor,
+        object,
+        object,
+        tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...] | None,
+    ]:
         """Run MoK's manual forward and retain its backward context.
 
         Args:
@@ -193,20 +269,27 @@ class _MoKRuntime:
         """
         if self.ep_group is None or self.config is None:
             raise RuntimeError("MoK expert runtime was used before expert-parallel initialization")
-        workspace = _mok_functional.get_workspace(
-            self.config,
-            self.ep_group,
-            device=x.device,
-            num_local_tokens=x.shape[0],
-            hidden_size=x.shape[1],
-            topk=top_experts.shape[1],
-        )
+        workspace = self._get_workspace(x, top_experts.shape[1])
         schedule = _mok_functional.build_schedule(
             workspace,
             self.config,
             top_experts,
             num_local_experts=routed_gate_weights.shape[0],
         )
+        if self.mok_config.precision == "mxfp8":
+            mxfp8_weights = self._get_mxfp8_weights(
+                routed_gate_weights,
+                routed_up_weights,
+                routed_down_weights,
+            )
+            forward_routed_gate_weights = mxfp8_weights[0][:2]
+            forward_routed_up_weights = mxfp8_weights[1][:2]
+            forward_routed_down_weights = mxfp8_weights[2][:2]
+        else:
+            mxfp8_weights = None
+            forward_routed_gate_weights = routed_gate_weights
+            forward_routed_up_weights = routed_up_weights
+            forward_routed_down_weights = routed_down_weights
         output, forward_context = _mok_functional.forward(
             self.config,
             workspace,
@@ -216,12 +299,12 @@ class _MoKRuntime:
             shared_gate_weights,
             shared_up_weights,
             shared_down_weights,
-            routed_gate_weights,
-            routed_up_weights,
-            routed_down_weights,
+            forward_routed_gate_weights,
+            forward_routed_up_weights,
+            forward_routed_down_weights,
             self.swiglu_limit,
         )
-        return output, schedule, forward_context
+        return output, schedule, forward_context, mxfp8_weights
 
     def backward(
         self,
@@ -236,6 +319,7 @@ class _MoKRuntime:
         routed_gate_weights: torch.Tensor,
         routed_up_weights: torch.Tensor,
         routed_down_weights: torch.Tensor,
+        mxfp8_weights: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...] | None,
     ) -> tuple[torch.Tensor, ...]:
         """Run MoK's manual backward.
 
@@ -261,30 +345,43 @@ class _MoKRuntime:
         """
         if self.ep_group is None or self.config is None:
             raise RuntimeError("MoK expert runtime was used before expert-parallel initialization")
-        workspace = _mok_functional.get_workspace(
-            self.config,
-            self.ep_group,
-            device=x.device,
-            num_local_tokens=x.shape[0],
-            hidden_size=x.shape[1],
-            topk=router_weights.shape[1],
-        )
-        return _mok_functional.backward(
-            self.config,
-            workspace,
-            schedule,
-            forward_context,
-            grad_output.contiguous(),
-            x,
-            router_weights,
-            shared_gate_weights,
-            shared_up_weights,
-            shared_down_weights,
-            routed_gate_weights,
-            routed_up_weights,
-            routed_down_weights,
-            self.swiglu_limit,
-        )
+        workspace = self._get_workspace(x, router_weights.shape[1])
+        if self.mok_config.precision == "mxfp8":
+            if mxfp8_weights is None:
+                raise RuntimeError("MoK MXFP8 backward requires the prequantized weights")
+            if len(mxfp8_weights) != 3:
+                raise RuntimeError(f"MoK MXFP8 backward expected 3 prequantized weights, got {len(mxfp8_weights)}")
+            if any(any(tensor is None for tensor in weight) for weight in mxfp8_weights):
+                raise RuntimeError("MoK MXFP8 backward requires both layouts for every routed weight")
+            backward_routed_gate_weights = mxfp8_weights[0]
+            backward_routed_up_weights = mxfp8_weights[1]
+            backward_routed_down_weights = mxfp8_weights[2][2:]
+        else:
+            if mxfp8_weights is not None:
+                raise RuntimeError("MoK BF16 backward received unexpected MXFP8 weights")
+            backward_routed_gate_weights = routed_gate_weights
+            backward_routed_up_weights = routed_up_weights
+            backward_routed_down_weights = routed_down_weights
+        try:
+            return _mok_functional.backward(
+                self.config,
+                workspace,
+                schedule,
+                forward_context,
+                grad_output.contiguous(),
+                x,
+                router_weights,
+                shared_gate_weights,
+                shared_up_weights,
+                shared_down_weights,
+                backward_routed_gate_weights,
+                backward_routed_up_weights,
+                backward_routed_down_weights,
+                self.swiglu_limit,
+            )
+        finally:
+            if not self._retain_mxfp8_cache_until_optimizer_step:
+                self._clear_mxfp8_forward_cache()
 
 
 class _MoKAutogradFunction(torch.autograd.Function):
@@ -325,7 +422,7 @@ class _MoKAutogradFunction(torch.autograd.Function):
         Returns:
             BF16 tensor of shape [tokens, hidden].
         """
-        output, schedule, forward_context = runtime.forward(
+        output, schedule, forward_context, mxfp8_weights = runtime.forward(
             x,
             router_weights,
             top_experts,
@@ -338,8 +435,12 @@ class _MoKAutogradFunction(torch.autograd.Function):
         )
         schedule_tensors, schedule_spec = _flatten_mok_tensor_dataclass(schedule)
         forward_context_tensors, forward_context_spec = _flatten_mok_tensor_dataclass(forward_context)
+        mxfp8_weight_tensors = (
+            tuple(tensor for weight in mxfp8_weights for tensor in weight) if mxfp8_weights is not None else ()
+        )
         ctx.runtime = runtime
         ctx.mok_tensor_specs = (schedule_spec, forward_context_spec)
+        ctx.mxfp8_weight_tensor_count = len(mxfp8_weight_tensors)
         ctx.save_for_backward(
             x,
             router_weights,
@@ -349,6 +450,7 @@ class _MoKAutogradFunction(torch.autograd.Function):
             routed_gate_weights,
             routed_up_weights,
             routed_down_weights,
+            *mxfp8_weight_tensors,
             *schedule_tensors,
             *forward_context_tensors,
         )
@@ -377,7 +479,17 @@ class _MoKAutogradFunction(torch.autograd.Function):
             routed_up_weights,
             routed_down_weights,
         ) = saved_tensors[:8]
-        schedule, offset = _unflatten_mok_tensor_dataclass(ctx.mok_tensor_specs[0], saved_tensors, 8)
+        offset = 8
+        mxfp8_tensor_count = ctx.mxfp8_weight_tensor_count
+        if mxfp8_tensor_count:
+            if mxfp8_tensor_count != 12:
+                raise RuntimeError(f"MoK MXFP8 backward expected 12 saved weight tensors, got {mxfp8_tensor_count}")
+            mxfp8_tensors = saved_tensors[offset : offset + mxfp8_tensor_count]
+            mxfp8_weights = tuple(tuple(mxfp8_tensors[index : index + 4]) for index in range(0, mxfp8_tensor_count, 4))
+            offset += mxfp8_tensor_count
+        else:
+            mxfp8_weights = None
+        schedule, offset = _unflatten_mok_tensor_dataclass(ctx.mok_tensor_specs[0], saved_tensors, offset)
         forward_context, offset = _unflatten_mok_tensor_dataclass(ctx.mok_tensor_specs[1], saved_tensors, offset)
         if offset != len(saved_tensors):
             raise RuntimeError(f"MoK saved-tensor metadata consumed {offset} of {len(saved_tensors)} tensors")
@@ -402,6 +514,7 @@ class _MoKAutogradFunction(torch.autograd.Function):
             routed_gate_weights,
             routed_up_weights,
             routed_down_weights,
+            mxfp8_weights,
         )
         return (
             None,
@@ -651,3 +764,22 @@ class GroupedExpertsMoK(nn.Module):
                         f"Cannot load {down_key}: expected local shape {expected_down_shape}, got {tuple(down.shape)}"
                     )
                 _local_tensor(self.routed_down_weights).copy_(down.transpose(-1, -2))
+
+
+def enable_mok_mxfp8_optimizer_step_cache(model_parts: list[nn.Module]) -> tuple[_MoKRuntime, ...]:
+    """Keep prequantized routed weights across microbatches with unchanged weights."""
+    runtimes = tuple(
+        module.runtime
+        for model_part in model_parts
+        for module in model_part.modules()
+        if isinstance(module, GroupedExpertsMoK) and module.runtime.mok_config.precision == "mxfp8"
+    )
+    for runtime in runtimes:
+        runtime._retain_mxfp8_cache_until_optimizer_step = True
+    return runtimes
+
+
+def clear_mok_mxfp8_optimizer_step_cache(runtimes: tuple[_MoKRuntime, ...]) -> None:
+    """Invalidate prequantized weights immediately after their BF16 masters update."""
+    for runtime in runtimes:
+        runtime._clear_mxfp8_forward_cache()

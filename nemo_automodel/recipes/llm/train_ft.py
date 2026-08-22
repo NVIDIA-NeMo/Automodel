@@ -652,6 +652,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        from nemo_automodel.components.moe.mok_experts import enable_mok_mxfp8_optimizer_step_cache
+
+        self._mok_mxfp8_runtimes = enable_mok_mxfp8_optimizer_step_cache(self.model_parts)
+
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
 
@@ -1252,6 +1256,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
+
+        if mok_mxfp8_runtimes := getattr(self, "_mok_mxfp8_runtimes", ()):
+            from nemo_automodel.components.moe.mok_experts import clear_mok_mxfp8_optimizer_step_cache
+
+            clear_mok_mxfp8_optimizer_step_cache(mok_mxfp8_runtimes)
 
         if hasattr(self.model_parts[0], "update_moe_gate_bias"):
             for mp in self.model_parts:

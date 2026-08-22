@@ -341,6 +341,14 @@ def _install_torch_and_layers_stubs(monkeypatch):
     experts_stub.GroupedExpertsTE = GroupedExpertsTE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.experts", experts_stub)
 
+    mok_experts_stub = types.ModuleType("nemo_automodel.components.moe.mok_experts")
+
+    class GroupedExpertsMoK:
+        pass
+
+    mok_experts_stub.GroupedExpertsMoK = GroupedExpertsMoK
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.mok_experts", mok_experts_stub)
+
 
 def _import_parallelizer_with_stubs(monkeypatch):
     import importlib
@@ -350,6 +358,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.moe.parallelizer",
         "nemo_automodel.components.moe.layers",
         "nemo_automodel.components.moe.experts",
+        "nemo_automodel.components.moe.mok_experts",
         "nemo_automodel.components.distributed.pipelining",
         "nemo_automodel.components.distributed.pipelining.config",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
@@ -890,6 +899,34 @@ def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
     )
 
     guard_mock.assert_called_once_with()
+
+
+def test_apply_fsdp_rejects_mok_mxfp8_with_ep_shard(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class MoKExperts(DummyExperts):
+        def __init__(self):
+            super().__init__()
+            self.runtime = types.SimpleNamespace(mok_config=types.SimpleNamespace(precision="mxfp8"))
+
+    class MoEModule:
+        def __init__(self):
+            self.experts = MoKExperts()
+            self.gate = None
+
+    monkeypatch.setattr(P, "MoE", MoEModule)
+    monkeypatch.setattr(P, "GroupedExpertsMoK", MoKExperts)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    with pytest.raises(ValueError, match="MoK MXFP8 currently requires ep_shard size 1"):
+        P.apply_fsdp(
+            model=DummyModel([DummyBlock(mlp=MoEModule())]),
+            fsdp_mesh=object(),
+            ep_enabled=True,
+            ep_shard_enabled=True,
+            ep_shard_mesh=object(),
+        )
 
 
 def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_sharder(monkeypatch):
