@@ -170,9 +170,6 @@ def _run_mode(
         optimizers=optimizer,
         max_grad_norm=1e9,
     )
-    expected_multiplier = 1 if summed_gradients else dist.get_world_size()
-    assert engine._gradient_reduction_multiplier(dist.get_world_size()) == expected_multiplier
-
     window_a, window_b = _windows(dist.get_rank())
     engine.begin_accumulation([window_a, window_b])
     result_a = engine.forward_backward(window_a, _per_token_identity_loss)

@@ -768,13 +768,11 @@ class TestPatchedBackwardMaybeWithNosync:
                 assert param_groups is None
 
     @pytest.mark.parametrize(
-        ("stage_finalize", "reduce_grad_per_microbatch", "global_optim_step", "expect_post_backward"),
+        ("stage_finalize", "global_optim_step", "expect_post_backward"),
         [
-            pytest.param(True, False, False, True, id="stage-final-overrides-global-false"),
-            pytest.param(False, False, True, False, id="stage-nonfinal-overrides-global-true"),
-            pytest.param(False, True, False, True, id="per-microbatch-reduce-overrides-global-false"),
-            pytest.param(False, True, True, True, id="per-microbatch-reduce-overrides-global-true"),
-            pytest.param(None, None, True, True, id="legacy-stage-falls-back-to-global"),
+            pytest.param(True, False, True, id="stage-final-overrides-global-false"),
+            pytest.param(False, True, False, id="stage-nonfinal-overrides-global-true"),
+            pytest.param(None, True, True, id="legacy-stage-falls-back-to-global"),
         ],
     )
     @patch("nemo_automodel.components.moe.fsdp_mixin.get_is_optim_step")
@@ -784,11 +782,10 @@ class TestPatchedBackwardMaybeWithNosync:
         mock_isinstance,
         mock_get_optim,
         stage_finalize,
-        reduce_grad_per_microbatch,
         global_optim_step,
         expect_post_backward,
     ):
-        """Stage finalization and per-microbatch reduction override the legacy global flag."""
+        """Effective stage finalization overrides the legacy global flag."""
 
         def isinstance_side_effect(obj, cls):
             if cls == MoEFSDPSyncMixin:
@@ -805,8 +802,6 @@ class TestPatchedBackwardMaybeWithNosync:
         mock_stage = SimpleNamespace(submod=moe_model)
         if stage_finalize is not None:
             mock_stage._nemo_finalize_backward = stage_finalize
-        if reduce_grad_per_microbatch is not None:
-            mock_stage._reduce_grad_per_microbatch = reduce_grad_per_microbatch
 
         bwd_kwargs = {
             "stage_output": Mock(),

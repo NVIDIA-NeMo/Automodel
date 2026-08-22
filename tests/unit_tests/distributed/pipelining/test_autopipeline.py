@@ -371,9 +371,11 @@ class _FinalizationStage:
 
     def __init__(self, submod=None):
         self.events = []
+        self.finalize_backward_states = []
         self.submod = nn.Module() if submod is None else submod
 
     def backward_maybe_with_nosync(self, _backward_type, _bwd_kwargs, *, last_backward=False):
+        self.finalize_backward_states.append(getattr(self, "_nemo_finalize_backward", None))
         self.events.append(("backward", last_backward))
         return (), None
 
@@ -535,6 +537,7 @@ class TestAutoPipelineKwargsChunkSpec:
 
         ap.step_microbatches(model_inputs, loss_fn=Mock(), finalize_backward=False)
         assert stage.events == [("backward", False), ("scale", 2)]
+        assert stage.finalize_backward_states == [False]
         assert stage._nemo_finalize_backward is True
 
         ap.step_microbatches(model_inputs, loss_fn=Mock(), finalize_backward=True)
@@ -545,6 +548,7 @@ class TestAutoPipelineKwargsChunkSpec:
             ("reduce", 2),
             ("scale", 2),
         ]
+        assert stage.finalize_backward_states == [False, True]
 
     def test_step_microbatches_preserves_requested_per_microbatch_gradient_reduction(self):
         stage = _FinalizationStage()
@@ -567,6 +571,7 @@ class TestAutoPipelineKwargsChunkSpec:
         )
 
         assert stage.events == [("backward", True), ("reduce", 2), ("scale", 2)]
+        assert stage.finalize_backward_states == [True]
 
     def test_step_microbatches_rejects_cross_call_schedule_gradient_scaling(self):
         schedule = _KwargsChunkSchedule()

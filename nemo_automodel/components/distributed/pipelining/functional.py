@@ -532,11 +532,10 @@ def _accumulation_aware_backward_maybe_with_nosync(
         tensors in their model-defined local layouts, plus optional
         split-backward parameter-group records.
     """
-    finalize_backward = self._nemo_finalize_backward or self._reduce_grad_per_microbatch
     return self._nemo_original_backward_maybe_with_nosync(
         backward_type,
         bwd_kwargs,
-        last_backward=last_backward and finalize_backward,
+        last_backward=last_backward and self._nemo_finalize_backward,
     )
 
 
@@ -550,8 +549,7 @@ def _accumulation_aware_perform_reduce_grad(self: PipelineStage, grad_scale_fact
     once per schedule. The original implementation is used unchanged for
     ordinary calls, final planned windows, and per-microbatch reduction mode.
     """
-    finalize_backward = self._nemo_finalize_backward or self._reduce_grad_per_microbatch
-    if finalize_backward:
+    if self._nemo_finalize_backward:
         self._nemo_original_perform_reduce_grad(grad_scale_factor)
         return
 

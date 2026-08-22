@@ -2765,17 +2765,16 @@ def test_pipeline_parallelism_fails_before_forward():
 
 
 @pytest.mark.parametrize(
-    ("declared_mode", "expected_multiplier", "expected_pre_collective_grad"),
+    ("declared_mode", "expected_pre_collective_grad"),
     [
-        pytest.param(None, 4, 14.0, id="undeclared-averaged"),
-        pytest.param(False, 4, 14.0, id="explicit-averaged"),
-        pytest.param(True, 1, 3.5, id="summed"),
+        pytest.param(None, 14.0, id="undeclared-averaged"),
+        pytest.param(False, 14.0, id="explicit-averaged"),
+        pytest.param(True, 3.5, id="summed"),
     ],
 )
 def test_gradient_reduction_mode_controls_main_loss_scale(
     monkeypatch,
     declared_mode,
-    expected_multiplier,
     expected_pre_collective_grad,
 ):
     model = ScaleModel()
@@ -2786,21 +2785,22 @@ def test_gradient_reduction_mode_controls_main_loss_scale(
 
     result = engine.forward_backward([_datum([2, 4], [1.0, 3.0])], _identity_loss)
 
-    assert engine._gradient_reduction_multiplier(4) == expected_multiplier
     assert result.loss_sum.item() == pytest.approx(14.0)
     assert result.weight_sum.item() == pytest.approx(4.0)
     assert result.loss.item() == pytest.approx(3.5)
     assert model.weight.grad.item() == pytest.approx(expected_pre_collective_grad)
 
 
-def test_gradient_reduction_mode_finds_summed_backend_below_ordinary_wrapper():
+def test_gradient_reduction_mode_finds_summed_backend_below_ordinary_wrapper(monkeypatch):
     model = ScaleModel()
     model.distributed_backend = nn.Identity()
     model.distributed_backend.calculate_per_token_loss = True
-
     engine = Engine(model, device="cpu")
+    _configure_fake_gradient_group(engine, monkeypatch, group_size=8)
 
-    assert engine._gradient_reduction_multiplier(8) == 1
+    engine.forward_backward([_datum([2, 4], [1.0, 3.0])], _identity_loss)
+
+    assert model.weight.grad.item() == pytest.approx(3.5)
 
 
 def test_summed_gradient_mode_planned_accumulation_matches_one_window(monkeypatch):

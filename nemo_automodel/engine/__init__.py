@@ -884,7 +884,7 @@ class Engine:
         self._validate_parallelism()
         dp_group, dp_size = self._dp_group_and_size()
         grad_group, grad_group_size = self._gradient_group_and_size(dp_group, dp_size)
-        gradient_reduction_multiplier = self._gradient_reduction_multiplier(grad_group_size)
+        gradient_reduction_multiplier = 1 if self._summed_gradient_reduction else grad_group_size
         self._validate_window_size_across_group(len(microbatches), grad_group, grad_group_size)
         denominator = (
             self._global_weight_sum(microbatches, dp_group, dp_size)
@@ -1132,24 +1132,19 @@ class Engine:
         except Exception as error:
             local_preflight_error = error
 
-        control_group: dist.ProcessGroup | None = None
-        control_group_size = 1
         # Explicit plans pay the small control collectives needed to fail
         # together before mutation. Keep the ordinary one-call path free of
         # new per-step collectives; its distributed callback contract remains
         # the same as before planned accumulation was introduced.
-        synchronize_update = state is not None
-        if synchronize_update:
-            control_group, control_group_size = self._accumulation_control_group_and_size()
-        if synchronize_update:
-            self._synchronize_accumulation_error(
-                local_preflight_error,
-                control_group,
-                control_group_size,
-                peer_message="another model-parallel rank rejected optim_step",
-            )
-        elif local_preflight_error is not None:
-            raise local_preflight_error
+        control_group, control_group_size = (
+            self._accumulation_control_group_and_size() if state is not None else (None, 1)
+        )
+        self._synchronize_accumulation_error(
+            local_preflight_error,
+            control_group,
+            control_group_size,
+            peer_message="another model-parallel rank rejected optim_step",
+        )
 
         device_mesh = self.mesh_context.device_mesh if self.mesh_context is not None else None
         moe_mesh = self.mesh_context.moe_mesh if self.mesh_context is not None else None
@@ -1182,15 +1177,12 @@ class Engine:
                         raise RuntimeError("gradient finalization did not return a gradient norm")
                 except Exception as error:
                     finalization_error = error
-                if synchronize_update:
-                    self._synchronize_accumulation_error(
-                        finalization_error,
-                        control_group,
-                        control_group_size,
-                        peer_message="another model-parallel rank failed while finalizing gradients",
-                    )
-                elif finalization_error is not None:
-                    raise finalization_error
+                self._synchronize_accumulation_error(
+                    finalization_error,
+                    control_group,
+                    control_group_size,
+                    peer_message="another model-parallel rank failed while finalizing gradients",
+                )
                 self._grads_finalized = True
             grad_norm = self._finalized_grad_norm
             assert grad_norm is not None
@@ -1201,15 +1193,12 @@ class Engine:
                     before_optimizer_step()
                 except Exception as error:
                     fence_error = error
-            if synchronize_update:
-                self._synchronize_accumulation_error(
-                    fence_error,
-                    control_group,
-                    control_group_size,
-                    peer_message="another model-parallel rank failed before the optimizer mutation fence",
-                )
-            elif fence_error is not None:
-                raise fence_error
+            self._synchronize_accumulation_error(
+                fence_error,
+                control_group,
+                control_group_size,
+                peer_message="another model-parallel rank failed before the optimizer mutation fence",
+            )
 
             mutation_started = True
             for optimizer in self.optimizers:
@@ -2121,22 +2110,6 @@ class Engine:
         self._validate_execution_parallelism()
         if self.pipeline is not None and self.pipeline.scale_grads_in_schedule:
             raise ValueError("Engine requires AutoPipeline scale_grads_in_schedule=False")
-
-    def _gradient_reduction_multiplier(self, grad_group_size: int) -> int:
-        """Return the factor that compensates the backend gradient collective.
-
-        Averaging backends divide by the complete DP-CP gradient group, so the
-        local loss numerator is multiplied by that group size before backward.
-        MegatronFSDP ``calculate_per_token_loss=True`` uses SUM collectives and
-        therefore needs no such compensation.
-
-        Args:
-            grad_group_size: Size of the complete DP-CP gradient group.
-
-        Returns:
-            One for summed gradients, otherwise ``grad_group_size``.
-        """
-        return 1 if self._summed_gradient_reduction else grad_group_size
 
     def _validate_execution_parallelism(self) -> None:
         """Validate model-parallel topology shared by forward and backward."""

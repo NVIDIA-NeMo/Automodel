@@ -513,7 +513,9 @@ class AutoPipeline:
         if schedule_method == "step":
             for stage in self._info.stages or ():
                 previous_stage_state.append((stage, vars(stage).get("_nemo_finalize_backward", _MISSING_STAGE_STATE)))
-                stage._nemo_finalize_backward = finalize_backward
+                stage._nemo_finalize_backward = finalize_backward or getattr(
+                    stage, "_reduce_grad_per_microbatch", False
+                )
         schedule._split_inputs = lambda _args, _kwargs=None: (model_args_chunks, model_kwargs_chunks)
         schedule._loss_fn = indexed_loss
         try:
