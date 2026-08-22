@@ -121,3 +121,58 @@ def test_peft_resume_does_not_flip_the_prefix_flags():
 
     assert adapter._uses_thinker_prefix is True
     assert adapter._uses_model_prefix is True
+
+
+def test_full_weight_adapter_keys_keep_the_thinker_flag():
+    """modules_to_save-style full weights carry the thinker namespace inside
+    the peft prefix; detection must recognize it there instead of flipping
+    the layout flags off."""
+    from unittest.mock import patch
+
+    adapter = _tiny_adapter()
+    hf_state = {
+        "base_model.model.thinker.model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(16, 32),
+        "base_model.model.thinker.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(4, 32),
+    }
+
+    with patch.object(adapter, "_from_hf_w_merged_experts", side_effect=lambda sd, mesh=None: sd):
+        out = adapter.from_hf(hf_state)
+
+    assert adapter._uses_thinker_prefix is True
+    assert adapter._uses_model_prefix is True
+    assert "base_model.model.model.layers.0.mlp.experts.0.gate_proj.weight" in out
+    assert not any(key.startswith("base_model.model.thinker.") for key in out)
+
+
+def test_talker_expert_keys_do_not_disable_the_thinker_prefix():
+    """A full omni dict carries talker experts too; any thinker evidence wins."""
+    from unittest.mock import patch
+
+    adapter = _tiny_adapter()
+    hf_state = {
+        "talker.model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(16, 32),
+        "thinker.model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(16, 32),
+    }
+
+    with patch.object(adapter, "_from_hf_w_merged_experts", side_effect=lambda sd, mesh=None: sd):
+        out = adapter.from_hf(hf_state)
+
+    assert adapter._uses_thinker_prefix is True
+    assert "model.layers.0.mlp.experts.0.gate_proj.weight" in out
+    assert "talker.model.layers.0.mlp.experts.0.gate_proj.weight" in out
+
+
+def test_thinker_less_adapter_dict_updates_the_flags():
+    """An adapter trained against a thinker-less base sets the flags from its
+    own keys, so later saves match that base's layout."""
+    from unittest.mock import patch
+
+    adapter = _tiny_adapter()
+    hf_state = {
+        "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_A.weight": torch.randn(4, 32),
+    }
+
+    with patch.object(adapter, "_from_hf_w_merged_experts", side_effect=lambda sd, mesh=None: sd):
+        adapter.from_hf(hf_state)
+
+    assert adapter._uses_thinker_prefix is False

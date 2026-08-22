@@ -65,13 +65,18 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
-        for key in hf_state_dict.keys():
-            # Skip LoRA keys: a PEFT adapter dict (resume) carries no thinker
-            # prefix by design and must not flip the flags used for full saves.
-            if ".mlp.experts." in key and key.endswith(".weight") and ".lora_" not in key:
-                self._uses_thinker_prefix = key.startswith("thinker.")
-                self._uses_model_prefix = "model." in key
-                break
+        # Detect the checkpoint's layout from its expert weight keys. PEFT
+        # saves nest the thinker namespace inside the "base_model.model."
+        # outer prefix, so check both positions, and consider every matching
+        # key rather than the first: a full omni dict also carries talker
+        # expert weights with no thinker namespace, and adapter dicts may mix
+        # lora keys with modules_to_save-style full weights.
+        expert_weight_keys = [key for key in hf_state_dict if ".mlp.experts." in key and key.endswith(".weight")]
+        if expert_weight_keys:
+            self._uses_thinker_prefix = any(
+                key.startswith(("thinker.", "base_model.model.thinker.")) for key in expert_weight_keys
+            )
+            self._uses_model_prefix = any("model." in key for key in expert_weight_keys)
 
         # Remove thinker prefix if present to match our internal format
         if self._uses_thinker_prefix:
