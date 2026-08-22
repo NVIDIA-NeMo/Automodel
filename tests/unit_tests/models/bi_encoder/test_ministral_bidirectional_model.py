@@ -114,6 +114,23 @@ def test_ministral3_bidirectional_attention_symmetric():
     )
 
 
+def test_ministral3_causal_attention_blocks_future_token_influence():
+    """Causal Ministral3 prevents a future token from changing an earlier position."""
+    cfg = tiny_bidirectional_config()
+    cfg.is_causal = True
+    model = Ministral3BidirectionalModel(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    modified = input_ids.clone()
+    modified[0, -1] = (modified[0, -1] + 1) % cfg.vocab_size
+
+    with torch.no_grad():
+        original = model(input_ids=input_ids).last_hidden_state
+        changed = model(input_ids=modified).last_hidden_state
+
+    assert all(layer.self_attn.is_causal is True for layer in model.layers)
+    torch.testing.assert_close(original[0, 0], changed[0, 0])
+
+
 def test_ministral3_bidirectional_forward_paths():
     cfg = tiny_bidirectional_config()
     model = Ministral3BidirectionalModel(cfg)

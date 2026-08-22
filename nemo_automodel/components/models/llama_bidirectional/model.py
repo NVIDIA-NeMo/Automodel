@@ -61,28 +61,28 @@ class LlamaBidirectionalConfig(LlamaConfig):
         self,
         pooling: str = "avg",
         temperature: float = 1.0,
+        is_causal: bool = False,
         **kwargs,
-    ):
+    ) -> None:
         """
         Initialize LlamaBidirectionalConfig.
 
         Args:
             pooling: Pooling strategy ('avg', 'cls', 'last', etc.)
-            temperature: Temperature for scaling logits
-            **kwargs: Additional arguments passed to LlamaConfig
+            temperature: Temperature for scaling logits.
+            is_causal: Whether to use causal rather than bidirectional attention.
+            **kwargs: Additional arguments passed to LlamaConfig.
         """
         self.pooling = pooling
         self.temperature = temperature
-        super().__init__(**kwargs)
+        super().__init__(is_causal=is_causal, **kwargs)
 
 
 class LlamaBidirectionalModel(LlamaModel):
-    """
-    Llama Model with bidirectional attention.
+    """Legacy Llama retrieval model with configurable attention.
 
-    This model removes causal masking from all attention layers, allowing tokens
-    to attend to all other tokens in the sequence. This is useful for embedding
-    and retrieval tasks where bidirectional context is beneficial.
+    The model defaults to bidirectional attention for embedding and retrieval
+    workloads. Setting ``config.is_causal`` enables standard causal attention.
 
     The model is auto-discovered by ModelRegistry via the ModelClass export,
     enabling it to be loaded via NeMoAutoModelBiEncoder.from_pretrained().
@@ -107,9 +107,9 @@ class LlamaBidirectionalModel(LlamaModel):
             config: Model configuration
         """
         super().__init__(config)
-        # Disable causal attention for all layers
+        is_causal = getattr(config, "is_causal", False)
         for layer in self.layers:
-            layer.self_attn.is_causal = False
+            layer.self_attn.is_causal = is_causal
 
     @check_model_inputs
     def forward(
@@ -123,6 +123,18 @@ class LlamaBidirectionalModel(LlamaModel):
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        if getattr(self.config, "is_causal", False):
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                use_cache=use_cache,
+                **kwargs,
+            )
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 

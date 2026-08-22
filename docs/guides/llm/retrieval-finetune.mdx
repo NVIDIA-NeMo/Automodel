@@ -123,11 +123,20 @@ The following table summarizes the supported model families and their effective 
 
 | Model `config.model_type` | Bi-Encoder Behavior | Cross-Encoder Behavior | Effective Retrieval Keyword Arguments |
 |---------------------------|---------------------|------------------------|----------------------------|
-| `llama`, `llama_bidirec` | Uses `LlamaBidirectionalModel` | Uses `LlamaBidirectionalForSequenceClassification` | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. Cross-encoder: `pooling`, `num_labels`, and `temperature` on the Llama scoring config. |
-| `ministral3` | Uses the stock Hugging Face `Ministral3Model` with `is_causal: false` | Uses the stock Hugging Face `Ministral3ForSequenceClassification` | Bi-encoder: wrapper-level `pooling` and `l2_normalize`, plus top-level recipe `temperature`. Cross-encoder: forwards `num_labels`; custom `pooling` and `temperature` are ignored. |
-| `ministral3_bidirec` | Uses the legacy custom `Ministral3BidirectionalModel` | Direct cross-encoder scoring is not supported by the custom retrieval registry. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
-| `llama_nemotron_vl` | Uses `LlamaNemotronVLModel` | Direct cross-encoder scoring is not supported by the custom retrieval registry today. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
-| Any model type without a retrieval registry entry | Falls back to `AutoModel` and sets `config.is_causal: false` | Falls back to `AutoModelForSequenceClassification` | Bi-encoder fallback receives standard Hugging Face `from_pretrained` keyword arguments. `pooling` and `l2_normalize` still apply in the AutoModel wrapper. Cross-encoder fallback forwards only `num_labels`. Custom `pooling` and `temperature` are ignored. |
+| `llama`, `llama_bidirec` | Uses `LlamaBidirectionalModel` with configurable text attention. | Uses `LlamaBidirectionalForSequenceClassification` | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, `is_causal`, and top-level recipe `temperature`. Cross-encoder: `pooling`, `num_labels`, and `temperature` on the Llama scoring config. |
+| `ministral3` | Uses the stock Hugging Face `Ministral3Model` with configurable text attention. | Uses the stock Hugging Face `Ministral3ForSequenceClassification` | Bi-encoder: wrapper-level `pooling`, `l2_normalize`, `is_causal`, plus top-level recipe `temperature`. Cross-encoder: forwards `num_labels`; custom `pooling` and `temperature` are ignored. |
+| `ministral3_bidirec` | Uses the legacy custom `Ministral3BidirectionalModel` with configurable text attention. | Direct cross-encoder scoring is not supported by the custom retrieval registry. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, `is_causal`, and top-level recipe `temperature`. |
+| `llama_nemotron_vl` | Uses `LlamaNemotronVLModel` and applies the attention policy only to its language tower. | Direct cross-encoder scoring is not supported by the custom retrieval registry today. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, `is_causal`, and top-level recipe `temperature`. |
+| Any model type without a retrieval registry entry | Falls back to `AutoModel` and applies the resolved attention policy. | Falls back to `AutoModelForSequenceClassification` | Bi-encoder fallback receives standard Hugging Face `from_pretrained` keyword arguments. `pooling`, `l2_normalize`, and `is_causal` apply in the AutoModel wrapper. Cross-encoder fallback forwards only `num_labels`. Custom `pooling` and `temperature` are ignored. |
+
+For bi-encoders, `model.is_causal` selects text self-attention. An explicit YAML or API value takes precedence over a
+saved `is_causal` value in the checkpoint's text config; when neither exists, the model defaults to `false` for
+bidirectional retrieval. The resolved value is saved with the text config. Cross-encoder attention is unchanged.
+For composite models such as Llama Nemotron VL, this setting affects only the language tower and does not change vision
+attention.
+
+Changing this setting changes the resulting embeddings. Regenerate stored corpus embeddings before querying an index
+with a model that uses a different attention policy.
 
 Known model types with a registry entry fail fast when the requested retrieval task is unsupported rather than falling
 back silently. For example, the legacy `ministral3_bidirec` type supports bi-encoder embeddings but not cross-encoder
@@ -137,10 +146,10 @@ from a parent checkpoint, set `model.extract_submodel: language_model`. Extracte
 where supported extracted types use registered retrieval classes and other extracted types can fall back to Hugging Face
 sequence classification for cross-encoder scoring.
 
-Treat unregistered decoder-only fallback models as an architecture experiment, not just a drop-in model swap. AutoModel
-sets `config.is_causal: false` for embedding fallbacks, while registered retrieval backbones such as the Llama
-bidirectional path use retrieval-specific implementations. Confirm that an unregistered architecture honors the
-`is_causal` flag and produces the expected bidirectional attention before relying on it for symmetric retrieval.
+Treat unregistered decoder-only fallback models as an architecture experiment, not just a drop-in model swap. The
+bi-encoder applies the resolved `is_causal` value to the text config and attention modules, while registered retrieval
+backbones such as the Llama path provide retrieval-specific implementations. Confirm that an unregistered architecture
+honors the selected policy before relying on it for retrieval.
 
 ## Prepare Data
 
