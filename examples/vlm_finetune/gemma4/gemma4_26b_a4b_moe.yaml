@@ -119,8 +119,8 @@ freeze_config:
 ci:
   recipe_owner: athitten
   nodes: 1
-  # Full robustness takes about 50 minutes.
-  time: "01:15:00"
+  # Full robustness measured 32 minutes; keep 13 minutes for filesystem variance.
+  time: "00:45:00"
   # Keep failures blocking; residual MoE drift is tracked by AM-707/AM-719.
   checkpoint_robustness:
     # The shared robustness batch of 2 exceeds this 26B MoE recipe's memory

@@ -27,17 +27,26 @@ class StateDictAdapter(ABC):
     """
 
     _supports_write_through_checkpoint_load: bool = False
+    _supports_checkpoint_load_without_full_copy: bool = False
 
     @property
     def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether all checkpoint-load destinations write through to final model storage.
+        """Whether every checkpoint tensor is loaded directly into the model's existing weight memory.
 
-        Adapters should set ``_supports_write_through_checkpoint_load`` only when every tensor produced by
-        ``to_hf`` for base-checkpoint loading is either the original model tensor or a view that writes through
-        to it. The checkpoint loader uses this guarantee to avoid materializing a converted full state dict on
-        the host.
+        Enable this only when writing every tensor returned by ``to_hf`` for base-checkpoint loading updates the
+        model itself. This lets the loader skip a complete CPU copy of the checkpoint.
         """
         return self._supports_write_through_checkpoint_load
+
+    @property
+    def supports_checkpoint_load_without_full_copy(self) -> bool:
+        """Whether DCP can load this adapter without another full set of model weights.
+
+        Large checkpoint tensors must be loaded into the model's existing weight memory. Small temporary tensors are
+        allowed when they can be applied and discarded without making a model-sized copy. For example, Gemma4 loads
+        a scale tensor and applies it to already-loaded expert weights.
+        """
+        return self._supports_checkpoint_load_without_full_copy
 
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
