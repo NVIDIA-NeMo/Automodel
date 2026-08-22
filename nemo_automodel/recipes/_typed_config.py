@@ -255,6 +255,7 @@ class RecipeConfig:
             max_steps=self._raw.get("step_scheduler.max_steps", None),
             val_check_interval=self._raw.get("step_scheduler.val_every_steps", None),
         )
+        seed = self._raw.get("seed", 42)
         dataloader_type = loader_kwargs.pop("dataloader_type", None)
         batch_sampler_config = None
         if isinstance(dataset_config, ScheduledDatasetConfig):
@@ -269,6 +270,32 @@ class RecipeConfig:
             )
         elif dataloader_type is not None:
             raise ValueError("dataloader_type is only supported by Megatron dataset configs")
+
+        dynamic_batching = loader_kwargs.pop("dynamic_batching", None)
+        if dynamic_batching is not None:
+            if batch_sampler_config is not None:
+                raise ValueError(
+                    "dataloader.dynamic_batching cannot be combined with a Megatron dataset, which brings "
+                    "its own micro-batch sampler"
+                )
+            if loader_kwargs.get("group_by_length", False):
+                raise ValueError("dataloader.dynamic_batching already groups by length; set group_by_length=false")
+            if int(self._raw.get("distributed.pp_size", 1) or 1) > 1:
+                raise ValueError(
+                    "dataloader.dynamic_batching does not support pipeline parallelism: the pipeline schedule "
+                    "is built for a fixed pp_batch_size derived from local_batch_size, while the token budget "
+                    "makes the batch dimension vary per step. Set pp_size=1."
+                )
+            from nemo_automodel.components.datasets.llm.dynamic_token_batch_sampler import (
+                DynamicTokenBatchSamplerConfig,
+            )
+
+            sampler_kwargs = _as_dict(dynamic_batching)
+            valid = {f.name for f in fields(DynamicTokenBatchSamplerConfig)} - {"seed"}
+            unknown = sorted(set(sampler_kwargs) - valid)
+            if unknown:
+                raise TypeError(f"Unexpected dynamic_batching field(s): {', '.join(unknown)}")
+            batch_sampler_config = DynamicTokenBatchSamplerConfig(**sampler_kwargs, seed=seed)
 
         config_fields = {
             "shuffle",
@@ -294,7 +321,7 @@ class RecipeConfig:
             group_by_length=loader_kwargs.pop("group_by_length", False),
             shuffle_buffer_size=loader_kwargs.pop("shuffle_buffer_size", 10000),
             batch_size=loader_kwargs.pop("batch_size", schedule.local_batch_size),
-            seed=self._raw.get("seed", 42),
+            seed=seed,
             collate_fn=collate,
             num_workers=loader_kwargs.pop("num_workers", 0),
             pin_memory=loader_kwargs.pop("pin_memory", False),
