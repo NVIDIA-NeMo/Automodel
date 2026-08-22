@@ -134,14 +134,23 @@ def _owns_hybridep_packed_cp_equalization(model_parts: Sequence[nn.Module]) -> b
     )
 
 
-def _resolve_hybridep_ep_group(
+def _resolve_hybridep_equalization_groups(
     uses_hybridep: bool,
     mesh_context: MeshContext | None,
-) -> tuple[dist.ProcessGroup | None, int]:
-    """Resolve the canonical EP group for a live HybridEP token dispatcher."""
+) -> tuple[dist.ProcessGroup | None, ...]:
+    """Resolve the ordered mesh-axis reductions used for packed-token equalization.
+
+    HybridEP dispatch itself communicates along ``ep``. With context
+    parallelism, however, one CP replica can be split across different EP rows
+    when ``ep_size`` and ``cp_size`` do not nest. Reducing first along ``ep``
+    and then along ``ep_shard`` computes one maximum over the complete
+    non-pipeline MoE mesh without creating a new process group. Consequently,
+    every CP replica starts from the same padded global width and every
+    HybridEP group receives the same local token extent after CP sharding.
+    """
 
     if not uses_hybridep:
-        return None, 1
+        return ()
     moe_mesh = mesh_context.moe_mesh if mesh_context is not None else None
     mesh_names = getattr(moe_mesh, "mesh_dim_names", ()) or ()
     if moe_mesh is None or "ep" not in mesh_names:
@@ -152,7 +161,17 @@ def _resolve_hybridep_ep_group(
         raise ValueError("a live HybridEP dispatcher requires ep_size > 1")
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("a live HybridEP dispatcher requires initialized torch.distributed process groups")
-    return ep_mesh.get_group(), ep_size
+
+    groups = [ep_mesh.get_group()]
+    cp_size = int(getattr(mesh_context, "cp_size", 1))
+    if cp_size > 1:
+        if "ep_shard" not in mesh_names:
+            raise ValueError("HybridEP with context parallelism requires mesh_context.moe_mesh with an 'ep_shard' axis")
+        ep_shard_mesh = moe_mesh["ep_shard"]
+        ep_shard_size = int(ep_shard_mesh.size())
+        if ep_shard_size > 1:
+            groups.append(ep_shard_mesh.get_group())
+    return tuple(groups)
 
 
 def _resolve_summed_gradient_reduction(model_parts: Sequence[nn.Module]) -> bool:
@@ -489,7 +508,7 @@ class Engine:
             dist.all_reduce(any_hybridep, op=dist.ReduceOp.MAX, group=self.pipeline.pp_mesh.get_group())
             pipeline_uses_hybridep = int(any_hybridep.item()) != 0
         self._pipeline_uses_hybridep = pipeline_uses_hybridep
-        self._hybridep_ep_group, self._hybridep_ep_size = _resolve_hybridep_ep_group(
+        self._hybridep_equalization_groups = _resolve_hybridep_equalization_groups(
             uses_hybridep,
             mesh_context,
         )
@@ -1062,20 +1081,36 @@ class Engine:
         return result
 
     def _hybridep_packed_token_target(self, model_inputs: Mapping[str, Any]) -> int | None:
-        """Return the EP-wide raw-THD token width required by HybridEP.
+        """Return the MoE-stage-wide raw-THD token width required by HybridEP.
 
-        Every rank enters one fixed-size metadata collective before local THD
-        validation. This makes a packed/non-packed or raw/final-THD mismatch a
-        group-wide error instead of letting one rank enter HybridEP with a
-        different routing-map shape. This path deliberately owns only the
-        CP=1 layout used by MOLT and the canonical Datum collaters; DSV4 keeps
-        its existing model-owned CP>1 equalization path.
+        Every rank enters fixed-size extrema collectives before local THD
+        validation. At CP size one the reduction is scoped to the exact EP
+        group. At CP size greater than one it runs in the fixed ``ep`` then
+        ``ep_shard`` order, producing one target over the complete non-PP MoE
+        mesh. Padding happens before CP sharding, so deterministic CP backends
+        turn that global target into equal local token extents. DSV4 keeps its
+        existing model-owned post-compression CP equalization path.
+
+        Args:
+            model_inputs: Unsharded collater output. ``input_ids`` is a Tensor
+                of shape ``[batch, tokens]``, or ``inputs_embeds`` is a Tensor
+                of shape ``[batch, tokens, hidden]``. The generic raw-THD path
+                requires ``batch == 1`` and ``seq_lens`` plus
+                ``seq_lens_padded`` as Tensors of shape ``[1, documents]``.
+                Model-owned layouts need only rank-consistent packed flags;
+                their remaining fields are opaque after that consensus. All
+                tensors are local to the rank before CP sharding.
+
+        Returns:
+            The physical global token width to materialize before CP sharding,
+            or ``None`` for non-packed inputs, non-HybridEP models, and models
+            that own post-preparation equalization.
         """
         if self.pipeline is not None and self._pipeline_uses_hybridep:
             if model_inputs.get("qkv_format") == "thd":
                 raise NotImplementedError("HybridEP packed token equalization currently supports eager PP size 1 only")
             return None
-        if self._hybridep_ep_group is None:
+        if not self._hybridep_equalization_groups:
             return None
 
         packed = model_inputs.get("qkv_format") == "thd"
@@ -1095,32 +1130,35 @@ class Engine:
             dtype=torch.int64,
             device=self.device,
         )
-        gathered = [torch.empty_like(local) for _ in range(self._hybridep_ep_size)]
-        dist.all_gather(gathered, local, group=self._hybridep_ep_group)
-        metadata = torch.stack(gathered).cpu().tolist()
+        # All metadata are nonnegative. Packing each value with its negation
+        # obtains both extrema through one MAX per mesh axis, keeping this
+        # per-outer-microbatch guard to one collective at CP=1 and two at CP>1.
+        extrema = torch.cat((local, -local))
+        for group in self._hybridep_equalization_groups:
+            dist.all_reduce(extrema, op=dist.ReduceOp.MAX, group=group)
+        upper = extrema[: local.numel()].cpu().tolist()
+        lower = (-extrema[local.numel() :]).cpu().tolist()
 
-        packed_flags = {row[0] for row in metadata}
-        if len(packed_flags) != 1:
+        if lower[0] != upper[0]:
             raise ValueError("HybridEP ranks must all use packed THD inputs or all use non-packed inputs")
-        if packed_flags == {0}:
+        if upper[0] == 0:
             return None
-        if self._cp_size() > 1:
-            if self._model_owns_hybridep_packed_cp_equalization:
-                return None
-            raise NotImplementedError(
-                "generic HybridEP packed token equalization currently supports CP size 1 only; "
-                "DSV4 retains its model-owned CP equalization path"
-            )
-        if any(row[1] != 1 for row in metadata):
+        if self._cp_size() > 1 and self._model_owns_hybridep_packed_cp_equalization:
+            # All ranks completed the packed/non-packed consensus above,
+            # preventing a split before the model's own collective. Do not
+            # impose the generic raw-THD/B=1 contract: the model validates and
+            # repads its own source layout before equalizing it.
+            return None
+        if lower[1] != 1:
             raise NotImplementedError(
                 "HybridEP packed token equalization currently requires raw THD seq_lens/seq_lens_padded inputs"
             )
-        if any(row[2] != 1 or row[3] != 1 or row[4] <= 0 for row in metadata):
+        if lower[2] != 1 or lower[3] != 1 or upper[3] != 1 or lower[4] <= 0:
             raise ValueError(
                 "HybridEP packed token equalization requires one non-empty raw THD token row per EP rank; "
-                f"got metadata {metadata}"
+                f"got metadata extrema min={lower}, max={upper}"
             )
-        return max(row[4] for row in metadata)
+        return int(upper[4])
 
     @staticmethod
     def _resolve_loss_batch_layout(
