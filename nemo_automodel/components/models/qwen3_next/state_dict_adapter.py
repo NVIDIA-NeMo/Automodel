@@ -99,7 +99,7 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         return new_state_dict
 
     def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+        self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         hf_state_dict = {}
         for fqn, tensor in state_dict.items():

@@ -435,7 +435,7 @@ def _warn_if_inline_consolidation_enabled(config: CheckpointingConfig) -> None:
 def _warn_if_large_inline_consolidation(
     config: CheckpointingConfig,
     state_dict: dict[str, torch.Tensor],
-    fqn_to_index_mapping: Optional[dict[str, int]],
+    fqn_to_index_mapping: dict[str, int] | None,
     is_final_checkpoint: bool = False,
 ) -> None:
     """Warn when inline consolidated export is large enough to waste GPU allocation time."""
@@ -496,7 +496,7 @@ class Checkpointer:
         dp_rank: int,
         tp_rank: int,
         pp_rank: int,
-        moe_mesh: Optional[DeviceMesh] = None,
+        moe_mesh: DeviceMesh | None = None,
         process_group: torch.distributed.ProcessGroup | None = None,
         pp_group: Optional["torch.distributed.ProcessGroup"] = None,
     ) -> None:
@@ -700,7 +700,7 @@ class Checkpointer:
         optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
         model: nn.Module | list[nn.Module],
         weights_path: str,
-        scheduler: Optional[Any] = None,
+        scheduler: Any | None = None,
         *,
         optimizer_part_ids: list[int] | None = None,
     ) -> None:
@@ -734,7 +734,7 @@ class Checkpointer:
         optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
         model: nn.Module | list[nn.Module],
         weights_path: str,
-        scheduler: Optional[Any] = None,
+        scheduler: Any | None = None,
         *,
         optimizer_part_ids: list[int] | None = None,
     ) -> None:
@@ -769,7 +769,7 @@ class Checkpointer:
         model_path: str,
         is_init_step: bool = False,
         use_checkpoint_id: bool = True,
-        key_mapping: Optional[dict[str, str]] = None,
+        key_mapping: dict[str, str] | None = None,
         allow_checkpoint_key_subset: bool = False,
     ) -> None:
         """
@@ -1676,7 +1676,7 @@ fi
 
     def _maybe_build_consolidated_index(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
-    ) -> Optional[dict[str, int]]:
+    ) -> dict[str, int] | None:
         """
         Build FQN to shard index mapping for consolidated HF export.
 
@@ -1768,7 +1768,7 @@ fi
 
     def _maybe_build_original_dtype_mapping(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
-    ) -> Optional[dict[str, str]]:
+    ) -> dict[str, str] | None:
         """
         Build FQN to target safetensors dtype mapping for consolidated export.
 
@@ -1798,9 +1798,9 @@ fi
 
     def _get_storage_writer(
         self,
-        consolidated_output_path: Optional[str],
-        fqn_to_index_mapping: Optional[dict[str, int]],
-        fqn_to_dtype_mapping: Optional[dict[str, str]],
+        consolidated_output_path: str | None,
+        fqn_to_index_mapping: dict[str, int] | None,
+        fqn_to_dtype_mapping: dict[str, str] | None,
         model_path: str,
         consolidation_handled_externally: bool = False,
     ) -> StorageWriter | None:
@@ -1833,7 +1833,7 @@ fi
     def _get_storage_reader(
         self,
         model_path: str,
-        key_mapping: Optional[dict[str, str]],
+        key_mapping: dict[str, str] | None,
         is_init_step: bool = False,
         is_safetensors: bool | None = None,
     ) -> StorageReader | None:
@@ -2029,14 +2029,14 @@ def save_losses(losses: dict[str, Any], weights_path: str) -> None:
         logger.warning("Failed to write checkpoint loss metadata to %s", losses_path, exc_info=True)
 
 
-def _create_dirs(*dirs: Optional[str]) -> None:
+def _create_dirs(*dirs: str | None) -> None:
     """Create local directory paths and ignore cloud paths."""
     for directory in dirs:
         if directory and not is_cloud_path(directory):
             os.makedirs(directory, exist_ok=True)
 
 
-def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:
+def _ensure_dirs(*dirs: str | None, process_group: torch.distributed.ProcessGroup | None = None) -> None:
     """
     Create directories on all ranks and synchronize across ranks.
 
@@ -2049,7 +2049,7 @@ def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessG
         torch.distributed.barrier(group=process_group)
 
 
-def _ensure_shared_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:
+def _ensure_shared_dirs(*dirs: str | None, process_group: torch.distributed.ProcessGroup | None = None) -> None:
     """Create shared DCP directories on group rank zero and synchronize the group.
 
     Unlike auxiliary per-rank state, DCP checkpoint directories must be visible
@@ -2397,8 +2397,8 @@ def _load_full_state_dict_into_model(
 def _convert_checkpoint_with_transformers(
     model: nn.Module,
     model_path: str,
-    key_mapping: Optional[dict[str, str]] = None,
-) -> Optional[dict[str, torch.Tensor]]:
+    key_mapping: dict[str, str] | None = None,
+) -> dict[str, torch.Tensor] | None:
     """
     Convert a checkpoint using transformers' conversion mapping for models that need tensor merging.
 
@@ -2622,7 +2622,7 @@ def _is_custom_model(module: nn.Module) -> bool:
     )
 
 
-def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, torch.Tensor]]:
+def _load_hf_checkpoint_preserving_dtype(model_path: str) -> dict[str, torch.Tensor] | None:
     """
     Load a HuggingFace checkpoint into a new state dict so tensor dtypes
     match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
@@ -2641,7 +2641,7 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, 
     return None
 
 
-def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]]:
+def _load_hf_safetensors_checkpoint(model_path: str) -> dict[str, torch.Tensor] | None:
     """
     Load a safetensors checkpoint into a state dict.
     """
@@ -2682,7 +2682,7 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch
 load_hf_safetensors_state_dict = _load_hf_safetensors_checkpoint
 
 
-def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]]:
+def _load_hf_bin_checkpoint(model_path: str) -> dict[str, torch.Tensor] | None:
     """
     Load a HuggingFace .bin checkpoint into a state dict.
 
@@ -2748,8 +2748,8 @@ def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]
 def _maybe_adapt_state_dict_from_hf(
     model_part: nn.Module,
     state_dict: dict[str, torch.Tensor],
-    moe_mesh: Optional[DeviceMesh] = None,
-    paramwrapper_layout_hint: Optional[str] = None,
+    moe_mesh: DeviceMesh | None = None,
+    paramwrapper_layout_hint: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Custom models use state dict adapters to convert the state dict from the Hugging Face format to the native format.
@@ -2770,7 +2770,7 @@ def _maybe_adapt_state_dict_from_hf(
     return state_dict
 
 
-def _read_paramwrapper_layout_metadata(model_path: str | os.PathLike) -> Optional[str]:
+def _read_paramwrapper_layout_metadata(model_path: str | os.PathLike) -> str | None:
     """Return the fused expert LoRA layout stamped into a PEFT checkpoint, if any.
 
     The PEFT save path records which peft ParamWrapper layout the adapter was
