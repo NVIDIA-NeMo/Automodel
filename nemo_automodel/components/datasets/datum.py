@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -31,9 +31,12 @@ from nemo_automodel.components.datasets.utils import (
     packed_sequence_thd_collater,
 )
 
+if TYPE_CHECKING:
+    from transformers import ProcessorMixin
+
 CROSS_ENTROPY_IGNORE_IDX = -100
 
-__all__ = ["CollatedLossInputs", "Datum", "LossInputLayout", "collate_datums"]
+__all__ = ["CollatedLossInputs", "Datum", "LossInputLayout", "collate_datums", "collate_vlm_datums"]
 
 
 def _pin_memory_tree(value: Any) -> Any:
@@ -485,4 +488,146 @@ def collate_datums(
         layouts=loss_layouts,
         item_to_datum=tuple(range(len(datums))),
         pad_values=loss_pad_values,
+    )
+
+
+def collate_vlm_datums(
+    datums: list[Datum],
+    *,
+    processor: "ProcessorMixin",
+    packed: bool = False,
+    get_rope_index: Callable[..., object] | None = None,
+    sequence_alignment: int = 1,
+) -> tuple[dict[str, Any], CollatedLossInputs]:
+    """Collate pre-tokenized VLM SFT Datums with processor-specific media inputs.
+
+    The input Datums retain their unshifted token stream because
+    :func:`~nemo_automodel.components.datasets.vlm.collate_fns.pad_collate_fn`
+    owns the autoregressive shift. ``labels`` and ``weights`` therefore also
+    use the unshifted token axis, with zero weight at target position zero.
+    In packed mode, every Datum becomes one THD document and the collater
+    preserves its real and aligned sequence lengths. Common VLM fields are
+    handled by the canonical VLM collaters; additional processor tensor fields
+    retain their leading media axis and are concatenated.
+
+    Args:
+        datums: Non-empty processor-ready VLM items. Each item has
+            ``input_ids``, ``labels``, and ``weights`` tensors of shape
+            ``[sequence]`` on matching unshifted token axes. Optional processor
+            fields carry their processor-defined token or leading media axes.
+        processor: Hugging Face processor (or compatible object) that supplies
+            the tokenizer padding token.
+        packed: Pack the Datums as THD documents instead of padding a batch.
+        get_rope_index: Optional bound model callable used to materialize
+            multi-axis VLM position IDs before packing.
+        sequence_alignment: Per-document THD alignment. Context-parallel
+            callers use ``2 * cp_size``. Multi-axis mRoPE with alignment above
+            one is rejected by the canonical packed-VLM implementation.
+
+    Returns:
+        A pair of shifted/padded model inputs and layout-aware loss inputs.
+        In padded mode, token model fields, labels, and weights have shape
+        ``[batch, padded_sequence - 1]``. In packed mode they have shape
+        ``[1, aligned_tokens]`` and model inputs include THD sequence metadata.
+        Media tensors retain arbitrary trailing dimensions and are concatenated
+        on their leading media axis.
+    """
+    if not datums:
+        raise ValueError("collate_vlm_datums requires at least one Datum")
+    if isinstance(sequence_alignment, bool) or not isinstance(sequence_alignment, int) or sequence_alignment < 1:
+        raise ValueError(f"sequence_alignment must be a positive integer, got {sequence_alignment!r}")
+
+    from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
+
+    examples = []
+    for datum in datums:
+        labels = datum.loss_fn_inputs.get("labels")
+        weights = datum.loss_fn_inputs.get("weights")
+        input_ids = datum.model_inputs.get("input_ids")
+        if not all(isinstance(value, torch.Tensor) and value.ndim == 1 for value in (input_ids, labels, weights)):
+            raise ValueError("VLM Datums require 1-D input_ids, labels, and weights")
+        if datum.seq_len < 2:
+            raise ValueError("VLM Datums require at least two tokens for autoregressive shifting")
+        if labels.shape != input_ids.shape or weights.shape != input_ids.shape:
+            raise ValueError("VLM labels and weights must match the unshifted input_ids shape")
+        if bool(weights[0] != 0):
+            raise ValueError("VLM weight at target position zero must be zero before autoregressive shift")
+        examples.append({**datum.model_inputs, "labels": labels})
+
+    if packed:
+        from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+        from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
+            _aligned_length,
+            _build_packed_vlm_sample,
+            _compute_mrope_position_ids,
+            _shift_sample,
+        )
+
+        position_ids = (
+            [_compute_mrope_position_ids(example, get_rope_index) for example in examples]
+            if get_rope_index is not None
+            else [None] * len(examples)
+        )
+        if any(position is not None for position in position_ids) and not all(
+            position is not None for position in position_ids
+        ):
+            raise ValueError("get_rope_index must return position IDs for every VLM Datum or none of them")
+        has_mrope = bool(position_ids and position_ids[0] is not None)
+        shifted_examples = []
+        shifted_weights = []
+        for example, position, datum in zip(examples, position_ids, datums):
+            if position is not None:
+                example["position_ids"] = position
+            shifted_examples.append(_shift_sample(example, has_mrope=has_mrope))
+            shifted_weights.append(datum.loss_fn_inputs["weights"][1:])
+
+        tokenizer = getattr(processor, "tokenizer", processor)
+        padding_idx = getattr(tokenizer, "pad_token_id", 0) or 0
+        pack_size = sum(_aligned_length(item["input_ids"].shape[0], sequence_alignment) for item in shifted_examples)
+        packed_sample = _build_packed_vlm_sample(
+            shifted_examples,
+            pack_size=pack_size,
+            padding_idx=padding_idx,
+            has_mrope=has_mrope,
+            sequence_alignment=sequence_alignment,
+        )
+        model_inputs = packed_sequence_thd_vlm_collater([packed_sample], padding_idx=padding_idx)
+        labels = model_inputs.pop("labels")
+        weights = torch.cat(
+            [
+                F.pad(weight, (0, _aligned_length(weight.shape[0], sequence_alignment) - weight.shape[0]))
+                for weight in shifted_weights
+            ]
+        ).unsqueeze(0)
+    else:
+        model_inputs = pad_collate_fn(examples, processor)
+        labels = model_inputs.pop("labels")
+
+        target_width = labels.shape[-1] + 1
+        shifted_weights = [
+            F.pad(datum.loss_fn_inputs["weights"], (0, target_width - datum.seq_len))[1:] for datum in datums
+        ]
+        weights = torch.stack(shifted_weights)
+
+    unhandled_keys = set().union(*(datum.model_inputs.keys() for datum in datums)) - set(model_inputs)
+    unhandled_keys -= {"input_ids", "attention_mask"}
+    for key in sorted(unhandled_keys):
+        values = [datum.model_inputs[key] for datum in datums if key in datum.model_inputs]
+        if not values:
+            continue
+        if not all(isinstance(value, torch.Tensor) and value.ndim > 0 for value in values):
+            raise TypeError(f"VLM processor field {key!r} must contain tensors with a leading media axis")
+        try:
+            model_inputs[key] = torch.cat(values, dim=0)
+        except RuntimeError as exc:
+            raise ValueError(f"VLM processor field {key!r} cannot be concatenated across samples") from exc
+
+    return model_inputs, CollatedLossInputs(
+        {"labels": labels, "weights": weights},
+        layouts={
+            "labels": LossInputLayout.PER_TOKEN,
+            "weights": LossInputLayout.PER_TOKEN,
+        },
+        item_to_datum=tuple(range(len(datums))),
+        pad_values={"labels": CROSS_ENTROPY_IGNORE_IDX},
     )

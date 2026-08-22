@@ -14,6 +14,7 @@
 
 import pickle
 from copy import copy, deepcopy
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -25,6 +26,7 @@ from nemo_automodel.components.datasets.datum import (
     Datum,
     LossInputLayout,
     collate_datums,
+    collate_vlm_datums,
 )
 
 
@@ -72,6 +74,36 @@ def _routed_datums():
             loss_fn_input_pad_values={"routed_experts": -1},
         ),
     ]
+
+
+def _vlm_datum(input_ids, weights, **media_inputs):
+    """Build one unshifted VLM item for collater tests.
+
+    Args:
+        input_ids: Token IDs with shape ``[sequence]``.
+        weights: Boolean supervision values with shape ``[sequence]``.
+        **media_inputs: Processor tensors with shape ``[media, ...]``.
+
+    Returns:
+        A Datum whose token fields have shape ``[sequence]`` and whose media
+        fields preserve their input shapes.
+    """
+    input_ids = torch.tensor(input_ids, dtype=torch.long)
+    weights = torch.tensor(weights, dtype=torch.bool)
+    labels = input_ids.clone().masked_fill(~weights, CROSS_ENTROPY_IGNORE_IDX)
+    return Datum(
+        model_inputs={
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            **media_inputs,
+        },
+        loss_fn_inputs={"labels": labels, "weights": weights},
+        loss_fn_input_layouts={
+            "labels": LossInputLayout.PER_TOKEN,
+            "weights": LossInputLayout.PER_TOKEN,
+        },
+        loss_fn_input_pad_values={"labels": CROSS_ENTROPY_IGNORE_IDX},
+    )
 
 
 # ── Datum ─────────────────────────────────────────────────────────────────
@@ -308,6 +340,106 @@ def test_to_features_native_python_ints():
 
 
 # ── collate_datums delegates to the canonical collaters ─────────────────────
+
+
+def test_collate_vlm_datums_delegates_padding_and_preserves_processor_fields():
+    processor = SimpleNamespace(image_processor=object(), tokenizer=SimpleNamespace(pad_token_id=9))
+    datums = [
+        _vlm_datum(
+            [1, 2, 3],
+            [0, 1, 1],
+            pixel_values=torch.tensor([[1.0, 2.0]]),
+            image_grid_thw=torch.tensor([[1, 2, 2]]),
+            image_flags=torch.tensor([[1]]),
+            imgs_sizes=torch.tensor([[32, 64]]),
+        ),
+        _vlm_datum([4, 5], [0, 1]),
+    ]
+
+    model_inputs, loss_inputs = collate_vlm_datums(datums, processor=processor)
+
+    torch.testing.assert_close(model_inputs["input_ids"], torch.tensor([[1, 2], [4, 5]]))
+    torch.testing.assert_close(model_inputs["attention_mask"], torch.tensor([[1, 1], [1, 1]]))
+    torch.testing.assert_close(loss_inputs["labels"], torch.tensor([[2, 3], [5, -100]]))
+    torch.testing.assert_close(loss_inputs["weights"], torch.tensor([[True, True], [True, False]]))
+    torch.testing.assert_close(model_inputs["image_flags"], torch.tensor([[1]]))
+    torch.testing.assert_close(model_inputs["imgs_sizes"], torch.tensor([[32, 64]]))
+    assert model_inputs["pixel_values"].dtype == torch.bfloat16
+    assert loss_inputs.item_to_datum == (0, 1)
+    assert loss_inputs.layouts == {
+        "labels": LossInputLayout.PER_TOKEN,
+        "weights": LossInputLayout.PER_TOKEN,
+    }
+    assert loss_inputs.pad_values == {"labels": CROSS_ENTROPY_IGNORE_IDX}
+
+
+def test_collate_vlm_datums_rejects_invalid_unshifted_contract():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    with pytest.raises(ValueError, match="at least one"):
+        collate_vlm_datums([], processor=processor)
+    with pytest.raises(ValueError, match="target position zero"):
+        collate_vlm_datums([_vlm_datum([1, 2], [1, 1])], processor=processor)
+
+
+def test_collate_vlm_datums_packs_aligned_thd_documents():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=9))
+    datums = [
+        _vlm_datum(
+            [1, 2, 3],
+            [0, 1, 1],
+            pixel_values=torch.tensor([[1.0, 2.0]]),
+            image_grid_thw=torch.tensor([[1, 2, 2]]),
+            image_flags=torch.tensor([[1]]),
+        ),
+        _vlm_datum([4, 5], [0, 1]),
+    ]
+
+    model_inputs, loss_inputs = collate_vlm_datums(
+        datums,
+        processor=processor,
+        packed=True,
+        sequence_alignment=4,
+    )
+
+    torch.testing.assert_close(model_inputs["input_ids"], torch.tensor([[1, 2, 9, 9, 4, 9, 9, 9]]))
+    torch.testing.assert_close(model_inputs["position_ids"], torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]))
+    torch.testing.assert_close(model_inputs["seq_lens"], torch.tensor([[2, 1]]))
+    torch.testing.assert_close(model_inputs["seq_lens_padded"], torch.tensor([[4, 4]]))
+    torch.testing.assert_close(loss_inputs["labels"], torch.tensor([[2, 3, -100, -100, 5, -100, -100, -100]]))
+    torch.testing.assert_close(
+        loss_inputs["weights"],
+        torch.tensor([[True, True, False, False, True, False, False, False]]),
+    )
+    torch.testing.assert_close(model_inputs["image_flags"], torch.tensor([[1]]))
+    assert model_inputs["qkv_format"] == "thd"
+    assert loss_inputs.item_to_datum == (0, 1)
+
+
+def test_collate_vlm_datums_packs_mrope_only_without_cp_alignment():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = [_vlm_datum([1, 2, 3], [0, 1, 1]), _vlm_datum([4, 5], [0, 1])]
+
+    def get_rope_index(input_ids, **_kwargs):
+        sequence = input_ids.shape[-1]
+        positions = torch.arange(sequence).expand(3, 1, sequence)
+        return positions, torch.zeros(1)
+
+    model_inputs, _ = collate_vlm_datums(
+        datums,
+        processor=processor,
+        packed=True,
+        get_rope_index=get_rope_index,
+    )
+
+    assert model_inputs["position_ids"].shape == (3, 1, 3)
+    with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
+        collate_vlm_datums(
+            datums,
+            processor=processor,
+            packed=True,
+            get_rope_index=get_rope_index,
+            sequence_alignment=2,
+        )
 
 
 def test_collate_padded_uses_default_collater_schema():
