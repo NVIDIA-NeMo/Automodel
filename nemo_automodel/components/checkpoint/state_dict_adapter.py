@@ -97,3 +97,7 @@ class StateDictAdapter(ABC):
             Hugging Face state-dict keys in adapter iteration order.
         """
         return list(self.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=False))
+
+    def convert_peft_target_module_to_hf(self, module_name: str) -> str:
+        """Convert a native PEFT target-module name to its Hugging Face namespace."""
+        return module_name

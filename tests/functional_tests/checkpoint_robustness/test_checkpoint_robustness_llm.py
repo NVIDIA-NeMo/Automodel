@@ -14,18 +14,15 @@
 
 """Train, checkpoint, and validate AutoModel and vanilla-HF reloads.
 
-Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
-    [--isolated_phase <source_load_reference|source_load_parity|train_and_save|automodel_reload|hf_reload|resume>]
-    [--kl_threshold <float>] [--hf_kl_threshold <float>]
-    [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
-    [--tokenizer_name <str>]
-    [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
-    [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
-    [--resume_tolerance_profile <strict|standard|relaxed>]
-    [--resume_first_loss_threshold <float>] [--resume_loss_threshold <float>]
-    [--skip_automodel_logit_parity] [--skip_hf_logit_parity] [--hf_adapter_ignored_key_prefix <str>]
-    [--hf_source_post_load_dequantize]
-    [--max_vram_gb <float>] [--max_cpu_gb <float>]
+Launch with ``torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>``.
+
+The CI launcher runs phases in isolated processes by default through ``--isolated_phase``. Accepted phase names are
+``source_load_reference``, ``source_load_parity``, ``train_and_save``, ``automodel_reload``, ``hf_reload``, ``resume``,
+and ``cross_tp_reload``. Direct invocation without ``--isolated_phase`` retains the compatibility single-process
+lifecycle.
+
+See ``tests/ci_tests/README.md#checkpoint-robustness`` for the public phase contract, tolerance profiles, and supported
+recipe controls.
 """
 
 from __future__ import annotations
@@ -34,17 +31,17 @@ import gc
 import hashlib
 import inspect
 import json
-import math
 import os
 import sys
 import time
 import traceback
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -52,7 +49,6 @@ if TYPE_CHECKING:
 import datasets
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -62,11 +58,22 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.shared.utils import dtype_from_str
+from tests.functional_tests.checkpoint_robustness.parity_metrics import (
+    _apply_parity_threshold_overrides,
+    _compute_parity_metrics,
+    _normalize_parity_profile_overrides,
+    _normalize_parity_threshold_overrides,
+    _parity_failures,
+    _resolve_parity_thresholds,
+    _select_parity_profile,
+    _validate_logits,
+)
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _checkpoint_for_completed_steps,
     _checkpoint_state_snapshot,
     _configure_resumed_run,
     _configure_uninterrupted_run,
+    _disable_checkpoint_saves_after_restore,
     _gather_rank_failures,
     _load_reference_trajectory,
     _persist_reference_trajectory,
@@ -82,47 +89,79 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
 
 datasets.disable_caching()
 
-# Llama token IDs for "The quick brown fox jumps over the lazy dog"
-_DEFAULT_INPUT_IDS = [791, 4996, 14198, 39935, 35308, 927, 279, 16053, 5679]
-_DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog"
+_PARITY_DOCUMENT_PATH = Path(__file__).with_name("parity_document.mdx")
+_PARITY_DOCUMENT_SHA256 = "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"  # pragma: allowlist secret
+_REMOVED_CHECKPOINT_ROBUSTNESS_FIELDS = {
+    "automodel_reload_cosine_threshold",
+    "automodel_reload_mean_kl_threshold",
+    "automodel_reload_p95_kl_threshold",
+    "check_hf_reload",
+    "check_resume",
+    "check_source_load_parity",
+    "cosine_threshold",
+    "cross_tp_kl_threshold",
+    "hf_cosine_threshold",
+    "hf_kl_threshold",
+    "kl_threshold",
+    "no_check_resume",
+    "skip_automodel_logit_parity",
+    "skip_hf_logit_parity",
+    "source_load_cosine_threshold",
+    "source_load_kl_threshold",
+    "source_load_mean_kl_threshold",
+}
 
 
-def _extract_custom_args(argv):
+@dataclass(frozen=True)
+class _LogitParityPolicy:
+    """Configuration and enforcement state for one full-logit comparison."""
+
+    phase: str
+    comparison: str
+    comparison_kind: Literal["same_implementation", "cross_framework", "cross_topology"]
+    profile: str
+    enforce: bool = True
+    mean_kl_threshold_override: float | None = None
+    p95_kl_threshold_override: float | None = None
+    cosine_threshold_override: float | None = None
+
+
+def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]:
     """Separate test-specific CLI flags from config parser arguments."""
     custom_keys = {
-        "--kl_threshold",
-        "--hf_kl_threshold",
         "--isolated_phase",
         "--cross_tp_size",
-        "--cross_tp_kl_threshold",
         "--experts_implementation",
         "--hf_adapter_ignored_key_prefix",
+        "--hf_device_map_cpu_max_memory_gib",
         "--hf_device_map_max_memory_gib",
+        "--hf_reload_timeout_seconds",
         "--tokenizer_name",
         "--max_vram_gb",
         "--max_cpu_gb",
         "--training_reproducibility_loss_threshold",
+        "--parity_sequence_length",
+        "--parity_threshold_overrides",
+        "--parity_tolerance_profile",
+        "--parity_tolerance_profile_overrides",
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
         "--resume_tolerance_profile",
-        "--source_load_cosine_threshold",
-        "--source_load_kl_threshold",
-        "--source_load_mean_kl_threshold",
     }
     boolean_keys = {
         "--trust_remote_code",
-        "--check_source_load_parity",
         "--check_fused_qkv_keys",
         "--check_phantom_keys",
-        "--check_resume",
         "--hf_device_map_auto",
         "--hf_source_post_load_dequantize",
-        "--no_check_resume",
+        "--skip_resume",
+        "--skip_source_load_parity",
+        "--skip_source_load_logit_parity",
         "--skip_hf_reload",
-        "--skip_automodel_logit_parity",
-        "--skip_hf_logit_parity",
+        "--skip_automodel_reload_logit_parity",
+        "--skip_hf_reload_logit_parity",
     }
-    custom = {}
+    custom: dict[str, object] = {}
     remaining = []
     i = 0
     while i < len(argv):
@@ -135,6 +174,7 @@ def _extract_custom_args(argv):
         else:
             remaining.append(argv[i])
             i += 1
+    cli_custom_keys = set(custom)
 
     # Read ci.checkpoint_robustness from the YAML config as defaults.
     # CLI args take precedence over YAML values.
@@ -143,36 +183,91 @@ def _extract_custom_args(argv):
         if arg == "--config" and j + 1 < len(remaining):
             config_path = remaining[j + 1]
             break
+    ci_robustness: dict = {}
     if config_path:
         import yaml
 
         with open(config_path) as f:
-            raw_cfg = yaml.safe_load(f)
+            raw_cfg = yaml.safe_load(f) or {}
         ci_robustness = raw_cfg.get("ci", {}).get("checkpoint_robustness") or {}
-        no_check_resume = ci_robustness.pop("no_check_resume", False)
-        if no_check_resume:
-            custom["no_check_resume"] = True
+        removed_fields = sorted(_REMOVED_CHECKPOINT_ROBUSTNESS_FIELDS & ci_robustness.keys())
+        if removed_fields:
+            raise ValueError("Removed checkpoint-robustness fields are not supported: " + ", ".join(removed_fields))
+        default_on_control_keys = {
+            "parity_threshold_overrides",
+            "parity_tolerance_profile_overrides",
+            "skip_resume",
+            "skip_source_load_parity",
+        }
         for k, v in ci_robustness.items():
+            if k in default_on_control_keys:
+                continue
             if k not in custom:
                 if "." in k:
                     # Dotted keys are config overrides (e.g. distributed.tp_size),
                     # route them to the config parser instead of the custom dict.
                     remaining.extend([f"--{k}", str(v)])
-                elif isinstance(v, bool) and v:
-                    custom[k] = True
+                elif isinstance(v, bool) and (v or k == "trust_remote_code"):
+                    # ``false`` is meaningful for trust_remote_code: it must be
+                    # able to override a recipe model that normally uses remote code.
+                    custom[k] = v
                 elif not isinstance(v, bool):
                     custom[k] = str(v)
-        # Enable check_resume by default unless no_check_resume is set
-        if not no_check_resume and "check_resume" not in custom:
-            custom["check_resume"] = True
+
+    raw_threshold_overrides = custom.get("parity_threshold_overrides")
+    if raw_threshold_overrides is None:
+        raw_threshold_overrides = ci_robustness.get("parity_threshold_overrides")
+    if isinstance(raw_threshold_overrides, str):
+        import yaml
+
+        raw_threshold_overrides = yaml.safe_load(raw_threshold_overrides)
+    if raw_threshold_overrides is not None:
+        custom["parity_threshold_overrides"] = _normalize_parity_threshold_overrides(raw_threshold_overrides)
+
+    raw_profile_overrides = custom.get("parity_tolerance_profile_overrides")
+    if raw_profile_overrides is None:
+        raw_profile_overrides = ci_robustness.get("parity_tolerance_profile_overrides")
+    if isinstance(raw_profile_overrides, str):
+        import yaml
+
+        raw_profile_overrides = yaml.safe_load(raw_profile_overrides)
+    if raw_profile_overrides is not None:
+        custom["parity_tolerance_profile_overrides"] = _normalize_parity_profile_overrides(raw_profile_overrides)
+
+    if "skip_source_load_parity" in cli_custom_keys:
+        source_load_parity_enabled = False
+    elif "skip_source_load_parity" in ci_robustness:
+        source_load_parity_enabled = not bool(ci_robustness["skip_source_load_parity"])
+    else:
+        source_load_parity_enabled = True
+    custom["source_load_parity_enabled"] = source_load_parity_enabled
+    if not source_load_parity_enabled:
+        custom["skip_source_load_parity"] = True
+
+    if "skip_resume" in cli_custom_keys:
+        resume_enabled = False
+    elif "skip_resume" in ci_robustness:
+        resume_enabled = not bool(ci_robustness["skip_resume"])
+    else:
+        resume_enabled = True
+    custom["resume_enabled"] = resume_enabled
+    if not resume_enabled:
+        custom["skip_resume"] = True
+
+    parity_sequence_length = int(custom.get("parity_sequence_length", "2048"))
+    if parity_sequence_length <= 0:
+        raise ValueError(f"parity_sequence_length must be positive, got {parity_sequence_length}")
+    if "hf_reload_timeout_seconds" in custom and int(custom["hf_reload_timeout_seconds"]) <= 0:
+        raise ValueError("hf_reload_timeout_seconds must be positive")
+    _resolve_parity_thresholds(str(custom.get("parity_tolerance_profile", "standard")), "same_implementation")
 
     return custom, remaining
 
 
 def _get_input_ids(tokenizer_name: str | None) -> list[int]:
-    """Return input IDs for the test prompt, using dynamic tokenization if tokenizer_name is set."""
+    """Tokenize the repository's long-form finetuning guide for parity testing."""
     if tokenizer_name is None:
-        return _DEFAULT_INPUT_IDS
+        raise ValueError("tokenizer_name is required to tokenize the checkpoint parity document")
     from nemo_automodel import NeMoAutoTokenizer
 
     tokenizer = NeMoAutoTokenizer.from_pretrained(
@@ -180,7 +275,22 @@ def _get_input_ids(tokenizer_name: str | None) -> list[int]:
         trust_remote_code=True,
         local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
     )
-    return tokenizer.encode(_DEFAULT_PROMPT, add_special_tokens=False)
+    return tokenizer.encode(_get_parity_document(), add_special_tokens=False)
+
+
+def _get_parity_document() -> str:
+    """Load and validate the fixed long-form document shared by LLM and VLM parity tests."""
+    try:
+        document_bytes = _PARITY_DOCUMENT_PATH.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"Unable to load checkpoint parity document: {_PARITY_DOCUMENT_PATH}") from exc
+    document_sha256 = hashlib.sha256(document_bytes).hexdigest()
+    if document_sha256 != _PARITY_DOCUMENT_SHA256:
+        raise RuntimeError(
+            "Checkpoint parity document changed unexpectedly: "
+            f"expected sha256={_PARITY_DOCUMENT_SHA256}, got sha256={document_sha256}"
+        )
+    return document_bytes.decode("utf-8")
 
 
 def _load_hf_config(
@@ -369,18 +479,184 @@ def _rss_gb() -> float:
     return rss_pages * page_size / 1024**3
 
 
-def _kl_divergence_from_logits(reference_logits: torch.Tensor, candidate_logits: torch.Tensor) -> torch.Tensor:
-    """Per-token KL(reference || candidate) for full [B, T, V] logits."""
-    assert reference_logits.shape == candidate_logits.shape
-    vocab_size = reference_logits.shape[-1]
-    ref_log_probs = F.log_softmax(reference_logits.float(), dim=-1).reshape(-1, vocab_size)
-    cand_log_probs = F.log_softmax(candidate_logits.float(), dim=-1).reshape(-1, vocab_size)
-    return F.kl_div(cand_log_probs, ref_log_probs, reduction="none", log_target=True).sum(-1)
+def _fit_input_ids_to_sequence_length(input_ids: list[int], sequence_length: int) -> list[int]:
+    """Truncate a tokenized document to the requested parity length."""
+    if not input_ids:
+        raise ValueError("Tokenized parity document must not be empty")
+    if sequence_length <= 0:
+        raise ValueError(f"parity_sequence_length must be positive, got {sequence_length}")
+    if len(input_ids) < sequence_length:
+        raise ValueError(
+            f"Tokenized parity document contains {len(input_ids)} tokens, but parity_sequence_length requires "
+            f"{sequence_length}; choose a shorter sequence length or a longer parity document"
+        )
+    return input_ids[:sequence_length]
 
 
-def _cosine_similarity_from_logits(reference_logits: torch.Tensor, candidate_logits: torch.Tensor) -> float:
-    """Cosine similarity over flattened float32 logits."""
-    return F.cosine_similarity(reference_logits.flatten().float(), candidate_logits.flatten().float(), dim=0).item()
+def _compare_logits(
+    artifact_dir: Path,
+    reference_logits: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    policy: _LogitParityPolicy,
+) -> str | None:
+    """Compute, persist, and optionally enforce one full-logit comparison.
+
+    Args:
+        artifact_dir: Directory that owns checkpoint-robustness artifacts.
+        reference_logits: Reference tensor of shape [..., vocab], with arbitrary leading token dimensions.
+        candidate_logits: Candidate tensor of shape [..., vocab], matching ``reference_logits`` exactly.
+        policy: Comparison identity, numerical profile, targeted overrides, and enforcement state.
+
+    Returns:
+        A failure message when an enforced gate fails, otherwise ``None``.
+    """
+    metrics = _compute_parity_metrics(reference_logits, candidate_logits)
+    profile_thresholds = _resolve_parity_thresholds(policy.profile, policy.comparison_kind)
+    threshold_overrides = {
+        "mean_kl": policy.mean_kl_threshold_override,
+        "p95_kl": policy.p95_kl_threshold_override,
+        "cosine_similarity": policy.cosine_threshold_override,
+    }
+    uses_threshold_overrides = any(value is not None for value in threshold_overrides.values())
+    active_profile_thresholds = _apply_parity_threshold_overrides(
+        profile_thresholds,
+        mean_kl=policy.mean_kl_threshold_override,
+        p95_kl=policy.p95_kl_threshold_override,
+        cosine_similarity=policy.cosine_threshold_override,
+    )
+    profile_failures = _parity_failures(metrics, profile_thresholds)
+    active_failures = _parity_failures(metrics, active_profile_thresholds)
+    threshold_mode = "profile_with_numeric_overrides" if uses_threshold_overrides else "profile"
+    payload = {
+        "schema_version": 1,
+        "parity_document_sha256": _PARITY_DOCUMENT_SHA256,
+        "phase": policy.phase,
+        "comparison": policy.comparison,
+        "comparison_kind": policy.comparison_kind,
+        "profile": policy.profile,
+        "profile_thresholds": profile_thresholds.to_dict(),
+        "threshold_overrides": threshold_overrides,
+        "active_thresholds": active_profile_thresholds.to_dict(),
+        "threshold_mode": threshold_mode,
+        "enforced": policy.enforce,
+        "passed": not policy.enforce or not active_failures,
+        "within_active_thresholds": not active_failures,
+        "would_pass_profile": not profile_failures,
+        "failures": list(active_failures) if policy.enforce else [],
+        "threshold_failures": list(active_failures),
+        "profile_failures": list(profile_failures),
+        "reference_logits": {
+            "dtype": str(reference_logits.dtype),
+            "shape": list(reference_logits.shape),
+        },
+        "candidate_logits": {
+            "dtype": str(candidate_logits.dtype),
+            "shape": list(candidate_logits.shape),
+        },
+        "metrics": metrics.to_dict(),
+    }
+    report_dir = artifact_dir / "parity_metrics"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"{policy.phase}_{policy.comparison}.json"
+    temporary_report_path = report_path.with_suffix(".tmp")
+    temporary_report_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary_report_path.replace(report_path)
+    print(f"CHECKPOINT_PARITY_METRICS {json.dumps(payload, sort_keys=True)}")
+
+    if not policy.enforce:
+        print(
+            f"[{policy.phase}] {policy.comparison} metrics are informational; "
+            f"would_pass_active_thresholds={not active_failures}, would_pass_profile={not profile_failures}"
+        )
+        return None
+    if not active_failures:
+        return None
+    return f"{policy.comparison} parity failed: " + "; ".join(active_failures)
+
+
+def _comparison_threshold_overrides(custom_args: dict[str, object], comparison: str) -> dict[str, float]:
+    """Return normalized overrides for one comparison."""
+    all_overrides = _normalize_parity_threshold_overrides(custom_args.get("parity_threshold_overrides"))
+    return all_overrides.get(comparison, {})
+
+
+def _comparison_profile(custom_args: dict[str, object], comparison: str) -> str:
+    """Return the comparison profile, falling back to the global profile."""
+    return _select_parity_profile(
+        str(custom_args.get("parity_tolerance_profile", "standard")),
+        custom_args.get("parity_tolerance_profile_overrides"),
+        comparison,
+    )
+
+
+def _source_load_parity_policy(custom_args: dict[str, object], *, enforce: bool = True) -> _LogitParityPolicy:
+    """Build the Phase 0 source-load policy."""
+    overrides = _comparison_threshold_overrides(custom_args, "source_load")
+    return _LogitParityPolicy(
+        phase="phase_0",
+        comparison="source_load",
+        comparison_kind="cross_framework",
+        profile=_comparison_profile(custom_args, "source_load"),
+        enforce=enforce and not bool(custom_args.get("skip_source_load_logit_parity", False)),
+        mean_kl_threshold_override=overrides.get("mean_kl"),
+        p95_kl_threshold_override=overrides.get("p95_kl"),
+        cosine_threshold_override=overrides.get("cosine_similarity"),
+    )
+
+
+def _repeatability_policy(*, phase: str, comparison: str, profile: str) -> _LogitParityPolicy:
+    """Build an informational policy for two forwards through one loaded model."""
+    return _LogitParityPolicy(
+        phase=phase,
+        comparison=comparison,
+        comparison_kind="same_implementation",
+        profile=profile,
+        enforce=False,
+    )
+
+
+def _automodel_reload_parity_policy(custom_args: dict[str, object]) -> _LogitParityPolicy:
+    """Build the Phase 2 AutoModel model-reload policy."""
+    overrides = _comparison_threshold_overrides(custom_args, "automodel_reload")
+    return _LogitParityPolicy(
+        phase="phase_2",
+        comparison="automodel_model_reload",
+        comparison_kind="same_implementation",
+        profile=_comparison_profile(custom_args, "automodel_reload"),
+        enforce=not bool(custom_args.get("skip_automodel_reload_logit_parity", False)),
+        mean_kl_threshold_override=overrides.get("mean_kl"),
+        p95_kl_threshold_override=overrides.get("p95_kl"),
+        cosine_threshold_override=overrides.get("cosine_similarity"),
+    )
+
+
+def _hf_reload_parity_policy(custom_args: dict[str, object]) -> _LogitParityPolicy:
+    """Build the Phase 3 vanilla-HF export-reload policy."""
+    overrides = _comparison_threshold_overrides(custom_args, "hf_reload")
+    return _LogitParityPolicy(
+        phase="phase_3",
+        comparison="hf_export_reload",
+        comparison_kind="cross_framework",
+        profile=_comparison_profile(custom_args, "hf_reload"),
+        enforce=not bool(custom_args.get("skip_hf_reload_logit_parity", False)),
+        mean_kl_threshold_override=overrides.get("mean_kl"),
+        p95_kl_threshold_override=overrides.get("p95_kl"),
+        cosine_threshold_override=overrides.get("cosine_similarity"),
+    )
+
+
+def _cross_tp_parity_policy(custom_args: dict[str, object]) -> _LogitParityPolicy:
+    """Build the optional Phase 5 cross-topology policy."""
+    overrides = _comparison_threshold_overrides(custom_args, "cross_tp")
+    return _LogitParityPolicy(
+        phase="phase_5",
+        comparison="cross_tp_reload",
+        comparison_kind="cross_topology",
+        profile=_comparison_profile(custom_args, "cross_tp"),
+        mean_kl_threshold_override=overrides.get("mean_kl"),
+        p95_kl_threshold_override=overrides.get("p95_kl"),
+        cosine_threshold_override=overrides.get("cosine_similarity"),
+    )
 
 
 def _tensor_digest(tensor: torch.Tensor) -> dict[str, object]:
@@ -518,6 +794,48 @@ def _model_kwargs_from_config(model_cfg: ConfigNode) -> dict:
     }
 
 
+def _model_pretrained_path(model_cfg: ConfigNode, model_kwargs: dict | None = None) -> str | Path:
+    """Resolve the source checkpoint for from-pretrained and config-based recipes."""
+    direct_path = getattr(model_cfg, "pretrained_model_name_or_path", None)
+    if direct_path:
+        return direct_path
+
+    nested_config = getattr(model_cfg, "config", None)
+    nested_path = getattr(nested_config, "pretrained_model_name_or_path", None)
+    if nested_path:
+        return nested_path
+    nested_name_or_path = getattr(nested_config, "name_or_path", None)
+    if nested_name_or_path:
+        return nested_name_or_path
+
+    if model_kwargs is not None:
+        materialized_config = model_kwargs.get("config")
+        for attribute in ("pretrained_model_name_or_path", "name_or_path", "_name_or_path"):
+            materialized_path = getattr(materialized_config, attribute, None)
+            if materialized_path:
+                return materialized_path
+
+    raise ValueError(
+        "Checkpoint robustness requires model.pretrained_model_name_or_path or "
+        "model.config.pretrained_model_name_or_path"
+    )
+
+
+def _set_model_pretrained_path(model_cfg: ConfigNode, pretrained_model_name_or_path: str | Path) -> None:
+    """Retarget both from-pretrained and config-based recipes to an exported checkpoint."""
+    path = str(pretrained_model_name_or_path)
+    nested_config = getattr(model_cfg, "config", None)
+    if nested_config is not None and (
+        hasattr(nested_config, "pretrained_model_name_or_path") or hasattr(nested_config, "name_or_path")
+    ):
+        if hasattr(nested_config, "pretrained_model_name_or_path"):
+            nested_config.pretrained_model_name_or_path = path
+        if hasattr(nested_config, "name_or_path"):
+            nested_config.name_or_path = path
+        return
+    model_cfg.pretrained_model_name_or_path = path
+
+
 def _resolve_hf_model_class(
     pretrained_model_name_or_path: str | Path,
     default_model_cls: type,
@@ -525,8 +843,12 @@ def _resolve_hf_model_class(
     revision: str | None = None,
     token: str | bool | None = None,
 ) -> type:
-    """Honor a checkpoint's advertised HF auto-model class when the VLM default is absent."""
+    """Select the vanilla-HF auto-model class supported by the checkpoint."""
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, PretrainedConfig
+    from transformers.models.auto.modeling_auto import (
+        MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
+        MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
+    )
 
     config_kwargs: dict[str, str | bool] = {
         "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
@@ -537,15 +859,26 @@ def _resolve_hf_model_class(
         config_kwargs["token"] = token
     config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
     auto_map = config_dict.get("auto_map") or {}
-    if not auto_map or default_model_cls.__name__ in auto_map:
-        return default_model_cls
-
     supported_classes = {
         model_cls.__name__: model_cls for model_cls in (AutoModelForImageTextToText, AutoModelForCausalLM)
     }
-    advertised_classes = [model_cls for name, model_cls in supported_classes.items() if name in auto_map]
-    if len(advertised_classes) == 1:
-        return advertised_classes[0]
+
+    if auto_map:
+        if default_model_cls.__name__ in auto_map:
+            return default_model_cls
+        advertised_classes = [model_cls for name, model_cls in supported_classes.items() if name in auto_map]
+        if len(advertised_classes) == 1:
+            return advertised_classes[0]
+        return default_model_cls
+
+    model_type = config_dict.get("model_type")
+    native_mappings = {
+        AutoModelForCausalLM: MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
+        AutoModelForImageTextToText: MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
+    }
+    native_classes = [model_cls for model_cls, mapping in native_mappings.items() if model_type in mapping]
+    if len(native_classes) == 1:
+        return native_classes[0]
     return default_model_cls
 
 
@@ -566,20 +899,69 @@ def _get_trust_remote_code_attn_implementation(
     token: str | bool | None = None,
 ) -> str:
     """Select the vanilla-HF attention implementation for a remote-code model."""
+    from transformers import PretrainedConfig
+
+    config_kwargs: dict[str, str | bool] = {
+        "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    }
+    if revision is not None:
+        config_kwargs["revision"] = revision
+    if token is not None:
+        config_kwargs["token"] = token
+    config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
+
+    # Remote-code checkpoints do not share optimized attention backend support:
+    # these models reject the recipe backend under the pinned Transformers
+    # version. Eager is their common vanilla-HF reference path.
+    eager_model_types = {"deepseek_v4", "nemotron-nas", "nemotron_flash", "nemotron_h", "step3p7"}
+    return "eager" if config_dict.get("model_type") in eager_model_types else "flash_attention_2"
+
+
+def _resolve_hf_attn_implementation(
+    pretrained_model_name_or_path: str | Path,
+    requested_implementation: str | None,
+    *,
+    hf_model_cls: type,
+    trust_remote_code: bool,
+    revision: str | None = None,
+    token: str | bool | None = None,
+) -> str | None:
+    """Use the recipe backend when vanilla HF supports it, otherwise use eager."""
+    if trust_remote_code:
+        compatible_implementation = _get_trust_remote_code_attn_implementation(
+            pretrained_model_name_or_path,
+            revision=revision,
+            token=token,
+        )
+        if compatible_implementation == "eager" or requested_implementation is None:
+            return compatible_implementation
+        return requested_implementation
+
+    if requested_implementation not in {"sdpa", "flash_attention_2"}:
+        return requested_implementation
+
     from transformers import AutoConfig
 
-    config_kwargs: dict[str, str | bool] = {"trust_remote_code": True}
+    config_kwargs: dict[str, str | bool] = {
+        "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    }
     if revision is not None:
         config_kwargs["revision"] = revision
     if token is not None:
         config_kwargs["token"] = token
     config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
+    try:
+        concrete_model_cls = hf_model_cls._model_mapping[type(config)]
+    except (AttributeError, KeyError):
+        return requested_implementation
 
-    # Remote-code checkpoints do not share optimized attention backend support:
-    # Nemotron-H has incompatible FA2/SDPA paths, and Step-3.7 explicitly rejects
-    # FA2. Eager is their common HF reference path. Other remote-code models
-    # (notably Nemotron-Flash) still require FA2.
-    return "eager" if config.model_type in {"nemotron_h", "step3p7"} else "flash_attention_2"
+    support_attribute = {
+        "sdpa": "_supports_sdpa",
+        "flash_attention_2": "_supports_flash_attn",
+    }[requested_implementation]
+    if not bool(getattr(concrete_model_cls, support_attribute, False)):
+        return "eager"
+    return requested_implementation
 
 
 def _hf_source_load_kwargs(
@@ -589,6 +971,7 @@ def _hf_source_load_kwargs(
     source_dtype: torch.dtype,
     trust_remote_code: bool,
     experts_implementation: str | None,
+    hf_model_cls: type,
     device: torch.device,
     hf_device_map_auto: bool,
 ) -> dict:
@@ -603,14 +986,18 @@ def _hf_source_load_kwargs(
     }
     hf_kwargs = {k: v for k, v in model_kwargs.items() if k in hf_allowed_keys}
     hf_kwargs["torch_dtype"] = source_dtype
-    hf_kwargs["trust_remote_code"] = trust_remote_code or bool(hf_kwargs.get("trust_remote_code", False))
+    hf_kwargs["trust_remote_code"] = trust_remote_code
     hf_kwargs["local_files_only"] = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
-    if hf_kwargs["trust_remote_code"] and "attn_implementation" not in hf_kwargs:
-        hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(
-            pretrained_model_name_or_path,
-            revision=hf_kwargs.get("revision"),
-            token=hf_kwargs.get("token"),
-        )
+    attn_implementation = _resolve_hf_attn_implementation(
+        pretrained_model_name_or_path,
+        hf_kwargs.get("attn_implementation"),
+        hf_model_cls=hf_model_cls,
+        trust_remote_code=hf_kwargs["trust_remote_code"],
+        revision=hf_kwargs.get("revision"),
+        token=hf_kwargs.get("token"),
+    )
+    if attn_implementation is not None:
+        hf_kwargs["attn_implementation"] = attn_implementation
     if experts_implementation and not trust_remote_code:
         hf_kwargs["experts_implementation"] = experts_implementation
         hf_kwargs["trust_remote_code"] = False
@@ -821,15 +1208,17 @@ def _load_input_ids_once(
     cfg,
     input_ids_loader: Callable[[str | None], list[int]],
     tokenizer_name: str | None,
+    *,
+    sequence_length: int,
 ) -> list[int]:
-    """Load dynamic input IDs once before distributed initialization.
+    """Load and expand dynamic input IDs once before distributed initialization.
 
     The tokenizer and processor imports are I/O-heavy on shared filesystems.
     Loading on every worker can turn a cold import into a multi-node import
     storm, so rank 0 writes the small result for the other ranks to read.
     """
     if tokenizer_name is None or _preinit_world_size() == 1:
-        return input_ids_loader(tokenizer_name)
+        return _fit_input_ids_to_sequence_length(input_ids_loader(tokenizer_name), sequence_length)
 
     sync_dir, payload_path, done_path, fail_path = _input_ids_sync_paths(cfg)
     if _preinit_global_rank() != 0:
@@ -843,7 +1232,7 @@ def _load_input_ids_once(
     done_path.unlink(missing_ok=True)
     fail_path.unlink(missing_ok=True)
     try:
-        input_ids = input_ids_loader(tokenizer_name)
+        input_ids = _fit_input_ids_to_sequence_length(input_ids_loader(tokenizer_name), sequence_length)
         temporary_payload_path = payload_path.with_suffix(".tmp")
         temporary_payload_path.write_text(json.dumps(input_ids))
         temporary_payload_path.replace(payload_path)
@@ -901,9 +1290,10 @@ def _hf_reload_sync_paths(cfg) -> tuple[Path, Path]:
     return sync_dir, sync_dir / "done"
 
 
-def _wait_for_hf_reload_rank0(done_path: Path) -> None:
+def _wait_for_hf_reload_rank0(done_path: Path, *, timeout_s: int | None = None) -> None:
     """Wait without an active collective for rank 0 to finish the vanilla-HF reload."""
-    timeout_s = int(os.environ.get("HF_RELOAD_TIMEOUT_SECONDS", "1800"))
+    if timeout_s is None:
+        timeout_s = int(os.environ.get("HF_RELOAD_TIMEOUT_SECONDS", "1800"))
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if done_path.exists():
@@ -912,7 +1302,7 @@ def _wait_for_hf_reload_rank0(done_path: Path) -> None:
     raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 vanilla-HF reload")
 
 
-def _prepare_hf_reload_sync(cfg) -> tuple[Path, Path] | None:
+def _prepare_hf_reload_sync(cfg, *, timeout_s: int | None = None) -> tuple[Path, Path] | None:
     """Prepare ranks for a long rank-0-only HF reload without starting an NCCL wait."""
     if not dist.is_initialized() or dist.get_world_size() == 1:
         return None
@@ -923,7 +1313,7 @@ def _prepare_hf_reload_sync(cfg) -> tuple[Path, Path] | None:
         done_path.unlink(missing_ok=True)
     _barrier()  # ensure all ranks released recipe memory and rank 0 reset the marker
     if not _rank0():
-        _wait_for_hf_reload_rank0(done_path)
+        _wait_for_hf_reload_rank0(done_path, timeout_s=timeout_s)
     return sync_dir, done_path
 
 
@@ -966,15 +1356,25 @@ def _record_deferred_failure(
         print(f"[{phase}] Comparison failed; deferring failure until later checkpoint phases complete.")
 
 
+def _broadcast_rank0_failure(failure_message: str | None) -> str | None:
+    """Broadcast one rank-0 comparison result so every worker follows the same path."""
+    if not dist.is_initialized():
+        return failure_message
+    payload = [failure_message]
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
 def _prepare_source_load_reference(
     cfg,
     input_ids: list[int],
     *,
     hf_model_cls: type,
-    trust_remote_code: bool,
+    trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
+    parity_tolerance_profile: str = "standard",
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
     """Compute vanilla HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
@@ -1001,6 +1401,7 @@ def _prepare_source_load_reference(
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
+            parity_tolerance_profile=parity_tolerance_profile,
         )
     except Exception:
         if fail_path is not None:
@@ -1017,10 +1418,11 @@ def _prepare_source_load_reference_rank0(
     input_ids: list[int],
     *,
     hf_model_cls: type,
-    trust_remote_code: bool,
+    trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
+    parity_tolerance_profile: str = "standard",
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
     """Rank-0 implementation of vanilla HF source-load reference capture."""
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -1029,8 +1431,7 @@ def _prepare_source_load_reference_rank0(
     _patch_remote_masking_api_compatibility()
 
     model_kwargs = _model_kwargs_from_config(cfg.model)
-    original_pretrained_path = model_kwargs.get("pretrained_model_name_or_path")
-    assert original_pretrained_path is not None, "source-load parity requires model.pretrained_model_name_or_path"
+    original_pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
     hf_model_cls = _resolve_hf_model_class(
         original_pretrained_path,
         hf_model_cls,
@@ -1038,7 +1439,8 @@ def _prepare_source_load_reference_rank0(
         token=model_kwargs.get("token"),
     )
     source_dtype = _resolve_source_load_dtype(model_kwargs)
-    trust_remote_code = trust_remote_code or bool(model_kwargs.get("trust_remote_code", False))
+    if trust_remote_code is None:
+        trust_remote_code = bool(model_kwargs.get("trust_remote_code", False))
 
     device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
     hf_kwargs = _hf_source_load_kwargs(
@@ -1047,9 +1449,16 @@ def _prepare_source_load_reference_rank0(
         source_dtype=source_dtype,
         trust_remote_code=trust_remote_code,
         experts_implementation=experts_implementation,
+        hf_model_cls=hf_model_cls,
         device=device,
         hf_device_map_auto=hf_device_map_auto,
     )
+    requested_attn_implementation = model_kwargs.get("attn_implementation")
+    if hf_kwargs.get("attn_implementation") != requested_attn_implementation:
+        print(
+            "[Phase 0] Vanilla-HF attention compatibility fallback: "
+            f"requested={requested_attn_implementation!r}, selected={hf_kwargs.get('attn_implementation')!r}"
+        )
     if hf_source_post_load_dequantize and hf_kwargs.get("device_map") == "auto" and torch.cuda.is_available():
         # Accelerate sizes the automatic map for the on-disk FP8 tensors. The
         # post-load BF16 representation needs roughly twice that memory, so cap
@@ -1105,6 +1514,18 @@ def _prepare_source_load_reference_rank0(
             fix_rotary_embeddings([hf_model])
 
     hf_logits = _get_logits(hf_model, input_ids, device)
+    repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+    _compare_logits(
+        _robustness_artifact_dir(cfg),
+        hf_logits,
+        repeated_hf_logits,
+        _repeatability_policy(
+            phase="phase_0",
+            comparison="hf_source_self_repeat",
+            profile=parity_tolerance_profile,
+        ),
+    )
+    del repeated_hf_logits
     hf_aliased = _lm_head_embedding_aliased(hf_model)
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
     del hf_model
@@ -1117,9 +1538,8 @@ def _compare_source_load_parity(
     candidate_logits: torch.Tensor,
     candidate_aliased: bool | None,
     *,
-    source_load_kl_threshold: float,
-    source_load_mean_kl_threshold: float,
-    source_load_cosine_threshold: float,
+    artifact_dir: Path,
+    policy: _LogitParityPolicy,
 ) -> str | None:
     """Compare the vanilla HF source-load reference against the constructed trainer model.
 
@@ -1128,9 +1548,8 @@ def _compare_source_load_parity(
             embedding alias state, and the explicit tie-word-embeddings setting. Other ranks pass ``None``.
         candidate_logits: Constructed trainer logits of shape [batch, sequence, vocab].
         candidate_aliased: Constructed trainer input/output embedding alias state.
-        source_load_kl_threshold: Maximum allowed per-token KL divergence.
-        source_load_mean_kl_threshold: Maximum allowed mean per-token KL divergence.
-        source_load_cosine_threshold: Minimum allowed cosine similarity over flattened logits.
+        artifact_dir: Directory that owns checkpoint-robustness artifacts.
+        policy: Source-load metric profile, legacy overrides, and enforcement state.
 
     Returns:
         Synchronized failure traceback when source-load parity fails, otherwise ``None``. The caller may defer this
@@ -1145,32 +1564,12 @@ def _compare_source_load_parity(
                 f"Source-load parity shape mismatch: HF logits {hf_logits.shape} vs trainer logits "
                 f"{candidate_logits.shape}"
             )
-            kl_source = _kl_divergence_from_logits(hf_logits, candidate_logits)
-            max_kl_source = kl_source.max().item()
-            mean_kl_source = kl_source.mean().item()
-            p95_kl_source = torch.quantile(kl_source, 0.95).item()
-            cosine_source = _cosine_similarity_from_logits(hf_logits, candidate_logits)
+            parity_failure = _compare_logits(artifact_dir, hf_logits, candidate_logits, policy)
+            if parity_failure is not None:
+                raise AssertionError(parity_failure)
             print(
-                f"[Phase 0] Source-load vs constructed-trainer max KL: {max_kl_source:.6e} "
-                f"(threshold: {source_load_kl_threshold:.6e}); mean KL: {mean_kl_source:.6e} "
-                f"(threshold: {source_load_mean_kl_threshold:.6e}); p95 KL: {p95_kl_source:.6e}; "
-                f"cosine={cosine_source:.8f} "
-                f"(threshold: {source_load_cosine_threshold:.8f}); "
-                f"hf_aliased={hf_aliased}; trainer_aliased={candidate_aliased}; "
-                f"tie_word_embeddings={explicit_tie_word_embeddings}"
-            )
-
-            assert max_kl_source <= source_load_kl_threshold, (
-                f"KL divergence between original HF source load and constructed trainer model too large: "
-                f"max per-token KL = {max_kl_source:.6e} > threshold {source_load_kl_threshold:.6e}"
-            )
-            assert mean_kl_source <= source_load_mean_kl_threshold, (
-                f"Mean KL divergence between original HF source load and constructed trainer model too large: "
-                f"mean per-token KL = {mean_kl_source:.6e} > threshold {source_load_mean_kl_threshold:.6e}"
-            )
-            assert cosine_source >= source_load_cosine_threshold, (
-                f"Cosine similarity between original HF source load and constructed trainer model too low: "
-                f"cosine = {cosine_source:.8f} < threshold {source_load_cosine_threshold:.8f}"
+                f"[Phase 0] Source-load aliases: hf_aliased={hf_aliased}; "
+                f"trainer_aliased={candidate_aliased}; tie_word_embeddings={explicit_tie_word_embeddings}"
             )
             if hf_aliased is not None and candidate_aliased is not None:
                 assert hf_aliased == candidate_aliased, (
@@ -1208,37 +1607,14 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     pp_batch_size = trainer.pipeline_config.pp_batch_size
     orig_seq_len = len(input_ids)
 
-    # PP recv buffer shapes are locked at first forward. r0.4.0 lacks
-    # AutoPipeline.update_seq_len (added in #1689) to resize on the fly, so
-    # discover the locked seq_len from the stages and pad input_ids to match
-    # for the forward pass. Captured logits are sliced back to orig_seq_len.
-    def _discover_pp_seq_len() -> int:
-        pp_seq_len = getattr(trainer.pp, "pp_seq_len", None)
-        if pp_seq_len:
-            return pp_seq_len
-        for stage in getattr(trainer.pp.info, "stages", None) or ():
-            inputs_meta = getattr(stage, "inputs_meta", None)
-            if not inputs_meta:
-                inputs_meta = getattr(getattr(stage, "_user_meta", None), "inputs", None)
-            for meta in inputs_meta or ():
-                shape = getattr(meta, "shape", ())
-                if len(shape) >= 2 and shape[1] > 0:
-                    return shape[1]
-        ds_seq_length = trainer.cfg.get("dataset.seq_length", None)
-        return ds_seq_length or orig_seq_len
-
-    pp_seq_len = _discover_pp_seq_len()
-    if orig_seq_len < pp_seq_len:
-        input_ids = list(input_ids) + [0] * (pp_seq_len - orig_seq_len)
+    # PyTorch pipeline stages preallocate activation buffers for one sequence
+    # shape. Resize those buffers before this parity-only forward just as the
+    # training recipes do before every schedule step.
+    trainer.pp.update_seq_len(orig_seq_len)
 
     # Replicate the prompt to pp_batch_size so the schedule's batch split is valid.
     ids = torch.tensor([input_ids] * pp_batch_size, device=device, dtype=torch.long)
-    # The PP schedule requires the static stage sequence length, but the parity
-    # prompt is usually much shorter. Keep synthetic tail tokens out of both
-    # attention and MoE dispatch so this forward represents the same prompt as
-    # the unpadded HF reference.
-    attention_mask = torch.zeros_like(ids)
-    attention_mask[:, :orig_seq_len] = 1
+    attention_mask = torch.ones_like(ids)
     targets = torch.zeros_like(ids) if trainer.pp.info.has_last_stage else None
 
     captured = [None]
@@ -1396,34 +1772,62 @@ def _prepopulate_hf_dynamic_modules_cache(local_dir: Path | str) -> None:
             shutil.copy2(src_py, dst_py)
 
 
-def _tp_size_from_argv(argv) -> int:
-    """Peek at --distributed.tp_size / --config YAML without constructing the cfg.
+def _prepare_consolidated_hf_cache_once(cfg, consolidated_dir: Path) -> None:
+    """Prepare remote-code files once before an isolated distributed setup.
 
-    Returns 1 if no TP setting is found. Used before cfg parsing to pick a
-    reasonable default kl_threshold.
+    Every worker reaches this function before the recipe initializes a process
+    group, so ``dist.get_rank()`` cannot select the writer. A small shared-file
+    marker lets pre-init global rank 0 finish all cache writes before the other
+    workers import the consolidated checkpoint's dynamic modules.
     """
-    for i, a in enumerate(argv):
-        if a == "--distributed.tp_size" and i + 1 < len(argv):
-            try:
-                return int(argv[i + 1])
-            except (TypeError, ValueError):
-                return 1
-    config_path = None
-    for i, a in enumerate(argv):
-        if a == "--config" and i + 1 < len(argv):
-            config_path = argv[i + 1]
-            break
-    if config_path:
-        try:
-            import yaml
+    expected_payload = str(consolidated_dir.resolve())
+    sync_dir = _robustness_artifact_dir(cfg) / "hf_dynamic_modules_cache"
+    done_path = sync_dir / "done"
+    fail_path = sync_dir / "fail"
 
-            with open(config_path) as f:
-                raw_cfg = yaml.safe_load(f) or {}
-            tp = (raw_cfg.get("distributed") or {}).get("tp_size", 1)
-            return int(tp) if tp is not None else 1
+    def is_ready() -> bool:
+        try:
+            return done_path.read_text() == expected_payload
+        except FileNotFoundError:
+            return False
+
+    def prepare_cache() -> None:
+        from transformers import AutoConfig
+
+        _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
+        try:
+            AutoConfig.from_pretrained(str(consolidated_dir), trust_remote_code=True)
         except Exception:
             pass
-    return 1
+
+    if is_ready():
+        return
+    if _preinit_world_size() == 1:
+        prepare_cache()
+        return
+    if _preinit_global_rank() == 0:
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        done_path.unlink(missing_ok=True)
+        fail_path.unlink(missing_ok=True)
+        try:
+            prepare_cache()
+            temporary_done_path = done_path.with_suffix(".tmp")
+            temporary_done_path.write_text(expected_payload)
+            temporary_done_path.replace(done_path)
+        except Exception:
+            fail_path.write_text(traceback.format_exc())
+            raise
+        return
+
+    timeout_s = int(os.environ.get("HF_DYNAMIC_MODULE_CACHE_TIMEOUT_SECONDS", "1800"))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if fail_path.exists():
+            raise RuntimeError(f"Rank 0 dynamic-module cache preparation failed:\n{fail_path.read_text()}")
+        if is_ready():
+            return
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 dynamic-module cache preparation")
 
 
 def _rank0() -> bool:
@@ -1497,25 +1901,13 @@ def _materialize_hf_quantization_config(cfg):
     return raw_quantization_config
 
 
-def _hf_reload_kl_error(max_kl_hf: float, hf_kl_threshold: float) -> str | None:
-    """Return an actionable HF reload parity error, including non-finite results."""
-    if not math.isfinite(max_kl_hf):
-        return f"HF-loaded model produced non-finite KL divergence: {max_kl_hf}"
-    if max_kl_hf > hf_kl_threshold:
-        return (
-            "KL divergence between original and HF-loaded model too large: "
-            f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
-        )
-    return None
-
-
 def _run_vanilla_hf_reload(
     cfg,
     input_ids: list[int],
     reference_logits: torch.Tensor,
     *,
     hf_model_cls: type,
-    custom_args: dict,
+    custom_args: dict[str, object],
 ) -> str | None:
     """Load the saved model with vanilla HF and validate its adapter and forward pass.
 
@@ -1530,19 +1922,27 @@ def _run_vanilla_hf_reload(
         An error message when loading or parity fails, otherwise ``None``.
     """
     try:
+        from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+
+        # Match Phase 0's vanilla-HF setup. Exported trust-remote-code models can
+        # still carry Transformers-v4 list-form ``_tied_weights_keys``.
+        apply_cache_compatibility_patches()
         _patch_remote_masking_api_compatibility()
         _, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
         is_peft = hasattr(cfg, "peft")
-        original_pretrained_path = cfg.model.pretrained_model_name_or_path
         model_kwargs = _model_kwargs_from_config(cfg.model)
+        original_pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
         original_quantization_config = _materialize_hf_quantization_config(cfg)
-        trust_remote_code = bool(custom_args.get("trust_remote_code", False))
+        configured_trust_remote_code = custom_args.get("trust_remote_code")
+        trust_remote_code = (
+            bool(model_kwargs.get("trust_remote_code", False))
+            if configured_trust_remote_code is None
+            else bool(configured_trust_remote_code)
+        )
         experts_implementation = custom_args.get("experts_implementation", None)
         hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
         check_fused_qkv_keys = bool(custom_args.get("check_fused_qkv_keys", False))
-        skip_hf_logit_parity = bool(custom_args.get("skip_hf_logit_parity", False))
         hf_adapter_ignored_key_prefix = custom_args.get("hf_adapter_ignored_key_prefix")
-        hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
         device = torch.device("cuda", torch.cuda.current_device())
         config_path = original_pretrained_path if is_peft else consolidated_dir
         hf_model_cls = _resolve_hf_model_class(
@@ -1560,17 +1960,24 @@ def _run_vanilla_hf_reload(
         for key in ("revision", "token"):
             if model_kwargs.get(key) is not None:
                 hf_kwargs[key] = model_kwargs[key]
-        # Load HF with the attention backend the recipe pins, the same way the
-        # source-load phase does. Attention backends are not bit-identical in bf16,
-        # so without this the two sides can run different backends and the reload
-        # reports a logit gap that the checkpoint did not cause.
-        if model_kwargs.get("attn_implementation") is not None:
-            hf_kwargs["attn_implementation"] = model_kwargs["attn_implementation"]
-        # Remote-code models can ship attention names that transformers 5.x
-        # rejects. Select a supported implementation while keeping Nemotron-H
-        # off HF's incompatible FlashAttention varlen path.
-        if trust_remote_code and "attn_implementation" not in hf_kwargs:
-            hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(config_path)
+        # Keep the recipe backend when vanilla HF supports it. Some model
+        # implementations reject that backend under the pinned Transformers
+        # version, so their independent HF reference uses eager instead.
+        attn_implementation = _resolve_hf_attn_implementation(
+            config_path,
+            model_kwargs.get("attn_implementation"),
+            hf_model_cls=hf_model_cls,
+            trust_remote_code=trust_remote_code,
+            revision=model_kwargs.get("revision"),
+            token=model_kwargs.get("token"),
+        )
+        if attn_implementation is not None:
+            hf_kwargs["attn_implementation"] = attn_implementation
+        if attn_implementation != model_kwargs.get("attn_implementation") and _rank0():
+            print(
+                "[Phase 3] Vanilla-HF attention compatibility fallback: "
+                f"requested={model_kwargs.get('attn_implementation')!r}, selected={attn_implementation!r}"
+            )
         if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
@@ -1656,6 +2063,18 @@ def _run_vanilla_hf_reload(
                     f"{hf_adapter_ignored_key_prefix!r} ({ignored_adapter_tensors} tensors)"
                 )
             hf_logits = _get_logits(peft_model, input_ids, device)
+            repeated_hf_logits = _get_logits(peft_model, input_ids, device)
+            _compare_logits(
+                _robustness_artifact_dir(cfg),
+                hf_logits,
+                repeated_hf_logits,
+                _repeatability_policy(
+                    phase="phase_3",
+                    comparison="hf_export_self_repeat",
+                    profile=_comparison_profile(custom_args, "hf_reload"),
+                ),
+            )
+            del repeated_hf_logits
 
             if check_fused_qkv_keys:
                 from safetensors import safe_open
@@ -1689,15 +2108,26 @@ def _run_vanilla_hf_reload(
                 if should_fix_rotary_embeddings([hf_model]):
                     fix_rotary_embeddings([hf_model])
             hf_logits = _get_logits(hf_model, input_ids, device)
+            repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+            _compare_logits(
+                _robustness_artifact_dir(cfg),
+                hf_logits,
+                repeated_hf_logits,
+                _repeatability_policy(
+                    phase="phase_3",
+                    comparison="hf_export_self_repeat",
+                    profile=_comparison_profile(custom_args, "hf_reload"),
+                ),
+            )
+            del repeated_hf_logits
             del hf_model
 
-        hf_reload_error = None
-        if skip_hf_logit_parity:
-            print("[HF reload] Forward smoke passed; cross-implementation logit KL comparison skipped by config")
-        else:
-            max_kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits).max().item()
-            print(f"[HF reload] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
-            hf_reload_error = _hf_reload_kl_error(max_kl_hf, hf_kl_threshold)
+        hf_reload_error = _compare_logits(
+            _robustness_artifact_dir(cfg),
+            reference_logits,
+            hf_logits,
+            _hf_reload_parity_policy(custom_args),
+        )
         del hf_logits
         _release_model_memory()
         return hf_reload_error
@@ -1755,7 +2185,7 @@ def _raise_distributed_failure(failure_message: str | None) -> None:
 def _run_process_isolated_checkpoint_phase(
     phase: str,
     *,
-    custom_args: dict,
+    custom_args: dict[str, object],
     recipe_cls: type[BaseRecipe],
     hf_model_cls: type,
     input_ids_loader: Callable[[str | None], list[int]],
@@ -1780,21 +2210,23 @@ def _run_process_isolated_checkpoint_phase(
         "automodel_reload",
         "hf_reload",
         "resume",
+        "cross_tp_reload",
     }
     if phase not in supported_phases:
         raise ValueError(f"Unsupported isolated checkpoint phase {phase!r}; expected one of {sorted(supported_phases)}")
-    if int(custom_args.get("cross_tp_size", "0")) > 0:
-        raise ValueError("Process-isolated checkpoint mode does not yet support cross_tp_size")
-    if custom_args.get("no_check_resume", False) and phase == "resume":
-        raise ValueError(f"Process-isolated phase {phase!r} conflicts with no_check_resume=true")
+    if custom_args.get("skip_resume", False) and phase == "resume":
+        raise ValueError(f"Process-isolated phase {phase!r} conflicts with skip_resume=true")
+    if phase == "cross_tp_reload" and int(custom_args.get("cross_tp_size", "0")) <= 0:
+        raise ValueError("Process-isolated cross_tp_reload requires cross_tp_size > 0")
 
     _disable_distributed_atexit_teardown()
     cfg = parse_args_and_load_config()
     tokenizer_name = custom_args.get("tokenizer_name", None)
+    parity_sequence_length = int(custom_args.get("parity_sequence_length", "2048"))
 
     if phase == "source_load_reference":
-        if not custom_args.get("check_source_load_parity", False):
-            raise ValueError("Isolated source_load_reference requires check_source_load_parity=true")
+        if not custom_args.get("source_load_parity_enabled", False):
+            raise ValueError("Isolated source_load_reference requires Phase 0 to be enabled")
 
         reference_path, metadata_path = _source_load_artifact_paths(cfg)
         source_load_fail_path = _source_load_sync_paths(cfg)[2] if _preinit_world_size() > 1 else None
@@ -1808,20 +2240,31 @@ def _run_process_isolated_checkpoint_phase(
                 path.unlink(missing_ok=True)
 
         _report_phase("Isolated Phase 0a source load: loading prompt input IDs")
-        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+        input_ids = _load_input_ids_once(
+            cfg,
+            input_ids_loader,
+            tokenizer_name,
+            sequence_length=parity_sequence_length,
+        )
         _report_phase("Isolated Phase 0a source load: starting vanilla-HF reference load")
         source_load_reference = _prepare_source_load_reference(
             cfg,
             input_ids,
             hf_model_cls=hf_model_cls,
-            trust_remote_code=bool(custom_args.get("trust_remote_code", False)),
+            trust_remote_code=custom_args.get("trust_remote_code"),
             experts_implementation=custom_args.get("experts_implementation", None),
             hf_device_map_auto=bool(custom_args.get("hf_device_map_auto", False)),
             hf_source_post_load_dequantize=bool(custom_args.get("hf_source_post_load_dequantize", False)),
+            parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
         )
         if _preinit_global_rank() == 0:
             assert source_load_reference is not None, "rank 0 source-load reference was not captured"
             reference_logits, hf_aliased, explicit_tie_word_embeddings = source_load_reference
+            token_count, vocab_size = _validate_logits(reference_logits)
+            print(
+                f"[Phase 0] Vanilla-HF source forward produced finite logits for "
+                f"{token_count} tokens and vocab_size={vocab_size}"
+            )
             reference_path.parent.mkdir(parents=True, exist_ok=True)
             temporary_reference_path = reference_path.with_suffix(".tmp")
             temporary_metadata_path = metadata_path.with_suffix(".tmp")
@@ -1849,11 +2292,16 @@ def _run_process_isolated_checkpoint_phase(
         return
 
     if phase == "source_load_parity":
-        if not custom_args.get("check_source_load_parity", False):
-            raise ValueError("Isolated source_load_parity requires check_source_load_parity=true")
+        if not custom_args.get("source_load_parity_enabled", False):
+            raise ValueError("Isolated source_load_parity requires Phase 0 to be enabled")
 
         _report_phase("Isolated Phase 0b source parity: loading prompt input IDs")
-        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+        input_ids = _load_input_ids_once(
+            cfg,
+            input_ids_loader,
+            tokenizer_name,
+            sequence_length=parity_sequence_length,
+        )
         reference_path, metadata_path = _source_load_artifact_paths(cfg)
         assert reference_path.exists(), f"Source-load reference logits not found at {reference_path}"
         assert metadata_path.exists(), f"Source-load reference metadata not found at {metadata_path}"
@@ -1886,9 +2334,8 @@ def _run_process_isolated_checkpoint_phase(
             source_load_reference,
             trainer_source_logits,
             _lm_head_embedding_aliased(source_trainer.model_parts[0]),
-            source_load_kl_threshold=float(custom_args.get("source_load_kl_threshold", "5e-3")),
-            source_load_mean_kl_threshold=float(custom_args.get("source_load_mean_kl_threshold", "1e-3")),
-            source_load_cosine_threshold=float(custom_args.get("source_load_cosine_threshold", "0.9999")),
+            artifact_dir=_robustness_artifact_dir(cfg),
+            policy=_source_load_parity_policy(custom_args),
         )
         _barrier()
         if _rank0():
@@ -1907,8 +2354,13 @@ def _run_process_isolated_checkpoint_phase(
         if custom_args.get("skip_hf_reload", False):
             raise ValueError("Process-isolated hf_reload conflicts with skip_hf_reload=true")
 
-        _report_phase("Isolated vanilla-HF reload: loading prompt input IDs")
-        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+        _report_phase("Isolated Phase 3 vanilla-HF export reload: loading prompt input IDs")
+        input_ids = _load_input_ids_once(
+            cfg,
+            input_ids_loader,
+            tokenizer_name,
+            sequence_length=parity_sequence_length,
+        )
 
         # The HF model is sharded by one rank-0 process over all GPUs on its
         # node. A CPU process group keeps the remaining workers synchronized
@@ -1924,7 +2376,10 @@ def _run_process_isolated_checkpoint_phase(
             _barrier()
 
         reference_path = _robustness_artifact_dir(cfg) / "reference_logits.pt"
-        hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
+        hf_reload_timeout_s = (
+            int(custom_args["hf_reload_timeout_seconds"]) if "hf_reload_timeout_seconds" in custom_args else None
+        )
+        hf_reload_sync_paths = _prepare_hf_reload_sync(cfg, timeout_s=hf_reload_timeout_s)
         hf_reload_error = None
         if _rank0():
             if not reference_path.exists():
@@ -1944,19 +2399,24 @@ def _run_process_isolated_checkpoint_phase(
                 f"CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=hf_reload check=hf_reload_parity\n{hf_reload_error}"
             )
         _raise_distributed_failure(hf_reload_error)
-        _report_phase("Isolated vanilla-HF reload: parity complete; exiting phase")
+        _report_phase("Isolated Phase 3 vanilla-HF export reload: parity complete; exiting phase")
         return
 
     if phase == "train_and_save":
-        _report_phase("Isolated train/save: loading prompt input IDs")
-        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+        _report_phase("Isolated Phase 1 train/save/reference: loading prompt input IDs")
+        input_ids = _load_input_ids_once(
+            cfg,
+            input_ids_loader,
+            tokenizer_name,
+            sequence_length=parity_sequence_length,
+        )
         resume_plan = None
-        if custom_args.get("check_resume", False):
+        if custom_args.get("resume_enabled", False):
             resume_plan = _resume_plan_from_config(cfg)
             _configure_uninterrupted_run(cfg, resume_plan)
 
         torch.cuda.reset_peak_memory_stats()
-        _report_phase("Isolated train/save: starting trainer setup")
+        _report_phase("Isolated Phase 1 train/save/reference: starting trainer setup")
         trainer = recipe_cls(cfg)
         trainer.setup()
         resume_recorder = None
@@ -1968,16 +2428,16 @@ def _run_process_isolated_checkpoint_phase(
         if reproducibility_dir is not None:
             reproducibility_recorder = _TrainingReproducibilityRecorder(trainer)
             reproducibility_recorder.attach()
-        _report_phase("Isolated train/save: trainer setup complete")
+        _report_phase("Isolated Phase 1 train/save/reference: trainer setup complete")
         if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
             _barrier()
             if _rank0():
                 _cleanup_input_ids_sync(cfg)
             _barrier()
 
-        _report_phase("Isolated train/save: starting training and checkpoint")
+        _report_phase("Isolated Phase 1 train/save/reference: starting training and checkpoint")
         trainer.run_train_validation_loop()
-        _report_phase("Isolated train/save: training and checkpoint complete")
+        _report_phase("Isolated Phase 1 train/save/reference: training and checkpoint complete")
 
         if resume_recorder is not None:
             _persist_reference_trajectory(resume_recorder)
@@ -2011,9 +2471,27 @@ def _run_process_isolated_checkpoint_phase(
         if max_cpu_gb > 0:
             assert peak_cpu_gb <= max_cpu_gb, f"Peak CPU RSS {peak_cpu_gb:.2f} GB exceeds threshold {max_cpu_gb:.2f} GB"
 
-        _report_phase("Isolated train/save: capturing reference logits")
+        _report_phase("Isolated Phase 1 train/save/reference: capturing reference logits")
         device = next(trainer.model_parts[0].parameters()).device
         reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        token_count, vocab_size = _validate_logits(reference_logits)
+        repeated_reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        if _rank0():
+            _compare_logits(
+                _robustness_artifact_dir(cfg),
+                reference_logits,
+                repeated_reference_logits,
+                _repeatability_policy(
+                    phase="phase_1",
+                    comparison="automodel_reference_self_repeat",
+                    profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+                ),
+            )
+            print(
+                f"[Phase 1] Reference forward produced finite logits for "
+                f"{token_count} tokens and vocab_size={vocab_size}"
+            )
+        del repeated_reference_logits
         _checkpoint_paths(cfg)
         artifact_dir = _robustness_artifact_dir(cfg)
         if _rank0():
@@ -2027,18 +2505,23 @@ def _run_process_isolated_checkpoint_phase(
                 json.dumps(trainable_digests, sort_keys=True)
             )
             _barrier()
-        _report_phase("Isolated train/save: reference artifacts persisted; exiting phase")
+        _report_phase("Isolated Phase 1 train/save/reference: reference artifacts persisted; exiting phase")
         return
 
     if phase == "automodel_reload":
-        _report_phase("Isolated AutoModel reload: loading prompt input IDs")
-        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+        _report_phase("Isolated Phase 2 AutoModel model reload: loading prompt input IDs")
+        input_ids = _load_input_ids_once(
+            cfg,
+            input_ids_loader,
+            tokenizer_name,
+            sequence_length=parity_sequence_length,
+        )
         checkpoint_dir, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
         reference_path = _robustness_artifact_dir(cfg) / "reference_logits.pt"
         assert reference_path.exists(), f"Reference logits not found at {reference_path}"
         is_peft = hasattr(cfg, "peft")
 
-        if custom_args.get("check_phantom_keys", False) and _rank0():
+        if custom_args.get("check_phantom_keys", False) and _preinit_global_rank() == 0:
             from safetensors import safe_open
 
             assert consolidated_dir.exists(), f"Phantom key check: {consolidated_dir} does not exist"
@@ -2051,21 +2534,14 @@ def _run_process_isolated_checkpoint_phase(
                         assert "_scales" not in key, f"Phantom mxfp4 key leaked: {key} in {sf_path.name}"
 
         if not is_peft:
-            if _rank0():
-                from transformers import AutoConfig
-
-                _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
-                try:
-                    AutoConfig.from_pretrained(str(consolidated_dir), trust_remote_code=True)
-                except Exception:
-                    pass
-            cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
+            _prepare_consolidated_hf_cache_once(cfg, consolidated_dir)
+            _set_model_pretrained_path(cfg.model, consolidated_dir)
             cfg.checkpoint.enabled = False
 
-        _report_phase("Isolated AutoModel reload: starting trainer setup")
+        _report_phase("Isolated Phase 2 AutoModel model reload: starting trainer setup")
         restored_trainer = recipe_cls(cfg)
         restored_trainer.setup()
-        _report_phase("Isolated AutoModel reload: trainer setup complete")
+        _report_phase("Isolated Phase 2 AutoModel model reload: trainer setup complete")
         if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
             _barrier()
             if _rank0():
@@ -2126,28 +2602,103 @@ def _run_process_isolated_checkpoint_phase(
                     )
             _raise_distributed_failure(failure_message)
 
+        reload_policy = _automodel_reload_parity_policy(custom_args)
         failure_message = None
         if _rank0():
             reference_logits = torch.load(reference_path, map_location="cpu", weights_only=True)
-            max_kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits).max().item()
-            tp_size = _tp_size_from_argv(sys.argv[1:])
-            default_threshold = "1e-5" if tp_size > 1 else "0"
-            kl_threshold = float(custom_args.get("kl_threshold", default_threshold))
-            print(f"\n[Isolated AutoModel reload] max KL: {max_kl_restored:.6e} (threshold: {kl_threshold:.6e})")
-            if custom_args.get("skip_automodel_logit_parity", False):
-                print(
-                    "[Isolated AutoModel reload] Cross-process logit KL is informational; "
-                    "exact trainable-parameter fingerprints are the checkpoint-integrity gate"
+            failure_message = _compare_logits(
+                _robustness_artifact_dir(cfg),
+                reference_logits,
+                restored_logits,
+                reload_policy,
+            )
+        failure_message = _broadcast_rank0_failure(failure_message)
+        if reload_policy.profile == "relaxed" or not reload_policy.enforce or failure_message is not None:
+            repeated_restored_logits = _get_logits(
+                restored_trainer.model_parts[0],
+                input_ids,
+                device,
+                trainer=restored_trainer,
+            )
+            if _rank0():
+                _compare_logits(
+                    _robustness_artifact_dir(cfg),
+                    restored_logits,
+                    repeated_restored_logits,
+                    _repeatability_policy(
+                        phase="phase_2",
+                        comparison="automodel_reload_self_repeat",
+                        profile=reload_policy.profile,
+                    ),
                 )
-            elif max_kl_restored > kl_threshold:
-                failure_message = (
-                    "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=logit_kl\n"
-                    "KL divergence between original and AutoModel checkpoint reload too large: "
-                    f"max per-token KL = {max_kl_restored:.6e} > threshold {kl_threshold:.6e}"
-                )
+            del repeated_restored_logits
+        if failure_message is not None:
+            failure_message = (
+                "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=full_logit_parity\n" + failure_message
+            )
         _raise_distributed_failure(failure_message)
         _report_phase(
             f"Isolated AutoModel reload: parity complete for {ckpt_step_dir.relative_to(checkpoint_dir)}; exiting phase"
+        )
+        return
+
+    if phase == "cross_tp_reload":
+        if hasattr(cfg, "peft"):
+            raise ValueError("Process-isolated cross_tp_reload does not support PEFT checkpoints")
+        _report_phase("Isolated Phase 5 cross-TP reload: loading prompt input IDs")
+        input_ids = _load_input_ids_once(
+            cfg,
+            input_ids_loader,
+            tokenizer_name,
+            sequence_length=parity_sequence_length,
+        )
+        checkpoint_dir, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
+        reference_path = _robustness_artifact_dir(cfg) / "reference_logits.pt"
+        if not reference_path.exists():
+            raise FileNotFoundError(f"Reference logits not found at {reference_path}")
+
+        _prepare_consolidated_hf_cache_once(cfg, consolidated_dir)
+        _set_model_pretrained_path(cfg.model, consolidated_dir)
+        cfg.checkpoint.enabled = False
+        cfg.distributed.tp_size = int(custom_args["cross_tp_size"])
+        cfg.distributed.dp_size = None
+
+        _report_phase("Isolated Phase 5 cross-TP reload: starting trainer setup")
+        cross_tp_trainer = recipe_cls(cfg)
+        cross_tp_trainer.setup()
+        _report_phase("Isolated Phase 5 cross-TP reload: trainer setup complete")
+        if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
+            _barrier()
+            if _rank0():
+                _cleanup_input_ids_sync(cfg)
+            _barrier()
+
+        device = next(cross_tp_trainer.model_parts[0].parameters()).device
+        cross_tp_logits = _get_logits(
+            cross_tp_trainer.model_parts[0],
+            input_ids,
+            device,
+            trainer=cross_tp_trainer,
+        )
+        failure_message = None
+        if _rank0():
+            reference_logits = torch.load(reference_path, map_location="cpu", weights_only=True)
+            failure_message = _compare_logits(
+                _robustness_artifact_dir(cfg),
+                reference_logits,
+                cross_tp_logits,
+                _cross_tp_parity_policy(custom_args),
+            )
+            if failure_message is not None:
+                failure_message = (
+                    "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=cross_tp_reload check=full_logit_parity\n"
+                    + failure_message
+                )
+        _raise_distributed_failure(failure_message)
+        _release_recipe_memory(cross_tp_trainer)
+        _report_phase(
+            f"Isolated Phase 5 cross-TP reload: parity complete for "
+            f"{ckpt_step_dir.relative_to(checkpoint_dir)}; exiting phase"
         )
         return
 
@@ -2156,9 +2707,12 @@ def _run_process_isolated_checkpoint_phase(
     checkpoint_path = _checkpoint_for_completed_steps(resume_plan, resume_plan.boundary_step)
     _configure_resumed_run(cfg, resume_plan, checkpoint_path)
 
-    _report_phase("Isolated resume: starting setup and optimizer checkpoint load")
+    _report_phase("Isolated Phase 4 native resume: starting setup and optimizer checkpoint load")
     resume_trainer = recipe_cls(cfg)
     resume_trainer.setup()
+    # The restore is complete. Phase 4 validates the continuation but does not
+    # need to publish another large distributed checkpoint at its final step.
+    _disable_checkpoint_saves_after_restore(resume_trainer)
     restored_state = _checkpoint_state_snapshot(resume_trainer, state_is_being_saved=False)
     local_failure = _restored_state_mismatch(reference_trajectory["boundary_state"], restored_state)
     failure_message = _gather_rank_failures(local_failure, check="restored_state")
@@ -2172,9 +2726,9 @@ def _run_process_isolated_checkpoint_phase(
 
     resume_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=False)
     resume_recorder.attach(resume_trainer)
-    _report_phase("Isolated resume: checkpoint state verified; starting shared-trajectory continuation")
+    _report_phase("Isolated Phase 4 native resume: checkpoint state verified; starting shared-trajectory continuation")
     resume_trainer.run_train_validation_loop()
-    _report_phase("Isolated resume: training complete")
+    _report_phase("Isolated Phase 4 native resume: training complete")
 
     resumed_trajectory = resume_recorder.to_dict()
     resume_tolerance = _resolve_resume_loss_tolerance(
@@ -2191,7 +2745,7 @@ def _run_process_isolated_checkpoint_phase(
     local_failure = comparison_report["blocking_failure"]
     failure_message = _gather_rank_failures(local_failure, check="shared_trajectory")
     _raise_distributed_failure(failure_message)
-    _report_phase("Isolated resume: shared-trajectory checkpoint continuation verified; exiting phase")
+    _report_phase("Isolated Phase 4 native resume: shared-trajectory checkpoint continuation verified; exiting phase")
 
 
 def run_checkpoint_robustness(
@@ -2219,24 +2773,15 @@ def run_checkpoint_robustness(
             input_ids_loader=input_ids_loader,
         )
         return
-    # When tensor parallelism is active the forward pass uses row-parallel
-    # all-reduces and cuBLASLt plan caches whose order of accumulation is
-    # process-dependent; this produces ULP-level bf16 drift between the
-    # trainer's and restored model's logits even with bit-identical weights.
-    # Use a small tolerance when TP>1; keep strict 0 otherwise so real
-    # save/load regressions in non-TP setups still fail.
-    _tp_size = _tp_size_from_argv(config_argv)
-    _default_kl_threshold = "1e-5" if _tp_size > 1 else "0"
-    kl_threshold = float(custom_args.get("kl_threshold", _default_kl_threshold))
     cross_tp_size = int(custom_args.get("cross_tp_size", "0"))
-    cross_tp_kl_threshold = float(custom_args.get("cross_tp_kl_threshold", "5e-3"))
-    trust_remote_code = bool(custom_args.get("trust_remote_code", False))
+    trust_remote_code = custom_args.get("trust_remote_code")
     experts_implementation = custom_args.get("experts_implementation", None)
     tokenizer_name = custom_args.get("tokenizer_name", None)
+    parity_sequence_length = int(custom_args.get("parity_sequence_length", "2048"))
     max_vram_gb = float(custom_args.get("max_vram_gb", "0"))
     max_cpu_gb = float(custom_args.get("max_cpu_gb", "0"))
     check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
-    check_resume = bool(custom_args.get("check_resume", False))
+    resume_enabled = bool(custom_args.get("resume_enabled", False))
     resume_tolerance = _resolve_resume_loss_tolerance(
         custom_args.get("resume_tolerance_profile", "standard"),
         first_step_override=custom_args.get("resume_first_loss_threshold"),
@@ -2246,20 +2791,22 @@ def run_checkpoint_robustness(
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
-    check_source_load_parity = bool(custom_args.get("check_source_load_parity", False))
-    source_load_kl_threshold = float(custom_args.get("source_load_kl_threshold", "5e-3"))
-    source_load_mean_kl_threshold = float(custom_args.get("source_load_mean_kl_threshold", "1e-3"))
-    source_load_cosine_threshold = float(custom_args.get("source_load_cosine_threshold", "0.9999"))
+    source_load_parity_enabled = bool(custom_args.get("source_load_parity_enabled", False))
     deferred_failures: list[str] = []
 
     cfg = parse_args_and_load_config()
-    resume_plan = _resume_plan_from_config(cfg) if check_resume else None
+    resume_plan = _resume_plan_from_config(cfg) if resume_enabled else None
     if resume_plan is not None:
         _configure_uninterrupted_run(cfg, resume_plan)
-    input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+    input_ids = _load_input_ids_once(
+        cfg,
+        input_ids_loader,
+        tokenizer_name,
+        sequence_length=parity_sequence_length,
+    )
 
     source_load_reference = None
-    if check_source_load_parity:
+    if source_load_parity_enabled:
         _report_phase("Phase 0: starting vanilla-HF source-load reference")
         source_load_reference = _prepare_source_load_reference(
             cfg,
@@ -2269,6 +2816,7 @@ def run_checkpoint_robustness(
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
+            parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
         )
         _barrier()
         _report_phase("Phase 0: vanilla-HF source-load reference complete")
@@ -2286,7 +2834,7 @@ def run_checkpoint_robustness(
             _cleanup_input_ids_sync(cfg)
         _barrier()
 
-    if check_source_load_parity:
+    if source_load_parity_enabled:
         _report_phase("Phase 0: starting constructed-trainer parity forward")
         device = next(trainer.model_parts[0].parameters()).device
         trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
@@ -2294,9 +2842,8 @@ def run_checkpoint_robustness(
             source_load_reference,
             trainer_source_logits,
             _lm_head_embedding_aliased(trainer.model_parts[0]),
-            source_load_kl_threshold=source_load_kl_threshold,
-            source_load_mean_kl_threshold=source_load_mean_kl_threshold,
-            source_load_cosine_threshold=source_load_cosine_threshold,
+            artifact_dir=_robustness_artifact_dir(cfg),
+            policy=_source_load_parity_policy(custom_args),
         )
         _record_deferred_failure(deferred_failures, "Phase 0 source-load parity", source_load_failure)
         del trainer_source_logits, source_load_reference
@@ -2367,11 +2914,29 @@ def run_checkpoint_robustness(
     if max_cpu_gb > 0:
         assert peak_cpu_gb <= max_cpu_gb, f"Peak CPU RSS {peak_cpu_gb:.2f} GB exceeds threshold {max_cpu_gb:.2f} GB"
 
-    # Phase 2: Capture reference logits before teardown
-    _report_phase("Phase 2: starting reference-logits capture")
+    # Phase 1 also captures the reference distribution before teardown. It is
+    # persisted by the isolated runner for the independent reload processes.
+    _report_phase("Phase 1: starting reference-logits capture")
     device = next(trainer.model_parts[0].parameters()).device
     reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
-    _report_phase("Phase 2: reference-logits capture complete")
+    token_count, vocab_size = _validate_logits(reference_logits)
+    repeated_reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+    if _rank0():
+        _compare_logits(
+            _robustness_artifact_dir(cfg),
+            reference_logits,
+            repeated_reference_logits,
+            _repeatability_policy(
+                phase="phase_1",
+                comparison="automodel_reference_self_repeat",
+                profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+            ),
+        )
+        print(
+            f"[Phase 1] Reference forward produced finite logits for {token_count} tokens and vocab_size={vocab_size}"
+        )
+    del repeated_reference_logits
+    _report_phase("Phase 1: reference-logits capture complete")
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
     if resume_plan is not None:
@@ -2385,7 +2950,7 @@ def run_checkpoint_robustness(
     _release_recipe_memory(trainer)
     del trainer
 
-    # Phase 3: Reload AutoModel from the consolidated checkpoint.
+    # Phase 2: Reload AutoModel from the exported HF-format consolidated weights.
     # Phantom key check: scan consolidated safetensors for leaked quantization keys
     if check_phantom_keys and _rank0():
         from safetensors import safe_open
@@ -2420,40 +2985,62 @@ def run_checkpoint_robustness(
 
     cfg = parse_args_and_load_config()
     if not is_peft:
-        cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
+        _set_model_pretrained_path(cfg.model, consolidated_dir)
         cfg.checkpoint.enabled = False
-    _report_phase("Phase 3: starting AutoModel reload setup")
+    _report_phase("Phase 2: starting AutoModel model reload setup")
     restored_trainer = recipe_cls(cfg)
     restored_trainer.setup()
-    _report_phase("Phase 3: AutoModel reload setup complete")
+    _report_phase("Phase 2: AutoModel model reload setup complete")
 
-    _report_phase("Phase 3: starting restored-logits capture")
+    _report_phase("Phase 2: starting restored-logits capture")
     restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
-    _report_phase("Phase 3: restored-logits capture complete")
+    _report_phase("Phase 2: restored-logits capture complete")
 
-    kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits)
-    max_kl_restored = kl_restored.max().item()
-    if _rank0():
-        print(f"\n[Phase 3] Automodel-from-consolidated max KL: {max_kl_restored:.6e} (threshold: {kl_threshold:.6e})")
+    reload_policy = _automodel_reload_parity_policy(custom_args)
     automodel_reload_error = None
-    if max_kl_restored > kl_threshold:
-        automodel_reload_error = (
-            "KL divergence between original and automodel-from-consolidated too large: "
-            f"max per-token KL = {max_kl_restored:.6e} > threshold {kl_threshold:.6e}"
+    if _rank0():
+        automodel_reload_error = _compare_logits(
+            _robustness_artifact_dir(cfg),
+            reference_logits,
+            restored_logits,
+            reload_policy,
         )
-    _record_deferred_failure(deferred_failures, "Phase 3 AutoModel reload parity", automodel_reload_error)
+    automodel_reload_error = _broadcast_rank0_failure(automodel_reload_error)
+    if reload_policy.profile == "relaxed" or not reload_policy.enforce or automodel_reload_error is not None:
+        repeated_restored_logits = _get_logits(
+            restored_trainer.model_parts[0],
+            input_ids,
+            device,
+            trainer=restored_trainer,
+        )
+        if _rank0():
+            _compare_logits(
+                _robustness_artifact_dir(cfg),
+                restored_logits,
+                repeated_restored_logits,
+                _repeatability_policy(
+                    phase="phase_2",
+                    comparison="automodel_reload_self_repeat",
+                    profile=reload_policy.profile,
+                ),
+            )
+        del repeated_restored_logits
+    _record_deferred_failure(deferred_failures, "Phase 2 AutoModel model reload parity", automodel_reload_error)
 
     _release_recipe_memory(restored_trainer)
     del restored_trainer
 
-    # Phase 4: Load into vanilla HF (rank 0 only)
-    _report_phase("Phase 4: starting vanilla-HF reload")
-    hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
+    # Phase 3: Load the same exported weights into vanilla HF (rank 0 only).
+    _report_phase("Phase 3: starting vanilla-HF export reload")
+    hf_reload_timeout_s = (
+        int(custom_args["hf_reload_timeout_seconds"]) if "hf_reload_timeout_seconds" in custom_args else None
+    )
+    hf_reload_sync_paths = _prepare_hf_reload_sync(cfg, timeout_s=hf_reload_timeout_s)
 
     hf_reload_error = None
     if skip_hf_reload:
         if _rank0():
-            print("[Phase 4] Skipped (ci.checkpoint_robustness.skip_hf_reload=true).")
+            print("[Phase 3] Skipped (ci.checkpoint_robustness.skip_hf_reload=true).")
     elif _rank0():
         hf_reload_error = _run_vanilla_hf_reload(
             cfg,
@@ -2464,52 +3051,22 @@ def run_checkpoint_robustness(
         )
 
     hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
-    _record_deferred_failure(deferred_failures, "Phase 4 HF reload parity", hf_reload_error)
-    _report_phase("Phase 4: vanilla-HF reload complete")
+    _record_deferred_failure(deferred_failures, "Phase 3 vanilla-HF export reload parity", hf_reload_error)
+    _report_phase("Phase 3: vanilla-HF export reload complete")
 
-    # Phase 5 (optional): Cross-TP — reload consolidated with a different TP size
-    if cross_tp_size > 0 and not is_peft:
-        _report_phase("Phase 5: starting cross-TP reload")
-        cfg = parse_args_and_load_config()
-        cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
-        cfg.checkpoint.enabled = False
-        cfg.distributed.tp_size = cross_tp_size
-        cfg.distributed.dp_size = None
-        cross_tp_trainer = recipe_cls(cfg)
-        cross_tp_trainer.setup()
-
-        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device, trainer=cross_tp_trainer)
-
-        kl_cross_tp = _kl_divergence_from_logits(reference_logits, cross_tp_logits)
-        max_kl_cross_tp = kl_cross_tp.max().item()
-        if _rank0():
-            print(
-                f"[Phase 5] Cross-TP (tp_size={cross_tp_size}) max KL: "
-                f"{max_kl_cross_tp:.6e} (threshold: {cross_tp_kl_threshold:.6e})"
-            )
-        cross_tp_error = None
-        if max_kl_cross_tp > cross_tp_kl_threshold:
-            cross_tp_error = (
-                "KL divergence between original and cross-TP model too large: "
-                f"max per-token KL = {max_kl_cross_tp:.6e} > threshold {cross_tp_kl_threshold:.6e}"
-            )
-        _record_deferred_failure(deferred_failures, "Phase 5 cross-TP reload parity", cross_tp_error)
-
-        _release_recipe_memory(cross_tp_trainer)
-        del cross_tp_trainer
-        _barrier()
-        _report_phase("Phase 5: cross-TP reload complete")
-
-    # Phase 6 (optional): restore the exact Phase 1 boundary and replay its continuation.
-    if check_resume:
+    # Phase 4: restore the exact Phase 1 boundary and replay its continuation.
+    if resume_enabled:
         assert resume_plan is not None
         reference_trajectory = _load_reference_trajectory(resume_plan)
         checkpoint_path = _checkpoint_for_completed_steps(resume_plan, resume_plan.boundary_step)
         cfg = parse_args_and_load_config()
         _configure_resumed_run(cfg, resume_plan, checkpoint_path)
-        _report_phase("Phase 6: starting resume setup and checkpoint load")
+        _report_phase("Phase 4: starting native-checkpoint resume setup and load")
         resume_trainer = recipe_cls(cfg)
         resume_trainer.setup()
+        # The restore is complete. Phase 4 validates the continuation but does not
+        # need to publish another large distributed checkpoint at its final step.
+        _disable_checkpoint_saves_after_restore(resume_trainer)
         restored_state = _checkpoint_state_snapshot(resume_trainer, state_is_being_saved=False)
         local_failure = _restored_state_mismatch(reference_trajectory["boundary_state"], restored_state)
         failure_message = _gather_rank_failures(local_failure, check="restored_state")
@@ -2523,9 +3080,9 @@ def run_checkpoint_robustness(
 
         resumed_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=False)
         resumed_recorder.attach(resume_trainer)
-        _report_phase("Phase 6: checkpoint state verified; starting shared-trajectory continuation")
+        _report_phase("Phase 4: checkpoint state verified; starting shared-trajectory continuation")
         resume_trainer.run_train_validation_loop()
-        _report_phase("Phase 6: resumed training complete")
+        _report_phase("Phase 4: resumed training complete")
 
         resumed_trajectory = resumed_recorder.to_dict()
         comparison_report = _report_resume_comparison(
@@ -2549,7 +3106,35 @@ def run_checkpoint_robustness(
         _release_recipe_memory(resume_trainer)
         del resume_trainer
         _barrier()
-        _report_phase("Phase 6: resume comparison complete")
+        _report_phase("Phase 4: resume comparison complete")
+
+    # Phase 5 (optional): reload the exported weights with a different TP size.
+    if cross_tp_size > 0 and not is_peft:
+        _report_phase("Phase 5: starting optional cross-TP consolidated reload")
+        cfg = parse_args_and_load_config()
+        _set_model_pretrained_path(cfg.model, consolidated_dir)
+        cfg.checkpoint.enabled = False
+        cfg.distributed.tp_size = cross_tp_size
+        cfg.distributed.dp_size = None
+        cross_tp_trainer = recipe_cls(cfg)
+        cross_tp_trainer.setup()
+
+        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device, trainer=cross_tp_trainer)
+        cross_tp_error = None
+        if _rank0():
+            cross_tp_error = _compare_logits(
+                _robustness_artifact_dir(cfg),
+                reference_logits,
+                cross_tp_logits,
+                _cross_tp_parity_policy(custom_args),
+            )
+        cross_tp_error = _broadcast_rank0_failure(cross_tp_error)
+        _record_deferred_failure(deferred_failures, "Phase 5 cross-TP consolidated reload parity", cross_tp_error)
+
+        _release_recipe_memory(cross_tp_trainer)
+        del cross_tp_trainer
+        _barrier()
+        _report_phase("Phase 5: optional cross-TP consolidated reload complete")
 
     # Skip the atexit-registered destroy_process_group() call. MoE models with expert
     # parallelism create NCCL sub-groups (DeepEP) that leave pending collective state,
