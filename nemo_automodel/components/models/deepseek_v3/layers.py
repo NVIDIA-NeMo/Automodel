@@ -39,7 +39,21 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class MLA(nn.Module):
-    def __init__(self, config: DeepseekV3Config, backend: BackendConfig):
+    def __init__(
+        self,
+        config: DeepseekV3Config,
+        backend: BackendConfig,
+        *,
+        latent_norm_eps: float | None = None,
+    ):
+        """Initialize multi-head latent attention.
+
+        Args:
+            config: Model configuration that defines the MLA dimensions.
+            backend: Kernel backend selections for attention, linear layers, and normalization.
+            latent_norm_eps: Epsilon for the internal query and key/value latent RMSNorms. Defaults to the
+                model-wide ``rms_norm_eps`` when omitted.
+        """
         super().__init__()
 
         self.n_heads = config.num_attention_heads
@@ -57,6 +71,7 @@ class MLA(nn.Module):
         attn_impl = backend.attn
         linear_impl = backend.linear
         rms_norm_impl = backend.rms_norm
+        latent_norm_eps = config.rms_norm_eps if latent_norm_eps is None else latent_norm_eps
 
         hidden_size = config.hidden_size
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
@@ -78,7 +93,7 @@ class MLA(nn.Module):
                 dtype=dtype,
             )
             self.q_a_layernorm = initialize_rms_norm_module(
-                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=config.rms_norm_eps, dtype=dtype
+                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=latent_norm_eps, dtype=dtype
             )
             self.q_b_proj = initialize_linear_module(
                 linear_impl=linear_impl,
@@ -96,7 +111,7 @@ class MLA(nn.Module):
             dtype=dtype,
         )
         self.kv_a_layernorm = initialize_rms_norm_module(
-            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=config.rms_norm_eps, dtype=dtype
+            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=latent_norm_eps, dtype=dtype
         )
         self.kv_b_proj = initialize_linear_module(
             linear_impl=linear_impl,

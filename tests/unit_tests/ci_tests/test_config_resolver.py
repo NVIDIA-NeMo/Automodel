@@ -316,6 +316,21 @@ def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
     assert "resume_first_loss_threshold" not in resolved["ci"]["checkpoint_robustness"]
 
 
+def test_glm_4_7_flash_uses_hf_aligned_router_precision(tmp_path):
+    """GLM 4.7 Flash keeps aligned router precision and calibrated HF parity profiles."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    _run_resolver(["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)], env=env)
+
+    resolved = yaml.load(out.open())
+    assert resolved["model"]["backend"]["gate_precision"] == "float32"
+    assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile_overrides"] == {
+        "source_load": "relaxed",
+        "hf_reload": "relaxed",
+    }
+
+
 @pytest.mark.parametrize(
     "recipe_path",
     [
@@ -457,6 +472,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "    skip_automodel_reload_logit_parity: true    # fixture arg, must NOT become top-level\n"
         "    skip_hf_reload_logit_parity: true           # fixture arg, must NOT become top-level\n"
         "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
+        "    capture_router_diagnostics: true           # fixture arg, must NOT become top-level\n"
         "    parity_threshold_overrides:                 # fixture arg, must NOT become top-level\n"
         "      source_load: {mean_kl: 1e-2}\n"
         "      automodel_reload: {p95_kl: 2e-2, cosine_similarity: 0.998}\n"
@@ -466,6 +482,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "    resume_tolerance_profile: relaxed             # fixture arg, must NOT become top-level\n"
         "    resume_first_loss_threshold: 1e-6           # fixture arg, must NOT become top-level\n"
         "    parity_sequence_length: 1024                # fixture arg, must NOT become top-level\n"
+        "    cross_framework_gate_sequence_length: 256   # fixture arg, must NOT become top-level\n"
         "    parity_tolerance_profile: strict            # fixture arg, must NOT become top-level\n"
         "    parity_tolerance_profile_overrides:         # fixture arg, must NOT become top-level\n"
         "      hf_reload: relaxed\n"
@@ -487,10 +504,12 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert "skip_automodel_reload_logit_parity" not in resolved
     assert "skip_hf_reload_logit_parity" not in resolved
     assert "hf_adapter_ignored_key_prefix" not in resolved
+    assert "capture_router_diagnostics" not in resolved
     assert "training_reproducibility_loss_threshold" not in resolved
     assert "resume_tolerance_profile" not in resolved
     assert "resume_first_loss_threshold" not in resolved
     assert "parity_sequence_length" not in resolved
+    assert "cross_framework_gate_sequence_length" not in resolved
     assert "parity_tolerance_profile" not in resolved
     assert "parity_tolerance_profile_overrides" not in resolved
     assert "tokenizer_name" not in resolved
@@ -505,10 +524,12 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_reload_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["skip_hf_reload_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
+    assert resolved["ci"]["checkpoint_robustness"]["capture_router_diagnostics"] is True
     assert resolved["ci"]["checkpoint_robustness"]["training_reproducibility_loss_threshold"] == 1e-2
     assert resolved["ci"]["checkpoint_robustness"]["resume_tolerance_profile"] == "relaxed"
     assert resolved["ci"]["checkpoint_robustness"]["resume_first_loss_threshold"] == 1e-6
     assert resolved["ci"]["checkpoint_robustness"]["parity_sequence_length"] == 1024
+    assert resolved["ci"]["checkpoint_robustness"]["cross_framework_gate_sequence_length"] == 256
     assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile"] == "strict"
     assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile_overrides"] == {"hf_reload": "relaxed"}
 

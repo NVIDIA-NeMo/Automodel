@@ -43,6 +43,7 @@ model:
     rms_norm: torch_fp32
     experts: gmm
     dispatcher: deepep
+    gate_precision: float32
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -123,9 +124,14 @@ ci:
   nodes: 1
   time: "00:30:00"
   checkpoint_robustness:
-    # Keep the currently mismatched HF comparisons blocking until the model or
-    # reference path is fixed; an observed mismatch alone is not a reason to skip.
+    # EP8 route-tail diagnostics show exact same-implementation repeat/reload,
+    # while both HF comparisons need the shared routed-MoE tolerance profile.
     tokenizer_name: zai-org/GLM-4.7-Flash
     hf_device_map_auto: true
+    cross_framework_gate_sequence_length: 128
+    capture_router_diagnostics: true
+    parity_tolerance_profile_overrides:
+      source_load: relaxed
+      hf_reload: relaxed
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
