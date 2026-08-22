@@ -24,6 +24,7 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
 from functools import partial
@@ -483,6 +484,8 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
+    pre_fsdp_hook: Callable[[torch.nn.Module], None] | None = None,
+    skip_task_head_prefixes_for_base_model: Sequence[str] | None = None,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -521,6 +524,18 @@ def apply_model_infrastructure(
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
+        pre_fsdp_hook: Optional in-place model-structure hook invoked after lower-
+            precision and attention transforms and any load-before-shard base-model
+            restore, but before state-key capture and FSDP wrapping. The hook must
+            return ``None``, make the same deterministic change on every rank, and
+            avoid collectives. Fresh parameters follow whichever constructor or
+            post-shard model-initialization path applies and the configured FSDP
+            mixed-precision policy; no task-specific initializer or precision
+            override is added. The hook is responsible for keeping model
+            configuration such as weight tying consistent with its changes.
+        skip_task_head_prefixes_for_base_model: Native model parameter FQN prefixes
+            to omit from the pretrained base-checkpoint load. Full training-checkpoint
+            restores still load these parameters.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -528,6 +543,46 @@ def apply_model_infrastructure(
     """
     if mesh is None:
         mesh = MeshContext()
+
+    if pre_fsdp_hook is not None and not callable(pre_fsdp_hook):
+        raise TypeError("pre_fsdp_hook must be callable or None.")
+
+    if pre_fsdp_hook is not None:
+        unsupported = [
+            name
+            for name, enabled in (
+                ("tensor parallelism", mesh.tp_size != 1),
+                ("context parallelism", mesh.cp_size != 1),
+                ("expert parallelism", mesh.ep_size != 1),
+                ("pipeline parallelism", autopipeline is not None or mesh.pp_size != 1),
+                ("PEFT", peft_config is not None),
+                (
+                    "quantization",
+                    quantization_config is not None
+                    or getattr(getattr(model, "config", None), "quantization_config", None) is not None,
+                ),
+                ("FP8", fp8_config is not None),
+                ("QAT", qat_quantizer is not None),
+            )
+            if enabled
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "pre_fsdp_hook currently supports only unquantized, non-PEFT models with "
+                f"tp_size=cp_size=ep_size=pp_size=1; unsupported: {', '.join(unsupported)}."
+            )
+
+    if isinstance(skip_task_head_prefixes_for_base_model, str):
+        raise TypeError("skip_task_head_prefixes_for_base_model must be a sequence of non-empty strings, not a string.")
+    skip_task_head_prefixes = (
+        list(skip_task_head_prefixes_for_base_model) if skip_task_head_prefixes_for_base_model is not None else None
+    )
+    if skip_task_head_prefixes is not None:
+        if any(not isinstance(prefix, str) for prefix in skip_task_head_prefixes):
+            raise TypeError("skip_task_head_prefixes_for_base_model must contain only strings.")
+        if any(not prefix for prefix in skip_task_head_prefixes):
+            raise ValueError("skip_task_head_prefixes_for_base_model must not contain empty prefixes.")
+        skip_task_head_prefixes = list(dict.fromkeys(skip_task_head_prefixes))
 
     # Create a checkpointer for loading base weights only. Keep consolidation disabled
     # so load-only infrastructure does not emit save/export warnings.
@@ -539,6 +594,7 @@ def apply_model_infrastructure(
         model_repo_id=pretrained_model_name_or_path,
         save_consolidated=False,
         is_peft=peft_config is not None,
+        skip_task_head_prefixes_for_base_model=skip_task_head_prefixes,
     )
     checkpointer = Checkpointer(
         ckpt_config,
@@ -609,6 +665,24 @@ def apply_model_infrastructure(
             # handle weight tying
             checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
         checkpoint_already_loaded = True
+
+    if pre_fsdp_hook is not None:
+        # A single-device meta model has already been materialized by the
+        # load-before-shard path above, while multi-rank FSDP models remain on
+        # meta until after sharding. Inspect the current tensors rather than
+        # the original construction flag so newly added modules land on the
+        # same device as the model in both cases.
+        has_meta_tensors = any(parameter.device.type == "meta" for parameter in model.parameters()) or any(
+            buffer.device.type == "meta" for buffer in model.buffers()
+        )
+        hook_context = init_empty_weights() if has_meta_tensors else nullcontext()
+        with hook_context:
+            hook_result = pre_fsdp_hook(model)
+        if hook_result is not None:
+            raise TypeError(
+                "pre_fsdp_hook must mutate the existing model in place and return None; "
+                f"got {type(hook_result).__name__}."
+            )
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     state_dict_adapter = getattr(model, "state_dict_adapter", None)

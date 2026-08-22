@@ -214,6 +214,203 @@ def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wr
         return result, mock_ckpt
 
 
+class TestPreFSDPHook:
+    def test_load_before_shard_runs_hook_after_base_load_and_before_key_snapshot(self):
+        from nemo_automodel._transformers import infrastructure as infra
+
+        with infra.init_empty_weights():
+            model = _DummyModel()
+
+        timeline = MagicMock()
+
+        def materialize_model(model_to_materialize, device, **_kwargs):
+            model_to_materialize.to_empty(device=device)
+
+        def mark_base_checkpoint_loaded(model_to_load, *_args, **_kwargs):
+            model_to_load.base_checkpoint_loaded = True
+
+        def add_value_head(model_to_update):
+            assert model_to_update.base_checkpoint_loaded is True
+            assert all(parameter.device.type == "cpu" for parameter in model_to_update.parameters())
+            model_to_update.value_head = torch.nn.Linear(4, 1)
+
+        hook = MagicMock(side_effect=add_value_head)
+        snapshot = MagicMock(side_effect=lambda _model, state_dict, **_kwargs: state_dict)
+        shard = MagicMock(return_value=model)
+        timeline.attach_mock(hook, "hook")
+        timeline.attach_mock(snapshot, "snapshot")
+        timeline.attach_mock(shard, "shard")
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=True),
+            patch(f"{_INFRA_MODULE}._maybe_adapt_state_dict_to_hf", snapshot),
+            patch(f"{_INFRA_MODULE}._shard_ep_fsdp", shard),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config.dequantize_base_checkpoint = False
+            mock_ckpt.initialize_model_weights.side_effect = materialize_model
+            mock_ckpt.load_base_model.side_effect = mark_base_checkpoint_loaded
+            timeline.attach_mock(mock_ckpt.initialize_model_weights, "initialize")
+            timeline.attach_mock(mock_ckpt.load_base_model, "load")
+
+            result = infra.apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=True,
+                pretrained_model_name_or_path="test/model",
+                pre_fsdp_hook=hook,
+                skip_task_head_prefixes_for_base_model=("value_head.", "value_head."),
+            )
+
+        assert result is model
+        hook.assert_called_once_with(model)
+        assert [mock_call[0] for mock_call in timeline.mock_calls] == [
+            "initialize",
+            "load",
+            "hook",
+            "snapshot",
+            "shard",
+        ]
+        assert snapshot.call_args.args[1]["value_head.weight"].device.type == "cpu"
+        assert model._pre_shard_hf_state_dict_keys == list(snapshot.call_args.args[1])
+        checkpoint_config = MockCheckpointer.call_args.args[0]
+        assert checkpoint_config.skip_task_head_prefixes_for_base_model == ["value_head."]
+
+    def test_meta_model_runs_hook_before_key_snapshot_and_creates_meta_head(self):
+        from nemo_automodel._transformers import infrastructure as infra
+
+        with infra.init_empty_weights():
+            model = _DummyModel()
+
+        timeline = MagicMock()
+
+        def add_value_head(model_to_update):
+            model_to_update.value_head = torch.nn.Linear(4, 1)
+            assert model_to_update.value_head.weight.device.type == "meta"
+
+        hook = MagicMock(side_effect=add_value_head)
+        snapshot = MagicMock(side_effect=lambda _model, state_dict, **_kwargs: state_dict)
+        shard = MagicMock(return_value=model)
+        timeline.attach_mock(hook, "hook")
+        timeline.attach_mock(snapshot, "snapshot")
+        timeline.attach_mock(shard, "shard")
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=2),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}._maybe_adapt_state_dict_to_hf", snapshot),
+            patch(f"{_INFRA_MODULE}._shard_ep_fsdp", shard),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            result = infra.apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=False,
+                pre_fsdp_hook=hook,
+            )
+
+        assert result is model
+        hook.assert_called_once_with(model)
+        assert [mock_call[0] for mock_call in timeline.mock_calls] == ["hook", "snapshot", "shard"]
+        assert "value_head.weight" in snapshot.call_args.args[1]
+        assert "value_head.weight" in model._pre_shard_hf_state_dict_keys
+
+    def test_rejects_hook_return_value_before_key_snapshot_or_sharding(self):
+        from nemo_automodel._transformers import infrastructure as infra
+
+        model = _DummyModel()
+        hook = MagicMock(return_value=model)
+
+        with (
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}._maybe_adapt_state_dict_to_hf") as snapshot,
+            patch(f"{_INFRA_MODULE}._shard_ep_fsdp") as shard,
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        ):
+            MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
+
+            with pytest.raises(TypeError, match="mutate the existing model in place and return None"):
+                infra.apply_model_infrastructure(
+                    model=model,
+                    is_meta_device=False,
+                    device=torch.device("cpu"),
+                    load_base_model=False,
+                    pre_fsdp_hook=hook,
+                )
+
+        hook.assert_called_once_with(model)
+        snapshot.assert_not_called()
+        shard.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "mesh_overrides,infrastructure_overrides,unsupported_name",
+        [
+            ({"tp_size": 2}, {}, "tensor parallelism"),
+            ({"cp_size": 2}, {}, "context parallelism"),
+            ({"ep_size": 2}, {}, "expert parallelism"),
+            ({"pp_size": 2}, {}, "pipeline parallelism"),
+            ({}, {"peft_config": object()}, "PEFT"),
+            ({}, {"quantization_config": object()}, "quantization"),
+            ({}, {"fp8_config": object()}, "FP8"),
+            ({}, {"qat_quantizer": object()}, "QAT"),
+        ],
+        ids=["tp", "cp", "ep", "pp", "peft", "quantization", "fp8", "qat"],
+    )
+    def test_rejects_unsupported_parallelism_and_model_transforms(
+        self,
+        mesh_overrides,
+        infrastructure_overrides,
+        unsupported_name,
+    ):
+        from nemo_automodel._transformers import infrastructure as infra
+
+        mesh_sizes = {"tp_size": 1, "cp_size": 1, "ep_size": 1, "pp_size": 1}
+        mesh_sizes.update(mesh_overrides)
+        hook = MagicMock()
+
+        with pytest.raises(NotImplementedError, match=unsupported_name):
+            infra.apply_model_infrastructure(
+                model=_DummyModel(),
+                is_meta_device=False,
+                device=torch.device("cpu"),
+                load_base_model=False,
+                mesh=SimpleNamespace(**mesh_sizes),
+                pre_fsdp_hook=hook,
+                **infrastructure_overrides,
+            )
+
+        hook.assert_not_called()
+
+    def test_rejects_checkpoint_native_quantization_before_running_hook(self):
+        from nemo_automodel._transformers import infrastructure as infra
+
+        model = _DummyModel()
+        model.config.quantization_config = {"quant_method": "bitsandbytes"}
+        hook = MagicMock()
+
+        with pytest.raises(NotImplementedError, match="quantization"):
+            infra.apply_model_infrastructure(
+                model=model,
+                is_meta_device=False,
+                device=torch.device("cpu"),
+                load_base_model=False,
+                pre_fsdp_hook=hook,
+            )
+
+        hook.assert_not_called()
+
+
 def test_apply_model_infrastructure_handles_unwrapped_single_rank_ddp_model():
     """Single-rank DDP skips wrapping, so the returned model may not have ``.module``."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
