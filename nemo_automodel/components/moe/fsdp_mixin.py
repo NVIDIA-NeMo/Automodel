@@ -22,6 +22,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.models.common.utils import get_is_optim_step
 from nemo_automodel.shared.multimodal_fsdp import iter_multimodal_modules
+from nemo_automodel.shared.task_heads import task_head_module
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
@@ -56,6 +57,13 @@ def _iter_fsdp_module_candidates(module: torch.nn.Module) -> Iterator[FSDPModule
     # Check lm_head
     if hasattr(module, "lm_head") and isinstance(module.lm_head, FSDPModule):
         yield module.lm_head
+
+    # A managed task head may live below an architecture-specific wrapper (for
+    # example ``thinker.lm_head``). Its independent FSDP unit must participate
+    # in the same deferred-sync lifecycle as the MoE backbone.
+    managed_task_head = task_head_module(module)
+    if isinstance(managed_task_head, FSDPModule):
+        yield managed_task_head
 
     # Multimodal towers/projectors. ``moe/parallelizer.apply_fsdp`` gives every
     # recognized *trainable* multimodal module its own FSDP unit, and under the

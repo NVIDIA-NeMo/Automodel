@@ -64,6 +64,7 @@ from nemo_automodel.components.utils.model_utils import (  # noqa: E402
     init_empty_weights,
     resolve_trust_remote_code,
 )
+from nemo_automodel.shared.task_heads import PreFSDPHookResult  # noqa: E402
 from nemo_automodel.shared.utils import dtype_from_str  # noqa: E402
 
 if TYPE_CHECKING:
@@ -400,7 +401,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
-        pre_fsdp_hook: Callable[[torch.nn.Module], None] | None = None,
+        pre_fsdp_hook: Callable[[torch.nn.Module], PreFSDPHookResult | None] | None = None,
         skip_task_head_prefixes_for_base_model: Sequence[str] | None = None,
         _retry_depth=0,
         **kwargs,
@@ -665,7 +666,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        pre_fsdp_hook: Callable[[torch.nn.Module], None] | None = None,
+        pre_fsdp_hook: Callable[[torch.nn.Module], PreFSDPHookResult | None] | None = None,
         skip_task_head_prefixes_for_base_model: Sequence[str] | None = None,
         **kwargs,
     ) -> PreTrainedModel:
@@ -721,11 +722,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled. Default: None.
             pre_fsdp_hook: Optional in-place model-structure hook invoked after model and
-                kernel setup but before FSDP wrapping. The hook must return ``None``.
-                It must make the same deterministic change on every rank and must not
-                run collectives. Initially supported only without model parallelism,
-                PEFT, or quantization. Added parameters use the model's standard
-                initialization path and configured FSDP precision policy.
+                kernel/lower-precision transforms and any load-before-shard base-model
+                restore, but before state-key capture and FSDP wrapping. Returning
+                ``None`` keeps the legacy pure-data-parallel contract. Returning
+                :class:`PreFSDPHookResult` declares a fresh task module that AutoModel
+                excludes from TP and lower-precision transforms, keeps trainable with
+                PEFT, and owns in FP32 FSDP units. The hook must be deterministic on
+                every rank, avoid collectives, and keep weight-tying configuration
+                consistent with its structural changes.
             skip_task_head_prefixes_for_base_model: Native model parameter FQN
                 prefixes to omit from the pretrained base-checkpoint load.
                 Training-checkpoint restore is unaffected.
@@ -820,7 +824,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        pre_fsdp_hook: Callable[[torch.nn.Module], None] | None = None,
+        pre_fsdp_hook: Callable[[torch.nn.Module], PreFSDPHookResult | None] | None = None,
         skip_task_head_prefixes_for_base_model: Sequence[str] | None = None,
         **kwargs,
     ) -> PreTrainedModel:

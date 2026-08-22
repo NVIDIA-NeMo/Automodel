@@ -26,7 +26,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
 from torch.distributed.tensor import Replicate, Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
@@ -52,6 +52,7 @@ from nemo_automodel.shared.multimodal_fsdp import (
     normalize_frozen_multimodal_sharding,
     shard_multimodal_module,
 )
+from nemo_automodel.shared.task_heads import exclude_task_heads_from_tp_plan
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
@@ -821,7 +822,11 @@ def apply_fsdp(
     if embed_norm is not None:
         fully_shard_default(embed_norm)
 
-    if lm_head is not None and not tied_input_output_embeddings:
+    if isinstance(lm_head, FSDPModule):
+        # Managed task heads are wrapped centrally before this model-specific
+        # path so dense and MoE models share the same FP32 FSDP policy.
+        pass
+    elif lm_head is not None and not tied_input_output_embeddings:
         # Use custom mixed precision policy for lm_head if lm_head_precision is specified
         if lm_head_precision == torch.float32:
             lm_head_mp_policy = MixedPrecisionPolicy(
@@ -1014,6 +1019,7 @@ def parallelize_model(
             tp_shard_plan=tp_shard_plan,
             tp_size=tp_mesh.size(),
         )
+        model_parallel_plan = exclude_task_heads_from_tp_plan(model, model_parallel_plan)
         # Every custom-MoE TP plan keeps the token path (attention, router)
         # replicated across TP ranks, so each expert gradient accumulates
         # tp_size identical contributions through the EP all-gather.

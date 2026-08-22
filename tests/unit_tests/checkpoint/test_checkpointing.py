@@ -74,6 +74,7 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
+from nemo_automodel.shared.task_heads import PreFSDPHookResult, register_task_head_module
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
@@ -904,6 +905,36 @@ def test_model_state_refreshes_tied_lm_head_before_dropping_key():
     assert model_state.has_local_tied_lm_head is True
     assert "lm_head.weight" not in saved_state_dict
     assert "model.embed_tokens.weight" in saved_state_dict
+
+
+def test_peft_model_state_saves_lora_and_managed_task_head():
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Linear(2, 2)
+    model.backbone.weight.requires_grad_(False)
+    model.backbone.bias.requires_grad_(False)
+    model.backbone.register_parameter("lora_A", torch.nn.Parameter(torch.ones(1)))
+
+    pre_hook_module_ids = {id(module) for module in model.modules()}
+    pre_hook_parameter_ids = {id(parameter) for parameter in model.parameters()}
+    model.task_head = torch.nn.Linear(2, 1)
+    register_task_head_module(
+        model,
+        PreFSDPHookResult(task_module=model.task_head),
+        pre_hook_module_ids=pre_hook_module_ids,
+        pre_hook_parameter_ids=pre_hook_parameter_ids,
+    )
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_model_state_dict",
+        return_value=model.state_dict(),
+    ):
+        saved_state_dict = ModelState(model, is_peft=True).state_dict()
+
+    assert set(saved_state_dict) == {
+        "base_model.model.backbone.lora_A",
+        "base_model.model.task_head.bias",
+        "base_model.model.task_head.weight",
+    }
 
 
 @pytest.mark.parametrize("cpu_offload", [False, True])
