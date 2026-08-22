@@ -124,10 +124,16 @@ fixture_keys:
     - hf_device_map_max_memory_gib
     - hf_reload_timeout_seconds
     - hf_source_post_load_dequantize
+    # GLM-only Phase 0 evidence capture: full-sequence router logits, cutoff
+    # margins, expert flips, and final-token KL conditioned on route agreement.
+    - capture_router_diagnostics
     # Full-logit parity defaults to 2048 tokens from the repository's fixed
     # long-form document. Named profiles gate mean KL, p95 KL, and cosine.
     # Max KL, JSD, and absolute-difference metrics are report-only.
     - parity_sequence_length
+    # Optional prefix of the same long forward used to gate cross-framework
+    # source/HF-reload parity. Full-sequence metrics remain report-only.
+    - cross_framework_gate_sequence_length
     - parity_tolerance_profile
     # Optional source_load, automodel_reload, hf_reload, or cross_tp profile
     # selections. Unspecified comparisons inherit parity_tolerance_profile.

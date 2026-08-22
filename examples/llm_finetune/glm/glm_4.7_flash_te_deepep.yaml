@@ -43,6 +43,7 @@ model:
     rms_norm: torch_fp32
     experts: gmm
     dispatcher: deepep
+    gate_precision: float32
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -127,5 +128,7 @@ ci:
     # reference path is fixed; an observed mismatch alone is not a reason to skip.
     tokenizer_name: zai-org/GLM-4.7-Flash
     hf_device_map_auto: true
+    cross_framework_gate_sequence_length: 128
+    capture_router_diagnostics: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500

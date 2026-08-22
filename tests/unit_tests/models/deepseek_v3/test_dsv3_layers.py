@@ -272,6 +272,32 @@ class TestMLAInitialization:
 
         assert mla.q_lora_rank == 1024
 
+    @pytest.mark.parametrize("latent_norm_eps", [None, 1e-6])
+    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
+    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
+    def test_mla_uses_explicit_latent_norm_epsilon(
+        self,
+        mock_init_attn,
+        mock_init_rms,
+        mock_init_linear,
+        latent_norm_eps,
+    ):
+        config = self.create_mock_config(q_lora_rank=1024, rms_norm_eps=1e-5)
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+        expected_epsilon = config.rms_norm_eps if latent_norm_eps is None else latent_norm_eps
+
+        mock_init_linear.return_value = Mock()
+        mock_init_rms.return_value = Mock()
+        mock_init_attn.return_value = (Mock(), Mock())
+
+        MLA(config, backend, latent_norm_eps=latent_norm_eps)
+
+        assert [call.kwargs["eps"] for call in mock_init_rms.call_args_list] == [
+            expected_epsilon,
+            expected_epsilon,
+        ]
+
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
