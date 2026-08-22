@@ -619,6 +619,7 @@ class Checkpointer:
             quantization=False,
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
+            legacy_paramwrapper_layout=self.config.legacy_paramwrapper_layout,
         )
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
@@ -645,6 +646,7 @@ class Checkpointer:
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
+                legacy_paramwrapper_layout=self.config.legacy_paramwrapper_layout,
                 process_group=consolidation_process_group,
             )
         self._maybe_write_offline_consolidation_script(model_dir)
@@ -864,7 +866,10 @@ class Checkpointer:
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
-                    model_state.model[0], state_dict_from_disk, moe_mesh=self.moe_mesh
+                    model_state.model[0],
+                    state_dict_from_disk,
+                    moe_mesh=self.moe_mesh,
+                    paramwrapper_layout_hint=_read_paramwrapper_layout_metadata(model_path),
                 )
             else:
                 state_dict_from_disk = {}
@@ -1033,7 +1038,12 @@ class Checkpointer:
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
-        state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
+        state_dict = _maybe_adapt_state_dict_from_hf(
+            model_state.model[0],
+            state_dict,
+            moe_mesh=self.moe_mesh,
+            paramwrapper_layout_hint=_read_paramwrapper_layout_metadata(model_path),
+        )
         adapter_complete = time.monotonic()
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
@@ -2736,14 +2746,41 @@ def _load_hf_bin_checkpoint(model_path: str) -> dict[str, torch.Tensor] | None:
 
 
 def _maybe_adapt_state_dict_from_hf(
-    model_part: nn.Module, state_dict: dict[str, torch.Tensor], moe_mesh: DeviceMesh | None = None
+    model_part: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    moe_mesh: DeviceMesh | None = None,
+    paramwrapper_layout_hint: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Custom models use state dict adapters to convert the state dict from the Hugging Face format to the native format.
+
+    ``paramwrapper_layout_hint`` carries the fused expert LoRA layout recorded in
+    the checkpoint's automodel_peft_config.json (see _read_paramwrapper_layout_metadata),
+    so the adapter resolves the peft ParamWrapper layout from metadata instead of shapes.
     """
     adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
-        return adapter.from_hf(state_dict, device_mesh=ep_mesh)
+        adapter._paramwrapper_layout_hint = paramwrapper_layout_hint
+        try:
+            return adapter.from_hf(state_dict, device_mesh=ep_mesh)
+        finally:
+            adapter._paramwrapper_layout_hint = None
     return state_dict
+
+
+def _read_paramwrapper_layout_metadata(model_path: str | os.PathLike) -> str | None:
+    """Return the fused expert LoRA layout stamped into a PEFT checkpoint, if any.
+
+    The PEFT save path records which peft ParamWrapper layout the adapter was
+    exported in (peft flipped it in 0.19.1, huggingface/peft#3165) inside
+    automodel_peft_config.json. Absent or unstamped checkpoints return None and
+    the adapter falls back to shape detection.
+    """
+    metadata_path = os.path.join(model_path, "automodel_peft_config.json")
+    try:
+        with open(metadata_path) as f:
+            return json.load(f).get("paramwrapper_layout")
+    except (FileNotFoundError, NotADirectoryError, json.JSONDecodeError):
+        return None

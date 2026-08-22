@@ -450,3 +450,53 @@ class TestMaybeStripQuantizationConfig:
         """No error when model has no config attribute."""
         model = nn.Linear(4, 4)
         _maybe_strip_quantization_config(model)
+
+
+class TestParamWrapperLayoutStamp:
+    """The PEFT save stamps the fused expert LoRA layout into
+    automodel_peft_config.json (peft flipped ParamWrapper in 0.19.1,
+    huggingface/peft#3165) so loads resolve it from metadata, not shapes."""
+
+    def test_v5_adapter_gets_the_modern_stamp_by_default(self):
+        from nemo_automodel.components.checkpoint.addons import _get_paramwrapper_layout_stamp
+
+        adapter = SimpleNamespace(_v5_peft_target_parameters=("mlp.experts.gate_up_proj",))
+        assert _get_paramwrapper_layout_stamp(adapter, False, False) == "peft-0.19.1"
+        assert _get_paramwrapper_layout_stamp(adapter, False, True) == "peft-0.18"
+
+    def test_non_v5_or_v4_saves_get_no_stamp(self):
+        from nemo_automodel.components.checkpoint.addons import _get_paramwrapper_layout_stamp
+
+        v5_adapter = SimpleNamespace(_v5_peft_target_parameters=("mlp.experts.gate_up_proj",))
+        plain_adapter = SimpleNamespace(_v5_peft_target_parameters=())
+        assert _get_paramwrapper_layout_stamp(plain_adapter, False, False) is None
+        assert _get_paramwrapper_layout_stamp(None, False, False) is None
+        assert _get_paramwrapper_layout_stamp(v5_adapter, True, False) is None
+
+
+class TestParamWrapperLayoutHintPlumbing:
+    def test_metadata_reader_round_trips(self, tmp_path):
+        import json as json_module
+
+        from nemo_automodel.components.checkpoint.checkpointing import _read_paramwrapper_layout_metadata
+
+        assert _read_paramwrapper_layout_metadata(tmp_path) is None
+        (tmp_path / "automodel_peft_config.json").write_text(json_module.dumps({"paramwrapper_layout": "peft-0.18"}))
+        assert _read_paramwrapper_layout_metadata(tmp_path) == "peft-0.18"
+
+    def test_hint_is_set_during_from_hf_and_cleared_after(self):
+        from nemo_automodel.components.checkpoint.checkpointing import _maybe_adapt_state_dict_from_hf
+
+        seen = {}
+
+        class _Adapter:
+            def from_hf(self, state_dict, device_mesh=None, **kwargs):
+                seen["hint"] = self._paramwrapper_layout_hint
+                return state_dict
+
+        model = nn.Module()
+        model.state_dict_adapter = _Adapter()
+        _maybe_adapt_state_dict_from_hf(model, {}, paramwrapper_layout_hint="peft-0.18")
+
+        assert seen["hint"] == "peft-0.18"
+        assert model.state_dict_adapter._paramwrapper_layout_hint is None

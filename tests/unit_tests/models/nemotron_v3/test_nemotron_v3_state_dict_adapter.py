@@ -663,15 +663,30 @@ class TestNemotronV3AdapterMixerExperts:
         assert adapter._expert_path_segment == "mixer.experts"
 
     def test_default_lora_export_uses_v5_for_non_gated_experts(self, config, moe_config, backend):
-        """Nemotron V3 emits ParamWrapper weights for its fused up projection."""
+        """Nemotron V3 emits ParamWrapper weights for its fused up projection.
+
+        The default export uses the corrected peft >= 0.19.1 layout, where the
+        native A tensor feeds ``lora_A`` (huggingface/peft#3165).
+        """
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
         tensor = torch.randn(moe_config.n_routed_experts, moe_config.dim, 8)
 
         result = adapter.convert_single_tensor_to_hf("model.layers.0.mixer.experts.lora_gate_and_up_A", tensor)
 
         keys = {key for key, _ in result}
-        assert keys == {"backbone.layers.0.mixer.experts.base_layer.lora_B.weight"}
+        assert keys == {"backbone.layers.0.mixer.experts.base_layer.lora_A.weight"}
         assert adapter._v5_peft_target_parameters == ("mixer.experts.up_proj", "mixer.experts.down_proj")
+
+    def test_legacy_layout_option_restores_the_pre_flip_suffix(self, config, moe_config, backend):
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        tensor = torch.randn(moe_config.n_routed_experts, moe_config.dim, 8)
+
+        result = adapter.convert_single_tensor_to_hf(
+            "model.layers.0.mixer.experts.lora_gate_and_up_A", tensor, legacy_paramwrapper_layout=True
+        )
+
+        keys = {key for key, _ in result}
+        assert keys == {"backbone.layers.0.mixer.experts.base_layer.lora_B.weight"}
 
     def test_v4_lora_export_stays_per_expert_for_non_gated_experts(self, config, moe_config, backend):
         """Explicit v4 compatibility retains the per-expert up projection."""

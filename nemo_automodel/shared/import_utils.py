@@ -506,6 +506,32 @@ def is_transformers_min_version(version, check_equality=True):
     return get_transformers_version() > PkgVersion(version)
 
 
+def get_peft_version():
+    """Get peft version from __version__, or None when peft is unavailable."""
+    try:
+        import peft
+
+        if hasattr(peft, "__version__"):
+            _version = str(peft.__version__)
+        else:
+            from importlib.metadata import version
+
+            _version = version("peft")
+    except Exception:
+        return None
+    return PkgVersion(_version)
+
+
+def is_peft_min_version(version, check_equality=True):
+    """Check if minimum version of `peft` is installed. False when peft is missing."""
+    peft_version = get_peft_version()
+    if peft_version is None:
+        return False
+    if check_equality:
+        return peft_version >= PkgVersion(version)
+    return peft_version > PkgVersion(version)
+
+
 def get_check_model_inputs_decorator():
     """
     Get the appropriate check_model_inputs decorator based on transformers version.
