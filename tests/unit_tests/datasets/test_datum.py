@@ -431,6 +431,27 @@ def test_collate_vlm_datums_delegates_padding_and_preserves_processor_fields():
     assert loss_inputs.pad_values == {"labels": CROSS_ENTROPY_IGNORE_IDX}
 
 
+@pytest.mark.parametrize("packed", [False, True])
+def test_collate_vlm_datums_pads_variable_resolution_pixel_tensors(packed):
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    first_pixels = torch.arange(24, dtype=torch.float32).reshape(1, 3, 2, 4)
+    second_pixels = torch.arange(48, dtype=torch.float32).reshape(2, 3, 4, 2) + 100
+    datums = [
+        _vlm_datum([1, 2, 3], [0, 1, 1], pixel_values=first_pixels),
+        _vlm_datum([4, 5, 6], [0, 1, 1], pixel_values=second_pixels),
+    ]
+
+    model_inputs, _ = collate_vlm_datums(datums, processor=processor, packed=packed)
+
+    pixel_values = model_inputs["pixel_values"]
+    assert pixel_values.shape == (3, 3, 4, 4)
+    assert pixel_values.dtype == torch.bfloat16
+    torch.testing.assert_close(pixel_values[0, :, :2, :], first_pixels[0].to(torch.bfloat16))
+    assert not bool(pixel_values[0, :, 2:, :].any())
+    torch.testing.assert_close(pixel_values[1:, :, :, :2], second_pixels.to(torch.bfloat16))
+    assert not bool(pixel_values[1:, :, :, 2:].any())
+
+
 def test_collate_vlm_datums_pads_s_and_s_minus_one_side_channels_with_layouts():
     processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
     datums = _vlm_rl_datums()

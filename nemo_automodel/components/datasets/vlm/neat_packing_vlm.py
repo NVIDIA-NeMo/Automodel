@@ -53,6 +53,7 @@ from nemo_automodel.components.datasets.vlm.samplers import (
     _smart_resize_image,
     _smart_resize_video,
 )
+from nemo_automodel.components.datasets.vlm.utils import _merge_media_values
 
 logger = logging.getLogger(__name__)
 
@@ -468,7 +469,7 @@ def _build_packed_vlm_sample(
         packed["position_ids"] = torch.tensor(all_position_ids_1d, dtype=torch.long)
 
     if pixel_values_list and all(isinstance(value, torch.Tensor) for value in pixel_values_list):
-        packed["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+        packed["pixel_values"] = _merge_media_values(pixel_values_list, field_name="pixel_values")
     elif pixel_values_list and all(isinstance(value, (list, tuple)) for value in pixel_values_list):
         packed["pixel_values"] = [item for value in pixel_values_list for item in value]
     elif pixel_values_list:

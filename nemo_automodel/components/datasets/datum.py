@@ -710,8 +710,10 @@ def collate_vlm_datums(
         shape ``[batch, padded_sequence - 1, ...]``. In packed mode they have
         shape ``[1, aligned_tokens, ...]`` and model inputs include THD sequence
         metadata. ``PER_DATUM`` and ``REPLICATED`` values retain their generic
-        Datum semantics. Media tensors retain arbitrary trailing dimensions and
-        are concatenated on their leading media axis.
+        Datum semantics. Four-dimensional ``pixel_values`` are right/bottom
+        padded to the batch's maximum height and width; other media tensors
+        retain their trailing dimensions. All media tensors are concatenated
+        on their leading media axis.
     """
     if not datums:
         raise ValueError("collate_vlm_datums requires at least one Datum")
