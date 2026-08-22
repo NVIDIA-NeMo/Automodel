@@ -31,7 +31,11 @@ from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.loggers.metric_logger import (
+    DEFAULT_BUFFER_SIZE,
+    MetricsSample,
+    build_metric_logger,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -384,11 +388,21 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
+        # Train metrics reach disk at least as often as the checkpoint they accompany,
+        # capped at the default so a long checkpoint interval cannot buffer unboundedly.
+        # flush because a buffered write only reaches the file object, whose own buffer is
+        # lost with the process. Validation is rare enough to write every point.
+        train_logger_kwargs = {"flush": True}
+        if self.step_scheduler.ckpt_every_steps > 0:
+            train_logger_kwargs["buffer_size"] = min(DEFAULT_BUFFER_SIZE, self.step_scheduler.ckpt_every_steps)
         self.metric_logger_train = build_metric_logger(
-            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl",
+            **train_logger_kwargs,
         )
         self.metric_logger_valid = build_metric_logger(
-            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl",
+            buffer_size=1,
+            flush=True,
         )
         self.loss_average_window = deque(maxlen=self.step_scheduler.loss_average_window_steps)
 
@@ -432,12 +446,21 @@ class TrainBiEncoderRecipe(BaseRecipe):
                             val_loss=val_loss,
                         )
                     self._maybe_collect_garbage()
+
+                    # Poll per step; the StepScheduler iterators stop on the flag.
+                    if self.step_scheduler.sigterm_received:
+                        logger.info("Preemption signal received at step %d; stopping cleanly.",
+                                    self.step_scheduler.step)
         finally:
             if pbar is not None:
                 pbar.close()
+            # In the finally, not after it: an exception (OOM, NCCL timeout) would
+            # otherwise propagate past these and discard every buffered record.
+            if self.metric_logger_train is not None:
+                self.metric_logger_train.close()
+            if self.metric_logger_valid is not None:
+                self.metric_logger_valid.close()
 
-        self.metric_logger_train.close()
-        self.metric_logger_valid.close()
         self._finalize_and_close_checkpointer()
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
