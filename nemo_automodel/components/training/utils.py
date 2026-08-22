@@ -121,18 +121,37 @@ def _clip_grad_norm_impl(
     else:
         parameters = list(parameters)
 
-    # Group parameters by their sharding pattern
+    # Resolve Partial gradients once after accumulation into the parameter's
+    # placement. In particular, a replicated parameter can legitimately receive
+    # a Partial gradient (for example replicated LoRA-A in a column-parallel
+    # projection). Computing or clipping its rank-local gradient would produce
+    # different norms and parameter updates across ranks. A sharded parameter can
+    # also receive a Partial gradient, which must reduce-scatter back to its shard.
+    for p in parameters:
+        grad = p.grad
+        if isinstance(grad, DTensor) and any(isinstance(placement, Partial) for placement in grad.placements):
+            target_placements = (
+                tuple(Replicate() if isinstance(placement, Partial) else placement for placement in p.placements)
+                if isinstance(p, DTensor)
+                else tuple(Replicate() for _ in grad.placements)
+            )
+            p.grad = grad.redistribute(placements=target_placements)
+
+    # Group parameters by their gradient sharding pattern.  Parameter and
+    # gradient placements need not match: Replicate parameters can have
+    # Partial gradients before the synchronization above.
     # Key: (device_mesh_id, tuple of placements)
     sharding_groups = {}
 
     for p in parameters:
-        if p.grad is None:
+        grad = p.grad
+        if grad is None:
             continue
 
-        if isinstance(p, DTensor):
+        if isinstance(grad, DTensor):
             # Create a hashable key from device_mesh and placements
-            mesh_id = id(p.device_mesh)
-            placements_tuple = tuple(str(placement) for placement in p.placements)
+            mesh_id = id(grad.device_mesh)
+            placements_tuple = tuple(str(placement) for placement in grad.placements)
             key = (mesh_id, placements_tuple)
         else:
             # Regular tensor - group separately
@@ -167,25 +186,22 @@ def _clip_grad_norm_impl(
     is_inf = math.isinf(norm_type)
     group_norms = []
     for group_params in sharding_groups.values():
-        first = group_params[0]
-        is_dtensor = isinstance(first, DTensor)
-        # Partial placements can't be reduced via sum-of-local-norms; materialize
-        # those per-grad (each full_tensor() is a same-shape collective, safe).
-        has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
+        first_grad = group_params[0].grad
+        is_dtensor = isinstance(first_grad, DTensor)
 
         local_max = torch.zeros((), dtype=torch.float64, device=target_device)
         for p in group_params:
             g = p.grad
             if isinstance(g, DTensor):
-                g = g.full_tensor() if has_partial else g.to_local()
+                g = g.to_local()
             if g.numel() == 0:
                 continue
             g_abs_max = g.detach().abs().max().to(device=target_device, dtype=torch.float64)
             local_max = torch.maximum(local_max, g_abs_max)
 
-        if is_dtensor and not has_partial:
-            mesh = first.device_mesh
-            for dim_idx, pl in enumerate(first.placements):
+        if is_dtensor:
+            mesh = first_grad.device_mesh
+            for dim_idx, pl in enumerate(first_grad.placements):
                 if isinstance(pl, Replicate):
                     continue
                 local_max = _all_reduce_scalar(local_max, torch.distributed.ReduceOp.MAX, mesh, dim_idx)
@@ -199,7 +215,7 @@ def _clip_grad_norm_impl(
         for p in group_params:
             g = p.grad
             if isinstance(g, DTensor):
-                g = g.full_tensor() if has_partial else g.to_local()
+                g = g.to_local()
             if g.numel() == 0:
                 continue
             g = g.detach().abs().div(scale)
@@ -208,9 +224,9 @@ def _clip_grad_norm_impl(
             else:
                 local_val = local_val + g.pow(norm_type).sum(dtype=torch.float64)
 
-        if is_dtensor and not has_partial:
-            mesh = first.device_mesh
-            for dim_idx, pl in enumerate(first.placements):
+        if is_dtensor:
+            mesh = first_grad.device_mesh
+            for dim_idx, pl in enumerate(first_grad.placements):
                 if isinstance(pl, Replicate):
                     continue
                 local_val = _all_reduce_scalar(local_val, torch.distributed.ReduceOp.SUM, mesh, dim_idx)
