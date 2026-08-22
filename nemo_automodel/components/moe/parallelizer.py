@@ -52,7 +52,10 @@ from nemo_automodel.shared.multimodal_fsdp import (
     normalize_frozen_multimodal_sharding,
     shard_multimodal_module,
 )
-from nemo_automodel.shared.owner_sharding import get_owner_sharded_parameter_spec
+from nemo_automodel.shared.owner_sharding import (
+    get_model_owned_dtensor_spec,
+    get_owner_sharded_parameter_spec,
+)
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
@@ -699,6 +702,26 @@ def apply_fsdp(
     # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
 
+    # Models may construct a rank-local shell first (so meta initialization is
+    # cheap) and turn it into a globally shaped DTensor only after the runtime
+    # mesh exists. Run that private capability before collecting ignored
+    # parameters so every FSDP unit records the final Parameter identity.
+    prepare_model_owned_dtensors = getattr(model, "_nemo_prepare_model_owned_dtensors", None)
+    prepared_model_owned_dtensors: set[nn.Parameter] = set()
+    if prepare_model_owned_dtensors is not None:
+        prepared = prepare_model_owned_dtensors(fsdp_mesh)
+        if prepared is None:
+            raise TypeError("_nemo_prepare_model_owned_dtensors must return an iterable of Parameters")
+        prepared_model_owned_dtensors = set(prepared)
+        registered_parameter_ids = {id(parameter) for parameter in model.parameters()}
+        for parameter in prepared_model_owned_dtensors:
+            if not isinstance(parameter, nn.Parameter):
+                raise TypeError("_nemo_prepare_model_owned_dtensors returned a non-Parameter value")
+            if id(parameter) not in registered_parameter_ids:
+                raise RuntimeError("A model-owned DTensor returned by the model is not a registered parameter")
+            if get_model_owned_dtensor_spec(parameter) is None:
+                raise RuntimeError("A prepared model-owned DTensor is missing its typed sharding contract")
+
     # Some trainable parameters are already physically sharded by model-owned
     # communication. Letting FSDP shard those local owner partitions again
     # would invalidate the model's lookup and autograd routing. The explicit
@@ -708,8 +731,11 @@ def apply_fsdp(
     # themselves, so treat a missing ``parameters`` method as an empty outer
     # parameter set while preserving the normal nn.Module path.
     outer_parameters = model.parameters() if hasattr(model, "parameters") else ()
-    externally_sharded_params = {
-        parameter for parameter in outer_parameters if get_owner_sharded_parameter_spec(parameter) is not None
+    externally_sharded_params = prepared_model_owned_dtensors | {
+        parameter
+        for parameter in outer_parameters
+        if get_owner_sharded_parameter_spec(parameter) is not None
+        or get_model_owned_dtensor_spec(parameter) is not None
     }
     if externally_sharded_params:
         logger.info(

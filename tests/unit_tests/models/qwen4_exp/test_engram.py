@@ -24,6 +24,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen4_exp.engram import (
@@ -62,6 +64,16 @@ def _tiny_ngram_embedding(table: nn.Module) -> Qwen4ExpNGramEmbedding:
         ngram_heads_vocab_sizes=(5, 7, 11, 13),
         ngram_heads_offsets=(0, 5, 12, 23),
     )
+
+
+def _parallelize_owner_table(table: nn.Module) -> None:
+    """Wrap one already-local owner shard in the current CPU world mesh."""
+    mesh = DeviceMesh.from_group(
+        dist.group.WORLD,
+        device_type="cpu",
+        mesh_dim_names=("dp_shard_cp",),
+    )
+    table.parallelize_weight(mesh)
 
 
 def _tiny_ple() -> Qwen4ExpPLELayer:
@@ -339,8 +351,12 @@ def _owner_sharded_gradient_worker(rank: int, world_size: int, store_path: str) 
             initializer_range=0.0,
         )
         table = config.build(process_group=dist.group.WORLD, dtype=torch.float32)
+        _parallelize_owner_table(table)
+        assert isinstance(table.weight, DTensor)
+        assert tuple(table.weight.shape) == (12, 3)
+        assert tuple(table.weight.placements) == (Shard(0),)
         full_weight = torch.arange(36, dtype=torch.float32).view(12, 3) / 10
-        table.weight.detach().copy_(full_weight[table.vocab_start_index : table.vocab_end_index])
+        table.weight.to_local().detach().copy_(full_weight[table.vocab_start_index : table.vocab_end_index])
         optimizer = torch.optim.SGD([table.weight], lr=0.1)
 
         ids_by_rank = (
@@ -364,12 +380,13 @@ def _owner_sharded_gradient_worker(rank: int, world_size: int, store_path: str) 
         expected.backward(upstream)
         dist.all_reduce(expected_weight.grad, group=dist.group.WORLD)
         expected_local_grad = expected_weight.grad[table.vocab_start_index : table.vocab_end_index]
-        torch.testing.assert_close(table.weight.grad, expected_local_grad, rtol=0, atol=0)
+        assert isinstance(table.weight.grad, DTensor)
+        torch.testing.assert_close(table.weight.grad.to_local(), expected_local_grad, rtol=0, atol=0)
 
         optimizer.step()
         expected_optimizer.step()
         torch.testing.assert_close(
-            table.weight,
+            table.weight.to_local(),
             expected_weight[table.vocab_start_index : table.vocab_end_index],
             rtol=0,
             atol=0,
@@ -383,6 +400,52 @@ def test_owner_sharded_table_matches_full_table_gradients(tmp_path: Path) -> Non
     mp.spawn(
         _owner_sharded_gradient_worker,
         args=(2, str(tmp_path / "owner-sharded-pg")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _engram_meta_dtensor_lifecycle_worker(rank: int, world_size: int, store_path: str) -> None:
+    try:
+        torch.set_num_threads(1)
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{store_path}",
+            rank=rank,
+            world_size=world_size,
+        )
+        with torch.device("meta"):
+            table = Qwen4ExpEngramTableConfig(
+                num_embeddings=12,
+                embedding_dim=3,
+                initializer_range=0.02,
+            ).build(process_group=dist.group.WORLD, dtype=torch.float32)
+        _parallelize_owner_table(table)
+        parameter = table.weight
+        assert isinstance(parameter, DTensor)
+        assert parameter.to_local().device.type == "meta"
+
+        from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
+
+        to_empty_parameters_only(table, device=torch.device("cpu"))
+        assert table.weight is parameter
+        assert table.weight.to_local().device.type == "cpu"
+        assert tuple(table.weight.shape) == (12, 3)
+        assert tuple(table.weight.placements) == (Shard(0),)
+        assert not hasattr(table.weight, "_nemo_model_owned_dtensor_spec")
+        table.reset_parameters()
+        table.mark_sharding_contract()
+        assert torch.isfinite(table.weight.to_local()).all()
+        assert hasattr(table.weight, "_nemo_model_owned_dtensor_spec")
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_engram_meta_dtensor_materialization_preserves_parameter_identity(tmp_path: Path) -> None:
+    mp.spawn(
+        _engram_meta_dtensor_lifecycle_worker,
+        args=(2, str(tmp_path / "engram-meta-dtensor-pg")),
         nprocs=2,
         join=True,
     )
@@ -402,6 +465,7 @@ def _owner_sharded_misroute_worker(rank: int, world_size: int, store_path: str) 
             embedding_dim=3,
             initializer_range=0.0,
         ).build(process_group=dist.group.WORLD, dtype=torch.float32)
+        _parallelize_owner_table(table)
         original_exchange_ids = table._exchange_ids
 
         def _exchange_ids_with_rank_zero_misroute(
@@ -494,6 +558,7 @@ def _owner_sharded_route_metadata_worker(rank: int, world_size: int, store_path:
             embedding_dim=3,
             initializer_range=0.0,
         ).build(process_group=dist.group.WORLD, dtype=torch.float32)
+        _parallelize_owner_table(table)
         ids_by_rank = (
             torch.tensor([0, 6]),
             torch.tensor([5, 11]),

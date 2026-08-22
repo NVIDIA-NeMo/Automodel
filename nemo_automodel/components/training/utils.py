@@ -22,7 +22,10 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
-from nemo_automodel.shared.owner_sharding import get_owner_sharded_parameter_spec
+from nemo_automodel.shared.owner_sharding import (
+    get_model_owned_dtensor_spec,
+    get_owner_sharded_parameter_spec,
+)
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -484,21 +487,21 @@ def scale_grads_and_clip_grad_norm(
             ep_ratio = float(dp_group_size) / float(ep_shard_size)
             ep_ratio *= float(expert_tp_replication_factor)
 
-    has_owner_sharded_params = any(
-        get_owner_sharded_parameter_spec(parameter) is not None
+    has_model_owned_sharded_params = any(
+        get_owner_sharded_parameter_spec(parameter) is not None or get_model_owned_dtensor_spec(parameter) is not None
         for model_part in model_parts
         for parameter in model_part.parameters()
     )
 
     # Single pass over parameters to apply both scalings where applicable
-    if pp_divisor is not None or ep_ratio is not None or has_owner_sharded_params:
+    if pp_divisor is not None or ep_ratio is not None or has_model_owned_sharded_params:
         for mp in model_parts:
             for name, p in mp.named_parameters():
                 if p.grad is None:
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
-                owner_spec = get_owner_sharded_parameter_spec(p)
+                owner_spec = get_owner_sharded_parameter_spec(p) or get_model_owned_dtensor_spec(p)
                 if owner_spec is not None:
                     p.grad.div_(float(owner_spec.gradient_divisor))
                 if ep_ratio is not None:

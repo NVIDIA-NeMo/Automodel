@@ -318,9 +318,19 @@ def _get_checkpoint_metadata_keys(
     storage_reader: StorageReader | None = None,
 ) -> set[str]:
     """Return checkpoint FQNs present in metadata."""
-    reader = storage_reader if storage_reader is not None else FileSystemReader(path)
-    metadata = reader.read_metadata()
+    metadata = _get_checkpoint_metadata(path, storage_reader)
     return set(metadata.state_dict_metadata.keys())
+
+
+def _get_checkpoint_metadata(
+    path: str,
+    storage_reader: StorageReader | None = None,
+) -> Any:
+    """Read DCP metadata through the same local or cloud storage backend."""
+    reader = _maybe_msc_reader(path, storage_reader)
+    if reader is None:
+        reader = FileSystemReader(path)
+    return reader.read_metadata()
 
 
 if _is_geq_torch_2_9():
@@ -757,7 +767,11 @@ class Checkpointer:
             optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
-        self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        optimizer_path = os.path.join(weights_path, "optim")
+        checkpoint_metadata = _get_checkpoint_metadata(optimizer_path).state_dict_metadata
+        state_dict = optimizer_state.prepare_load_state_dict(state_dict, checkpoint_metadata)
+        self._do_load(state_dict, optimizer_path)
+        state_dict = optimizer_state.finalize_load_state_dict(state_dict)
         optimizer_state.load_state_dict(state_dict)
 
     @torch.no_grad()

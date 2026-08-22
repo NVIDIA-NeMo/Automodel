@@ -25,6 +25,8 @@ import torch
 import torch.distributed.checkpoint as dcp
 from safetensors.torch import save_file
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
@@ -133,6 +135,13 @@ class _TinyOwnerShardedCheckpointModel(HFCheckpointingMixin, nn.Module):
         # ``apply_model_infrastructure`` records this global adapter key list
         # before FSDP in production.  Keep the exact same checkpoint contract.
         self._pre_shard_hf_state_dict_keys = self.state_dict_adapter.get_hf_state_dict_keys(self.state_dict())
+        self.engram_table.parallelize_weight(
+            DeviceMesh.from_group(
+                process_group,
+                device_type="cpu",
+                mesh_dim_names=("dp_shard_cp",),
+            )
+        )
 
     @property
     def engram_table(self) -> Qwen4ExpOwnerShardedEmbedding:
@@ -165,7 +174,10 @@ def _run_model_checkpoint_round_trip(
         expected_local_table = global_rows * 10 + torch.arange(3, dtype=torch.float32)
         with torch.no_grad():
             source.ordinary.copy_(torch.tensor([701.0, 703.0, 709.0]))
-            source.engram_table.weight.copy_(expected_local_table)
+            source.engram_table.weight.to_local().copy_(expected_local_table)
+        assert isinstance(source.engram_table.weight, DTensor)
+        assert tuple(source.engram_table.weight.shape) == (256, 3)
+        assert tuple(source.engram_table.weight.placements) == (Shard(0),)
 
         global_keys = source._pre_shard_hf_state_dict_keys
         global_table_keys = [key for key in global_keys if key.startswith(f"{_TABLE_PREFIX}.shard_")]
@@ -213,18 +225,78 @@ def _run_model_checkpoint_round_trip(
         target = _TinyOwnerShardedCheckpointModel(torch.distributed.group.WORLD)
         with torch.no_grad():
             target.ordinary.fill_(-1)
-            target.engram_table.weight.fill_(-1000 - rank)
+            target.engram_table.weight.to_local().fill_(-1000 - rank)
         checkpointer.load_model(target, model_path=model_path)
 
         torch.testing.assert_close(target.ordinary, source.ordinary)
-        torch.testing.assert_close(target.engram_table.weight, expected_local_table)
-        gathered_tables = [torch.empty_like(target.engram_table.weight) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_tables, target.engram_table.weight)
+        target_local_weight = target.engram_table.weight.to_local()
+        torch.testing.assert_close(target_local_weight, expected_local_table)
+        gathered_tables = [torch.empty_like(target_local_weight) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_tables, target_local_weight)
         restored_global_table = torch.cat(gathered_tables)
         expected_global_rows = torch.arange(256, dtype=torch.float32).unsqueeze(1)
         expected_global_table = expected_global_rows * 10 + torch.arange(3, dtype=torch.float32)
         torch.testing.assert_close(restored_global_table, expected_global_table)
         assert not torch.equal(gathered_tables[0], gathered_tables[1])
+    finally:
+        if checkpointer is not None:
+            checkpointer.close()
+        torch.distributed.destroy_process_group()
+
+
+def _run_model_checkpoint_resharded_load(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    checkpoint_dir: str,
+) -> None:
+    """Load the physical PLE checkpoint with a different owner world size."""
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    checkpointer = None
+    try:
+        target = _TinyOwnerShardedCheckpointModel(torch.distributed.group.WORLD)
+        with torch.no_grad():
+            target.ordinary.fill_(-1)
+            target.engram_table.weight.to_local().fill_(-1000 - rank)
+
+        config = CheckpointingConfig(
+            checkpoint_dir=checkpoint_dir,
+            model_save_format="safetensors",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        checkpointer = config.build(
+            dp_rank=rank,
+            tp_rank=0,
+            pp_rank=0,
+            process_group=torch.distributed.group.WORLD,
+        )
+        checkpointer.load_model(target, model_path=os.path.join(checkpoint_dir, "model"))
+
+        torch.testing.assert_close(target.ordinary, torch.tensor([701.0, 703.0, 709.0]))
+        local_weight = target.engram_table.weight.to_local()
+        rows = torch.arange(
+            target.engram_table.global_row_start,
+            target.engram_table.global_row_end,
+            dtype=torch.float32,
+        ).unsqueeze(1)
+        torch.testing.assert_close(local_weight, rows * 10 + torch.arange(3, dtype=torch.float32))
+
+        gathered_tables = [torch.empty_like(local_weight) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_tables, local_weight)
+        restored_global_table = torch.cat(gathered_tables)
+        expected_rows = torch.arange(256, dtype=torch.float32).unsqueeze(1)
+        torch.testing.assert_close(restored_global_table, expected_rows * 10 + torch.arange(3, dtype=torch.float32))
+
+        local_hf_state = target.state_dict_adapter.to_hf(target.state_dict())
+        local_table_keys = {key for key in local_hf_state if key.startswith(f"{_TABLE_PREFIX}.shard_")}
+        assert len(local_table_keys) == 128 // world_size
     finally:
         if checkpointer is not None:
             checkpointer.close()
@@ -542,11 +614,19 @@ def test_hf_storage_reader_writes_only_owned_shards_through_views(
 
 
 def test_model_safetensors_checkpoint_round_trip_preserves_owner_shards_across_ranks(tmp_path: Path) -> None:
-    """Two owners save/load 128 disjoint PLE shard keys through the public checkpoint path."""
+    """Two owners save 128 PLE shards, then two and four owners restore them."""
     world_size = 2
+    checkpoint_dir = str(tmp_path / "checkpoint")
     torch.multiprocessing.spawn(
         _run_model_checkpoint_round_trip,
-        args=(world_size, str(tmp_path / "dist_init"), str(tmp_path / "checkpoint")),
+        args=(world_size, str(tmp_path / "dist_init"), checkpoint_dir),
         nprocs=world_size,
+        join=True,
+    )
+    resharded_world_size = 4
+    torch.multiprocessing.spawn(
+        _run_model_checkpoint_resharded_load,
+        args=(resharded_world_size, str(tmp_path / "resharded_dist_init"), checkpoint_dir),
+        nprocs=resharded_world_size,
         join=True,
     )

@@ -45,7 +45,7 @@ loss or straight-through gradient.
 |---|---|
 | FSDP2 | 47 decoder blocks use whole-layer activation checkpointing; the PLE owner-collective block remains eager; QSA indexers frozen |
 | Expert parallelism | EP64 baseline; EP128 for the CP1/CP8 comparison |
-| Engram ownership | 64 or 128 contiguous row-owner shards over the world group |
+| Engram ownership | Global `Shard(0)` DTensor over the world group; 64 or 128 contiguous local row shards |
 | Context parallelism | CP1 and CP8 at world size 128; CP was disabled in the EP64 baseline run below |
 | Tensor / pipeline parallelism | Disabled |
 | Workload | Non-packed, right-tail-padded HellaSwag next-token prediction |
@@ -57,11 +57,12 @@ The 100-step run reduced training loss from 3.0734 at step 0 to 1.8195 at step
 collective errors and published model, optimizer, dataloader, scheduler, and
 RNG state in a distributed checkpoint.
 
-The PLE table uses contiguous owner sharding. Request ranks group hashed row IDs
-by owner; an equal-capacity All-to-All sends IDs to owners and a second
-autograd-aware All-to-All returns values. Backward reverses the value route so
-only the rank that owns a row stores and updates its gradient. The validated
-cluster runs used NCCL's internal IB transport
+The PLE table is a globally shaped DTensor with placement `Shard(0)`. Request
+ranks group hashed row IDs by owner; an equal-capacity All-to-All sends IDs to
+owners and a second autograd-aware All-to-All returns values. Each rank directly
+looks up only its contiguous local DTensor shard, and backward reverses the
+value route so only the owner stores and updates each row's gradient. The
+validated cluster runs used NCCL's internal IB transport
 (`NCCL_NET_PLUGIN=none` and `NCCL_NET=IB`).
 
 ## Numerical Validation
@@ -126,8 +127,11 @@ setup.
 - Activation checkpointing wraps 47 of the 48 decoder blocks. The block that
   owns PLE remains eager because replaying its mutable owner-sharded
   All-to-All collectives during recomputation is not supported.
-- Optimizer checkpoint resume requires the same PLE owner-group size and
-  owner-rank-to-row mapping; optimizer-state resharding is not implemented.
+- Native distributed checkpoints store the PLE parameter and optimizer tensors
+  under their global DTensor FQNs, so DCP can reshard them when the owner world
+  size changes. Checkpoints from the earlier rank-local owner format can be
+  loaded only with their original owner topology; save once in the native
+  DTensor format before changing topology.
 - CP is limited to language-only, non-packed, right-tail-padded inputs with
   TP=PP=1. Packed sequences, left/interior padding, TP, PP, MTP, and
   vision/video training remain unsupported.

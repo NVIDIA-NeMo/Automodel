@@ -34,6 +34,7 @@ from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import Qwen3_5MoeStateDictAdapter
@@ -175,8 +176,9 @@ class Qwen4ExpStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         every ordinary tensor.  No table view, copy, or collective is created.
 
         Args:
-            state_dict: Native model state.  Its PLE weight has rank-local shape
-                ``[local_table_rows, embedding_dim]``.
+            state_dict: Native model state. Its PLE weight is either the
+                single-rank local tensor or the globally shaped ``Shard(0)``
+                DTensor used by distributed training.
 
         Returns:
             HF-format keys in native state iteration order, with the one local
@@ -209,29 +211,51 @@ class Qwen4ExpStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         tensor: Any,
         exclude_key_regex: str | None,
     ) -> list[tuple[str, torch.Tensor]]:
-        """Split one local table tensor into aliasing physical-shard views.
+        """Split one local table shard into aliasing physical-checkpoint views.
 
         Args:
-            tensor: Native local table of shape
-                ``[global_row_end - global_row_start, embedding_dim]``.
+            tensor: Single-rank local table, or a globally shaped ``Shard(0)``
+                DTensor whose local shard has shape ``[global_row_end -
+                global_row_start, embedding_dim]``.
             exclude_key_regex: Optional regular expression applied to emitted
                 checkpoint keys.
 
         Returns:
             Ordered ``(key, view)`` pairs.  Every view has shape
             ``[rows_per_checkpoint_shard, embedding_dim]`` and aliases
-            ``tensor`` along its first axis.
+                the local table storage along its first axis.
         """
-        if not isinstance(tensor, torch.Tensor) or state_dict_utils.is_dtensor(tensor):
-            raise TypeError("The owner-sharded Engram weight must be a rank-local torch.Tensor")
-        expected_shape = (
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError("The Engram weight must be a Tensor")
+        expected_local_shape = (
             int(self.engram_table.global_row_end) - int(self.engram_table.global_row_start),
             self.engram_table.embedding_dim,
         )
-        if tuple(tensor.shape) != expected_shape:
+        if isinstance(tensor, DTensor):
+            expected_global_shape = (self.engram_table.num_embeddings, self.engram_table.embedding_dim)
+            if tuple(tensor.shape) != expected_global_shape:
+                raise ValueError(
+                    f"Native Engram DTensor shape {tuple(tensor.shape)} does not match global table shape "
+                    f"{expected_global_shape}"
+                )
+            if tuple(tensor.placements) != (Shard(0),):
+                raise ValueError(f"Native Engram DTensor must use placement Shard(0), got {tensor.placements}")
+            if self.engram_table.process_group is None:
+                raise RuntimeError("A single-rank reference Engram table must not be a DTensor")
+            owner_ranks = tuple(torch.distributed.get_process_group_ranks(self.engram_table.process_group))
+            mesh_ranks = tuple(torch.distributed.get_process_group_ranks(tensor.device_mesh.get_group()))
+            if owner_ranks != mesh_ranks:
+                raise ValueError(
+                    "Native Engram DTensor mesh does not match the owner process group: "
+                    f"owner={owner_ranks}, mesh={mesh_ranks}"
+                )
+            local_tensor = tensor.to_local()
+        else:
+            local_tensor = tensor
+        if tuple(local_tensor.shape) != expected_local_shape:
             raise ValueError(
-                f"Native Engram weight shape {tuple(tensor.shape)} does not match local owner range "
-                f"and embedding dimension {expected_shape}"
+                f"Native Engram local weight shape {tuple(local_tensor.shape)} does not match local owner range "
+                f"and embedding dimension {expected_local_shape}"
             )
 
         result: list[tuple[str, torch.Tensor]] = []
@@ -240,7 +264,7 @@ class Qwen4ExpStateDictAdapter(Qwen3_5MoeStateDictAdapter):
             key = f"{self._table_hf_prefix}.shard_{shard_idx}.weight"
             if exclude_key_regex and re.match(exclude_key_regex, key):
                 continue
-            view = tensor.narrow(0, local_row_start, self._rows_per_checkpoint_shard)
+            view = local_tensor.narrow(0, local_row_start, self._rows_per_checkpoint_shard)
             result.append((key, view))
         return result
 
@@ -254,8 +278,8 @@ class Qwen4ExpStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         """Convert native tensors and expose the local PLE table as views.
 
         Args:
-            state_dict: Native tensors.  The PLE entry has shape
-                ``[local_table_rows, embedding_dim]``; inherited grouped expert
+            state_dict: Native tensors. The PLE entry is either local or a
+                globally shaped ``Shard(0)`` DTensor; inherited grouped expert
                 entries have shape ``[experts, input, output]``.
             exclude_key_regex: Optional regular expression for checkpoint keys.
             quantization: Whether inherited expert export should use the

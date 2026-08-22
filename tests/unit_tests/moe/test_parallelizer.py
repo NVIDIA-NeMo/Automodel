@@ -1077,6 +1077,56 @@ def test_apply_fsdp_excludes_model_owned_shard_from_block_and_root(monkeypatch):
     assert root_call[1]["ignored_params"] == {owner_weight}
 
 
+def test_apply_fsdp_prepares_and_excludes_final_model_owned_dtensor_identity(monkeypatch):
+    """The model hook runs before every FSDP unit snapshots ignored params."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    # ``_import_parallelizer_with_stubs`` gives the module its own minimal
+    # ``torch.nn.Parameter`` class.  Use that exact runtime class so this test
+    # exercises the production type guard instead of mixing the real and
+    # stubbed torch modules.
+    distributed_weight = P.nn.Parameter()
+
+    class ModelOwnedDTensorBlock(DummyBlock):
+        def parameters(self):
+            yield distributed_weight
+
+    class ModelOwnedDTensorModel(DummyModel):
+        def parameters(self):
+            yield distributed_weight
+
+        def _nemo_prepare_model_owned_dtensors(self, mesh):
+            assert mesh is fsdp_mesh
+            return {distributed_weight}
+
+    block = ModelOwnedDTensorBlock(mlp=DummyMoE())
+    model = ModelOwnedDTensorModel([block])
+    fsdp_mesh = object()
+    monkeypatch.setattr(
+        P,
+        "get_model_owned_dtensor_spec",
+        lambda parameter: object() if parameter is distributed_weight else None,
+    )
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+    )
+
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    assert block_call[1]["ignored_params"] == {distributed_weight}
+    root_call = _find_call_by_first_arg(fully_shard_mock, model)
+    assert root_call is not None
+    assert root_call[1]["ignored_params"] == {distributed_weight}
+
+
 @pytest.mark.parametrize(
     "audio_trainable, visual_trainable",
     [

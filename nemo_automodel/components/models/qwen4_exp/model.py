@@ -31,6 +31,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
@@ -582,6 +583,28 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         """Replace the untied LM projection."""
         self.lm_head = value
 
+    def _nemo_prepare_model_owned_dtensors(self, fsdp_mesh: DeviceMesh) -> set[nn.Parameter]:
+        """Convert PLE owner shards to global DTensors before FSDP wrapping.
+
+        Args:
+            fsdp_mesh: Flattened data/context shard mesh whose rank order is
+                identical to the PLE owner process group.
+
+        Returns:
+            The exact registered parameter identities that FSDP must ignore
+            because the model consumes their local shards directly.
+        """
+        parameters: set[nn.Parameter] = set()
+        for layer in self.model.language_model.layers.values():
+            if layer.ple is None:
+                continue
+            table = layer.ple.ple_embedding.ngram_embedding
+            parameter = table.parallelize_weight(fsdp_mesh)
+            if id(parameter) not in {id(registered) for registered in self.parameters()}:
+                raise RuntimeError("The parallelized Engram DTensor is not registered on the Qwen4-Exp model")
+            parameters.add(parameter)
+        return parameters
+
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
         """Return Qwen4-Exp's contiguous model-owned CP batch sharder.
 
@@ -703,7 +726,7 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
         for layer in self.model.language_model.layers.values():
             if layer.ple is not None:
-                layer.ple.ple_embedding.ngram_embedding.mark_owner_weight()
+                layer.ple.ple_embedding.ngram_embedding.mark_sharding_contract()
 
 
 ModelClass = Qwen4ExpForConditionalGeneration

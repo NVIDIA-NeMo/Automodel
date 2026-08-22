@@ -20,9 +20,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.qwen4_exp.engram import Qwen4ExpEngramTableConfig
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.shared.owner_sharding import get_model_owned_dtensor_spec
 
 
 class _EngramOnlyModel(nn.Module):
@@ -35,6 +38,13 @@ class _EngramOnlyModel(nn.Module):
             embedding_dim=2,
             initializer_range=0.0,
         ).build(process_group=dist.group.WORLD, dtype=torch.float32)
+        self.table.parallelize_weight(
+            DeviceMesh.from_group(
+                dist.group.WORLD,
+                device_type="cpu",
+                mesh_dim_names=("dp_shard_cp",),
+            )
+        )
 
 
 def _engram_scale_and_norm_worker(rank: int, world_size: int, store_path: str) -> None:
@@ -47,10 +57,14 @@ def _engram_scale_and_norm_worker(rank: int, world_size: int, store_path: str) -
             world_size=world_size,
         )
         model = _EngramOnlyModel()
-        owner_spec = model.table.weight._nemo_owner_sharded_spec
+        assert isinstance(model.table.weight, DTensor)
+        assert tuple(model.table.weight.shape) == (6, 2)
+        assert tuple(model.table.weight.placements) == (Shard(0),)
+        owner_spec = get_model_owned_dtensor_spec(model.table.weight)
+        assert owner_spec is not None
         assert owner_spec.process_group is dist.group.WORLD
         assert owner_spec.gradient_divisor == float(world_size)
-        assert owner_spec.optimizer_state_namespace == "__nemo_engram_owner_v1"
+        assert owner_spec.legacy_optimizer_state_namespace == "__nemo_engram_owner_v1"
         model.table.weight.grad = torch.full_like(model.table.weight, float(rank + 1))
 
         total_norm = scale_grads_and_clip_grad_norm(
@@ -59,8 +73,9 @@ def _engram_scale_and_norm_worker(rank: int, world_size: int, store_path: str) -
             foreach=True,
         )
 
-        expected_grad = torch.full_like(model.table.weight, float(rank + 1) / world_size)
-        torch.testing.assert_close(model.table.weight.grad, expected_grad, rtol=0, atol=0)
+        expected_grad = torch.full_like(model.table.weight.to_local(), float(rank + 1) / world_size)
+        assert isinstance(model.table.weight.grad, DTensor)
+        torch.testing.assert_close(model.table.weight.grad.to_local(), expected_grad, rtol=0, atol=0)
         # Six local values across two ranks: rank 0 contributes 6*(1/2)^2,
         # rank 1 contributes 6*(2/2)^2.
         expected_norm = torch.tensor(7.5, dtype=torch.float64).sqrt()

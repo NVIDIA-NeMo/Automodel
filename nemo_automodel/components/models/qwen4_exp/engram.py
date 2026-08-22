@@ -24,11 +24,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.qwen4_exp.cp import Qwen4ExpCPContext, qwen4_cp_left_halo
 from nemo_automodel.components.models.qwen4_exp.layers import Qwen4ExpGroupedRMSNorm
-from nemo_automodel.shared.owner_sharding import OwnerShardedParameterSpec
+from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec, OwnerShardedParameterSpec
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 _QWEN4_EXP_OWNER_OPTIMIZER_STATE_NAMESPACE = "__nemo_engram_owner_v1"
@@ -338,8 +340,15 @@ class Qwen4ExpOwnerShardedEmbedding(nn.Module):
                 dtype=dtype,
             )
         )
-        self.mark_owner_weight()
+        self.mark_sharding_contract()
         self.reset_parameters()
+
+    def mark_sharding_contract(self) -> None:
+        """Restore the contract matching the current parameter representation."""
+        if isinstance(self.weight, DTensor):
+            self.mark_model_owned_dtensor_weight()
+        else:
+            self.mark_owner_weight()
 
     def mark_owner_weight(self) -> None:
         """Stamp the model-owned sharding contract on the current Parameter.
@@ -349,6 +358,8 @@ class Qwen4ExpOwnerShardedEmbedding(nn.Module):
         that replacement, so the top-level model calls this method again after
         materialization and dtype casting.
         """
+        if isinstance(self.weight, DTensor):
+            raise TypeError("A distributed Engram DTensor must use the model-owned DTensor contract")
         self.weight._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
             process_group=self.process_group,
             gradient_divisor=float(self.owner_world_size),
@@ -357,10 +368,105 @@ class Qwen4ExpOwnerShardedEmbedding(nn.Module):
             optimizer_state_namespace=_QWEN4_EXP_OWNER_OPTIMIZER_STATE_NAMESPACE,
         )
 
+    def mark_model_owned_dtensor_weight(self) -> None:
+        """Restore the runtime contract on a materialized PLE DTensor.
+
+        Meta materialization preserves the DTensor parameter identity and
+        placements, but arbitrary tensor attributes are not guaranteed to
+        survive.  The top-level model therefore calls this method after weight
+        initialization and dtype casting.
+        """
+        if not isinstance(self.weight, DTensor):
+            raise TypeError("The distributed Engram weight must be a DTensor before its runtime contract is marked")
+        if self.process_group is None:
+            raise RuntimeError("A single-rank reference Engram table must not use the distributed DTensor contract")
+        self.weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
+            process_group=self.process_group,
+            gradient_divisor=float(self.owner_world_size),
+            legacy_optimizer_state_namespace=_QWEN4_EXP_OWNER_OPTIMIZER_STATE_NAMESPACE,
+        )
+
+    def parallelize_weight(self, fsdp_mesh: DeviceMesh) -> nn.Parameter:
+        """Represent the already-local owner shard as one global DTensor.
+
+        The local storage is already the final contiguous row shard, so this
+        method uses :meth:`DTensor.from_local` rather than redistributing or
+        slicing it again.  It runs before FSDP records its ignored parameters;
+        the returned parameter identity must be passed unchanged to every FSDP
+        unit containing the table.
+
+        Args:
+            fsdp_mesh: One-dimensional FSDP shard/CP mesh. Its rank order must
+                exactly match the PLE owner process group.
+
+        Returns:
+            The registered global ``[num_embeddings, embedding_dim]`` DTensor
+            parameter with placement ``Shard(0)``.
+        """
+        if self.process_group is None:
+            raise RuntimeError("A single-rank reference Engram table must remain an ordinary Parameter")
+        if fsdp_mesh.ndim != 1:
+            raise ValueError(f"The Engram DTensor requires a one-dimensional owner mesh, got ndim={fsdp_mesh.ndim}")
+        if fsdp_mesh.size() != self.owner_world_size:
+            raise ValueError(
+                "The Engram owner group and FSDP mesh must have the same size: "
+                f"{self.owner_world_size} != {fsdp_mesh.size()}"
+            )
+        owner_ranks = tuple(dist.get_process_group_ranks(self.process_group))
+        mesh_ranks = tuple(dist.get_process_group_ranks(fsdp_mesh.get_group()))
+        if owner_ranks != mesh_ranks:
+            raise ValueError(
+                "The Engram owner group rank order must exactly match the FSDP mesh: "
+                f"owner={owner_ranks}, fsdp={mesh_ranks}"
+            )
+
+        expected_global_shape = (self.num_embeddings, self.embedding_dim)
+        expected_local_shape = (self.num_embeddings_per_rank, self.embedding_dim)
+        if isinstance(self.weight, DTensor):
+            if tuple(self.weight.shape) != expected_global_shape:
+                raise ValueError(
+                    f"Engram DTensor global shape {tuple(self.weight.shape)} does not match {expected_global_shape}"
+                )
+            if tuple(self.weight.placements) != (Shard(0),):
+                raise ValueError(f"Engram DTensor must use placement Shard(0), got {self.weight.placements}")
+            if tuple(self.weight.to_local().shape) != expected_local_shape:
+                raise ValueError(
+                    "Engram DTensor local shape does not match its contiguous owner range: "
+                    f"{tuple(self.weight.to_local().shape)} != {expected_local_shape}"
+                )
+            current_mesh_ranks = tuple(dist.get_process_group_ranks(self.weight.device_mesh.get_group()))
+            if current_mesh_ranks != mesh_ranks:
+                raise ValueError(
+                    "Engram DTensor is already attached to a different mesh: "
+                    f"current={current_mesh_ranks}, requested={mesh_ranks}"
+                )
+            self.mark_model_owned_dtensor_weight()
+            return self.weight
+
+        if tuple(self.weight.shape) != expected_local_shape:
+            raise ValueError(
+                "Engram local weight shape does not match its contiguous owner range: "
+                f"{tuple(self.weight.shape)} != {expected_local_shape}"
+            )
+        local_weight = self.weight.detach()
+        requires_grad = self.weight.requires_grad
+        distributed_weight = DTensor.from_local(
+            local_weight,
+            device_mesh=fsdp_mesh,
+            placements=(Shard(0),),
+            run_check=False,
+            shape=torch.Size(expected_global_shape),
+            stride=(self.embedding_dim, 1),
+        )
+        self.weight = nn.Parameter(distributed_weight, requires_grad=requires_grad)
+        self.mark_model_owned_dtensor_weight()
+        return self.weight
+
     @torch.no_grad()
     def reset_parameters(self) -> None:
         """Initialize the rank-local weight with a finite normal distribution."""
-        nn.init.normal_(self.weight, mean=0.0, std=self.initializer_range)
+        local_weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        nn.init.normal_(local_weight, mean=0.0, std=self.initializer_range)
 
     def _validate_global_ids(self, global_ids: torch.Tensor) -> None:
         """Validate IDs symmetrically before any variable-sized collective.
@@ -621,7 +727,14 @@ class Qwen4ExpOwnerShardedEmbedding(nn.Module):
         original_shape = global_ids.shape
         flattened_ids = global_ids.reshape(-1).to(dtype=torch.long)
         if self.process_group is None:
+            if isinstance(self.weight, DTensor):
+                raise RuntimeError("A single-rank reference Engram table must not carry a distributed weight")
             return F.embedding(flattened_ids, self.weight).reshape(*original_shape, self.embedding_dim)
+        if not isinstance(self.weight, DTensor):
+            raise RuntimeError(
+                "The distributed Engram table was used before its owner shard became a global DTensor; "
+                "apply the model's distributed parallelization first"
+            )
 
         owners = torch.div(flattened_ids, self.num_embeddings_per_rank, rounding_mode="floor")
         send_counts = torch.bincount(owners, minlength=self.owner_world_size).to(torch.int64)
@@ -637,7 +750,8 @@ class Qwen4ExpOwnerShardedEmbedding(nn.Module):
         )
         self._validate_received_ids(received_ids, output_split_sizes)
         local_ids = received_ids - self.vocab_start_index
-        owned_values = F.embedding(local_ids, self.weight)
+        local_weight = self.weight.to_local(grad_placements=self.weight.placements)
+        owned_values = F.embedding(local_ids, local_weight)
         returned_values = _FixedCapacityAllToAll.apply(
             owned_values,
             output_split_sizes,

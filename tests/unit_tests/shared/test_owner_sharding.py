@@ -19,7 +19,9 @@ import torch
 
 import nemo_automodel.shared.owner_sharding as owner_sharding
 from nemo_automodel.shared.owner_sharding import (
+    ModelOwnedDTensorSpec,
     OwnerShardedParameterSpec,
+    get_model_owned_dtensor_spec,
     get_owner_sharded_parameter_spec,
 )
 
@@ -95,3 +97,54 @@ def test_get_owner_sharded_parameter_spec_rejects_second_sharding_owner(monkeypa
 
     with pytest.raises(RuntimeError, match="cannot also use a model-owned sharding"):
         get_owner_sharded_parameter_spec(parameter)
+
+
+def test_model_owned_dtensor_spec_round_trip(monkeypatch) -> None:
+    parameter = torch.nn.Parameter(torch.ones(2, 3))
+    spec = ModelOwnedDTensorSpec(
+        process_group=object(),
+        gradient_divisor=4.0,
+        legacy_optimizer_state_namespace="__test_owner_v1",
+    )
+    parameter._nemo_model_owned_dtensor_spec = spec
+    monkeypatch.setattr(owner_sharding, "DTensor", torch.Tensor)
+
+    assert get_model_owned_dtensor_spec(parameter) is spec
+
+
+@pytest.mark.parametrize("divisor", [0.0, -1.0, float("inf"), float("nan")])
+def test_model_owned_dtensor_spec_rejects_invalid_gradient_divisor(divisor: float) -> None:
+    with pytest.raises(ValueError, match="gradient_divisor"):
+        ModelOwnedDTensorSpec(
+            process_group=object(),
+            gradient_divisor=divisor,
+            legacy_optimizer_state_namespace="__test_owner_v1",
+        )
+
+
+def test_model_owned_dtensor_spec_requires_dtensor() -> None:
+    parameter = torch.nn.Parameter(torch.ones(1))
+    parameter._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
+        process_group=object(),
+        gradient_divisor=1.0,
+    )
+
+    with pytest.raises(TypeError, match="only be attached to a DTensor"):
+        get_model_owned_dtensor_spec(parameter)
+
+
+def test_model_owned_dtensor_spec_rejects_both_contracts(monkeypatch) -> None:
+    parameter = torch.nn.Parameter(torch.ones(1))
+    parameter._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
+        process_group=object(),
+        gradient_divisor=1.0,
+    )
+    parameter._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
+        process_group=None,
+        gradient_divisor=1.0,
+        optimizer_state_namespace="__test_owner_v1",
+    )
+    monkeypatch.setattr(owner_sharding, "DTensor", torch.Tensor)
+
+    with pytest.raises(RuntimeError, match="both owner-sharding contracts"):
+        get_model_owned_dtensor_spec(parameter)
