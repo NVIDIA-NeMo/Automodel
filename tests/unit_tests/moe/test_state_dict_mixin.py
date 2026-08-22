@@ -894,6 +894,45 @@ class TestFromHfWMergedExperts:
 
 
 class TestConvertSingleMergedExpertToHfSplitExperts:
+    def test_allocating_cuda_conversions_use_generation_zero_collection(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        mixin.backend.experts = "te"
+        gate_up_tensor = Mock(spec=torch.Tensor, is_meta=False, is_cuda=True)
+        down_tensor = Mock(spec=torch.Tensor, ndim=3, shape=(2, 3, 4), is_meta=False, is_cuda=True)
+        gate_up_splits = [
+            torch.arange(24, dtype=torch.float32).reshape(4, 6) + 24 * expert_id for expert_id in range(2)
+        ]
+        down_splits = [torch.arange(12, dtype=torch.float32).reshape(3, 4) + 12 * expert_id for expert_id in range(2)]
+
+        with (
+            patch.object(mixin, "_split_experts_weights", side_effect=[gate_up_splits, down_splits]),
+            patch("torch.cuda.is_available", return_value=True),
+            patch("nemo_automodel.components.moe.state_dict_mixin.gc.collect") as collect,
+            patch("torch.cuda.empty_cache") as empty_cache,
+        ):
+            mixin._last_expert_ids = [0, 1]
+            gate_up_result = mixin._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.gate_and_up_projs", gate_up_tensor
+            )
+            down_result = mixin._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.down_projs", down_tensor
+            )
+
+        assert gate_up_result is not None and down_result is not None
+        assert [gc_call.args for gc_call in collect.call_args_list] == [(0,), (0,)]
+        assert empty_cache.call_count == 2
+        converted = dict(gate_up_result + down_result)
+        for expert_id, (gate_up_split, down_split) in enumerate(zip(gate_up_splits, down_splits)):
+            torch.testing.assert_close(
+                converted[f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"], gate_up_split[:, :3].T
+            )
+            torch.testing.assert_close(
+                converted[f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"], gate_up_split[:, 3:].T
+            )
+            torch.testing.assert_close(
+                converted[f"model.layers.0.mlp.experts.{expert_id}.down_proj.weight"], down_split.T
+            )
+
     @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
     def test_gate_and_up_projs_conversion(self, mock_is_dtensor):
         mock_is_dtensor.return_value = False
