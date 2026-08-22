@@ -505,11 +505,18 @@ class TestQwen3VLMoeForConditionalGeneration:
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
         attention_mask = torch.ones(batch, seq_len, device=device)
         padding_mask = torch.zeros(batch, seq_len, dtype=torch.bool, device=device)
+        pixel_values = torch.randn(1, 4, vl_config.vision_config.in_channels, device=device)
+        image_grid_thw = torch.tensor([[1, 2, 2]], device=device)
 
         squeezed_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
         squeezed_position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
         squeezed_padding_mask = torch.ones(batch, seq_len, dtype=torch.bool, device=device)
         squeezed_kwargs = {"foo": "bar"}
+        squeeze_input_kwargs = {}
+
+        def fake_squeeze(input_ids, position_ids, padding_mask, kwargs):
+            squeeze_input_kwargs.update(kwargs)
+            return squeezed_ids, squeezed_position_ids, squeezed_padding_mask, squeezed_kwargs
 
         # Mock the model.model.forward to avoid internal tensor operations
         mock_hidden = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
@@ -517,7 +524,7 @@ class TestQwen3VLMoeForConditionalGeneration:
         with (
             patch(
                 "nemo_automodel.components.models.qwen3_vl_moe.model.squeeze_input_for_thd",
-                return_value=(squeezed_ids, squeezed_position_ids, squeezed_padding_mask, squeezed_kwargs),
+                side_effect=fake_squeeze,
             ) as mock_squeeze,
             patch.object(model.model, "forward") as mock_model_forward,
         ):
@@ -531,6 +538,8 @@ class TestQwen3VLMoeForConditionalGeneration:
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 qkv_format="thd",
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
             )
 
             # Result should be logits from lm_head
@@ -542,9 +551,14 @@ class TestQwen3VLMoeForConditionalGeneration:
             assert squeeze_args[1] is position_ids
             assert squeeze_args[2] is padding_mask
             assert squeeze_args[3]["qkv_format"] == "thd"
+            assert "pixel_values" not in squeeze_input_kwargs
+            assert "image_grid_thw" not in squeeze_input_kwargs
 
             # Verify model.model.forward was called
             mock_model_forward.assert_called_once()
+            model_kwargs = mock_model_forward.call_args.kwargs
+            assert model_kwargs["pixel_values"] is pixel_values
+            assert model_kwargs["image_grid_thw"] is image_grid_thw
 
     def test_initialize_weights_invokes_language_model(self, vl_config, backend_config, moe_config):
         model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)

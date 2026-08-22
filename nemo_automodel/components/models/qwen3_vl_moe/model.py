@@ -645,9 +645,24 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                 padding_mask = None
 
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
+            # These tensors are indexed by media item, not by the placeholder
+            # THD batch dimension, so squeezing dim 0 would drop a single item.
+            media_kwargs = {
+                key: kwargs.pop(key)
+                for key in (
+                    "pixel_values",
+                    "pixel_values_videos",
+                    "image_grid_thw",
+                    "video_grid_thw",
+                    "image_position_ids",
+                    "second_per_grid_ts",
+                )
+                if key in kwargs
+            }
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, kwargs
             )
+            kwargs.update(media_kwargs)
             attention_mask = None
             if padding_mask is not None:
                 kwargs["padding_mask"] = padding_mask
