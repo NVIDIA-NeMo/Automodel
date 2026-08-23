@@ -1645,9 +1645,17 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             self._vlm_chunk_idx = chunk_idx + 1
 
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
+            # These tensors are indexed by media item, not by the placeholder
+            # THD batch dimension, so squeezing dim 0 would drop a single item.
+            media_kwargs = {
+                key: kwargs.pop(key)
+                for key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw")
+                if key in kwargs
+            }
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, kwargs
             )
+            kwargs.update(media_kwargs)
             attention_mask = None
 
         # Context-parallel: embed + vision-splice the full sequence, then select

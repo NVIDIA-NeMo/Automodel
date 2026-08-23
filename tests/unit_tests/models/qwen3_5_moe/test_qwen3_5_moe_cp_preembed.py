@@ -13,6 +13,7 @@ and stub the heavy submodules.
 from __future__ import annotations
 
 import types
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -66,6 +67,41 @@ def test_declares_cp_vision_frame_sharding_support():
     capabilities = Qwen3_5MoeForConditionalGeneration.ModelCapabilities()
 
     assert capabilities.supports_cp_vision_frame_sharding is True
+
+
+@pytest.mark.parametrize(
+    ("pixel_key", "grid_key"),
+    (("pixel_values", "image_grid_thw"), ("pixel_values_videos", "video_grid_thw")),
+)
+def test_thd_forward_preserves_single_media_axes(pixel_key, grid_key):
+    model = Qwen3_5MoeForConditionalGeneration.__new__(Qwen3_5MoeForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.config = types.SimpleNamespace(
+        text_config=types.SimpleNamespace(output_hidden_states=False),
+        image_token_id=99,
+        vision_start_token_id=98,
+    )
+    model.model = MagicMock(return_value=types.SimpleNamespace(last_hidden_state=torch.randn(3, 4)))
+    model.cp_mesh = None
+    model.mtp = None
+    model.lm_head = None
+
+    pixel_values = torch.randn(1, 12)
+    grid_thw = torch.tensor([[1, 1, 1]])
+    result = model(
+        input_ids=torch.tensor([[99, 1, 2]]),
+        position_ids=torch.arange(3).unsqueeze(0),
+        padding_mask=torch.zeros(1, 3, dtype=torch.bool),
+        qkv_format="thd",
+        **{pixel_key: pixel_values, grid_key: grid_thw},
+    )
+
+    assert result.logits.shape == (3, 4)
+    model_kwargs = model.model.call_args.kwargs
+    assert model_kwargs[pixel_key] is pixel_values
+    assert model_kwargs[pixel_key].shape == (1, 12)
+    assert model_kwargs[grid_key] is grid_thw
+    assert model_kwargs[grid_key].shape == (1, 3)
 
 
 class TestPrepareModelInputsForCP:
