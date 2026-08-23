@@ -125,8 +125,8 @@ fixture_keys:
     - hf_reload_timeout_seconds
     - hf_source_post_load_dequantize
     # Optional routed-MoE evidence to determine whether parity outliers are
-    # caused by numerically fragile router choices. Currently enabled only for
-    # GLM 4.7 Flash.
+    # caused by numerically fragile router choices. Currently implemented only
+    # for GLM 4.7 Flash.
     - capture_router_diagnostics
     # Optional HF self-comparison across sequence lengths, used to distinguish
     # shape-sensitive numerics from a cross-framework loading or parity bug. A
