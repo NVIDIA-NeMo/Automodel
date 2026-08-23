@@ -183,6 +183,7 @@ class DFlashTrainerModule(nn.Module):
         loss_decay_gamma: float | None = None,
         loss_type: str = "dflash",
         prefix_weight_base: float = 0.9,
+        sliding_window: int | None = None,
     ):
         super().__init__()
         if loss_type not in _DFLASH_LOSS_TYPES:
@@ -202,6 +203,13 @@ class DFlashTrainerModule(nn.Module):
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
+        # Bounds how far back a block reads the target context. ``None`` keeps the
+        # full prefix (plain DFlash); the published DFlash 2 drafters train and
+        # serve their ``sliding_attention`` layers with a finite window, which also
+        # keeps the flex BlockMask sparse on long sequences.
+        if sliding_window is not None and sliding_window < 1:
+            raise ValueError(f"sliding_window must be >= 1 when set, got {sliding_window}.")
+        self.sliding_window = sliding_window
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.prefix_weight_base = float(prefix_weight_base)
@@ -490,6 +498,7 @@ class DFlashTrainerModule(nn.Module):
                 causal=causal,
                 ctx_doc_id=ctx_doc_id,
                 anchor_doc_id=anchor_doc_id,
+                sliding_window=self.sliding_window,
             )
         else:
             attn_mask = create_dflash_sdpa_mask(
@@ -502,6 +511,7 @@ class DFlashTrainerModule(nn.Module):
                 causal=causal,
                 ctx_doc_id=ctx_doc_id,
                 anchor_doc_id=anchor_doc_id,
+                sliding_window=self.sliding_window,
             )
         return anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, prefix_lengths
 
