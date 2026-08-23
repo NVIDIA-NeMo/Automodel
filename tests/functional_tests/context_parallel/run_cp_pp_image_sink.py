@@ -171,13 +171,14 @@ def main():
                 [batch, sequence] in the same CP-local layout as the logits.
 
         Returns:
-            Tensor of shape [batch, sequence] containing per-token causal-LM loss.
+            Scalar weighted causal-LM loss numerator.
         """
         logits = output[0] if isinstance(output, tuple) else getattr(output, "logits", output)
         labels = loss_inputs["labels"]
-        return F.cross_entropy(
+        per_token_loss = F.cross_entropy(
             logits.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100, reduction="none"
         ).reshape_as(loss_inputs["weights"])
+        return (per_token_loss * loss_inputs["weights"].to(per_token_loss)).sum()
 
     def cp_only(m, world_mesh, moe_mesh, *, dp_axis_names, cp_axis_name=None, **kw):
         if cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1:
@@ -241,7 +242,7 @@ def main():
             model_inputs=batch,
             loss_fn_inputs={"labels": labels, "weights": torch.ones_like(labels, dtype=torch.float32)},
         )
-        result = engine.forward_backward([datum], loss_fn)
+        result = engine.forward_backward([[datum]], loss_fn)
         losses.append(float(result.loss.detach()))
 
     embed = model_part0.get_input_embeddings()

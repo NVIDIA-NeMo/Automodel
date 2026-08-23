@@ -200,10 +200,10 @@ def _ep_tp_grad_parity_worker(rank: int, world_size: int, port: int) -> None:
                 loss_inputs: Mapping whose ``weights`` tensor has shape [tokens, hidden].
 
             Returns:
-                Tensor of shape [tokens, hidden] containing per-element squared loss.
+                Scalar weighted squared-loss numerator.
             """
             observed["output"] = output.detach()
-            return output.square()
+            return (output.square() * loss_inputs["weights"].to(output)).sum()
 
         model = _ExpertModel(experts)
         model._nemo_moe_tp_requires_replica_sync = True
@@ -216,7 +216,7 @@ def _ep_tp_grad_parity_worker(rank: int, world_size: int, port: int) -> None:
             optimizers=optimizer,
             max_grad_norm=1e6,
         )
-        forward_backward_result = engine.forward_backward([datum], loss_fn)
+        forward_backward_result = engine.forward_backward([[datum]], loss_fn)
         torch.testing.assert_close(observed["output"], y_ref, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(forward_backward_result.loss, loss_ref.to(torch.float64), rtol=1e-5, atol=1e-7)
 
@@ -237,7 +237,7 @@ def _ep_tp_grad_parity_worker(rank: int, world_size: int, port: int) -> None:
             experts.down_projs.grad.to_local(), _TP_SIZE * down_grad_ref_local, rtol=1e-4, atol=1e-5
         )
 
-        # Engine.optim_step must remove exactly that factor before any parameter
+        # Engine.step must remove exactly that factor before any parameter
         # mutation. Capture the corrected gradients at its staging-fence hook;
         # the method then performs the SGD update and clears all gradients.
         corrected_grads: dict[str, torch.Tensor] = {}
@@ -246,7 +246,7 @@ def _ep_tp_grad_parity_worker(rank: int, world_size: int, port: int) -> None:
             corrected_grads["gate_up"] = experts.gate_and_up_projs.grad.to_local().detach().clone()
             corrected_grads["down"] = experts.down_projs.grad.to_local().detach().clone()
 
-        step_result = engine.optim_step(before_optimizer_step=capture_corrected_grads)
+        step_result = engine.step(before_optimizer_step=capture_corrected_grads)
         torch.testing.assert_close(corrected_grads["gate_up"], gate_up_grad_ref_local, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(corrected_grads["down"], down_grad_ref_local, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(step_result.grad_norm, reference_grad_norm, rtol=1e-5, atol=1e-7)

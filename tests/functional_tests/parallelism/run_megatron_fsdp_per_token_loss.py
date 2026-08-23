@@ -119,8 +119,8 @@ def _local_parameters(model: nn.Module) -> dict[str, torch.Tensor]:
     return parameters
 
 
-def _per_token_identity_loss(output: torch.Tensor, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-    """Return model outputs as Engine-owned weighted per-token losses.
+def _weighted_identity_loss(output: torch.Tensor, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return the weighted model-output numerator.
 
     Args:
         output: Model values shaped ``[batch=1, sequence=4]``.
@@ -128,11 +128,11 @@ def _per_token_identity_loss(output: torch.Tensor, loss_inputs: dict[str, torch.
             ``[batch=1, sequence=4]`` layout.
 
     Returns:
-        Per-token losses with shape ``[batch=1, sequence=4]``. Engine applies
-        ``weights`` and the complete-window denominator.
+        Scalar weighted numerator. Engine applies the complete-window
+        denominator.
     """
     assert output.shape == loss_inputs["weights"].shape
-    return output
+    return (output * loss_inputs["weights"].to(output)).sum()
 
 
 def _run_mode(
@@ -172,8 +172,8 @@ def _run_mode(
         max_grad_norm=1e9,
     )
     window_a, window_b = _windows(dist.get_rank())
-    result = engine.forward_backward(window_a + window_b, _per_token_identity_loss)
-    step_result = engine.optim_step()
+    result = engine.forward_backward([window_a, window_b], _weighted_identity_loss)
+    step_result = engine.step()
 
     statistics = (
         result.loss_sum.item(),

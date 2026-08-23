@@ -53,8 +53,8 @@ from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.models.common.mtp import prepare_mtp_context_parallel_inputs
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.engine import Engine, ForwardBackwardResult, ForwardResult, OptimStepResult, collate_prebatched
-from nemo_automodel.engine.outputs import LossFnOutputBatch, PerTokenOutput
+from nemo_automodel.engine import Engine, EvaluationResult, ForwardBackwardResult, StepResult, collate_prebatched
+from nemo_automodel.engine.outputs import LossOutput
 
 
 class ScaleModel(nn.Module):
@@ -287,8 +287,55 @@ def _datum(values, weights=None) -> Datum:
     return Datum(model_inputs={"input_ids": values}, loss_fn_inputs={"weights": weights})
 
 
-def _identity_loss(output, _loss_inputs):
-    return output
+def _identity_loss(output, loss_inputs):
+    return (output * loss_inputs["weights"].to(output)).sum()
+
+
+def _batches(datums, *, batch_size=1, sizes=None):
+    """Build explicit Engine batches for tests that vary outer boundaries."""
+    datums = list(datums)
+    if sizes is None:
+        return [datums[start : start + batch_size] for start in range(0, len(datums), batch_size)]
+    result = []
+    start = 0
+    for size in sizes:
+        result.append(datums[start : start + size])
+        start += size
+    assert start == len(datums)
+    return result
+
+
+def _output_records(result):
+    """Transpose field-first Engine token outputs for compact assertions."""
+    records = []
+    for batch in result.token_outputs:
+        if not batch:
+            continue
+        size = len(next(iter(batch.values())))
+        assert all(len(values) == size for values in batch.values())
+        records.extend({name: values[index] for name, values in batch.items()} for index in range(size))
+    return records
+
+
+def _batch_records(result):
+    """Return the caller-owned batch mappings that were requested."""
+    return [output for output in result.batch_outputs if output is not None]
+
+
+def _with_token_outputs(output, loss_inputs, **token_outputs):
+    """Build one scalar loss numerator with physical token fields."""
+    return LossOutput(
+        loss_sum=(output * loss_inputs["weights"].to(output)).sum(),
+        token_outputs=token_outputs,
+    )
+
+
+def _with_batch_output(output, loss_inputs, **batch_output):
+    """Build one scalar loss numerator with one caller-owned batch mapping."""
+    return LossOutput(
+        loss_sum=(output * loss_inputs["weights"].to(output)).sum(),
+        batch_output=batch_output,
+    )
 
 
 def _configure_fake_gradient_group(engine: Engine, monkeypatch, *, group_size: int) -> None:
@@ -363,24 +410,24 @@ def test_capable_fp8_model_rejects_missing_torchao_api_during_engine_constructio
     assert model.weight.grad is None
 
 
-def test_optim_step_clips_updates_and_clears_real_gradients():
+def test_step_clips_updates_and_clears_real_gradients():
     model = ScaleModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=0.5)
 
-    engine.forward_backward([_datum([4])], _identity_loss)
+    engine.forward_backward(_batches([_datum([4])]), _identity_loss)
     torch.testing.assert_close(model.weight.grad, torch.tensor(4.0))
 
-    result = engine.optim_step()
+    result = engine.step()
 
-    assert isinstance(result, OptimStepResult)
+    assert isinstance(result, StepResult)
     torch.testing.assert_close(result.grad_norm, torch.tensor(4.0, dtype=torch.float64))
     torch.testing.assert_close(model.weight, torch.tensor(0.95))
     assert model.weight.grad is None
     assert result.learning_rates == (0.1,)
 
 
-def test_optim_step_orders_multi_optimizer_topology_and_post_step_work(monkeypatch):
+def test_step_orders_multi_optimizer_topology_and_post_step_work(monkeypatch):
     events = []
 
     class GateModel(ScaleModel):
@@ -465,7 +512,7 @@ def test_optim_step_orders_multi_optimizer_topology_and_post_step_work(monkeypat
     def before_optimizer_step():
         events.append("before-step")
 
-    result = engine.optim_step(before_optimizer_step=before_optimizer_step)
+    result = engine.step(before_optimizer_step=before_optimizer_step)
 
     assert engine.optimizers == (first_optimizer, second_optimizer)
     assert engine.lr_schedulers == (first_scheduler, second_scheduler)
@@ -503,7 +550,7 @@ def test_optim_step_orders_multi_optimizer_topology_and_post_step_work(monkeypat
     assert second.weight.grad is None
 
 
-def test_optim_step_fp8_post_step_failure_does_not_advance_scheduler(monkeypatch):
+def test_step_fp8_post_step_failure_does_not_advance_scheduler(monkeypatch):
     events = []
 
     class GateModel(ScaleModel):
@@ -550,18 +597,18 @@ def test_optim_step_fp8_post_step_failure_does_not_advance_scheduler(monkeypatch
     )
 
     with pytest.raises(RuntimeError, match="fp8 scale precompute failed"):
-        engine.optim_step()
+        engine.step()
 
     assert events == ["step", "zero", "gate", "fp8"]
     torch.testing.assert_close(model.weight, torch.tensor(0.8))
     assert model.weight.grad is None
 
     with pytest.raises(RuntimeError, match="already consumed|cannot be optimized"):
-        engine.optim_step()
+        engine.step()
     assert events == ["step", "zero", "gate", "fp8"]
 
 
-def test_optim_step_callback_failure_preserves_optimizer_and_post_step_state(monkeypatch):
+def test_step_callback_failure_preserves_optimizer_and_post_step_state(monkeypatch):
     events = []
 
     class GateModel(ScaleModel):
@@ -602,7 +649,7 @@ def test_optim_step_callback_failure_preserves_optimizer_and_post_step_state(mon
         raise ValueError("staging failed")
 
     with pytest.raises(ValueError, match="staging failed"):
-        engine.optim_step(before_optimizer_step=fail_before_step)
+        engine.step(before_optimizer_step=fail_before_step)
 
     assert events == ["finalize", "before-step"]
     torch.testing.assert_close(model.weight, torch.tensor(1.0))
@@ -610,14 +657,14 @@ def test_optim_step_callback_failure_preserves_optimizer_and_post_step_state(mon
 
     # Retrying the mutation fence must consume the already-finalized gradients;
     # running finalization/scaling twice would silently change the update.
-    result = engine.optim_step()
+    result = engine.step()
     assert events == ["finalize", "before-step", "step", "zero", "gate", "scheduler"]
     torch.testing.assert_close(model.weight, torch.tensor(0.8))
     assert model.weight.grad is None
     assert result.learning_rates == (0.1,)
 
 
-def test_optim_step_finalization_failure_poison_engine(monkeypatch):
+def test_step_finalization_failure_poison_engine(monkeypatch):
     model = ScaleModel()
     model.weight.grad = torch.tensor(2.0)
     engine = Engine(model, device="cpu", optimizers=torch.optim.SGD(model.parameters(), lr=0.1))
@@ -628,15 +675,15 @@ def test_optim_step_finalization_failure_poison_engine(monkeypatch):
     monkeypatch.setattr(engine_module, "scale_grads_and_clip_grad_norm", fail_finalization)
 
     with pytest.raises(RuntimeError, match="finalization failed"):
-        engine.optim_step()
+        engine.step()
     with pytest.raises(RuntimeError, match="cannot be optimized"):
-        engine.optim_step()
+        engine.step()
 
     torch.testing.assert_close(model.weight, torch.tensor(1.0))
     torch.testing.assert_close(model.weight.grad, torch.tensor(2.0))
 
 
-def test_optim_step_requires_an_optimizer(monkeypatch):
+def test_step_requires_an_optimizer(monkeypatch):
     monkeypatch.setattr(
         engine_module,
         "scale_grads_and_clip_grad_norm",
@@ -644,10 +691,10 @@ def test_optim_step_requires_an_optimizer(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="requires at least one optimizer"):
-        Engine(ScaleModel(), device="cpu").optim_step()
+        Engine(ScaleModel(), device="cpu").step()
 
 
-def test_optim_step_rejects_noncallable_mutation_fence_before_finalization(monkeypatch):
+def test_step_rejects_noncallable_mutation_fence_before_finalization(monkeypatch):
     model = ScaleModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     monkeypatch.setattr(
@@ -657,10 +704,10 @@ def test_optim_step_rejects_noncallable_mutation_fence_before_finalization(monke
     )
 
     with pytest.raises(TypeError, match="before_optimizer_step must be callable or None"):
-        Engine(model, device="cpu", optimizers=optimizer).optim_step(before_optimizer_step=object())
+        Engine(model, device="cpu", optimizers=optimizer).step(before_optimizer_step=object())
 
 
-def test_forward_runs_eval_without_grad_lifecycle_and_returns_local_statistics(monkeypatch):
+def test_evaluate_runs_without_grad_lifecycle_and_returns_local_statistics(monkeypatch):
     class EvalModel(ScaleModel):
         def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
             assert not self.training
@@ -686,39 +733,40 @@ def test_forward_runs_eval_without_grad_lifecycle_and_returns_local_statistics(m
     )
     monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(9.0))
 
-    def loss_with_outputs(output, _loss_inputs):
+    def loss_with_outputs(output, loss_inputs):
         assert not torch.is_grad_enabled()
-        return output, [{"value": output.sum()}]
+        return _with_batch_output(output, loss_inputs, value=output.sum())
 
     engine = Engine(model, device="cpu")
     engine._dp_group_and_size = lambda: pytest.fail("forward must not synchronize data-parallel replicas")
-    result = engine.forward(
-        [_datum([1, 100], [1.0, 0.0]), _datum([3], [0.5])],
+    result = engine.evaluate(
+        _batches([_datum([1, 100], [1.0, 0.0]), _datum([3], [0.5])]),
         loss_with_outputs,
     )
 
-    assert isinstance(result, ForwardResult)
+    assert isinstance(result, EvaluationResult)
     assert result.loss_sum.item() == pytest.approx(2.5)
     assert result.weight_sum.item() == pytest.approx(1.5)
-    assert [item["value"].item() for item in result.loss_fn_outputs] == [101.0, 3.0]
-    assert all(not item["value"].requires_grad for item in result.loss_fn_outputs)
+    assert [item["value"].item() for item in _batch_records(result)] == [101.0, 3.0]
+    assert all(not item["value"].requires_grad for item in _batch_records(result))
     assert model.weight.grad.item() == 7.0
     assert model.forward_calls == 2
-    assert not model.training
+    assert model.training
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == 9.0
 
 
-def test_forward_zero_weight_window_still_executes_without_gradients():
+def test_evaluate_zero_weight_window_still_executes_without_gradients():
     model = ScaleModel()
 
-    result = Engine(model, device="cpu").forward(
-        [_datum([1, 2], [0.0, 0.0])],
+    result = Engine(model, device="cpu").evaluate(
+        _batches([_datum([1, 2], [0.0, 0.0])]),
         lambda output, _inputs: output.sum(),
     )
 
     assert result.loss_sum.item() == 0
     assert result.weight_sum.item() == 0
-    assert result.loss_fn_outputs == []
+    assert result.token_outputs == [{}]
+    assert result.batch_outputs == [None]
     assert model.forward_calls == 1
     assert model.weight.grad is None
 
@@ -729,7 +777,7 @@ def test_forward_backward_uses_one_denominator_for_the_window():
     engine = Engine(model, device="cpu")
 
     result = engine.forward_backward(
-        [_datum([1, 2]), _datum([3])],
+        _batches([_datum([1, 2]), _datum([3])]),
         _identity_loss,
     )
 
@@ -737,7 +785,8 @@ def test_forward_backward_uses_one_denominator_for_the_window():
     assert result.loss.item() == pytest.approx(2.0)
     assert result.loss_sum.item() == pytest.approx(6.0)
     assert result.weight_sum.item() == pytest.approx(3.0)
-    assert result.loss_fn_outputs == []
+    assert result.token_outputs == [{}, {}]
+    assert result.batch_outputs == [None, None]
     assert model.weight.grad.item() == pytest.approx(2.0)
     assert torch.equal(model.weight, initial_weight)
     assert model.forward_calls == 2
@@ -748,12 +797,12 @@ def test_multiple_backward_calls_with_an_optimizer_fail_fast():
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=None)
 
-    engine.forward_backward([_datum([2])], _identity_loss)
-    with pytest.raises(RuntimeError, match="optim_step"):
-        engine.forward_backward([_datum([6])], _identity_loss)
+    engine.forward_backward(_batches([_datum([2])]), _identity_loss)
+    with pytest.raises(RuntimeError, match="call step"):
+        engine.forward_backward(_batches([_datum([6])]), _identity_loss)
 
     torch.testing.assert_close(model.weight.grad, torch.tensor(2.0))
-    engine.optim_step()
+    engine.step()
     torch.testing.assert_close(model.weight, torch.tensor(0.8))
 
 
@@ -763,12 +812,12 @@ def test_multiple_backward_calls_can_accumulate_before_one_optimizer_step():
     engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=None)
 
     first = engine.forward_backward(
-        [_datum([2])],
+        _batches([_datum([2])]),
         _identity_loss,
         accumulate_gradients=True,
     )
     second = engine.forward_backward(
-        [_datum([6])],
+        _batches([_datum([6])]),
         _identity_loss,
         accumulate_gradients=True,
     )
@@ -776,7 +825,7 @@ def test_multiple_backward_calls_can_accumulate_before_one_optimizer_step():
     assert first.loss.item() == pytest.approx(2.0)
     assert second.loss.item() == pytest.approx(6.0)
     torch.testing.assert_close(model.weight.grad, torch.tensor(8.0))
-    engine.optim_step()
+    engine.step()
     torch.testing.assert_close(model.weight, torch.tensor(0.2))
 
 
@@ -785,16 +834,16 @@ def test_failed_accumulated_backward_poisoned_gradients_cannot_be_reused():
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=None)
 
-    engine.forward_backward([_datum([2])], _identity_loss, accumulate_gradients=True)
+    engine.forward_backward(_batches([_datum([2])]), _identity_loss, accumulate_gradients=True)
 
     def fail(_output, _loss_inputs):
         raise ValueError("later accumulation failed")
 
     with pytest.raises(ValueError, match="later accumulation failed"):
-        engine.forward_backward([_datum([6])], fail, accumulate_gradients=True)
+        engine.forward_backward(_batches([_datum([6])]), fail, accumulate_gradients=True)
 
     with pytest.raises(RuntimeError, match="failed"):
-        engine.optim_step()
+        engine.step()
     torch.testing.assert_close(model.weight, torch.tensor(1.0))
 
 
@@ -809,37 +858,37 @@ def test_failed_backward_poisoned_gradients_cannot_be_reused():
         calls += 1
         if calls == 2:
             raise ValueError("second microbatch failed")
-        return output
+        return _identity_loss(output, _loss_inputs)
 
     with pytest.raises(ValueError, match="second microbatch failed"):
-        engine.forward_backward([_datum([2]), _datum([6])], fail_on_second_microbatch)
+        engine.forward_backward(_batches([_datum([2]), _datum([6])]), fail_on_second_microbatch)
 
     torch.testing.assert_close(model.weight.grad, torch.tensor(1.0))
     with pytest.raises(RuntimeError, match="failed"):
-        engine.forward_backward([_datum([4])], _identity_loss)
+        engine.forward_backward(_batches([_datum([4])]), _identity_loss)
     with pytest.raises(RuntimeError, match="failed"):
-        engine.optim_step()
+        engine.step()
     torch.testing.assert_close(model.weight, torch.tensor(1.0))
 
 
-def test_optim_step_rejects_double_step_and_accepts_a_new_window():
+def test_step_rejects_double_step_and_accepts_a_new_window():
     model = ScaleModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=None)
 
-    engine.forward_backward([_datum([2])], _identity_loss)
-    engine.optim_step()
+    engine.forward_backward(_batches([_datum([2])]), _identity_loss)
+    engine.step()
     torch.testing.assert_close(model.weight, torch.tensor(0.8))
 
     with pytest.raises(RuntimeError, match="already consumed"):
-        engine.optim_step()
+        engine.step()
 
-    engine.forward_backward([_datum([5])], _identity_loss)
-    engine.optim_step()
+    engine.forward_backward(_batches([_datum([5])]), _identity_loss)
+    engine.step()
     torch.testing.assert_close(model.weight, torch.tensor(0.3))
 
 
-def test_forward_backward_groups_flat_datums_by_microbatch_size():
+def test_forward_backward_preserves_explicit_batch_groups():
     group_sizes = []
 
     def recording_collate(datums):
@@ -850,17 +899,16 @@ def test_forward_backward_groups_flat_datums_by_microbatch_size():
     result = Engine(
         model,
         device="cpu",
-        microbatch_size=2,
         collate_fn=recording_collate,
-    ).forward_backward([_datum([value]) for value in range(1, 6)], _identity_loss)
+    ).forward_backward(_batches([_datum([value]) for value in range(1, 6)], batch_size=2), _identity_loss)
 
     assert group_sizes == [2, 2, 1]
     assert model.forward_calls == 3
     assert result.loss.item() == pytest.approx(3.0)
 
 
-@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
-def test_explicit_microbatch_sizes_override_fixed_grouping(execution):
+@pytest.mark.parametrize("execution", ["evaluate", "forward_backward"])
+def test_explicit_batches_define_grouping(execution):
     groups = []
 
     def recording_collate(datums):
@@ -868,51 +916,46 @@ def test_explicit_microbatch_sizes_override_fixed_grouping(execution):
         groups.append(tuple(int(datum.model_inputs["input_ids"].item()) for datum in datums))
         return collate_datums(datums)
 
-    def loss_with_outputs(output, _loss_inputs):
-        """Return ``[B, S]`` losses and one scalar record per Datum."""
-        return output, [{"value": row.flatten()[0]} for row in output]
+    def loss_with_outputs(output, loss_inputs):
+        """Return one restored token value per Datum."""
+        return _with_token_outputs(output, loss_inputs, value=output)
 
     model = ScaleModel()
-    result = getattr(Engine(model, device="cpu", microbatch_size=1, collate_fn=recording_collate), execution)(
-        [_datum([value]) for value in range(1, 5)],
+    result = getattr(Engine(model, device="cpu", collate_fn=recording_collate), execution)(
+        _batches([_datum([value]) for value in range(1, 5)], sizes=[1, 3]),
         loss_with_outputs,
-        microbatch_sizes=[1, 3],
     )
 
     assert groups == [(1,), (2, 3, 4)]
     assert model.forward_calls == 2
-    assert [item["value"].item() for item in result.loss_fn_outputs] == [1.0, 2.0, 3.0, 4.0]
+    assert [item["value"].item() for item in _output_records(result)] == [1.0, 2.0, 3.0, 4.0]
 
 
 @pytest.mark.parametrize(
-    ("microbatch_sizes", "error_type"),
+    ("batches", "error_type"),
     [
-        pytest.param(1, TypeError, id="not-a-sequence"),
+        pytest.param(1, ValueError, id="not-a-sequence"),
         pytest.param([], ValueError, id="empty"),
-        pytest.param([0, 4], ValueError, id="zero"),
-        pytest.param([-1, 5], ValueError, id="negative"),
-        pytest.param([True, 3], TypeError, id="bool"),
-        pytest.param([1.5, 2.5], TypeError, id="non-integer"),
-        pytest.param([1, 2], ValueError, id="sum-too-small"),
-        pytest.param([1, 4], ValueError, id="sum-too-large"),
+        pytest.param([[]], ValueError, id="empty-inner-batch"),
+        pytest.param([_datum([1])], ValueError, id="flat-datums"),
+        pytest.param([[object()]], TypeError, id="non-datum-item"),
     ],
 )
-def test_explicit_microbatch_sizes_fail_before_collation(microbatch_sizes, error_type):
+def test_invalid_explicit_batches_fail_before_collation(batches, error_type):
     def unexpected_collate(_datums):
-        pytest.fail("invalid explicit microbatch sizes must fail before collation")
+        pytest.fail("invalid explicit batches must fail before collation")
 
     model = ScaleModel()
     with pytest.raises(error_type):
-        Engine(model, device="cpu", collate_fn=unexpected_collate).forward(
-            [_datum([value]) for value in range(1, 5)],
+        Engine(model, device="cpu", collate_fn=unexpected_collate).evaluate(
+            batches,
             _identity_loss,
-            microbatch_sizes=microbatch_sizes,
         )
 
     assert model.forward_calls == 0
 
 
-def test_explicit_microbatch_sizes_use_one_weighted_optimizer_window():
+def test_explicit_batches_use_one_weighted_optimizer_window():
     model = ScaleModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     datums = [
@@ -924,12 +967,11 @@ def test_explicit_microbatch_sizes_use_one_weighted_optimizer_window():
     engine = Engine(
         model,
         device="cpu",
-        microbatch_size=1,
         optimizers=optimizer,
         max_grad_norm=None,
     )
 
-    result = engine.forward_backward(datums, _identity_loss, microbatch_sizes=(1, 3))
+    result = engine.forward_backward(_batches(datums, sizes=(1, 3)), _identity_loss)
 
     assert model.forward_calls == 2
     assert result.loss_sum.item() == pytest.approx(60.0)
@@ -937,7 +979,7 @@ def test_explicit_microbatch_sizes_use_one_weighted_optimizer_window():
     assert result.loss.item() == pytest.approx(6.0)
     assert model.weight.grad.item() == pytest.approx(6.0)
 
-    engine.optim_step()
+    engine.step()
     assert model.weight.item() == pytest.approx(0.4)
 
 
@@ -1009,7 +1051,7 @@ def test_hybridep_padding_extends_only_the_physical_thd_extent(monkeypatch):
     real, padded, token_mask = engine_module._output_sequence_lengths(
         [_datum([7]), _datum([8])],
         model_inputs,
-        loss_inputs,
+        model_inputs["input_ids"],
         (0, 1),
         is_thd=True,
     )
@@ -1227,7 +1269,7 @@ def test_raw_thd_packed_collater_is_prepared_by_context_parallel_sharder():
         """
         seen.update(inputs)
         assert inputs["weights"].shape == output.shape == (3,)
-        return output
+        return _identity_loss(output, inputs)
 
     datums = [
         Datum(
@@ -1253,10 +1295,9 @@ def test_raw_thd_packed_collater_is_prepared_by_context_parallel_sharder():
     result = Engine(
         model,
         device="cpu",
-        microbatch_size=2,
         collate_fn=partial(collate_datums, packed=True),
         batch_context_fn=batch_context,
-    ).forward_backward(datums, loss_fn)
+    ).forward_backward(_batches(datums, batch_size=2), loss_fn)
 
     assert result.loss.item() == pytest.approx(2.0)
     assert "seq_lens" not in seen
@@ -1272,9 +1313,8 @@ def test_raw_thd_requires_a_thd_capable_context_parallel_sharder():
         Engine(
             model,
             device="cpu",
-            microbatch_size=2,
             collate_fn=partial(collate_datums, packed=True),
-        ).forward_backward([_datum([1, 2]), _datum([3])], _identity_loss)
+        ).forward_backward(_batches([_datum([1, 2]), _datum([3])]), _identity_loss)
 
     assert model.forward_calls == 0
 
@@ -1419,9 +1459,9 @@ def test_context_parallel_shards_model_and_rl_loss_inputs_together():
         assert inputs["weights"].tolist() == [[1.0, 1.0, 0.0, 0.0]]
         torch.testing.assert_close(inputs["advantages"], torch.tensor([[0.5, 0.6, 0.0, 0.0]]))
         torch.testing.assert_close(inputs["routed_experts"], expected_local_routes)
-        return output
+        return _identity_loss(output, inputs)
 
-    result = engine.forward_backward([datum], loss_fn)
+    result = engine.forward_backward(_batches([datum]), loss_fn)
 
     assert result.loss.item() == pytest.approx(11 / 6)
     assert model.weight.grad.item() == pytest.approx(11 / 6)
@@ -1461,7 +1501,7 @@ def test_context_parallel_rejects_legacy_non_token_weights():
             device="cpu",
             mesh_context=mesh_context,
             collate_fn=collate_prebatched,
-        ).forward([datum], _identity_loss)
+        ).evaluate(_batches([datum]), _identity_loss)
     assert model.forward_calls == 0
 
 
@@ -1483,11 +1523,11 @@ def test_packed_thd_rejects_legacy_non_token_weights_without_pp_splitting():
     )
 
     with pytest.raises(ValueError, match="packed THD.*token-aligned loss weights"):
-        Engine(model, device="cpu", collate_fn=collate_prebatched).forward([datum], _identity_loss)
+        Engine(model, device="cpu", collate_fn=collate_prebatched).evaluate(_batches([datum]), _identity_loss)
     assert model.forward_calls == 0
 
 
-@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+@pytest.mark.parametrize("execution", ["evaluate", "forward_backward"])
 def test_context_parallel_prepares_mtp_futures_before_sharding(execution):
     class MTPModel(ScaleModel):
         def __init__(self):
@@ -1555,9 +1595,9 @@ def test_context_parallel_prepares_mtp_futures_before_sharding(execution):
 
     def loss_fn(output, loss_inputs):
         captured_loss_inputs.update(loss_inputs)
-        return output
+        return _identity_loss(output, loss_inputs)
 
-    result = getattr(engine, execution)([datum], loss_fn)
+    result = getattr(engine, execution)([[datum]], loss_fn)
 
     input_ids, position_ids, valid_masks = model.mtp_forward_inputs
 
@@ -1578,7 +1618,7 @@ def test_context_parallel_prepares_mtp_futures_before_sharding(execution):
         [[21, 22, 23, -7]],
         [[22, 23, -7, -7]],
     ]
-    if execution == "forward":
+    if execution == "evaluate":
         assert result.loss_sum.item() == pytest.approx(46)
         assert result.weight_sum.item() == pytest.approx(8)
         assert model.weight.grad is None
@@ -1632,7 +1672,7 @@ def test_context_pipeline_parallel_rejects_mtp_without_combined_capability():
 def test_weights_mask_loss_and_denominator():
     model = ScaleModel()
     result = Engine(model, device="cpu").forward_backward(
-        [_datum([1, 100], [1.0, 0.0]), _datum([3, 5], [0.5, 1.0])],
+        _batches([_datum([1, 100], [1.0, 0.0]), _datum([3, 5], [0.5, 1.0])]),
         _identity_loss,
     )
 
@@ -1645,7 +1685,7 @@ def test_weights_mask_loss_and_denominator():
 def test_fractional_weight_sum_below_one_is_not_clamped():
     model = ScaleModel()
     result = Engine(model, device="cpu").forward_backward(
-        [_datum([2, 4], [0.2, 0.3])],
+        _batches([_datum([2, 4], [0.2, 0.3])]),
         _identity_loss,
     )
 
@@ -1655,37 +1695,38 @@ def test_fractional_weight_sum_below_one_is_not_clamped():
     assert model.weight.grad.item() == pytest.approx(3.2)
 
 
-def test_loss_fn_outputs_follow_datum_order_and_are_detached():
+def test_batch_outputs_follow_outer_batch_order_and_are_detached():
     model = ScaleModel()
 
-    def loss_with_outputs(output, _loss_inputs):
-        return output, [{"first_token": row.flatten()[0], "model_value": row.sum()} for row in output]
+    def loss_with_outputs(output, loss_inputs):
+        return _with_batch_output(
+            output,
+            loss_inputs,
+            first_token=output.flatten()[0],
+            model_value=output.sum(),
+        )
 
-    result = Engine(model, device="cpu", microbatch_size=2).forward_backward(
-        [_datum([1, 2]), _datum([3]), _datum([4])],
+    result = Engine(model, device="cpu").forward_backward(
+        _batches([_datum([1, 2]), _datum([3]), _datum([4])]),
         loss_with_outputs,
     )
 
-    assert [item["first_token"].item() for item in result.loss_fn_outputs] == [1, 3, 4]
-    assert all(not item["model_value"].requires_grad for item in result.loss_fn_outputs)
+    assert [item["first_token"].item() for item in _batch_records(result)] == [1, 3, 4]
+    assert all(not item["model_value"].requires_grad for item in _batch_records(result))
 
 
-@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
-def test_typed_batch_outputs_split_token_fields_into_datum_records(execution):
-    """The callback describes one collated token tensor; Engine owns Datum splitting."""
+@pytest.mark.parametrize("execution", ["evaluate", "forward_backward"])
+def test_token_outputs_split_physical_fields_into_datums(execution):
+    """The loss describes one physical token tensor; Engine owns Datum splitting."""
     datums = [_datum([1, 2]), _datum([3, 4, 5])]
 
-    def loss_with_outputs(output, _loss_inputs):
+    def loss_with_outputs(output, loss_inputs):
         token_probe = torch.stack((output, output + 100), dim=-1)
-        return output, LossFnOutputBatch(
-            per_token={"token_probe": PerTokenOutput(token_probe, fill_value=-1.0)},
-            per_datum=[{"sample_id": torch.tensor(11)}, {"sample_id": torch.tensor(22)}],
-        )
+        return _with_token_outputs(output, loss_inputs, token_probe=token_probe)
 
-    result = getattr(Engine(ScaleModel(), device="cpu", microbatch_size=2), execution)(datums, loss_with_outputs)
-    outputs = result.loss_fn_outputs
+    result = getattr(Engine(ScaleModel(), device="cpu"), execution)(_batches(datums, batch_size=2), loss_with_outputs)
+    outputs = _output_records(result)
 
-    assert [item["sample_id"].item() for item in outputs] == [11, 22]
     torch.testing.assert_close(outputs[0]["token_probe"], torch.tensor([[1.0, 101.0], [2.0, 102.0]]))
     torch.testing.assert_close(
         outputs[1]["token_probe"],
@@ -1719,25 +1760,22 @@ def test_raw_thd_multirow_outputs_restore_trailing_features_in_datum_order():
     def loss_with_outputs(output, loss_inputs):
         assert output.shape == loss_inputs["weights"].shape == (8,)
         probe = torch.stack((output, output + 100), dim=-1)
-        return output, LossFnOutputBatch(
-            per_token={"features": PerTokenOutput(probe), "tokens": PerTokenOutput(output)}
-        )
+        return _with_token_outputs(output, loss_inputs, features=probe, tokens=output)
 
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
     result = Engine(
         model,
         device="cpu",
-        microbatch_size=2,
         collate_fn=raw_thd_collate,
-    ).forward(datums, loss_with_outputs)
+    ).evaluate(_batches(datums, batch_size=2), loss_with_outputs)
 
     torch.testing.assert_close(
-        result.loss_fn_outputs[0]["features"], torch.tensor([[1.0, 101.0], [2.0, 102.0], [3.0, 103.0]])
+        _output_records(result)[0]["features"], torch.tensor([[1.0, 101.0], [2.0, 102.0], [3.0, 103.0]])
     )
-    torch.testing.assert_close(result.loss_fn_outputs[1]["features"], torch.tensor([[4.0, 104.0], [5.0, 105.0]]))
-    torch.testing.assert_close(result.loss_fn_outputs[0]["tokens"], torch.tensor([1.0, 2.0, 3.0]))
-    torch.testing.assert_close(result.loss_fn_outputs[1]["tokens"], torch.tensor([4.0, 5.0]))
+    torch.testing.assert_close(_output_records(result)[1]["features"], torch.tensor([[4.0, 104.0], [5.0, 105.0]]))
+    torch.testing.assert_close(_output_records(result)[0]["tokens"], torch.tensor([1.0, 2.0, 3.0]))
+    torch.testing.assert_close(_output_records(result)[1]["tokens"], torch.tensor([4.0, 5.0]))
 
 
 def test_typed_batch_outputs_follow_left_and_noncontiguous_attention_masks():
@@ -1765,20 +1803,19 @@ def test_typed_batch_outputs_follow_left_and_noncontiguous_attention_masks():
             ),
         )
 
-    def loss_with_outputs(output, _loss_inputs):
+    def loss_with_outputs(output, loss_inputs):
         probe = torch.stack((output, output + 100), dim=-1)
-        return output, LossFnOutputBatch(per_token={"probe": PerTokenOutput(probe)})
+        return _with_token_outputs(output, loss_inputs, probe=probe)
 
     result = Engine(
         ScaleModel(),
         device="cpu",
-        microbatch_size=2,
         collate_fn=masked_collate,
-    ).forward(datums, loss_with_outputs)
+    ).evaluate(_batches(datums, batch_size=2), loss_with_outputs)
 
-    torch.testing.assert_close(result.loss_fn_outputs[0]["probe"], torch.tensor([[10.0, 110.0], [11.0, 111.0]]))
+    torch.testing.assert_close(_output_records(result)[0]["probe"], torch.tensor([[10.0, 110.0], [11.0, 111.0]]))
     torch.testing.assert_close(
-        result.loss_fn_outputs[1]["probe"],
+        _output_records(result)[1]["probe"],
         torch.tensor([[20.0, 120.0], [21.0, 121.0], [22.0, 122.0]]),
     )
 
@@ -1788,7 +1825,7 @@ def test_padded_output_routing_keeps_attention_mask_compact():
     real_lengths, padded_lengths, token_mask = engine_module._output_sequence_lengths(
         [_datum([1, 2]), _datum([3, 4])],
         {"attention_mask": mask},
-        {"weights": mask.to(torch.float32)},
+        mask.to(torch.float32),
         (0, 1),
         is_thd=False,
     )
@@ -1800,30 +1837,29 @@ def test_padded_output_routing_keeps_attention_mask_compact():
     torch.testing.assert_close(token_mask, mask)
 
 
-def test_legacy_per_datum_output_tensors_remain_opaque():
-    """A vector whose length resembles a token axis must not opt into restoration by shape."""
+def test_batch_output_tensors_remain_opaque():
+    """A batch value whose length resembles tokens is not token-restored."""
     opaque = torch.tensor([91.0, 92.0, 93.0])
 
-    result = Engine(ScaleModel(), device="cpu", microbatch_size=2).forward(
-        [_datum([1, 2]), _datum([3, 4, 5])],
-        lambda output, _inputs: (output, [{"opaque": opaque.clone()} for _ in output]),
+    result = Engine(ScaleModel(), device="cpu").evaluate(
+        _batches([_datum([1, 2]), _datum([3, 4, 5])], batch_size=2),
+        lambda output, inputs: _with_batch_output(output, inputs, opaque=opaque.clone()),
     )
 
-    assert len(result.loss_fn_outputs[0]["opaque"]) == 3
-    assert len(result.loss_fn_outputs[1]["opaque"]) == 3
-    assert all(torch.equal(item["opaque"], opaque) for item in result.loss_fn_outputs)
+    assert len(_batch_records(result)) == 1
+    torch.testing.assert_close(_batch_records(result)[0]["opaque"], opaque)
 
 
-def test_typed_batch_output_rejects_a_mismatched_token_shape():
-    def loss_with_bad_shape(output, _loss_inputs):
-        return output, LossFnOutputBatch(
-            per_token={"bad_probe": PerTokenOutput(output[:, :-1])},
-            per_datum=[{}, {}],
+def test_token_output_rejects_a_mismatched_token_shape():
+    def loss_with_bad_shape(output, loss_inputs):
+        return LossOutput(
+            loss_sum=_identity_loss(output, loss_inputs),
+            token_outputs={"bad_probe": output[:, :-1]},
         )
 
     with pytest.raises(ValueError, match=r"bad_probe.*shape|shape.*bad_probe"):
-        Engine(ScaleModel(), device="cpu", microbatch_size=2).forward(
-            [_datum([1, 2]), _datum([3, 4])],
+        Engine(ScaleModel(), device="cpu").evaluate(
+            _batches([_datum([1, 2]), _datum([3, 4])], batch_size=2),
             loss_with_bad_shape,
         )
 
@@ -1831,27 +1867,13 @@ def test_typed_batch_output_rejects_a_mismatched_token_shape():
 def test_output_only_parse_error_is_reported_before_single_rank_backward():
     model = ScaleModel()
 
-    with pytest.raises(ValueError, match="outputs must be a sequence of mappings"):
+    with pytest.raises(TypeError, match="Tensor or LossOutput"):
         Engine(model, device="cpu").forward_backward(
-            [_datum([1, 2])],
+            _batches([_datum([1, 2])]),
             lambda output, _inputs: (output, "not-records"),
         )
 
     assert model.weight.grad is None
-
-
-def test_typed_batch_output_rejects_explicit_empty_per_datum_records():
-    def loss_with_empty_records(output, _loss_inputs):
-        return output, LossFnOutputBatch(
-            per_token={"probe": PerTokenOutput(output)},
-            per_datum=[],
-        )
-
-    with pytest.raises(ValueError, match=r"per_datum contains 0 records, expected 2"):
-        Engine(ScaleModel(), device="cpu", microbatch_size=2).forward(
-            [_datum([1]), _datum([2])],
-            loss_with_empty_records,
-        )
 
 
 @pytest.mark.parametrize(
@@ -1865,7 +1887,7 @@ def test_typed_batch_output_rejects_explicit_empty_per_datum_records():
         (
             torch.tensor([0, 4], dtype=torch.int32),
             torch.tensor([0, 5], dtype=torch.int32),
-            r"padded lengths sum to 5.*loss weights.*4",
+            r"padded lengths sum to 5.*model inputs.*4",
         ),
     ],
     ids=("real-exceeds-padded", "padded-sum-mismatch"),
@@ -1895,52 +1917,47 @@ def test_typed_batch_output_rejects_invalid_final_thd_lengths_before_forward(
         )
 
     with pytest.raises(ValueError, match=match):
-        Engine(model, device="cpu", collate_fn=bad_thd_collate).forward(
-            [_datum([1, 2, 3, 4])],
+        Engine(model, device="cpu", collate_fn=bad_thd_collate).evaluate(
+            _batches([_datum([1, 2, 3, 4])]),
             _identity_loss,
         )
     assert model.forward_calls == 0
 
 
-def test_typed_batch_output_rejects_per_token_and_per_datum_key_collision():
-    def loss_with_duplicate_key(output, _loss_inputs):
-        return output, LossFnOutputBatch(
-            per_token={"score": PerTokenOutput(output)},
-            per_datum=[{"score": torch.tensor(1.0)}, {"score": torch.tensor(2.0)}],
+def test_token_and_batch_output_names_are_independent():
+    def loss_with_duplicate_key(output, loss_inputs):
+        return LossOutput(
+            loss_sum=_identity_loss(output, loss_inputs),
+            token_outputs={"score": output},
+            batch_output={"score": output.sum()},
         )
 
-    with pytest.raises(ValueError, match=r"score.*(?:both|conflict|duplicate)|(?:both|conflict|duplicate).*score"):
-        Engine(ScaleModel(), device="cpu", microbatch_size=2).forward(
-            [_datum([1, 2]), _datum([3, 4])],
-            loss_with_duplicate_key,
-        )
+    result = Engine(ScaleModel(), device="cpu").evaluate(
+        _batches([_datum([1, 2]), _datum([3, 4])], batch_size=2),
+        loss_with_duplicate_key,
+    )
+
+    assert len(result.token_outputs[0]["score"]) == 2
+    assert _batch_records(result)[0]["score"].item() == 10
 
 
-def test_loss_fn_outputs_must_align_with_datums():
-    model = ScaleModel()
-    with pytest.raises(ValueError, match="one mapping per Datum"):
-        Engine(model, device="cpu", microbatch_size=2).forward_backward(
-            [_datum([1]), _datum([2])],
-            lambda output, _inputs: (output, [{"only": "one"}]),
-        )
-    assert model.weight.grad is None
-
-
-def test_loss_fn_outputs_must_be_consistent_across_the_window():
+def test_output_channels_may_be_requested_for_only_some_outer_batches():
     calls = 0
 
     def inconsistent_outputs(output, _inputs):
         nonlocal calls
         calls += 1
         if calls == 1:
-            return output, [{"value": output.sum()}]
-        return output
+            return _identity_loss(output, _inputs)
+        return _with_token_outputs(output, _inputs, value=output)
 
-    with pytest.raises(ValueError, match="every microbatch or none"):
-        Engine(ScaleModel(), device="cpu").forward_backward(
-            [_datum([1]), _datum([2])],
-            inconsistent_outputs,
-        )
+    result = Engine(ScaleModel(), device="cpu").forward_backward(
+        _batches([_datum([1]), _datum([2])]),
+        inconsistent_outputs,
+    )
+
+    assert result.token_outputs[0] == {}
+    torch.testing.assert_close(result.token_outputs[1]["value"][0], torch.tensor([2.0]))
 
 
 class TinyLM(nn.Module):
@@ -1973,13 +1990,14 @@ def test_raw_output_and_loss_inputs_support_an_rl_loss_callback():
         ).view_as(inputs["weights"])
         ratio = torch.exp(new_logprobs - inputs["logprobs"])
         losses = -(ratio * inputs["advantages"])
-        return losses, [{"policy_sum": (losses * inputs["weights"]).sum()}]
+        policy_sum = (losses * inputs["weights"]).sum()
+        return LossOutput(loss_sum=policy_sum, batch_output={"policy_sum": policy_sum})
 
-    result = Engine(model, device="cpu").forward_backward([datum], policy_loss)
+    result = Engine(model, device="cpu").forward_backward(_batches([datum]), policy_loss)
 
     assert torch.isfinite(result.loss)
-    assert torch.isfinite(result.loss_fn_outputs[0]["policy_sum"])
-    assert not result.loss_fn_outputs[0]["policy_sum"].requires_grad
+    assert torch.isfinite(_batch_records(result)[0]["policy_sum"])
+    assert not _batch_records(result)[0]["policy_sum"].requires_grad
     assert model.embedding.weight.grad is not None
     assert model.output.weight.grad is not None
 
@@ -2001,7 +2019,7 @@ def test_lifecycle_marks_only_the_last_microbatch_for_sync(monkeypatch):
     monkeypatch.setattr(engine_module, "get_sync_ctx", sync_context)
 
     Engine(ScaleModel(), device="cpu").forward_backward(
-        [_datum([1]), _datum([2])],
+        _batches([_datum([1]), _datum([2])]),
         _identity_loss,
     )
 
@@ -2044,7 +2062,7 @@ def test_pipeline_window_uses_schedule_microbatches_and_global_normalization():
     def loss_fn(output, inputs):
         assert active
         assert output.shape == inputs["weights"].shape == (1, 2)
-        return output
+        return _identity_loss(output, inputs)
 
     result = Engine(
         pipeline,
@@ -2053,16 +2071,18 @@ def test_pipeline_window_uses_schedule_microbatches_and_global_normalization():
         collate_fn=collate_prebatched,
         context_fn=forward_context,
     ).forward_backward(
-        [
-            _datum([[1, 2], [3, 4]]),
-            _datum([[5, 6], [7, 8]]),
-        ],
+        _batches(
+            [
+                _datum([[1, 2], [3, 4]]),
+                _datum([[5, 6], [7, 8]]),
+            ]
+        ),
         loss_fn,
     )
 
     assert result.loss.item() == pytest.approx(4.5)
     assert model.weight.grad.item() == pytest.approx(4.5)
-    assert result.loss_fn_outputs == []
+    assert _output_records(result) == []
     assert pipeline.step_calls == 2
     # The fake schedule performs and counts every backward, then returns None.
     # A second Engine-owned backward would either fail or change these counts.
@@ -2084,7 +2104,7 @@ def test_pipeline_window_uses_schedule_microbatches_and_global_normalization():
     assert not active
 
 
-def test_pipeline_forward_uses_eval_microbatches_without_backward_and_orders_outputs():
+def test_pipeline_evaluate_uses_microbatches_without_backward_and_orders_token_outputs():
     model = ScaleModel()
     other_part = ScaleModel()
     pipeline = _FakeAutoPipeline(
@@ -2098,29 +2118,28 @@ def test_pipeline_forward_uses_eval_microbatches_without_backward_and_orders_out
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
-        microbatch_size=2,
-    ).forward(
-        [_datum([1, 2]), _datum([3, 4])],
-        lambda output, _inputs: (output, [{"first_token": output.flatten()[0]}]),
+    ).evaluate(
+        _batches([_datum([1, 2]), _datum([3, 4])], batch_size=2),
+        lambda output, inputs: _with_token_outputs(output, inputs, values=output),
     )
 
     assert result.loss_sum.item() == pytest.approx(10.0)
     assert result.weight_sum.item() == pytest.approx(4.0)
-    assert [item["first_token"].item() for item in result.loss_fn_outputs] == [1.0, 3.0]
+    assert [item["values"][0].item() for item in _output_records(result)] == [1.0, 3.0]
     assert pipeline.eval_calls == 1
     assert pipeline.step_calls == 0
     assert pipeline.backward_calls == 0
     assert model.weight.grad is None
     assert model.forward_calls == 2
-    assert not model.training
-    assert not other_part.training
+    assert model.training
+    assert other_part.training
     torch.testing.assert_close(torch.stack(pipeline.callback_losses), torch.tensor([7.0, 3.0]))
 
 
 def test_forward_does_not_apply_backward_only_parallelism_restrictions():
     model = ScaleModel()
     model.calculate_per_token_loss = True
-    eager_result = Engine(model, device="cpu").forward([_datum([1])], _identity_loss)
+    eager_result = Engine(model, device="cpu").evaluate(_batches([_datum([1])]), _identity_loss)
 
     pipeline_model = ScaleModel()
     pipeline = _FakeAutoPipeline(pipeline_model, num_microbatches=1, scale_grads=True)
@@ -2128,7 +2147,7 @@ def test_forward_does_not_apply_backward_only_parallelism_restrictions():
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
-    ).forward([_datum([2])], _identity_loss)
+    ).evaluate(_batches([_datum([2])]), _identity_loss)
 
     assert eager_result.loss_sum.item() == 1.0
     assert pipeline_result.loss_sum.item() == 2.0
@@ -2136,7 +2155,7 @@ def test_forward_does_not_apply_backward_only_parallelism_restrictions():
     assert pipeline.step_calls == 0
 
 
-@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+@pytest.mark.parametrize("execution", ["evaluate", "forward_backward"])
 def test_pipeline_stage_metadata_prevents_real_forward_from_resetting_media_cursor(execution):
     class MediaModel(ScaleModel):
         def __init__(self):
@@ -2191,12 +2210,12 @@ def test_pipeline_stage_metadata_prevents_real_forward_from_resetting_media_curs
         collate_fn=collate_prebatched,
         context_fn=batch_context,
     )
-    getattr(engine, execution)([datum], _identity_loss)
+    getattr(engine, execution)([[datum]], _identity_loss)
 
     assert model.consumed_media == [1, 2]
     assert pipeline.updated_seq_lens == [1]
     assert pipeline.step_calls == int(execution == "forward_backward")
-    assert pipeline.eval_calls == int(execution == "forward")
+    assert pipeline.eval_calls == int(execution == "evaluate")
 
 
 def test_pipeline_lifecycle_and_moe_scale_cover_outer_and_inner_microbatches(monkeypatch):
@@ -2233,16 +2252,18 @@ def test_pipeline_lifecycle_and_moe_scale_cover_outer_and_inner_microbatches(mon
         mesh_context=_pipeline_mesh_context(),
         collate_fn=collate_prebatched,
     ).forward_backward(
-        [
-            _datum([[1], [2]]),
-            _datum([[3], [4]]),
-        ],
+        _batches(
+            [
+                _datum([[1], [2]]),
+                _datum([[3], [4]]),
+            ]
+        ),
         _identity_loss,
     )
 
     assert events == ["prepare", "step", "after_first", "final", "step"]
-    assert model.training
-    assert other_part.training
+    assert not model.training
+    assert not other_part.training
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.25)
 
 
@@ -2254,15 +2275,52 @@ def test_pipeline_outputs_follow_logical_microbatch_order():
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
-        microbatch_size=2,
     ).forward_backward(
-        [_datum([1]), _datum([2])],
-        lambda output, _inputs: (output, [{"metric": output.sum()}]),
+        _batches([_datum([1]), _datum([2])], batch_size=2),
+        lambda output, inputs: _with_token_outputs(output, inputs, values=output),
     )
 
     assert pipeline.step_calls == 1
     assert pipeline.backward_calls == 2
-    assert [item["metric"].item() for item in result.loss_fn_outputs] == [1.0, 2.0]
+    assert [item["values"].item() for item in _output_records(result)] == [1.0, 2.0]
+
+
+def test_pipeline_batch_output_rejects_multiple_inner_microbatches():
+    model = ScaleModel()
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2)
+
+    with pytest.raises(NotImplementedError, match="batch_output requires num_microbatches=1"):
+        Engine(
+            pipeline,
+            device="cpu",
+            mesh_context=_pipeline_mesh_context(),
+        ).evaluate(
+            _batches([_datum([1]), _datum([2])], batch_size=2),
+            lambda output, inputs: _with_batch_output(output, inputs, metric=output.sum()),
+        )
+
+
+def test_pipeline_batch_output_supports_one_inner_microbatch():
+    model = ScaleModel()
+    pipeline = _FakeAutoPipeline(model, num_microbatches=1)
+
+    result = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+    ).evaluate(
+        _batches([_datum([1, 2])]),
+        lambda output, inputs: _with_batch_output(
+            output,
+            inputs,
+            metrics={"mean": output.mean()},
+        ),
+    )
+
+    assert result.token_outputs == [{}]
+    assert len(result.batch_outputs) == 1
+    torch.testing.assert_close(result.batch_outputs[0]["metrics"]["mean"], torch.tensor(1.5))
+    assert not result.batch_outputs[0]["metrics"]["mean"].requires_grad
 
 
 def _packed_layout_datums(lengths: list[int]) -> list[Datum]:
@@ -2297,8 +2355,8 @@ def _packed_layout_datums(lengths: list[int]) -> list[Datum]:
     return datums
 
 
-@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
-def test_indexed_mask_restores_typed_outputs_and_preserves_model_metadata(execution):
+@pytest.mark.parametrize("execution", ["evaluate", "forward_backward"])
+def test_indexed_mask_restores_token_outputs_and_preserves_model_metadata(execution):
     datums = _packed_layout_datums([2, 3])
     model = _IndexedMaskScaleModel()
 
@@ -2311,31 +2369,25 @@ def test_indexed_mask_restores_typed_outputs_and_preserves_model_metadata(execut
                 ``[1, tokens]`` and whose ``sample_id`` has shape ``[datums]``.
 
         Returns:
-            The loss tensor of shape ``[1, tokens]`` and typed probes of shape
-            ``[1, tokens, 2]`` with one scalar record per Datum.
+            A scalar numerator and a probe of shape ``[1, tokens, 2]``.
         """
         probe = torch.stack((loss_inputs["advantages"], loss_inputs["old_logprobs"]), dim=-1)
-        return output, LossFnOutputBatch(
-            per_token={"probe": PerTokenOutput(probe)},
-            per_datum=[{"sample_id": sample_id} for sample_id in loss_inputs["sample_id"]],
-        )
+        return _with_token_outputs(output, loss_inputs, probe=probe)
 
     result = getattr(
         Engine(
             model,
             device="cpu",
-            microbatch_size=2,
             collate_fn=partial(collate_datums, packing_layout="indexed_mask"),
         ),
         execution,
-    )(datums, loss_with_outputs)
+    )(_batches(datums, batch_size=2), loss_with_outputs)
 
     torch.testing.assert_close(model.forward_kwargs["attention_mask"], torch.tensor([[1, 1, 2, 2, 2]]))
     torch.testing.assert_close(model.forward_kwargs["position_ids"], torch.tensor([[0, 1, 0, 1, 2]]))
     torch.testing.assert_close(model.forward_kwargs["_packed_seq_ids"], model.forward_kwargs["attention_mask"])
     assert "_engine_packing_layout" not in model.forward_kwargs
-    assert [record["sample_id"].item() for record in result.loss_fn_outputs] == [11, 22]
-    for datum, record in zip(datums, result.loss_fn_outputs):
+    for datum, record in zip(datums, _output_records(result)):
         expected = torch.stack(
             (datum.loss_fn_inputs["advantages"], datum.loss_fn_inputs["old_logprobs"]),
             dim=-1,
@@ -2366,9 +2418,8 @@ def test_indexed_mask_preserves_explicit_singleton_and_multi_datum_groups():
     Engine(
         ScaleModel(),
         device="cpu",
-        microbatch_size=1,
         collate_fn=recording_collate,
-    ).forward(datums, _identity_loss, microbatch_sizes=[1, 3])
+    ).evaluate(_batches(datums, sizes=[1, 3]), _identity_loss)
 
     torch.testing.assert_close(collated_groups[0]["attention_mask"], torch.tensor([[1, 1]]))
     torch.testing.assert_close(collated_groups[0]["_packed_seq_ids"], collated_groups[0]["attention_mask"])
@@ -2400,9 +2451,8 @@ def test_custom_packed_seq_ids_without_engine_marker_remain_ordinary_model_metad
     Engine(
         model,
         device="cpu",
-        microbatch_size=2,
         collate_fn=custom_collate,
-    ).forward(datums, _identity_loss)
+    ).evaluate(_batches(datums, batch_size=2), _identity_loss)
 
     assert model.forward_kwargs["_packed_seq_ids"].shape == (2, 3)
     assert "_engine_packing_layout" not in model.forward_kwargs
@@ -2437,9 +2487,8 @@ def test_indexed_mask_rejects_noncontiguous_document_maps(packed_seq_ids, messag
         Engine(
             ScaleModel(),
             device="cpu",
-            microbatch_size=2,
             collate_fn=invalid_collate,
-        ).forward(datums, _identity_loss)
+        ).evaluate(_batches(datums, batch_size=2), _identity_loss)
 
 
 def test_indexed_mask_rejects_context_and_pipeline_parallelism():
@@ -2458,9 +2507,8 @@ def test_indexed_mask_rejects_context_and_pipeline_parallelism():
             ScaleModel(),
             device="cpu",
             mesh_context=cp_mesh_context,
-            microbatch_size=2,
             collate_fn=collate_fn,
-        ).forward(datums, _identity_loss)
+        ).evaluate(_batches(datums, batch_size=2), _identity_loss)
 
     pipeline = _FakeAutoPipeline(ScaleModel(), num_microbatches=1)
     with pytest.raises(NotImplementedError, match="eager execution with PP size 1"):
@@ -2468,22 +2516,20 @@ def test_indexed_mask_rejects_context_and_pipeline_parallelism():
             pipeline,
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
-            microbatch_size=2,
             collate_fn=collate_fn,
-        ).forward(datums, _identity_loss)
+        ).evaluate(_batches(datums, batch_size=2), _identity_loss)
 
 
 def test_indexed_mask_rejects_hybridep_equalization():
     engine = Engine(
         ScaleModel(),
         device="cpu",
-        microbatch_size=2,
         collate_fn=partial(collate_datums, packing_layout="indexed_mask"),
     )
     engine._hybridep_equalization_groups = (object(),)
 
     with pytest.raises(NotImplementedError, match="indexed_mask.*HybridEP"):
-        engine.forward(_packed_layout_datums([2, 3]), _identity_loss)
+        engine.evaluate(_batches(_packed_layout_datums([2, 3]), batch_size=2), _identity_loss)
 
 
 def _final_thd_layout_collate(datums: list[Datum]):
@@ -2508,7 +2554,7 @@ def _final_thd_layout_collate(datums: list[Datum]):
     )
 
 
-@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+@pytest.mark.parametrize("execution", ["evaluate", "forward_backward"])
 @pytest.mark.parametrize(
     ("lengths", "collate_fn"),
     [
@@ -2516,8 +2562,8 @@ def _final_thd_layout_collate(datums: list[Datum]):
         pytest.param([1, 1, 2, 4], _final_thd_layout_collate, id="final-thd-3-plus-1"),
     ],
 )
-def test_pipeline_typed_batch_outputs_split_packed_stream_in_datum_order(execution, lengths, collate_fn):
-    """Packed callbacks return one stream; Engine restores records after logical PP ordering."""
+def test_pipeline_token_outputs_split_packed_stream_in_datum_order(execution, lengths, collate_fn):
+    """Packed loss functions return one stream; Engine restores Datum order."""
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
     pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
@@ -2525,24 +2571,19 @@ def test_pipeline_typed_batch_outputs_split_packed_stream_in_datum_order(executi
 
     def loss_with_outputs(output, loss_inputs):
         probe = torch.stack((loss_inputs["advantages"], loss_inputs["old_logprobs"]), dim=-1)
-        return output, LossFnOutputBatch(
-            per_token={"rl_probe": PerTokenOutput(probe, fill_value=-999.0)},
-            per_datum=[{"sample_id": sample_id} for sample_id in loss_inputs["sample_id"]],
-        )
+        return _with_token_outputs(output, loss_inputs, rl_probe=probe)
 
     result = getattr(
         Engine(
             pipeline,
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
-            microbatch_size=4,
             collate_fn=collate_fn,
         ),
         execution,
-    )(datums, loss_with_outputs)
-    outputs = result.loss_fn_outputs
+    )(_batches(datums, batch_size=len(datums)), loss_with_outputs)
+    outputs = _output_records(result)
 
-    assert [item["sample_id"].item() for item in outputs] == [11, 22, 33, 44]
     for datum, item in zip(datums, outputs):
         expected = torch.stack(
             (datum.loss_fn_inputs["advantages"], datum.loss_fn_inputs["old_logprobs"]),
@@ -2552,7 +2593,7 @@ def test_pipeline_typed_batch_outputs_split_packed_stream_in_datum_order(executi
         assert not item["rl_probe"].requires_grad
 
 
-@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+@pytest.mark.parametrize("execution", ["evaluate", "forward_backward"])
 def test_pipeline_raw_thd_routes_explicit_loss_layouts_and_outputs_in_datum_order(execution):
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
@@ -2567,19 +2608,18 @@ def test_pipeline_raw_thd_routes_explicit_loss_layouts_and_outputs_in_datum_orde
         torch.testing.assert_close(loss_inputs["old_logprobs"], -output)
         sample_ids = loss_inputs["sample_id"].clone()
         seen.append(sample_ids.tolist())
-        return output, [{"sample_id": sample_id} for sample_id in sample_ids]
+        return _with_token_outputs(output, loss_inputs, values=output)
 
     engine = Engine(
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
-        microbatch_size=4,
         collate_fn=partial(collate_datums, packed=True),
     )
-    result = getattr(engine, execution)(datums, loss_with_outputs)
+    result = getattr(engine, execution)(_batches(datums, batch_size=4), loss_with_outputs)
 
     assert seen == [[33, 44], [11, 22]]
-    if execution == "forward":
+    if execution == "evaluate":
         assert result.loss_sum.item() == pytest.approx(36.0)
         assert result.weight_sum.item() == pytest.approx(8.0)
         assert pipeline.eval_calls == 1
@@ -2594,11 +2634,12 @@ def test_pipeline_raw_thd_routes_explicit_loss_layouts_and_outputs_in_datum_orde
         assert pipeline.step_calls == 1
         assert pipeline.backward_calls == 2
         assert model.weight.grad.item() == pytest.approx(4.5)
-    outputs = result.loss_fn_outputs
-    assert [item["sample_id"].item() for item in outputs] == [11, 22, 33, 44]
+    outputs = _output_records(result)
+    for datum, item in zip(datums, outputs):
+        torch.testing.assert_close(item["values"], datum.input_ids.to(torch.float32))
 
 
-def test_pipeline_packed_legacy_collater_metadata_stripping_fails_closed():
+def test_pipeline_packed_collater_metadata_stripping_fails_closed():
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
     pipeline = _FakeAutoPipeline(model, num_microbatches=2)
@@ -2613,9 +2654,8 @@ def test_pipeline_packed_legacy_collater_metadata_stripping_fails_closed():
             pipeline,
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
-            microbatch_size=4,
             collate_fn=strip_layout_metadata,
-        ).forward(datums, _identity_loss)
+        ).evaluate(_batches(datums, batch_size=4), _identity_loss)
 
     assert pipeline.eval_calls == 0
 
@@ -2649,7 +2689,7 @@ def test_custom_collater_cannot_strip_loss_input_pad_values():
         return model_inputs, dict(loss_inputs)
 
     with pytest.raises(ValueError, match="CollatedLossInputs.*loss_fn_input_pad_values"):
-        Engine(model, device="cpu", collate_fn=strip_pad_metadata).forward([datum], _identity_loss)
+        Engine(model, device="cpu", collate_fn=strip_pad_metadata).evaluate(_batches([datum]), _identity_loss)
 
     assert model.forward_calls == 0
 
@@ -2699,7 +2739,7 @@ def test_typed_custom_collater_cannot_change_datum_metadata(metadata_error):
         )
 
     with pytest.raises(ValueError, match="CollatedLossInputs (pad value|layout).+disagrees"):
-        Engine(model, device="cpu", collate_fn=change_metadata).forward([datum], _identity_loss)
+        Engine(model, device="cpu", collate_fn=change_metadata).evaluate(_batches([datum]), _identity_loss)
 
     assert model.forward_calls == 0
 
@@ -2718,38 +2758,40 @@ def test_pipeline_final_thd_routes_three_plus_one_datums_and_restores_output_ord
         torch.testing.assert_close(loss_inputs["old_logprobs"], -output)
         sample_ids = loss_inputs["sample_id"].clone()
         seen.append(sample_ids.tolist())
-        return output, [{"sample_id": sample_id} for sample_id in sample_ids]
+        return _with_token_outputs(output, loss_inputs, values=output)
 
     result = Engine(
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
-        microbatch_size=4,
         collate_fn=_final_thd_layout_collate,
-    ).forward(datums, loss_with_outputs)
+    ).evaluate(_batches(datums, batch_size=4), loss_with_outputs)
 
     assert result.loss_sum.item() == pytest.approx(36.0)
     assert result.weight_sum.item() == pytest.approx(8.0)
     assert seen == [[44], [11, 22, 33]]
-    assert [item["sample_id"].item() for item in result.loss_fn_outputs] == [11, 22, 33, 44]
+    for datum, item in zip(datums, _output_records(result)):
+        torch.testing.assert_close(item["values"], datum.input_ids.to(torch.float32))
 
 
-def test_pipeline_final_thd_rejects_wrong_outputs_even_when_window_total_matches():
+def test_pipeline_final_thd_rejects_wrong_token_shape():
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
     pipeline = _FakeAutoPipeline(model, num_microbatches=2, callback_order=[1, 0])
     datums = _packed_layout_datums([1, 1, 2, 4])
 
-    with pytest.raises(ValueError, match="returned 2 outputs for microbatch 0, expected 3"):
+    with pytest.raises(ValueError, match="wrong.*physical token shape"):
         Engine(
             pipeline,
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
-            microbatch_size=4,
             collate_fn=_final_thd_layout_collate,
-        ).forward(
-            datums,
-            lambda output, _loss_inputs: (output, [{"wrong": 0}, {"wrong": 1}]),
+        ).evaluate(
+            _batches(datums, batch_size=4),
+            lambda output, inputs: LossOutput(
+                loss_sum=_identity_loss(output, inputs),
+                token_outputs={"wrong": output[:-1]},
+            ),
         )
 
 
@@ -2768,9 +2810,8 @@ def test_engine_rejects_collater_item_reordering_before_execution():
         Engine(
             ScaleModel(),
             device="cpu",
-            microbatch_size=2,
             collate_fn=reordered_collate,
-        ).forward(datums, _identity_loss)
+        ).evaluate(_batches(datums), _identity_loss)
 
 
 def test_engine_keeps_weights_as_a_per_token_contract():
@@ -2781,7 +2822,7 @@ def test_engine_keeps_weights_as_a_per_token_contract():
     )
 
     with pytest.raises(ValueError, match="weights.*PER_TOKEN"):
-        Engine(ScaleModel(), device="cpu").forward([datum], _identity_loss)
+        Engine(ScaleModel(), device="cpu").evaluate(_batches([datum]), _identity_loss)
 
 
 def test_pipeline_single_microbatch_validates_thd_item_count():
@@ -2812,7 +2853,7 @@ def test_pipeline_single_microbatch_validates_thd_item_count():
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
             collate_fn=two_sequence_collate,
-        ).forward([datum], _identity_loss)
+        ).evaluate(_batches([datum]), _identity_loss)
 
 
 def test_pipeline_output_sync_finds_last_stage_on_physical_rank_zero(monkeypatch):
@@ -2820,7 +2861,7 @@ def test_pipeline_output_sync_finds_last_stage_on_physical_rank_zero(monkeypatch
     engine = Engine(pipeline, device="cpu", mesh_context=_pipeline_mesh_context())
     pp_group = object()
     engine._pp_group_and_size = lambda: (pp_group, 2)
-    expected = [{"metric": torch.tensor(7.0)}]
+    expected = {"metric": [torch.tensor(7.0)]}
 
     def fake_all_gather_into_tensor(gathered, local, *, group):
         torch.testing.assert_close(local, torch.tensor([0, 0], dtype=torch.int64))
@@ -2832,16 +2873,16 @@ def test_pipeline_output_sync_finds_last_stage_on_physical_rank_zero(monkeypatch
         assert src == 11
         assert group is pp_group
         assert device == torch.device("cpu")
-        objects[0] = pickle.dumps(expected)
+        objects[0] = pickle.dumps({"token_outputs": expected, "batch_output": None})
 
     monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather_into_tensor)
     monkeypatch.setattr(dist, "get_rank", lambda *, group: 1)
     monkeypatch.setattr(dist, "get_global_rank", lambda group, group_rank: 11 if group_rank == 0 else 12)
     monkeypatch.setattr(dist, "broadcast_object_list", fake_broadcast_object_list)
 
-    result = engine._broadcast_pipeline_outputs([], serialized_outputs=None)
+    result = engine._broadcast_pipeline_outputs({}, None, serialized_outputs=None)
 
-    assert result == expected
+    assert result == (expected, None)
 
 
 def test_pipeline_output_sync_skips_object_broadcast_without_outputs(monkeypatch):
@@ -2862,23 +2903,23 @@ def test_pipeline_output_sync_skips_object_broadcast_without_outputs(monkeypatch
         lambda *_args, **_kwargs: pytest.fail("empty pipeline outputs must not use an object collective"),
     )
 
-    assert engine._broadcast_pipeline_outputs([], serialized_outputs=None) == []
+    assert engine._broadcast_pipeline_outputs({}, None, serialized_outputs=None) == ({}, None)
 
 
-def test_pipeline_prebatched_outputs_require_one_inner_microbatch():
+def test_pipeline_prebatched_batch_output_requires_one_inner_microbatch():
     model = ScaleModel()
     pipeline = _FakeAutoPipeline(model, num_microbatches=2)
     datum = _datum([[1], [2]])
 
-    with pytest.raises(ValueError, match="prebatched Datum may return outputs only"):
+    with pytest.raises(NotImplementedError, match="batch_output requires num_microbatches=1"):
         Engine(
             pipeline,
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
             collate_fn=collate_prebatched,
         ).forward_backward(
-            [datum],
-            lambda output, _inputs: (output, [{"metric": output.sum()}]),
+            _batches([datum]),
+            lambda output, inputs: _with_batch_output(output, inputs, metric=output.sum()),
         )
 
 
@@ -2910,7 +2951,7 @@ def test_pipeline_prebatched_per_datum_field_without_item_mapping_is_rejected():
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
             collate_fn=collate_prebatched,
-        ).forward([datum], _identity_loss)
+        ).evaluate(_batches([datum]), _identity_loss)
 
     assert pipeline.eval_calls == 0
 
@@ -2934,7 +2975,7 @@ def test_pipeline_final_thd_embeddings_use_the_token_axis_for_sequence_length():
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
         collate_fn=collate_prebatched,
-    ).forward_backward([datum], lambda output, _inputs: output.sum())
+    ).forward_backward(_batches([datum]), lambda output, _inputs: output.sum())
 
     assert pipeline.updated_seq_lens == [4]
 
@@ -2949,7 +2990,7 @@ def test_pipeline_requires_materialized_padded_microbatch_size_to_match_config()
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
             collate_fn=collate_prebatched,
-        ).forward_backward([_datum([[1], [2]])], _identity_loss)
+        ).forward_backward(_batches([_datum([[1], [2]])]), _identity_loss)
 
     assert pipeline.step_calls == 0
     assert model.forward_calls == 0
@@ -2999,9 +3040,9 @@ def test_pipeline_te_thd_keeps_arbitrary_loss_fields_aligned_through_cp(monkeypa
     def loss_fn(output, inputs):
         seen.append((output.detach().clone(), inputs["advantages"].clone(), inputs["old_logprobs"].clone()))
         assert output.shape == inputs["weights"].shape == (1, 2)
-        return output
+        return _identity_loss(output, inputs)
 
-    result = engine.forward_backward([datum], loss_fn)
+    result = engine.forward_backward(_batches([datum]), loss_fn)
 
     assert result.loss.item() == pytest.approx(18 / 8)
     assert len(pipeline.prepared_inputs) == 1
@@ -3079,7 +3120,7 @@ def test_eager_te_thd_batch_context_preserves_trailing_routes_through_cp(monkeyp
             Per-token losses with shape ``[tokens]``.
         """
         torch.testing.assert_close(loss_fn_inputs["routed_experts"], expected_routes)
-        return output
+        return _identity_loss(output, loss_fn_inputs)
 
     engine = Engine(
         model,
@@ -3091,7 +3132,7 @@ def test_eager_te_thd_batch_context_preserves_trailing_routes_through_cp(monkeyp
     engine._dp_group_and_size = lambda: (None, 1)
     engine._gradient_group_and_size = lambda _group, _size: (None, 1)
 
-    result = engine.forward_backward([datum], loss_fn)
+    result = engine.forward_backward(_batches([datum]), loss_fn)
 
     assert result.loss_sum.item() == pytest.approx(18.0)
     torch.testing.assert_close(expected_routes[-1], torch.tensor([[-1, -1]], dtype=torch.int16))
@@ -3126,7 +3167,7 @@ def test_pipeline_thd_rejects_nonzero_per_token_pad_sentinel_before_schedule():
             device="cpu",
             mesh_context=_pipeline_mesh_context(),
             collate_fn=collate_prebatched,
-        ).forward_backward([datum], _identity_loss)
+        ).forward_backward(_batches([datum]), _identity_loss)
 
     assert pipeline.step_calls == 0
     assert model.forward_calls == 0
@@ -3138,7 +3179,7 @@ def test_pipeline_rejects_schedule_gradient_scaling_before_forward():
 
     with pytest.raises(ValueError, match="scale_grads_in_schedule=False"):
         Engine(pipeline, device="cpu", mesh_context=_pipeline_mesh_context()).forward_backward(
-            [_datum([1])], _identity_loss
+            _batches([_datum([1])]), _identity_loss
         )
 
     assert pipeline.step_calls == 0
@@ -3146,7 +3187,7 @@ def test_pipeline_rejects_schedule_gradient_scaling_before_forward():
     assert model.weight.grad is None
 
 
-def test_pipeline_groups_multiple_flat_datums_into_one_outer_batch():
+def test_pipeline_splits_one_explicit_outer_batch():
     model = ScaleModel()
     pipeline = _FakeAutoPipeline(model)
 
@@ -3154,8 +3195,7 @@ def test_pipeline_groups_multiple_flat_datums_into_one_outer_batch():
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
-        microbatch_size=2,
-    ).forward_backward([_datum([1]), _datum([2])], _identity_loss)
+    ).forward_backward(_batches([_datum([1]), _datum([2])], batch_size=2), _identity_loss)
 
     assert result.loss.item() == pytest.approx(1.5)
     assert pipeline.step_calls == 1
@@ -3167,7 +3207,7 @@ def test_pipeline_requires_mesh_context_before_forward():
     pipeline = _FakeAutoPipeline(model)
 
     with pytest.raises(ValueError, match="requires mesh_context"):
-        Engine(pipeline, device="cpu").forward_backward([_datum([1])], _identity_loss)
+        Engine(pipeline, device="cpu").forward_backward(_batches([_datum([1])]), _identity_loss)
 
     assert pipeline.step_calls == 0
     assert model.forward_calls == 0
@@ -3196,13 +3236,13 @@ def test_forward_context_covers_forward_loss_and_backward():
 
     def loss_fn(output, _inputs):
         assert active
-        return output
+        return _identity_loss(output, _inputs)
 
-    Engine(model, device="cpu", context_fn=forward_context).forward_backward([_datum([1, 2])], loss_fn)
+    Engine(model, device="cpu", context_fn=forward_context).forward_backward(_batches([_datum([1, 2])]), loss_fn)
     assert not active
 
 
-@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+@pytest.mark.parametrize("execution", ["evaluate", "forward_backward"])
 def test_batch_context_receives_prepared_side_inputs_without_forwarding_them_to_model(execution):
     active = False
     legacy_active = False
@@ -3320,7 +3360,7 @@ def test_batch_context_receives_prepared_side_inputs_without_forwarding_them_to_
         assert active
         torch.testing.assert_close(loss_fn_inputs["routed_experts"], routed_experts)
         events.append("loss")
-        return output
+        return _identity_loss(output, loss_fn_inputs)
 
     result = getattr(
         Engine(
@@ -3331,7 +3371,7 @@ def test_batch_context_receives_prepared_side_inputs_without_forwarding_them_to_
             batch_context_fn=batch_context,
         ),
         execution,
-    )([datum], loss_fn)
+    )([[datum]], loss_fn)
 
     assert result.loss_sum.item() == pytest.approx(6.0)
     expected_events = ["legacy_enter", "context_enter", "model", "loss"]
@@ -3439,14 +3479,14 @@ def test_batch_context_covers_activation_checkpoint_recompute():
         Returns:
             Squared per-token losses with shape ``[B, S]``.
         """
-        return output.square()
+        return (output.square() * _loss_fn_inputs["weights"].to(output)).sum()
 
     Engine(
         model,
         device="cpu",
         collate_fn=collate_prebatched,
         batch_context_fn=batch_context,
-    ).forward_backward([datum], loss_fn)
+    ).forward_backward(_batches([datum]), loss_fn)
 
     assert model.block_calls == 2
     assert not active
@@ -3501,7 +3541,7 @@ def test_pipeline_batch_context_tracks_each_microbatch_through_checkpoint_backwa
     def loss_fn(output, loss_fn_inputs):
         route = int(loss_fn_inputs["route_id"].flatten()[0])
         assert active_route == [route]
-        return output
+        return _identity_loss(output, loss_fn_inputs)
 
     result = Engine(
         pipeline,
@@ -3509,7 +3549,7 @@ def test_pipeline_batch_context_tracks_each_microbatch_through_checkpoint_backwa
         mesh_context=_pipeline_mesh_context(),
         collate_fn=collate_prebatched,
         batch_context_fn=batch_context,
-    ).forward_backward([datum], loss_fn)
+    ).forward_backward(_batches([datum]), loss_fn)
 
     assert result.loss.item() == pytest.approx(2.5)
     assert model.weight.grad.item() == pytest.approx(2.5)
@@ -3522,7 +3562,7 @@ def test_window_sets_the_same_moe_aux_scale_as_the_recipes(monkeypatch):
     monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
 
     Engine(ScaleModel(), device="cpu").forward_backward(
-        [_datum([1]), _datum([2])],
+        _batches([_datum([1]), _datum([2])]),
         _identity_loss,
     )
 
@@ -3562,9 +3602,9 @@ def test_model_specific_collater_keeps_multimodal_inputs_and_gradients():
         ),
     ]
     model = TinyVLM()
-    Engine(model, device="cpu", microbatch_size=2, collate_fn=_vlm_collate).forward_backward(
-        datums,
-        lambda output, _inputs: output,
+    Engine(model, device="cpu", collate_fn=_vlm_collate).forward_backward(
+        _batches(datums, batch_size=2),
+        lambda output, inputs: (output * inputs["weights"].to(output)).sum(),
     )
 
     assert model.text.weight.grad is not None
@@ -3573,7 +3613,7 @@ def test_model_specific_collater_keeps_multimodal_inputs_and_gradients():
     assert model.vision.weight.grad.abs().sum() > 0
 
 
-def test_explicit_microbatch_sizes_preserve_packed_vlm_group_boundaries():
+def test_explicit_batches_preserve_packed_vlm_group_boundaries():
     processor = SimpleNamespace(
         image_token_id=99,
         image_processor=SimpleNamespace(merge_size=2),
@@ -3634,22 +3674,17 @@ def test_explicit_microbatch_sizes_preserve_packed_vlm_group_boundaries():
         yield
 
     def loss_with_routes(output, loss_inputs):
-        """Return ``[T]`` losses and restorable ``[T, L, K]`` routes."""
-        return output, LossFnOutputBatch(
-            per_token={
-                "routes": PerTokenOutput(loss_inputs["routed_experts"], fill_value=-1),
-            }
-        )
+        """Return a scalar numerator and restorable ``[T, L, K]`` routes."""
+        return _with_token_outputs(output, loss_inputs, routes=loss_inputs["routed_experts"])
 
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
     result = Engine(
         model,
         device="cpu",
-        microbatch_size=1,
         collate_fn=recording_collate,
         batch_context_fn=record_prepared_group,
-    ).forward(datums, loss_with_routes, microbatch_sizes=[1, 3])
+    ).evaluate(_batches(datums, sizes=[1, 3]), loss_with_routes)
 
     assert collate_groups == [(10,), (20, 30, 40)]
     assert [group["cu_seqlens"].numel() - 1 for group in prepared_groups] == [1, 3]
@@ -3669,7 +3704,7 @@ def test_explicit_microbatch_sizes_preserve_packed_vlm_group_boundaries():
         -1,
         -1,
     ]
-    assert [record["routes"].flatten().tolist() for record in result.loss_fn_outputs] == [
+    assert [record["routes"].flatten().tolist() for record in _output_records(result)] == [
         [10, 11],
         [20, 21],
         [30, 31],
@@ -3713,11 +3748,9 @@ def test_vlm_datum_collater_restores_prediction_aligned_outputs_without_padding(
             loss_inputs: Collated loss tensors on the same token axes.
 
         Returns:
-            The per-token loss and typed route output batch.
+            A scalar numerator and a prediction-aligned route stream.
         """
-        return output, LossFnOutputBatch(
-            per_token={"routes": PerTokenOutput(loss_inputs["routed_experts"], fill_value=-1)}
-        )
+        return _with_token_outputs(output, loss_inputs, routes=loss_inputs["routed_experts"])
 
     model = ScaleModel()
     if packing_layout == "thd":
@@ -3725,7 +3758,6 @@ def test_vlm_datum_collater_restores_prediction_aligned_outputs_without_padding(
     result = Engine(
         model,
         device="cpu",
-        microbatch_size=2,
         collate_fn=partial(
             collate_vlm_datums,
             processor=processor,
@@ -3733,10 +3765,10 @@ def test_vlm_datum_collater_restores_prediction_aligned_outputs_without_padding(
             packing_layout="indexed_mask" if packing_layout == "indexed_mask" else None,
             sequence_alignment=4 if packing_layout == "thd" else 1,
         ),
-    ).forward(datums, loss_with_routes)
+    ).evaluate(_batches(datums, batch_size=2), loss_with_routes)
 
-    torch.testing.assert_close(result.loss_fn_outputs[0]["routes"], torch.tensor([10, 11, 12]))
-    torch.testing.assert_close(result.loss_fn_outputs[1]["routes"], torch.tensor([20, 21]))
+    torch.testing.assert_close(_output_records(result)[0]["routes"], torch.tensor([10, 11, 12]))
+    torch.testing.assert_close(_output_records(result)[1]["routes"], torch.tensor([20, 21]))
 
 
 def test_prebatched_datum_keeps_existing_recipe_batch_layout():
@@ -3746,7 +3778,9 @@ def test_prebatched_datum_keeps_existing_recipe_batch_layout():
         loss_fn_inputs={"weights": torch.tensor([[1.0, 1.0], [1.0, 0.0]])},
     )
 
-    result = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward([datum], _identity_loss)
+    result = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward(
+        _batches([datum]), _identity_loss
+    )
 
     assert result.loss.item() == pytest.approx(2.0)
     assert model.weight.grad.item() == pytest.approx(2.0)
@@ -3762,7 +3796,9 @@ def test_prebatched_datum_keeps_vlm_media_layout():
         loss_fn_inputs={"weights": torch.ones(2)},
     )
 
-    result = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward([datum], _identity_loss)
+    result = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward(
+        _batches([datum]), _identity_loss
+    )
 
     assert torch.isfinite(result.loss)
     assert model.text.weight.grad is not None
@@ -3773,7 +3809,7 @@ def test_scalar_loss_is_a_local_weighted_sum_numerator():
     model = ScaleModel()
 
     result = Engine(model, device="cpu").forward_backward(
-        [_datum([1, 100], [1.0, 0.0]), _datum([3, 5], [0.5, 1.0])],
+        _batches([_datum([1, 100], [1.0, 0.0]), _datum([3, 5], [0.5, 1.0])]),
         lambda output, inputs: (output * inputs["weights"]).sum(),
     )
 
@@ -3784,7 +3820,7 @@ def test_scalar_loss_is_a_local_weighted_sum_numerator():
 def test_zero_weights_run_graph_connected_zero_backward():
     model = ScaleModel()
     result = Engine(model, device="cpu").forward_backward(
-        [_datum([1, 2], [0.0, 0.0])],
+        _batches([_datum([1, 2], [0.0, 0.0])]),
         _identity_loss,
     )
     assert result.loss.item() == 0
@@ -3800,7 +3836,7 @@ def test_pipeline_parallelism_fails_before_forward():
 
     with pytest.raises(NotImplementedError, match="pipeline"):
         Engine(model, device="cpu", mesh_context=mesh_context).forward_backward(
-            [_datum([1])],
+            _batches([_datum([1])]),
             _identity_loss,
         )
 
@@ -3826,7 +3862,7 @@ def test_gradient_reduction_mode_controls_main_loss_scale(
     engine = Engine(model, device="cpu")
     _configure_fake_gradient_group(engine, monkeypatch, group_size=4)
 
-    result = engine.forward_backward([_datum([2, 4], [1.0, 3.0])], _identity_loss)
+    result = engine.forward_backward(_batches([_datum([2, 4], [1.0, 3.0])]), _identity_loss)
 
     assert result.loss_sum.item() == pytest.approx(14.0)
     assert result.weight_sum.item() == pytest.approx(4.0)
@@ -3841,7 +3877,7 @@ def test_gradient_reduction_mode_finds_summed_backend_below_ordinary_wrapper(mon
     engine = Engine(model, device="cpu")
     _configure_fake_gradient_group(engine, monkeypatch, group_size=8)
 
-    engine.forward_backward([_datum([2, 4], [1.0, 3.0])], _identity_loss)
+    engine.forward_backward(_batches([_datum([2, 4], [1.0, 3.0])]), _identity_loss)
 
     assert model.weight.grad.item() == pytest.approx(3.5)
 
@@ -3852,7 +3888,7 @@ def test_summed_gradient_mode_zero_weight_window_keeps_graph_connected_zero(monk
     engine = Engine(model, device="cpu")
     _configure_fake_gradient_group(engine, monkeypatch, group_size=4)
 
-    result = engine.forward_backward([_datum([100, 200], [0.0, 0.0])], _identity_loss)
+    result = engine.forward_backward(_batches([_datum([100, 200], [0.0, 0.0])]), _identity_loss)
 
     assert result.loss.item() == 0
     assert result.loss_sum.item() == 0
@@ -3881,7 +3917,7 @@ def test_moe_aux_scale_uses_general_gradient_reduction_formula(
     engine._cp_size = lambda: 2
     _configure_fake_gradient_group(engine, monkeypatch, group_size=8)
 
-    engine.forward_backward([_datum([1]), _datum([2]), _datum([3])], _identity_loss)
+    engine.forward_backward(_batches([_datum([1]), _datum([2]), _datum([3])]), _identity_loss)
 
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(expected_scale)
     assert model.aux_weight.grad.item() == pytest.approx(expected_local_aux_grad)
@@ -3905,11 +3941,11 @@ def test_gradient_reduction_mode_rejects_ambiguous_declarations(root_mode, neste
         Engine(model, device="cpu")
 
 
-def test_loss_shape_must_exactly_match_weights():
+def test_loss_must_be_a_scalar_numerator():
     model = ScaleModel()
-    with pytest.raises(ValueError, match="exactly the same shape"):
+    with pytest.raises(TypeError, match="scalar Tensor"):
         Engine(model, device="cpu").forward_backward(
-            [_datum([1, 2])],
+            _batches([_datum([1, 2])]),
             lambda output, _inputs: output[:, :1],
         )
     assert model.weight.grad is None
@@ -3925,7 +3961,7 @@ def test_collater_cannot_change_weight_sum():
 
     with pytest.raises(ValueError, match="collate_fn changed"):
         Engine(model, device="cpu", collate_fn=bad_collate).forward_backward(
-            [_datum([1, 2])],
+            _batches([_datum([1, 2])]),
             _identity_loss,
         )
     assert model.forward_calls == 0
@@ -3938,22 +3974,22 @@ def _distributed_worker(rank: int, world_size: int, init_file: str) -> None:
         # collectives and keeps each rank's statistics local. DDP/FSDP wrappers
         # may impose their own aligned-call requirement.
         forward_window = [_datum([1])] if rank == 0 else [_datum([2]), _datum([3])]
-        forward_result = Engine(ScaleModel(), device="cpu").forward(forward_window, _identity_loss)
+        forward_result = Engine(ScaleModel(), device="cpu").evaluate(_batches(forward_window), _identity_loss)
         assert forward_result.loss_sum.item() == pytest.approx(1.0 if rank == 0 else 5.0)
         assert forward_result.weight_sum.item() == pytest.approx(1.0 if rank == 0 else 2.0)
 
         model = nn.parallel.DistributedDataParallel(ScaleModel())
         bad_window = [_datum([1])] if rank == 0 else [_datum([1]), _datum([2])]
         with pytest.raises(ValueError, match="same number of microbatches"):
-            Engine(model, device="cpu").forward_backward(bad_window, _identity_loss)
+            Engine(model, device="cpu").forward_backward(_batches(bad_window), _identity_loss)
         assert model.module.forward_calls == 0
 
         window = [_datum([1, 2]), _datum([3])] if rank == 0 else [_datum([4]), _datum([5, 6])]
-        result = Engine(model, device="cpu").forward_backward(window, _identity_loss)
+        result = Engine(model, device="cpu").forward_backward(_batches(window), _identity_loss)
         assert result.loss.item() == pytest.approx(3.5)
         assert result.loss_sum.item() == pytest.approx(21.0)
         assert result.weight_sum.item() == pytest.approx(6.0)
-        assert result.loss_fn_outputs == []
+        assert _output_records(result) == []
         assert model.module.weight.grad.item() == pytest.approx(3.5)
 
         # Dynamic token balancing keeps the number of forwards rank-symmetric,
@@ -3963,10 +3999,9 @@ def _distributed_worker(rank: int, world_size: int, init_file: str) -> None:
         first_value = rank * 4 + 1
         variable_window = [_datum([value]) for value in range(first_value, first_value + 4)]
         variable_sizes = [1, 3] if rank == 0 else [2, 2]
-        variable_result = Engine(variable_model, device="cpu", microbatch_size=1).forward_backward(
-            variable_window,
+        variable_result = Engine(variable_model, device="cpu").forward_backward(
+            _batches(variable_window, sizes=variable_sizes),
             _identity_loss,
-            microbatch_sizes=variable_sizes,
         )
 
         assert variable_model.module.forward_calls == 2
@@ -3987,17 +4022,17 @@ def _distributed_worker(rank: int, world_size: int, init_file: str) -> None:
             max_grad_norm=1.0,
         )
         accumulated_engine.forward_backward(
-            [_datum([2 + 2 * rank])],
+            _batches([_datum([2 + 2 * rank])]),
             _identity_loss,
             accumulate_gradients=True,
         )
         accumulated_engine.forward_backward(
-            [_datum([6 + 2 * rank])],
+            _batches([_datum([6 + 2 * rank])]),
             _identity_loss,
             accumulate_gradients=True,
         )
         assert accumulated_model.weight.grad.full_tensor().item() == pytest.approx(10.0)
-        step_result = accumulated_engine.optim_step()
+        step_result = accumulated_engine.step()
         assert step_result.grad_norm.item() == pytest.approx(10.0)
         assert accumulated_model.weight.full_tensor().item() == pytest.approx(0.9)
     finally:
@@ -4083,7 +4118,7 @@ def _hybridep_packed_equalization_worker(rank: int, world_size: int, init_file: 
                 torch.testing.assert_close(loss_inputs["weights"], torch.ones(4))
             yield
 
-        def loss_with_tokens(output, _loss_inputs):
+        def loss_with_tokens(output, loss_inputs):
             """Return the scaled tokens as both loss and a restorable stream.
 
             Args:
@@ -4093,7 +4128,7 @@ def _hybridep_packed_equalization_worker(rank: int, world_size: int, init_file: 
             Returns:
                 Per-token losses and a typed token output batch.
             """
-            return output, LossFnOutputBatch(per_token={"tokens": PerTokenOutput(output)})
+            return _with_token_outputs(output, loss_inputs, tokens=output)
 
         engine = Engine(
             model,
@@ -4104,15 +4139,15 @@ def _hybridep_packed_equalization_worker(rank: int, world_size: int, init_file: 
             max_grad_norm=None,
             batch_context_fn=batch_context,
         )
-        result = engine.forward_backward([datum], loss_with_tokens)
+        result = engine.forward_backward(_batches([datum]), loss_with_tokens)
 
         assert result.loss.item() == pytest.approx(3.5)
         assert result.loss_sum.item() == pytest.approx(21.0)
         assert result.weight_sum.item() == pytest.approx(6.0)
         assert model.module.weight.grad.item() == pytest.approx(3.5)
-        torch.testing.assert_close(result.loss_fn_outputs[0]["tokens"], token_ids.to(torch.float32).unsqueeze(0))
+        torch.testing.assert_close(_output_records(result)[0]["tokens"], token_ids.to(torch.float32).unsqueeze(0))
 
-        engine.optim_step()
+        engine.step()
         assert model.module.weight.item() == pytest.approx(0.65)
     finally:
         dist.destroy_process_group()
@@ -4146,10 +4181,9 @@ def _hybridep_padded_batch_mismatch_worker(rank: int, world_size: int, init_file
             model,
             device="cpu",
             mesh_context=mesh_context,
-            microbatch_size=len(datums),
         )
         with pytest.raises(NotImplementedError, match="same batch size"):
-            engine.forward(datums, _identity_loss)
+            engine.evaluate(_batches(datums, batch_size=len(datums)), _identity_loss)
 
         width = 3 if rank == 0 else 2
         attention_mask = torch.ones((1, width), dtype=torch.long)
@@ -4162,7 +4196,7 @@ def _hybridep_padded_batch_mismatch_worker(rank: int, world_size: int, init_file
         )
         engine = Engine(model, device="cpu", mesh_context=mesh_context, collate_fn=collate_prebatched)
         with pytest.raises(NotImplementedError, match="sequence-padding preflight"):
-            engine.forward([prebatched], _identity_loss)
+            engine.evaluate(_batches([prebatched]), _identity_loss)
 
         equal_width = 2
         equal_datum = Datum(
@@ -4173,7 +4207,7 @@ def _hybridep_padded_batch_mismatch_worker(rank: int, world_size: int, init_file
             loss_fn_inputs={"weights": torch.ones((1, equal_width))},
             loss_fn_input_layouts={"weights": LossInputLayout.PER_TOKEN},
         )
-        result = engine.forward([equal_datum], _identity_loss)
+        result = engine.evaluate(_batches([equal_datum]), _identity_loss)
         assert result.loss_sum.item() == pytest.approx(2 * rank + 3)
         assert "padding_mask" not in equal_datum.model_inputs
     finally:
@@ -4318,7 +4352,7 @@ def _hybridep_packed_cp_cross_axis_worker(rank: int, world_size: int, init_file:
                 per-token losses and a typed output batch whose ``tokens``
                 field contains a Tensor of shape ``[local_tokens]``.
             """
-            return output, LossFnOutputBatch(per_token={"tokens": PerTokenOutput(output)})
+            return _with_token_outputs(output, _loss_inputs, tokens=output)
 
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         engine = Engine(
@@ -4331,16 +4365,16 @@ def _hybridep_packed_cp_cross_axis_worker(rank: int, world_size: int, init_file:
             batch_context_fn=batch_context,
         )
         assert len(engine._hybridep_equalization_groups) == 2
-        result = engine.forward_backward([datum], loss_fn)
+        result = engine.forward_backward(_batches([datum]), loss_fn)
 
         expected_mean = 46.0 / 12.0
         assert result.loss.item() == pytest.approx(expected_mean)
         assert result.loss_sum.item() == pytest.approx(46.0)
         assert result.weight_sum.item() == pytest.approx(12.0)
         assert model.module.weight.grad.item() == pytest.approx(expected_mean)
-        torch.testing.assert_close(result.loss_fn_outputs[0]["tokens"], token_ids.to(torch.float32).unsqueeze(0))
+        torch.testing.assert_close(_output_records(result)[0]["tokens"], token_ids.to(torch.float32).unsqueeze(0))
 
-        engine.optim_step()
+        engine.step()
         assert model.module.weight.item() == pytest.approx(1.0 - 0.1 * expected_mean)
     finally:
         dist.destroy_process_group()
@@ -4413,29 +4447,28 @@ def _hybridep_padded_cp_cross_axis_worker(rank: int, world_size: int, init_file:
                 Per-token losses and a typed token output with the same local
                 physical axes.
             """
-            return output, LossFnOutputBatch(per_token={"tokens": PerTokenOutput(output)})
+            return _with_token_outputs(output, _loss_inputs, tokens=output)
 
         engine = Engine(
             model,
             device="cpu",
             mesh_context=mesh_context,
-            microbatch_size=len(datums),
             optimizers=optimizer,
             max_grad_norm=None,
             batch_context_fn=batch_context,
         )
         assert len(engine._hybridep_equalization_groups) == 2
-        result = engine.forward_backward(datums, loss_with_tokens)
+        result = engine.forward_backward(_batches(datums, batch_size=len(datums)), loss_with_tokens)
 
         assert result.loss.item() == pytest.approx(4.5)
         assert result.loss_sum.item() == pytest.approx(36.0)
         assert result.weight_sum.item() == pytest.approx(8.0)
         assert model.module.weight.grad.item() == pytest.approx(4.5)
-        assert len(result.loss_fn_outputs) == len(datums)
-        for record, tokens in zip(result.loss_fn_outputs, values):
+        assert len(_output_records(result)) == len(datums)
+        for record, tokens in zip(_output_records(result), values):
             torch.testing.assert_close(record["tokens"], torch.tensor(tokens, dtype=torch.float32))
 
-        engine.optim_step()
+        engine.step()
         assert model.module.weight.item() == pytest.approx(0.55)
     finally:
         dist.destroy_process_group()
@@ -4560,7 +4593,7 @@ def _batch_context_cp_worker(rank: int, world_size: int, init_file: str) -> None
             """
             assert batch_context_active
             torch.testing.assert_close(loss_fn_inputs["routed_experts"], expected_routes)
-            return output
+            return _identity_loss(output, loss_fn_inputs)
 
         result = Engine(
             model,
@@ -4568,7 +4601,7 @@ def _batch_context_cp_worker(rank: int, world_size: int, init_file: str) -> None
             mesh_context=mesh_context,
             collate_fn=collate_prebatched,
             batch_context_fn=batch_context,
-        ).forward_backward([datum], loss_fn)
+        ).forward_backward(_batches([datum]), loss_fn)
 
         assert result.loss.item() == pytest.approx(3.5)
         assert result.loss_sum.item() == pytest.approx(21.0)
@@ -4616,7 +4649,7 @@ def _context_parallel_worker(rank: int, world_size: int, init_file: str, dp_size
             device="cpu",
             mesh_context=mesh_context,
             collate_fn=collate_prebatched,
-        ).forward_backward(window, _identity_loss)
+        ).forward_backward(_batches(window), _identity_loss)
 
         assert result.loss.item() == pytest.approx(4.5)
         assert result.loss_sum.item() == pytest.approx(18.0 if dp_size == 1 else 36.0)
@@ -4629,7 +4662,7 @@ def _context_parallel_worker(rank: int, world_size: int, init_file: str, dp_size
             device="cpu",
             mesh_context=mesh_context,
             collate_fn=collate_prebatched,
-        ).forward(window, _identity_loss)
+        ).evaluate(_batches(window), _identity_loss)
         expected_sum = (
             18.0 if dp_size == 1 else 10.0 + 16.0 * get_flat_mesh(mesh_context.device_mesh, "dp").get_local_rank()
         )
@@ -4696,7 +4729,7 @@ def _context_parallel_worker(rank: int, world_size: int, init_file: str, dp_size
             optimizers=averaged_optimizer,
             max_grad_norm=None,
         )
-        averaged_result = averaged_engine.forward_backward(window_a + window_b, _identity_loss)
+        averaged_result = averaged_engine.forward_backward(_batches(window_a + window_b), _identity_loss)
 
         assert averaged_result.loss_sum.item() == pytest.approx(expected_a_sum + expected_b_sum)
         assert averaged_result.weight_sum.item() == pytest.approx(expected_a_weight + expected_b_weight)
@@ -4704,7 +4737,7 @@ def _context_parallel_worker(rank: int, world_size: int, init_file: str, dp_size
         assert averaged_result.loss.item() == pytest.approx(expected_global_mean)
         assert averaged_model.module.weight.grad.item() == pytest.approx(expected_global_mean)
 
-        averaged_engine.optim_step()
+        averaged_engine.step()
         assert averaged_model.module.weight.item() == pytest.approx(1.0 - 0.1 * expected_global_mean)
 
         # Mimic MegatronFSDP calculate_per_token_loss=True with a SUM hook over
@@ -4729,13 +4762,13 @@ def _context_parallel_worker(rank: int, world_size: int, init_file: str, dp_size
             optimizers=summed_optimizer,
             max_grad_norm=None,
         )
-        summed_result = summed_engine.forward_backward(window_a + window_b, _identity_loss)
+        summed_result = summed_engine.forward_backward(_batches(window_a + window_b), _identity_loss)
 
         torch.testing.assert_close(summed_result.loss_sum, averaged_result.loss_sum)
         torch.testing.assert_close(summed_result.weight_sum, averaged_result.weight_sum)
         assert summed_model.weight.grad.item() == pytest.approx(expected_global_mean)
 
-        summed_engine.optim_step()
+        summed_engine.step()
         torch.testing.assert_close(summed_model.weight, averaged_model.module.weight)
     finally:
         dist.destroy_process_group()
@@ -4761,7 +4794,7 @@ def _mismatched_context_parallel_weights_worker(rank: int, world_size: int, init
                 device="cpu",
                 mesh_context=mesh_context,
                 collate_fn=collate_prebatched,
-            ).forward_backward([datum], _identity_loss)
+            ).forward_backward(_batches([datum]), _identity_loss)
 
         assert model.module.forward_calls == 0
     finally:
@@ -4787,46 +4820,46 @@ def _context_parallel_output_consensus_worker(rank: int, world_size: int, init_f
                 process_group=None,
             ),
         )
-        weights = torch.ones(2)
-        valid = LossFnOutputBatch(
-            per_token={"probe": PerTokenOutput(torch.tensor([1.0, 2.0]))},
-            per_datum=[{}],
+        token_reference = torch.ones(2)
+        valid = LossOutput(
+            loss_sum=torch.tensor(0.0),
+            token_outputs={"probe": torch.tensor([1.0, 2.0])},
         )
         cases = [
             (None if rank == 0 else valid, "different loss output schemas"),
             (
                 valid
                 if rank == 0
-                else LossFnOutputBatch(
-                    per_token={"probe": PerTokenOutput(torch.tensor([1.0]))},
-                    per_datum=[{}],
+                else LossOutput(
+                    loss_sum=torch.tensor(0.0),
+                    token_outputs={"probe": torch.tensor([1.0])},
                 ),
                 "invalid loss_fn outputs",
             ),
             (
                 valid
                 if rank == 0
-                else LossFnOutputBatch(
-                    per_token={"probe": PerTokenOutput(torch.tensor([1.0, 2.0]))},
-                    per_datum=[{}, {}],
+                else LossOutput(
+                    loss_sum=torch.tensor(0.0),
+                    batch_output={"rank_value": torch.tensor(rank)},
                 ),
-                "invalid loss_fn outputs",
+                "different loss output schemas",
             ),
         ]
         for outputs, match in cases:
             with pytest.raises(ValueError, match=match):
-                engine._validate_loss_fn_outputs_across_cp(
+                engine._validate_outputs_across_cp(
                     outputs,
-                    weights,
-                    expected_records=1,
+                    token_reference,
+                    expected_datums=1,
                 )
             dist.barrier()
 
         with pytest.raises(ValueError, match="invalid loss_fn outputs"):
-            engine._validate_loss_fn_outputs_across_cp(
+            engine._validate_outputs_across_cp(
                 valid,
-                weights,
-                expected_records=1,
+                token_reference,
+                expected_datums=1,
                 local_error=ValueError("rank-local output parse failure") if rank == 0 else None,
             )
     finally:
@@ -4844,17 +4877,17 @@ def _data_parallel_output_error_worker(rank: int, world_size: int, init_file: st
     try:
         model = nn.parallel.DistributedDataParallel(ScaleModel())
 
-        def loss_with_rank_local_output_error(output, _loss_inputs):
-            records = [{}, {}] if rank == 0 else [{}]
-            return output, LossFnOutputBatch(
-                per_token={"probe": PerTokenOutput(output)},
-                per_datum=records,
+        def loss_with_rank_local_output_error(output, loss_inputs):
+            probe = output[:, :-1] if rank == 0 else output
+            return LossOutput(
+                loss_sum=_identity_loss(output, loss_inputs),
+                token_outputs={"probe": probe},
             )
 
-        expected = "per_datum contains 2 records" if rank == 0 else "another model-parallel rank"
+        expected = "probe.*physical token shape" if rank == 0 else "another model-parallel rank"
         with pytest.raises((ValueError, RuntimeError), match=expected):
             Engine(model, device="cpu").forward_backward(
-                [_datum([1, 2])],
+                _batches([_datum([1, 2])]),
                 loss_with_rank_local_output_error,
             )
         assert model.module.weight.grad is not None

@@ -691,7 +691,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.pp if self.pp_enabled else self.model_parts[0],
             device=self.dist_env.device,
             mesh_context=self.mesh_context,
-            microbatch_size=1,
             collate_fn=collate_prebatched,
             padding_token_id=padding_token_id,
             mtp_ignore_index=self.cfg.mtp.ignore_index,
@@ -1084,7 +1083,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         log_denominator = None
         if log_drafter:
             # The optional drafter breakdown is emitted from inside the first
-            # loss callback, before forward_backward can return its weight_sum.
+            # loss-function call, before forward_backward can return its weight_sum.
             # Preserve its exact global mean only on logging steps; ordinary
             # steps avoid this otherwise-duplicate collective.
             local_label_tokens = torch.tensor(
@@ -1107,13 +1106,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
 
         forward_backward_result = self.engine.forward_backward(
-            [self._make_engine_datum(batch) for batch in batches],
+            [[self._make_engine_datum(batch)] for batch in batches],
             engine_loss_fn,
         )
         reporting_loss = forward_backward_result.loss
         num_label_tokens = int(forward_backward_result.weight_sum.item())
 
-        step_result = self.engine.optim_step(
+        step_result = self.engine.step(
             before_optimizer_step=self.checkpointer.maybe_wait_for_staging,
         )
 
@@ -1159,11 +1158,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_loss = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
             total_num_label_tokens = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
             for batch in val_dataloader:
-                result = self.engine.forward([self._make_engine_datum(batch)], self._engine_validation_loss_fn)
+                result = self.engine.evaluate([[self._make_engine_datum(batch)]], self._engine_validation_loss_fn)
                 total_loss += result.loss_sum
                 total_num_label_tokens += result.weight_sum
 
-        # Engine.forward has already reconstructed CP shards and synchronized
+        # Engine.evaluate has already reconstructed CP shards and synchronized
         # PP stages. Only independent DP validation shards remain to combine.
         total_loss = self._dp_allreduce(total_loss).item()
         total_num_label_tokens = int(self._dp_allreduce(total_num_label_tokens).item())

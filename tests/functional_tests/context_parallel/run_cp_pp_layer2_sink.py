@@ -215,8 +215,8 @@ def main():
                 [batch, sequence] in the same CP-local layout as the logits.
 
         Returns:
-            Tensor of shape [batch, sequence] containing the summed causal-LM
-            loss over the base and optional MTP prediction depths.
+            Scalar weighted causal-LM numerator summed over the base and
+            optional MTP prediction depths.
         """
         # step3p7's last PP stage emits (logits, *mtp_per_depth_logits); minimax
         # emits a bare logits tensor. Handle both, threading the MTP depths.
@@ -235,7 +235,7 @@ def main():
             loss = loss + F.cross_entropy(
                 m.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100, reduction="none"
             ).reshape_as(weights)
-        return loss
+        return (loss * weights.to(loss)).sum()
 
     def cp_only_parallelize(m, world_mesh, moe_mesh, *, dp_axis_names, cp_axis_name=None, **kw):
         if cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1:
@@ -279,7 +279,7 @@ def main():
             model_inputs={"input_ids": input_ids.clone(), "position_ids": pos.clone()},
             loss_fn_inputs={"labels": labels, "weights": torch.ones_like(labels, dtype=torch.float32)},
         )
-        result = engine.forward_backward([datum], loss_fn)
+        result = engine.forward_backward([[datum]], loss_fn)
         losses.append(float(result.loss.detach()))
 
     # (3) embeddings receive gradients -- only the first PP stage owns embed_tokens.

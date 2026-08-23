@@ -60,7 +60,7 @@ class LossInputLayout(str, Enum):
     ``PER_TOKEN`` values have a leading token axis and follow token padding,
     packing, CP sharding, and PP microbatching; trailing feature axes are
     preserved. ``PER_DATUM`` values contain one scalar for each outer
-    :class:`Datum`; CP ranks receive the same scalars, so a loss callback uses
+    :class:`Datum`; CP ranks receive the same scalars, so a loss function uses
     them with its CP-local token contribution rather than returning a repeated
     full-sequence scalar. ``REPLICATED`` values are batch-level metadata copied
     unchanged to every CP/PP microbatch.
@@ -544,20 +544,18 @@ def _collate_vlm_loss_inputs(
     if packed:
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _aligned_length
 
-    required = {"labels", "weights"}
-    for datum in datums:
-        missing = required - set(datum.loss_fn_inputs)
-        if missing:
-            raise ValueError(f"VLM Datums require loss inputs {sorted(missing)}")
-
     loss_keys = set().union(*(datum.loss_fn_inputs for datum in datums))
+    standard_fields = {"labels", "weights"}
+    for key in standard_fields.intersection(loss_keys):
+        if any(key not in datum.loss_fn_inputs for datum in datums):
+            raise ValueError(f"VLM loss input {key!r} must be present in every Datum or none of them")
     layouts: dict[str, LossInputLayout] = {}
     pad_values: dict[str, float | int | bool] = {}
     for key in sorted(loss_keys):
         declared_layouts = [datum.loss_fn_input_layouts[key] for datum in datums if key in datum.loss_fn_input_layouts]
         if declared_layouts:
             layouts[key] = declared_layouts[0]
-        elif key in required:
+        elif key in standard_fields:
             layouts[key] = LossInputLayout.PER_TOKEN
         else:
             raise ValueError(f"VLM loss input {key!r} must declare an explicit LossInputLayout")
@@ -570,22 +568,24 @@ def _collate_vlm_loss_inputs(
         elif key == "labels":
             pad_values[key] = CROSS_ENTROPY_IGNORE_IDX
 
-    for key in sorted(required):
+    for key in sorted(standard_fields.intersection(loss_keys)):
         if any(
             datum.loss_fn_input_layouts.get(key, LossInputLayout.PER_TOKEN) is not LossInputLayout.PER_TOKEN
             for datum in datums
         ):
             raise ValueError(f"VLM {key} must use the PER_TOKEN layout")
-    if any(
+    if "labels" in loss_keys and any(
         datum.loss_fn_input_pad_values.get("labels", CROSS_ENTROPY_IGNORE_IDX) != CROSS_ENTROPY_IGNORE_IDX
         for datum in datums
     ):
         raise ValueError(f"VLM labels must use pad value {CROSS_ENTROPY_IGNORE_IDX}")
-    if any(datum.loss_fn_input_pad_values.get("weights", 0) != 0 for datum in datums):
+    if "weights" in loss_keys and any(datum.loss_fn_input_pad_values.get("weights", 0) != 0 for datum in datums):
         raise ValueError("VLM weights must use pad value 0")
 
     token_conventions: dict[str, str] = {}
-    add_default_label_pad = not any("labels" in datum.loss_fn_input_pad_values for datum in datums)
+    add_default_label_pad = "labels" in loss_keys and not any(
+        "labels" in datum.loss_fn_input_pad_values for datum in datums
+    )
     normalized = []
     for datum in datums:
         prediction_length = datum.seq_len - 1
@@ -593,7 +593,7 @@ def _collate_vlm_loss_inputs(
         loss_inputs = {}
         for key, value in datum.loss_fn_inputs.items():
             if layouts[key] is LossInputLayout.PER_TOKEN:
-                if key in required and value.ndim != 1:
+                if key in standard_fields and value.ndim != 1:
                     raise ValueError(f"VLM {key} must be one-dimensional")
                 if value.ndim < 1:
                     raise ValueError(f"PER_TOKEN VLM loss input {key!r} must have a leading token axis")
@@ -638,6 +638,66 @@ def _collate_vlm_loss_inputs(
     return collate_datums(normalized, packed=packed)[1]
 
 
+def _infer_media_token_types(
+    model_inputs: Mapping[str, Any],
+    processor: "ProcessorMixin",
+) -> tuple[str, torch.Tensor] | None:
+    """Build a processor-specific text/image/video marker for one VLM item.
+
+    Args:
+        model_inputs: Processor-ready model fields. ``input_ids`` is a token
+            vector of shape ``[sequence]``; media or grid fields indicate that
+            token types may be required.
+        processor: Processor or tokenizer owner used to resolve image and video
+            placeholder token IDs.
+
+    Returns:
+        ``(field_name, token_types)`` with integer ``token_types [sequence]``
+        where 0, 1, and 2 denote text, image, and video respectively; ``None``
+        when the field already exists, no media is present, or placeholder IDs
+        cannot be resolved.
+    """
+    if "mm_token_type_ids" in model_inputs or "token_type_ids" in model_inputs:
+        return None
+    media_keys = {
+        name
+        for name in model_inputs
+        if any(marker in name for marker in ("pixel", "image", "video")) and "token_type" not in name
+    }
+    if not media_keys:
+        return None
+
+    from nemo_automodel.components.datasets.vlm.utils import _resolve_processor_token_id
+
+    input_ids = model_inputs.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor):
+        raise ValueError("VLM media inputs require Tensor input_ids")
+    image_token_id = _resolve_processor_token_id(
+        processor,
+        ("image_token_id", "image_token_index", "img_context_token_id", "image_token"),
+        ("<|image_pad|>", "<image>", "<|image|>"),
+    )
+    video_token_id = _resolve_processor_token_id(
+        processor,
+        ("video_token_id", "video_token_index", "video_context_token_id", "video_token"),
+        ("<|video_pad|>", "<video>", "<|video|>"),
+    )
+    if image_token_id is None and video_token_id is None:
+        return None
+
+    token_types = torch.zeros_like(input_ids, dtype=torch.long)
+    if image_token_id is not None:
+        token_types.masked_fill_(input_ids == image_token_id, 1)
+    if video_token_id is not None:
+        token_types.masked_fill_(input_ids == video_token_id, 2)
+    key = (
+        "mm_token_type_ids"
+        if "image_grid_thw" in model_inputs or "video_grid_thw" in model_inputs
+        else "token_type_ids"
+    )
+    return key, token_types
+
+
 def collate_vlm_datums(
     datums: list[Datum],
     *,
@@ -669,8 +729,9 @@ def collate_vlm_datums(
 
     Args:
         datums: Non-empty processor-ready VLM items. Each item has
-            1-D ``input_ids`` and ``attention_mask`` plus mandatory ``labels``
-            and ``weights`` loss inputs. Additional loss inputs must declare a
+            1-D ``input_ids`` and ``attention_mask``. Training Datums commonly
+            add ``labels`` and ``weights``; forward-only Datums need neither.
+            Additional loss inputs must declare a
             :class:`LossInputLayout`; ``PER_TOKEN`` values use a leading ``S``
             or ``S-1`` axis. Optional processor fields carry their
             processor-defined token or leading media axes.
@@ -749,15 +810,18 @@ def collate_vlm_datums(
                 f"VLM media token mismatch after autoregressive shift for Datum {index}: {shifted_mismatch}"
             )
 
-        examples.append(
-            {
-                **datum.model_inputs,
-                # Canonical VLM collaters own the model-input shift and require
-                # a labels field. Real labels are collated below with every
-                # other loss side channel.
-                "labels": torch.full_like(input_ids, CROSS_ENTROPY_IGNORE_IDX),
-            }
-        )
+        example = {
+            **datum.model_inputs,
+            # Canonical VLM collaters own the model-input shift and require a
+            # labels field. Real labels are collated below with every other
+            # loss side channel.
+            "labels": torch.full_like(input_ids, CROSS_ENTROPY_IGNORE_IDX),
+        }
+        inferred_token_types = _infer_media_token_types(example, processor)
+        if inferred_token_types is not None:
+            key, token_types = inferred_token_types
+            example[key] = token_types
+        examples.append(example)
 
     if pack_tokens:
         from nemo_automodel.components.datasets.vlm.collate_fns import (

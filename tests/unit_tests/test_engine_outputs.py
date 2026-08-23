@@ -17,93 +17,69 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_automodel import LossFnOutputBatch as PublicLossFnOutputBatch
-from nemo_automodel import PerTokenOutput as PublicPerTokenOutput
-from nemo_automodel.engine.outputs import LossFnOutputBatch, PerTokenOutput
+from nemo_automodel import LossOutput as PublicLossOutput
+from nemo_automodel.engine.outputs import LossOutput
 
 
-def test_output_types_are_public_lazy_exports() -> None:
-    assert PublicPerTokenOutput is PerTokenOutput
-    assert PublicLossFnOutputBatch is LossFnOutputBatch
+def test_loss_output_is_a_public_lazy_export() -> None:
+    assert PublicLossOutput is LossOutput
 
 
-def test_loss_fn_output_batch_copies_containers_but_retains_values() -> None:
+def test_loss_output_copies_containers_but_retains_values() -> None:
     logprobs = torch.randn(5, requires_grad=True)
-    sample_id = torch.tensor(7)
-    token_output = PerTokenOutput(logprobs, fill_value=-1.0)
-    token_fields = {"logprobs": token_output}
-    record = {"sample_id": sample_id}
-    records = [record]
+    token_fields = {"logprobs": logprobs}
 
-    output = LossFnOutputBatch(per_token=token_fields, per_datum=records)
+    output = LossOutput(
+        loss_sum=torch.tensor(1.0),
+        token_outputs=token_fields,
+    )
 
-    token_fields["entropy"] = PerTokenOutput(torch.ones(5))
-    record["new_field"] = 3
-    records.append({"sample_id": torch.tensor(8)})
+    token_fields["entropy"] = torch.ones(5)
 
-    assert tuple(output.per_token) == ("logprobs",)
-    assert output.per_token["logprobs"] is token_output
-    assert output.per_token["logprobs"].tensor is logprobs
-    assert output.per_token["logprobs"].fill_value == -1.0
-    assert output.per_datum is not None
-    assert len(output.per_datum) == 1
-    assert dict(output.per_datum[0]) == {"sample_id": sample_id}
-    assert output.per_datum[0]["sample_id"] is sample_id
-
+    assert dict(output.token_outputs) == {"logprobs": logprobs}
+    assert output.token_outputs["logprobs"] is logprobs
     with pytest.raises(TypeError):
-        output.per_token["another"] = PerTokenOutput(torch.ones(5))  # type: ignore[index]
+        output.token_outputs["another"] = torch.ones(5)  # type: ignore[index]
+
+
+def test_loss_output_requires_an_output_channel() -> None:
+    with pytest.raises(ValueError, match="requires token_outputs or batch_output"):
+        LossOutput(loss_sum=torch.tensor(1.0))
+
+
+def test_loss_output_batch_channel_is_read_only_and_separate() -> None:
+    metric = torch.tensor(2.0, requires_grad=True)
+    batch_output = {"metrics": {"reward": metric}}
+
+    output = LossOutput(loss_sum=torch.tensor(1.0), batch_output=batch_output)
+    batch_output["model_output"] = torch.ones(1)
+
+    assert dict(output.batch_output) == {"metrics": {"reward": metric}}
     with pytest.raises(TypeError):
-        output.per_datum[0]["another"] = 1  # type: ignore[index]
-
-
-def test_loss_fn_output_batch_preserves_none_per_datum() -> None:
-    output = LossFnOutputBatch(per_token={"logprobs": PerTokenOutput(torch.ones(3))})
-
-    assert output.per_datum is None
+        output.batch_output["another"] = 1  # type: ignore[index]
 
 
 @pytest.mark.parametrize(
     ("kwargs", "error", "match"),
     [
-        ({"tensor": [1.0]}, TypeError, "tensor must be a torch.Tensor"),
-        ({"tensor": torch.tensor(1.0)}, ValueError, "at least one dimension"),
-        ({"tensor": torch.ones(1), "fill_value": "zero"}, TypeError, "fill_value must be an int or float"),
+        ({"loss_sum": torch.ones(2)}, TypeError, "scalar torch.Tensor"),
+        ({"loss_sum": 1.0}, TypeError, "scalar torch.Tensor"),
+        ({"loss_sum": torch.tensor(1.0), "token_outputs": {"x": torch.tensor(1.0)}}, TypeError, "non-scalar"),
     ],
 )
-def test_per_token_output_rejects_invalid_values(kwargs, error, match) -> None:
+def test_loss_output_rejects_invalid_tensors(kwargs, error, match) -> None:
     with pytest.raises(error, match=match):
-        PerTokenOutput(**kwargs)
+        LossOutput(**kwargs)
 
 
 @pytest.mark.parametrize(
-    ("per_token", "error", "match"),
+    ("token_outputs", "error", "match"),
     [
-        ([], TypeError, "per_token must be a mapping"),
-        ({}, ValueError, "per_token cannot be empty"),
-        ({"": PerTokenOutput(torch.ones(1))}, TypeError, "field names must be non-empty strings"),
-        ({1: PerTokenOutput(torch.ones(1))}, TypeError, "field names must be non-empty strings"),
-        ({"logprobs": torch.ones(1)}, TypeError, "must be a PerTokenOutput"),
+        ({"": torch.ones(1)}, TypeError, "field names must be non-empty strings"),
+        ({1: torch.ones(1)}, TypeError, "field names must be non-empty strings"),
+        ({"logprobs": [1.0]}, TypeError, "non-scalar torch.Tensor"),
     ],
 )
-def test_loss_fn_output_batch_rejects_invalid_token_fields(per_token, error, match) -> None:
+def test_loss_output_rejects_invalid_token_fields(token_outputs, error, match) -> None:
     with pytest.raises(error, match=match):
-        LossFnOutputBatch(per_token=per_token)
-
-
-@pytest.mark.parametrize(
-    ("per_datum", "error", "match"),
-    [
-        ({"sample_id": 1}, TypeError, "per_datum must be a sequence of mappings"),
-        ("record", TypeError, "per_datum must be a sequence of mappings"),
-        ([1], TypeError, "record 0 must be a mapping"),
-        ([{"": 1}], TypeError, "field names must be non-empty strings"),
-        ([{1: "sample"}], TypeError, "field names must be non-empty strings"),
-        ([{"logprobs": torch.ones(1)}], ValueError, "conflicts with per_token fields"),
-    ],
-)
-def test_loss_fn_output_batch_rejects_invalid_per_datum_records(per_datum, error, match) -> None:
-    with pytest.raises(error, match=match):
-        LossFnOutputBatch(
-            per_token={"logprobs": PerTokenOutput(torch.ones(1))},
-            per_datum=per_datum,
-        )
+        LossOutput(loss_sum=torch.tensor(1.0), token_outputs=token_outputs)

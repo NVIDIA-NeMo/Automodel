@@ -31,11 +31,10 @@ from nemo_automodel.components.distributed.context_parallel import ContextParall
 LossInputValue = torch.Tensor | tuple[torch.Tensor, ...]
 
 __all__ = [
+    "EvaluationResult",
     "ForwardBackwardResult",
-    "ForwardResult",
-    "LossFnOutputBatch",
-    "OptimStepResult",
-    "PerTokenOutput",
+    "LossOutput",
+    "StepResult",
 ]
 
 
@@ -45,153 +44,97 @@ def _validate_field_name(name: Any, *, container: str) -> None:
 
 
 @dataclass(frozen=True, eq=False)
-class PerTokenOutput:
-    """One callback tensor aligned with the current local token stream.
+class LossOutput:
+    """A local loss numerator and explicitly laid-out values returned with it.
 
-    The tensor's leading dimensions must exactly match the current CP-local
-    loss ``weights`` shape (``[B, S]`` or ``[T]``); only trailing feature
-    dimensions may be added. The tensor must also be on the same device as the
-    weights. The Engine therefore knows the token axis without guessing from
-    arbitrary shapes.
-    ``fill_value`` is used only when restoring a caller position for which a
-    backend did not retain a token (for example, a dropped slot in a repacked
-    sequence).
-
-    The tensor is deliberately retained by reference rather than cloned. This
-    preserves its device, autograd relationship, and avoids copying potentially
-    large token outputs; the Engine detaches returned records at its API
-    boundary.
+    ``loss_sum`` is the already-weighted scalar numerator for the current
+    physical batch. ``token_outputs`` contains tensors aligned with that
+    batch's complete local token stream; the Engine restores them through
+    packing and context parallelism before returning one tensor per Datum.
+    ``batch_output`` is one opaque mapping for the complete physical batch.
+    The Engine detaches and transports it across pipeline stages, but does not
+    interpret or restore its contents across context parallelism.
 
     Args:
-        tensor: Tensor covering the complete CP-local token stream for the
-            current loss-callback invocation.
-        fill_value: Scalar value used for positions introduced by layout
-            restoration. It must be representable by ``tensor.dtype`` when the
-            Engine performs that restoration.
+        loss_sum: Scalar local loss numerator.
+        token_outputs: Named tensors whose leading axes exactly match prepared
+            token weights: padded ``[batch, sequence, ...]``, canonical packed
+            ``[1, tokens, ...]``, or active model-owned THD
+            ``[tokens, ...]``. Trailing feature dimensions are preserved.
+        batch_output: Caller-owned values for the complete batch, such as
+            aggregate metrics. This is separate from token outputs because it
+            has no Datum or token layout known to the Engine.
     """
 
-    tensor: torch.Tensor
-    fill_value: float | int = 0
+    loss_sum: torch.Tensor
+    token_outputs: Mapping[str, torch.Tensor] | None = None
+    batch_output: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.tensor, torch.Tensor):
-            raise TypeError(f"PerTokenOutput.tensor must be a torch.Tensor, got {type(self.tensor).__name__}")
-        if self.tensor.ndim == 0:
-            raise ValueError("PerTokenOutput.tensor must have at least one dimension")
-        if not isinstance(self.fill_value, (int, float)):
-            raise TypeError(f"PerTokenOutput.fill_value must be an int or float, got {type(self.fill_value).__name__}")
-
-
-@dataclass(frozen=True, eq=False)
-class LossFnOutputBatch:
-    """Layout-aware outputs from one loss-callback invocation.
-
-    ``per_token`` holds batch-level local token streams. Callbacks should not
-    split those streams into per-Datum tensors themselves: under packed context
-    parallelism, different ranks can own different numbers of tokens from one
-    Datum. The Engine can restore each complete stream first and then route it
-    to the final per-Datum records.
-
-    Restoration requires the active context-parallel backend to report a
-    reversible token layout. Backends that do not report one fail explicitly
-    when this typed output is requested; legacy output records remain usable.
-
-    ``per_datum`` optionally supplies the ordinary output records that the
-    restored token fields will augment. It follows the existing callback
-    convention of one mapping per logical Datum in the current microbatch.
-    These records are opaque and must already be identical on CP ranks (for
-    example, sample IDs copied from a PER_DATUM loss input). A token-derived
-    CP-local value belongs in ``per_token`` so the Engine can restore it before
-    producing records.
-
-    Input mappings, the record sequence, and each record mapping are copied and
-    exposed as read-only views. Tensor and other nested values are intentionally
-    retained by reference so the envelope is cheap and preserves autograd until
-    the Engine consumes it.
-
-    Args:
-        per_token: Non-empty mapping from output field name to its local token
-            tensor and restoration fill value. Tensor leading dimensions and
-            device must match the callback's loss weights.
-        per_datum: Optional sequence of existing per-Datum output mappings.
-            These mappings may not already contain a field named by
-            ``per_token`` because the Engine will add those fields after token
-            restoration.
-    """
-
-    per_token: Mapping[str, PerTokenOutput]
-    per_datum: Sequence[Mapping[str, Any]] | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.per_token, Mapping):
-            raise TypeError(f"LossFnOutputBatch.per_token must be a mapping, got {type(self.per_token).__name__}")
-        copied_per_token = dict(self.per_token)
-        if not copied_per_token:
-            raise ValueError("LossFnOutputBatch.per_token cannot be empty")
-        for name, output in copied_per_token.items():
-            _validate_field_name(name, container="per_token")
-            if not isinstance(output, PerTokenOutput):
-                raise TypeError(f"per_token field {name!r} must be a PerTokenOutput, got {type(output).__name__}")
-
-        object.__setattr__(self, "per_token", MappingProxyType(copied_per_token))
-        if self.per_datum is None:
-            return
-        if not isinstance(self.per_datum, Sequence) or isinstance(self.per_datum, (str, bytes)):
-            raise TypeError(
-                "LossFnOutputBatch.per_datum must be a sequence of mappings or None, "
-                f"got {type(self.per_datum).__name__}"
-            )
-
-        copied_records: list[Mapping[str, Any]] = []
-        token_names = set(copied_per_token)
-        for index, record in enumerate(self.per_datum):
-            if not isinstance(record, Mapping):
-                raise TypeError(f"per_datum record {index} must be a mapping, got {type(record).__name__}")
-            copied_record = dict(record)
-            for name in copied_record:
-                _validate_field_name(name, container=f"per_datum record {index}")
-            conflicts = token_names.intersection(copied_record)
-            if conflicts:
-                raise ValueError(f"per_datum record {index} conflicts with per_token fields {sorted(conflicts)}")
-            copied_records.append(MappingProxyType(copied_record))
-        object.__setattr__(self, "per_datum", tuple(copied_records))
+        if not isinstance(self.loss_sum, torch.Tensor) or self.loss_sum.ndim != 0:
+            raise TypeError("LossOutput.loss_sum must be a scalar torch.Tensor")
+        token_outputs = {} if self.token_outputs is None else dict(self.token_outputs)
+        if self.token_outputs is not None and not token_outputs:
+            raise ValueError("LossOutput.token_outputs cannot be an empty mapping")
+        for name, tensor in token_outputs.items():
+            _validate_field_name(name, container="token_outputs")
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+                raise TypeError(f"token output {name!r} must be a non-scalar torch.Tensor")
+        batch_output = None if self.batch_output is None else dict(self.batch_output)
+        if self.batch_output is not None and not batch_output:
+            raise ValueError("LossOutput.batch_output cannot be an empty mapping")
+        if batch_output is not None:
+            for name in batch_output:
+                _validate_field_name(name, container="batch_output")
+        if not token_outputs and batch_output is None:
+            raise ValueError("LossOutput requires token_outputs or batch_output; return the scalar loss Tensor instead")
+        object.__setattr__(self, "token_outputs", MappingProxyType(token_outputs))
+        object.__setattr__(
+            self,
+            "batch_output",
+            None if batch_output is None else MappingProxyType(batch_output),
+        )
 
 
 @dataclass(frozen=True)
-class ForwardResult:
-    """Forward-only loss statistics and per-Datum outputs.
+class EvaluationResult:
+    """Evaluation loss statistics and optional typed outputs.
 
     ``loss_sum`` and ``weight_sum`` are complete across model-parallel CP and
     PP ranks, but remain local to one data-parallel replica. The Engine adds no
     per-call DP loss-statistic collective, so callers reduce the two sums once
     at the end of an evaluation epoch. Distributed model wrappers may still
     communicate during forward and therefore retain their own call-alignment
-    requirements. ``loss_fn_outputs`` remains local to the replica's input
-    Datums. PP stages receive identical detached copies. Legacy output mappings
-    remain opaque and therefore CP-local; fields declared through
-    :class:`LossFnOutputBatch` are restored to full token order across CP before
-    being split back into per-Datum records.
+    requirements. ``token_outputs`` remains local to the replica's input
+    Datums. PP stages receive identical detached copies. Token fields declared
+    through :class:`LossOutput` are restored to full token order across CP
+    before being split into one tensor per Datum. ``batch_outputs`` is opaque,
+    remains local to each context-parallel rank, and is copied only across the
+    corresponding pipeline lane.
 
     Attributes:
         loss_sum: Detached weighted numerator for this Datum window.
         weight_sum: Detached full-sequence weight denominator for this window.
-        loss_fn_outputs: Detached per-Datum mappings in input order.
+        token_outputs: One field-to-Datum-tensors mapping per input batch. A batch
+            that requested no token outputs has an empty mapping.
+        batch_outputs: One caller-owned mapping or ``None`` per input batch.
     """
 
     loss_sum: torch.Tensor
     weight_sum: torch.Tensor
-    loss_fn_outputs: list[dict[str, Any]]
+    token_outputs: list[dict[str, list[torch.Tensor]]]
+    batch_outputs: list[Mapping[str, Any] | None]
 
 
 @dataclass(frozen=True)
 class ForwardBackwardResult:
-    """One complete optimizer window's loss statistics and callback outputs.
+    """One complete optimizer window's loss statistics and optional outputs.
 
     The numerator is summed across the DP-CP gradient group. The full-sequence
     denominator is summed across DP only because CP ranks begin with replicated
     weights; both are synchronized across PP stages. ``loss`` is
     ``loss_sum / weight_sum`` when the denominator is nonzero and zero
-    otherwise. ``loss_fn_outputs`` remains local to one data-parallel replica,
+    otherwise. ``token_outputs`` remains local to one data-parallel replica,
     is restored to full token order across CP when explicitly typed, and is
     identical on every PP stage in that replica.
 
@@ -201,17 +144,21 @@ class ForwardBackwardResult:
             across PP stages.
         weight_sum: Detached window denominator, summed across DP but
             not CP, then synchronized across PP stages.
-        loss_fn_outputs: Detached per-Datum mappings in input order.
+        token_outputs: One field-to-Datum-tensors mapping per input batch. A batch
+            that requested no token outputs has an empty mapping.
+        batch_outputs: One caller-owned mapping or ``None`` per input batch.
+            Values are not restored across context parallelism.
     """
 
     loss: torch.Tensor
     loss_sum: torch.Tensor
     weight_sum: torch.Tensor
-    loss_fn_outputs: list[dict[str, Any]]
+    token_outputs: list[dict[str, list[torch.Tensor]]]
+    batch_outputs: list[Mapping[str, Any] | None]
 
 
 @dataclass(frozen=True)
-class OptimStepResult:
+class StepResult:
     """Statistics from one completed optimizer step.
 
     Attributes:
@@ -226,12 +173,12 @@ class OptimStepResult:
     learning_rates: tuple[float, ...]
 
 
-ParsedLossOutputs = list[dict[str, Any]] | LossFnOutputBatch | None
+ParsedLossOutputs = LossOutput | None
 
 
 @dataclass(frozen=True)
 class _OutputRestorePlan:
-    """How to turn one CP-local callback token stream back into Datums."""
+    """How to turn one CP-local token stream back into Datums."""
 
     sharder: ContextParallelSharder
     is_thd: bool
@@ -243,27 +190,18 @@ class _OutputRestorePlan:
     synthetic_suffix_tokens: int = 0
 
 
-def _weighted_numerator(losses: Any, weights: torch.Tensor) -> torch.Tensor:
-    if not isinstance(losses, torch.Tensor):
-        raise TypeError("loss_fn must return a Tensor, optionally followed by per-Datum outputs")
-    if losses.ndim == 0:
-        numerator = losses
-    elif losses.shape == weights.shape:
-        numerator = (losses * weights.to(losses)).sum()
-    else:
-        raise ValueError(
-            "loss_fn must return a scalar local weighted sum or losses with exactly the same shape as weights; "
-            f"got losses={tuple(losses.shape)}, weights={tuple(weights.shape)}"
-        )
-    if losses.device != weights.device:
-        raise ValueError("loss_fn losses and weights must be on the same device")
-    return numerator
+def _scalar_loss_sum(loss_sum: Any, weights: torch.Tensor) -> torch.Tensor:
+    if not isinstance(loss_sum, torch.Tensor) or loss_sum.ndim != 0:
+        raise TypeError("loss_fn must return a scalar Tensor or LossOutput")
+    if loss_sum.device != weights.device:
+        raise ValueError("loss_fn loss and weights must be on the same device")
+    return loss_sum
 
 
 def _output_sequence_lengths(
     datums: Sequence[Datum],
     model_inputs: Mapping[str, Any],
-    loss_inputs: Mapping[str, LossInputValue],
+    token_reference: torch.Tensor,
     item_to_datum: tuple[int, ...] | None,
     *,
     is_thd: bool,
@@ -279,8 +217,8 @@ def _output_sequence_lengths(
         datums: Logical items represented by the collated token tensors.
         model_inputs: Model mapping whose token fields have padded
             ``[batch, sequence]`` or packed ``[1, tokens]`` layout.
-        loss_inputs: Loss mapping whose per-token ``weights`` has the same
-            leading token axes as ``model_inputs``.
+        token_reference: Tensor with the same leading token axes as the model
+            output. This is internal routing metadata, not a user loss field.
         item_to_datum: Identity mapping from collated logical items to Datums.
         is_thd: Whether the physical model layout is THD.
         packed_seq_ids: Optional 1-based document map of shape ``[1, tokens]``
@@ -296,9 +234,6 @@ def _output_sequence_lengths(
     if item_to_datum != tuple(range(len(datums))):
         raise ValueError("token output restoration requires collater items to preserve Datum order")
 
-    weights = loss_inputs.get("weights")
-    if not isinstance(weights, torch.Tensor):
-        raise ValueError("token output restoration requires Tensor loss weights")
     if packed_seq_ids is not None:
         if is_thd:
             raise ValueError("indexed-mask output routing cannot be combined with a THD model layout")
@@ -306,9 +241,9 @@ def _output_sequence_lengths(
             raise ValueError(f"_packed_seq_ids must have shape [1, tokens], got {tuple(packed_seq_ids.shape)}")
         if packed_seq_ids.dtype == torch.bool or packed_seq_ids.is_floating_point():
             raise TypeError("_packed_seq_ids must use an integer dtype")
-        if weights.ndim < 2 or tuple(weights.shape[:2]) != tuple(packed_seq_ids.shape):
+        if token_reference.ndim < 2 or tuple(token_reference.shape[:2]) != tuple(packed_seq_ids.shape):
             raise ValueError(
-                "indexed-mask token outputs require weights on the same [1, tokens] axes as _packed_seq_ids"
+                "indexed-mask token outputs require model tokens on the same [1, tokens] axes as _packed_seq_ids"
             )
         if bool((packed_seq_ids < 0).any()):
             raise ValueError("_packed_seq_ids must contain only zero padding or positive document IDs")
@@ -354,21 +289,21 @@ def _output_sequence_lengths(
                 "packed token metadata requires 0 <= real_length <= padded_length for every Datum; "
                 f"got real={real_lengths}, padded={padded_lengths}"
             )
-        if sum(padded_lengths) != weights.numel():
+        if sum(padded_lengths) != token_reference.numel():
             raise ValueError(
-                f"packed padded lengths sum to {sum(padded_lengths)}, but loss weights have token width "
-                f"{weights.numel()}"
+                f"packed padded lengths sum to {sum(padded_lengths)}, but model inputs have token width "
+                f"{token_reference.numel()}"
             )
         return real_lengths, padded_lengths, None
 
-    if weights.ndim < 2 or weights.shape[0] != len(item_to_datum):
-        raise ValueError("padded token outputs require weights with one row per Datum")
-    width = int(weights.shape[1])
+    if token_reference.ndim < 2 or token_reference.shape[0] != len(item_to_datum):
+        raise ValueError("padded token outputs require model tokens with one row per Datum")
+    width = int(token_reference.shape[1])
     attention_mask = model_inputs.get("attention_mask")
     if (
         isinstance(attention_mask, torch.Tensor)
         and attention_mask.ndim == 2
-        and tuple(attention_mask.shape) == tuple(weights.shape[:2])
+        and tuple(attention_mask.shape) == tuple(token_reference.shape[:2])
     ):
         token_mask = attention_mask.to(torch.bool)
         # Keep token routing compact. Turning every active position into a
@@ -411,12 +346,12 @@ def _lengths_from_cu_seqlens(cu_seqlens: torch.Tensor, sentinel: int = -1000) ->
     return tuple(result)
 
 
-def _loss_sequence_dim_from_weights(weights: torch.Tensor) -> int:
-    if weights.ndim == 1:
+def _token_sequence_dim(token_reference: torch.Tensor) -> int:
+    if token_reference.ndim == 1:
         return 0
-    if weights.ndim == 2:
+    if token_reference.ndim == 2:
         return 1
-    raise ValueError(f"per-token output weights must be one- or two-dimensional, got {tuple(weights.shape)}")
+    raise ValueError(f"token routing reference must be one- or two-dimensional, got {tuple(token_reference.shape)}")
 
 
 def _split_restored_token_output(
@@ -441,7 +376,7 @@ def _split_restored_token_output(
     """
     if plan.item_to_datum is None:
         if datum_indices != (0,):
-            raise NotImplementedError("prebatched token outputs can only produce their single outer Datum record")
+            raise NotImplementedError("prebatched token outputs can only produce their single outer Datum tensor")
         if plan.synthetic_suffix_tokens:
             restored_width = int(tensor.shape[seq_dim])
             if plan.synthetic_suffix_tokens >= restored_width:
@@ -505,71 +440,53 @@ def _split_restored_token_output(
     return pieces
 
 
-def _loss_fn_output_contract(
+def _loss_output_contract(
     outputs: ParsedLossOutputs,
-    weights: Any,
+    token_reference: Any,
     *,
-    expected_records: int | None,
-    microbatch_index: int | None,
+    expected_datums: int | None,
 ) -> tuple[str | None, tuple[Any, ...]]:
     """Return a local validation error and a rank-comparable output schema."""
     if outputs is None:
         return None, ("none",)
-    if expected_records is None:
+    token_outputs = outputs.token_outputs
+    if token_outputs and expected_datums is None:
         return (
-            "a prebatched Datum may return outputs only when num_microbatches=1 because its inner sample "
+            "a prebatched Datum may return token outputs only when num_microbatches=1 because its inner sample "
             "boundaries are not part of the Datum contract",
             ("unsupported", type(outputs).__name__),
         )
-    if not isinstance(weights, torch.Tensor):
-        return "loss_fn outputs require Tensor loss weights", ("invalid-weights", type(weights).__name__)
-
-    if isinstance(outputs, list):
-        error = None
-        if len(outputs) != expected_records:
-            error = (
-                f"pipeline loss_fn returned {len(outputs)} outputs for microbatch {microbatch_index}, "
-                f"expected {expected_records} from its Datum mapping"
-                if microbatch_index is not None
-                else f"loss_fn outputs must contain one mapping per Datum; got {len(outputs)} for {expected_records}"
-            )
-        # Legacy records are deliberately opaque and may contain rank-local
-        # fields. Only their presence and routing count participate in CP
-        # consensus; typed outputs opt into stronger schema agreement.
-        return error, ("legacy", len(outputs))
+    if token_outputs and not isinstance(token_reference, torch.Tensor):
+        return "token outputs require an internal token reference", ("invalid-token-reference",)
 
     error = None
-    if weights.ndim not in (1, 2):
-        error = f"per-token output weights must be one- or two-dimensional, got {tuple(weights.shape)}"
-    records = outputs.per_datum
-    if records is not None and len(records) != expected_records:
-        error = (
-            f"LossFnOutputBatch.per_datum contains {len(records)} records, expected {expected_records}"
-            if error is None
-            else error
-        )
-    record_keys = () if records is None else tuple(tuple(sorted(record)) for record in records)
+    if token_outputs and token_reference.ndim not in (1, 2):
+        error = f"token reference must be one- or two-dimensional, got {tuple(token_reference.shape)}"
     field_schema: list[tuple[Any, ...]] = []
-    for name, spec in sorted(outputs.per_token.items()):
-        tensor = spec.tensor
-        if tensor.shape[: weights.ndim] != weights.shape and error is None:
+    for name, tensor in sorted(token_outputs.items()):
+        if tensor.shape[: token_reference.ndim] != token_reference.shape and error is None:
             error = (
-                f"per-token output {name!r} must start with the loss weight shape {tuple(weights.shape)}, "
+                f"token output {name!r} must start with the physical token shape {tuple(token_reference.shape)}, "
                 f"got {tuple(tensor.shape)}"
             )
-        if tensor.device != weights.device and error is None:
-            error = f"per-token output {name!r} must be on the loss weight device {weights.device}, got {tensor.device}"
+        if tensor.device != token_reference.device and error is None:
+            error = (
+                f"token output {name!r} must be on the model token device {token_reference.device}, got {tensor.device}"
+            )
         field_schema.append(
             (
                 name,
                 str(tensor.dtype),
                 tensor.device.type,
                 tuple(tensor.shape),
-                type(spec.fill_value).__name__,
-                repr(spec.fill_value),
             )
         )
-    return error, ("typed", len(records) if records is not None else None, record_keys, tuple(field_schema))
+    return error, (
+        "typed",
+        expected_datums if token_outputs else None,
+        tuple(field_schema),
+        outputs.batch_output is not None,
+    )
 
 
 def _token_mask_schema(token_mask: torch.Tensor | None) -> tuple[tuple[int, ...], str] | None:
@@ -581,9 +498,9 @@ def _token_mask_schema(token_mask: torch.Tensor | None) -> tuple[tuple[int, ...]
     return tuple(compact.shape), digest
 
 
-def _loss_fn_output_restore_contract(
-    outputs: LossFnOutputBatch,
-    weights: Any,
+def _loss_output_restore_contract(
+    outputs: LossOutput,
+    token_reference: Any,
     plan: _OutputRestorePlan,
     *,
     datum_indices: tuple[int, ...] | None,
@@ -592,9 +509,9 @@ def _loss_fn_output_restore_contract(
 ) -> tuple[str | None, tuple[Any, ...]]:
     """Preflight one typed restore before any field enters a CP collective."""
     try:
-        if not isinstance(weights, torch.Tensor):
-            raise ValueError("loss_fn token outputs require Tensor loss weights")
-        seq_dim = _loss_sequence_dim_from_weights(weights)
+        if not isinstance(token_reference, torch.Tensor):
+            raise ValueError("token outputs require an internal token reference")
+        seq_dim = _token_sequence_dim(token_reference)
         if datum_indices is None:
             if plan.item_to_datum is not None:
                 raise RuntimeError("loss_fn output routing is missing the collater's Datum mapping")
@@ -634,7 +551,7 @@ def _loss_fn_output_restore_contract(
                 "typed per-token outputs are unavailable for this batch"
             )
 
-        local_width = int(weights.shape[seq_dim])
+        local_width = int(token_reference.shape[seq_dim])
         global_width = local_width * cp_size
         if selected_layout is not None:
             captured = selected_layout.local_token_global_indices
@@ -662,7 +579,7 @@ def _loss_fn_output_restore_contract(
                 restored_width = selected_layout.original_seq_len
         if (
             plan.is_thd
-            and weights.ndim == 2
+            and token_reference.ndim == 2
             and (
                 selected_layout is None
                 or (selected_layout.input_token_stream_positions is None and selected_layout.input_row_shape is None)
@@ -671,7 +588,7 @@ def _loss_fn_output_restore_contract(
             # Some model-owned THD paths retain caller [B, S] rows instead of
             # reporting an explicit input_row_shape. Routing flattens those
             # token axes row-major after restoration.
-            restored_width *= int(weights.shape[0])
+            restored_width *= int(token_reference.shape[0])
 
         if plan.item_to_datum is not None:
             assert plan.real_lengths is not None and plan.padded_lengths is not None
@@ -684,10 +601,10 @@ def _loss_fn_output_restore_contract(
             elif plan.packed_seq_ids is not None:
                 if plan.item_to_datum != datum_indices:
                     raise ValueError("indexed-mask output routing requires the complete Datum group in input order")
-                if weights.ndim != 2 or tuple(weights.shape) != tuple(plan.packed_seq_ids.shape):
+                if token_reference.ndim != 2 or tuple(token_reference.shape) != tuple(plan.packed_seq_ids.shape):
                     raise ValueError(
-                        "indexed-mask token outputs require weights with the original [1, tokens] shape; "
-                        f"got {tuple(weights.shape)} and ids {tuple(plan.packed_seq_ids.shape)}"
+                        "indexed-mask token outputs require the original [1, tokens] model shape; "
+                        f"got {tuple(token_reference.shape)} and ids {tuple(plan.packed_seq_ids.shape)}"
                     )
                 if restored_width != plan.packed_seq_ids.shape[1]:
                     raise ValueError(
@@ -695,10 +612,10 @@ def _loss_fn_output_restore_contract(
                         f"expected {plan.packed_seq_ids.shape[1]}"
                     )
             else:
-                if weights.ndim != 2 or weights.shape[0] != len(datum_indices):
+                if token_reference.ndim != 2 or token_reference.shape[0] != len(datum_indices):
                     raise ValueError(
                         f"restored padded token output must have {len(datum_indices)} rows, "
-                        f"got local loss weights {tuple(weights.shape)}"
+                        f"got local model tokens {tuple(token_reference.shape)}"
                     )
                 expected_widths = {plan.padded_lengths[index] for index in datum_indices}
                 if expected_widths != {restored_width}:
@@ -737,9 +654,9 @@ def _loss_fn_output_restore_contract(
             _token_mask_schema(plan.token_mask),
             plan.synthetic_suffix_tokens,
             seq_dim,
-            tuple(weights.shape),
+            tuple(token_reference.shape),
             layout_schema,
-            tuple(sorted(outputs.per_token)),
+            tuple(sorted(outputs.token_outputs)),
         )
         return None, schema
     except Exception as error:
@@ -747,54 +664,40 @@ def _loss_fn_output_restore_contract(
 
 
 def _parse_loss_result(
-    result: torch.Tensor | tuple[torch.Tensor, Sequence[Mapping[str, Any]] | LossFnOutputBatch],
+    result: torch.Tensor | LossOutput,
     weights: torch.Tensor,
 ) -> tuple[torch.Tensor, ParsedLossOutputs, Exception | None]:
-    """Normalize one loss callback result without applying Datum routing.
+    """Normalize one loss function result without applying Datum routing.
 
     Output-only contract errors are returned separately so distributed peers
     can finish the same backward schedule and reach a common error decision.
     Loss-tensor errors still raise immediately because no valid backward value
     exists in that case.
     """
-    if not isinstance(result, tuple):
-        return _weighted_numerator(result, weights), None, None
-    if not result:
-        raise ValueError("loss_fn returned an empty tuple instead of a loss Tensor")
-    numerator = _weighted_numerator(result[0], weights)
-    if len(result) != 2:
-        return numerator, None, ValueError("loss_fn must return a loss Tensor or a two-item (loss, outputs) tuple")
-    outputs = result[1]
+    if isinstance(result, torch.Tensor):
+        return _scalar_loss_sum(result, weights), None, None
+    if not isinstance(result, LossOutput):
+        raise TypeError("loss_fn must return a Tensor or LossOutput")
+    numerator = result.loss_sum
+    if numerator.device != weights.device:
+        raise ValueError("LossOutput.loss_sum and weights must be on the same device")
     try:
-        if isinstance(outputs, LossFnOutputBatch):
-            detached = LossFnOutputBatch(
-                per_token={
-                    name: PerTokenOutput(spec.tensor.detach(), fill_value=spec.fill_value)
-                    for name, spec in outputs.per_token.items()
-                },
-                per_datum=(None if outputs.per_datum is None else [_detach(record) for record in outputs.per_datum]),
-            )
-            return numerator, detached, None
-        if (
-            not isinstance(outputs, Sequence)
-            or isinstance(outputs, (str, bytes))
-            or not all(isinstance(item, Mapping) for item in outputs)
-        ):
-            raise ValueError("loss_fn outputs must be a sequence of mappings")
-        return numerator, [_detach(dict(item)) for item in outputs], None
+        detached = LossOutput(
+            loss_sum=numerator.detach(),
+            token_outputs=(
+                {name: tensor.detach() for name, tensor in result.token_outputs.items()}
+                if result.token_outputs
+                else None
+            ),
+            batch_output=None if result.batch_output is None else _detach(result.batch_output),
+        )
+        return numerator, detached, None
     except Exception as error:
         return numerator, None, error
 
 
-def _update_output_mode(previous: bool | None, outputs: ParsedLossOutputs) -> bool:
-    current = outputs is not None
-    if previous is not None and previous != current:
-        raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
-    return current
-
-
 def _detach(value: Any) -> Any:
-    """Detach tensor leaves without changing an output record's structure."""
+    """Detach tensor leaves without changing a caller-owned batch value."""
     if isinstance(value, torch.Tensor):
         return value.detach()
     if isinstance(value, Mapping):

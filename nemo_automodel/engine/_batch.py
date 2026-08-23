@@ -38,16 +38,16 @@ _LOSS_METADATA = ("cu_seqlens", "cu_seqlens_padded", "max_seqlen", "padding_mask
 def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], CollatedLossInputs | dict[str, torch.Tensor]]:
     """Return one already-collated Datum without changing its layout.
 
-    The Datum represents the whole prebatched item. Consequently, one
-    optional ``loss_fn_output`` mapping also describes that whole batch, not
-    each sample inside it. A typed token output likewise remains one record
-    containing the full inner ``[B, S, ...]`` (or flat THD) tensor; the Engine
-    cannot split hidden inner samples. Output records are rejected when PP
-    divides that prebatched Datum into multiple inner microbatches.
+    The Datum represents the whole prebatched item. Consequently, the Engine
+    cannot split a :class:`LossOutput` token field into hidden inner samples;
+    it returns the complete inner ``[B, S, ...]`` (or flat THD) tensor for that
+    Datum. ``batch_output`` describes the same complete outer item and is
+    rejected when AutoPipeline divides it into multiple inner microbatches,
+    because caller-owned values have no generic merge operation.
 
     Args:
         datums: A one-item list whose model and loss tensor fields already have
-            the batch layout expected by the model and loss callback.
+            the batch layout expected by the model and loss function.
 
     Returns:
         Separate shallow copies of the Datum's model-input and loss-input
@@ -87,8 +87,10 @@ def _resolve_loss_batch_layout(
     datums: list[Datum],
     model_inputs: Mapping[str, Any],
     loss_inputs: Mapping[str, LossInputValue],
+    *,
+    require_weights: bool = True,
 ) -> _LossBatchLayout:
-    """Resolve collater metadata without exposing it to the loss callback."""
+    """Resolve collater metadata without exposing it to the loss function."""
     datum_layouts: dict[str, LossInputLayout] = {}
     for name in sorted({name for datum in datums for name in datum.loss_fn_input_layouts}):
         declared = [datum.loss_fn_input_layouts[name] for datum in datums if name in datum.loss_fn_input_layouts]
@@ -141,8 +143,10 @@ def _resolve_loss_batch_layout(
         )
 
     weights = loss_inputs.get("weights")
-    if not isinstance(weights, torch.Tensor):
+    if require_weights and not isinstance(weights, torch.Tensor):
         raise ValueError("collate_fn must return a Tensor loss input named 'weights'")
+    if weights is not None and not isinstance(weights, torch.Tensor):
+        raise TypeError("collated loss input 'weights' must be a Tensor")
 
     fields: dict[str, LossInputLayout] = {}
     unresolved: set[str] = set()
@@ -207,26 +211,34 @@ def _validate_loss_batch_layout(
     if set(layouts) != set(loss_inputs):
         raise ValueError("loss input layouts must describe every collated loss field exactly once")
     token_fields = [name for name, layout in layouts.items() if layout is LossInputLayout.PER_TOKEN]
-    token_reference_name = "weights" if layouts.get("weights") is LossInputLayout.PER_TOKEN else None
-    if token_reference_name is None and "labels" in token_fields:
-        token_reference_name = "labels"
-    if token_reference_name is None and token_fields:
-        token_reference_name = token_fields[0]
-    token_reference = loss_inputs.get(token_reference_name) if token_reference_name is not None else None
-    if token_reference_name is not None and not isinstance(token_reference, torch.Tensor):
-        raise TypeError(f"per-token loss field {token_reference_name!r} must be a Tensor")
-    loss_seq_dim = (
-        _loss_sequence_dim(model_inputs, token_reference) if isinstance(token_reference, torch.Tensor) else None
-    )
-    if token_reference_name is not None and loss_seq_dim is None:
-        raise ValueError(f"per-token loss field {token_reference_name!r} must match the primary model token axes")
+    sequence_dims: dict[str, int] = {}
+    for name in token_fields:
+        value = loss_inputs[name]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"per-token loss field {name!r} must be a Tensor")
+        sequence_dim = _loss_sequence_dim(model_inputs, value)
+        if sequence_dim is None:
+            raise ValueError(f"per-token loss field {name!r} must match the primary model token axes")
+        sequence_dims[name] = sequence_dim
+    if len(set(sequence_dims.values())) > 1:
+        raise ValueError(f"per-token loss fields disagree on the model sequence axis: {sequence_dims}")
+
+    # A reference carries only the common token prefix used by CP/PP slicing.
+    # Choose the lowest-rank field so a routed-expert tensor [B, S, L, K], for
+    # example, cannot make an ordinary target tensor [B, S] look misaligned.
+    token_reference_name = None
+    if token_fields:
+        minimum_rank = min(loss_inputs[name].ndim for name in token_fields)
+        minimum_rank_fields = [name for name in token_fields if loss_inputs[name].ndim == minimum_rank]
+        token_reference_name = next(
+            (name for name in ("weights", "labels") if name in minimum_rank_fields),
+            min(minimum_rank_fields),
+        )
+    loss_seq_dim = None if token_reference_name is None else sequence_dims[token_reference_name]
 
     for name, value in loss_inputs.items():
         layout = layouts[name]
-        if layout is LossInputLayout.PER_TOKEN:
-            if not isinstance(value, torch.Tensor) or not _is_token_aligned(value, token_reference):
-                raise ValueError(f"per-token loss field {name!r} does not match the collated token layout")
-        elif layout is LossInputLayout.PER_DATUM:
+        if layout is LossInputLayout.PER_DATUM:
             if not isinstance(value, torch.Tensor) or value.ndim == 0 or value.shape[0] != len(datums):
                 shape = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
                 raise ValueError(f"per-Datum loss field {name!r} must have leading size {len(datums)}, got {shape}")

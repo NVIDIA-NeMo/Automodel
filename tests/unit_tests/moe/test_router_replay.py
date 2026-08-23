@@ -498,16 +498,16 @@ def test_engine_batch_context_adapter_replays_real_gate_and_preserves_router_gra
                 ``[batch, sequence]`` axes.
 
         Returns:
-            Per-token loss with shape ``[batch, sequence]``.
+            Scalar weighted loss numerator.
         """
-        return output
+        return (output * _loss_fn_inputs["weights"].to(output)).sum()
 
     Engine(
         model,
         device="cpu",
         collate_fn=collate_prebatched,
         batch_context_fn=adapter,
-    ).forward_backward([datum], loss_fn)
+    ).forward_backward([[datum]], loss_fn)
 
     torch.testing.assert_close(model.selected_indices, target.reshape(-1, 2).long())
     gate_grad = model.model.layers["0"].gate.weight.grad

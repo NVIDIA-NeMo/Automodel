@@ -140,7 +140,7 @@ class _FakePPModel:
         self.info = SimpleNamespace(has_first_stage=True, has_last_stage=False, stages=[], schedule=None)
 
 
-class _StageWithCPPreembedInForward:
+class _StageWithCPPreembedInForward(torch.nn.Module):
     # Sunk VLM (minimax/qwen3_5/qwen3_5_moe/step3p7): embeds + shards per
     # microbatch inside forward and pulls media from the PP side channel, so
     # media MUST still be staged for PP under CP.
@@ -148,7 +148,7 @@ class _StageWithCPPreembedInForward:
         return {}
 
 
-class _StageWithoutCPPrepare:
+class _StageWithoutCPPrepare(torch.nn.Module):
     pass
 
 
@@ -310,7 +310,6 @@ def test_setup_always_stages_pp_media_under_pp(
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
     assert dataloader_calls[0]["cp_size"] == cp_size
     assert trainer.engine.pipeline is trainer.pp
-    assert trainer.engine.microbatch_size == 1
 
 
 def test_setup_stages_pp_validation_media_and_preserves_packing_wiring(monkeypatch):

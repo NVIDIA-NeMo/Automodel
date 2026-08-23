@@ -635,6 +635,36 @@ def test_collate_vlm_datums_aligns_token_type_model_inputs(field, packed):
     assert model_inputs[field].shape == model_inputs["input_ids"].shape
 
 
+@pytest.mark.parametrize("layout", ["padded", "thd", "indexed"])
+def test_collate_vlm_datums_infers_media_token_types_for_forward_datums(layout):
+    processor = SimpleNamespace(
+        image_token_id=99,
+        video_token_id=88,
+        image_processor=SimpleNamespace(merge_size=2),
+        video_processor=SimpleNamespace(merge_size=2),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+    )
+    datum = Datum(
+        model_inputs={
+            "input_ids": torch.tensor([1, 99, 88, 2]),
+            "attention_mask": torch.ones(4, dtype=torch.long),
+            "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            "video_grid_thw": torch.tensor([[1, 2, 2]]),
+        }
+    )
+
+    model_inputs, loss_inputs = collate_vlm_datums(
+        [datum],
+        processor=processor,
+        packed=layout == "thd",
+        packing_layout="indexed_mask" if layout == "indexed" else None,
+    )
+
+    torch.testing.assert_close(model_inputs["mm_token_type_ids"], torch.tensor([[0, 1, 2]]))
+    assert model_inputs["mm_token_type_ids"].shape == model_inputs["input_ids"].shape
+    assert loss_inputs == {}
+
+
 def test_collate_vlm_datums_rejects_invalid_unshifted_contract():
     processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
     with pytest.raises(ValueError, match="at least one"):

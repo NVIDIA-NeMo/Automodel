@@ -97,7 +97,6 @@ def test_recipes_run_one_datum_engine_window_then_one_optimizer_step(recipe_cls,
     recipe.engine = Engine(
         model,
         device="cpu",
-        microbatch_size=1,
         collate_fn=collate_prebatched,
         optimizers=recipe.optimizer,
         max_grad_norm=None,

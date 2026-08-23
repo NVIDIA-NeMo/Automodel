@@ -805,7 +805,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             optimizers=self.optimizer,
             lr_schedulers=self.lr_scheduler,
             max_grad_norm=self.max_grad_norm,
-            microbatch_size=1,
             collate_fn=collate_prebatched,
             padding_token_id=(self.tokenizer.pad_token_id if self.tokenizer is not None else 0) or 0,
             mtp_ignore_index=self.cfg.mtp.ignore_index,
@@ -943,8 +942,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             last_stage_model,
             grad_reduce_group=self._get_dp_group(include_cp=True),
         )
-        # Engine supplies this loss through its training and forward-only
-        # per-microbatch callbacks.
+        # Engine supplies this loss to every physical training or evaluation
+        # microbatch.
         self.pp.info.schedule._loss_fn = self.pipeline_loss_fn
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
@@ -1218,12 +1217,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         forward_backward_result = self.engine.forward_backward(
-            [self._make_engine_datum(batch) for batch in batches],
+            [[self._make_engine_datum(batch)] for batch in batches],
             self._engine_loss_fn,
         )
         reporting_loss = forward_backward_result.loss
         num_label_tokens = int(forward_backward_result.weight_sum.item())
-        step_result = self.engine.optim_step(before_optimizer_step=self.checkpointer.maybe_wait_for_staging)
+        step_result = self.engine.step(before_optimizer_step=self.checkpointer.maybe_wait_for_staging)
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].install_optimized_model_weights()
@@ -1292,11 +1291,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_num_label_tokens = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
 
             for batch in val_dataloader:
-                result = self.engine.forward([self._make_engine_datum(batch)], self._engine_validation_loss_fn)
+                result = self.engine.evaluate([[self._make_engine_datum(batch)]], self._engine_validation_loss_fn)
                 total_loss += result.loss_sum
                 total_num_label_tokens += result.weight_sum
 
-        # Engine.forward has already reconstructed CP shards and synchronized
+        # Engine.evaluate has already reconstructed CP shards and synchronized
         # PP stages. Only independent DP validation shards remain to combine.
         total_loss = self._dp_allreduce(total_loss)
         total_num_label_tokens = int(self._dp_allreduce(total_num_label_tokens).item())

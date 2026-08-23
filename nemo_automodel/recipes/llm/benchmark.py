@@ -336,12 +336,14 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 torch.cuda.nvtx.range_push(f"iteration_{i}_forward_backward")
                 try:
                     with self.timers("forward_backward", log_level=2):
-                        forward_backward_result = self.engine.forward_backward(datums, self._engine_loss_fn)
+                        forward_backward_result = self.engine.forward_backward(
+                            [[datum] for datum in datums], self._engine_loss_fn
+                        )
                 finally:
                     torch.cuda.nvtx.range_pop()
 
                 with self.timers("optimizer", log_level=2):
-                    self.engine.optim_step(before_optimizer_step=self.checkpointer.maybe_wait_for_staging)
+                    self.engine.step(before_optimizer_step=self.checkpointer.maybe_wait_for_staging)
                     logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager

@@ -19,12 +19,12 @@ both raw THD metadata (``seq_lens``) and final THD metadata (``cu_seqlens``).
 Each path runs training, forward-only evaluation, then training again on the
 same pipeline. Evaluation must match a native eager Llama in summed loss and
 weight statistics without creating gradients; both surrounding training calls
-must match eager loss plus every local-stage gradient. Additional flat-Datum
-runs cover explicit loss layouts and typed per-token callback outputs for raw
-2+2 and final-THD 3+1 document splits. Under CP2 they run both forward and
-forward/backward, use ragged internally padded sequences, and require every PP
-and CP rank to receive the same restored Datum records. A final padded
-two-Datum update verifies legacy callback mappings in logical input order.
+must match eager loss plus every local-stage gradient. Additional explicit
+Datum batches cover loss layouts and field-first token outputs for raw 2+2 and
+final-THD 3+1 document splits. Under CP2 they run both evaluation and training,
+use ragged internally padded sequences, and require every PP and CP rank to
+receive the same logical per-Datum token tensors. A final padded two-Datum
+update verifies restored token order on every pipeline stage.
 
 Run with::
 
@@ -62,8 +62,7 @@ from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismS
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM
-from nemo_automodel.engine import Engine, collate_prebatched
-from nemo_automodel.engine.outputs import LossFnOutputBatch, PerTokenOutput
+from nemo_automodel.engine import Engine, LossOutput, collate_prebatched
 
 VOCAB_SIZE = 64
 SEQ_LEN = 8
@@ -136,6 +135,12 @@ def _token_losses(output, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         ignore_index=-100,
         reduction="none",
     ).reshape_as(loss_inputs["weights"])
+
+
+def _weighted_loss_sum(output, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return the scalar weighted numerator for one physical token batch."""
+    losses = _token_losses(output, loss_inputs)
+    return (losses * loss_inputs["weights"].to(losses)).sum()
 
 
 def _eager_reference(
@@ -371,7 +376,7 @@ def _build_pipeline(
         device=device,
         dtype=torch.bfloat16,
         pp_seq_len=SEQ_LEN,
-    ).build(model, loss_fn=_token_losses)
+    ).build(model, loss_fn=_weighted_loss_sum)
     del model
     if mesh_context.cp_size > 1:
         cp_mesh = mesh_context.device_mesh["cp"]
@@ -464,16 +469,18 @@ def _run_thd_layout(
         collate_fn=collate_prebatched,
     )
 
-    pre_eval_result = engine.forward_backward([datum], _token_losses)
+    pre_eval_result = engine.forward_backward([[datum]], _weighted_loss_sum)
     torch.testing.assert_close(pre_eval_result.loss.float(), reference_loss.float(), atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(pre_eval_result.loss_sum.float(), reference_eval_loss_sum.float(), atol=4e-2, rtol=2e-3)
     torch.testing.assert_close(pre_eval_result.weight_sum.float(), reference_eval_weight_sum.float(), atol=0, rtol=0)
-    assert pre_eval_result.loss_fn_outputs == []
+    assert pre_eval_result.token_outputs == [{}]
+    assert pre_eval_result.batch_outputs == [None]
     pre_eval_grad_diff = _assert_local_grad_parity(pipeline, reference_grads)
     for part in pipeline.parts:
         part.zero_grad(set_to_none=True)
 
-    forward_result = engine.forward([datum], _token_losses)
+    modes_before_evaluation = [part.training for part in pipeline.parts]
+    forward_result = engine.evaluate([[datum]], _weighted_loss_sum)
 
     torch.testing.assert_close(
         forward_result.loss_sum.float(),
@@ -487,21 +494,23 @@ def _run_thd_layout(
         atol=0,
         rtol=0,
     )
-    assert forward_result.loss_fn_outputs == []
+    assert forward_result.token_outputs == [{}]
+    assert forward_result.batch_outputs == [None]
     if any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
         raise AssertionError(f"PP2 {layout} THD forward-only evaluation unexpectedly created parameter gradients")
-    if any(part.training for part in pipeline.parts):
-        raise AssertionError(f"PP2 {layout} THD forward-only evaluation did not keep every model part in eval mode")
+    if [part.training for part in pipeline.parts] != modes_before_evaluation:
+        raise AssertionError(f"PP2 {layout} THD evaluation did not restore every model part's mode")
 
     # Reuse the exact pipeline immediately. Together with the training call
     # above, this proves both train->eval and eval->train schedule transitions
-    # restore temporary split/loss callbacks and backward state.
-    train_result = engine.forward_backward([datum], _token_losses)
+    # restore temporary split/loss functions and backward state.
+    train_result = engine.forward_backward([[datum]], _weighted_loss_sum)
 
     torch.testing.assert_close(train_result.loss.float(), reference_loss.float(), atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(train_result.loss_sum.float(), reference_eval_loss_sum.float(), atol=4e-2, rtol=2e-3)
     torch.testing.assert_close(train_result.weight_sum.float(), reference_eval_weight_sum.float(), atol=0, rtol=0)
-    assert train_result.loss_fn_outputs == []
+    assert train_result.token_outputs == [{}]
+    assert train_result.batch_outputs == [None]
     grad_diff = _assert_local_grad_parity(pipeline, reference_grads)
     if dist.get_rank() == 0:
         print(
@@ -540,7 +549,7 @@ def _run_explicit_loss_layout(
         expected_microbatch_ids = {(11, 22, 33), (44,)}
     else:
         raise ValueError(f"unknown explicit loss layout: {layout}")
-    if execution not in {"forward", "forward_backward"}:
+    if execution not in {"evaluate", "forward_backward"}:
         raise ValueError(f"unknown Engine execution: {execution}")
 
     for part in pipeline.parts:
@@ -566,21 +575,20 @@ def _run_explicit_loss_layout(
         assert loss_inputs["global_coefficients"].shape == (2,)
         losses = _explicit_layout_losses(output, loss_inputs)
         rl_probe = torch.stack((loss_inputs["advantages"], loss_inputs["old_logprobs"]), dim=-1)
-        return losses, LossFnOutputBatch(
-            per_token={"rl_probe": PerTokenOutput(rl_probe)},
-            per_datum=[{"sample_id": value} for value in loss_inputs["sample_id"]],
+        return LossOutput(
+            loss_sum=(losses * loss_inputs["weights"].to(losses)).sum(),
+            token_outputs={"rl_probe": rl_probe},
         )
 
     engine = Engine(
         pipeline,
         device=device,
         mesh_context=mesh_context,
-        microbatch_size=4,
         collate_fn=collate_fn,
     )
-    result = getattr(engine, execution)(datums, loss_with_outputs)
+    result = getattr(engine, execution)([datums], loss_with_outputs)
 
-    if execution == "forward":
+    if execution == "evaluate":
         torch.testing.assert_close(result.loss_sum.float(), reference_loss_sum.float(), atol=4e-2, rtol=2e-3)
         torch.testing.assert_close(result.weight_sum.float(), reference_weight_sum.float(), atol=0, rtol=0)
         if any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
@@ -593,29 +601,23 @@ def _run_explicit_loss_layout(
         if not any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
             raise AssertionError(f"PP2 x CP{mesh_context.cp_size} {layout} backward created no gradients")
 
-    outputs = result.loss_fn_outputs
-    output_ids = torch.stack([item["sample_id"] for item in outputs]).to(torch.long)
-    expected_ids = torch.tensor([11, 22, 33, 44], device=device)
-    torch.testing.assert_close(output_ids, expected_ids)
+    outputs = result.token_outputs[0]["rl_probe"]
     restored_probe = []
-    for datum, item in zip(datums, outputs):
+    for datum, output in zip(datums, outputs):
         expected_probe = torch.stack(
             (datum.loss_fn_inputs["advantages"], datum.loss_fn_inputs["old_logprobs"]),
             dim=-1,
         )
-        torch.testing.assert_close(item["rl_probe"], expected_probe)
-        assert not item["rl_probe"].requires_grad
-        restored_probe.append(item["rl_probe"])
+        torch.testing.assert_close(output, expected_probe)
+        assert not output.requires_grad
+        restored_probe.append(output)
     flat_probe = torch.cat(restored_probe)
-    gathered = [torch.empty_like(output_ids) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, output_ids)
-    assert all(torch.equal(ids, expected_ids) for ids in gathered)
     gathered_probe = [torch.empty_like(flat_probe) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered_probe, flat_probe)
     assert all(torch.equal(probe, flat_probe) for probe in gathered_probe)
     if dist.get_rank() == 0:
         datum_counts = "2+2" if layout == "raw" else "3+1"
-        reported_loss = result.loss_sum.item() if execution == "forward" else result.loss.item()
+        reported_loss = result.loss_sum.item() if execution == "evaluate" else result.loss.item()
         print(
             f"PP2 x CP{mesh_context.cp_size} {layout} {execution} explicit loss/output routing passed "
             f"({datum_counts} Datums; loss={reported_loss:.6f})"
@@ -627,7 +629,7 @@ def _run_padded_output_broadcast(pipeline: AutoPipeline, device: torch.device, m
         part.zero_grad(set_to_none=True)
 
     datums = []
-    for sample_id, offset in ((17, 0), (29, 8)):
+    for offset in (0, 8):
         input_ids = torch.arange(1 + offset, 1 + offset + SEQ_LEN, device=device) % VOCAB_SIZE
         labels = input_ids.roll(-1)
         labels[-1] = -100
@@ -637,33 +639,34 @@ def _run_padded_output_broadcast(pipeline: AutoPipeline, device: torch.device, m
                 loss_fn_inputs={
                     "labels": labels,
                     "weights": (labels != -100).to(torch.float32),
-                    "sample_id": torch.tensor(sample_id, device=device),
                 },
             )
         )
 
     def loss_with_output(output, loss_inputs):
-        logits = getattr(output, "logits", output)
         losses = _token_losses(output, loss_inputs)
-        return losses, [{"sample_id": loss_inputs["sample_id"][0], "score": logits.float().mean()}]
+        return LossOutput(
+            loss_sum=(losses * loss_inputs["weights"].to(losses)).sum(),
+            token_outputs={"labels": loss_inputs["labels"]},
+        )
 
     result = Engine(
         pipeline,
         device=device,
         mesh_context=mesh_context,
-        microbatch_size=2,
-    ).forward_backward(datums, loss_with_output)
+    ).forward_backward([datums], loss_with_output)
 
-    expected_ids = torch.tensor([17, 29], device=device)
-    output_ids = torch.stack([item["sample_id"] for item in result.loss_fn_outputs]).to(device=device, dtype=torch.long)
-    torch.testing.assert_close(output_ids, expected_ids)
-    gathered = [torch.empty_like(output_ids) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, output_ids)
-    assert all(torch.equal(ids, expected_ids) for ids in gathered)
+    restored_labels = result.token_outputs[0]["labels"]
+    assert len(restored_labels) == len(datums)
+    for datum, output_labels in zip(datums, restored_labels):
+        torch.testing.assert_close(output_labels, datum.loss_fn_inputs["labels"])
+    flat_labels = torch.cat(restored_labels)
+    gathered = [torch.empty_like(flat_labels) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, flat_labels)
+    assert all(torch.equal(labels, flat_labels) for labels in gathered)
     assert torch.isfinite(result.loss)
-    assert all(torch.isfinite(item["score"]) for item in result.loss_fn_outputs)
     if dist.get_rank() == 0:
-        print("PP2 padded per-Datum outputs passed (logical order [17, 29] synchronized on both ranks)")
+        print("PP2 padded token outputs passed (logical Datum order synchronized on both ranks)")
 
 
 def main() -> None:
@@ -690,7 +693,7 @@ def main() -> None:
         if cp_size > 1:
             pipeline = _build_pipeline(device, mesh_context)
             for layout in ("raw", "final"):
-                for execution in ("forward", "forward_backward"):
+                for execution in ("evaluate", "forward_backward"):
                     _run_explicit_loss_layout(pipeline, layout, execution, device, mesh_context)
                     dist.barrier()
             return
@@ -730,9 +733,9 @@ def main() -> None:
             weights,
         )
         dist.barrier()
-        _run_explicit_loss_layout(final_pipeline, "raw", "forward", device, mesh_context)
+        _run_explicit_loss_layout(final_pipeline, "raw", "evaluate", device, mesh_context)
         dist.barrier()
-        _run_explicit_loss_layout(final_pipeline, "final", "forward", device, mesh_context)
+        _run_explicit_loss_layout(final_pipeline, "final", "evaluate", device, mesh_context)
         dist.barrier()
         _run_padded_output_broadcast(final_pipeline, device, mesh_context)
         dist.barrier()

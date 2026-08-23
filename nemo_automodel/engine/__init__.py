@@ -17,19 +17,17 @@
 from nemo_automodel.engine._batch import collate_prebatched
 from nemo_automodel.engine._engine import Engine
 from nemo_automodel.engine.outputs import (
+    EvaluationResult,
     ForwardBackwardResult,
-    ForwardResult,
-    LossFnOutputBatch,
-    OptimStepResult,
-    PerTokenOutput,
+    LossOutput,
+    StepResult,
 )
 
 __all__ = [
     "Engine",
+    "EvaluationResult",
     "ForwardBackwardResult",
-    "ForwardResult",
-    "LossFnOutputBatch",
-    "OptimStepResult",
-    "PerTokenOutput",
+    "LossOutput",
+    "StepResult",
     "collate_prebatched",
 ]

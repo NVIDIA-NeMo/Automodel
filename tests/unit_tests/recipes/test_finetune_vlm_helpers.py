@@ -412,14 +412,15 @@ def _build_engine_recipe_for_optim_step(*, pp_enabled: bool = False):
         loss=torch.tensor(0.25),
         loss_sum=torch.tensor(1.0),
         weight_sum=torch.tensor(4.0),
-        loss_fn_outputs=[],
+        token_outputs=[],
+        batch_outputs=[],
     )
-    recipe.engine.optim_step.return_value = SimpleNamespace(grad_norm=2.5, learning_rates=(0.01,))
+    recipe.engine.step.return_value = SimpleNamespace(grad_norm=2.5, learning_rates=(0.01,))
     return recipe
 
 
 @pytest.mark.cuda(False)
-def test_run_train_step_passes_flat_prebatched_datums_to_engine():
+def test_run_train_step_passes_nested_prebatched_datums_to_engine():
     recipe = _build_engine_recipe_for_optim_step(pp_enabled=True)
     batches = [
         {
@@ -434,14 +435,15 @@ def test_run_train_step_passes_flat_prebatched_datums_to_engine():
     metrics = recipe._run_train_optim_step(batches)
 
     datums, loss_fn = recipe.engine.forward_backward.call_args.args
-    assert len(datums) == 2
-    assert all(datum.model_inputs.keys() == {"input_ids"} for datum in datums)
-    assert [datum.loss_fn_inputs["weights"].tolist() for datum in datums] == [
+    assert [len(batch) for batch in datums] == [1, 1]
+    flat_datums = [batch[0] for batch in datums]
+    assert all(datum.model_inputs.keys() == {"input_ids"} for datum in flat_datums)
+    assert [datum.loss_fn_inputs["weights"].tolist() for datum in flat_datums] == [
         [[True, False, True, False]],
         [[False, True, False, True]],
     ]
     assert callable(loss_fn)
-    recipe.engine.optim_step.assert_called_once_with(
+    recipe.engine.step.assert_called_once_with(
         before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging,
     )
     assert metrics.metrics["loss"] == pytest.approx(0.25)
@@ -463,13 +465,14 @@ def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call():
     recipe._compute_vlm_loss = MagicMock(side_effect=[torch.tensor(1.0), torch.tensor(2.0)])
 
     def forward_backward(datums, loss_fn):
-        for datum in datums:
+        for (datum,) in datums:
             loss_fn(object(), datum.loss_fn_inputs)
         return ForwardBackwardResult(
             loss=torch.tensor(0.25),
             loss_sum=torch.tensor(1.0),
             weight_sum=torch.tensor(4.0),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         )
 
     recipe.engine.forward_backward.side_effect = forward_backward
@@ -511,13 +514,14 @@ def test_run_train_step_uses_engine_for_empty_supervision():
         loss=torch.tensor(0.0),
         loss_sum=torch.tensor(0.0),
         weight_sum=torch.tensor(0.0),
-        loss_fn_outputs=[],
+        token_outputs=[],
+        batch_outputs=[],
     )
     batch = {"labels": torch.full((1, 4), -100), "input_ids": torch.arange(4).reshape(1, 4)}
     metrics = recipe._run_train_optim_step([batch])
 
     recipe.engine.forward_backward.assert_called_once()
-    recipe.engine.optim_step.assert_called_once()
+    recipe.engine.step.assert_called_once()
     assert metrics.metrics["loss"] == 0.0
     assert metrics.metrics["num_label_tokens"] == 0
     assert not recipe.optimizer[0].step_called
@@ -542,7 +546,7 @@ def test_train_step_leaves_fp8_post_step_work_to_engine(monkeypatch):
     batch = {"labels": torch.tensor([[1, 2]]), "input_ids": torch.tensor([[3, 4]])}
     recipe._run_train_optim_step([batch])
 
-    recipe.engine.optim_step.assert_called_once_with(
+    recipe.engine.step.assert_called_once_with(
         before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging,
     )
 
@@ -2142,7 +2146,7 @@ def test_vlm_engine_validation_loss_uses_eval_path():
     )
 
 
-def test_vlm_validation_uses_engine_forward_and_aggregates_uneven_batches(monkeypatch):
+def test_vlm_validation_uses_engine_evaluate_and_aggregates_uneven_batches(monkeypatch):
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.model_parts = [MagicMock()]
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
@@ -2152,16 +2156,18 @@ def test_vlm_validation_uses_engine_forward_and_aggregates_uneven_batches(monkey
     recipe.loss_fn = object()
 
     engine = MagicMock()
-    engine.forward.side_effect = [
+    engine.evaluate.side_effect = [
         SimpleNamespace(
             loss_sum=torch.tensor(4.0, dtype=torch.float64),
             weight_sum=torch.tensor(2.0, dtype=torch.float64),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         ),
         SimpleNamespace(
             loss_sum=torch.tensor(9.0, dtype=torch.float64),
             weight_sum=torch.tensor(3.0, dtype=torch.float64),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         ),
     ]
     recipe.engine = engine
@@ -2187,15 +2193,16 @@ def test_vlm_validation_uses_engine_forward_and_aggregates_uneven_batches(monkey
     ]
     metrics = recipe._run_validation_epoch(batches)
 
-    assert engine.forward.call_count == 2
-    for call, batch in zip(engine.forward.call_args_list, batches):
-        datums, loss_fn = call.args
-        assert len(datums) == 1
-        assert datums[0].model_inputs["input_ids"] is batch["input_ids"]
-        assert datums[0].model_inputs["pixel_values"] is batch["pixel_values"]
-        assert datums[0].loss_fn_inputs["labels"] is batch["labels"]
-        torch.testing.assert_close(datums[0].loss_fn_inputs["weights"], batch["labels"].ne(-100))
-        assert datums[0].loss_fn_input_layouts == {
+    assert engine.evaluate.call_count == 2
+    for call, batch in zip(engine.evaluate.call_args_list, batches):
+        datum_batches, loss_fn = call.args
+        assert len(datum_batches) == len(datum_batches[0]) == 1
+        datum = datum_batches[0][0]
+        assert datum.model_inputs["input_ids"] is batch["input_ids"]
+        assert datum.model_inputs["pixel_values"] is batch["pixel_values"]
+        assert datum.loss_fn_inputs["labels"] is batch["labels"]
+        torch.testing.assert_close(datum.loss_fn_inputs["weights"], batch["labels"].ne(-100))
+        assert datum.loss_fn_input_layouts == {
             "labels": LossInputLayout.PER_TOKEN,
             "weights": LossInputLayout.PER_TOKEN,
         }
@@ -2220,10 +2227,11 @@ def test_vlm_validation_rejects_zero_global_denominator(monkeypatch, batches):
     recipe.pp_enabled = False
     recipe.loss_fn = object()
     recipe.engine = MagicMock()
-    recipe.engine.forward.return_value = SimpleNamespace(
+    recipe.engine.evaluate.return_value = SimpleNamespace(
         loss_sum=torch.tensor(0.0, dtype=torch.float64),
         weight_sum=torch.tensor(0.0, dtype=torch.float64),
-        loss_fn_outputs=[],
+        token_outputs=[],
+        batch_outputs=[],
     )
     recipe._dp_allreduce = MagicMock(side_effect=lambda tensor, **kwargs: tensor)
     monkeypatch.setattr(
@@ -2273,7 +2281,6 @@ def test_vlm_setup_builds_engine_for_eager_sum_loss(monkeypatch):
 
     assert isinstance(trainer.loss_fn, MaskedCrossEntropy)
     assert trainer.engine is not None
-    assert trainer.engine.microbatch_size == 1
     assert trainer.engine.mtp_ignore_index == trainer.cfg.mtp.ignore_index == -100
 
 

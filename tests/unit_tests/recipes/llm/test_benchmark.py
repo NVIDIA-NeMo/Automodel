@@ -162,9 +162,10 @@ def mock_recipe(mock_config, monkeypatch):
             loss=torch.tensor(0.5),
             loss_sum=torch.tensor(12.0),
             weight_sum=torch.tensor(24.0),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         )
-        recipe.engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
+        recipe.engine.step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
         return recipe
 
 
@@ -463,7 +464,7 @@ class TestBenchmarkingRecipeRunBenchmark:
             mock_recipe.run_benchmark()
 
             mock_recipe.optimizer[0].zero_grad.assert_not_called()
-            assert mock_recipe.engine.optim_step.call_count == 30
+            assert mock_recipe.engine.step.call_count == 30
 
     def test_run_benchmark_optimizer_step_per_iteration(self, mock_recipe):
         """Test that Engine performs one optimizer step per iteration."""
@@ -500,8 +501,8 @@ class TestBenchmarkingRecipeRunBenchmark:
         with patch("torch.distributed.barrier"):
             mock_recipe.run_benchmark()
 
-            assert mock_recipe.engine.optim_step.call_count == 30
-            for call in mock_recipe.engine.optim_step.call_args_list:
+            assert mock_recipe.engine.step.call_count == 30
+            for call in mock_recipe.engine.step.call_args_list:
                 assert call.kwargs["before_optimizer_step"] is mock_recipe.checkpointer.maybe_wait_for_staging
             mock_recipe.optimizer[0].step.assert_not_called()
             graph_manager.capture.assert_called_once_with()
@@ -563,7 +564,7 @@ class TestBenchmarkingRecipeRunBenchmark:
 
         torch.cuda.nvtx.range_push.assert_called_once_with("iteration_0_forward_backward")
         torch.cuda.nvtx.range_pop.assert_called_once_with()
-        mock_recipe.engine.optim_step.assert_not_called()
+        mock_recipe.engine.step.assert_not_called()
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
@@ -887,7 +888,8 @@ class TestBenchmarkingRecipeLossCalculation:
             loss=torch.tensor(0.625),
             loss_sum=torch.tensor(10.625),
             weight_sum=torch.tensor(17.0),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         )
 
         # Mock timers
@@ -925,6 +927,7 @@ class TestBenchmarkingRecipeLossCalculation:
         assert "num_label_tokens=17 | loss=0.6250" in capsys.readouterr().out
         datums, loss_fn = mock_recipe.engine.forward_backward.call_args.args
         assert len(datums) == 8
+        assert all(len(batch) == 1 for batch in datums)
         assert loss_fn == mock_recipe._engine_loss_fn
 
     def test_pp_engine_result_avoids_duplicate_recipe_collectives(self, mock_recipe):

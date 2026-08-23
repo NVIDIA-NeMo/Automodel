@@ -1119,7 +1119,6 @@ def test_setup_builds_engine_for_eager_sum_loss(monkeypatch):
 
     assert isinstance(trainer.loss_fn, MaskedCrossEntropy)
     assert trainer.engine is not None
-    assert trainer.engine.microbatch_size == 1
     assert trainer.engine.mtp_ignore_index == -321
     assert trainer.engine.optimizers == tuple(trainer.optimizer)
     assert trainer.engine.lr_schedulers == tuple(trainer.lr_scheduler or ())
@@ -1144,7 +1143,6 @@ def test_setup_builds_engine_for_eager_fused_loss(monkeypatch):
 
     assert trainer.loss_fn is fused_loss
     assert trainer.engine is not None
-    assert trainer.engine.microbatch_size == 1
 
 
 @pytest.mark.parametrize(
@@ -1286,7 +1284,6 @@ def test_setup_pipeline_engine_matrix(
         assert trainer.loss_fn is fused_loss_fn
     assert trainer.engine is not None
     assert trainer.engine.pipeline is pipeline
-    assert trainer.engine.microbatch_size == 1
     assert dataloader_build_kwargs[0]["collate_wrapper"] is (None if dataloader_emits_thd else pp_collate_wrapper)
 
 
@@ -1588,7 +1585,7 @@ def test_engine_validation_pipeline_loss_reuses_configured_loss_and_thd_metadata
     recipe.pipeline_loss_fn.assert_called_once_with(output, labels)
 
 
-def test_run_validation_epoch_uses_engine_forward_for_pp_complete_results(monkeypatch):
+def test_run_validation_epoch_uses_engine_evaluate_for_pp_complete_results(monkeypatch):
     recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
     recipe.model_parts = [MagicMock()]
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
@@ -1600,16 +1597,18 @@ def test_run_validation_epoch_uses_engine_forward_for_pp_complete_results(monkey
     recipe.tool_call_evaluator = None
 
     engine = MagicMock()
-    engine.forward.side_effect = [
+    engine.evaluate.side_effect = [
         SimpleNamespace(
             loss_sum=torch.tensor(4.0, dtype=torch.float64),
             weight_sum=torch.tensor(2.0, dtype=torch.float64),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         ),
         SimpleNamespace(
             loss_sum=torch.tensor(9.0, dtype=torch.float64),
             weight_sum=torch.tensor(3.0, dtype=torch.float64),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         ),
     ]
     recipe.engine = engine
@@ -1627,14 +1626,15 @@ def test_run_validation_epoch_uses_engine_forward_for_pp_complete_results(monkey
     ]
     metrics = recipe._run_validation_epoch(batches)
 
-    assert engine.forward.call_count == 2
-    for call, batch in zip(engine.forward.call_args_list, batches):
-        datums, loss_fn = call.args
-        assert len(datums) == 1
-        assert datums[0].model_inputs["input_ids"] is batch["input_ids"]
-        assert datums[0].loss_fn_inputs["labels"] is batch["labels"]
-        torch.testing.assert_close(datums[0].loss_fn_inputs["weights"], batch["labels"].ne(-100))
-        assert datums[0].loss_fn_input_layouts == {
+    assert engine.evaluate.call_count == 2
+    for call, batch in zip(engine.evaluate.call_args_list, batches):
+        datum_batches, loss_fn = call.args
+        assert len(datum_batches) == len(datum_batches[0]) == 1
+        datum = datum_batches[0][0]
+        assert datum.model_inputs["input_ids"] is batch["input_ids"]
+        assert datum.loss_fn_inputs["labels"] is batch["labels"]
+        torch.testing.assert_close(datum.loss_fn_inputs["weights"], batch["labels"].ne(-100))
+        assert datum.loss_fn_input_layouts == {
             "labels": LossInputLayout.PER_TOKEN,
             "weights": LossInputLayout.PER_TOKEN,
         }
@@ -2102,9 +2102,10 @@ class TestRunTrainOptimStepUsesEngine:
             loss=torch.tensor(0.5),
             loss_sum=torch.tensor(2.0),
             weight_sum=torch.tensor(4.0),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         )
-        engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
+        engine.step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
         object.__setattr__(recipe, "engine", engine)
         object.__setattr__(recipe, "timestamp", 0.0)
         monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
@@ -2124,9 +2125,10 @@ class TestRunTrainOptimStepUsesEngine:
             loss=torch.tensor(0.25),
             loss_sum=torch.tensor(1.75),
             weight_sum=torch.tensor(7.0),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         )
-        engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.02,))
+        engine.step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.02,))
         object.__setattr__(recipe, "engine", engine)
         optimizer = SimpleNamespace(
             step=MagicMock(),
@@ -2136,8 +2138,8 @@ class TestRunTrainOptimStepUsesEngine:
         object.__setattr__(recipe, "optimizer", [optimizer])
         metrics = recipe._run_train_optim_step(batches)
 
-        engine.forward_backward.assert_called_once_with(datums, recipe._engine_loss_fn)
-        engine.optim_step.assert_called_once_with(before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging)
+        engine.forward_backward.assert_called_once_with([[datum] for datum in datums], recipe._engine_loss_fn)
+        engine.step.assert_called_once_with(before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging)
         assert make_datum.call_count == 2
         optimizer.step.assert_not_called()
         optimizer.zero_grad.assert_not_called()
@@ -2158,18 +2160,19 @@ class TestRunTrainOptimStepUsesEngine:
             loss=torch.tensor(0.5),
             loss_sum=torch.tensor(1.0),
             weight_sum=torch.tensor(2.0),
-            loss_fn_outputs=[],
+            token_outputs=[],
+            batch_outputs=[],
         )
-        engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
+        engine.step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
         object.__setattr__(recipe, "engine", engine)
 
         recipe._run_train_optim_step([batch])
 
         engine.forward_backward.assert_called_once()
-        engine.optim_step.assert_called_once_with(before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging)
+        engine.step.assert_called_once_with(before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging)
         datums, loss_fn = engine.forward_backward.call_args.args
-        assert len(datums) == 1
-        assert datums[0].model_inputs["qkv_format"] == "thd"
+        assert len(datums) == 1 and len(datums[0]) == 1
+        assert datums[0][0].model_inputs["qkv_format"] == "thd"
         assert loss_fn == recipe._engine_loss_fn
 
     def test_train_step_leaves_fp8_post_step_work_to_engine(self, monkeypatch):
@@ -2199,7 +2202,7 @@ class TestRunTrainOptimStepUsesEngine:
 
         recipe._run_train_optim_step([{"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[2, -100]])}])
 
-        recipe.engine.optim_step.assert_called_once_with(
+        recipe.engine.step.assert_called_once_with(
             before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging,
         )
 
