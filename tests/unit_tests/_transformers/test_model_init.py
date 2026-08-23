@@ -664,6 +664,33 @@ class TestDictConfigOverrideKeepsCustomPath:
         # otherwise collide with the positional config and/or raise TypeError).
         assert "config" not in captured_kwargs
 
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_config_object_is_passed_only_positionally(self, mock_resolve_cls, _mock_download):
+        hf_config = self._make_config()
+        captured_kwargs = {}
+
+        def fake_model_cls(config, **kwargs):
+            assert config is hf_config
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        mock_resolve_cls.return_value = fake_model_cls
+
+        is_custom, _ = _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config="fake/model",
+            attn_implementation="flash_attention_2",
+            torch_dtype="auto",
+            quantization_config=None,
+            force_hf=False,
+            config=hf_config,
+        )
+
+        assert is_custom is True
+        assert "config" not in captured_kwargs
+
 
 class TestSetupBnbLoadingKwargs:
     """_setup_bnb_loading_kwargs sets a per-GPU device_map and disables HF async weight loading."""
