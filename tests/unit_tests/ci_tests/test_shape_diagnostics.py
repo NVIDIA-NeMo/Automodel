@@ -26,7 +26,7 @@ from tests.functional_tests.checkpoint_robustness.shape_diagnostics import (
 
 def test_shape_diagnostic_config_adds_standing_gate_and_deduplicates_sweep():
     config = _normalize_shape_diagnostic_config(
-        {"enabled": True, "sweep_lengths": [512, 128, 512]},
+        {"sweep_lengths": [512, 128, 512]},
         parity_sequence_length=2048,
     )
 
@@ -37,9 +37,8 @@ def test_shape_diagnostic_config_adds_standing_gate_and_deduplicates_sweep():
 @pytest.mark.parametrize(
     ("raw_config", "message"),
     [
-        ({"enabled": True, "median_kl": True}, "Unknown shape_diagnostic fields"),
-        ({"enabled": True, "sweep_lengths": [2048]}, "must be shorter than parity_sequence_length"),
-        ({"enabled": False, "sweep_lengths": [128]}, "requires shape_diagnostic.enabled=true"),
+        ({"median_kl": True}, "Unknown shape_diagnostic fields"),
+        ({"sweep_lengths": [2048]}, "must be shorter than parity_sequence_length"),
     ],
 )
 def test_shape_diagnostic_config_rejects_invalid_or_median_fields(raw_config, message):
@@ -57,6 +56,7 @@ def test_shape_report_labels_bitwise_point_and_persists_concise_log(tmp_path, ca
         base_logits,
         standalone_logits,
         parity_document_sha256="fixed-document",
+        phase="phase_0",
         gate_sequence_length=1,
         sweep_lengths=(2,),
         router_diagnostics={
@@ -68,6 +68,7 @@ def test_shape_report_labels_bitwise_point_and_persists_concise_log(tmp_path, ca
     )
 
     assert report["enforced"] is False
+    assert report["phase"] == "phase_0"
     assert report["points"][1]["purposes"] == ["standing_gate_context"]
     assert report["points"][1]["interpretation"] == "same_kernel_regime_not_probing"
     assert report["points"][2]["purposes"] == ["calibration_sweep"]

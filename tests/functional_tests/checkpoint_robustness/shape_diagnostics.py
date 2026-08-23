@@ -30,13 +30,10 @@ from tests.functional_tests.checkpoint_robustness.parity_metrics import _compute
 class _ShapeDiagnosticConfig:
     """Validated configuration for non-gating vanilla-HF shape probes."""
 
-    enabled: bool = False
     sweep_lengths: tuple[int, ...] = ()
 
     def lengths(self, *, parity_sequence_length: int, gate_sequence_length: int | None) -> tuple[int, ...]:
         """Return unique standalone-forward lengths, including the standing gate probe."""
-        if not self.enabled:
-            return ()
         lengths = set(self.sweep_lengths)
         if gate_sequence_length is not None and gate_sequence_length < parity_sequence_length:
             lengths.add(gate_sequence_length)
@@ -52,14 +49,11 @@ def _normalize_shape_diagnostic_config(
     if raw_config is None:
         return _ShapeDiagnosticConfig()
     if not isinstance(raw_config, Mapping):
-        raise ValueError("shape_diagnostic must be a mapping with enabled and optional sweep_lengths fields")
-    unknown_fields = set(raw_config) - {"enabled", "sweep_lengths"}
+        raise ValueError("shape_diagnostic must be a mapping with an optional sweep_lengths field")
+    unknown_fields = set(raw_config) - {"sweep_lengths"}
     if unknown_fields:
         raise ValueError(f"Unknown shape_diagnostic fields: {sorted(unknown_fields)}")
 
-    enabled = raw_config.get("enabled", False)
-    if not isinstance(enabled, bool):
-        raise ValueError(f"shape_diagnostic.enabled must be a boolean, got {enabled!r}")
     raw_lengths = raw_config.get("sweep_lengths", ())
     if not isinstance(raw_lengths, (list, tuple)):
         raise ValueError("shape_diagnostic.sweep_lengths must be a list of positive integers")
@@ -74,9 +68,7 @@ def _normalize_shape_diagnostic_config(
                 f"({raw_length} is invalid for {parity_sequence_length})"
             )
         lengths.append(raw_length)
-    if not enabled and lengths:
-        raise ValueError("shape_diagnostic.sweep_lengths requires shape_diagnostic.enabled=true")
-    return _ShapeDiagnosticConfig(enabled=enabled, sweep_lengths=tuple(sorted(set(lengths))))
+    return _ShapeDiagnosticConfig(sweep_lengths=tuple(sorted(set(lengths))))
 
 
 def _build_shape_diagnostic_report(
@@ -84,6 +76,7 @@ def _build_shape_diagnostic_report(
     standalone_logits: Mapping[int, torch.Tensor],
     *,
     parity_document_sha256: str,
+    phase: str,
     gate_sequence_length: int | None,
     sweep_lengths: tuple[int, ...] = (),
     router_diagnostics: Mapping[int, Mapping[str, object]] | None = None,
@@ -123,6 +116,7 @@ def _build_shape_diagnostic_report(
     return {
         "schema_version": 1,
         "diagnostic": "vanilla_hf_shape_sensitivity",
+        "phase": phase,
         "enforced": False,
         "parity_document_sha256": parity_document_sha256,
         "base_sequence_length": base_sequence_length,
@@ -141,6 +135,7 @@ def _persist_shape_diagnostic_report(report: Mapping[str, object], report_path: 
     points = report["points"]
     assert isinstance(points, Mapping)
     summary = {
+        "phase": report["phase"],
         "base_sequence_length": report["base_sequence_length"],
         "enforced": False,
         "points": {

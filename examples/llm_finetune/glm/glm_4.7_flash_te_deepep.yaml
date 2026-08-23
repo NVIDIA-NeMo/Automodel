@@ -130,10 +130,6 @@ ci:
     hf_device_map_auto: true
     cross_framework_gate_sequence_length: 128
     capture_router_diagnostics: true
-    # Compare HF@2048[:128] with an independent HF@128 forward. This is
-    # informational context for the shortened cross-framework parity gate.
-    shape_diagnostic:
-      enabled: true
     parity_tolerance_profile_overrides:
       source_load: relaxed
       hf_reload: relaxed

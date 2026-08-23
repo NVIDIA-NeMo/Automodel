@@ -127,8 +127,8 @@ fixture_keys:
     # GLM-only Phase 0 evidence capture: full-sequence router logits, cutoff
     # margins, expert flips, and final-token KL conditioned on route agreement.
     - capture_router_diagnostics
-    # Optional non-gating vanilla-HF shape-sensitivity probe. A shorter gate
-    # length adds one standing forward; sweep_lengths add calibration forwards.
+    # Optional non-gating vanilla-HF calibration sweep. A shorter cross-framework
+    # gate automatically adds the standing shape forward without this mapping.
     - shape_diagnostic
     # Full-logit parity defaults to 2048 tokens from the repository's fixed
     # long-form document. Named profiles gate mean KL, p95 KL, and cosine.
