@@ -39,6 +39,34 @@ logger = logging.getLogger(__name__)
 BatchContextFactory = Callable[[], AbstractContextManager[Any]]
 
 
+def _enable_input_gradients_for_pipeline_backward(stages: list[PipelineStage]) -> None:
+    """Re-enable autograd on activation receive buffers before training.
+
+    PyTorch's pipeline ``schedule.eval()`` initializes non-first-stage receive
+    buffers while backward is disabled, so those floating-point buffers do not
+    require gradients. The schedule caches that forward infrastructure and
+    does not rebuild it when the next call is ``step()``. Re-enabling the
+    existing buffers is sufficient and avoids resetting stage metadata or
+    accumulated parameter gradients.
+    """
+
+    def enable(value: Any) -> None:
+        buffer = getattr(value, "buffer", None)
+        if isinstance(buffer, torch.Tensor):
+            if buffer.is_floating_point() or buffer.is_complex():
+                buffer.requires_grad_(True)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                enable(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                enable(item)
+
+    for stage in stages:
+        enable(getattr(stage, "args_recv_info", {}))
+
+
 @contextmanager
 def _stage_batch_contexts(
     stages: list[PipelineStage],
@@ -345,6 +373,8 @@ class AutoPipeline:
         Returns:
             The value returned by the underlying PyTorch pipeline schedule.
         """
+        if self._info.stages is not None:
+            _enable_input_gradients_for_pipeline_backward(self._info.stages)
         return self._run_prepared_microbatches(
             model_inputs,
             loss_fn=loss_fn,

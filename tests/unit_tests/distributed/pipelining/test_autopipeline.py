@@ -560,6 +560,23 @@ class TestAutoPipelinePreparedMicrobatches:
         assert schedule._split_inputs == original_split_inputs
         assert schedule._loss_fn is original_loss_fn
 
+    def test_training_reenables_receive_buffer_gradients_after_evaluation(self):
+        schedule = _PreparedMicrobatchSchedule()
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+        activation = types.SimpleNamespace(buffer=torch.zeros(1, 8))
+        token_ids = types.SimpleNamespace(buffer=torch.zeros(1, 8, dtype=torch.long))
+        stage = types.SimpleNamespace(args_recv_info={0: (activation, token_ids)})
+        ap._info.stages = [stage]
+        model_inputs = [{"input_ids": torch.zeros(1, 8)} for _ in range(2)]
+
+        ap.eval_microbatches(model_inputs, loss_fn=Mock())
+        assert not activation.buffer.requires_grad
+
+        ap.step_microbatches(model_inputs, loss_fn=Mock())
+
+        assert activation.buffer.requires_grad
+        assert not token_ids.buffer.requires_grad
+
     def test_eval_microbatches_uses_step_capability_when_eval_forwards_kwargs(self):
         schedule = _ForwardingEvalSchedule()
         ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
