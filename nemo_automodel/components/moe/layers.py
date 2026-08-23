@@ -458,7 +458,11 @@ class Gate(nn.Module):
             indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sigmoid_with_bias":
-            scores = scores.sigmoid()
+            # Score in fp32 like the softmax path: HF sigmoid-router references
+            # compute sigmoid(logits.float()), and bf16 sigmoid quantizes scores
+            # at ~2e-3 — enough to flip knife-edge e_score_correction_bias
+            # selections (AMINT-286).
+            scores = torch.sigmoid(scores.to(dtype=self.gate_precision or torch.float32))
             original_scores = scores
             scores_for_choice = scores
 
@@ -479,7 +483,8 @@ class Gate(nn.Module):
             indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         else:
-            scores = scores.sigmoid()
+            # Score in fp32 like the softmax path (see sigmoid_with_bias above).
+            scores = torch.sigmoid(scores.to(dtype=self.gate_precision or torch.float32))
             original_scores = scores
 
             # Add correction bias to balance tokens across gates.
