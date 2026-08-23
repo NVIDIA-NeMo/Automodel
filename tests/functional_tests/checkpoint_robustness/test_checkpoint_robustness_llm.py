@@ -553,6 +553,71 @@ def _patch_remote_masking_api_compatibility() -> None:
         setattr(masking_utils, function_name, compatible_mask_function)
 
 
+def _patch_remote_fla_api_compatibility() -> None:
+    """Adapt remote model code to the renamed fla-core KDA gate API.
+
+    Kimi-Linear's pre-0.4.2 remote code calls
+    ``fused_kda_gate(g, A_log, head_k_dim, g_bias=...)`` with a flat
+    ``g`` of shape ``[..., heads * head_k_dim]`` that the old kernel reshaped
+    internally. fla-core 0.4.2 renamed the API to
+    ``fused_kda_gate(g, A_log, dt_bias=None, lower_bound=None, ...)`` and
+    expects ``g`` pre-reshaped to ``[..., heads, head_k_dim]``. Translate
+    legacy calls when the installed function no longer accepts the old form;
+    an installed fla that still accepts ``g_bias`` is left untouched.
+    """
+    try:
+        import fla.ops.kda as kda_ops
+        import fla.ops.kda.gate as kda_gate
+    except ImportError:
+        return
+
+    gate_function = kda_gate.fused_kda_gate
+    if getattr(gate_function, "_nemo_legacy_kda_gate_patched", False):
+        return
+    parameter_names = set(inspect.signature(gate_function).parameters)
+    if "g_bias" in parameter_names or "dt_bias" not in parameter_names:
+        return
+
+    @wraps(gate_function)
+    def compatible_fused_kda_gate(g, A_log, *args, _gate_function=gate_function, **kwargs):
+        """Translate a legacy KDA gate call onto the renamed fla-core API.
+
+        Args:
+            g: Gate projection. Legacy callers pass a flat Tensor of shape
+                [..., heads * head_k_dim] together with a positional
+                ``head_k_dim``; new-style callers pass [..., heads, head_k_dim].
+            A_log: Per-head log-decay Tensor of shape [heads].
+            *args: A leading int is the legacy positional ``head_k_dim``; a
+                following tensor is the legacy positional ``g_bias``.
+            **kwargs: Legacy ``g_bias``/``beta``/``threshold`` keywords are
+                translated or rejected; everything else passes through.
+
+        Returns:
+            Gate Tensor of shape [..., heads, head_k_dim] from the new API.
+        """
+        if args and isinstance(args[0], int):
+            head_k_dim = args[0]
+            remaining = list(args[1:])
+            if remaining:
+                kwargs.setdefault("g_bias", remaining.pop(0))
+            if remaining:
+                raise TypeError("Unexpected extra positional arguments for legacy fused_kda_gate call")
+            g_bias = kwargs.pop("g_bias", None)
+            beta = kwargs.pop("beta", 1.0)
+            threshold = kwargs.pop("threshold", 20.0)
+            if beta != 1.0 or threshold != 20.0:
+                raise TypeError(
+                    "Legacy fused_kda_gate beta/threshold overrides are not supported by the installed fla API"
+                )
+            return _gate_function(g.view(*g.shape[:-1], -1, head_k_dim), A_log, dt_bias=g_bias, **kwargs)
+        return _gate_function(g, A_log, *args, **kwargs)
+
+    compatible_fused_kda_gate._nemo_legacy_kda_gate_patched = True  # type: ignore[attr-defined]
+    kda_gate.fused_kda_gate = compatible_fused_kda_gate
+    if getattr(kda_ops, "fused_kda_gate", None) is gate_function:
+        kda_ops.fused_kda_gate = compatible_fused_kda_gate
+
+
 def _rss_gb() -> float:
     """Current RSS in GB from /proc/self/statm."""
     page_size = os.sysconf("SC_PAGE_SIZE")
@@ -1518,6 +1583,7 @@ def _prepare_source_load_reference_rank0(
 
     apply_cache_compatibility_patches()
     _patch_remote_masking_api_compatibility()
+    _patch_remote_fla_api_compatibility()
 
     model_kwargs = _model_kwargs_from_config(cfg.model)
     original_pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
@@ -2028,6 +2094,7 @@ def _run_vanilla_hf_reload(
         # still carry Transformers-v4 list-form ``_tied_weights_keys``.
         apply_cache_compatibility_patches()
         _patch_remote_masking_api_compatibility()
+        _patch_remote_fla_api_compatibility()
         _, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
         is_peft = hasattr(cfg, "peft")
         model_kwargs = _model_kwargs_from_config(cfg.model)
