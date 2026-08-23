@@ -124,8 +124,15 @@ ci:
   nodes: 1
   time: "00:30:00"
   checkpoint_robustness:
-    # EP8 route-tail diagnostics show exact same-implementation repeat/reload,
-    # while both HF comparisons need the shared routed-MoE tolerance profile.
+    # The released checkpoint is near a numerically critical point: small
+    # kernel-order and rounding differences are amplified through its routed
+    # layers. Even vanilla HF reaches mean KL ~0.15 when the same first 512
+    # tokens are evaluated at different total sequence lengths. At 2K, a small
+    # late-token tail dominates the aggregate divergence, while weights load
+    # exactly and same-implementation repeat/reload and native resume are exact.
+    # Keep the full 2K metrics and router evidence, but gate its first 128-token
+    # prefix with the shared relaxed profile so measured long-context numerical
+    # instability is not mistaken for a cross-framework correctness regression.
     tokenizer_name: zai-org/GLM-4.7-Flash
     hf_device_map_auto: true
     cross_framework_gate_sequence_length: 128
