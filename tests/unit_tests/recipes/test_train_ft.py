@@ -1233,7 +1233,7 @@ def test_setup_pipeline_engine_matrix(
         pass
 
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.AutoPipeline", DummyAutoPipeline)
-    monkeypatch.setattr("nemo_automodel.engine.AutoPipeline", DummyAutoPipeline)
+    monkeypatch.setattr("nemo_automodel.engine._engine.AutoPipeline", DummyAutoPipeline)
     parts = [DummyModel()]
     parts[0]._pp_return_hidden_states_supported = True
     if pipeline_thd_kind == "native":

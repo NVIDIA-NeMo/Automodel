@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-import nemo_automodel.engine as engine_module
+import nemo_automodel.engine._engine as engine_module
 from nemo_automodel import CollatedLossInputs as PublicCollatedLossInputs
 from nemo_automodel import Datum as PublicDatum
 from nemo_automodel import Engine as PublicEngine
@@ -842,7 +842,7 @@ def test_explicit_microbatch_sizes_use_one_weighted_optimizer_window():
     assert model.weight.item() == pytest.approx(0.4)
 
 
-def test_hybridep_padding_extends_only_the_physical_thd_extent():
+def test_hybridep_padding_extends_only_the_physical_thd_extent(monkeypatch):
     """Synthetic EP padding preserves documents and every side-channel sentinel."""
     model_inputs = {
         "input_ids": torch.tensor([[7, 99, 8]]),
@@ -867,6 +867,16 @@ def test_hybridep_padding_extends_only_the_physical_thd_extent():
         "sequence_ids": LossInputLayout.PER_TOKEN,
         "global_scale": LossInputLayout.REPLICATED,
     }
+
+    engine = object.__new__(Engine)
+    engine.pipeline = None
+    engine._pipeline_uses_hybridep = False
+    engine._hybridep_equalization_groups = (object(),)
+    engine._model_owns_hybridep_packed_cp_equalization = False
+    engine.device = torch.device("cpu")
+    engine._cp_size = lambda: 1
+    monkeypatch.setattr(dist, "all_reduce", lambda *_args, **_kwargs: None)
+    assert engine._hybridep_equalization_target(model_inputs) == (True, 3)
 
     engine_module._pad_hybridep_packed_thd(
         model_inputs,

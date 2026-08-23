@@ -161,7 +161,7 @@ def _patch_pp_setup_minimals(
     validation_loader_config=None,
 ):
     monkeypatch.setattr(vlm_finetune, "AutoPipeline", _FakePPModel)
-    monkeypatch.setattr("nemo_automodel.engine.AutoPipeline", _FakePPModel)
+    monkeypatch.setattr("nemo_automodel.engine._engine.AutoPipeline", _FakePPModel)
     monkeypatch.setattr(
         vlm_finetune,
         "initialize_distributed",
