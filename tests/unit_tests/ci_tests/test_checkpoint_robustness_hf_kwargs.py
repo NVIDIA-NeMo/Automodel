@@ -1292,7 +1292,13 @@ def test_hf_fp32_module_names_includes_generic_model_strict_contract():
         "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
         return_value=TinyAutoModel,
     ):
-        assert _hf_fp32_module_names(hf_config) == ("rotary_emb", "router.e_score_correction_bias")
+        # Dotted strict names also register their distinctive leaf so vanilla
+        # layouts with a different parent path stay covered.
+        assert _hf_fp32_module_names(hf_config) == (
+            "rotary_emb",
+            "router.e_score_correction_bias",
+            "e_score_correction_bias",
+        )
 
 
 def test_hf_fp32_module_names_combines_gdn_and_generic_contracts_without_duplicates():
@@ -1774,3 +1780,29 @@ def test_repair_legacy_partial_rotary_is_noop_without_legacy_spec():
     rope_before = deepcopy(full_rotary.rope_parameters)
     assert _repair_legacy_partial_rotary_config(full_rotary) is False
     assert full_rotary.rope_parameters == rope_before
+
+
+
+def test_hf_fp32_module_names_cover_vanilla_layout_differences():
+    """The fp32 contract must reach tensors whose vanilla-HF parent path differs.
+
+    AutoModel's strict name is ``mlp.gate.e_score_correction_bias``, but in-tree
+    MiniMax-M2 keeps the buffer at ``mlp.e_score_correction_bias``; without the
+    leaf entry the HF reference silently casts the router bias to bf16.
+    """
+
+    class TinyAutoModel:
+        _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "router.weight", "norm.bias"]
+
+    hf_config = SimpleNamespace(architectures=["TinyForCausalLM"])
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=TinyAutoModel,
+    ):
+        names = _hf_fp32_module_names(hf_config)
+
+    assert "mlp.gate.e_score_correction_bias" in names
+    assert "e_score_correction_bias" in names
+    # Generic leaves would pin every weight/bias fp32 and must not be added.
+    assert "weight" not in names
+    assert "bias" not in names

@@ -1146,6 +1146,17 @@ def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
     for name in getattr(model_cls, "_keep_in_fp32_modules_strict", None) or ():
         if name not in module_names:
             module_names.append(name)
+        # AutoModel strict names use AutoModel module paths, but vanilla HF
+        # layouts can hang the same tensor off a different parent (in-tree
+        # MiniMax-M2 keeps e_score_correction_bias on ``mlp``, not
+        # ``mlp.gate``), so the AutoModel-path entry silently fails to match
+        # and the reference's router bias was cast to bf16 — scrambling 30-73%
+        # of knife-edge top-k selections per layer (AMINT-286). Also register
+        # the distinctive leaf so any layout keeps the tensor in fp32; generic
+        # ``weight``/``bias`` leaves are excluded to avoid pinning everything.
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf not in ("weight", "bias") and leaf not in module_names:
+            module_names.append(leaf)
     return tuple(module_names)
 
 
