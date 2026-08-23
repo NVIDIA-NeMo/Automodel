@@ -909,6 +909,78 @@ def test_hybridep_padding_extends_only_the_physical_thd_extent():
     assert token_mask is None
 
 
+def test_hybridep_padded_equalization_extends_sequence_and_side_channels():
+    """Synthetic sequence columns are masked without changing media coordinates."""
+    pixel_values = torch.arange(6).view(2, 3)
+    model_inputs = {
+        "input_ids": torch.tensor([[7, 8, 0], [9, 0, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 0], [1, 0, 0]]),
+        "position_ids": torch.tensor(
+            [
+                [[0, 1, 0], [0, 0, 0]],
+                [[10, 11, 0], [20, 0, 0]],
+            ]
+        ),
+        "mm_token_type_ids": torch.tensor([[1, 0, 0], [0, 0, 0]]),
+        "pixel_values": pixel_values,
+    }
+    loss_inputs = {
+        "weights": torch.tensor([[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]]),
+        "labels": torch.tensor([[8, 9, -100], [10, -100, -100]]),
+        "routed_experts": torch.tensor(
+            [[[[2]], [[3]], [[-1]]], [[[4]], [[-1]], [[-1]]]],
+            dtype=torch.int16,
+        ),
+        "scores": torch.tensor([0.25, 0.5]),
+        "global_scale": torch.tensor(0.75),
+    }
+    layouts = {
+        "weights": LossInputLayout.PER_TOKEN,
+        "labels": LossInputLayout.PER_TOKEN,
+        "routed_experts": LossInputLayout.PER_TOKEN,
+        "scores": LossInputLayout.PER_DATUM,
+        "global_scale": LossInputLayout.REPLICATED,
+    }
+
+    engine_module._pad_hybridep_padded_sequence(
+        model_inputs,
+        loss_inputs,
+        layouts,
+        {"weights": 7, "labels": -100, "routed_experts": -1},
+        target_sequence_length=5,
+        padding_token_id=99,
+    )
+
+    torch.testing.assert_close(
+        model_inputs["input_ids"],
+        torch.tensor([[7, 8, 0, 99, 99], [9, 0, 0, 99, 99]]),
+    )
+    torch.testing.assert_close(
+        model_inputs["attention_mask"],
+        torch.tensor([[1, 1, 0, 0, 0], [1, 0, 0, 0, 0]]),
+    )
+    torch.testing.assert_close(
+        model_inputs["padding_mask"],
+        torch.tensor(
+            [
+                [False, False, True, True, True],
+                [False, True, True, True, True],
+            ]
+        ),
+    )
+    assert model_inputs["position_ids"].shape == (2, 2, 5)
+    assert model_inputs["mm_token_type_ids"].shape == (2, 5)
+    assert model_inputs["pixel_values"] is pixel_values
+    torch.testing.assert_close(
+        loss_inputs["weights"],
+        torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0, 0.0]]),
+    )
+    torch.testing.assert_close(loss_inputs["labels"][:, -2:], torch.full((2, 2), -100))
+    torch.testing.assert_close(loss_inputs["routed_experts"][:, -2:], torch.full((2, 2, 1, 1), -1, dtype=torch.int16))
+    torch.testing.assert_close(loss_inputs["scores"], torch.tensor([0.25, 0.5]))
+    torch.testing.assert_close(loss_inputs["global_scale"], torch.tensor(0.75))
+
+
 @pytest.mark.parametrize(
     ("cp_size", "ep_shard_size", "expected_names"),
     [(1, 3, ("ep",)), (2, 3, ("ep", "ep_shard")), (2, 1, ("ep",))],
@@ -979,7 +1051,7 @@ def test_model_owned_hybridep_cp_runs_consensus_but_skips_engine_padding(monkeyp
     monkeypatch.setattr(dist, "all_reduce", record_all_reduce)
 
     assert (
-        engine._hybridep_packed_token_target(
+        engine._hybridep_equalization_target(
             {
                 # A model-owned source layout need not satisfy the generic
                 # raw-THD or one-row contract.
@@ -990,6 +1062,25 @@ def test_model_owned_hybridep_cp_runs_consensus_but_skips_engine_padding(monkeyp
         is None
     )
     assert calls == [(dist.ReduceOp.MAX, engine._hybridep_equalization_groups[0])]
+
+
+def test_equal_shape_padded_hybridep_is_a_noop(monkeypatch):
+    """Equal padded extents keep legacy masks and model fields untouched."""
+    engine = object.__new__(Engine)
+    engine.pipeline = None
+    engine._pipeline_uses_hybridep = False
+    engine._hybridep_equalization_groups = (object(),)
+    engine.device = torch.device("cpu")
+    model_inputs = {
+        "input_ids": torch.ones((2, 3), dtype=torch.long),
+        "attention_mask": torch.ones((2, 1, 3, 3), dtype=torch.bool),
+        "custom_token_field": torch.ones((2, 3)),
+    }
+    monkeypatch.setattr(dist, "all_reduce", lambda *_args, **_kwargs: None)
+
+    assert engine._hybridep_equalization_target(model_inputs) is None
+    assert "padding_mask" not in model_inputs
+    assert model_inputs["attention_mask"].shape == (2, 1, 3, 3)
 
 
 def test_raw_thd_packed_collater_is_prepared_by_context_parallel_sharder():
@@ -3698,6 +3789,68 @@ def _hybridep_packed_equalization_worker(rank: int, world_size: int, init_file: 
         dist.destroy_process_group()
 
 
+def _hybridep_padded_batch_mismatch_worker(rank: int, world_size: int, init_file: str) -> None:
+    """Verify every EP rank rejects unequal padded batch sizes.
+
+    Args:
+        rank: Current Gloo process rank.
+        world_size: Number of ranks in the shared DP/EP topology.
+        init_file: Shared file-store path used to initialize the process group.
+    """
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        mesh_context = MeshContext.build(
+            FSDP2Config(),
+            ParallelismSizes(ep_size=world_size),
+            world_size=world_size,
+        )
+        model = ScaleModel()
+        model.hybridep_probe = _UniformTokenDispatcherProbe()
+        datums = [_datum([1, 2, 3])] if rank == 0 else [_datum([4, 5]), _datum([6])]
+        engine = Engine(
+            model,
+            device="cpu",
+            mesh_context=mesh_context,
+            microbatch_size=len(datums),
+        )
+        with pytest.raises(NotImplementedError, match="same batch size"):
+            engine.forward(datums, _identity_loss)
+
+        width = 3 if rank == 0 else 2
+        attention_mask = torch.ones((1, width), dtype=torch.long)
+        if rank == 1:
+            attention_mask = torch.ones((1, 1, width, width), dtype=torch.bool)
+        prebatched = Datum(
+            model_inputs={"input_ids": torch.arange(width).view(1, width), "attention_mask": attention_mask},
+            loss_fn_inputs={"weights": torch.ones((1, width))},
+            loss_fn_input_layouts={"weights": LossInputLayout.PER_TOKEN},
+        )
+        engine = Engine(model, device="cpu", mesh_context=mesh_context, collate_fn=collate_prebatched)
+        with pytest.raises(NotImplementedError, match="sequence-padding preflight"):
+            engine.forward([prebatched], _identity_loss)
+
+        equal_width = 2
+        equal_datum = Datum(
+            model_inputs={
+                "input_ids": torch.tensor([[rank + 1, rank + 2]]),
+                "attention_mask": torch.ones((1, 1, equal_width, equal_width), dtype=torch.bool),
+            },
+            loss_fn_inputs={"weights": torch.ones((1, equal_width))},
+            loss_fn_input_layouts={"weights": LossInputLayout.PER_TOKEN},
+        )
+        result = engine.forward([equal_datum], _identity_loss)
+        assert result.loss_sum.item() == pytest.approx(2 * rank + 3)
+        assert "padding_mask" not in equal_datum.model_inputs
+    finally:
+        dist.destroy_process_group()
+
+
 def _hybridep_packed_cp_cross_axis_worker(rank: int, world_size: int, init_file: str) -> None:
     """Verify unequal DP packs reach one width through real EP then EP-shard groups.
 
@@ -3860,6 +4013,101 @@ def _hybridep_packed_cp_cross_axis_worker(rank: int, world_size: int, init_file:
 
         engine.optim_step()
         assert model.module.weight.item() == pytest.approx(1.0 - 0.1 * expected_mean)
+    finally:
+        dist.destroy_process_group()
+
+
+def _hybridep_padded_cp_cross_axis_worker(rank: int, world_size: int, init_file: str) -> None:
+    """Restore same-B, unequal-width DP batches after HybridEP plus CP.
+
+    Args:
+        rank: Current Gloo process rank.
+        world_size: Four-rank ``dp=2, cp=2, ep=2`` topology size.
+        init_file: Shared file-store path used to initialize the process group.
+    """
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        mesh_context = MeshContext.build(
+            FSDP2Config(),
+            ParallelismSizes(dp_size=2, cp_size=2, ep_size=2),
+            world_size=world_size,
+        )
+        base_model = _DistributedCPModel()
+        base_model.hybridep_probe = _UniformTokenDispatcherProbe()
+        gradient_group = get_flat_mesh(mesh_context.device_mesh, "dp_cp").get_group()
+        model = _DDPWithCP(base_model, process_group=gradient_group)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        dp_rank = get_flat_mesh(mesh_context.device_mesh, "dp").get_local_rank()
+        cp_rank = mesh_context.device_mesh["cp"].get_local_rank()
+        values = [[1, 2, 3], [4]] if dp_rank == 0 else [[5, 6], [7, 8]]
+        datums = [_datum(tokens) for tokens in values]
+
+        @contextmanager
+        def batch_context(model_inputs, loss_inputs):
+            """Check the real CP-local physical token rectangle.
+
+            Args:
+                model_inputs: CP-local model mapping with ``input_ids`` and
+                    ``padding_mask`` shaped ``[physical_batch=2,
+                    local_sequence=2]``.
+                loss_inputs: CP-local loss mapping with ``weights`` shaped
+                    ``[physical_batch=2, local_sequence=2]``.
+
+            Yields:
+                None while the CP-local forward consumes this shard.
+            """
+            assert model_inputs["input_ids"].shape == (2, 2)
+            assert model_inputs["padding_mask"].shape == (2, 2)
+            assert loss_inputs["weights"].shape == (2, 2)
+            if dp_rank == 0:
+                expected = torch.tensor([[1, 2], [4, 0]]) if cp_rank == 0 else torch.tensor([[3, 0], [0, 0]])
+            else:
+                expected = torch.tensor([[5, 6], [7, 8]]) if cp_rank == 0 else torch.zeros((2, 2), dtype=torch.long)
+            torch.testing.assert_close(model_inputs["input_ids"], expected)
+            yield
+
+        def loss_with_tokens(output, _loss_inputs):
+            """Return one typed token stream from the real CP-local shard.
+
+            Args:
+                output: CP-local values of shape ``[physical_batch=2,
+                    local_sequence=2]``.
+                _loss_inputs: CP-local loss mapping with matching ``weights``.
+
+            Returns:
+                Per-token losses and a typed token output with the same local
+                physical axes.
+            """
+            return output, LossFnOutputBatch(per_token={"tokens": PerTokenOutput(output)})
+
+        engine = Engine(
+            model,
+            device="cpu",
+            mesh_context=mesh_context,
+            microbatch_size=len(datums),
+            optimizers=optimizer,
+            max_grad_norm=None,
+            batch_context_fn=batch_context,
+        )
+        assert len(engine._hybridep_equalization_groups) == 2
+        result = engine.forward_backward(datums, loss_with_tokens)
+
+        assert result.loss.item() == pytest.approx(4.5)
+        assert result.loss_sum.item() == pytest.approx(36.0)
+        assert result.weight_sum.item() == pytest.approx(8.0)
+        assert model.module.weight.grad.item() == pytest.approx(4.5)
+        assert len(result.loss_fn_outputs) == len(datums)
+        for record, tokens in zip(result.loss_fn_outputs, values):
+            torch.testing.assert_close(record["tokens"], torch.tensor(tokens, dtype=torch.float32))
+
+        engine.optim_step()
+        assert model.module.weight.item() == pytest.approx(0.55)
     finally:
         dist.destroy_process_group()
 
@@ -4303,10 +4551,28 @@ def test_hybridep_packed_ranks_equalize_physical_token_extents(tmp_path):
     )
 
 
+def test_hybridep_padded_ranks_reject_unequal_batch_sizes(tmp_path):
+    mp.spawn(
+        _hybridep_padded_batch_mismatch_worker,
+        args=(2, str(tmp_path / "engine_hybridep_padded_batch_mismatch_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
 def test_hybridep_packed_cp_equalizes_across_ep_and_ep_shard_axes(tmp_path):
     mp.spawn(
         _hybridep_packed_cp_cross_axis_worker,
         args=(4, str(tmp_path / "engine_hybridep_packed_cp_cross_axis_init")),
+        nprocs=4,
+        join=True,
+    )
+
+
+def test_hybridep_padded_cp_equalizes_across_ep_and_ep_shard_axes(tmp_path):
+    mp.spawn(
+        _hybridep_padded_cp_cross_axis_worker,
+        args=(4, str(tmp_path / "engine_hybridep_padded_cp_cross_axis_init")),
         nprocs=4,
         join=True,
     )
