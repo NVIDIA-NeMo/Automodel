@@ -74,7 +74,7 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
-from nemo_automodel.shared.task_heads import PreFSDPHookResult, register_task_head_module
+from nemo_automodel.shared.task_heads import register_task_head_module
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
@@ -919,7 +919,7 @@ def test_peft_model_state_saves_lora_and_managed_task_head():
     model.task_head = torch.nn.Linear(2, 1)
     register_task_head_module(
         model,
-        PreFSDPHookResult(task_module=model.task_head),
+        model.task_head,
         pre_hook_module_ids=pre_hook_module_ids,
         pre_hook_parameter_ids=pre_hook_parameter_ids,
     )

@@ -28,7 +28,7 @@ import gc
 import inspect
 import logging
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -64,7 +64,6 @@ from nemo_automodel.components.utils.model_utils import (  # noqa: E402
     init_empty_weights,
     resolve_trust_remote_code,
 )
-from nemo_automodel.shared.task_heads import PreFSDPHookResult  # noqa: E402
 from nemo_automodel.shared.utils import dtype_from_str  # noqa: E402
 
 if TYPE_CHECKING:
@@ -401,8 +400,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
-        pre_fsdp_hook: Callable[[torch.nn.Module], PreFSDPHookResult | None] | None = None,
-        skip_task_head_prefixes_for_base_model: Sequence[str] | None = None,
+        pre_fsdp_hook: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
         _retry_depth=0,
         **kwargs,
     ):
@@ -453,7 +451,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 pre_fsdp_hook=pre_fsdp_hook,
-                skip_task_head_prefixes_for_base_model=skip_task_head_prefixes_for_base_model,
                 load_base_model=load_base_model,
                 _retry_depth=_retry_depth + 1,
                 **retry_kwargs,
@@ -643,7 +640,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             weights_already_loaded=weights_already_loaded,
             inject_te_attention=inject_te_attention,
             pre_fsdp_hook=pre_fsdp_hook,
-            skip_task_head_prefixes_for_base_model=skip_task_head_prefixes_for_base_model,
         )
 
         return model
@@ -666,8 +662,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        pre_fsdp_hook: Callable[[torch.nn.Module], PreFSDPHookResult | None] | None = None,
-        skip_task_head_prefixes_for_base_model: Sequence[str] | None = None,
+        pre_fsdp_hook: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -723,16 +718,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 If provided, the model will be compiled. Default: None.
             pre_fsdp_hook: Optional in-place model-structure hook invoked after model and
                 kernel/lower-precision transforms and any load-before-shard base-model
-                restore, but before state-key capture and FSDP wrapping. Returning
-                ``None`` keeps the legacy pure-data-parallel contract. Returning
-                :class:`PreFSDPHookResult` declares a fresh task module that AutoModel
-                excludes from TP and lower-precision transforms, keeps trainable with
-                PEFT, and owns in FP32 FSDP units. The hook must be deterministic on
-                every rank, avoid collectives, and keep weight-tying configuration
+                restore, but before state-key capture and FSDP wrapping. It must return
+                the fresh task module it attached to the model. AutoModel excludes that
+                module from TP and lower-precision transforms, keeps it trainable with
+                PEFT, and owns it in an FP32 FSDP unit. The hook must be deterministic
+                on every rank, avoid collectives, and keep weight-tying configuration
                 consistent with its structural changes.
-            skip_task_head_prefixes_for_base_model: Native model parameter FQN
-                prefixes to omit from the pretrained base-checkpoint load.
-                Training-checkpoint restore is unaffected.
             **kwargs: Additional keyword arguments. Notable ones include:
                 - has_packed_sequence (bool): Whether using packed sequences. Default: False.
                 - cache_dir (str): Cache directory for model weights.
@@ -801,7 +792,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             pre_fsdp_hook=pre_fsdp_hook,
-            skip_task_head_prefixes_for_base_model=skip_task_head_prefixes_for_base_model,
             load_base_model=True,
             **kwargs,
         )
@@ -824,8 +814,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        pre_fsdp_hook: Callable[[torch.nn.Module], PreFSDPHookResult | None] | None = None,
-        skip_task_head_prefixes_for_base_model: Sequence[str] | None = None,
+        pre_fsdp_hook: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -910,7 +899,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             pre_fsdp_hook=pre_fsdp_hook,
-            skip_task_head_prefixes_for_base_model=skip_task_head_prefixes_for_base_model,
             load_base_model=kwargs.pop("load_base_model", False),
             **kwargs,
         )

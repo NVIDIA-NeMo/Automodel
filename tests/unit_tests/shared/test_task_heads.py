@@ -16,7 +16,6 @@ import pytest
 from torch import nn
 
 from nemo_automodel.shared.task_heads import (
-    PreFSDPHookResult,
     exclude_task_heads_from_tp_plan,
     is_task_head_parameter,
     register_task_head_module,
@@ -43,7 +42,7 @@ def _model_with_registered_task_head() -> _ModelWithTaskHead:
     model.task_head = _ProjectionBlock()
     register_task_head_module(
         model,
-        PreFSDPHookResult(task_module=model.task_head),
+        model.task_head,
         pre_hook_module_ids=pre_hook_module_ids,
         pre_hook_parameter_ids=pre_hook_parameter_ids,
     )

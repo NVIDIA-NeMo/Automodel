@@ -215,9 +215,8 @@ def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wr
 
 
 class TestPreFSDPHook:
-    def test_typed_hook_resets_meta_head_after_post_shard_base_load(self):
+    def test_hook_resets_meta_head_after_post_shard_base_load(self):
         from nemo_automodel._transformers import infrastructure as infra
-        from nemo_automodel.shared.task_heads import PreFSDPHookResult
 
         with infra.init_empty_weights():
             model = _DummyModel()
@@ -233,7 +232,7 @@ class TestPreFSDPHook:
 
         def mark_base_checkpoint_loaded(model_to_load, *_args, **_kwargs):
             assert all(parameter.device.type == "cpu" for parameter in model_to_load.parameters())
-            assert mock_ckpt.config.skip_task_head_prefixes_for_base_model == ["manual_head.", "value_head."]
+            assert mock_ckpt.config.skip_task_head_prefixes_for_base_model == ["value_head."]
             model_to_load.base_checkpoint_loaded = True
 
         def add_value_head(model_to_update):
@@ -253,7 +252,7 @@ class TestPreFSDPHook:
             value_head.reset_parameters = MagicMock(side_effect=reset_after_base_load)
             timeline.attach_mock(value_head.reset_parameters, "reset")
             model_to_update.value_head = value_head
-            return PreFSDPHookResult(task_module=value_head)
+            return value_head
 
         hook = MagicMock(side_effect=add_value_head)
         snapshot = MagicMock(side_effect=lambda _model, state_dict, **_kwargs: state_dict)
@@ -285,7 +284,6 @@ class TestPreFSDPHook:
                 load_base_model=True,
                 pretrained_model_name_or_path="test/model",
                 pre_fsdp_hook=hook,
-                skip_task_head_prefixes_for_base_model=("manual_head.",),
             )
 
         assert result is model
@@ -300,7 +298,7 @@ class TestPreFSDPHook:
         ]
         assert snapshot.call_args.args[1]["value_head.weight"].device.type == "meta"
         assert model._pre_shard_hf_state_dict_keys == list(snapshot.call_args.args[1])
-        assert mock_ckpt.config.skip_task_head_prefixes_for_base_model == ["manual_head.", "value_head."]
+        assert mock_ckpt.config.skip_task_head_prefixes_for_base_model == ["value_head."]
         model.value_head.reset_parameters.assert_called_once_with()
         assert all(parameter.dtype == torch.float32 for parameter in model.value_head.parameters())
 
@@ -316,13 +314,12 @@ class TestPreFSDPHook:
         ],
         ids=["reused_parameters", "reused_module", "not_attached", "external_alias", "bf16", "frozen"],
     )
-    def test_typed_result_validates_fresh_attached_module(
+    def test_returned_module_validates_fresh_attached_module(
         self,
         invalid_declaration,
         error_match,
     ):
         from nemo_automodel._transformers import infrastructure as infra
-        from nemo_automodel.shared.task_heads import PreFSDPHookResult
 
         model = _DummyModel()
         if invalid_declaration == "existing_module":
@@ -330,23 +327,23 @@ class TestPreFSDPHook:
 
         def declare_invalid_modules(model_to_update):
             if invalid_declaration == "reused":
-                return PreFSDPHookResult(task_module=model_to_update.linear)
+                return model_to_update.linear
             if invalid_declaration == "existing_module":
                 model_to_update.value_head.projection = torch.nn.Linear(4, 1)
-                return PreFSDPHookResult(task_module=model_to_update.value_head)
+                return model_to_update.value_head
             if invalid_declaration == "unattached":
-                return PreFSDPHookResult(task_module=torch.nn.Linear(4, 1))
+                return torch.nn.Linear(4, 1)
             if invalid_declaration == "external_alias":
                 model_to_update.value_head = torch.nn.Linear(4, 1)
                 model_to_update.register_parameter("aliased_weight", model_to_update.value_head.weight)
-                return PreFSDPHookResult(task_module=model_to_update.value_head)
+                return model_to_update.value_head
             if invalid_declaration == "bf16":
                 model_to_update.value_head = torch.nn.Linear(4, 1, dtype=torch.bfloat16)
-                return PreFSDPHookResult(task_module=model_to_update.value_head)
+                return model_to_update.value_head
             if invalid_declaration == "frozen":
                 model_to_update.value_head = torch.nn.Linear(4, 1)
                 model_to_update.value_head.requires_grad_(False)
-                return PreFSDPHookResult(task_module=model_to_update.value_head)
+                return model_to_update.value_head
             raise AssertionError(f"unexpected declaration: {invalid_declaration}")
 
         hook = MagicMock(side_effect=declare_invalid_modules)
@@ -373,7 +370,7 @@ class TestPreFSDPHook:
         from nemo_automodel._transformers import infrastructure as infra
 
         model = _DummyModel()
-        hook = MagicMock(return_value=model)
+        hook = MagicMock(return_value=object())
 
         with (
             patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
@@ -383,7 +380,7 @@ class TestPreFSDPHook:
         ):
             MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
 
-            with pytest.raises(TypeError, match="must return None or PreFSDPHookResult"):
+            with pytest.raises(TypeError, match="must return a torch.nn.Module"):
                 infra.apply_model_infrastructure(
                     model=model,
                     is_meta_device=False,
@@ -413,7 +410,7 @@ class TestPreFSDPHook:
         native_quantization,
     ):
         from nemo_automodel._transformers import infrastructure as infra
-        from nemo_automodel.shared.task_heads import PreFSDPHookResult, task_head_module_name
+        from nemo_automodel.shared.task_heads import task_head_module_name
 
         model = _DummyModel()
         if native_quantization:
@@ -428,7 +425,7 @@ class TestPreFSDPHook:
         def add_value_head(model_to_update):
             assert model_to_update.transforms_complete is True
             model_to_update.value_head = torch.nn.Linear(4, 1)
-            return PreFSDPHookResult(task_module=model_to_update.value_head)
+            return model_to_update.value_head
 
         transform = MagicMock(side_effect=apply_transforms)
         hook = MagicMock(side_effect=add_value_head)
@@ -480,14 +477,13 @@ class TestPreFSDPHook:
 
     def test_managed_result_rejects_tied_output_head(self):
         from nemo_automodel._transformers import infrastructure as infra
-        from nemo_automodel.shared.task_heads import PreFSDPHookResult
 
         model = _DummyModel()
         model.config.tie_word_embeddings = True
 
         def add_value_head(model_to_update):
             model_to_update.value_head = torch.nn.Linear(4, 1)
-            return PreFSDPHookResult(task_module=model_to_update.value_head)
+            return model_to_update.value_head
 
         hook = MagicMock(side_effect=add_value_head)
 
@@ -511,7 +507,6 @@ class TestPreFSDPHook:
 
     def test_peft_freeze_keeps_lora_and_managed_task_head_trainable(self):
         from nemo_automodel._transformers import infrastructure as infra
-        from nemo_automodel.shared.task_heads import PreFSDPHookResult
 
         model = _DummyModel()
 
@@ -522,7 +517,7 @@ class TestPreFSDPHook:
         def add_value_head(model_to_update):
             assert hasattr(model_to_update.linear, "lora_A")
             model_to_update.value_head = torch.nn.Linear(4, 1)
-            return PreFSDPHookResult(task_module=model_to_update.value_head)
+            return model_to_update.value_head
 
         with (
             patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
@@ -551,14 +546,14 @@ class TestPreFSDPHook:
 
 
 def _register_test_task_head(model: torch.nn.Module) -> torch.nn.Module:
-    from nemo_automodel.shared.task_heads import PreFSDPHookResult, register_task_head_module
+    from nemo_automodel.shared.task_heads import register_task_head_module
 
     pre_hook_module_ids = {id(module) for module in model.modules()}
     pre_hook_parameter_ids = {id(parameter) for parameter in model.parameters()}
     model.value_head = torch.nn.Linear(4, 1)
     register_task_head_module(
         model,
-        PreFSDPHookResult(task_module=model.value_head),
+        model.value_head,
         pre_hook_module_ids=pre_hook_module_ids,
         pre_hook_parameter_ids=pre_hook_parameter_ids,
     )

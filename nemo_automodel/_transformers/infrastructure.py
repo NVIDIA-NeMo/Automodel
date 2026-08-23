@@ -24,7 +24,7 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
 from functools import partial
@@ -82,7 +82,6 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.shared.task_heads import (
-    PreFSDPHookResult,
     is_task_head_parameter,
     register_task_head_module,
     task_head_module,
@@ -547,8 +546,7 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
-    pre_fsdp_hook: Callable[[torch.nn.Module], PreFSDPHookResult | None] | None = None,
-    skip_task_head_prefixes_for_base_model: Sequence[str] | None = None,
+    pre_fsdp_hook: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -589,17 +587,12 @@ def apply_model_infrastructure(
             models that already use TE via BackendConfig). Default: False.
         pre_fsdp_hook: Optional in-place model-structure hook invoked after lower-
             precision and attention transforms and any load-before-shard base-model
-            restore, but before state-key capture and FSDP wrapping. Returning
-            ``None`` retains the legacy pure-data-parallel structural-hook contract.
-            Returning :class:`PreFSDPHookResult` declares a fresh task module that
-            AutoModel excludes from TP/PEFT/quantization transforms and manages as
-            trainable FP32 FSDP units. The hook must make the same deterministic
-            change on every rank and avoid collectives. It is responsible for
-            keeping model configuration such as weight tying consistent with its
-            changes.
-        skip_task_head_prefixes_for_base_model: Native model parameter FQN prefixes
-            to omit from the pretrained base-checkpoint load. Full training-checkpoint
-            restores still load these parameters.
+            restore, but before state-key capture and FSDP wrapping. It must return
+            the fresh task module it attached to the model. AutoModel excludes that
+            module from TP/PEFT/quantization transforms and manages it as a trainable
+            FP32 FSDP unit. The hook must make the same deterministic change on every
+            rank, avoid collectives, and keep model configuration such as weight tying
+            consistent with its changes.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -614,18 +607,6 @@ def apply_model_infrastructure(
     if pre_fsdp_hook is not None and (autopipeline is not None or mesh.pp_size != 1):
         raise NotImplementedError("pre_fsdp_hook does not support pipeline parallelism")
 
-    if isinstance(skip_task_head_prefixes_for_base_model, str):
-        raise TypeError("skip_task_head_prefixes_for_base_model must be a sequence of non-empty strings, not a string.")
-    skip_task_head_prefixes = (
-        list(skip_task_head_prefixes_for_base_model) if skip_task_head_prefixes_for_base_model is not None else None
-    )
-    if skip_task_head_prefixes is not None:
-        if any(not isinstance(prefix, str) for prefix in skip_task_head_prefixes):
-            raise TypeError("skip_task_head_prefixes_for_base_model must contain only strings.")
-        if any(not prefix for prefix in skip_task_head_prefixes):
-            raise ValueError("skip_task_head_prefixes_for_base_model must not contain empty prefixes.")
-        skip_task_head_prefixes = list(dict.fromkeys(skip_task_head_prefixes))
-
     # Create a checkpointer for loading base weights only. Keep consolidation disabled
     # so load-only infrastructure does not emit save/export warnings.
     ckpt_config = CheckpointingConfig(
@@ -636,7 +617,6 @@ def apply_model_infrastructure(
         model_repo_id=pretrained_model_name_or_path,
         save_consolidated=False,
         is_peft=peft_config is not None,
-        skip_task_head_prefixes_for_base_model=skip_task_head_prefixes,
     )
     checkpointer = Checkpointer(
         ckpt_config,
@@ -721,55 +701,27 @@ def apply_model_infrastructure(
         # them below.
         hook_context = init_empty_weights() if has_meta_tensors else torch.device(device)
         with hook_context:
-            hook_result = pre_fsdp_hook(model)
+            task_module = pre_fsdp_hook(model)
 
-        if hook_result is None:
-            unsupported = [
-                name
-                for name, enabled in (
-                    ("tensor parallelism", mesh.tp_size != 1),
-                    ("context parallelism", mesh.cp_size != 1),
-                    ("expert parallelism", mesh.ep_size != 1),
-                    ("PEFT", peft_config is not None),
-                    (
-                        "quantization",
-                        quantization_config is not None
-                        or getattr(getattr(model, "config", None), "quantization_config", None) is not None,
-                    ),
-                    ("FP8", fp8_config is not None),
-                    ("QAT", qat_quantizer is not None),
-                )
-                if enabled
-            ]
-            if unsupported:
-                raise NotImplementedError(
-                    "A pre_fsdp_hook that returns None supports only the legacy unquantized, non-PEFT, "
-                    f"tp_size=cp_size=ep_size=1 contract; unsupported: {', '.join(unsupported)}. "
-                    "Return PreFSDPHookResult to declare a managed task module."
-                )
-        elif isinstance(hook_result, PreFSDPHookResult):
-            name = register_task_head_module(
-                model,
-                hook_result,
-                pre_hook_module_ids=pre_hook_module_ids,
-                pre_hook_parameter_ids=pre_hook_parameter_ids,
+        name = register_task_head_module(
+            model,
+            task_module,
+            pre_hook_module_ids=pre_hook_module_ids,
+            pre_hook_parameter_ids=pre_hook_parameter_ids,
+        )
+        if is_tied_word_embeddings(model):
+            raise ValueError(
+                "A managed task module requires an untied output head; the hook must disable supported "
+                "embedding tying and tied-only architectures are unsupported"
             )
-            if is_tied_word_embeddings(model):
-                raise ValueError(
-                    "A managed task module requires an untied output head; the hook must disable supported "
-                    "embedding tying and tied-only architectures are unsupported"
+        if any(parameter.device.type == "meta" for parameter in model.get_submodule(name).parameters()):
+            task_head_needing_reset = name
+            reset_parameters = getattr(model.get_submodule(name), "reset_parameters", None)
+            if not callable(reset_parameters):
+                raise TypeError(
+                    f"Managed task module {name!r} was created on meta and must implement reset_parameters()"
                 )
-            if any(parameter.device.type == "meta" for parameter in model.get_submodule(name).parameters()):
-                task_head_needing_reset = name
-                reset_parameters = getattr(model.get_submodule(name), "reset_parameters", None)
-                if not callable(reset_parameters):
-                    raise TypeError(
-                        f"Managed task module {name!r} was created on meta and must implement reset_parameters()"
-                    )
-            skip_task_head_prefixes = list(dict.fromkeys([*(skip_task_head_prefixes or ()), f"{name}."]))
-            checkpointer.config.skip_task_head_prefixes_for_base_model = skip_task_head_prefixes
-        else:
-            raise TypeError(f"pre_fsdp_hook must return None or PreFSDPHookResult; got {type(hook_result).__name__}")
+        checkpointer.config.skip_task_head_prefixes_for_base_model = [f"{name}."]
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     state_dict_adapter = getattr(model, "state_dict_adapter", None)

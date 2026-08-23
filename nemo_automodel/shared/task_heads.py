@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Mapping
 
@@ -25,46 +24,19 @@ from torch import nn
 
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
-__all__ = ["PreFSDPHookResult"]
-
 _TASK_HEAD_MODULE_NAME = "_nemo_task_head_module_name"
-
-
-@dataclass(frozen=True)
-class PreFSDPHookResult:
-    """Declare a fresh task module installed by ``pre_fsdp_hook``.
-
-    The declared module is excluded from tensor- and expert-specific sharding,
-    replicated over tensor parallelism, and placed in its own FP32 FSDP unit
-    over the data/context-parallel mesh. It stays trainable under PEFT and is
-    included in resumable training checkpoints. The module must be newly
-    created by the hook, attached exactly once below the model root, and expose
-    ``reset_parameters()`` when it is created on the meta device. Under tensor
-    or sequence parallelism, the module remains responsible for accepting the
-    distributed activation layout supplied by its owning model. Consolidated
-    Hugging Face export remains the owning model's responsibility.
-
-    Args:
-        task_module: Fresh parameter-owning module attached to the model by the
-            hook. A compound task head can be represented by one container
-            module. Every parameter must be trainable, float32, and owned only
-            within that module's subtree.
-    """
-
-    task_module: nn.Module
 
 
 def register_task_head_module(
     model: nn.Module,
-    result: PreFSDPHookResult,
+    module: nn.Module,
     *,
     pre_hook_module_ids: set[int],
     pre_hook_parameter_ids: set[int],
 ) -> str:
     """Validate and record the task module returned by a pre-FSDP hook."""
-    module = result.task_module
     if not isinstance(module, nn.Module):
-        raise TypeError("PreFSDPHookResult.task_module must be a torch.nn.Module")
+        raise TypeError("pre_fsdp_hook must return a torch.nn.Module")
 
     paths_by_id: dict[int, list[str]] = {}
     for name, candidate in model.named_modules(remove_duplicate=False):
