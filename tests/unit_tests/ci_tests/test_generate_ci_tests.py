@@ -17,6 +17,7 @@ from pathlib import Path
 from ruamel.yaml import YAML
 
 from tests.ci_tests.utils.generate_ci_tests import detect_yml_configurations, generate_job, generate_pipeline
+from tests.ci_tests.utils.validate_new_recipe_ci import auto_discover_subpaths, is_ci_enabled
 
 
 def test_auto_discovery_excludes_model_verification_cards(tmp_path):
@@ -29,6 +30,9 @@ def test_auto_discovery_excludes_model_verification_cards(tmp_path):
     discovered = detect_yml_configurations(str(tmp_path), "performance", "llm_benchmark")
 
     assert discovered == [Path("examples/llm_benchmark/model/recipe.yaml")]
+    assert not is_ci_enabled(
+        Path("examples/llm_benchmark/model/model_verification_card.yaml"), auto_discover_subpaths(), set()
+    )
 
 
 def test_generate_deepseek_v4_pretrain_nightly_job():

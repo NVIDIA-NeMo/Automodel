@@ -124,8 +124,6 @@ def validate_card(card: object) -> list[str]:
                 for field in ("precision", "automodel_commit", "last_verified", "expected_result"):
                     if not _string(leaf.get(field)):
                         errors.append(f"{location}.{field} must be a non-empty string for verified items")
-                if not (_string(leaf.get("recipe")) or _string(leaf.get("command"))):
-                    errors.append(f"{location} must include a recipe or command for verified items")
                 if category in {"training", "performance"}:
                     metrics = _mapping(leaf.get("metrics"), f"{location}.metrics", errors)
                     for metric in TRAINING_METRICS:

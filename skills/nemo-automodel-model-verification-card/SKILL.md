@@ -15,8 +15,9 @@ Read [references/card-schema.md](references/card-schema.md) before creating or c
 2. Read the reference framework's model card and copy only the workload contract that is meaningful in AutoModel. Do not copy framework-specific conversion or checkpoint items.
 3. Define every supported card item in `verification_index`. For each hardware target, put every item in exactly one of `verified` or `not_verified`.
 4. Add the matching item leaves under `items`, using the same hardware and status.
-5. Add or reference a runnable public recipe for each verified training item. Keep private executor configuration, mounts, tokens, cluster paths, job IDs, and internal issue URLs out of the repository.
-6. Validate the card, lint the example YAMLs, and run focused tests before review.
+5. Record concise evidence for verified items. Link an existing public recipe when it materially helps, but do not copy recipe-owned dataset, optimizer, scheduler, batch-size, or step settings into the card.
+6. Keep private executor configuration, mounts, tokens, cluster paths, job IDs, and internal issue URLs out of the repository.
+7. Validate the card, lint the example YAMLs, and run focused tests for shared discovery or tooling changes before review.
 
 ## Canonical inventory
 
@@ -48,7 +49,7 @@ For `checkpoint_resume`, resume directly from the middle pretrain checkpoint int
 
 Treat timing, TFLOPS, and tokens/s from a functional convergence run as sanity observations. They do not verify `pretrain_performance`; that item requires a separate tuned run of the public benchmark recipe.
 
-For `sft_long_context`, use `togethercomputer/CoderForge-Preview` and sequence length 131072. Start from the maintained CoderForge example under `examples/long_context_validation/` and adapt it to the model without changing this contract.
+For `sft_long_context`, use `togethercomputer/CoderForge-Preview` and sequence length 131072. Start from the maintained Qwen3 128K CoderForge example under `examples/long_context_validation/qwen3_32b/` and adapt it to the model without changing this contract.
 
 For `vllm_checkpoint_compatibility`, load the consolidated checkpoint through vLLM and run deterministic generation. Successful AutoModel reload alone does not satisfy this item.
 
@@ -61,17 +62,18 @@ uv run python skills/nemo-automodel-model-verification-card/scripts/validate_car
   examples/<domain>/<model>/<model>_verification_card.yaml
 ```
 
-Then run the example YAML linter and the focused unit tests for the card and YAML discovery logic. Never change a status merely to make validation pass.
+Then run the example YAML linter and focused unit tests for any shared YAML discovery or tooling behavior that changed. Validate cards directly with the bundled validator; do not add a unit test that merely loads a particular card and mirrors the validator. Never change a status merely to make validation pass.
 
 ## Completion checklist
 
 - Card name ends in `_verification_card.yaml` and sits beside current model examples.
 - Every indexed item appears exactly once under `verified` or `not_verified` for each hardware target.
 - Item leaves use only `verified` or `not_verified` and match the index.
-- Every verified item records the immutable AutoModel commit, date, precision, public command or recipe, and concrete expected result.
+- Every verified item records the immutable AutoModel commit, date, precision, and concrete expected result.
 - Every verified training leaf includes all five metrics.
 - Resume evidence includes all shared steps, the declared tolerance, and exact LR/token checks.
 - Long-context SFT uses CoderForge and sequence length 131072.
 - Performance is a separate item and uses a public benchmark recipe.
+- Recipe-owned workload settings are not duplicated in the card.
 - The card contains no private runtime information or credentials.
 - The bundled validator and focused tests pass.

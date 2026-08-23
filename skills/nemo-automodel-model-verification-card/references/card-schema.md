@@ -31,9 +31,6 @@ items:
       status: verified
       precision: bf16
       automodel_commit: immutable_commit
-      recipe: examples/path/to/recipe.yaml
-      command: >
-        public reproducible command
       last_verified: "YYYY-MM-DD"
       metrics:
         initial_loss: 0.0
@@ -57,7 +54,6 @@ A verified leaf contains:
 
 - `precision`
 - `automodel_commit`
-- `recipe` or `command`
 - `last_verified`
 - `expected_result`
 
@@ -78,4 +74,6 @@ An unverified leaf needs only `status: not_verified`, but should state a reprodu
 
 ## Paths and evidence
 
-Repository paths are relative to the repository root. Commands may use portable container paths such as `/work/data` when the recipe documents the required mounts. Never record absolute host experiment paths, private cluster identifiers, Slurm IDs, credentials, or internal tracker URLs in a public card.
+Link an existing repository recipe when it is important to interpreting or reproducing an item, especially for performance. Do not copy dataset paths, optimizer settings, scheduler settings, batch sizes, or step counts that are already owned by that recipe into the card.
+
+Repository paths are relative to the repository root. Commands may use portable container paths such as `/work/data` when useful, but are not required evidence fields. Never record absolute host experiment paths, private cluster identifiers, Slurm IDs, credentials, or internal tracker URLs in a public card.
