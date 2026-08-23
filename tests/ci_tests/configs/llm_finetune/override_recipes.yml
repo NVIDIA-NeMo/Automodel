@@ -31,8 +31,6 @@ exempt_configs:
     reason: "Deprecated for 26.10 (Falcon 3)"
   falcon3_7b_instruct_squad_peft:
     reason: "Deprecated for 26.10 (Falcon 3)"
-  glm_4.5_air_te_deepep:
-    reason: "Deprecated for 26.10 (GLM-4.5 MoE)"
   glm_4_9b_chat_hf_hellaswag_fp8:
     reason: "Deprecated for 26.10 (GLM-4)"
   glm_4_9b_chat_hf_squad:
