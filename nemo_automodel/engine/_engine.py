@@ -534,12 +534,14 @@ class Engine:
         loss_fn: LossFn,
         *,
         microbatch_sizes: Sequence[int] | None = None,
+        accumulate_gradients: bool = False,
     ) -> ForwardBackwardResult:
         """Run one complete optimizer accumulation window.
 
         A second call with configured optimizers is rejected until
-        :meth:`optim_step` consumes the first call's gradients. A failed
-        partial backward poisons the window so its gradients cannot be reused.
+        :meth:`optim_step` consumes the first call's gradients unless
+        ``accumulate_gradients`` is true. A failed partial backward poisons the
+        window so its gradients cannot be reused.
 
         Args:
             datums: Flat sequence of Datum items in the complete optimizer
@@ -550,13 +552,20 @@ class Engine:
             microbatch_sizes: Optional explicit partition of the flat Datum
                 sequence. It overrides ``microbatch_size`` for this call while
                 preserving one global loss denominator and optimizer window.
+            accumulate_gradients: Whether to add this complete window's
+                gradients to a preceding successful call before one shared
+                :meth:`optim_step`. Each call retains its own loss
+                normalization. The default preserves the one-call-per-step
+                safety check.
 
         Returns:
             Globally normalized loss statistics and per-Datum outputs for the
             complete optimizer window.
         """
+        if not isinstance(accumulate_gradients, bool):
+            raise TypeError("accumulate_gradients must be a bool")
         if self.optimizers:
-            if self._backward_status == "ready":
+            if self._backward_status == "ready" and not accumulate_gradients:
                 raise RuntimeError(
                     "forward_backward already produced the current optimizer window; call optim_step first"
                 )

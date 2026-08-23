@@ -68,6 +68,25 @@ class ScaleModel(nn.Module):
         return input_ids.to(torch.float32) * self.weight
 
 
+class _VectorScaleModel(nn.Module):
+    """Scale tokens by one shardable parameter for real FSDP2 tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1))
+
+    def forward(self, input_ids: torch.Tensor, **_) -> torch.Tensor:
+        """Scale token IDs.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence].
+
+        Returns:
+            Tensor of shape [batch, sequence].
+        """
+        return input_ids.to(torch.float32) * self.weight
+
+
 class _IndexedMaskScaleModel(ScaleModel):
     def __init__(self) -> None:
         super().__init__()
@@ -736,6 +755,47 @@ def test_multiple_backward_calls_with_an_optimizer_fail_fast():
     torch.testing.assert_close(model.weight.grad, torch.tensor(2.0))
     engine.optim_step()
     torch.testing.assert_close(model.weight, torch.tensor(0.8))
+
+
+def test_multiple_backward_calls_can_accumulate_before_one_optimizer_step():
+    model = ScaleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=None)
+
+    first = engine.forward_backward(
+        [_datum([2])],
+        _identity_loss,
+        accumulate_gradients=True,
+    )
+    second = engine.forward_backward(
+        [_datum([6])],
+        _identity_loss,
+        accumulate_gradients=True,
+    )
+
+    assert first.loss.item() == pytest.approx(2.0)
+    assert second.loss.item() == pytest.approx(6.0)
+    torch.testing.assert_close(model.weight.grad, torch.tensor(8.0))
+    engine.optim_step()
+    torch.testing.assert_close(model.weight, torch.tensor(0.2))
+
+
+def test_failed_accumulated_backward_poisoned_gradients_cannot_be_reused():
+    model = ScaleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=None)
+
+    engine.forward_backward([_datum([2])], _identity_loss, accumulate_gradients=True)
+
+    def fail(_output, _loss_inputs):
+        raise ValueError("later accumulation failed")
+
+    with pytest.raises(ValueError, match="later accumulation failed"):
+        engine.forward_backward([_datum([6])], fail, accumulate_gradients=True)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        engine.optim_step()
+    torch.testing.assert_close(model.weight, torch.tensor(1.0))
 
 
 def test_failed_backward_poisoned_gradients_cannot_be_reused():
@@ -3914,6 +3974,32 @@ def _distributed_worker(rank: int, world_size: int, init_file: str) -> None:
         assert variable_result.loss_sum.item() == pytest.approx(36.0)
         assert variable_result.weight_sum.item() == pytest.approx(8.0)
         assert variable_model.module.weight.grad.item() == pytest.approx(4.5)
+
+        from torch.distributed.fsdp import fully_shard
+
+        accumulated_model = _VectorScaleModel()
+        fully_shard(accumulated_model)
+        accumulated_optimizer = torch.optim.SGD(accumulated_model.parameters(), lr=0.1)
+        accumulated_engine = Engine(
+            accumulated_model,
+            device="cpu",
+            optimizers=accumulated_optimizer,
+            max_grad_norm=1.0,
+        )
+        accumulated_engine.forward_backward(
+            [_datum([2 + 2 * rank])],
+            _identity_loss,
+            accumulate_gradients=True,
+        )
+        accumulated_engine.forward_backward(
+            [_datum([6 + 2 * rank])],
+            _identity_loss,
+            accumulate_gradients=True,
+        )
+        assert accumulated_model.weight.grad.full_tensor().item() == pytest.approx(10.0)
+        step_result = accumulated_engine.optim_step()
+        assert step_result.grad_norm.item() == pytest.approx(10.0)
+        assert accumulated_model.weight.full_tensor().item() == pytest.approx(0.9)
     finally:
         dist.destroy_process_group()
 
