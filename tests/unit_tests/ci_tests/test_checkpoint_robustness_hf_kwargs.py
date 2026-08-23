@@ -19,7 +19,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, PretrainedConfig
 
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder import (
     _extract_custom_args as _extract_biencoder_custom_args,
@@ -56,6 +56,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _raise_distributed_failure,
     _record_deferred_failure,
     _repeatability_policy,
+    _replace_nemo_owned_reference_config,
     _resolve_hf_attn_implementation,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
@@ -1707,3 +1708,110 @@ def test_record_deferred_failure_preserves_all_comparison_failures():
     _record_deferred_failure(failures, "Phase 4 HF reload parity", "HF parity failed")
 
     assert failures == ["Phase 4 HF reload parity:\nHF parity failed"]
+
+
+
+class _FakeNemoOwnedConfig(PretrainedConfig):
+    """Stands in for an AutoModel component config registered into AutoConfig."""
+
+    model_type = "stub_reference"
+
+
+# The helper discriminates on the class's owning package, not its bases.
+_FakeNemoOwnedConfig.__module__ = "nemo_automodel.components.models.test_only.config"
+
+_STUB_AUTO_MAP = {"AutoConfig": "configuration_stub.StubReferenceConfig"}
+
+
+def _write_stub_remote_checkpoint(tmp_path, *, quantization_config=None):
+    """Write a minimal remote-code checkpoint dir exposing its own config class."""
+    (tmp_path / "configuration_stub.py").write_text(
+        "from transformers import PretrainedConfig\n"
+        "\n"
+        "\n"
+        "class StubReferenceConfig(PretrainedConfig):\n"
+        '    model_type = "stub_reference"\n'
+    )
+    config = {"model_type": "stub_reference", "auto_map": _STUB_AUTO_MAP, "hidden_size": 8}
+    if quantization_config is not None:
+        config["quantization_config"] = quantization_config
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    return tmp_path
+
+
+def test_replace_nemo_owned_reference_config_resolves_checkpoint_auto_map(tmp_path):
+    ckpt = _write_stub_remote_checkpoint(tmp_path)
+    hijacked = _FakeNemoOwnedConfig(auto_map=dict(_STUB_AUTO_MAP))
+
+    replaced, did_replace = _replace_nemo_owned_reference_config(hijacked, ckpt, trust_remote_code=True)
+
+    assert did_replace is True
+    assert type(replaced).__name__ == "StubReferenceConfig"
+    assert type(replaced).__module__.startswith("transformers_modules")
+
+
+def test_replace_nemo_owned_reference_config_preserves_dequantize_request(tmp_path):
+    ckpt = _write_stub_remote_checkpoint(tmp_path, quantization_config={"quant_method": "fp8"})
+    hijacked = _FakeNemoOwnedConfig(
+        auto_map=dict(_STUB_AUTO_MAP),
+        quantization_config={"quant_method": "fp8", "dequantize": True},
+    )
+
+    replaced, did_replace = _replace_nemo_owned_reference_config(hijacked, ckpt, trust_remote_code=True)
+
+    assert did_replace is True
+    assert replaced.quantization_config["dequantize"] is True
+
+
+def test_replace_nemo_owned_reference_config_noop_cases(tmp_path):
+    from transformers import AutoConfig
+
+    hf_config = AutoConfig.for_model("llama", vocab_size=64, hidden_size=32, num_hidden_layers=1)
+    assert _replace_nemo_owned_reference_config(hf_config, tmp_path, trust_remote_code=True) == (hf_config, False)
+
+    no_auto_map = _FakeNemoOwnedConfig()
+    assert _replace_nemo_owned_reference_config(no_auto_map, tmp_path, trust_remote_code=True) == (no_auto_map, False)
+
+    untrusted = _FakeNemoOwnedConfig(auto_map=dict(_STUB_AUTO_MAP))
+    assert _replace_nemo_owned_reference_config(untrusted, tmp_path, trust_remote_code=False) == (untrusted, False)
+
+
+def test_hf_source_load_kwargs_drops_nemo_owned_recipe_config():
+    with patch(
+        "transformers.PretrainedConfig.get_config_dict",
+        return_value=({"model_type": "unknown_remote_model"}, {}),
+    ):
+        hf_kwargs = _hf_source_load_kwargs(
+            {"config": _FakeNemoOwnedConfig(), "attn_implementation": "eager"},
+            pretrained_model_name_or_path="model-path",
+            source_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            experts_implementation=None,
+            hf_model_cls=AutoModelForCausalLM,
+            device=torch.device("cpu"),
+            hf_device_map_auto=False,
+        )
+
+    assert "config" not in hf_kwargs
+
+
+def test_hf_source_load_kwargs_keeps_hf_recipe_config():
+    from transformers import AutoConfig
+
+    hf_config = AutoConfig.for_model("llama", vocab_size=64, hidden_size=32, num_hidden_layers=1)
+    with patch(
+        "transformers.PretrainedConfig.get_config_dict",
+        return_value=({"model_type": "unknown_remote_model"}, {}),
+    ):
+        hf_kwargs = _hf_source_load_kwargs(
+            {"config": hf_config, "attn_implementation": "eager"},
+            pretrained_model_name_or_path="model-path",
+            source_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            experts_implementation=None,
+            hf_model_cls=AutoModelForCausalLM,
+            device=torch.device("cpu"),
+            hf_device_map_auto=False,
+        )
+
+    assert hf_kwargs["config"] is hf_config

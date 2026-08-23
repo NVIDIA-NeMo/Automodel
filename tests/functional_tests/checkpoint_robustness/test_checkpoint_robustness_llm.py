@@ -343,6 +343,75 @@ def _load_hf_fp8_dequantized_config(
     return config
 
 
+def _is_nemo_owned_config(config) -> bool:
+    """Return True when a config object is an AutoModel component config."""
+    return type(config).__module__.startswith("nemo_automodel")
+
+
+def _replace_nemo_owned_reference_config(
+    config,
+    pretrained_model_name_or_path: str | Path,
+    *,
+    trust_remote_code: bool,
+    revision: str | None = None,
+    token: str | bool | None = None,
+):
+    """Re-resolve a vanilla-reference config hijacked by AutoModel registrations.
+
+    nemo_automodel registers its component config classes into Transformers'
+    ``CONFIG_MAPPING`` (``_CUSTOM_CONFIG_REGISTRATIONS``), and a locally
+    registered ``model_type`` wins over checkpoint remote code even with
+    ``trust_remote_code=True``. Inside the harness process, AutoConfig then
+    resolves checkpoints such as Kimi-Linear to an AutoModel-owned class while
+    the model class still comes from the checkpoint's ``auto_map``, and
+    ``from_pretrained`` rejects the pair with a ``config_class`` mismatch
+    (AMINT-288). Resolve the checkpoint's own config class from its
+    ``auto_map`` instead, preserving a load-time FP8 ``dequantize`` request.
+
+    Args:
+        config: Config resolved for the vanilla reference load.
+        pretrained_model_name_or_path: Checkpoint the reference loads from.
+        trust_remote_code: Whether the reference load trusts remote code.
+        revision: Optional checkpoint revision.
+        token: Optional Hub token.
+
+    Returns:
+        Tuple of the faithful config and whether a replacement happened.
+    """
+    if not trust_remote_code or not _is_nemo_owned_config(config):
+        return config, False
+    auto_map = getattr(config, "auto_map", None) or {}
+    class_reference = auto_map.get("AutoConfig")
+    if not class_reference:
+        return config, False
+
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    load_kwargs: dict[str, str | bool] = {
+        "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    }
+    if revision is not None:
+        load_kwargs["revision"] = revision
+    if token is not None:
+        load_kwargs["token"] = token
+    config_cls = get_class_from_dynamic_module(class_reference, pretrained_model_name_or_path, **load_kwargs)
+    replacement = config_cls.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+
+    original_quantization = getattr(config, "quantization_config", None)
+    requested_dequantize = (
+        original_quantization.get("dequantize")
+        if isinstance(original_quantization, dict)
+        else getattr(original_quantization, "dequantize", None)
+    )
+    if requested_dequantize:
+        replacement_quantization = getattr(replacement, "quantization_config", None)
+        if isinstance(replacement_quantization, dict):
+            replacement.quantization_config = {**replacement_quantization, "dequantize": True}
+        elif replacement_quantization is not None:
+            replacement_quantization.dequantize = True
+    return replacement, True
+
+
 def _dequantize_hf_fp8_weights_in_place(model, output_dtype: torch.dtype) -> int:
     """Dequantize native per-tensor HF FP8 modules without their runtime kernel.
 
@@ -985,6 +1054,13 @@ def _hf_source_load_kwargs(
         "trust_remote_code",
     }
     hf_kwargs = {k: v for k, v in model_kwargs.items() if k in hf_allowed_keys}
+    recipe_config = hf_kwargs.get("config")
+    if recipe_config is not None and _is_nemo_owned_config(recipe_config):
+        # AutoModel component configs are never valid for a vanilla-HF
+        # reference; remote and in-tree model classes both reject them with a
+        # config_class mismatch. Let the reference resolve the checkpoint's
+        # own config instead.
+        del hf_kwargs["config"]
     hf_kwargs["torch_dtype"] = source_dtype
     hf_kwargs["trust_remote_code"] = trust_remote_code
     hf_kwargs["local_files_only"] = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
@@ -1489,6 +1565,17 @@ def _prepare_source_load_reference_rank0(
             revision=hf_kwargs.get("revision"),
             token=hf_kwargs.get("token"),
         )
+    hf_config, replaced_reference_config = _replace_nemo_owned_reference_config(
+        hf_config,
+        original_pretrained_path,
+        trust_remote_code=hf_kwargs["trust_remote_code"],
+        revision=hf_kwargs.get("revision"),
+        token=hf_kwargs.get("token"),
+    )
+    if replaced_reference_config:
+        # Pass the faithful config explicitly so from_pretrained's internal
+        # AutoConfig resolution cannot re-select the AutoModel-owned class.
+        hf_kwargs["config"] = hf_config
 
     model_load_context = _hf_model_load_context(
         trust_remote_code=trust_remote_code,
@@ -2007,6 +2094,17 @@ def _run_vanilla_hf_reload(
                 revision=model_kwargs.get("revision"),
                 token=model_kwargs.get("token"),
             )
+        hf_config, replaced_reference_config = _replace_nemo_owned_reference_config(
+            hf_config,
+            config_path,
+            trust_remote_code=trust_remote_code,
+            revision=model_kwargs.get("revision"),
+            token=model_kwargs.get("token"),
+        )
+        if replaced_reference_config:
+            # Pass the faithful config explicitly so from_pretrained's internal
+            # AutoConfig resolution cannot re-select the AutoModel-owned class.
+            hf_kwargs["config"] = hf_config
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
         # rank-0-only stall trips the NCCL watchdog while the other ranks idle at
