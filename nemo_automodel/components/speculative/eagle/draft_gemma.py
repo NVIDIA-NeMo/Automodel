@@ -124,6 +124,7 @@ def _normalize_gemma4_draft_config(config: PretrainedConfig) -> None:
     # 2. RoPE: flatten the nested per-attention-type schedule to a standard
     #    full-rotary Llama RoPE on the global base. Clearing ``rope_parameters``
     #    routes ``_get_rope_config`` down the flat ``rope_theta`` path.
+    full_attention_config = config.per_layer_config["full_attention"]
     config.rope_theta = _extract_global_rope_theta(config)
     config.rope_parameters = None
     config.rope_scaling = None
@@ -131,6 +132,9 @@ def _normalize_gemma4_draft_config(config: PretrainedConfig) -> None:
     # rotary; the target's global-attention ``partial_rotary_factor`` (0.25) and
     # larger ``global_head_dim`` (512) apply only inside the frozen target.
     config.partial_rotary_factor = 1.0
+    config.head_dim = full_attention_config.head_dim
+    config.num_key_value_heads = full_attention_config.num_key_value_heads
+    config.allow_global_per_layer_attribute_access = True
 
     # 3. MoE targets: the draft is a dense model, but on a MoE Gemma4
     #    (``enable_moe_block``) the config ``intermediate_size`` is the *per-expert*

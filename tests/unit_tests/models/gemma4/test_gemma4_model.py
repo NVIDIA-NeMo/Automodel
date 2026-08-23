@@ -360,8 +360,8 @@ class TestGemma4MoEDecoderLayer:
         batch, seq = 2, 4
         x = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
         pos_emb = (
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
         )
 
         with (
@@ -384,8 +384,8 @@ class TestGemma4MoEDecoderLayer:
         batch, seq = 2, 4
         x = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
         pos_emb = (
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
         )
         # Sentinel distinguishable by value — what pre_feedforward_layernorm_2 returns.
         sentinel = torch.full_like(x, 7.0)
