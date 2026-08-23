@@ -124,11 +124,13 @@ fixture_keys:
     - hf_device_map_max_memory_gib
     - hf_reload_timeout_seconds
     - hf_source_post_load_dequantize
-    # GLM-only Phase 0 evidence capture: full-sequence router logits, cutoff
-    # margins, expert flips, and final-token KL conditioned on route agreement.
+    # Optional routed-MoE evidence to determine whether parity outliers are
+    # caused by numerically fragile router choices. Currently enabled only for
+    # GLM 4.7 Flash.
     - capture_router_diagnostics
-    # Optional non-gating vanilla-HF calibration sweep. A shorter cross-framework
-    # gate automatically adds the standing shape forward without this mapping.
+    # Optional HF self-comparison across sequence lengths, used to distinguish
+    # shape-sensitive numerics from a cross-framework loading or parity bug. A
+    # shorter cross-framework gate measures its gate length automatically.
     - shape_diagnostic
     # Full-logit parity defaults to 2048 tokens from the repository's fixed
     # long-form document. Named profiles gate mean KL, p95 KL, and cosine.
