@@ -49,6 +49,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _LogitParityPolicy,
     _model_pretrained_path,
     _normalize_peft_no_split_modules,
+    _patch_remote_fla_api_compatibility,
     _patch_remote_masking_api_compatibility,
     _peft_adapter_load_kwargs,
     _post_load_dequant_max_memory,
@@ -1817,3 +1818,71 @@ def test_hf_source_load_kwargs_keeps_hf_recipe_config():
         )
 
     assert hf_kwargs["config"] is hf_config
+
+
+def _install_fake_fla(monkeypatch, gate_function):
+    """Register a minimal fake fla.ops.kda[.gate] module tree exposing gate_function."""
+    import sys
+    from types import ModuleType
+
+    fla = ModuleType("fla")
+    ops = ModuleType("fla.ops")
+    kda = ModuleType("fla.ops.kda")
+    gate = ModuleType("fla.ops.kda.gate")
+    gate.fused_kda_gate = gate_function
+    kda.fused_kda_gate = gate_function
+    kda.gate = gate
+    ops.kda = kda
+    fla.ops = ops
+    for name, module in (("fla", fla), ("fla.ops", ops), ("fla.ops.kda", kda), ("fla.ops.kda.gate", gate)):
+        monkeypatch.setitem(sys.modules, name, module)
+    return kda, gate
+
+
+def test_remote_fla_api_compatibility_translates_legacy_kda_gate(monkeypatch):
+    """Legacy fused_kda_gate(g, A, head_k_dim, g_bias=...) calls must reach the renamed API.
+
+    The fake installed API mirrors fla-core 0.4.2: g arrives pre-reshaped to
+    [..., heads, head_k_dim] and the bias keyword is dt_bias.
+    """
+    calls = {}
+
+    def fused_kda_gate(g, A_log, dt_bias=None, lower_bound=None, output_dtype=torch.float32):
+        calls["g_shape"] = tuple(g.shape)
+        calls["dt_bias"] = dt_bias
+        return g
+
+    kda, gate = _install_fake_fla(monkeypatch, fused_kda_gate)
+    _patch_remote_fla_api_compatibility()
+
+    # Legacy call: flat g of shape [batch, sequence, heads * head_k_dim].
+    g = torch.zeros(2, 3, 8)
+    bias = torch.ones(8)
+    gate.fused_kda_gate(g, torch.zeros(2), 4, g_bias=bias)
+    assert calls["g_shape"] == (2, 3, 2, 4)
+    assert calls["dt_bias"] is bias
+
+    # New-style calls pass through untouched.
+    gate.fused_kda_gate(torch.zeros(2, 3, 2, 4), torch.zeros(2), dt_bias=None)
+    assert calls["g_shape"] == (2, 3, 2, 4)
+    assert calls["dt_bias"] is None
+
+    # The package-level re-export is patched consistently, and re-patching no-ops.
+    assert kda.fused_kda_gate is gate.fused_kda_gate
+    patched = gate.fused_kda_gate
+    _patch_remote_fla_api_compatibility()
+    assert gate.fused_kda_gate is patched
+
+    with pytest.raises(TypeError, match="beta/threshold"):
+        gate.fused_kda_gate(g, torch.zeros(2), 4, g_bias=bias, beta=2.0)
+
+
+def test_remote_fla_api_compatibility_preserves_legacy_capable_api(monkeypatch):
+    def fused_kda_gate(g, A, head_k_dim, g_bias=None, beta=1.0, threshold=20.0):
+        return g
+
+    kda, gate = _install_fake_fla(monkeypatch, fused_kda_gate)
+    _patch_remote_fla_api_compatibility()
+
+    assert gate.fused_kda_gate is fused_kda_gate
+    assert kda.fused_kda_gate is fused_kda_gate
