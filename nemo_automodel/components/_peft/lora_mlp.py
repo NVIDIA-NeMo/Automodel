@@ -39,7 +39,7 @@ from packaging import version
 from torch.autograd.function import BackwardCFunction
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components._peft.lora import LinearLoRA
+from nemo_automodel.components._peft.lora import LinearLoRA, _lora_input
 from nemo_automodel.shared.import_utils import null_decorator
 
 try:
@@ -226,15 +226,16 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         # ``addmm_`` is not autocast-eligible — an in-place op cannot change its output dtype — so
         # unlike the ``F.linear`` calls its operands are *not* auto-cast and must already be in the
         # base projection's dtype. They are not when the adapters are held in a different dtype than
-        # the base (``lora_dtype``), which the per-linear path handles via autocast; cast to keep the
-        # fused path identical to it. A no-op when the dtypes already agree.
+        # the base (``lora_dtype``); cast to keep the fused path identical to the per-linear one. A no-op
+        # when the dtypes already agree. Without autocast the adapter matmuls also need the activation in
+        # the adapter dtype, which ``_lora_input`` provides as the per-linear path does.
         e = F.linear(x2, gW)  # gate_out (saved)
-        e.addmm_(*_cast(e.dtype, F.linear(x2, gA) * gS, gB.t()))
+        e.addmm_(*_cast(e.dtype, F.linear(_lora_input(x2, gA.dtype), gA) * gS, gB.t()))
         g = F.linear(x2, uW)  # up_out (saved)
-        g.addmm_(*_cast(g.dtype, F.linear(x2, uA) * uS, uB.t()))
+        g.addmm_(*_cast(g.dtype, F.linear(_lora_input(x2, uA.dtype), uA) * uS, uB.t()))
         h = _swiglu_fwd(e, g)  # down-projection input (recomputed in backward)
         out = F.linear(h, dW)
-        out.addmm_(*_cast(out.dtype, F.linear(h, dA) * dS, dB.t()))
+        out.addmm_(*_cast(out.dtype, F.linear(_lora_input(h, dA.dtype), dA) * dS, dB.t()))
 
         # Save only x / gate_out / up_out; the SwiGLU activation and down-input are recomputed.
         ctx.save_for_backward(x2, e, g, gA, gB, uA, uB, dA, dB)
@@ -435,13 +436,14 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         orig_shape = x.shape
         x2 = x.reshape(-1, orig_shape[-1])
         # See LoRASwiGLUMLPFunction.forward: ``addmm_`` is not autocast-eligible, so cast its operands
-        # to the base projection's dtype for a ``lora_dtype`` that differs from the base weights.
+        # to the base projection's dtype for a ``lora_dtype`` that differs from the base weights, and
+        # hand the adapter matmuls the activation in the adapter dtype when autocast is off.
         e = F.linear(x2, uW)  # up_out (saved)
-        e.addmm_(*_cast(e.dtype, F.linear(x2, uA) * uS, uB.t()))
+        e.addmm_(*_cast(e.dtype, F.linear(_lora_input(x2, uA.dtype), uA) * uS, uB.t()))
         relu_e = torch.relu(e)
         f = relu_e * relu_e  # down-projection input (recomputed in backward)
         out = F.linear(f, dW)
-        out.addmm_(*_cast(out.dtype, F.linear(f, dA) * dS, dB.t()))
+        out.addmm_(*_cast(out.dtype, F.linear(_lora_input(f, dA.dtype), dA) * dS, dB.t()))
         ctx.save_for_backward(x2, e, uA, uB, dA, dB)
         setattr(ctx, "_lora_mlp_state", _ReLU2State((uW, dW), (uS, dS), orig_shape))
         return out.view(*orig_shape[:-1], dW.shape[0])

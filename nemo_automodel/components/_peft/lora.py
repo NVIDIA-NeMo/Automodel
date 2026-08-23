@@ -75,6 +75,28 @@ def _extract_base_dtype(
     return default_dtype
 
 
+def _lora_input(x: torch.Tensor, adapter_dtype: torch.dtype) -> torch.Tensor:
+    """Return the activation the eager LoRA matmuls consume.
+
+    Without autocast ``F.linear`` requires the activation and the adapter weight to share a dtype,
+    which they do not when adapters are held in another dtype than the base (e.g. FP32 adapters over a
+    BF16 base), so the activation is cast to the adapter dtype. Under autocast the matmuls reconcile
+    dtypes themselves, and an up-cast would only keep a wider copy of the activation until backward.
+
+    Args:
+        x: Input activations of any shape; may be a DTensor.
+        adapter_dtype: Dtype of the ``lora_A`` weight that consumes ``x``.
+
+    Returns:
+        ``x`` itself under autocast for its device type or when it already has ``adapter_dtype``,
+        otherwise ``x`` cast to ``adapter_dtype`` with the same shape.
+    """
+    device_type = x.device.type
+    if torch.amp.is_autocast_available(device_type) and torch.is_autocast_enabled(device_type):
+        return x
+    return x.to(adapter_dtype)
+
+
 class LinearLoRA(nn.Linear):
     """
     Linear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN).
@@ -364,23 +386,27 @@ class LinearLoRA(nn.Linear):
             res = tp_linear_forward(x, self.weight, bias, mm_for_2d_compile=False)
 
         if self._lora_token_gate is not None:
-            return res + self._gated_lora_forward(x)
+            return res + self._gated_lora_forward(x).to(res.dtype)
 
         if not self.use_dora:
             if self.dropout_position == "pre":
                 x = F.dropout(x, p=self.dropout_p, training=self.training)
 
+            # Compute the LoRA branch in the adapter dtype and add it in `res`'s dtype.
+            lora_x = _lora_input(x, self.lora_A.weight.dtype)
             # Apply scale before lora_B to keep lora_res as a Partial tensor.
             # This allows both res and lora_res to remain Partial, so only one reduce-scatter is needed after addition.
             # Multiplying after lora_B would convert Partial to Replicate, causing an extra reduce-scatter operation.
-            use_memory_efficient_lora = self._should_use_memory_efficient_lora(x)
+            use_memory_efficient_lora = self._should_use_memory_efficient_lora(lora_x)
             if use_memory_efficient_lora:
                 a, b = self._adapter_weights()
-                if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
-                    return apply_memory_efficient_lora(x, a, b, self.scale, False, res)
-                lora_res = apply_memory_efficient_lora(x, a, b, self.scale, False)
+                fuse_residual = self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0
+                # The fused residual is added in the LoRA branch's dtype; a narrower one would round `res`.
+                if fuse_residual and lora_x.dtype == res.dtype:
+                    return apply_memory_efficient_lora(lora_x, a, b, self.scale, False, res)
+                lora_res = apply_memory_efficient_lora(lora_x, a, b, self.scale, False).to(res.dtype)
             else:
-                lora_res = self.lora_B(self.lora_A(x) * self.scale)
+                lora_res = self.lora_B(self.lora_A(lora_x) * self.scale).to(res.dtype)
             if self.dropout_position == "post":
                 lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
             if use_memory_efficient_lora:
@@ -397,7 +423,7 @@ class LinearLoRA(nn.Linear):
             x_lora = x
             base_result = res
 
-        lora_result = self.lora_B(self.lora_A(x_lora))
+        lora_result = self.lora_B(self.lora_A(_lora_input(x_lora, self.lora_A.weight.dtype))).to(res.dtype)
         if self.dropout_position == "post":
             lora_result = F.dropout(lora_result, p=self.dropout_p, training=self.training)
 
@@ -440,7 +466,7 @@ class LinearLoRA(nn.Linear):
 
         Returns:
             Tensor of shape [..., out_features] with the same leading dimensions as ``x``: the
-            gated LoRA update, without the base projection.
+            gated LoRA update, without the base projection, in the adapter compute dtype.
         """
         if self.use_dora:
             raise NotImplementedError("lora_token_gate does not support DoRA adapters.")
@@ -459,7 +485,7 @@ class LinearLoRA(nn.Linear):
             )
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
-        hidden = self.lora_A(x)
+        hidden = self.lora_A(_lora_input(x, self.lora_A.weight.dtype))
         hidden = hidden * (gate.reshape(hidden.shape[:-1]).unsqueeze(-1).to(hidden.dtype) * self.scale)
         lora_res = self.lora_B(hidden)
         if self.dropout_position == "post":
@@ -517,17 +543,27 @@ class TritonLinearLoRA(LinearLoRA):
             res = F.linear(x, self.weight, self.bias)
 
         if self._lora_token_gate is not None:
-            return res + self._gated_lora_forward(x)
+            return res + self._gated_lora_forward(x).to(res.dtype)
 
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
         if self.use_memory_efficient_lora:
+            # Canonicalize to the base output dtype: the kernel requires one
+            # dtype across x, adapters, and output, and the addend must match
+            # `res` for the fused addition. The casts are outside the autograd
+            # Function, so gradients flow back in the original dtypes.
+            compute_dtype = res.dtype
+            x = x.to(compute_dtype)
             a, b = self._adapter_weights()
+            a = a.to(compute_dtype)
+            b = b.to(compute_dtype)
             if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
                 return apply_memory_efficient_lora(x, a, b, self.scale, True, res)
             lora_res = apply_memory_efficient_lora(x, a, b, self.scale, True)
         else:
-            lora_res = self.lora_B(self.lora_A(x) * self.scale)
+            # Compute the LoRA branch in the adapter dtype and add it in `res`'s dtype.
+            lora_x = _lora_input(x, self.lora_A.weight.dtype)
+            lora_res = self.lora_B(self.lora_A(lora_x) * self.scale).to(res.dtype)
         if self.dropout_position == "post":
             lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
         if self.use_memory_efficient_lora:

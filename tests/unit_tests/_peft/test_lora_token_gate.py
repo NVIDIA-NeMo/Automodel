@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -21,6 +23,7 @@ from torch.utils.checkpoint import checkpoint
 from nemo_automodel.components._peft.lora import (
     LinearLoRA,
     PeftConfig,
+    TritonLinearLoRA,
     apply_lora_to_linear_modules,
     lora_token_gate,
     patch_linear_module,
@@ -251,6 +254,34 @@ def test_float_gate_scales_the_adapter_update_on_a_bf16_module():
         with lora_token_gate(linear, torch.full((B, S), 0.5)):
             half_delta = linear(x).float() - base
     torch.testing.assert_close(half_delta, 0.5 * full_delta, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("lora_cls", [LinearLoRA, TritonLinearLoRA])
+def test_gate_with_fp32_adapters_over_bf16_base_matches_fp64(lora_cls):
+    """Without autocast the gated branch runs FP32 adapters over a BF16 base and adds in the base dtype."""
+    torch.manual_seed(0)
+    linear = lora_cls(nn.Linear(H, H, dtype=torch.bfloat16), dim=4, alpha=8, lora_dtype=torch.float32)
+    nn.init.normal_(linear.lora_B.weight, std=0.1)
+    reference = copy.deepcopy(linear).double()
+    x = torch.randn(B, S, H, dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().double().requires_grad_(True)
+    gate = _gate()
+
+    with lora_token_gate(linear, gate):
+        out = linear(x)
+    with lora_token_gate(reference, gate):
+        ref_out = reference(x_ref)
+    upstream = torch.randn_like(out)
+    out.backward(upstream)
+    ref_out.backward(upstream.double())
+
+    assert out.dtype == x.grad.dtype == torch.bfloat16
+    torch.testing.assert_close(out.double(), ref_out.detach(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(x.grad.double(), x_ref.grad, rtol=2e-2, atol=2e-2)
+    for name in ("lora_A", "lora_B"):
+        grad = getattr(linear, name).weight.grad
+        assert grad.dtype == torch.float32, name
+        torch.testing.assert_close(grad.double(), getattr(reference, name).weight.grad, rtol=2e-2, atol=2e-2)
 
 
 def test_gate_rejects_lora_on_moe_experts():
