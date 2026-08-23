@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -128,6 +128,7 @@ class CollatedLossInputs(dict[str, torch.Tensor]):
         self._layouts = dict(layouts)
         self._pad_values = resolved_pad_values
         self.item_to_datum = resolved_item_to_datum
+        self._engine_packing_layout: str | None = None
 
     @property
     def layouts(self) -> Mapping[str, LossInputLayout]:
@@ -141,12 +142,14 @@ class CollatedLossInputs(dict[str, torch.Tensor]):
 
     def copy(self) -> CollatedLossInputs:
         """Return a shallow copy that retains the layout side channel."""
-        return type(self)(
+        copied = type(self)(
             self,
             layouts=self.layouts,
             item_to_datum=self.item_to_datum,
             pad_values=self.pad_values,
         )
+        copied._engine_packing_layout = self._engine_packing_layout
+        return copied
 
     def __copy__(self) -> CollatedLossInputs:
         return self.copy()
@@ -332,6 +335,7 @@ def collate_datums(
     datums: list[Datum],
     *,
     packed: bool = False,
+    packing_layout: Literal["indexed_mask"] | None = None,
     pad_seq_len_divisible: int | None = None,
     ignore_index: int = CROSS_ENTROPY_IGNORE_IDX,
 ) -> tuple[dict[str, Any], CollatedLossInputs]:
@@ -344,6 +348,15 @@ def collate_datums(
     Args:
         datums: Non-empty training items for one microbatch.
         packed: Produce one flat THD token row instead of a padded batch.
+        packing_layout: Optional packed physical layout. ``"indexed_mask"``
+            produces one ``[1, tokens]`` row with a 1-based document-id
+            ``attention_mask`` and reset ``position_ids`` for Hugging Face
+            variable-length attention. It cannot be combined with ``packed``
+            or ``pad_seq_len_divisible``. The caller must configure indexed-mask
+            handling for its attention backend: configure the model to actually
+            use Flash Attention 2 and call
+            ``configure_packing(attn_implementation="flash_attention_2")``.
+            This collater does not patch the model globally.
         pad_seq_len_divisible: Round the padded token width to this multiple.
         ignore_index: Label fill value used internally by the THD collater.
 
@@ -351,12 +364,20 @@ def collate_datums(
         ``(model_inputs, loss_fn_inputs)``. The second item remains a ``dict``
         and also exposes complete ``layouts`` and ``item_to_datum`` metadata.
         Per-token loss inputs have shape ``[B, T, ...]`` in padded mode and
-        ``[1, total_tokens, ...]`` in packed mode; per-Datum scalar loss inputs
-        have shape ``[B]``. Replicated inputs retain one copy of their original
-        shape.
+        ``[1, total_tokens, ...]`` in either packed layout; per-Datum scalar
+        loss inputs have shape ``[B]``. Replicated inputs retain one copy of
+        their original shape.
     """
     if not datums:
         raise ValueError("collate_datums requires at least one Datum")
+    if packing_layout not in (None, "indexed_mask"):
+        raise ValueError(f"packing_layout must be 'indexed_mask' or None, got {packing_layout!r}")
+    if packed and packing_layout is not None:
+        raise ValueError("packed and packing_layout cannot be set together")
+    if packing_layout == "indexed_mask" and pad_seq_len_divisible is not None:
+        raise ValueError("indexed_mask packing does not support pad_seq_len_divisible")
+
+    pack_tokens = packed or packing_layout == "indexed_mask"
 
     model_keys = set(datums[0].model_inputs)
     loss_keys = set(datums[0].loss_fn_inputs)
@@ -367,7 +388,7 @@ def collate_datums(
             raise ValueError("every Datum in a microbatch must carry the same loss_fn_inputs keys")
 
     features = [datum.to_features(ignore_index=ignore_index) for datum in datums]
-    if packed:
+    if pack_tokens:
         unsupported = model_keys - {"input_ids", "attention_mask"}
         if unsupported:
             raise ValueError(
@@ -380,7 +401,26 @@ def collate_datums(
                 raise ValueError(
                     "packed Datums must contain only real tokens; explicit attention_mask padding is unsupported"
                 )
+
+    if packed:
         model_inputs = packed_sequence_thd_collater([pack_features_for_thd(features, ignore_index=ignore_index)])
+    elif packing_layout == "indexed_mask":
+        input_ids = torch.cat([datum.input_ids for datum in datums]).unsqueeze(0)
+        packed_seq_ids = torch.cat(
+            [
+                torch.full((datum.seq_len,), index, dtype=torch.long, device=datum.input_ids.device)
+                for index, datum in enumerate(datums, 1)
+            ]
+        ).unsqueeze(0)
+        position_ids = torch.cat(
+            [torch.arange(datum.seq_len, dtype=torch.long, device=datum.input_ids.device) for datum in datums]
+        ).unsqueeze(0)
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": packed_seq_ids,
+            "position_ids": position_ids,
+            "_packed_seq_ids": packed_seq_ids,
+        }
     else:
         model_inputs = default_collater([dict(feature) for feature in features], pad_seq_len_divisible)
 
@@ -450,7 +490,7 @@ def collate_datums(
                 raise ValueError(
                     f"PER_TOKEN loss input {key!r} must use one trailing shape, dtype, and device; got {shapes}"
                 )
-            if packed:
+            if pack_tokens:
                 loss_inputs[key] = torch.cat(values, dim=0).unsqueeze(0)
             else:
                 loss_inputs[key] = torch.stack(
@@ -483,12 +523,14 @@ def collate_datums(
             raise ValueError(f"REPLICATED loss input {key!r} must have the same value in every Datum")
         loss_inputs[key] = first
 
-    return model_inputs, CollatedLossInputs(
+    collated_loss_inputs = CollatedLossInputs(
         loss_inputs,
         layouts=loss_layouts,
         item_to_datum=tuple(range(len(datums))),
         pad_values=loss_pad_values,
     )
+    collated_loss_inputs._engine_packing_layout = packing_layout
+    return model_inputs, collated_loss_inputs
 
 
 def _collate_vlm_loss_inputs(
@@ -601,6 +643,7 @@ def collate_vlm_datums(
     *,
     processor: "ProcessorMixin",
     packed: bool = False,
+    packing_layout: Literal["indexed_mask"] | None = None,
     get_rope_index: Callable[..., object] | None = None,
     sequence_alignment: int = 1,
 ) -> tuple[dict[str, Any], CollatedLossInputs]:
@@ -615,12 +658,14 @@ def collate_vlm_datums(
     replay must be converted by its owner to ``[:-1]`` before being passed as
     an ``S-1`` field; its direction cannot be inferred from shape alone.
 
-    In packed mode, every Datum becomes one THD document. Each loss field is
-    padded inside that document before concatenation, preserving nonzero pad
-    sentinels and arbitrary trailing feature axes. ``token_type_ids`` and
-    ``mm_token_type_ids`` follow the same model-token shift/alignment. Other
-    processor media tensors retain their leading media axis and are
-    concatenated.
+    In packed mode, every Datum becomes one THD document. With
+    ``packing_layout="indexed_mask"``, the same logical documents instead use
+    a 1-based ``[1, tokens]`` document mask for Hugging Face variable-length
+    attention. Each loss field is concatenated on the same flat token row,
+    preserving nonzero pad sentinels and arbitrary trailing feature axes.
+    ``token_type_ids`` and ``mm_token_type_ids`` follow the same model-token
+    shift. Other processor media tensors retain their leading media axis and
+    are concatenated.
 
     Args:
         datums: Non-empty processor-ready VLM items. Each item has
@@ -632,6 +677,15 @@ def collate_vlm_datums(
         processor: Hugging Face processor (or compatible object) that supplies
             the tokenizer padding token.
         packed: Pack the Datums as THD documents instead of padding a batch.
+        packing_layout: Optional packed physical layout. ``"indexed_mask"``
+            emits one ``[1, tokens]`` token row and a matching 1-based document
+            map in ``attention_mask`` and ``_packed_seq_ids``. It cannot be
+            combined with ``packed`` and currently requires
+            ``sequence_alignment=1``. The caller must configure indexed-mask
+            handling for its attention backend: configure the model to actually
+            use Flash Attention 2 and call
+            ``configure_packing(attn_implementation="flash_attention_2")``.
+            This collater does not patch the model globally.
         get_rope_index: Optional bound model callable used to materialize
             multi-axis VLM position IDs before packing.
         sequence_alignment: Per-document THD alignment. Context-parallel
@@ -642,17 +696,26 @@ def collate_vlm_datums(
         A pair of shifted/padded model inputs and layout-aware loss inputs.
         In padded mode, token model fields and ``PER_TOKEN`` loss fields have
         shape ``[batch, padded_sequence - 1, ...]``. In packed mode they have
-        shape ``[1, aligned_tokens, ...]`` and model inputs include THD sequence
-        metadata. ``PER_DATUM`` and ``REPLICATED`` values retain their generic
-        Datum semantics. Four-dimensional ``pixel_values`` are right/bottom
-        padded to the batch's maximum height and width; other media tensors
-        retain their trailing dimensions. All media tensors are concatenated
-        on their leading media axis.
+        shape ``[1, aligned_tokens, ...]``. THD model inputs include sequence
+        metadata; indexed-mask model inputs include the document-id map.
+        ``PER_DATUM`` and ``REPLICATED`` values retain their generic Datum
+        semantics. Four-dimensional ``pixel_values`` are right/bottom padded
+        to the batch's maximum height and width; other media tensors retain
+        their trailing dimensions. All media tensors are concatenated on their
+        leading media axis.
     """
     if not datums:
         raise ValueError("collate_vlm_datums requires at least one Datum")
+    if packing_layout not in (None, "indexed_mask"):
+        raise ValueError(f"packing_layout must be 'indexed_mask' or None, got {packing_layout!r}")
+    if packed and packing_layout is not None:
+        raise ValueError("packed and packing_layout cannot be set together")
     if isinstance(sequence_alignment, bool) or not isinstance(sequence_alignment, int) or sequence_alignment < 1:
         raise ValueError(f"sequence_alignment must be a positive integer, got {sequence_alignment!r}")
+    if packing_layout == "indexed_mask" and sequence_alignment != 1:
+        raise ValueError("indexed_mask packing requires sequence_alignment=1")
+
+    pack_tokens = packed or packing_layout == "indexed_mask"
 
     from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
     from nemo_automodel.components.datasets.vlm.utils import _media_token_mismatch
@@ -674,7 +737,7 @@ def collate_vlm_datums(
             raise ValueError("VLM Datums require a 1-D attention_mask matching input_ids")
         if datum.seq_len < 2:
             raise ValueError("VLM Datums require at least two tokens for autoregressive shifting")
-        if packed and bool((attention_mask == 0).any()):
+        if pack_tokens and bool((attention_mask == 0).any()):
             raise ValueError("packed VLM Datums cannot contain pre-existing attention_mask padding")
 
         mismatch = _media_token_mismatch(input_ids, datum.model_inputs, processor)
@@ -696,8 +759,11 @@ def collate_vlm_datums(
             }
         )
 
-    if packed:
-        from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+    if pack_tokens:
+        from nemo_automodel.components.datasets.vlm.collate_fns import (
+            neat_packed_vlm_collater,
+            packed_sequence_thd_vlm_collater,
+        )
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
             _build_packed_vlm_sample,
             _compute_mrope_position_ids,
@@ -726,7 +792,15 @@ def collate_vlm_datums(
             has_mrope=has_mrope,
             sequence_alignment=sequence_alignment,
         )
-        model_inputs = packed_sequence_thd_vlm_collater([packed_sample], padding_idx=padding_idx)
+        if packed:
+            model_inputs = packed_sequence_thd_vlm_collater([packed_sample], padding_idx=padding_idx)
+        else:
+            model_inputs = neat_packed_vlm_collater(
+                [packed_sample],
+                padding_idx=padding_idx,
+                materialize_4d_mask=False,
+            )
+            model_inputs["_packed_seq_ids"] = model_inputs["attention_mask"]
         model_inputs.pop("labels")
     else:
         model_inputs = pad_collate_fn(examples, processor)
@@ -741,10 +815,11 @@ def collate_vlm_datums(
 
     loss_inputs = _collate_vlm_loss_inputs(
         datums,
-        packed=packed,
+        packed=pack_tokens,
         sequence_alignment=sequence_alignment,
         padding_idx=padding_idx,
     )
+    loss_inputs._engine_packing_layout = packing_layout
 
     unhandled_keys = set().union(*(datum.model_inputs.keys() for datum in datums)) - set(model_inputs)
     unhandled_keys -= {"input_ids", "attention_mask"}

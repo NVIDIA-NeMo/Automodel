@@ -235,6 +235,7 @@ class _OutputRestorePlan:
 
     sharder: ContextParallelSharder
     is_thd: bool
+    packed_seq_ids: torch.Tensor | None
     item_to_datum: tuple[int, ...] | None
     real_lengths: tuple[int, ...] | None
     padded_lengths: tuple[int, ...] | None
@@ -266,12 +267,30 @@ def _output_sequence_lengths(
     item_to_datum: tuple[int, ...] | None,
     *,
     is_thd: bool,
+    packed_seq_ids: torch.Tensor | None = None,
 ) -> tuple[
     tuple[int, ...] | None,
     tuple[int, ...] | None,
     torch.Tensor | None,
 ]:
-    """Capture real and padded sequence lengths before CP mutates the batch."""
+    """Capture real and padded sequence lengths before CP mutates the batch.
+
+    Args:
+        datums: Logical items represented by the collated token tensors.
+        model_inputs: Model mapping whose token fields have padded
+            ``[batch, sequence]`` or packed ``[1, tokens]`` layout.
+        loss_inputs: Loss mapping whose per-token ``weights`` has the same
+            leading token axes as ``model_inputs``.
+        item_to_datum: Identity mapping from collated logical items to Datums.
+        is_thd: Whether the physical model layout is THD.
+        packed_seq_ids: Optional 1-based document map of shape ``[1, tokens]``
+            for a physically BSH indexed-mask pack; zero denotes padding.
+
+    Returns:
+        Real lengths, padded lengths, and an optional padded-batch boolean mask.
+        Length tuples contain one value per Datum. The mask has shape
+        ``[batch, sequence]`` when ordinary padded rows need sparse routing.
+    """
     if item_to_datum is None:
         return None, None, None
     if item_to_datum != tuple(range(len(datums))):
@@ -280,6 +299,34 @@ def _output_sequence_lengths(
     weights = loss_inputs.get("weights")
     if not isinstance(weights, torch.Tensor):
         raise ValueError("token output restoration requires Tensor loss weights")
+    if packed_seq_ids is not None:
+        if is_thd:
+            raise ValueError("indexed-mask output routing cannot be combined with a THD model layout")
+        if packed_seq_ids.ndim != 2 or packed_seq_ids.shape[0] != 1:
+            raise ValueError(f"_packed_seq_ids must have shape [1, tokens], got {tuple(packed_seq_ids.shape)}")
+        if packed_seq_ids.dtype == torch.bool or packed_seq_ids.is_floating_point():
+            raise TypeError("_packed_seq_ids must use an integer dtype")
+        if weights.ndim < 2 or tuple(weights.shape[:2]) != tuple(packed_seq_ids.shape):
+            raise ValueError(
+                "indexed-mask token outputs require weights on the same [1, tokens] axes as _packed_seq_ids"
+            )
+        if bool((packed_seq_ids < 0).any()):
+            raise ValueError("_packed_seq_ids must contain only zero padding or positive document IDs")
+        flat_seq_ids = packed_seq_ids[0]
+        valid_tokens = int((flat_seq_ids > 0).sum())
+        if not bool((flat_seq_ids[:valid_tokens] > 0).all()) or bool((flat_seq_ids[valid_tokens:] != 0).any()):
+            raise ValueError("_packed_seq_ids zero padding must be one trailing suffix")
+        valid_seq_ids = flat_seq_ids[:valid_tokens]
+        observed = tuple(int(value) for value in torch.unique(valid_seq_ids).tolist())
+        expected = tuple(range(1, len(item_to_datum) + 1))
+        if observed != expected:
+            raise ValueError(f"_packed_seq_ids must contain every document ID 1..{len(expected)}, got {observed}")
+        if valid_seq_ids.numel() > 1:
+            transitions = valid_seq_ids[1:] - valid_seq_ids[:-1]
+            if bool(((transitions < 0) | (transitions > 1)).any()):
+                raise ValueError("_packed_seq_ids must contain one contiguous segment for each document in order")
+        real_lengths = tuple(int((packed_seq_ids == index).sum()) for index in expected)
+        return real_lengths, real_lengths, None
     if is_thd:
         if isinstance(model_inputs.get("seq_lens"), torch.Tensor):
             real_lengths = _valid_row_values(model_inputs["seq_lens"])
@@ -379,7 +426,19 @@ def _split_restored_token_output(
     datum_indices: tuple[int, ...],
     seq_dim: int,
 ) -> list[torch.Tensor]:
-    """Split one restored collated token tensor into input-Datum coordinates."""
+    """Split one restored collated token tensor into input-Datum coordinates.
+
+    Args:
+        tensor: Restored token output of shape ``[batch, sequence, ...]`` or
+            a flat THD-equivalent ``[tokens, ...]`` layout.
+        plan: Captured physical layout and logical document routing metadata.
+        datum_indices: Outer Datum indices represented by ``tensor``.
+        seq_dim: Sequence axis in ``tensor`` before any packed-row squeeze.
+
+    Returns:
+        One contiguous tensor per requested Datum, each with shape
+        ``[datum_tokens, ...]``.
+    """
     if plan.item_to_datum is None:
         if datum_indices != (0,):
             raise NotImplementedError("prebatched token outputs can only produce their single outer Datum record")
@@ -394,6 +453,19 @@ def _split_restored_token_output(
         return [tensor]
     if plan.real_lengths is None or plan.padded_lengths is None:
         raise RuntimeError("token output routing metadata is incomplete")
+
+    if plan.packed_seq_ids is not None:
+        packed_seq_ids = plan.packed_seq_ids
+        if tensor.ndim < 2 or tuple(tensor.shape[:2]) != tuple(packed_seq_ids.shape):
+            raise ValueError(
+                "restored indexed-mask token output must start with the original [1, tokens] axes; "
+                f"got {tuple(tensor.shape)} and ids {tuple(packed_seq_ids.shape)}"
+            )
+        if plan.item_to_datum != datum_indices:
+            raise ValueError("indexed-mask output routing requires the complete Datum group in input order")
+        row = tensor.select(0, 0)
+        valid_tokens = sum(plan.real_lengths)
+        return [piece.contiguous() for piece in torch.split(row[:valid_tokens], plan.real_lengths, dim=0)]
 
     if plan.is_thd:
         expected_width = sum(plan.padded_lengths[index] for index in datum_indices)
@@ -608,6 +680,19 @@ def _loss_fn_output_restore_contract(
                 if restored_width != expected_width:
                     raise ValueError(
                         f"restored packed token output has width {restored_width}, expected {expected_width}"
+                    )
+            elif plan.packed_seq_ids is not None:
+                if plan.item_to_datum != datum_indices:
+                    raise ValueError("indexed-mask output routing requires the complete Datum group in input order")
+                if weights.ndim != 2 or tuple(weights.shape) != tuple(plan.packed_seq_ids.shape):
+                    raise ValueError(
+                        "indexed-mask token outputs require weights with the original [1, tokens] shape; "
+                        f"got {tuple(weights.shape)} and ids {tuple(plan.packed_seq_ids.shape)}"
+                    )
+                if restored_width != plan.packed_seq_ids.shape[1]:
+                    raise ValueError(
+                        f"restored indexed-mask token output has width {restored_width}, "
+                        f"expected {plan.packed_seq_ids.shape[1]}"
                     )
             else:
                 if weights.ndim != 2 or weights.shape[0] != len(datum_indices):

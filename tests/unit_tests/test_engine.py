@@ -68,6 +68,26 @@ class ScaleModel(nn.Module):
         return input_ids.to(torch.float32) * self.weight
 
 
+class _IndexedMaskScaleModel(ScaleModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forward_kwargs = {}
+
+    def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Record the Hugging Face-style indexed-mask forward contract.
+
+        Args:
+            input_ids: Token IDs of shape ``[1, tokens]``.
+            **kwargs: Model inputs whose attention and position tensors have
+                shape ``[1, tokens]``.
+
+        Returns:
+            Scaled token values of shape ``[1, tokens]``.
+        """
+        self.forward_kwargs = kwargs
+        return super().forward(input_ids)
+
+
 class _MainAndAuxScaleModel(nn.Module):
     """Small model whose main and auto-scaled auxiliary gradients are separable."""
 
@@ -2217,6 +2237,195 @@ def _packed_layout_datums(lengths: list[int]) -> list[Datum]:
     return datums
 
 
+@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+def test_indexed_mask_restores_typed_outputs_and_preserves_model_metadata(execution):
+    datums = _packed_layout_datums([2, 3])
+    model = _IndexedMaskScaleModel()
+
+    def loss_with_outputs(output, loss_inputs):
+        """Return typed probes on the indexed-mask token axes.
+
+        Args:
+            output: Model values of shape ``[1, tokens]``.
+            loss_inputs: Mapping whose per-token tensors have shape
+                ``[1, tokens]`` and whose ``sample_id`` has shape ``[datums]``.
+
+        Returns:
+            The loss tensor of shape ``[1, tokens]`` and typed probes of shape
+            ``[1, tokens, 2]`` with one scalar record per Datum.
+        """
+        probe = torch.stack((loss_inputs["advantages"], loss_inputs["old_logprobs"]), dim=-1)
+        return output, LossFnOutputBatch(
+            per_token={"probe": PerTokenOutput(probe)},
+            per_datum=[{"sample_id": sample_id} for sample_id in loss_inputs["sample_id"]],
+        )
+
+    result = getattr(
+        Engine(
+            model,
+            device="cpu",
+            microbatch_size=2,
+            collate_fn=partial(collate_datums, packing_layout="indexed_mask"),
+        ),
+        execution,
+    )(datums, loss_with_outputs)
+
+    torch.testing.assert_close(model.forward_kwargs["attention_mask"], torch.tensor([[1, 1, 2, 2, 2]]))
+    torch.testing.assert_close(model.forward_kwargs["position_ids"], torch.tensor([[0, 1, 0, 1, 2]]))
+    torch.testing.assert_close(model.forward_kwargs["_packed_seq_ids"], model.forward_kwargs["attention_mask"])
+    assert "_engine_packing_layout" not in model.forward_kwargs
+    assert [record["sample_id"].item() for record in result.loss_fn_outputs] == [11, 22]
+    for datum, record in zip(datums, result.loss_fn_outputs):
+        expected = torch.stack(
+            (datum.loss_fn_inputs["advantages"], datum.loss_fn_inputs["old_logprobs"]),
+            dim=-1,
+        )
+        torch.testing.assert_close(record["probe"], expected)
+
+
+def test_indexed_mask_preserves_explicit_singleton_and_multi_datum_groups():
+    datums = _packed_layout_datums([2, 2, 2, 2])
+    collated_groups = []
+    packing_layouts = []
+
+    def recording_collate(items):
+        """Record indexed-mask token tensors for one explicit Datum group.
+
+        Args:
+            items: Datums whose token tensors have shape ``[datum_tokens]``.
+
+        Returns:
+            Model and loss mappings whose per-token tensors have shape
+            ``[1, tokens]``.
+        """
+        result = collate_datums(items, packing_layout="indexed_mask")
+        collated_groups.append(result[0])
+        packing_layouts.append(result[1]._engine_packing_layout)
+        return result
+
+    Engine(
+        ScaleModel(),
+        device="cpu",
+        microbatch_size=1,
+        collate_fn=recording_collate,
+    ).forward(datums, _identity_loss, microbatch_sizes=[1, 3])
+
+    torch.testing.assert_close(collated_groups[0]["attention_mask"], torch.tensor([[1, 1]]))
+    torch.testing.assert_close(collated_groups[0]["_packed_seq_ids"], collated_groups[0]["attention_mask"])
+    assert "_engine_packing_layout" not in collated_groups[0]
+    torch.testing.assert_close(collated_groups[1]["attention_mask"], torch.tensor([[1, 1, 2, 2, 3, 3]]))
+    torch.testing.assert_close(collated_groups[1]["_packed_seq_ids"], collated_groups[1]["attention_mask"])
+    assert "_engine_packing_layout" not in collated_groups[1]
+    assert packing_layouts == ["indexed_mask", "indexed_mask"]
+
+
+def test_custom_packed_seq_ids_without_engine_marker_remain_ordinary_model_metadata():
+    datums = _packed_layout_datums([2, 3])
+
+    def custom_collate(items):
+        """Attach a custom document tensor to an ordinary padded batch.
+
+        Args:
+            items: Datums whose token tensors have shape ``[datum_tokens]``.
+
+        Returns:
+            Padded model and loss mappings with shape ``[batch, sequence]``;
+            ``_packed_seq_ids`` is model-owned metadata without an Engine marker.
+        """
+        model_inputs, loss_inputs = collate_datums(items)
+        model_inputs["_packed_seq_ids"] = model_inputs["attention_mask"].clone()
+        return model_inputs, loss_inputs
+
+    model = _IndexedMaskScaleModel()
+    Engine(
+        model,
+        device="cpu",
+        microbatch_size=2,
+        collate_fn=custom_collate,
+    ).forward(datums, _identity_loss)
+
+    assert model.forward_kwargs["_packed_seq_ids"].shape == (2, 3)
+    assert "_engine_packing_layout" not in model.forward_kwargs
+
+
+@pytest.mark.parametrize(
+    ("packed_seq_ids", "message"),
+    [
+        (torch.tensor([[1, 2, 1, 2, 2]]), "contiguous segment"),
+        (torch.tensor([[1, 0, 1, 2, 2]]), "trailing suffix"),
+    ],
+)
+def test_indexed_mask_rejects_noncontiguous_document_maps(packed_seq_ids, message):
+    datums = _packed_layout_datums([2, 3])
+
+    def invalid_collate(items):
+        """Replace the canonical ``[1, tokens]`` document map with an invalid one.
+
+        Args:
+            items: Datums whose token tensors have shape ``[datum_tokens]``.
+
+        Returns:
+            Model and loss mappings whose token tensors have shape
+            ``[1, tokens]`` and whose indexed document map is invalid.
+        """
+        model_inputs, loss_inputs = collate_datums(items, packing_layout="indexed_mask")
+        model_inputs["attention_mask"] = packed_seq_ids
+        model_inputs["_packed_seq_ids"] = packed_seq_ids
+        return model_inputs, loss_inputs
+
+    with pytest.raises(ValueError, match=message):
+        Engine(
+            ScaleModel(),
+            device="cpu",
+            microbatch_size=2,
+            collate_fn=invalid_collate,
+        ).forward(datums, _identity_loss)
+
+
+def test_indexed_mask_rejects_context_and_pipeline_parallelism():
+    datums = _packed_layout_datums([2, 3])
+    collate_fn = partial(collate_datums, packing_layout="indexed_mask")
+    cp_mesh_context = SimpleNamespace(
+        pp_size=1,
+        cp_size=2,
+        device_mesh=_CPMesh(size=2, rank=0),
+        moe_mesh=None,
+        process_group=None,
+    )
+
+    with pytest.raises(NotImplementedError, match="context-parallel size 1"):
+        Engine(
+            ScaleModel(),
+            device="cpu",
+            mesh_context=cp_mesh_context,
+            microbatch_size=2,
+            collate_fn=collate_fn,
+        ).forward(datums, _identity_loss)
+
+    pipeline = _FakeAutoPipeline(ScaleModel(), num_microbatches=1)
+    with pytest.raises(NotImplementedError, match="eager execution with PP size 1"):
+        Engine(
+            pipeline,
+            device="cpu",
+            mesh_context=_pipeline_mesh_context(),
+            microbatch_size=2,
+            collate_fn=collate_fn,
+        ).forward(datums, _identity_loss)
+
+
+def test_indexed_mask_rejects_hybridep_equalization():
+    engine = Engine(
+        ScaleModel(),
+        device="cpu",
+        microbatch_size=2,
+        collate_fn=partial(collate_datums, packing_layout="indexed_mask"),
+    )
+    engine._hybridep_equalization_groups = (object(),)
+
+    with pytest.raises(NotImplementedError, match="indexed_mask.*HybridEP"):
+        engine.forward(_packed_layout_datums([2, 3]), _identity_loss)
+
+
 def _final_thd_layout_collate(datums: list[Datum]):
     """Convert canonical packed output to final THD without dropping layout metadata."""
     model_inputs, loss_inputs = collate_datums(datums, packed=True)
@@ -3408,8 +3617,8 @@ def test_explicit_microbatch_sizes_preserve_packed_vlm_group_boundaries():
     ]
 
 
-@pytest.mark.parametrize("packed", [False, True])
-def test_vlm_datum_collater_restores_prediction_aligned_outputs_without_padding(packed):
+@pytest.mark.parametrize("packing_layout", [None, "thd", "indexed_mask"])
+def test_vlm_datum_collater_restores_prediction_aligned_outputs_without_padding(packing_layout):
     """VLM outputs use each Datum's shifted ``S-1`` token length."""
     processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
     datums = []
@@ -3451,7 +3660,7 @@ def test_vlm_datum_collater_restores_prediction_aligned_outputs_without_padding(
         )
 
     model = ScaleModel()
-    if packed:
+    if packing_layout == "thd":
         model.backend = SimpleNamespace(attn="te")
     result = Engine(
         model,
@@ -3460,8 +3669,9 @@ def test_vlm_datum_collater_restores_prediction_aligned_outputs_without_padding(
         collate_fn=partial(
             collate_vlm_datums,
             processor=processor,
-            packed=packed,
-            sequence_alignment=4 if packed else 1,
+            packed=packing_layout == "thd",
+            packing_layout="indexed_mask" if packing_layout == "indexed_mask" else None,
+            sequence_alignment=4 if packing_layout == "thd" else 1,
         ),
     ).forward(datums, loss_with_routes)
 

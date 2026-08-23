@@ -452,6 +452,68 @@ def test_collate_vlm_datums_pads_variable_resolution_pixel_tensors(packed):
     assert not bool(pixel_values[1:, :, :, 2:].any())
 
 
+def test_collate_vlm_datums_indexed_mask_preserves_media_and_rl_side_channels():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    datums = _vlm_rl_datums()
+    first_pixels = torch.arange(24, dtype=torch.float32).reshape(1, 3, 2, 4)
+    second_pixels = torch.arange(48, dtype=torch.float32).reshape(2, 3, 4, 2) + 100
+    datums[0].model_inputs["pixel_values"] = first_pixels
+    datums[1].model_inputs["pixel_values"] = second_pixels
+
+    model_inputs, loss_inputs = collate_vlm_datums(
+        datums,
+        processor=processor,
+        packing_layout="indexed_mask",
+    )
+
+    torch.testing.assert_close(model_inputs["input_ids"], torch.tensor([[1, 2, 3, 5, 6]]))
+    torch.testing.assert_close(model_inputs["attention_mask"], torch.tensor([[1, 1, 1, 2, 2]]))
+    torch.testing.assert_close(model_inputs["_packed_seq_ids"], model_inputs["attention_mask"])
+    assert "_engine_packing_layout" not in model_inputs
+    assert loss_inputs._engine_packing_layout == "indexed_mask"
+    torch.testing.assert_close(model_inputs["position_ids"], torch.tensor([[0, 1, 2, 0, 1]]))
+    assert "qkv_format" not in model_inputs
+    assert model_inputs["pixel_values"].shape == (3, 3, 4, 4)
+    torch.testing.assert_close(model_inputs["pixel_values"][0, :, :2, :], first_pixels[0].to(torch.bfloat16))
+    torch.testing.assert_close(model_inputs["pixel_values"][1:, :, :, :2], second_pixels.to(torch.bfloat16))
+    torch.testing.assert_close(
+        loss_inputs["target_scores"],
+        torch.tensor([[[2.0, 3.0], [4.0, 5.0], [6.0, 7.0], [22.0, 23.0], [24.0, 25.0]]]),
+    )
+    torch.testing.assert_close(
+        loss_inputs["routed_experts"][0],
+        torch.cat([datum.loss_fn_inputs["routed_experts"] for datum in datums]),
+    )
+    torch.testing.assert_close(loss_inputs["sequence_score"], torch.tensor([0.25, 0.75]))
+    assert loss_inputs.item_to_datum == (0, 1)
+
+
+def test_collate_vlm_datums_indexed_mask_rejects_thd_alignment():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+
+    with pytest.raises(ValueError, match="indexed_mask.*sequence_alignment=1"):
+        collate_vlm_datums(
+            _vlm_rl_datums(),
+            processor=processor,
+            packing_layout="indexed_mask",
+            sequence_alignment=2,
+        )
+
+
+def test_collate_vlm_datums_single_indexed_document_keeps_explicit_layout_metadata():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+
+    model_inputs, loss_inputs = collate_vlm_datums(
+        [_vlm_datum([1, 2, 3], [0, 1, 1])],
+        processor=processor,
+        packing_layout="indexed_mask",
+    )
+
+    torch.testing.assert_close(model_inputs["_packed_seq_ids"], torch.ones(1, 2, dtype=torch.long))
+    assert "_engine_packing_layout" not in model_inputs
+    assert loss_inputs._engine_packing_layout == "indexed_mask"
+
+
 def test_collate_vlm_datums_pads_s_and_s_minus_one_side_channels_with_layouts():
     processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
     datums = _vlm_rl_datums()
@@ -761,6 +823,39 @@ def test_collate_packed_concatenates_into_one_thd_row():
     assert batch["seq_lens_padded"][0].tolist() == [3, 2]
 
 
+def test_collate_indexed_mask_uses_one_row_with_document_ids_and_reset_positions():
+    batch, loss_inputs = collate_datums(_toy_datums(), packing_layout="indexed_mask")
+
+    torch.testing.assert_close(batch["input_ids"], torch.tensor([[10, 11, 12, 20, 21]]))
+    torch.testing.assert_close(batch["attention_mask"], torch.tensor([[1, 1, 1, 2, 2]]))
+    torch.testing.assert_close(batch["_packed_seq_ids"], batch["attention_mask"])
+    assert "_engine_packing_layout" not in batch
+    assert loss_inputs._engine_packing_layout == "indexed_mask"
+    torch.testing.assert_close(batch["position_ids"], torch.tensor([[0, 1, 2, 0, 1]]))
+    assert "qkv_format" not in batch
+    assert "seq_lens" not in batch
+    torch.testing.assert_close(loss_inputs["weights"], torch.tensor([[1.0, 1.0, 0.0, 1.0, 1.0]]))
+    torch.testing.assert_close(loss_inputs["advantages"], torch.tensor([[0.5, 0.5, 0.5, 0.9, 0.9]]))
+    assert loss_inputs.item_to_datum == (0, 1)
+
+
+def test_collate_single_indexed_document_keeps_explicit_layout_metadata():
+    batch, loss_inputs = collate_datums([_toy_datums()[0]], packing_layout="indexed_mask")
+
+    torch.testing.assert_close(batch["_packed_seq_ids"], torch.ones(1, 3, dtype=torch.long))
+    assert "_engine_packing_layout" not in batch
+    assert loss_inputs._engine_packing_layout == "indexed_mask"
+
+
+def test_collate_indexed_mask_rejects_conflicting_or_padded_layout_options():
+    datums = _toy_datums()
+
+    with pytest.raises(ValueError, match="packed and packing_layout"):
+        collate_datums(datums, packed=True, packing_layout="indexed_mask")
+    with pytest.raises(ValueError, match="pad_seq_len_divisible"):
+        collate_datums(datums, packing_layout="indexed_mask", pad_seq_len_divisible=8)
+
+
 def test_collate_packed_side_inputs_ride_the_flat_axis():
     batch, loss_inputs = collate_datums(_toy_datums(), packed=True)
     # Per-token floats are concatenated in datum order, aligned with input_ids.
@@ -831,7 +926,7 @@ def test_collate_packed_per_sample_side_input_is_one_per_datum():
 
 
 def test_collated_loss_inputs_copy_preserves_side_channel_and_dict_compatibility():
-    result = collate_datums(_toy_datums())
+    result = collate_datums(_toy_datums(), packing_layout="indexed_mask")
     loss_inputs = result[1]
 
     assert isinstance(result, tuple)
@@ -846,6 +941,7 @@ def test_collated_loss_inputs_copy_preserves_side_channel_and_dict_compatibility
         assert all(torch.equal(copied[key], loss_inputs[key]) for key in loss_inputs)
         assert copied.layouts == loss_inputs.layouts
         assert copied.item_to_datum == loss_inputs.item_to_datum
+        assert copied._engine_packing_layout == "indexed_mask"
 
 
 def test_collated_loss_inputs_copy_preserves_read_only_pad_values():

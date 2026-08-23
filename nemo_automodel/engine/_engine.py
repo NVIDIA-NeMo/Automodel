@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from nemo_automodel.components.datasets.datum import Datum, LossInputLayout, collate_datums
+from nemo_automodel.components.datasets.datum import CollatedLossInputs, Datum, LossInputLayout, collate_datums
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
@@ -1067,10 +1067,45 @@ class Engine:
             The CP context factory, CP-local model inputs, CP-local loss
             inputs, collated field-layout metadata, and an internal plan for
             restoring explicitly declared token outputs. Token-aligned model
-            and loss tensors use the same padded, packed THD, Magi, or
-            model-owned local sequence layout.
+            and loss tensors use the same padded, packed THD, indexed-mask,
+            Magi, or model-owned local sequence layout. Indexed-mask packing
+            remains physical ``[1, tokens]`` and requires eager CP1/PP1.
         """
         model_inputs, collated_loss_inputs = self.collate_fn(datums)
+        packing_layout = (
+            getattr(collated_loss_inputs, "_engine_packing_layout", None)
+            if isinstance(collated_loss_inputs, CollatedLossInputs)
+            else None
+        )
+        if packing_layout not in (None, "indexed_mask"):
+            raise ValueError(f"unsupported Engine packing layout {packing_layout!r}")
+        indexed_mask_packing = packing_layout == "indexed_mask"
+        if indexed_mask_packing:
+            if self._cp_size() > 1:
+                raise NotImplementedError("indexed_mask packing currently requires context-parallel size 1")
+            if self.pipeline is not None:
+                raise NotImplementedError("indexed_mask packing currently requires eager execution with PP size 1")
+            if self._hybridep_equalization_groups:
+                raise NotImplementedError("indexed_mask packing is not supported with HybridEP")
+            if model_inputs.get("qkv_format") == "thd":
+                raise ValueError("indexed_mask packing cannot be combined with qkv_format='thd'")
+            packed_seq_ids = model_inputs.get("_packed_seq_ids")
+            if not isinstance(packed_seq_ids, torch.Tensor):
+                raise TypeError("indexed_mask packing requires Tensor _packed_seq_ids")
+            primary = model_inputs.get("inputs_embeds", model_inputs.get("input_ids"))
+            if not isinstance(primary, torch.Tensor) or primary.ndim < 2 or primary.shape[0] != 1:
+                shape = tuple(primary.shape) if isinstance(primary, torch.Tensor) else type(primary).__name__
+                raise ValueError(f"indexed_mask packing requires a [1, tokens, ...] primary tensor, got {shape}")
+            item_to_datum = (
+                collated_loss_inputs.item_to_datum if isinstance(collated_loss_inputs, CollatedLossInputs) else None
+            )
+            if item_to_datum != tuple(range(len(datums))):
+                raise ValueError("indexed_mask packing requires identity item_to_datum metadata")
+            attention_mask = model_inputs.get("attention_mask")
+            if not isinstance(attention_mask, torch.Tensor) or not torch.equal(attention_mask, packed_seq_ids):
+                raise ValueError("indexed_mask packing requires attention_mask and _packed_seq_ids to match")
+        else:
+            packed_seq_ids = None
         hybridep_target = self._hybridep_equalization_target(model_inputs)
         hybridep_suffix_tokens = 0
         if hybridep_target is not None:
@@ -1142,6 +1177,7 @@ class Engine:
                 loss_inputs,
                 loss_batch_layout.item_to_datum,
                 is_thd=model_inputs.get("qkv_format") == "thd",
+                packed_seq_ids=packed_seq_ids,
             )
             if loss_seq_dim is not None and weight_layout is LossInputLayout.PER_TOKEN
             else (None, None, None)
@@ -1294,6 +1330,7 @@ class Engine:
             _OutputRestorePlan(
                 sharder=sharder,
                 is_thd=is_thd,
+                packed_seq_ids=packed_seq_ids,
                 item_to_datum=loss_batch_layout.item_to_datum,
                 real_lengths=real_lengths,
                 padded_lengths=padded_lengths,
