@@ -17,7 +17,10 @@ import json
 import pytest
 import torch
 
-from tests.functional_tests.checkpoint_robustness.router_diagnostics import compare_glm_router_captures
+from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
+    compare_glm_router_captures,
+    summarize_glm_router_shape_captures,
+)
 
 
 def _capture(router_logits, indices):
@@ -37,7 +40,7 @@ def _capture(router_logits, indices):
     }
 
 
-def test_router_report_separates_natural_floor_from_routed_tail(tmp_path):
+def test_router_report_separates_natural_floor_from_routed_tail(tmp_path, capsys):
     hf_path = tmp_path / "hf.pt"
     automodel_path = tmp_path / "automodel.pt"
     report_path = tmp_path / "report.json"
@@ -57,6 +60,11 @@ def test_router_report_separates_natural_floor_from_routed_tail(tmp_path):
 
     assert report["route_flip_token_count"] == 1
     assert report["route_flip_token_fraction"] == pytest.approx(0.5)
+    assert report["early_layer_summary"]["route_flip_token_count"] == 1
+    assert report["early_layer_summary"]["flips_above_score_perturbation_bound_fraction"] == 0.0
+    sign_test = report["early_layer_summary"]["correction_bias_direction_sign_test"]
+    assert sign_test["added_bias_equal_count"] == 1
+    assert sign_test["added_bias_greater_fraction_with_ties_split"] == pytest.approx(0.5)
     final_token_kl = report["final_token_kl"]
     assert final_token_kl["natural_agreement_floor_no_flipped_layers"]["token_count"] == 1
     assert final_token_kl["natural_agreement_floor_no_flipped_layers"]["mean_kl"] == pytest.approx(0.0)
@@ -65,5 +73,35 @@ def test_router_report_separates_natural_floor_from_routed_tail(tmp_path):
     assert final_token_kl["by_flipped_layer_count"][0]["token_count"] == 1
     assert final_token_kl["by_flipped_layer_count"][1]["token_count"] == 1
     persisted = json.loads(report_path.read_text())
-    assert persisted["schema_version"] == 1
+    assert persisted["schema_version"] == 2
     assert persisted["final_token_kl"]["by_flipped_layer_count"]["0"]["token_count"] == 1
+    concise_log = capsys.readouterr().out
+    assert "CHECKPOINT_ROUTER_DIAGNOSTICS" in concise_log
+    assert '"layer_metrics"' not in concise_log
+
+
+def test_router_shape_report_attributes_kl_to_sustained_self_flips(tmp_path):
+    base_path = tmp_path / "base.pt"
+    standalone_path = tmp_path / "standalone.pt"
+    base_capture = _capture([[4.0, 1.0, 0.0], [1.0, 0.99, 0.0]], [[0], [0]])
+    standalone_capture = _capture([[3.9, 1.1, 0.0], [0.99, 1.0, 0.0]], [[0], [1]])
+    # Repeat the same routed layer under distinct indices to model 11-layer persistence.
+    base_capture["layers"] = {layer: base_capture["layers"][1] for layer in range(1, 12)}
+    standalone_capture["layers"] = {layer: standalone_capture["layers"][1] for layer in range(1, 12)}
+    torch.save(base_capture, base_path)
+    torch.save(standalone_capture, standalone_path)
+    reference_logits = torch.tensor([[[2.0, -2.0], [20.0, -20.0]]])
+    candidate_logits = reference_logits.clone()
+    candidate_logits[:, 1, :] = -candidate_logits[:, 1, :]
+
+    report = summarize_glm_router_shape_captures(
+        base_path,
+        standalone_path,
+        reference_logits=reference_logits,
+        candidate_logits=candidate_logits,
+    )
+
+    assert report["tokens_with_any_flip_count"] == 1
+    assert report["tokens_with_sustained_flips_count"] == 1
+    assert report["sustained_flip_final_token_kl"]["token_count"] == 1
+    assert report["sustained_flip_final_token_kl"]["mean_kl"] > 1.0

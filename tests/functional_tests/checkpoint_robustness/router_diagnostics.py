@@ -235,6 +235,70 @@ def _kl_summary(values: torch.Tensor) -> dict[str, int | float] | None:
     }
 
 
+def _route_flip_mask(reference_indices: torch.Tensor, candidate_indices: torch.Tensor) -> torch.Tensor:
+    """Return tokens whose selected expert sets differ."""
+    return (reference_indices.sort(dim=-1).values != candidate_indices.sort(dim=-1).values).any(dim=-1)
+
+
+def _flip_pair_bias_directions(
+    hf_indices: torch.Tensor,
+    automodel_indices: torch.Tensor,
+    correction_bias: torch.Tensor,
+    route_flip_mask: torch.Tensor,
+) -> dict[str, int | float | None]:
+    """Summarize whether expert replacements systematically follow correction bias.
+
+    A one-sided correction-bias implementation error favors higher- or lower-bias
+    experts. Symmetric arithmetic noise should split added-versus-dropped expert
+    pairs around 50%; exact bias ties contribute one half to that sign statistic.
+    """
+    greater_count = 0
+    equal_count = 0
+    less_count = 0
+    for token_index in route_flip_mask.nonzero(as_tuple=False).flatten().tolist():
+        hf_experts = set(hf_indices[token_index].tolist())
+        automodel_experts = set(automodel_indices[token_index].tolist())
+        dropped_experts = hf_experts - automodel_experts
+        added_experts = automodel_experts - hf_experts
+        for dropped_expert in dropped_experts:
+            for added_expert in added_experts:
+                added_bias = correction_bias[added_expert].item()
+                dropped_bias = correction_bias[dropped_expert].item()
+                if added_bias > dropped_bias:
+                    greater_count += 1
+                elif added_bias < dropped_bias:
+                    less_count += 1
+                else:
+                    equal_count += 1
+    pair_count = greater_count + equal_count + less_count
+    greater_fraction = (greater_count + 0.5 * equal_count) / pair_count if pair_count else None
+    return {
+        "pair_count": pair_count,
+        "added_bias_greater_count": greater_count,
+        "added_bias_equal_count": equal_count,
+        "added_bias_less_count": less_count,
+        "added_bias_greater_fraction_with_ties_split": greater_fraction,
+        "absolute_deviation_from_half": None if greater_fraction is None else abs(greater_fraction - 0.5),
+    }
+
+
+def _combine_bias_direction_counts(counts: list[dict[str, int | float | None]]) -> dict[str, int | float | None]:
+    """Combine per-layer correction-bias sign-test counts."""
+    greater_count = sum(int(layer["added_bias_greater_count"]) for layer in counts)
+    equal_count = sum(int(layer["added_bias_equal_count"]) for layer in counts)
+    less_count = sum(int(layer["added_bias_less_count"]) for layer in counts)
+    pair_count = greater_count + equal_count + less_count
+    greater_fraction = (greater_count + 0.5 * equal_count) / pair_count if pair_count else None
+    return {
+        "pair_count": pair_count,
+        "added_bias_greater_count": greater_count,
+        "added_bias_equal_count": equal_count,
+        "added_bias_less_count": less_count,
+        "added_bias_greater_fraction_with_ties_split": greater_fraction,
+        "absolute_deviation_from_half": None if greater_fraction is None else abs(greater_fraction - 0.5),
+    }
+
+
 def compare_glm_router_captures(
     hf_path: Path,
     automodel_path: Path,
@@ -282,6 +346,12 @@ def compare_glm_router_captures(
     bias_abs_max = 0.0
     examples: list[dict[str, object]] = []
     flipped_layer_counts: torch.Tensor | None = None
+    early_layer_indices = sorted(hf_layers)[:5]
+    early_layer_token_count = 0
+    early_route_flip_count = 0
+    early_large_margin_flip_count = 0
+    early_bias_direction_counts: list[dict[str, int | float | None]] = []
+    all_bias_direction_counts: list[dict[str, int | float | None]] = []
 
     for layer_index in sorted(hf_layers):
         hf_layer = hf_layers[layer_index]
@@ -306,7 +376,7 @@ def compare_glm_router_captures(
         if hf_scores.shape[-1] <= topk:
             raise ValueError(f"Layer {layer_index} needs at least topk+1 router scores for boundary diagnostics")
 
-        route_flip_mask = (hf_indices.sort(dim=-1).values != automodel_indices.sort(dim=-1).values).any(dim=-1)
+        route_flip_mask = _route_flip_mask(hf_indices, automodel_indices)
         if flipped_layer_counts is None:
             flipped_layer_counts = torch.zeros_like(route_flip_mask, dtype=torch.int64)
         elif flipped_layer_counts.shape != route_flip_mask.shape:
@@ -316,6 +386,8 @@ def compare_glm_router_captures(
         top_values = hf_scores.topk(topk + 1, dim=-1).values
         hf_boundary_margin = top_values[:, topk - 1] - top_values[:, topk]
         explained_flip_mask = route_flip_mask & (hf_boundary_margin <= 2 * score_delta_per_token)
+        large_margin_flip_mask = route_flip_mask & ~explained_flip_mask
+        bias_direction = _flip_pair_bias_directions(hf_indices, automodel_indices, hf_bias, route_flip_mask)
 
         logit_delta = (hf_logits - automodel_logits).abs()
         score_delta = (hf_scores - automodel_scores).abs()
@@ -342,7 +414,19 @@ def compare_glm_router_captures(
             "flips_within_score_perturbation_bound_fraction": (
                 layer_explained_count / layer_flip_count if layer_flip_count else None
             ),
+            "flips_above_score_perturbation_bound_count": int(large_margin_flip_mask.sum().item()),
+            "flips_above_score_perturbation_bound_fraction": (
+                int(large_margin_flip_mask.sum().item()) / layer_flip_count if layer_flip_count else None
+            ),
+            "correction_bias_direction_sign_test": bias_direction,
         }
+
+        all_bias_direction_counts.append(bias_direction)
+        if layer_index in early_layer_indices:
+            early_layer_token_count += hf_logits.shape[0]
+            early_route_flip_count += layer_flip_count
+            early_large_margin_flip_count += int(large_margin_flip_mask.sum().item())
+            early_bias_direction_counts.append(bias_direction)
 
         if len(examples) < 12:
             for token_index in route_flip_mask.nonzero(as_tuple=False).flatten().tolist():
@@ -389,7 +473,7 @@ def compare_glm_router_captures(
         for flip_count in torch.unique(flipped_layer_counts).tolist()
     }
     report: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_family": "glm4_moe_lite",
         "comparison": "hf_source_vs_automodel_source",
         "layer_count": len(layer_metrics),
@@ -408,6 +492,22 @@ def compare_glm_router_captures(
         "flips_within_score_perturbation_bound_fraction": (
             total_explained_flips / total_route_flips if total_route_flips else None
         ),
+        "flips_above_score_perturbation_bound_count": total_route_flips - total_explained_flips,
+        "flips_above_score_perturbation_bound_fraction": (
+            (total_route_flips - total_explained_flips) / total_route_flips if total_route_flips else None
+        ),
+        "correction_bias_direction_sign_test": _combine_bias_direction_counts(all_bias_direction_counts),
+        "early_layer_summary": {
+            "layer_indices": early_layer_indices,
+            "layer_token_count": early_layer_token_count,
+            "route_flip_token_count": early_route_flip_count,
+            "route_flip_token_fraction": early_route_flip_count / early_layer_token_count,
+            "flips_above_score_perturbation_bound_count": early_large_margin_flip_count,
+            "flips_above_score_perturbation_bound_fraction": (
+                early_large_margin_flip_count / early_route_flip_count if early_route_flip_count else None
+            ),
+            "correction_bias_direction_sign_test": _combine_bias_direction_counts(early_bias_direction_counts),
+        },
         "final_token_kl": {
             "all_tokens": _kl_summary(per_token_kl),
             "natural_agreement_floor_no_flipped_layers": _kl_summary(per_token_kl[natural_agreement_mask]),
@@ -421,5 +521,106 @@ def compare_glm_router_captures(
     temporary_report_path = report_path.with_suffix(".tmp")
     temporary_report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     temporary_report_path.replace(report_path)
-    print(f"CHECKPOINT_ROUTER_DIAGNOSTICS {json.dumps(report, sort_keys=True)}")
+    early_summary = report["early_layer_summary"]
+    final_token_kl = report["final_token_kl"]
+    concise_summary = {
+        "early_layer_indices": early_summary["layer_indices"],
+        "early_route_flip_token_fraction": early_summary["route_flip_token_fraction"],
+        "early_large_margin_flip_fraction": early_summary["flips_above_score_perturbation_bound_fraction"],
+        "early_added_bias_greater_fraction_with_ties_split": early_summary["correction_bias_direction_sign_test"][
+            "added_bias_greater_fraction_with_ties_split"
+        ],
+        "early_bias_direction_absolute_deviation_from_half": early_summary["correction_bias_direction_sign_test"][
+            "absolute_deviation_from_half"
+        ],
+        "natural_agreement_floor_mean_kl": (final_token_kl["natural_agreement_floor_no_flipped_layers"] or {}).get(
+            "mean_kl"
+        ),
+        "routed_tail_mean_kl": (final_token_kl["routed_tail_one_or_more_flipped_layers"] or {}).get("mean_kl"),
+        "report_path": str(report_path),
+    }
+    print(f"CHECKPOINT_ROUTER_DIAGNOSTICS {json.dumps(concise_summary, sort_keys=True)}")
     return report
+
+
+def summarize_glm_router_shape_captures(
+    base_path: Path,
+    standalone_path: Path,
+    *,
+    reference_logits: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    sustained_flip_layer_count: int = 11,
+) -> dict[str, object]:
+    """Summarize vanilla-HF route changes caused only by sequence shape."""
+    base_capture = torch.load(base_path, map_location="cpu", weights_only=True)
+    standalone_capture = torch.load(standalone_path, map_location="cpu", weights_only=True)
+    base_layers = base_capture["layers"]
+    standalone_layers = standalone_capture["layers"]
+    if set(base_layers) != set(standalone_layers):
+        raise ValueError(
+            f"Base and standalone HF router layer sets differ: {sorted(base_layers)} != {sorted(standalone_layers)}"
+        )
+    if sustained_flip_layer_count <= 0:
+        raise ValueError("sustained_flip_layer_count must be positive")
+
+    flipped_layer_counts: torch.Tensor | None = None
+    layer_metrics: dict[int, dict[str, int | float]] = {}
+    total_layer_tokens = 0
+    total_route_flips = 0
+    early_layer_indices = sorted(base_layers)[:5]
+    early_layer_tokens = 0
+    early_route_flips = 0
+    for layer_index in sorted(base_layers):
+        base_indices = base_layers[layer_index]["indices"].reshape(-1, base_layers[layer_index]["indices"].shape[-1])
+        standalone_indices = standalone_layers[layer_index]["indices"].reshape(
+            -1, standalone_layers[layer_index]["indices"].shape[-1]
+        )
+        if base_indices.shape[0] < standalone_indices.shape[0] or base_indices.shape[1] != standalone_indices.shape[1]:
+            raise ValueError(f"HF shape router capture mismatch in layer {layer_index}")
+        base_prefix_indices = base_indices[: standalone_indices.shape[0]]
+        route_flip_mask = _route_flip_mask(base_prefix_indices, standalone_indices)
+        if flipped_layer_counts is None:
+            flipped_layer_counts = torch.zeros_like(route_flip_mask, dtype=torch.int64)
+        elif flipped_layer_counts.shape != route_flip_mask.shape:
+            raise ValueError("HF shape router layers contain different token counts")
+        flipped_layer_counts += route_flip_mask
+        flip_count = int(route_flip_mask.sum().item())
+        token_count = route_flip_mask.numel()
+        layer_metrics[layer_index] = {
+            "token_count": token_count,
+            "route_flip_token_count": flip_count,
+            "route_flip_token_fraction": flip_count / token_count,
+        }
+        total_layer_tokens += token_count
+        total_route_flips += flip_count
+        if layer_index in early_layer_indices:
+            early_layer_tokens += token_count
+            early_route_flips += flip_count
+
+    assert flipped_layer_counts is not None
+    per_token_kl = _token_kl(reference_logits, candidate_logits)
+    if per_token_kl.shape != flipped_layer_counts.shape:
+        raise ValueError(
+            f"HF shape router capture has {flipped_layer_counts.numel()} tokens, "
+            f"but final logits have {per_token_kl.numel()}"
+        )
+    any_flip_mask = flipped_layer_counts > 0
+    sustained_flip_mask = flipped_layer_counts >= sustained_flip_layer_count
+    return {
+        "layer_count": len(layer_metrics),
+        "route_flip_layer_token_count": total_route_flips,
+        "route_flip_layer_token_fraction": total_route_flips / total_layer_tokens,
+        "tokens_with_any_flip_count": int(any_flip_mask.sum().item()),
+        "tokens_with_any_flip_fraction": any_flip_mask.float().mean().item(),
+        "sustained_flip_layer_count": sustained_flip_layer_count,
+        "tokens_with_sustained_flips_count": int(sustained_flip_mask.sum().item()),
+        "tokens_with_sustained_flips_fraction": sustained_flip_mask.float().mean().item(),
+        "sustained_flip_final_token_kl": _kl_summary(per_token_kl[sustained_flip_mask]),
+        "no_sustained_flip_final_token_kl": _kl_summary(per_token_kl[~sustained_flip_mask]),
+        "early_layer_summary": {
+            "layer_indices": early_layer_indices,
+            "route_flip_token_count": early_route_flips,
+            "route_flip_token_fraction": early_route_flips / early_layer_tokens,
+        },
+        "layer_metrics": layer_metrics,
+    }

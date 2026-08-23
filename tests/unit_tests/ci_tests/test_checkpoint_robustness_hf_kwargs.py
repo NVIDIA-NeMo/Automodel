@@ -818,6 +818,24 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert remaining == ["--config", str(config_path)]
 
 
+def test_extract_custom_args_reads_shape_diagnostic_mapping(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        "ci:\n"
+        "  checkpoint_robustness:\n"
+        "    parity_sequence_length: 1024\n"
+        "    cross_framework_gate_sequence_length: 256\n"
+        "    shape_diagnostic:\n"
+        "      enabled: true\n"
+        "      sweep_lengths: [128, 512]\n"
+    )
+
+    custom, _remaining = _extract_custom_args(["--config", str(config_path)])
+
+    assert custom["shape_diagnostic"].enabled is True
+    assert custom["shape_diagnostic"].sweep_lengths == (128, 512)
+
+
 def test_extract_custom_args_rejects_removed_config_fields(tmp_path):
     config_path = tmp_path / "recipe.yaml"
     config_path.write_text("ci:\n  checkpoint_robustness:\n    hf_kl_threshold: 0.01\n")
@@ -1102,6 +1120,8 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         hf_source_post_load_dequantize=False,
         parity_tolerance_profile="standard",
         capture_router_diagnostics=False,
+        shape_diagnostic=None,
+        cross_framework_gate_sequence_length=None,
     )
     persisted_logits = torch.load(
         tmp_path / ".checkpoint_robustness" / "source_load_reference_logits.pt",
@@ -1360,6 +1380,26 @@ def test_source_load_parity_success_returns_no_deferred_failure(tmp_path):
     )
 
     assert failure is None
+
+
+def test_source_load_parity_embeds_shape_diagnostic_in_schema_v3_metrics(tmp_path):
+    logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
+    shape_report_path = tmp_path / "shape_diagnostics" / "phase_0_hf_shape.json"
+    shape_report_path.parent.mkdir(parents=True)
+    shape_report_path.write_text('{"schema_version": 1, "enforced": false, "points": {}}\n')
+
+    failure = _compare_source_load_parity(
+        (logits, None, None),
+        logits.clone(),
+        None,
+        artifact_dir=tmp_path,
+        policy=_source_load_parity_policy({"parity_tolerance_profile": "strict"}),
+    )
+
+    assert failure is None
+    payload = json.loads((tmp_path / "parity_metrics" / "phase_0_source_load.json").read_text())
+    assert payload["schema_version"] == 3
+    assert payload["shape_diagnostic"] == {"schema_version": 1, "enforced": False, "points": {}}
 
 
 def test_source_load_logit_skip_keeps_metrics_informational():

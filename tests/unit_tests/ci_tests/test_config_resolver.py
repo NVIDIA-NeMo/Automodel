@@ -473,6 +473,9 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "    skip_hf_reload_logit_parity: true           # fixture arg, must NOT become top-level\n"
         "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
         "    capture_router_diagnostics: true           # fixture arg, must NOT become top-level\n"
+        "    shape_diagnostic:                          # fixture arg, must NOT become top-level\n"
+        "      enabled: true\n"
+        "      sweep_lengths: [128, 512]\n"
         "    parity_threshold_overrides:                 # fixture arg, must NOT become top-level\n"
         "      source_load: {mean_kl: 1e-2}\n"
         "      automodel_reload: {p95_kl: 2e-2, cosine_similarity: 0.998}\n"
@@ -505,6 +508,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert "skip_hf_reload_logit_parity" not in resolved
     assert "hf_adapter_ignored_key_prefix" not in resolved
     assert "capture_router_diagnostics" not in resolved
+    assert "shape_diagnostic" not in resolved
     assert "training_reproducibility_loss_threshold" not in resolved
     assert "resume_tolerance_profile" not in resolved
     assert "resume_first_loss_threshold" not in resolved
@@ -525,6 +529,10 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["ci"]["checkpoint_robustness"]["skip_hf_reload_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
     assert resolved["ci"]["checkpoint_robustness"]["capture_router_diagnostics"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["shape_diagnostic"] == {
+        "enabled": True,
+        "sweep_lengths": [128, 512],
+    }
     assert resolved["ci"]["checkpoint_robustness"]["training_reproducibility_loss_threshold"] == 1e-2
     assert resolved["ci"]["checkpoint_robustness"]["resume_tolerance_profile"] == "relaxed"
     assert resolved["ci"]["checkpoint_robustness"]["resume_first_loss_threshold"] == 1e-6
