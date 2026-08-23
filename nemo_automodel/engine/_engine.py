@@ -55,6 +55,7 @@ from nemo_automodel.engine._batch import (
     _model_token_template,
     _pad_hybridep_packed_thd,
     _pad_hybridep_padded_sequence,
+    _pin_memory,
     _pipeline_datum_indices,
     _primary_name,
     _resolve_loss_batch_layout,
@@ -324,6 +325,10 @@ class Engine:
             applies any remaining CP/THD preparation. The callable must keep
             model inputs and loss inputs aligned and preserve the sum of
             ``weights``.
+        pin_memory: For a CUDA device, page-lock the final collated CPU tensors
+            before their non-blocking transfer. This runs after padding,
+            packing, and HybridEP equalization so it pins the tensors that are
+            actually transferred.
         padding_token_id: Token used when the CP sharder pads ``input_ids``.
         mtp_ignore_index: Label value used for invalid globally shifted MTP
             targets before context-parallel sharding.
@@ -378,6 +383,7 @@ class Engine:
         device: torch.device | str,
         mesh_context: MeshContext | None = None,
         collate_fn: CollateFn = collate_datums,
+        pin_memory: bool = False,
         padding_token_id: int = 0,
         mtp_ignore_index: int = -100,
         context_fn: Callable[[dict[str, Any]], AbstractContextManager[Any]] = _nullcontext_for_batch,
@@ -418,6 +424,7 @@ class Engine:
         )
         self._model_owns_hybridep_packed_cp_equalization = model_owns_hybridep_packed_cp_equalization
         self.collate_fn = collate_fn
+        self.pin_memory = pin_memory
         self.padding_token_id = padding_token_id
         self.mtp_ignore_index = mtp_ignore_index
         self.context_fn = context_fn
@@ -1304,6 +1311,8 @@ class Engine:
             is_thd=model_inputs.get("qkv_format") == "thd",
             packed_seq_ids=packed_seq_ids,
         )
+        if self.pin_memory and self.device.type == "cuda":
+            model_inputs, loss_inputs = _pin_memory((model_inputs, loss_inputs))
         model_inputs = _to_device(model_inputs, self.device)
         loss_inputs = _to_device(loss_inputs, self.device)
         token_reference = (

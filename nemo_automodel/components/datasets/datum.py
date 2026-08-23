@@ -39,21 +39,6 @@ CROSS_ENTROPY_IGNORE_IDX = -100
 __all__ = ["CollatedLossInputs", "Datum", "LossInputLayout", "collate_datums", "collate_vlm_datums"]
 
 
-def _pin_memory_tree(value: Any) -> Any:
-    """Pin tensors in the common container shapes accepted by Engine inputs."""
-    if isinstance(value, torch.Tensor):
-        return value.pin_memory()
-    if isinstance(value, dict):
-        return {name: _pin_memory_tree(item) for name, item in value.items()}
-    if isinstance(value, list):
-        return [_pin_memory_tree(item) for item in value]
-    if isinstance(value, tuple):
-        pinned = tuple(_pin_memory_tree(item) for item in value)
-        return type(value)(*pinned) if hasattr(value, "_fields") else pinned
-    pin_memory = getattr(value, "pin_memory", None)
-    return pin_memory() if callable(pin_memory) else value
-
-
 class LossInputLayout(str, Enum):
     """How one loss input relates to the Datums being collated.
 
@@ -275,26 +260,6 @@ class Datum:
             if isinstance(value, torch.Tensor) and value.ndim == 1:
                 return int(value.shape[0])
         raise ValueError("cannot infer token length; use a model-specific collate_fn for this Datum")
-
-    def pin_memory(self) -> Datum:
-        """Pin tensor inputs when a DataLoader pins this custom batch object.
-
-        PyTorch delegates custom batch pinning to ``pin_memory()``. Recursively
-        pin common model-input containers, then update this Datum only after
-        both input mappings succeed. Non-tensor metadata and loss layout
-        metadata remain unchanged.
-
-        Returns:
-            This Datum with model and loss tensors replaced by their
-            pinned-memory counterparts.
-        """
-        model_inputs = _pin_memory_tree(self.model_inputs)
-        loss_fn_inputs = _pin_memory_tree(self.loss_fn_inputs)
-        self.model_inputs.clear()
-        self.model_inputs.update(model_inputs)
-        self.loss_fn_inputs.clear()
-        self.loss_fn_inputs.update(loss_fn_inputs)
-        return self
 
     def to_features(self, *, ignore_index: int = CROSS_ENTROPY_IGNORE_IDX) -> dict[str, Any]:
         """Convert one text Datum for the repository's canonical collaters.

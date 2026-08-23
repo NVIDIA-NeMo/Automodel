@@ -274,6 +274,21 @@ def _to_device(value: Any, device: torch.device) -> Any:
     return value
 
 
+def _pin_memory(value: Any) -> Any:
+    """Page-lock CPU tensors in the container shapes accepted by Engine inputs."""
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu" or value.is_pinned():
+            return value
+        return value.pin_memory()
+    if isinstance(value, dict):
+        return {key: _pin_memory(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_pin_memory(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_pin_memory(item) for item in value)
+    return value
+
+
 def _pad_tensor_axis(tensor: torch.Tensor, *, dim: int, amount: int, value: int | float | bool) -> torch.Tensor:
     """Right-pad one tensor axis without disturbing trailing feature axes."""
     if amount <= 0:

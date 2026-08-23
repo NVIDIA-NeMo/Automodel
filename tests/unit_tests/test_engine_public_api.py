@@ -185,6 +185,35 @@ def test_forward_custom_collater_needs_no_weights() -> None:
     torch.testing.assert_close(outputs[0], torch.tensor([3.0, 5.0, 7.0]))
 
 
+def test_forward_pins_final_collated_model_and_side_tensors(monkeypatch) -> None:
+    model_tokens = torch.tensor([[1, 2, 3]])
+    weights = torch.ones(1, 3)
+    pinned = []
+
+    def collate(_datums):
+        return {"input_ids": model_tokens}, {"weights": weights}
+
+    def record_pin(tensor, _device=None):
+        pinned.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", record_pin)
+    monkeypatch.setattr("nemo_automodel.engine._engine._to_device", lambda value, _device: value)
+    datum = Datum(
+        input_ids=[1, 2, 3],
+        loss_fn_inputs={"weights": torch.ones(3)},
+        loss_fn_input_layouts={"weights": LossInputLayout.PER_TOKEN},
+    )
+    engine = Engine(TokenModel(), device="cuda", collate_fn=collate, pin_memory=True)
+    monkeypatch.setattr(engine, "_validate_forward_batch_across_model_parallel", lambda *_args: None)
+
+    engine.forward([datum], lambda output, inputs: output * inputs["weights"])
+
+    assert len(pinned) == 2
+    assert pinned[0] is model_tokens
+    assert pinned[1] is weights
+
+
 @pytest.mark.parametrize("axis", ["context-parallel", "pipeline"])
 def test_forward_rejects_inconsistent_model_parallel_datum_layouts(monkeypatch, axis) -> None:
     engine = Engine(TokenModel(), device="cpu")
