@@ -1091,7 +1091,8 @@ def parallelize_model(
             model,
             fsdp_mesh,
             ep_enabled=ep_enabled,
-            ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
+            ep_shard_enabled=ep_shard_mesh is not None
+            and (ep_shard_mesh.size() > 1 or offload_policy is not None),
             ep_shard_mesh=ep_shard_mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
