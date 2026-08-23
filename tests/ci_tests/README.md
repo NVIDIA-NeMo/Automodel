@@ -65,7 +65,7 @@ ci:
     parity_sequence_length: 2048  # Optional. Full-logit parity prompt length (default: 2048; 1K-4K recommended)
     # cross_framework_gate_sequence_length: 128  # Exceptional: gate Phases 0/3 on this prefix of the same forward
     # capture_router_diagnostics: true  # GLM-only Phase 0 router evidence; disabled by default
-    # shape_diagnostic: {enabled: true, sweep_lengths: [128, 256, 512, 1024]}  # Informational HF shape probe
+    # shape_diagnostic: {sweep_lengths: [128, 256, 512, 1024]}  # Optional informational HF calibration sweep
     parity_tolerance_profile: standard  # Optional: strict, standard (default), or relaxed
     hf_device_map_auto: true      # Optional. Use for large HF reference loads that do not fit on one GPU
     # skip_resume: true           # Exceptional: skip native-checkpoint resume (Phase 4)
@@ -170,16 +170,16 @@ from the routed tail. Raw captures and JSON evidence live under `.checkpoint_rob
 embedded in the schema-v3 Phase 0 parity record. The option is model-specific and off by default because it retains
 router tensors until the forward finishes; unsupported model families fail explicitly when it is enabled.
 
-`shape_diagnostic.enabled: true` measures the vanilla-HF reference against itself when only forward sequence shape
-changes. If `cross_framework_gate_sequence_length` is shorter than `parity_sequence_length`, the harness adds one
-standing forward and reports `KL(HF_full[:gate_length] || HF_gate_length)` beside the cross-framework gate. Optional
-`sweep_lengths` add onboarding or kernel-upgrade calibration points, all using prefixes of the same SHA-checked fixed
-document. With router capture enabled, each point also reports self-flip counts and the final-token mean KL for tokens
-that flip in at least 11 layers; that amplification cost, not raw flip frequency, distinguishes sensitive GLM behavior
-from stable routed MoEs such as Qwen. Bitwise-zero points are labeled `same_kernel_regime_not_probing`, not evidence of
-general shape stability. Shape diagnostics are informational, print one concise CI line, and store full evidence under
-`.checkpoint_robustness/shape_diagnostics/` and in the schema-v3 Phase 0 parity record. Leave `sweep_lengths` empty for
-the cheap standing check; calibration sweeps add one vanilla-HF forward per unique length.
+When `cross_framework_gate_sequence_length` is shorter than `parity_sequence_length`, the harness automatically runs
+the vanilla-HF reference at the gate length and reports `KL(HF_full[:gate_length] || HF_gate_length)` beside both the
+Phase 0 source and Phase 3 export-reload comparisons. No separate opt-in is required for this standing measurement.
+The optional `shape_diagnostic.sweep_lengths` mapping adds Phase 0 onboarding or kernel-upgrade calibration points,
+all using prefixes of the same SHA-checked fixed document. With router capture enabled, each Phase 0 point also reports
+self-flip counts and the final-token mean KL for tokens that flip in at least 11 layers; that amplification cost, not
+raw flip frequency, distinguishes sensitive GLM behavior from stable routed MoEs such as Qwen. Bitwise-zero points are
+labeled `same_kernel_regime_not_probing`, not evidence of general shape stability. Shape diagnostics are informational,
+print one concise CI line, and store full evidence under `.checkpoint_robustness/shape_diagnostics/` and in each
+schema-v3 parity record. Calibration sweeps add one vanilla-HF forward per unique length.
 
 Every comparison reports mean, p95, and max per-token `KL(reference || candidate)`; mean, p95, and max per-token
 Jensen-Shannon divergence (natural log, bounded by `ln(2)`); whole-tensor cosine similarity; and mean/max absolute

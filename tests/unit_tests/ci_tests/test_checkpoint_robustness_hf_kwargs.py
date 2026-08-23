@@ -58,6 +58,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _repeatability_policy,
     _resolve_hf_attn_implementation,
     _resolve_hf_model_class,
+    _run_hf_reload_standing_shape_diagnostic,
     _run_process_isolated_checkpoint_phase,
     _run_vanilla_hf_reload,
     _set_model_pretrained_path,
@@ -801,6 +802,7 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert custom["skip_hf_reload_logit_parity"] is True
     assert custom["trust_remote_code"] is False
     assert custom["capture_router_diagnostics"] is True
+    assert custom["shape_diagnostic"].sweep_lengths == ()
     assert custom["parity_sequence_length"] == "1024"
     assert custom["cross_framework_gate_sequence_length"] == "256"
     assert custom["parity_tolerance_profile"] == "relaxed"
@@ -826,13 +828,11 @@ def test_extract_custom_args_reads_shape_diagnostic_mapping(tmp_path):
         "    parity_sequence_length: 1024\n"
         "    cross_framework_gate_sequence_length: 256\n"
         "    shape_diagnostic:\n"
-        "      enabled: true\n"
         "      sweep_lengths: [128, 512]\n"
     )
 
     custom, _remaining = _extract_custom_args(["--config", str(config_path)])
 
-    assert custom["shape_diagnostic"].enabled is True
     assert custom["shape_diagnostic"].sweep_lengths == (128, 512)
 
 
@@ -985,6 +985,43 @@ def test_hf_reload_applies_remote_code_compatibility_patches():
     apply_compatibility.assert_called_once_with()
     assert error is not None
     assert "RuntimeError: compatibility sentinel" in error
+
+
+def test_hf_reload_standing_shape_diagnostic_is_automatic_for_shorter_gate(tmp_path):
+    logits = torch.randn(1, 4, 3)
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._run_hf_shape_diagnostic"
+    ) as run_shape_diagnostic:
+        _run_hf_reload_standing_shape_diagnostic(
+            Mock(),
+            [11, 12, 13, 14],
+            torch.device("cpu"),
+            logits,
+            artifact_dir=tmp_path,
+            custom_args={"cross_framework_gate_sequence_length": "2"},
+        )
+
+    call = run_shape_diagnostic.call_args
+    assert call.kwargs["config"].sweep_lengths == ()
+    assert call.kwargs["gate_sequence_length"] == 2
+    assert call.kwargs["capture_router_diagnostics"] is False
+    assert call.kwargs["phase"] == "phase_3"
+
+
+def test_hf_reload_standing_shape_diagnostic_skips_full_length_gate(tmp_path):
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._run_hf_shape_diagnostic"
+    ) as run_shape_diagnostic:
+        _run_hf_reload_standing_shape_diagnostic(
+            Mock(),
+            [11, 12],
+            torch.device("cpu"),
+            torch.randn(1, 2, 3),
+            artifact_dir=tmp_path,
+            custom_args={"cross_framework_gate_sequence_length": "2"},
+        )
+
+    run_shape_diagnostic.assert_not_called()
 
 
 def test_process_isolated_cross_tp_reload_uses_exported_weights_and_reports_parity(tmp_path):

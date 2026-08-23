@@ -282,21 +282,17 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
     else:
         cross_framework_gate_sequence_length = None
     raw_shape_diagnostic = ci_robustness.get("shape_diagnostic")
-    if raw_shape_diagnostic is not None:
-        shape_diagnostic = _normalize_shape_diagnostic_config(
-            raw_shape_diagnostic,
-            parity_sequence_length=parity_sequence_length,
-        )
-        if shape_diagnostic.enabled and not shape_diagnostic.lengths(
-            parity_sequence_length=parity_sequence_length,
-            gate_sequence_length=cross_framework_gate_sequence_length,
-        ):
-            raise ValueError(
-                "shape_diagnostic.enabled=true requires a shorter cross_framework_gate_sequence_length "
-                "or at least one sweep_lengths entry"
-            )
-        if shape_diagnostic.enabled and not source_load_parity_enabled:
-            raise ValueError("shape_diagnostic.enabled=true requires source-load parity to be enabled")
+    shape_diagnostic = _normalize_shape_diagnostic_config(
+        raw_shape_diagnostic,
+        parity_sequence_length=parity_sequence_length,
+    )
+    shape_diagnostic_lengths = shape_diagnostic.lengths(
+        parity_sequence_length=parity_sequence_length,
+        gate_sequence_length=cross_framework_gate_sequence_length,
+    )
+    if shape_diagnostic.sweep_lengths and not source_load_parity_enabled:
+        raise ValueError("shape_diagnostic.sweep_lengths requires source-load parity to be enabled")
+    if shape_diagnostic_lengths:
         custom["shape_diagnostic"] = shape_diagnostic
     if "hf_reload_timeout_seconds" in custom and int(custom["hf_reload_timeout_seconds"]) <= 0:
         raise ValueError("hf_reload_timeout_seconds must be positive")
@@ -1522,9 +1518,9 @@ def _prepare_source_load_reference_rank0(
     artifact_dir = _robustness_artifact_dir(cfg)
     for router_path in _router_diagnostic_paths(artifact_dir):
         router_path.unlink(missing_ok=True)
-    _shape_diagnostic_report_path(artifact_dir).unlink(missing_ok=True)
+    _shape_diagnostic_report_path(artifact_dir, "phase_0").unlink(missing_ok=True)
     if capture_router_diagnostics:
-        if shape_diagnostic is not None and shape_diagnostic.enabled:
+        if shape_diagnostic is not None:
             for sequence_length in shape_diagnostic.lengths(
                 parity_sequence_length=len(input_ids),
                 gate_sequence_length=cross_framework_gate_sequence_length,
@@ -1633,7 +1629,7 @@ def _prepare_source_load_reference_rank0(
         ),
     )
     del repeated_hf_logits
-    if shape_diagnostic is not None and shape_diagnostic.enabled:
+    if shape_diagnostic is not None:
         _run_hf_shape_diagnostic(
             hf_model,
             input_ids,
@@ -1643,6 +1639,7 @@ def _prepare_source_load_reference_rank0(
             config=shape_diagnostic,
             gate_sequence_length=cross_framework_gate_sequence_length,
             capture_router_diagnostics=capture_router_diagnostics,
+            phase="phase_0",
         )
     hf_aliased = _lm_head_embedding_aliased(hf_model)
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
@@ -1683,12 +1680,14 @@ def _compare_source_load_parity(
                 f"{candidate_logits.shape}"
             )
             parity_failure = _compare_logits(artifact_dir, hf_logits, candidate_logits, policy)
-            shape_report_path = _shape_diagnostic_report_path(artifact_dir)
+            shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_0")
             if shape_report_path.exists():
-                _attach_source_load_diagnostic(
+                _attach_parity_diagnostic(
                     artifact_dir,
-                    "shape_diagnostic",
-                    json.loads(shape_report_path.read_text()),
+                    phase="phase_0",
+                    comparison="source_load",
+                    key="shape_diagnostic",
+                    diagnostic=json.loads(shape_report_path.read_text()),
                 )
             hf_router_capture, automodel_router_capture, router_report = _router_diagnostic_paths(artifact_dir)
             if hf_router_capture.exists() or automodel_router_capture.exists():
@@ -1708,7 +1707,13 @@ def _compare_source_load_parity(
                     reference_logits=hf_logits,
                     candidate_logits=candidate_logits,
                 )
-                _attach_source_load_diagnostic(artifact_dir, "router_diagnostics", router_diagnostics)
+                _attach_parity_diagnostic(
+                    artifact_dir,
+                    phase="phase_0",
+                    comparison="source_load",
+                    key="router_diagnostics",
+                    diagnostic=router_diagnostics,
+                )
             if parity_failure is not None:
                 raise AssertionError(parity_failure)
             print(
@@ -2045,6 +2050,34 @@ def _materialize_hf_quantization_config(cfg):
     return raw_quantization_config
 
 
+def _run_hf_reload_standing_shape_diagnostic(
+    hf_model: torch.nn.Module,
+    input_ids: list[int],
+    device: torch.device,
+    hf_logits: torch.Tensor,
+    *,
+    artifact_dir: Path,
+    custom_args: dict[str, object],
+) -> None:
+    """Automatically contextualize a shortened Phase 3 cross-framework gate."""
+    if "cross_framework_gate_sequence_length" not in custom_args:
+        return
+    gate_sequence_length = int(custom_args["cross_framework_gate_sequence_length"])
+    if gate_sequence_length >= len(input_ids):
+        return
+    _run_hf_shape_diagnostic(
+        hf_model,
+        input_ids,
+        device,
+        hf_logits,
+        artifact_dir=artifact_dir,
+        config=_ShapeDiagnosticConfig(),
+        gate_sequence_length=gate_sequence_length,
+        capture_router_diagnostics=False,
+        phase="phase_3",
+    )
+
+
 def _run_vanilla_hf_reload(
     cfg,
     input_ids: list[int],
@@ -2073,6 +2106,8 @@ def _run_vanilla_hf_reload(
         apply_cache_compatibility_patches()
         _patch_remote_masking_api_compatibility()
         _, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
+        artifact_dir = _robustness_artifact_dir(cfg)
+        _shape_diagnostic_report_path(artifact_dir, "phase_3").unlink(missing_ok=True)
         is_peft = hasattr(cfg, "peft")
         model_kwargs = _model_kwargs_from_config(cfg.model)
         original_pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
@@ -2219,6 +2254,14 @@ def _run_vanilla_hf_reload(
                 ),
             )
             del repeated_hf_logits
+            _run_hf_reload_standing_shape_diagnostic(
+                peft_model,
+                input_ids,
+                device,
+                hf_logits,
+                artifact_dir=artifact_dir,
+                custom_args=custom_args,
+            )
 
             if check_fused_qkv_keys:
                 from safetensors import safe_open
@@ -2264,14 +2307,31 @@ def _run_vanilla_hf_reload(
                 ),
             )
             del repeated_hf_logits
+            _run_hf_reload_standing_shape_diagnostic(
+                hf_model,
+                input_ids,
+                device,
+                hf_logits,
+                artifact_dir=artifact_dir,
+                custom_args=custom_args,
+            )
             del hf_model
 
         hf_reload_error = _compare_logits(
-            _robustness_artifact_dir(cfg),
+            artifact_dir,
             reference_logits,
             hf_logits,
             _hf_reload_parity_policy(custom_args),
         )
+        shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_3")
+        if shape_report_path.exists():
+            _attach_parity_diagnostic(
+                artifact_dir,
+                phase="phase_3",
+                comparison="hf_export_reload",
+                key="shape_diagnostic",
+                diagnostic=json.loads(shape_report_path.read_text()),
+            )
         del hf_logits
         _release_model_memory()
         return hf_reload_error
@@ -2291,9 +2351,9 @@ def _router_diagnostic_paths(artifact_dir: Path) -> tuple[Path, Path, Path]:
     return router_dir / "phase_0_hf.pt", router_dir / "phase_0_automodel.pt", router_dir / "phase_0_summary.json"
 
 
-def _shape_diagnostic_report_path(artifact_dir: Path) -> Path:
-    """Return the full non-gating Phase 0 HF shape report path."""
-    return artifact_dir / "shape_diagnostics" / "phase_0_hf_shape.json"
+def _shape_diagnostic_report_path(artifact_dir: Path, phase: str) -> Path:
+    """Return the full non-gating HF shape report path for one phase."""
+    return artifact_dir / "shape_diagnostics" / f"{phase}_hf_shape.json"
 
 
 def _shape_router_capture_path(artifact_dir: Path, sequence_length: int) -> Path:
@@ -2335,6 +2395,7 @@ def _run_hf_shape_diagnostic(
     config: _ShapeDiagnosticConfig,
     gate_sequence_length: int | None,
     capture_router_diagnostics: bool,
+    phase: Literal["phase_0", "phase_3"],
 ) -> None:
     """Run informational HF-full-prefix versus HF-standalone forwards."""
     diagnostic_lengths = config.lengths(
@@ -2342,7 +2403,7 @@ def _run_hf_shape_diagnostic(
         gate_sequence_length=gate_sequence_length,
     )
     if not diagnostic_lengths:
-        raise ValueError("Enabled shape diagnostic has no standalone-forward lengths")
+        raise ValueError("Shape diagnostic has no standalone-forward lengths")
 
     standalone_logits: dict[int, torch.Tensor] = {}
     router_summaries: dict[int, dict[str, object]] = {}
@@ -2374,18 +2435,26 @@ def _run_hf_shape_diagnostic(
         base_logits,
         standalone_logits,
         parity_document_sha256=_PARITY_DOCUMENT_SHA256,
+        phase=phase,
         gate_sequence_length=gate_sequence_length,
         sweep_lengths=config.sweep_lengths,
         router_diagnostics=router_summaries or None,
     )
-    _persist_shape_diagnostic_report(report, _shape_diagnostic_report_path(artifact_dir))
+    _persist_shape_diagnostic_report(report, _shape_diagnostic_report_path(artifact_dir, phase))
 
 
-def _attach_source_load_diagnostic(artifact_dir: Path, key: str, diagnostic: dict[str, object]) -> None:
-    """Attach full diagnostic evidence to the schema-v3 Phase 0 parity record."""
-    report_path = artifact_dir / "parity_metrics" / "phase_0_source_load.json"
+def _attach_parity_diagnostic(
+    artifact_dir: Path,
+    *,
+    phase: str,
+    comparison: str,
+    key: str,
+    diagnostic: dict[str, object],
+) -> None:
+    """Attach full diagnostic evidence to one schema-v3 parity record."""
+    report_path = artifact_dir / "parity_metrics" / f"{phase}_{comparison}.json"
     if not report_path.exists():
-        raise FileNotFoundError(f"Cannot attach {key}: Phase 0 parity report is missing at {report_path}")
+        raise FileNotFoundError(f"Cannot attach {key}: parity report is missing at {report_path}")
     payload = json.loads(report_path.read_text())
     if payload.get("schema_version") != 3:
         raise ValueError(f"Cannot attach {key} to unsupported parity schema {payload.get('schema_version')!r}")

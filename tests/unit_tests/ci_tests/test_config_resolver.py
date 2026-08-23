@@ -474,7 +474,6 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
         "    capture_router_diagnostics: true           # fixture arg, must NOT become top-level\n"
         "    shape_diagnostic:                          # fixture arg, must NOT become top-level\n"
-        "      enabled: true\n"
         "      sweep_lengths: [128, 512]\n"
         "    parity_threshold_overrides:                 # fixture arg, must NOT become top-level\n"
         "      source_load: {mean_kl: 1e-2}\n"
@@ -530,7 +529,6 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["ci"]["checkpoint_robustness"]["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
     assert resolved["ci"]["checkpoint_robustness"]["capture_router_diagnostics"] is True
     assert resolved["ci"]["checkpoint_robustness"]["shape_diagnostic"] == {
-        "enabled": True,
         "sweep_lengths": [128, 512],
     }
     assert resolved["ci"]["checkpoint_robustness"]["training_reproducibility_loss_threshold"] == 1e-2
