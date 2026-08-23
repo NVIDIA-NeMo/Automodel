@@ -14,6 +14,7 @@
 
 import json
 from contextlib import nullcontext
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -56,6 +57,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _prepare_consolidated_hf_cache_once,
     _raise_distributed_failure,
     _record_deferred_failure,
+    _repair_legacy_partial_rotary_config,
     _repeatability_policy,
     _replace_nemo_owned_reference_config,
     _resolve_hf_attn_implementation,
@@ -1716,6 +1718,69 @@ def test_record_deferred_failure_preserves_all_comparison_failures():
     assert failures == ["Phase 4 HF reload parity:\nHF parity failed"]
 
 
+def _legacy_partial_rotary_minimax_config(**overrides):
+    """Tiny in-tree MiniMax-M2 config built from checkpoint-style legacy fields."""
+    from transformers import AutoConfig
+
+    kwargs = dict(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        rotary_dim=16,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        max_position_embeddings=128,
+    )
+    kwargs.update(overrides)
+    return AutoConfig.for_model("minimax_m2", **kwargs)
+
+
+def test_repair_legacy_partial_rotary_derives_factor_from_rotary_dim():
+    config = _legacy_partial_rotary_minimax_config()
+
+    factor_missing_before = not config.rope_parameters.get("partial_rotary_factor")
+    assert _repair_legacy_partial_rotary_config(config) is factor_missing_before
+    assert config.rope_parameters["partial_rotary_factor"] == pytest.approx(0.5)
+    # A second pass finds the factor present and must not report a repair.
+    assert _repair_legacy_partial_rotary_config(config) is False
+
+
+def test_repaired_minimax_m2_config_rotates_only_rotary_dim():
+    from transformers import AutoModelForCausalLM as HFAutoModelForCausalLM
+
+    config = _legacy_partial_rotary_minimax_config()
+    _repair_legacy_partial_rotary_config(config)
+
+    model = HFAutoModelForCausalLM.from_config(config)
+    # inv_freq carries one frequency per rotated dim pair: rotary_dim // 2,
+    # not head_dim // 2 (the full-rotation failure mode from AMINT-286).
+    assert model.model.rotary_emb.inv_freq.shape[0] == config.rotary_dim // 2
+
+
+def test_repair_legacy_partial_rotary_is_noop_without_legacy_spec():
+    from transformers import AutoConfig
+
+    llama = AutoConfig.for_model(
+        "llama",
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+    )
+    rope_before = deepcopy(getattr(llama, "rope_parameters", None))
+    assert _repair_legacy_partial_rotary_config(llama) is False
+    assert getattr(llama, "rope_parameters", None) == rope_before
+
+    full_rotary = _legacy_partial_rotary_minimax_config(rotary_dim=32)
+    rope_before = deepcopy(full_rotary.rope_parameters)
+    assert _repair_legacy_partial_rotary_config(full_rotary) is False
+    assert full_rotary.rope_parameters == rope_before
 
 class _FakeNemoOwnedConfig(PretrainedConfig):
     """Stands in for an AutoModel component config registered into AutoConfig."""

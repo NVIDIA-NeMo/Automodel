@@ -343,6 +343,40 @@ def _load_hf_fp8_dequantized_config(
     return config
 
 
+def _repair_legacy_partial_rotary_config(config) -> bool:
+    """Restore a legacy partial-rotary spec dropped by newer Transformers configs.
+
+    Checkpoints such as MiniMax-M2.* express partial RoPE only through the
+    legacy ``rotary_dim`` config field. Transformers 5.x in-tree configs keep
+    ``rotary_dim`` as a plain attribute while their models read only
+    ``rope_parameters["partial_rotary_factor"]``, so the vanilla reference
+    silently rotates the full head dimension with the wrong frequency ladder
+    and becomes a deterministic but invalid reference (AMINT-286). Derive the
+    missing factor as ``rotary_dim / head_dim``.
+
+    Args:
+        config: Loaded HF config for the vanilla reference model.
+
+    Returns:
+        True when the config's rope parameters were repaired; False when the
+        config has no legacy spec or already carries a partial factor.
+    """
+    rotary_dim = getattr(config, "rotary_dim", None)
+    head_dim = getattr(config, "head_dim", None)
+    if not rotary_dim or not head_dim or rotary_dim == head_dim:
+        return False
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        if rope_parameters.get("partial_rotary_factor"):
+            return False
+        rope_parameters["partial_rotary_factor"] = rotary_dim / head_dim
+        return True
+    if rope_parameters is not None and hasattr(rope_parameters, "partial_rotary_factor"):
+        if rope_parameters.partial_rotary_factor:
+            return False
+        rope_parameters.partial_rotary_factor = rotary_dim / head_dim
+        return True
+    return False
 def _is_nemo_owned_config(config) -> bool:
     """Return True when a config object is an AutoModel component config."""
     return type(config).__module__.startswith("nemo_automodel")
@@ -1655,6 +1689,10 @@ def _prepare_source_load_reference_rank0(
         # Pass the faithful config explicitly so from_pretrained's internal
         # AutoConfig resolution cannot re-select the AutoModel-owned class.
         hf_kwargs["config"] = hf_config
+    if _repair_legacy_partial_rotary_config(hf_config):
+        # The repaired spec only reaches the model when the config object is
+        # passed explicitly; from_pretrained otherwise re-reads config.json.
+        hf_kwargs["config"] = hf_config
 
     model_load_context = _hf_model_load_context(
         trust_remote_code=trust_remote_code,
@@ -2184,6 +2222,12 @@ def _run_vanilla_hf_reload(
         if replaced_reference_config:
             # Pass the faithful config explicitly so from_pretrained's internal
             # AutoConfig resolution cannot re-select the AutoModel-owned class.
+            hf_kwargs["config"] = hf_config
+        if _repair_legacy_partial_rotary_config(hf_config):
+            # The repaired spec only reaches the model when the config object
+            # is passed explicitly; from_pretrained otherwise re-reads
+            # config.json (the consolidated export copies the source config,
+            # so it carries the same legacy rotary_dim field).
             hf_kwargs["config"] = hf_config
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
