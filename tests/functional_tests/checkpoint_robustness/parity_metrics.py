@@ -158,6 +158,12 @@ def _compute_parity_metrics(
         if not bool(torch.isfinite(candidate_chunk).all()):
             raise ValueError(f"Candidate logits contain non-finite values in flattened token range [{start}, {end})")
 
+        reference_chunk_float64 = reference_chunk.flatten().to(torch.float64)
+        candidate_chunk_float64 = candidate_chunk.flatten().to(torch.float64)
+        dot_product += torch.dot(reference_chunk_float64, candidate_chunk_float64).item()
+        reference_squared_norm += torch.dot(reference_chunk_float64, reference_chunk_float64).item()
+        candidate_squared_norm += torch.dot(candidate_chunk_float64, candidate_chunk_float64).item()
+
         reference_log_probs = F.log_softmax(reference_chunk, dim=-1)
         candidate_log_probs = F.log_softmax(candidate_chunk, dim=-1)
         reference_probs = reference_log_probs.exp()
@@ -175,9 +181,6 @@ def _compute_parity_metrics(
         absolute_difference = (reference_chunk - candidate_chunk).abs()
         absolute_difference_sum += absolute_difference.sum(dtype=torch.float64).item()
         max_absolute_difference = max(max_absolute_difference, absolute_difference.max().item())
-        dot_product += (reference_chunk * candidate_chunk).sum(dtype=torch.float64).item()
-        reference_squared_norm += reference_chunk.square().sum(dtype=torch.float64).item()
-        candidate_squared_norm += candidate_chunk.square().sum(dtype=torch.float64).item()
 
     per_token_kl = torch.cat(kl_chunks)
     if not bool(torch.isfinite(per_token_kl).all()):
