@@ -741,3 +741,62 @@ def test_linear_lora_negative_last_dim_shard_takes_async_shaping(single_rank_pg)
     bmm_spy.assert_not_called()
     assert isinstance(out, DTensor)
     assert torch.allclose(out.full_tensor(), ref, atol=1e-6)
+
+
+def test_eager_lora_fp32_adapters_over_bf16_base():
+    """Eager LoRA with fp32 adapters over a bf16 base runs and keeps grad dtypes.
+
+    F.linear cannot mix an fp32 adapter weight with a bf16 activation: the
+    activation is computed in the adapter dtype and the addend is cast back to
+    the base output dtype. Adapter gradients stay fp32, input gradients stay
+    in the input dtype.
+    """
+    base = nn.Linear(16, 16, dtype=torch.bfloat16)
+    patched = patch_linear_module(base, dim=4, alpha=8, lora_dtype=torch.float32, use_triton=False)
+    x = torch.randn(2, 16, dtype=torch.bfloat16, requires_grad=True)
+    out = patched(x)
+    assert out.dtype == torch.bfloat16
+    out.sum().backward()
+    assert patched.lora_A.weight.dtype == torch.float32
+    assert patched.lora_A.weight.grad is not None
+    assert patched.lora_A.weight.grad.dtype == torch.float32
+    assert patched.lora_B.weight.grad is not None
+    assert patched.lora_B.weight.grad.dtype == torch.float32
+    assert x.grad is not None and x.grad.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestTritonLoRAMixedDtype:
+    """Triton LoRA with fp32 adapters over a bf16 base, on GPU.
+
+    The kernel requires one dtype across activation, adapters, and output, so
+    the dtype is canonicalized to the base output dtype. Autocast-promoted
+    fp32 activations (e.g. torch.square under bf16 autocast) must not break
+    the kernel or leak an fp32 output.
+    """
+
+    def _build(self):
+        base = nn.Linear(512, 256, bias=False, dtype=torch.bfloat16, device="cuda")
+        return patch_linear_module(base, dim=32, alpha=64, lora_dtype=torch.float32, use_triton=True)
+
+    def test_bf16_input(self):
+        patched = self._build()
+        x = torch.randn(4, 8, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        out = patched(x)
+        assert out.dtype == torch.bfloat16
+        out.float().pow(2).sum().backward()
+        assert patched.lora_A.weight.grad is not None
+        assert patched.lora_A.weight.grad.dtype == torch.float32
+
+    def test_autocast_promoted_fp32_input(self):
+        patched = self._build()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            xb = torch.randn(4, 8, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            xp = torch.square(xb)  # autocast promotes square to fp32
+            assert xp.dtype == torch.float32
+            out = patched(xp)
+        assert out.dtype == torch.bfloat16
+        out.float().pow(2).sum().backward()
+        assert patched.lora_A.weight.grad is not None
+        assert patched.lora_A.weight.grad.dtype == torch.float32
+        assert xb.grad is not None and xb.grad.dtype == torch.bfloat16
