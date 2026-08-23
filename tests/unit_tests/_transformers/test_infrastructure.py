@@ -1051,7 +1051,9 @@ class TestApplyModelInfrastructurePostShardInit:
 # =============================================================================
 
 
-def _run_apply_model_infrastructure_load_before_shard(*, peft_config=None):
+def _run_apply_model_infrastructure_load_before_shard(
+    *, peft_config=None, is_meta_device=True, weights_already_loaded=False
+):
     """Helper that invokes apply_model_infrastructure with load_before_shard=True."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
@@ -1070,12 +1072,13 @@ def _run_apply_model_infrastructure_load_before_shard(*, peft_config=None):
 
         result = apply_model_infrastructure(
             model=model,
-            is_meta_device=True,
+            is_meta_device=is_meta_device,
             device=torch.device("cpu"),
             load_base_model=True,
             peft_config=peft_config,
             pretrained_model_name_or_path="test/model",
             cache_dir="/tmp/cache",
+            weights_already_loaded=weights_already_loaded,
         )
 
         return result, mock_ckpt, model
@@ -1113,6 +1116,76 @@ class TestLoadBeforeShardPath:
 
         _, kwargs = mock_ckpt.load_base_model.call_args
         assert "peft_init_method" not in kwargs
+
+    def test_load_before_shard_loads_checkpoint_when_init_left_weights_unloaded(self):
+        """A non-meta model whose init did not load weights must still read the checkpoint.
+
+        ``is_meta_device`` is False for every model built under DDP or MegatronFSDP,
+        including AutoModel's own implementations, whose constructor only creates the
+        architecture. Gating the read on it left those models randomly initialized.
+        """
+        _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard(
+            is_meta_device=False, weights_already_loaded=False
+        )
+
+        mock_ckpt.load_base_model.assert_called_once_with(
+            model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True
+        )
+        # Nothing is on meta, so there are no parameter shells to materialize.
+        mock_ckpt.initialize_model_weights.assert_not_called()
+
+    def test_load_before_shard_skips_checkpoint_when_init_already_loaded_weights(self):
+        """HF's from_pretrained already populated the weights; only re-tie, do not re-read."""
+        _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard(
+            is_meta_device=False, weights_already_loaded=True
+        )
+
+        mock_ckpt.load_base_model.assert_called_once_with(
+            model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=False
+        )
+        mock_ckpt.initialize_model_weights.assert_not_called()
+
+
+def test_load_before_shard_populates_unloaded_model_from_checkpoint(tmp_path):
+    """End-to-end guard on CPU: the model must end up holding the checkpoint's values.
+
+    The mocked tests above pin the call; this one pins the outcome, using the real
+    Checkpointer and a real safetensors checkpoint whose every tensor is 0.5.
+    """
+    from transformers import LlamaConfig
+    from transformers import LlamaForCausalLM as HFLlamaForCausalLM
+
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+    from nemo_automodel.components.models.llama.model import LlamaForCausalLM
+
+    config = LlamaConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=256,
+        max_position_embeddings=128,
+        tie_word_embeddings=False,
+    )
+    reference = HFLlamaForCausalLM(config)
+    with torch.no_grad():
+        for param in reference.parameters():
+            param.fill_(0.5)
+    reference.save_pretrained(tmp_path, safe_serialization=True)
+
+    config.torch_dtype = torch.float32
+    model = apply_model_infrastructure(
+        model=LlamaForCausalLM(config),
+        is_meta_device=False,
+        device=torch.device("cpu"),
+        load_base_model=True,
+        pretrained_model_name_or_path=str(tmp_path),
+        weights_already_loaded=False,
+    )
+
+    for name, param in model.named_parameters():
+        assert torch.equal(param.detach(), torch.full_like(param, 0.5)), f"{name} was not loaded"
 
 
 # =============================================================================
