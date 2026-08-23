@@ -612,67 +612,6 @@ def test_collate_vlm_datums_rejects_mixed_s_and_s_minus_one_conventions_for_one_
         collate_vlm_datums(datums, processor=processor)
 
 
-def test_collate_vlm_datums_rejects_per_token_trailing_shape_mismatch():
-    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
-    datums = _vlm_rl_datums()
-    datums[1].loss_fn_inputs["target_scores"] = torch.ones(3, 3)
-
-    with pytest.raises(ValueError, match="target_scores"):
-        collate_vlm_datums(datums, processor=processor)
-
-
-def test_collate_vlm_datums_rejects_per_token_dtype_mismatch():
-    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
-    datums = _vlm_rl_datums()
-    datums[1].loss_fn_inputs["target_scores"] = datums[1].loss_fn_inputs["target_scores"].to(torch.float64)
-
-    with pytest.raises(ValueError, match="target_scores"):
-        collate_vlm_datums(datums, processor=processor)
-
-
-def test_collate_vlm_datums_requires_matching_loss_keys():
-    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
-    datums = _vlm_rl_datums()
-    del datums[1].loss_fn_inputs["target_scores"]
-    del datums[1].loss_fn_input_layouts["target_scores"]
-    del datums[1].loss_fn_input_pad_values["target_scores"]
-
-    with pytest.raises(ValueError, match="same loss_fn_inputs keys"):
-        collate_vlm_datums(datums, processor=processor)
-
-
-@pytest.mark.parametrize(
-    ("metadata_name", "second_value", "message"),
-    [
-        ("loss_fn_input_layouts", LossInputLayout.REPLICATED, "same explicit layout"),
-        ("loss_fn_input_pad_values", -8.0, "same pad value"),
-    ],
-)
-def test_collate_vlm_datums_requires_consistent_side_channel_metadata(metadata_name, second_value, message):
-    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
-    datums = _vlm_rl_datums()
-    getattr(datums[1], metadata_name)["target_scores"] = second_value
-
-    with pytest.raises(ValueError, match=message):
-        collate_vlm_datums(datums, processor=processor)
-
-
-@pytest.mark.parametrize(
-    ("metadata_name", "message"),
-    [
-        ("loss_fn_input_layouts", "every Datum must declare the layout"),
-        ("loss_fn_input_pad_values", "every Datum must declare the pad value"),
-    ],
-)
-def test_collate_vlm_datums_rejects_partially_declared_side_channel_metadata(metadata_name, message):
-    processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
-    datums = _vlm_rl_datums()
-    del getattr(datums[1], metadata_name)["target_scores"]
-
-    with pytest.raises(ValueError, match=message):
-        collate_vlm_datums(datums, processor=processor)
-
-
 def test_collate_vlm_datums_rejects_explicit_padding_in_packed_input():
     processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
     datum = _vlm_datum([1, 2, 0], [0, 1, 0])

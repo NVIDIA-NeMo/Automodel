@@ -491,150 +491,59 @@ def collate_datums(
     )
 
 
-def _pad_leading_axis(value: torch.Tensor, length: int, pad_value: float | int | bool) -> torch.Tensor:
-    """Right-pad a token tensor while preserving arbitrary trailing axes.
-
-    Args:
-        value: Tensor with shape ``[tokens, ...]``.
-        length: Requested leading-axis length.
-        pad_value: Scalar used for the appended token rows.
-
-    Returns:
-        A tensor with shape ``[length, ...]``.
-    """
-    padding = length - value.shape[0]
-    if padding < 0:
-        raise ValueError(f"cannot pad a leading axis of length {value.shape[0]} to {length}")
-    if padding == 0:
-        return value
-    tail = torch.full(
-        (padding, *value.shape[1:]),
-        pad_value,
-        dtype=value.dtype,
-        device=value.device,
-    )
-    return torch.cat((value, tail), dim=0)
-
-
-def _resolve_vlm_loss_contract(
+def _collate_vlm_loss_inputs(
     datums: list[Datum],
-) -> tuple[
-    dict[str, LossInputLayout],
-    dict[str, float | int | bool],
-    dict[str, str],
-]:
-    """Resolve VLM loss layouts and their pre-shift token conventions.
+    *,
+    packed: bool,
+    sequence_alignment: int,
+    padding_idx: int,
+) -> CollatedLossInputs:
+    """Normalize VLM token fields to ``S-1``, then use the generic collater."""
+    if packed:
+        from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _aligned_length
 
-    Args:
-        datums: Processor-ready VLM items with unshifted token streams.
+    required = {"labels", "weights"}
+    for datum in datums:
+        missing = required - set(datum.loss_fn_inputs)
+        if missing:
+            raise ValueError(f"VLM Datums require loss inputs {sorted(missing)}")
 
-    Returns:
-        The resolved layouts, explicit padding values, and ``S`` versus
-        ``S-1`` convention for each ``PER_TOKEN`` field.
-    """
-    loss_keys = set(datums[0].loss_fn_inputs)
-    missing_required = {"labels", "weights"} - loss_keys
-    if missing_required:
-        raise ValueError(f"VLM Datums require loss inputs {sorted(missing_required)}")
-    for index, datum in enumerate(datums[1:], start=1):
-        if set(datum.loss_fn_inputs) != loss_keys:
-            raise ValueError(
-                "every VLM Datum must contain the same loss_fn_inputs keys; "
-                f"Datum 0 has {sorted(loss_keys)} and Datum {index} has {sorted(datum.loss_fn_inputs)}"
-            )
-
+    loss_keys = set().union(*(datum.loss_fn_inputs for datum in datums))
     layouts: dict[str, LossInputLayout] = {}
     pad_values: dict[str, float | int | bool] = {}
-    token_conventions: dict[str, str] = {}
     for key in sorted(loss_keys):
         declared_layouts = [datum.loss_fn_input_layouts[key] for datum in datums if key in datum.loss_fn_input_layouts]
-        if declared_layouts and len(declared_layouts) != len(datums):
-            raise ValueError(f"every Datum must declare the layout for VLM loss input {key!r}, or none may declare it")
-        if len(set(declared_layouts)) > 1:
-            raise ValueError(f"every VLM Datum must use the same explicit layout for loss input {key!r}")
         if declared_layouts:
-            layout = declared_layouts[0]
-        elif key in {"labels", "weights"}:
-            layout = LossInputLayout.PER_TOKEN
+            layouts[key] = declared_layouts[0]
+        elif key in required:
+            layouts[key] = LossInputLayout.PER_TOKEN
         else:
             raise ValueError(f"VLM loss input {key!r} must declare an explicit LossInputLayout")
-        if key in {"labels", "weights"} and layout is not LossInputLayout.PER_TOKEN:
-            raise ValueError(f"VLM {key} must use the PER_TOKEN layout")
-        layouts[key] = layout
 
         declared_pad_values = [
             datum.loss_fn_input_pad_values[key] for datum in datums if key in datum.loss_fn_input_pad_values
         ]
-        if declared_pad_values and len(declared_pad_values) != len(datums):
-            raise ValueError(
-                f"every Datum must declare the pad value for VLM loss input {key!r}, or none may declare it"
-            )
-        if len(set(declared_pad_values)) > 1:
-            raise ValueError(f"every VLM Datum must use the same pad value for loss input {key!r}")
         if declared_pad_values:
             pad_values[key] = declared_pad_values[0]
         elif key == "labels":
             pad_values[key] = CROSS_ENTROPY_IGNORE_IDX
 
-        if layout is not LossInputLayout.PER_TOKEN:
-            continue
-
-        values = [datum.loss_fn_inputs[key] for datum in datums]
-        if key in {"labels", "weights"} and any(value.ndim != 1 for value in values):
-            raise ValueError(f"VLM {key} must be one-dimensional")
-        conventions = []
-        for value, datum in zip(values, datums):
-            if value.ndim < 1:
-                raise ValueError(f"PER_TOKEN VLM loss input {key!r} must have a leading token axis")
-            if value.shape[0] == datum.seq_len:
-                conventions.append("S")
-            elif value.shape[0] == datum.seq_len - 1:
-                conventions.append("S-1")
-            else:
-                raise ValueError(
-                    f"PER_TOKEN VLM loss input {key!r} must use leading length S or S-1; "
-                    f"got shape {tuple(value.shape)} for S={datum.seq_len}"
-                )
-        if len(set(conventions)) != 1:
-            raise ValueError(f"PER_TOKEN VLM loss input {key!r} cannot mix S and S-1 conventions across Datums")
-        token_conventions[key] = conventions[0]
-
-    if pad_values.get("labels", CROSS_ENTROPY_IGNORE_IDX) != CROSS_ENTROPY_IGNORE_IDX:
+    for key in sorted(required):
+        if any(
+            datum.loss_fn_input_layouts.get(key, LossInputLayout.PER_TOKEN) is not LossInputLayout.PER_TOKEN
+            for datum in datums
+        ):
+            raise ValueError(f"VLM {key} must use the PER_TOKEN layout")
+    if any(
+        datum.loss_fn_input_pad_values.get("labels", CROSS_ENTROPY_IGNORE_IDX) != CROSS_ENTROPY_IGNORE_IDX
+        for datum in datums
+    ):
         raise ValueError(f"VLM labels must use pad value {CROSS_ENTROPY_IGNORE_IDX}")
-    if pad_values.get("weights", 0) != 0:
+    if any(datum.loss_fn_input_pad_values.get("weights", 0) != 0 for datum in datums):
         raise ValueError("VLM weights must use pad value 0")
-    if token_conventions["weights"] == "S" and any(bool(datum.loss_fn_inputs["weights"][0] != 0) for datum in datums):
-        raise ValueError("VLM weight at target position zero must be zero before autoregressive shift")
-    return layouts, pad_values, token_conventions
 
-
-def _collate_vlm_loss_inputs(
-    datums: list[Datum],
-    *,
-    layouts: dict[str, LossInputLayout],
-    pad_values: dict[str, float | int | bool],
-    token_conventions: dict[str, str],
-    packed: bool,
-    sequence_alignment: int,
-    padding_idx: int,
-) -> CollatedLossInputs:
-    """Apply the VLM autoregressive/packing plan to every loss side channel.
-
-    Args:
-        datums: Processor-ready VLM items with token length ``S``.
-        layouts: Resolved layout for every loss field.
-        pad_values: Explicit per-field token padding values.
-        token_conventions: ``S`` or ``S-1`` convention for token fields.
-        packed: Whether to concatenate aligned THD documents.
-        sequence_alignment: Per-document alignment in packed mode.
-        padding_idx: Token id used in the throwaway alignment template.
-
-    Returns:
-        Layout-aware loss inputs on the shifted prediction-token axis.
-    """
-    if packed:
-        from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _aligned_length
-
+    token_conventions: dict[str, str] = {}
+    add_default_label_pad = not any("labels" in datum.loss_fn_input_pad_values for datum in datums)
     normalized = []
     for datum in datums:
         prediction_length = datum.seq_len - 1
@@ -642,20 +551,45 @@ def _collate_vlm_loss_inputs(
         loss_inputs = {}
         for key, value in datum.loss_fn_inputs.items():
             if layouts[key] is LossInputLayout.PER_TOKEN:
-                value = value[1:] if token_conventions[key] == "S" else value
+                if key in required and value.ndim != 1:
+                    raise ValueError(f"VLM {key} must be one-dimensional")
+                if value.ndim < 1:
+                    raise ValueError(f"PER_TOKEN VLM loss input {key!r} must have a leading token axis")
+                if value.shape[0] == datum.seq_len:
+                    convention = "S"
+                elif value.shape[0] == prediction_length:
+                    convention = "S-1"
+                else:
+                    raise ValueError(
+                        f"PER_TOKEN VLM loss input {key!r} must use leading length S or S-1; "
+                        f"got shape {tuple(value.shape)} for S={datum.seq_len}"
+                    )
+                previous = token_conventions.setdefault(key, convention)
+                if convention != previous:
+                    raise ValueError(f"PER_TOKEN VLM loss input {key!r} cannot mix S and S-1 conventions across Datums")
+                if key == "weights" and convention == "S" and bool(value[0] != 0):
+                    raise ValueError("VLM weight at target position zero must be zero before autoregressive shift")
+                value = value[1:] if convention == "S" else value
                 if packed:
-                    value = _pad_leading_axis(value, output_length, pad_values.get(key, 0))
+                    value = F.pad(
+                        value,
+                        (*([0, 0] * (value.ndim - 1)), 0, output_length - value.shape[0]),
+                        value=pad_values.get(key, 0),
+                    )
             loss_inputs[key] = value
 
         input_ids = datum.input_ids[:-1]
         if packed:
-            input_ids = _pad_leading_axis(input_ids, output_length, padding_idx)
+            input_ids = F.pad(input_ids, (0, output_length - input_ids.shape[0]), value=padding_idx)
+        datum_pad_values = dict(datum.loss_fn_input_pad_values)
+        if add_default_label_pad:
+            datum_pad_values["labels"] = CROSS_ENTROPY_IGNORE_IDX
         normalized.append(
             Datum(
                 model_inputs={"input_ids": input_ids},
                 loss_fn_inputs=loss_inputs,
-                loss_fn_input_layouts=layouts,
-                loss_fn_input_pad_values=pad_values,
+                loss_fn_input_layouts=datum.loss_fn_input_layouts,
+                loss_fn_input_pad_values=datum_pad_values,
             )
         )
 
@@ -762,12 +696,9 @@ def collate_vlm_datums(
             }
         )
 
-    layouts, loss_pad_values, token_conventions = _resolve_vlm_loss_contract(datums)
-
     if packed:
         from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
-            _aligned_length,
             _build_packed_vlm_sample,
             _compute_mrope_position_ids,
             _shift_sample,
@@ -789,10 +720,8 @@ def collate_vlm_datums(
                 example["position_ids"] = position
             shifted_examples.append(_shift_sample(example, has_mrope=has_mrope))
 
-        pack_size = sum(_aligned_length(item["input_ids"].shape[0], sequence_alignment) for item in shifted_examples)
         packed_sample = _build_packed_vlm_sample(
             shifted_examples,
-            pack_size=pack_size,
             padding_idx=padding_idx,
             has_mrope=has_mrope,
             sequence_alignment=sequence_alignment,
@@ -812,9 +741,6 @@ def collate_vlm_datums(
 
     loss_inputs = _collate_vlm_loss_inputs(
         datums,
-        layouts=layouts,
-        pad_values=loss_pad_values,
-        token_conventions=token_conventions,
         packed=packed,
         sequence_alignment=sequence_alignment,
         padding_idx=padding_idx,

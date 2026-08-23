@@ -105,7 +105,7 @@ class TestBuildPackedVlmSample:
                 "labels": torch.tensor([105, 106]),
             },
         ]
-        result = _build_packed_vlm_sample(samples, pack_size=8, padding_idx=0)
+        result = _build_packed_vlm_sample(samples, padding_idx=0)
 
         # No pre-padding: length = sum of samples (3 + 2 = 5)
         assert result["input_ids"].shape == (5,)
@@ -128,7 +128,7 @@ class TestBuildPackedVlmSample:
                 "image_grid_thw": torch.tensor([[1, 224, 224]]),
             },
         ]
-        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+        result = _build_packed_vlm_sample(samples, padding_idx=0)
 
         assert result["pixel_values"].shape[0] == 3  # 2 + 1
         assert result["image_grid_thw"].shape[0] == 3
@@ -149,7 +149,7 @@ class TestBuildPackedVlmSample:
             },
         ]
 
-        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+        result = _build_packed_vlm_sample(samples, padding_idx=0)
 
         assert isinstance(result["pixel_values"], list)
         assert [tuple(value.shape) for value in result["pixel_values"]] == [(3, 8, 12), (3, 16, 8)]
@@ -167,7 +167,7 @@ class TestBuildPackedVlmSample:
                 "mm_token_type_ids": torch.tensor([1, 1]),
             },
         ]
-        result = _build_packed_vlm_sample(samples, pack_size=8, padding_idx=0)
+        result = _build_packed_vlm_sample(samples, padding_idx=0)
         assert result["mm_token_type_ids"].tolist() == [0, 1, 0, 1, 1]
 
     def test_sequence_alignment_pads_each_document_and_preserves_real_lengths(self):
@@ -178,7 +178,6 @@ class TestBuildPackedVlmSample:
 
         result = _build_packed_vlm_sample(
             samples,
-            pack_size=8,
             padding_idx=0,
             sequence_alignment=4,
         )
@@ -436,7 +435,7 @@ class TestMRoPESupport:
                 ),
             },
         ]
-        result = _build_packed_vlm_sample(samples, pack_size=7, padding_idx=0, has_mrope=True)
+        result = _build_packed_vlm_sample(samples, padding_idx=0, has_mrope=True)
 
         # No pre-padding: [3, 5] (3+2 tokens)
         assert result["position_ids"].shape == (3, 5)

@@ -371,7 +371,6 @@ def _aligned_length(length: int, alignment: int) -> int:
 
 def _build_packed_vlm_sample(
     samples: list[dict],
-    pack_size: int,
     padding_idx: int,
     has_mrope: bool = False,
     sequence_alignment: int = 1,
@@ -468,14 +467,9 @@ def _build_packed_vlm_sample(
     else:
         packed["position_ids"] = torch.tensor(all_position_ids_1d, dtype=torch.long)
 
-    if pixel_values_list and all(isinstance(value, torch.Tensor) for value in pixel_values_list):
-        packed["pixel_values"] = _merge_media_values(pixel_values_list, field_name="pixel_values")
-    elif pixel_values_list and all(isinstance(value, (list, tuple)) for value in pixel_values_list):
-        packed["pixel_values"] = [item for value in pixel_values_list for item in value]
-    elif pixel_values_list:
-        raise TypeError("Packed VLM pixel_values must be consistently tensors or variable-resolution lists.")
-    else:
-        packed["pixel_values"] = None
+    packed["pixel_values"] = (
+        _merge_media_values(pixel_values_list, field_name="pixel_values") if pixel_values_list else None
+    )
     packed["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0) if image_grid_thw_list else None
     packed["image_position_ids"] = torch.cat(image_position_ids_list, dim=0) if image_position_ids_list else None
     packed["pixel_values_videos"] = torch.cat(pixel_values_videos_list, dim=0) if pixel_values_videos_list else None
@@ -632,7 +626,6 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
 
         return _build_packed_vlm_sample(
             kept,
-            self.pack_size,
             self.padding_idx,
             has_mrope=self.has_mrope,
             sequence_alignment=self.sequence_alignment,
