@@ -21,7 +21,20 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from nemo_automodel.components.loss import vocab_parallel_entropy, vocab_parallel_log_probs
+from nemo_automodel.components import loss as loss_package
+from nemo_automodel.components.loss import (
+    token_entropy,
+    token_log_probs,
+    vocab_parallel_entropy,
+    vocab_parallel_log_probs,
+)
+
+
+def test_previous_names_remain_importable_without_being_advertised() -> None:
+    assert vocab_parallel_log_probs is token_log_probs
+    assert vocab_parallel_entropy is token_entropy
+    assert "vocab_parallel_log_probs" not in loss_package.__all__
+    assert "vocab_parallel_entropy" not in loss_package.__all__
 
 
 def _run_vocab_parallel_parity(rank: int, world_size: int, init_file: str) -> None:
@@ -57,7 +70,7 @@ def _run_vocab_parallel_parity(rank: int, world_size: int, init_file: str) -> No
                 shape=full_logits.shape,
                 stride=full_stride,
             )
-            actual_log_probs = vocab_parallel_log_probs(
+            actual_log_probs = token_log_probs(
                 distributed_log_prob_logits,
                 targets,
                 temperature=temperature,
@@ -91,7 +104,7 @@ def _run_vocab_parallel_parity(rank: int, world_size: int, init_file: str) -> No
                 shape=full_logits.shape,
                 stride=full_stride,
             )
-            actual_entropy = vocab_parallel_entropy(distributed_entropy_logits, temperature=temperature)
+            actual_entropy = token_entropy(distributed_entropy_logits, temperature=temperature)
 
             reference_entropy_logits = full_logits.detach().clone().requires_grad_()
             reference_log_distribution = torch.log_softmax(reference_entropy_logits / temperature, dim=-1)
@@ -111,12 +124,12 @@ def _run_vocab_parallel_parity(rank: int, world_size: int, init_file: str) -> No
             )
 
             with torch.no_grad():
-                no_grad_log_probs = vocab_parallel_log_probs(
+                no_grad_log_probs = token_log_probs(
                     distributed_log_prob_logits,
                     targets,
                     temperature=temperature,
                 )
-                no_grad_entropy = vocab_parallel_entropy(distributed_entropy_logits, temperature=temperature)
+                no_grad_entropy = token_entropy(distributed_entropy_logits, temperature=temperature)
             assert not no_grad_log_probs.requires_grad
             assert not no_grad_entropy.requires_grad
     finally:
@@ -147,9 +160,9 @@ def test_vocab_parallel_rejects_invalid_placements(one_rank_mesh) -> None:
     targets = torch.tensor([0, 1])
 
     with pytest.raises(ValueError, match="exactly one Shard placement"):
-        vocab_parallel_log_probs(replicated, targets)
+        token_log_probs(replicated, targets)
     with pytest.raises(ValueError, match="last vocabulary axis"):
-        vocab_parallel_entropy(token_sharded)
+        token_entropy(token_sharded)
 
 
 @pytest.mark.parametrize("temperature", [0.0, -1.0, math.inf, math.nan])
@@ -157,7 +170,7 @@ def test_vocab_parallel_rejects_invalid_temperature(one_rank_mesh, temperature) 
     logits = DTensor.from_local(torch.randn(2, 3), one_rank_mesh, [Shard(-1)], run_check=False)
 
     with pytest.raises(ValueError, match="positive and finite"):
-        vocab_parallel_entropy(logits, temperature=temperature)
+        token_entropy(logits, temperature=temperature)
 
 
 @pytest.mark.parametrize(
@@ -171,7 +184,7 @@ def test_vocab_parallel_rejects_invalid_targets(one_rank_mesh, targets, error_ty
     logits = DTensor.from_local(torch.randn(2, 3), one_rank_mesh, [Shard(-1)], run_check=False)
 
     with pytest.raises(error_type, match=message):
-        vocab_parallel_log_probs(logits, targets)
+        token_log_probs(logits, targets)
 
 
 @pytest.mark.parametrize(
@@ -181,16 +194,114 @@ def test_vocab_parallel_rejects_invalid_targets(one_rank_mesh, targets, error_ty
 def test_vocab_parallel_marks_out_of_range_targets_nan(one_rank_mesh, targets, invalid_index) -> None:
     logits = DTensor.from_local(torch.randn(2, 3), one_rank_mesh, [Shard(-1)], run_check=False)
 
-    result = vocab_parallel_log_probs(logits, targets)
+    result = token_log_probs(logits, targets)
 
     assert torch.isnan(result[invalid_index])
     assert torch.isfinite(result[1 - invalid_index])
 
 
-def test_vocab_parallel_requires_dtensor_logits() -> None:
+def test_dense_forward_and_backward_match_fp32_reference_across_chunks() -> None:
+    torch.manual_seed(1234)
+    temperature = 0.7
+    logits = torch.randn(3, 97, 19, dtype=torch.float32, requires_grad=True)
+    targets = torch.randint(0, logits.shape[-1], logits.shape[:-1])
+    upstream_log_probs = torch.randn(logits.shape[:-1])
+    upstream_entropy = torch.randn(logits.shape[:-1])
+
+    actual_log_probs = token_log_probs(logits, targets, temperature=temperature)
+    actual_entropy = token_entropy(logits, temperature=temperature)
+
+    reference_logits = logits.detach().clone().requires_grad_()
+    reference_log_distribution = torch.log_softmax(reference_logits.float() / temperature, dim=-1)
+    reference_log_probs = reference_log_distribution.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    reference_entropy = -(reference_log_distribution.exp() * reference_log_distribution).sum(dim=-1)
+
+    assert actual_log_probs.dtype == torch.float32
+    assert actual_entropy.dtype == torch.float32
+    torch.testing.assert_close(actual_log_probs, reference_log_probs)
+    torch.testing.assert_close(actual_entropy, reference_entropy)
+
+    (actual_log_probs * upstream_log_probs + actual_entropy * upstream_entropy).sum().backward()
+    (reference_log_probs * upstream_log_probs + reference_entropy * upstream_entropy).sum().backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad)
+
+
+def test_dense_bfloat16_token_stats_return_fp32() -> None:
+    torch.manual_seed(1234)
+    logits = torch.randn(257, 19, dtype=torch.bfloat16)
+    targets = torch.randint(0, logits.shape[-1], logits.shape[:-1])
+
+    log_probs = token_log_probs(logits, targets)
+    entropy = token_entropy(logits)
+    reference_log_distribution = torch.log_softmax(logits.float(), dim=-1)
+
+    assert log_probs.dtype == torch.float32
+    assert entropy.dtype == torch.float32
+    torch.testing.assert_close(
+        log_probs,
+        reference_log_distribution.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1),
+    )
+    torch.testing.assert_close(entropy, -(reference_log_distribution.exp() * reference_log_distribution).sum(dim=-1))
+
+
+def test_dense_token_stats_support_arbitrary_leading_dimensions() -> None:
+    logits = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+    target = torch.tensor(2)
+
+    log_prob = token_log_probs(logits, target)
+    entropy = token_entropy(logits)
+
+    assert log_prob.shape == torch.Size([])
+    assert entropy.shape == torch.Size([])
+    torch.testing.assert_close(log_prob, torch.log_softmax(logits, dim=-1)[target])
+    expected_entropy = -(torch.softmax(logits, dim=-1) * torch.log_softmax(logits, dim=-1)).sum()
+    torch.testing.assert_close(entropy, expected_entropy)
+
+
+def test_dense_token_stats_preserve_empty_token_gradient() -> None:
+    logits = torch.empty(0, 5, requires_grad=True)
+    targets = torch.empty(0, dtype=torch.long)
+
+    log_probs = token_log_probs(logits, targets)
+    entropy = token_entropy(logits)
+    (log_probs.sum() + entropy.sum()).backward()
+
+    assert log_probs.shape == torch.Size([0])
+    assert entropy.shape == torch.Size([0])
+    assert logits.grad is not None
+    assert logits.grad.shape == logits.shape
+
+
+def test_dense_log_probs_marks_out_of_range_targets_nan() -> None:
+    logits = torch.randn(3, 5)
+    targets = torch.tensor([-1, 4, 5])
+
+    result = token_log_probs(logits, targets)
+
+    assert torch.isnan(result[0])
+    assert torch.isfinite(result[1])
+    assert torch.isnan(result[2])
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, math.inf, math.nan])
+def test_dense_token_stats_reject_invalid_temperature(temperature) -> None:
     logits = torch.randn(2, 3)
 
-    with pytest.raises(TypeError, match="logits must be a DTensor"):
-        vocab_parallel_log_probs(logits, torch.tensor([0, 1]))
-    with pytest.raises(TypeError, match="logits must be a DTensor"):
-        vocab_parallel_entropy(logits)
+    with pytest.raises(ValueError, match="positive and finite"):
+        token_log_probs(logits, torch.tensor([0, 1]), temperature=temperature)
+    with pytest.raises(ValueError, match="positive and finite"):
+        token_entropy(logits, temperature=temperature)
+
+
+@pytest.mark.parametrize(
+    ("operation", "message"),
+    [
+        (lambda: token_log_probs(torch.ones(2, 3, dtype=torch.long), torch.tensor([0, 1])), "floating-point"),
+        (lambda: token_log_probs(torch.randn(2, 3), torch.tensor([0.0, 1.0])), "torch.int64"),
+        (lambda: token_log_probs(torch.randn(2, 3), torch.tensor([[0, 1]])), "targets shape"),
+        (lambda: token_entropy(torch.empty(2, 0)), "vocabulary size"),
+    ],
+)
+def test_dense_token_stats_reject_invalid_inputs(operation, message) -> None:
+    with pytest.raises((TypeError, ValueError), match=message):
+        operation()

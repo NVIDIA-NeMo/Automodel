@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tensor-parallel token statistics for vocabulary-sharded logits."""
+"""Token statistics for dense and vocabulary-sharded logits."""
 
 import math
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+
+_DENSE_TOKEN_CHUNK_SIZE = 256
 
 
 def _sum_vocab_shards(values: torch.Tensor, logits: DTensor, vocab_mesh_dim: int) -> torch.Tensor:
@@ -128,7 +130,7 @@ def _shifted_local_logits(
     return scaled_logits - global_max.unsqueeze(-1), shard_offset, vocab_mesh_dim
 
 
-def vocab_parallel_log_probs(
+def _vocab_parallel_log_probs(
     logits: DTensor,
     targets: torch.Tensor,
     *,
@@ -192,7 +194,7 @@ def vocab_parallel_log_probs(
     return log_probs.masked_fill(global_stats[..., 2] != 1, torch.nan)
 
 
-def vocab_parallel_entropy(
+def _vocab_parallel_entropy(
     logits: DTensor,
     *,
     temperature: float = 1.0,
@@ -225,3 +227,148 @@ def vocab_parallel_entropy(
         vocab_mesh_dim,
     )
     return global_stats[..., 0].log() - global_stats[..., 1] / global_stats[..., 0]
+
+
+def token_log_probs(
+    logits: torch.Tensor | DTensor,
+    targets: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Compute selected-token log probabilities for dense or vocabulary-sharded logits.
+
+    Dense logits are converted to fp32 in chunks of at most 256 token rows so
+    long sequences do not materialize the entire vocabulary tensor in fp32.
+    Vocabulary-sharded DTensors use distributed reductions without gathering
+    the vocabulary.
+
+    Args:
+        logits: Floating-point tensor with global shape [..., vocab], with
+            arbitrary leading dimensions. A DTensor must have exactly one
+            ``Shard`` placement on the vocabulary axis and ``Replicate`` on
+            every other mesh dimension; its per-rank local shape is
+            [..., local_vocab].
+        targets: Rank-local int64 tensor of shape [...], matching the leading
+            dimensions of ``logits`` and containing global vocabulary indices.
+            For DTensor logits, targets must be replicated across the
+            vocabulary-shard mesh dimension.
+        temperature: Positive finite scale applied before normalization.
+
+    Returns:
+        Differentiable fp32 tensor of shape [...] containing selected-token log
+        probabilities. Invalid target positions contain ``NaN``. The function
+        does not mutate or gather ``logits``.
+
+    Raises:
+        TypeError: If an input has an invalid type or dtype.
+        ValueError: If a shape, device, DTensor placement, vocabulary size, or
+            temperature is invalid.
+    """
+    if isinstance(logits, DTensor):
+        return _vocab_parallel_log_probs(logits, targets, temperature=temperature)
+    if not isinstance(logits, torch.Tensor):
+        raise TypeError(f"logits must be a torch.Tensor or DTensor, got {type(logits).__name__}")
+    if not logits.is_floating_point():
+        raise TypeError(f"logits must have a floating-point dtype, got {logits.dtype}")
+    if logits.ndim == 0:
+        raise ValueError("logits must have shape [..., vocab]")
+    if logits.shape[-1] <= 0:
+        raise ValueError(f"logits vocabulary size must be positive, got {logits.shape[-1]}")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError(f"temperature must be positive and finite, got {temperature}")
+    if isinstance(targets, DTensor):
+        raise TypeError("targets must be a rank-local torch.Tensor, not a DTensor")
+    if not isinstance(targets, torch.Tensor):
+        raise TypeError(f"targets must be a torch.Tensor, got {type(targets).__name__}")
+    if targets.dtype != torch.long:
+        raise TypeError(f"targets must have dtype torch.int64, got {targets.dtype}")
+    if targets.device != logits.device:
+        raise ValueError(f"targets and logits must be on the same device, got {targets.device} and {logits.device}")
+    if tuple(targets.shape) != tuple(logits.shape[:-1]):
+        raise ValueError(
+            f"targets shape must match logits leading shape {tuple(logits.shape[:-1])}, got {tuple(targets.shape)}"
+        )
+
+    leading_shape = logits.shape[:-1]
+    vocab_size = logits.shape[-1]
+    flat_logits = logits.reshape(-1, vocab_size)
+    flat_targets = targets.reshape(-1)
+    log_probs = torch.empty(flat_targets.shape, dtype=torch.float32, device=logits.device)
+    for start in range(0, flat_targets.numel(), _DENSE_TOKEN_CHUNK_SIZE):
+        end = min(start + _DENSE_TOKEN_CHUNK_SIZE, flat_targets.numel())
+        chunk = flat_logits[start:end].float()
+        if temperature != 1.0:
+            chunk = chunk / temperature
+        chunk_targets = flat_targets[start:end]
+        valid_targets = (chunk_targets >= 0) & (chunk_targets < vocab_size)
+        safe_targets = chunk_targets.clamp(min=0, max=vocab_size - 1)
+        selected_logits = chunk.gather(dim=-1, index=safe_targets.unsqueeze(-1)).squeeze(-1)
+        chunk_log_probs = selected_logits - torch.logsumexp(chunk, dim=-1)
+        log_probs[start:end] = chunk_log_probs.masked_fill(~valid_targets, torch.nan)
+    if flat_targets.numel() == 0:
+        log_probs = flat_logits.float().sum(dim=-1)
+    return log_probs.reshape(leading_shape)
+
+
+def token_entropy(
+    logits: torch.Tensor | DTensor,
+    *,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Compute categorical entropy for dense or vocabulary-sharded logits.
+
+    Dense logits are converted to fp32 in chunks of at most 256 token rows so
+    long sequences do not materialize the entire vocabulary tensor in fp32.
+    Vocabulary-sharded DTensors use distributed reductions without gathering
+    the vocabulary.
+
+    Args:
+        logits: Floating-point tensor with global shape [..., vocab], with
+            arbitrary leading dimensions. A DTensor must have exactly one
+            ``Shard`` placement on the vocabulary axis and ``Replicate`` on
+            every other mesh dimension; its per-rank local shape is
+            [..., local_vocab].
+        temperature: Positive finite scale applied before normalization.
+
+    Returns:
+        Differentiable fp32 tensor of shape [...] containing categorical entropy.
+        The function does not mutate or gather ``logits``.
+
+    Raises:
+        TypeError: If ``logits`` has an invalid type or dtype.
+        ValueError: If a shape, DTensor placement, vocabulary size, or
+            temperature is invalid.
+    """
+    if isinstance(logits, DTensor):
+        return _vocab_parallel_entropy(logits, temperature=temperature)
+    if not isinstance(logits, torch.Tensor):
+        raise TypeError(f"logits must be a torch.Tensor or DTensor, got {type(logits).__name__}")
+    if not logits.is_floating_point():
+        raise TypeError(f"logits must have a floating-point dtype, got {logits.dtype}")
+    if logits.ndim == 0:
+        raise ValueError("logits must have shape [..., vocab]")
+    if logits.shape[-1] <= 0:
+        raise ValueError(f"logits vocabulary size must be positive, got {logits.shape[-1]}")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError(f"temperature must be positive and finite, got {temperature}")
+
+    leading_shape = logits.shape[:-1]
+    vocab_size = logits.shape[-1]
+    flat_logits = logits.reshape(-1, vocab_size)
+    entropy = torch.empty(flat_logits.shape[0], dtype=torch.float32, device=logits.device)
+    for start in range(0, flat_logits.shape[0], _DENSE_TOKEN_CHUNK_SIZE):
+        end = min(start + _DENSE_TOKEN_CHUNK_SIZE, flat_logits.shape[0])
+        chunk = flat_logits[start:end].float()
+        if temperature != 1.0:
+            chunk = chunk / temperature
+        log_distribution = torch.log_softmax(chunk, dim=-1)
+        entropy[start:end] = -(log_distribution.exp() * log_distribution).sum(dim=-1)
+    if flat_logits.shape[0] == 0:
+        entropy = flat_logits.float().sum(dim=-1)
+    return entropy.reshape(leading_shape)
+
+
+# Import-only compatibility for callers of the previously released names.
+# New code should use the canonical Tensor-or-DTensor APIs above.
+vocab_parallel_log_probs = token_log_probs
+vocab_parallel_entropy = token_entropy
