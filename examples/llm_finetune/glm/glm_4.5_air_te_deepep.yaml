@@ -113,4 +113,13 @@ optimizer:
 ci:
   recipe_owner: hemildesai
   nodes: 8
-  time: "00:15:00"
+  time: "01:30:00"
+  checkpoint_robustness:
+    tokenizer_name: zai-org/GLM-4.5-Air
+    hf_device_map_auto: true
+    # Compare vanilla HF with itself at shorter shapes before attributing any
+    # long-context cross-framework drift to loading or conversion correctness.
+    shape_diagnostic:
+      sweep_lengths: [128, 512]
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
