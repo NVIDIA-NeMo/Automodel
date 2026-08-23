@@ -578,6 +578,25 @@ def test_optim_step_callback_failure_preserves_optimizer_and_post_step_state(mon
     assert result.learning_rates == (0.1,)
 
 
+def test_optim_step_finalization_failure_poison_engine(monkeypatch):
+    model = ScaleModel()
+    model.weight.grad = torch.tensor(2.0)
+    engine = Engine(model, device="cpu", optimizers=torch.optim.SGD(model.parameters(), lr=0.1))
+
+    def fail_finalization(**_kwargs):
+        raise RuntimeError("finalization failed")
+
+    monkeypatch.setattr(engine_module, "scale_grads_and_clip_grad_norm", fail_finalization)
+
+    with pytest.raises(RuntimeError, match="finalization failed"):
+        engine.optim_step()
+    with pytest.raises(RuntimeError, match="cannot be optimized"):
+        engine.optim_step()
+
+    torch.testing.assert_close(model.weight, torch.tensor(1.0))
+    torch.testing.assert_close(model.weight.grad, torch.tensor(2.0))
+
+
 def test_optim_step_requires_an_optimizer(monkeypatch):
     monkeypatch.setattr(
         engine_module,
@@ -1620,7 +1639,9 @@ def test_raw_thd_multirow_outputs_restore_trailing_features_in_datum_order():
     def loss_with_outputs(output, loss_inputs):
         assert output.shape == loss_inputs["weights"].shape == (8,)
         probe = torch.stack((output, output + 100), dim=-1)
-        return output, LossFnOutputBatch(per_token={"probe": PerTokenOutput(probe)})
+        return output, LossFnOutputBatch(
+            per_token={"features": PerTokenOutput(probe), "tokens": PerTokenOutput(output)}
+        )
 
     model = ScaleModel()
     model.backend = SimpleNamespace(attn="te")
@@ -1632,9 +1653,11 @@ def test_raw_thd_multirow_outputs_restore_trailing_features_in_datum_order():
     ).forward(datums, loss_with_outputs)
 
     torch.testing.assert_close(
-        result.loss_fn_outputs[0]["probe"], torch.tensor([[1.0, 101.0], [2.0, 102.0], [3.0, 103.0]])
+        result.loss_fn_outputs[0]["features"], torch.tensor([[1.0, 101.0], [2.0, 102.0], [3.0, 103.0]])
     )
-    torch.testing.assert_close(result.loss_fn_outputs[1]["probe"], torch.tensor([[4.0, 104.0], [5.0, 105.0]]))
+    torch.testing.assert_close(result.loss_fn_outputs[1]["features"], torch.tensor([[4.0, 104.0], [5.0, 105.0]]))
+    torch.testing.assert_close(result.loss_fn_outputs[0]["tokens"], torch.tensor([1.0, 2.0, 3.0]))
+    torch.testing.assert_close(result.loss_fn_outputs[1]["tokens"], torch.tensor([4.0, 5.0]))
 
 
 def test_typed_batch_outputs_follow_left_and_noncontiguous_attention_masks():

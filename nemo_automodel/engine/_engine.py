@@ -49,8 +49,8 @@ from nemo_automodel.engine._batch import (
     LossInputs,
     LossInputValue,
     _is_token_aligned,
+    _loss_sequence_dim,
     _LossBatchLayout,
-    _matches_primary_token_layout,
     _materialize_loss_mapping,
     _model_token_template,
     _pad_hybridep_packed_thd,
@@ -396,7 +396,6 @@ class Engine:
         self.lr_schedulers = _as_tuple(lr_schedulers)
         self.max_grad_norm = max_grad_norm
         self._optim_step_consumed = False
-        self._grads_finalized = False
         self._finalized_grad_norm: torch.Tensor | float | None = None
         self._optim_step_in_progress = False
         self._backward_status = "idle"
@@ -479,12 +478,11 @@ class Engine:
                 )
                 if batch_error is not None:
                     raise batch_error
-                if batch_returns_outputs is not None:
-                    if returns_outputs is None:
-                        returns_outputs = batch_returns_outputs
-                    elif returns_outputs != batch_returns_outputs:
-                        raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
-                    loss_fn_outputs.extend(batch_outputs)
+                if returns_outputs is None:
+                    returns_outputs = batch_returns_outputs
+                elif returns_outputs != batch_returns_outputs:
+                    raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
+                loss_fn_outputs.extend(batch_outputs)
                 continue
 
             loss_inputs = _with_loss_metadata(model_inputs, loss_inputs)
@@ -566,7 +564,7 @@ class Engine:
                 raise RuntimeError("the previous backward window failed and this Engine cannot be reused")
             if self._backward_status == "running":
                 raise RuntimeError("a forward_backward call is already running")
-        if self._grads_finalized:
+        if self._finalized_grad_norm is not None:
             raise RuntimeError("gradients were already finalized; retry optim_step before forward_backward")
         if self.optimizers:
             self._backward_status = "running"
@@ -577,7 +575,6 @@ class Engine:
                 self._backward_status = "broken"
             raise
         self._optim_step_consumed = False
-        self._grads_finalized = False
         self._finalized_grad_norm = None
         if self.optimizers:
             self._backward_status = "ready"
@@ -650,7 +647,9 @@ class Engine:
         grad_group, grad_group_size = self._gradient_group_and_size(dp_group, dp_size)
         gradient_reduction_multiplier = 1 if self._summed_gradient_reduction else grad_group_size
         self._validate_window_size_across_group(len(microbatches), grad_group, grad_group_size)
-        denominator = self._global_weight_sum(microbatches, dp_group, dp_size)
+        denominator = self._local_weight_sum(microbatches)
+        if dp_size > 1:
+            dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=dp_group)
         zero_denominator = bool(denominator == 0)
         safe_denominator = torch.where(denominator > 0, denominator, torch.ones_like(denominator))
         self._validate_pipeline_window(len(microbatches), denominator)
@@ -702,14 +701,13 @@ class Engine:
                         output_error = batch_error
                     else:
                         try:
-                            if batch_returns_outputs is not None:
-                                if returns_outputs is None:
-                                    returns_outputs = batch_returns_outputs
-                                elif returns_outputs != batch_returns_outputs:
-                                    raise ValueError(
-                                        "loss_fn must return per-Datum outputs for every microbatch or none of them"
-                                    )
-                                loss_fn_outputs.extend(batch_outputs)
+                            if returns_outputs is None:
+                                returns_outputs = batch_returns_outputs
+                            elif returns_outputs != batch_returns_outputs:
+                                raise ValueError(
+                                    "loss_fn must return per-Datum outputs for every microbatch or none of them"
+                                )
+                            loss_fn_outputs.extend(batch_outputs)
                         except Exception as error:
                             output_error = error
             else:
@@ -846,7 +844,7 @@ class Engine:
         self._optim_step_in_progress = True
         mutation_started = False
         try:
-            if not self._grads_finalized:
+            if self._finalized_grad_norm is None:
                 self._finalized_grad_norm = scale_grads_and_clip_grad_norm(
                     max_grad_norm=self.max_grad_norm,
                     model_parts=self.model_parts,
@@ -863,7 +861,6 @@ class Engine:
                 )
                 if self._finalized_grad_norm is None:
                     raise RuntimeError("gradient finalization did not return a gradient norm")
-                self._grads_finalized = True
             grad_norm = self._finalized_grad_norm
             assert grad_norm is not None
 
@@ -891,7 +888,7 @@ class Engine:
                 float(group["lr"]) for optimizer in self.optimizers for group in optimizer.param_groups
             )
         except Exception:
-            if mutation_started or not self._grads_finalized:
+            if mutation_started or self._finalized_grad_norm is None:
                 self._optim_step_consumed = True
                 self._backward_status = "broken"
             raise
@@ -899,7 +896,6 @@ class Engine:
             self._optim_step_in_progress = False
 
         self._optim_step_consumed = True
-        self._grads_finalized = False
         self._finalized_grad_norm = None
         self._backward_status = "idle"
         return OptimStepResult(grad_norm=grad_norm, learning_rates=learning_rates)
@@ -1243,7 +1239,7 @@ class Engine:
             for name in thd_loss_fields:
                 key = f"{_LOSS_FIELD_PREFIX}{name}"
                 candidate = model_inputs.pop(key, None)
-                if isinstance(candidate, torch.Tensor) and _matches_primary_token_layout(candidate, model_inputs):
+                if isinstance(candidate, torch.Tensor) and _loss_sequence_dim(model_inputs, candidate) is not None:
                     local_loss_inputs[name] = candidate
                 else:
                     local_loss_inputs[name] = sharder.shard_token_tensor(
@@ -1400,7 +1396,7 @@ class Engine:
         *,
         backward_scale: torch.Tensor | None,
         zero_weight_sum: bool,
-    ) -> tuple[bool | None, list[dict[str, Any]], Exception | None]:
+    ) -> tuple[bool, list[dict[str, Any]], Exception | None]:
         """Run prepared pipeline microbatches in training or forward-only mode.
 
         Args:
@@ -1593,79 +1589,43 @@ class Engine:
         chunk_index: int | None,
     ) -> list[dict[str, Any]]:
         """Restore explicitly typed token streams and merge per-Datum records."""
-        weights = loss_inputs.get("weights")
-        if not isinstance(weights, torch.Tensor):
-            raise ValueError("loss_fn token outputs require Tensor loss weights")
         if isinstance(outputs, list):
             return outputs
 
+        # _validate_loss_fn_outputs_across_cp has already checked this frozen
+        # output envelope on every CP rank before any field enters a gather.
+        weights = loss_inputs["weights"]
         if datum_indices is None:
-            if plan.item_to_datum is not None:
-                raise RuntimeError("loss_fn output routing is missing the collater's Datum mapping")
-            if chunk_index is not None:
-                raise NotImplementedError(
-                    "a prebatched Datum cannot restore token outputs across multiple pipeline microbatches"
-                )
             datum_indices = (0,)
 
         source_records = ({},) * len(datum_indices) if outputs.per_datum is None else outputs.per_datum
         records = [dict(record) for record in source_records]
-        if len(records) != len(datum_indices):
-            raise ValueError(
-                f"LossFnOutputBatch.per_datum contains {len(records)} records, expected {len(datum_indices)}"
+
+        local_seq_dim = _loss_sequence_dim_from_weights(weights)
+        selected_layout = plan.sharder.shard_layout
+        if chunk_index is not None:
+            selected_layout = (
+                None
+                if selected_layout is None or selected_layout.chunk_layouts is None
+                else selected_layout.chunk_layouts[chunk_index]
             )
-        record_keys = {key for record in records for key in record}
-        collisions = record_keys & set(outputs.per_token)
-        if collisions:
-            raise ValueError(f"per-token output keys collide with per-Datum records: {sorted(collisions)}")
 
         restored_fields: list[tuple[str, torch.Tensor, int]] = []
         for name in sorted(outputs.per_token):
             spec = outputs.per_token[name]
-            tensor = spec.tensor.detach()
-            if tensor.shape[: weights.ndim] != weights.shape:
-                raise ValueError(
-                    f"per-token output {name!r} must start with the loss weight shape {tuple(weights.shape)}, "
-                    f"got {tuple(tensor.shape)}"
-                )
-            if tensor.device != weights.device:
-                raise ValueError(
-                    f"per-token output {name!r} must be on the loss weight device {weights.device}, got {tensor.device}"
-                )
-            seq_dim = _loss_sequence_dim_from_weights(weights)
-            shard_layout = plan.sharder.shard_layout
-            selected_layout = shard_layout
-            if chunk_index is not None:
-                if shard_layout is None or shard_layout.chunk_layouts is None:
-                    if self._cp_size() > 1:
-                        raise NotImplementedError(
-                            "the active context-parallel backend does not report reversible per-pipeline-chunk "
-                            "token layouts; typed per-token outputs are unavailable for this packed PP+CP batch"
-                        )
-                    selected_layout = None
-                else:
-                    if chunk_index < 0 or chunk_index >= len(shard_layout.chunk_layouts):
-                        raise IndexError(
-                            f"pipeline chunk {chunk_index} is out of range for "
-                            f"{len(shard_layout.chunk_layouts)} reported CP layouts"
-                        )
-                    selected_layout = shard_layout.chunk_layouts[chunk_index]
-            if self._cp_size() > 1 and selected_layout is None:
-                raise NotImplementedError(
-                    "the active context-parallel backend does not report a reversible token layout; "
-                    "typed per-token outputs are unavailable for this batch"
-                )
+            tensor = spec.tensor
+            restored_seq_dim = local_seq_dim
             if selected_layout is not None:
                 tensor = plan.sharder.gather_token_tensor(
                     tensor,
-                    seq_dim=seq_dim,
+                    seq_dim=local_seq_dim,
                     trim=True,
                     fill=spec.fill_value,
                     chunk_index=chunk_index,
                 )
                 if selected_layout.input_row_shape is not None:
-                    seq_dim = len(selected_layout.input_row_shape) - 1
-            restored_fields.append((name, tensor, seq_dim))
+                    restored_seq_dim = len(selected_layout.input_row_shape) - 1
+            restored_fields.append((name, tensor, restored_seq_dim))
 
         # Complete every field's CP collective before Datum-local splitting.
         # A routing error can then no longer leave a peer entering the next
@@ -1990,17 +1950,6 @@ class Engine:
             raise ValueError(f"pipeline stages must use the same outer window size; got {gathered[:, 0].tolist()}")
         if not torch.allclose(gathered[:, 1], gathered[0, 1].expand(pp_size), rtol=1e-8, atol=1e-12):
             raise ValueError(f"pipeline stages must use the same weight denominator; got {gathered[:, 1].tolist()}")
-
-    def _global_weight_sum(
-        self,
-        microbatches: list[list[Datum]],
-        dp_group: dist.ProcessGroup | None,
-        dp_size: int,
-    ) -> torch.Tensor:
-        denominator = self._local_weight_sum(microbatches)
-        if dp_size > 1:
-            dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=dp_group)
-        return denominator
 
     def _local_weight_sum(self, microbatches: list[list[Datum]]) -> torch.Tensor:
         """Return the full-sequence denominator for one DP replica."""

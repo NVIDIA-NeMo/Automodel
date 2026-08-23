@@ -151,7 +151,7 @@ def _resolve_loss_batch_layout(
             fields[name] = datum_layouts[name]
             continue
 
-        if isinstance(value, torch.Tensor) and _loss_sequence_dim(dict(model_inputs), value) is not None:
+        if isinstance(value, torch.Tensor) and _loss_sequence_dim(model_inputs, value) is not None:
             fields[name] = LossInputLayout.PER_TOKEN
             continue
 
@@ -206,9 +206,6 @@ def _validate_loss_batch_layout(
     """Validate semantic loss layouts before any CP/PP transformation."""
     if set(layouts) != set(loss_inputs):
         raise ValueError("loss input layouts must describe every collated loss field exactly once")
-    weights = loss_inputs.get("weights")
-    if not isinstance(weights, torch.Tensor):
-        raise ValueError("collate_fn must return a Tensor loss input named 'weights'")
     token_fields = [name for name, layout in layouts.items() if layout is LossInputLayout.PER_TOKEN]
     token_reference_name = "weights" if layouts.get("weights") is LossInputLayout.PER_TOKEN else None
     if token_reference_name is None and "labels" in token_fields:
@@ -564,7 +561,7 @@ def _model_token_template(model_inputs: Mapping[str, Any]) -> torch.Tensor:
     return primary
 
 
-def _loss_sequence_dim(model_inputs: dict[str, Any], value: torch.Tensor) -> int | None:
+def _loss_sequence_dim(model_inputs: Mapping[str, Any], value: torch.Tensor) -> int | None:
     """Find the sequence axis shared by primary model tokens and loss weights.
 
     Args:
@@ -606,18 +603,6 @@ def _primary_name(model_inputs: Mapping[str, Any]) -> str:
     if len(names) != 1:
         raise ValueError("model inputs must contain exactly one of input_ids or inputs_embeds")
     return names[0]
-
-
-def _matches_primary_token_layout(tensor: torch.Tensor, model_inputs: Mapping[str, Any]) -> bool:
-    primary_name = _primary_name(model_inputs)
-    primary = model_inputs[primary_name]
-    if not isinstance(primary, torch.Tensor) or tensor.ndim == 0:
-        return False
-    if model_inputs.get("qkv_format") == "thd":
-        token_dims = primary.ndim - int(primary_name == "inputs_embeds")
-    else:
-        token_dims = 1 if primary.ndim == 1 else 2
-    return tensor.ndim >= token_dims and tuple(tensor.shape[:token_dims]) == tuple(primary.shape[:token_dims])
 
 
 def _with_loss_metadata(model_inputs: Mapping[str, Any], loss_inputs: Mapping[str, LossInputValue]) -> LossInputs:
@@ -720,12 +705,6 @@ def _pipeline_datum_indices(
         if row_count != num_datums:
             return None
         item_to_datum = tuple(range(num_datums))
-
-    if len(item_to_datum) != num_datums or sorted(item_to_datum) != list(range(num_datums)):
-        raise ValueError(
-            "collater item_to_datum must contain every outer Datum index exactly once; "
-            f"got {list(item_to_datum)} for {num_datums} Datums"
-        )
 
     counts = [
         _thd_microbatch_sequence_count(microbatch) if is_thd else _padded_microbatch_size(microbatch)
