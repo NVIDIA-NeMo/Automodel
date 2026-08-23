@@ -310,11 +310,13 @@ def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypat
     _patch_remote_masking_api_compatibility()
 
     for function_name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        # Pre-v5 remote code passes the removed ``cache_position`` and the
+        # renamed ``input_embeds`` keywords (e.g. Kimi-Linear).
         result = getattr(masking_utils, function_name)(
-            "config",
-            "inputs",
-            "attention",
-            "cache",
+            config="config",
+            input_embeds="inputs",
+            attention_mask="attention",
+            past_key_values="cache",
             position_ids="positions",
             cache_position="removed-argument",
         )
@@ -329,7 +331,7 @@ def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypat
 def test_remote_masking_api_compatibility_preserves_supported_api(monkeypatch):
     import transformers.masking_utils as masking_utils
 
-    def create_mask(config, inputs_embeds, attention_mask, past_key_values, cache_position=None):
+    def create_mask(config, input_embeds, attention_mask, past_key_values, cache_position=None):
         return cache_position
 
     monkeypatch.setattr(masking_utils, "create_causal_mask", create_mask)

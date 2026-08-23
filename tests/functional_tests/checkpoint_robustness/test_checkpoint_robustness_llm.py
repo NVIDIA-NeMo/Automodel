@@ -516,7 +516,7 @@ def _peft_adapter_load_kwargs(hf_kwargs: dict[str, object]) -> dict[str, object]
 
 
 def _patch_remote_masking_api_compatibility() -> None:
-    """Allow remote model code to pass masking kwargs removed by Transformers."""
+    """Adapt remote model code to masking kwargs removed or renamed by Transformers."""
     import transformers.masking_utils as masking_utils
 
     for function_name in ("create_causal_mask", "create_sliding_window_causal_mask"):
@@ -524,16 +524,29 @@ def _patch_remote_masking_api_compatibility() -> None:
         if getattr(mask_function, "_nemo_removed_kwargs_patched", False):
             continue
         parameters = inspect.signature(mask_function).parameters.values()
-        accepts_cache_position = any(
-            parameter.name == "cache_position" or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
+        parameter_names = {parameter.name for parameter in parameters}
+        accepts_var_keyword = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        drop_cache_position = "cache_position" not in parameter_names and not accepts_var_keyword
+        # Transformers v5.x renamed ``input_embeds`` to ``inputs_embeds``;
+        # pre-v5 remote code (e.g. Kimi-Linear) still passes the old keyword.
+        rename_input_embeds = (
+            "input_embeds" not in parameter_names and "inputs_embeds" in parameter_names and not accepts_var_keyword
         )
-        if accepts_cache_position:
+        if not drop_cache_position and not rename_input_embeds:
             continue
 
         @wraps(mask_function)
-        def compatible_mask_function(*args, _mask_function=mask_function, **kwargs):
-            kwargs.pop("cache_position", None)
+        def compatible_mask_function(
+            *args,
+            _mask_function=mask_function,
+            _drop_cache_position=drop_cache_position,
+            _rename_input_embeds=rename_input_embeds,
+            **kwargs,
+        ):
+            if _drop_cache_position:
+                kwargs.pop("cache_position", None)
+            if _rename_input_embeds and "input_embeds" in kwargs:
+                kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
             return _mask_function(*args, **kwargs)
 
         compatible_mask_function._nemo_removed_kwargs_patched = True  # type: ignore[attr-defined]
