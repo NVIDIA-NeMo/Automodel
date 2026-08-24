@@ -122,7 +122,7 @@ moe_metrics:
   top_k_experts: 0
 
 wandb:
-  enable: true
+  enable: false
   entity: ${oc.env:WANDB_ENTITY,Nemo-automodel}
   project: ${oc.env:WANDB_PROJECT,mok}
   name: glm-5.2-mok-mxfp8-mock-8k
