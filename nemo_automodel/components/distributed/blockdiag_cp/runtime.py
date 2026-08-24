@@ -223,6 +223,7 @@ def cp_blockdiag_sdpa(
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
+    window_size: tuple[int, int] | None = None,
     **kwargs,
 ) -> torch.Tensor:
     """Block-diagonal context-parallel SDPA.
@@ -247,6 +248,8 @@ def cp_blockdiag_sdpa(
         is_causal: Ignored on the CP path (forwarded to stock SDPA otherwise).
         scale: Softmax scale (``None`` -> ``D**-0.5``).
         enable_gqa: Grouped-query attention flag as passed by HF's sdpa path.
+        window_size: Optional inclusive ``(left, right)`` sliding-attention
+            window. Negative values leave that side unbounded.
         **kwargs: Ignored; accepted for SDPA signature compatibility.
 
     Returns:
@@ -280,16 +283,21 @@ def cp_blockdiag_sdpa(
     # Decide the KV-exchange path (needed-only halo/a2a vs full all-gather) explicitly,
     # logging why, including downgrades to all-gather for mode, kernel, missing meta, or
     # a cross-node CP group where needed-only exchange is disabled by default.
-    path, plan, reason = _select_kv_exchange_path(
-        step_state,
-        group,
-        doc_ids,
-        query.shape[seq_dim],
-        query.device,
-        offset,
-        query_dtype=query.dtype,
-        dropout_p=dropout_p,
-    )
+    left_window, right_window = window_size or (-1, 0)
+    has_local_window = (left_window is not None and left_window >= 0) or (right_window is not None and right_window > 0)
+    if has_local_window:
+        path, plan, reason = "allgather", None, "sliding-window mask requires the dense block-diagonal path"
+    else:
+        path, plan, reason = _select_kv_exchange_path(
+            step_state,
+            group,
+            doc_ids,
+            query.shape[seq_dim],
+            query.device,
+            offset,
+            query_dtype=query.dtype,
+            dropout_p=dropout_p,
+        )
     global _KV_EXCHANGE_PATH_LOGGED
     if not _KV_EXCHANGE_PATH_LOGGED:
         _KV_EXCHANGE_PATH_LOGGED = True
@@ -357,7 +365,7 @@ def cp_blockdiag_sdpa(
     key_full = kv_full[:, :n_kv_heads_local]
     value_full = kv_full[:, n_kv_heads_local:]
 
-    if attn_backend in ("flash", "te"):
+    if not has_local_window and attn_backend in ("flash", "te"):
         out = kernels._cp_blockdiag_varlen(
             query,
             key_full,
@@ -392,7 +400,14 @@ def cp_blockdiag_sdpa(
     L = query.shape[seq_dim]
     S = key_full.shape[seq_dim]
 
-    allow = kernels._cp_blockdiag_mask(doc_ids, offset, L, S, B)  # [B, 1, L, S]
+    allow = kernels._cp_blockdiag_mask(
+        doc_ids,
+        offset,
+        L,
+        S,
+        B,
+        window_size=window_size if has_local_window else None,
+    )  # [B, 1, L, S]
 
     return _ORIGINAL_SDPA(
         query,
