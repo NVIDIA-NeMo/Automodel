@@ -144,6 +144,11 @@ class MiniMaxM2Model(nn.Module):
             # The HF reference returns selected weights in the fp32 router
             # logits dtype; keep them fp32 through the expert combine.
             router_weights_fp32=True,
+            # The checkpoint stores the gate weight in fp32; allocate it fp32 so
+            # every construction path (including meta-device init before FSDP
+            # sharding) keeps the gate's dtype group uniform with its fp32
+            # correction-bias buffer.
+            gate_dtype=torch.float32,
             dtype=model_dtype,
         )
         if moe_overrides:

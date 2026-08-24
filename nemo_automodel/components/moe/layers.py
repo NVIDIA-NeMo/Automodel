@@ -270,12 +270,13 @@ class Gate(nn.Module):
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
 
+        gate_dtype = config.gate_dtype or config.dtype
         self.weight = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype), requires_grad=self.train_gate
+            torch.empty(config.n_routed_experts, config.dim, dtype=gate_dtype), requires_grad=self.train_gate
         )
         if config.router_bias:
             self.bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=self.train_gate
+                torch.empty(config.n_routed_experts, dtype=gate_dtype), requires_grad=self.train_gate
             )
         else:
             self.bias = None

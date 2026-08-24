@@ -80,6 +80,37 @@ def test_router_fp32_contract_is_model_owned():
     assert indices.shape == (8, TINY["num_experts_per_tok"])
 
 
+def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping():
+    """The gate must be fp32 from allocation, before any init or checkpoint cast.
+
+    FSDP shards the freshly constructed (meta/from_pretrained) module: a
+    bf16-allocated gate weight with an fp32-pinned compute dtype shares its
+    module with the fp32 correction-bias buffer, which FSDP cannot isolate
+    (pipeline 64344786: "FSDP could not isolate parameters with a distinct
+    dtype from siblings in the same module: mlp.gate.weight").
+    """
+    import torch.distributed.fsdp as fsdp
+
+    from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+
+    config = AutoConfig.for_model("minimax_m2", torch_dtype="bfloat16", **TINY)
+    model = MiniMaxM2ForCausalLM(config, backend=_cpu_backend())
+    block = model.model.layers["0"]
+
+    # No initialize_weights on purpose: this is the state FSDP shards.
+    assert block.mlp.gate.weight.dtype == torch.float32
+    assert block.mlp.gate.e_score_correction_bias.dtype == torch.float32
+
+    fully_shard_by_dtype(
+        block,
+        mesh=None,
+        mp_policy=fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
+        offload_policy=None,
+        fp32_compute_module_names=tuple(MiniMaxM2ForCausalLM._keep_in_fp32_modules_strict),
+        fully_shard_fn=lambda *args, **kwargs: None,
+    )
+
+
 def test_explicit_gate_precision_override_is_preserved():
     config = AutoConfig.for_model("minimax_m2", torch_dtype="bfloat16", **TINY)
     backend = _cpu_backend()
