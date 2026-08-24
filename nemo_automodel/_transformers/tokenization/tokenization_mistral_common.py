@@ -29,7 +29,6 @@ from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.tokens.tokenizers.tekken import Tekkenizer
 from mistral_common.tokens.tokenizers.utils import download_tokenizer_from_hf_hub, get_one_valid_tokenizer_file
-
 from transformers.audio_utils import load_audio_as
 from transformers.tokenization_utils_base import (
     LARGE_INTEGER,
