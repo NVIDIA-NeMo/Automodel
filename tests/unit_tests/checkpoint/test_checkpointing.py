@@ -34,6 +34,8 @@ from torch.nn.parallel import DistributedDataParallel
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _DIFFUSERS_INDEX_FN,
     _extract_file_index_with_status,
+    _get_safetensors_file_metadata,
+    _HuggingFaceStorageReader,
     get_fqn_to_dtype_mapping,
     get_fqn_to_file_index_mapping,
 )
@@ -75,6 +77,7 @@ from nemo_automodel.components.checkpoint.utils import (
 )
 from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
+from nemo_automodel.components.models.mistral3.state_dict_adapter import Mistral3FP8StateDictAdapter
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 from nemo_automodel.components.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
@@ -1847,6 +1850,7 @@ class TestLoadModelCustomModelGuard:
         model.config = SimpleNamespace(quantization_config=quantization_config)
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
         model.state_dict_adapter.supports_low_memory_dcp_load = True
+        model.state_dict_adapter.iter_checkpoint_load_parts.return_value = None
         mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
         mock_load_hf.return_value = mock_state_dict
 
@@ -1884,6 +1888,73 @@ class TestLoadModelCustomModelGuard:
             mock_load_hf.assert_not_called()
             mock_dcp_load.assert_called_once()
             assert "load_model:" in caplog.text
+
+    def test_mistral3_fp8_checkpoint_loads_and_finishes_bounded_layer_groups(self, tmp_path):
+        """The allocating FP8 adapter must not retain every layer's temporary destinations."""
+
+        class WeightOnly(torch.nn.Module):
+            def __init__(self, size):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(size, dtype=torch.bfloat16))
+
+        CustomModel = type("CustomModel", (torch.nn.Module,), {})
+        CustomModel.__module__ = "nemo_automodel.components.models.mistral3.model"
+        model = CustomModel()
+        model.model = torch.nn.Module()
+        model.model.embed_tokens = torch.nn.Embedding(4, 4, dtype=torch.bfloat16)
+        model.model.layers = torch.nn.ModuleList()
+        for _ in range(2):
+            layer = torch.nn.Module()
+            layer.self_attn = torch.nn.Module()
+            layer.self_attn.q_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+            model.model.layers.append(layer)
+        model.model.norm = WeightOnly(4)
+        model.lm_head = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+        model.config = SimpleNamespace(
+            tie_word_embeddings=False,
+            num_hidden_layers=2,
+            quantization_config={"quant_method": "fp8", "weight_block_size": None},
+        )
+        model.state_dict_adapter = Mistral3FP8StateDictAdapter.for_causal_lm(model.config)
+
+        checkpoint_state = {}
+        expected_state = {}
+        for key, tensor in model.state_dict().items():
+            if ".layers." in key and key.endswith(".weight"):
+                checkpoint_state[key] = torch.full(tensor.shape, 2.0, dtype=torch.float8_e4m3fn)
+                checkpoint_state[key + "_scale_inv"] = torch.tensor(0.5, dtype=torch.bfloat16)
+                expected_state[key] = torch.ones_like(tensor)
+            else:
+                checkpoint_state[key] = torch.full_like(tensor, 3.0)
+                expected_state[key] = torch.full_like(tensor, 3.0)
+
+        model_path = tmp_path / "model"
+        model_path.mkdir()
+        save_file(checkpoint_state, model_path / "model.safetensors")
+        checkpointer = self._make_checkpointer()
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype"
+            ) as full_cpu_load,
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.dcp.load",
+                wraps=dcp.load,
+            ) as dcp_load,
+        ):
+            # Mistral3 VLMs also expose a generic Transformers conversion mapping. Load parts already use exact HF
+            # checkpoint names, so that redundant mapping must not disable the adapter-owned grouped path.
+            checkpointer.load_model(
+                model,
+                model_path=str(model_path),
+                is_init_step=True,
+                key_mapping={"^model": "unused.generic.mapping"},
+            )
+
+        full_cpu_load.assert_not_called()
+        assert dcp_load.call_count == 2  # shared tensors and one bounded decoder-layer group
+        for key, expected in expected_state.items():
+            torch.testing.assert_close(model.state_dict()[key], expected)
 
 
 class TestLoadModelCheckpointKeySubset:
@@ -2930,6 +3001,21 @@ class TestGetStorageReaderInitStep:
         # Backport reader must be constructed instead
         backport_marker.assert_called_once_with(path="/fake/path", key_mapping=None)
         assert reader is backport_marker.return_value
+
+    def test_backport_reader_parses_safetensors_metadata_once(self, tmp_path):
+        """Part-by-part loads reuse one parsed copy of the checkpoint metadata."""
+        save_file({"weight": torch.ones(2, 2)}, tmp_path / "model.safetensors")
+        reader = _HuggingFaceStorageReader(str(tmp_path))
+
+        with patch(
+            "nemo_automodel.components.checkpoint._backports.hf_storage._get_safetensors_file_metadata",
+            wraps=_get_safetensors_file_metadata,
+        ) as parse_metadata:
+            first = reader.read_metadata()
+            second = reader.read_metadata()
+
+        assert first is second
+        parse_metadata.assert_called_once()
 
     def test_non_init_step_no_keymap_uses_upstream(self):
         """For mid-training safetensors loads (is_init_step=False, no key_mapping),
