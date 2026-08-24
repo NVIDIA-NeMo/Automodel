@@ -115,7 +115,13 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
             # temperature as the bi-encoder path does. Backbones that scale inside
             # forward (LlamaBidirectionalForSequenceClassification) apply model.temperature
             # there; the two compose, and both default to 1.0.
-            outputs.logits = outputs.logits.view(-1, self.train_n_passages) / self.temperature
+            #
+            # Up-cast to fp32 BEFORE the division. The backbone emits bf16 logits, and
+            # dividing by a small temperature magnifies them (10x at temperature=0.1),
+            # pushing them onto a coarse part of the bf16 grid -- at magnitude ~32 the
+            # spacing is 0.25, which distorts the softmax and every gradient through it.
+            # Staying in fp32 through cross_entropy costs nothing at this tensor size.
+            outputs.logits = outputs.logits.view(-1, self.train_n_passages).float() / self.temperature
             loss = F.cross_entropy(outputs.logits, labels)
 
             loss_buffer.append(loss.clone().detach())
@@ -149,7 +155,8 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
 
                     with autocast_ctx:
                         outputs = model(**batch, return_dict=True)
-                        logits = outputs.logits.view(-1, self.val_n_passages) / self.temperature
+                        # fp32 before the temperature division, as in the train step.
+                        logits = outputs.logits.view(-1, self.val_n_passages).float() / self.temperature
                         loss = F.cross_entropy(logits, labels)
 
                     loss_buffer.append(loss.clone().detach())
