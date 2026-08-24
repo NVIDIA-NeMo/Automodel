@@ -267,33 +267,6 @@ class TestIterFSDPModules:
         assert moe_model.lm_head in modules
 
     @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
-    def test_iterates_managed_task_head_and_drives_sync_state(self, mock_isinstance):
-        mock_isinstance.side_effect = _mock_fsdp_isinstance
-
-        model = MockFSDPModule()
-        task_head = MockFSDPModule()
-        moe_model = MockMoEModel(MockBackend(enable_fsdp_optimizations=True), model)
-        moe_model.value_head = task_head
-        moe_model._nemo_task_head_module_name = "value_head"
-
-        modules = list(_iter_fsdp_modules(moe_model))
-
-        assert task_head in modules
-
-        task_head._is_last_backward = True
-        task_head._reshard_after_backward = True
-        task_head._requires_gradient_sync = True
-        moe_model.prepare_for_grad_accumulation()
-        assert task_head._is_last_backward is False
-        assert task_head._reshard_after_backward is False
-        assert task_head._requires_gradient_sync is False
-
-        moe_model.prepare_for_final_backward()
-        assert task_head._is_last_backward is True
-        assert task_head._reshard_after_backward is True
-        assert task_head._requires_gradient_sync is True
-
-    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_iterates_model_embeddings_lm_head(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
             if cls.__name__ == "FSDPModule":

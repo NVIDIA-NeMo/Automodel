@@ -65,7 +65,6 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
-from nemo_automodel.shared.task_heads import is_task_head_parameter
 
 _PREFIX = "model."
 _OPTIMIZER_PARTS_KEY = "optimizer_parts"
@@ -441,11 +440,7 @@ class ModelState:
         # this filtering removes them.
         # TODO: this is a hack and we should find a better way to do this.
         if self.is_peft:
-            model_state_dict = {
-                k: v
-                for k, v in model_state_dict.items()
-                if "lora_" in k or any(is_task_head_parameter(part, k) for part in self.model)
-            }
+            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
 
         # Pipeline parallelism partitions layers across PP ranks, so each rank's
         # local adapter (collected above) only covers its own stages. Gather the

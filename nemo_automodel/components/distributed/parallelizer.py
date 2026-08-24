@@ -83,7 +83,6 @@ from nemo_automodel.shared.multimodal_fsdp import (
     module_parameters,
     normalize_frozen_multimodal_sharding,
 )
-from nemo_automodel.shared.task_heads import exclude_task_heads_from_tp_plan
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
@@ -338,14 +337,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             # Generate or use tensor parallel plan
             model_parallel_plan = {
                 k: translate_to_lora(v)
-                for k, v in exclude_task_heads_from_tp_plan(
+                for k, v in _get_parallel_plan(
                     model,
-                    _get_parallel_plan(
-                        model,
-                        sequence_parallel,
-                        tp_shard_plan,
-                        tp_size=tp_mesh.size(),
-                    ),
+                    sequence_parallel,
+                    tp_shard_plan,
+                    tp_size=tp_mesh.size(),
                 ).items()
             }
 
@@ -524,7 +520,6 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
             model_tp_plan: dict[str, ParallelStyle] = {
                 "lm_head": translate_to_lora(ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)),
             }
-            model_tp_plan = exclude_task_heads_from_tp_plan(model, model_tp_plan)
 
             mlp_tp_plan: dict[str, ParallelStyle] = {
                 "mixer.up_proj": translate_to_lora(ColwiseParallel()),

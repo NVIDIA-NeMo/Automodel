@@ -100,27 +100,6 @@ _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 logger = logging.getLogger(__name__)
 
 
-def _remove_base_checkpoint_task_heads(
-    state_dict: dict[str, torch.Tensor],
-    prefixes: list[str],
-) -> dict[str, torch.Tensor]:
-    """Remove task-head tensors intentionally omitted from a base-model load.
-
-    Args:
-        state_dict: Full base-checkpoint state dictionary. Tensor shapes are
-            model-dependent and keys are native model parameter FQNs. The mapping
-            is mutated in place.
-        prefixes: Native model parameter FQN prefixes to remove.
-
-    Returns:
-        The same state-dict mapping with matching task-head tensors removed.
-    """
-    for key in tuple(state_dict):
-        if any(key.startswith(prefix) for prefix in prefixes):
-            state_dict.pop(key)
-    return state_dict
-
-
 def _format_restricted_load_error(f: FileLike) -> str:
     return (
         f"Refusing to load torch artifact from {f!r} with pickle-based torch.load. "
@@ -839,10 +818,6 @@ class Checkpointer:
                         "Materialized missing tied lm_head.weight from embedding weights for %s during init load.",
                         type(model_state.model[0]).__name__,
                     )
-                _remove_base_checkpoint_task_heads(
-                    converted_state_dict,
-                    model_state.skip_task_head_prefixes,
-                )
                 # Load using full_state_dict=True to properly convert tensors to DTensors for FSDP
                 _load_full_state_dict_into_model(model_state.model, converted_state_dict)
                 return
@@ -913,11 +888,6 @@ class Checkpointer:
                     "Materialized missing tied lm_head.weight from embedding weights for %s during init load.",
                     type(model_state.model[0]).__name__,
                 )
-
-            _remove_base_checkpoint_task_heads(
-                state_dict_from_disk,
-                model_state.skip_task_head_prefixes,
-            )
 
             total_bytes = sum(
                 t.nelement() * t.element_size() for t in state_dict_from_disk.values() if isinstance(t, torch.Tensor)

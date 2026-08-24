@@ -28,7 +28,6 @@ import gc
 import inspect
 import logging
 import os
-from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -400,7 +399,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
-        pre_fsdp_hook: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
         _retry_depth=0,
         **kwargs,
     ):
@@ -450,7 +448,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 peft_config=peft_config,
                 fp8_config=fp8_config,
                 compile_config=compile_config,
-                pre_fsdp_hook=pre_fsdp_hook,
                 load_base_model=load_base_model,
                 _retry_depth=_retry_depth + 1,
                 **retry_kwargs,
@@ -639,7 +636,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             freeze_config=freeze_config,
             weights_already_loaded=weights_already_loaded,
             inject_te_attention=inject_te_attention,
-            pre_fsdp_hook=pre_fsdp_hook,
         )
 
         return model
@@ -662,7 +658,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        pre_fsdp_hook: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -716,14 +711,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 If provided, FP8 quantization will be applied. Default: None.
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled. Default: None.
-            pre_fsdp_hook: Optional in-place model-structure hook invoked after model and
-                kernel/lower-precision transforms and any load-before-shard base-model
-                restore, but before state-key capture and FSDP wrapping. It must return
-                the fresh task module it attached to the model. AutoModel excludes that
-                module from TP and lower-precision transforms, keeps it trainable with
-                PEFT, and owns it in an FP32 FSDP unit. The hook must be deterministic
-                on every rank, avoid collectives, and keep weight-tying configuration
-                consistent with its structural changes.
             **kwargs: Additional keyword arguments. Notable ones include:
                 - has_packed_sequence (bool): Whether using packed sequences. Default: False.
                 - cache_dir (str): Cache directory for model weights.
@@ -791,7 +778,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             peft_config=peft_config,
             fp8_config=fp8_config,
             compile_config=compile_config,
-            pre_fsdp_hook=pre_fsdp_hook,
             load_base_model=True,
             **kwargs,
         )
@@ -814,7 +800,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        pre_fsdp_hook: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -898,7 +883,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             peft_config=peft_config,
             fp8_config=fp8_config,
             compile_config=compile_config,
-            pre_fsdp_hook=pre_fsdp_hook,
             load_base_model=kwargs.pop("load_base_model", False),
             **kwargs,
         )

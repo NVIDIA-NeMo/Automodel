@@ -143,38 +143,6 @@ class TestResolveMeshContext:
 
 
 class TestFromPretrainedDeviceMesh:
-    def test_forwards_pre_fsdp_hook_configuration_to_build_model(self):
-        hook = MagicMock()
-
-        with (
-            patch("torch.cuda.current_device", return_value=0),
-            patch("nemo_automodel._transformers.auto_model.instantiate_infrastructure") as mock_infra,
-            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=MagicMock()),
-            patch("nemo_automodel._transformers.auto_model.get_is_hf_model", return_value=True),
-            patch("nemo_automodel._transformers.auto_model.resolve_sdpa_method", return_value=None),
-            patch.object(NeMoAutoModelForCausalLM, "_build_model", return_value=MagicMock()) as mock_build,
-        ):
-            mock_infra.return_value = (None, None, None, None)
-
-            NeMoAutoModelForCausalLM.from_pretrained(
-                "test-model",
-                pre_fsdp_hook=hook,
-            )
-
-        assert mock_build.call_args.kwargs["pre_fsdp_hook"] is hook
-
-    def test_from_config_forwards_pre_fsdp_hook_configuration_to_build_model(self):
-        hook = MagicMock()
-
-        with patch.object(_BaseNeMoAutoModelClass, "_build_model", return_value=MagicMock()) as mock_build:
-            _BaseNeMoAutoModelClass.from_config(
-                config=MagicMock(name_or_path="test"),
-                trust_remote_code=False,
-                pre_fsdp_hook=hook,
-            )
-
-        assert mock_build.call_args.kwargs["pre_fsdp_hook"] is hook
-
     def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
         sentinel_model = object()
@@ -1570,8 +1538,6 @@ class TestBuildModelRetryDepth:
         """When the retried call succeeds, the model is returned normally."""
         build_kwargs, mock_config = self._make_build_kwargs()
         sentinel_model = MagicMock()
-        hook = MagicMock()
-        build_kwargs["pre_fsdp_hook"] = hook
         with (
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
             patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
@@ -1593,7 +1559,6 @@ class TestBuildModelRetryDepth:
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert result is sentinel_model
             assert mock_init.call_count == 2
-            assert mock_apply.call_args.kwargs["pre_fsdp_hook"] is hook
 
     def test_build_model_applies_runtime_patches_before_infrastructure(self):
         """Model runtime hooks run after construction and before sharding/checkpoint infra."""

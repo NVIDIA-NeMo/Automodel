@@ -24,15 +24,12 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
-from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Union
 
 import torch
-import torch.distributed as dist
-from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 
 from nemo_automodel._transformers.utils import _should_load_before_shard
 from nemo_automodel._transformers.v4_patches.kv_sharing import (
@@ -62,7 +59,6 @@ from nemo_automodel.components.distributed.megatron_fsdp import (
     snapshot_distributed_param_attrs,
 )
 from nemo_automodel.components.distributed.mesh import MeshContext
-from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -81,12 +77,7 @@ from nemo_automodel.components.utils.model_utils import (
     init_empty_weights,
     print_trainable_parameters,
 )
-from nemo_automodel.shared.task_heads import (
-    is_task_head_parameter,
-    register_task_head_module,
-    task_head_module,
-)
-from nemo_automodel.shared.tied_weights import ensure_tied_lm_head, is_tied_word_embeddings
+from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
@@ -214,30 +205,6 @@ def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
 
 def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext):
     """Apply EP + FSDP sharding (non-PP path)."""
-    managed_task_head = task_head_module(model)
-    if managed_task_head is not None and get_world_size_safe() > 1:
-        if not isinstance(model_wrapper, FSDP2Manager):
-            raise NotImplementedError("The managed pre-FSDP task module currently requires FSDP2")
-        if mesh.device_mesh is None:
-            raise ValueError("The managed pre-FSDP task module requires a device mesh")
-        fsdp_mesh = get_fsdp_dp_mesh(mesh.device_mesh, "dp_replicate", "dp_shard_cp")
-        task_head_mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.float32,
-            reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
-            cast_forward_inputs=True,
-        )
-        if isinstance(managed_task_head, FSDPModule):
-            raise RuntimeError("The managed task module must not already be FSDP-wrapped")
-        # A size-one data mesh still needs its own FSDP unit under pure TP:
-        # otherwise the later root unit inherits the backbone's BF16 policy.
-        fully_shard(
-            managed_task_head,
-            mesh=fsdp_mesh,
-            mp_policy=task_head_mp_policy,
-            offload_policy=model_wrapper.offload_policy,
-            reshard_after_forward=False,
-        )
     if parallelize_fn is not None and get_world_size_safe() > 1:
         parallelize_fn(
             model,
@@ -251,36 +218,6 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext):
             model[0] if isinstance(model, tuple) else model
         )  # MegatronFSDP will return (model, None) since we don't pass optimizer here
     return model
-
-
-@torch.no_grad()
-def _sync_task_head_replicas(model: torch.nn.Module, mesh: MeshContext, device: torch.device) -> None:
-    """Broadcast the local task-head shard across the TP replica axis."""
-    managed_task_head = task_head_module(model)
-    if (
-        managed_task_head is None
-        or mesh.device_mesh is None
-        or "tp" not in (mesh.device_mesh.mesh_dim_names or ())
-        or not dist.is_available()
-        or not dist.is_initialized()
-    ):
-        return
-
-    replica_mesh = mesh.device_mesh["tp"]
-    if replica_mesh.size() <= 1:
-        return
-    group = replica_mesh.get_group()
-    source_rank = dist.get_process_group_ranks(group)[0]
-    backend = str(dist.get_backend(group)).lower()
-    for parameter in managed_task_head.parameters():
-        to_local = getattr(parameter, "to_local", None)
-        local = to_local() if callable(to_local) else parameter
-        if "nccl" in backend and local.device.type != "cuda":
-            communication_tensor = local.to(device=device)
-            dist.broadcast(communication_tensor, src=source_rank, group=group)
-            local.copy_(communication_tensor.to(device=local.device))
-        else:
-            dist.broadcast(local, src=source_rank, group=group)
 
 
 #  Infrastructure instantiation (config -> runtime objects)
@@ -546,7 +483,6 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
-    pre_fsdp_hook: Callable[[torch.nn.Module], torch.nn.Module] | None = None,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -585,14 +521,6 @@ def apply_model_infrastructure(
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
-        pre_fsdp_hook: Optional in-place model-structure hook invoked after lower-
-            precision and attention transforms and any load-before-shard base-model
-            restore, but before state-key capture and FSDP wrapping. It must return
-            the fresh task module it attached to the model. AutoModel excludes that
-            module from TP/PEFT/quantization transforms and manages it as a trainable
-            FP32 FSDP unit. The hook must make the same deterministic change on every
-            rank, avoid collectives, and keep model configuration such as weight tying
-            consistent with its changes.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -600,12 +528,6 @@ def apply_model_infrastructure(
     """
     if mesh is None:
         mesh = MeshContext()
-
-    if pre_fsdp_hook is not None and not callable(pre_fsdp_hook):
-        raise TypeError("pre_fsdp_hook must be callable or None.")
-
-    if pre_fsdp_hook is not None and (autopipeline is not None or mesh.pp_size != 1):
-        raise NotImplementedError("pre_fsdp_hook does not support pipeline parallelism")
 
     # Create a checkpointer for loading base weights only. Keep consolidation disabled
     # so load-only infrastructure does not emit save/export warnings.
@@ -629,9 +551,9 @@ def apply_model_infrastructure(
     if checkpointer.config.dequantize_base_checkpoint is None:
         checkpointer.config.dequantize_base_checkpoint = hasattr(getattr(model, "config", None), "quantization_config")
 
-    # Apply PEFT and lower precision if configured. The task hook runs after
-    # these transforms so a fresh task head is not silently LoRA-wrapped,
-    # quantized, or converted to FP8/QAT.
+    # Apply PEFT and lower precision if configured
+    # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
+    # This allows copy operations between meta tensors to succeed (they're no-ops)
     peft_ctx = init_empty_weights() if is_meta_device else nullcontext()
     with peft_ctx:
         model = _apply_peft_and_lower_precision(
@@ -684,44 +606,6 @@ def apply_model_infrastructure(
                 load_base_model=load_base_model,
             )
         checkpoint_already_loaded = True
-
-    task_head_needing_reset: str | None = None
-    if pre_fsdp_hook is not None:
-        pre_hook_module_ids = {id(module) for module in model.modules()}
-        pre_hook_parameter_ids = {id(parameter) for parameter in model.parameters()}
-        # A load-before-shard model has already been materialized above. A
-        # post-shard-load model is still meta, so construct its fresh modules on
-        # meta too and initialize them only after FSDP materialization.
-        has_meta_tensors = any(parameter.device.type == "meta" for parameter in model.parameters()) or any(
-            buffer.device.type == "meta" for buffer in model.buffers()
-        )
-        # Native/BnB quantized models may already reside on the training device
-        # and cannot be moved afterwards. Make implicit task-module construction
-        # follow that device; meta models must stay meta until FSDP materializes
-        # them below.
-        hook_context = init_empty_weights() if has_meta_tensors else torch.device(device)
-        with hook_context:
-            task_module = pre_fsdp_hook(model)
-
-        name = register_task_head_module(
-            model,
-            task_module,
-            pre_hook_module_ids=pre_hook_module_ids,
-            pre_hook_parameter_ids=pre_hook_parameter_ids,
-        )
-        if is_tied_word_embeddings(model):
-            raise ValueError(
-                "A managed task module requires an untied output head; the hook must disable supported "
-                "embedding tying and tied-only architectures are unsupported"
-            )
-        if any(parameter.device.type == "meta" for parameter in model.get_submodule(name).parameters()):
-            task_head_needing_reset = name
-            reset_parameters = getattr(model.get_submodule(name), "reset_parameters", None)
-            if not callable(reset_parameters):
-                raise TypeError(
-                    f"Managed task module {name!r} was created on meta and must implement reset_parameters()"
-                )
-        checkpointer.config.skip_task_head_prefixes_for_base_model = [f"{name}."]
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     state_dict_adapter = getattr(model, "state_dict_adapter", None)
@@ -835,25 +719,13 @@ def apply_model_infrastructure(
         checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
     )
 
-    # Base checkpoints intentionally omit the fresh task module. Initialize it
-    # only when the hook created it on meta, after materialization and base load,
-    # so architecture-specific model initializers cannot skip or overwrite them.
-    if task_head_needing_reset is not None:
-        managed_task_head = task_head_module(model)
-        if managed_task_head is None:
-            raise RuntimeError("The managed task module disappeared during model parallelization")
-        managed_task_head.to(dtype=torch.float32)
-        if any(parameter.dtype != torch.float32 for parameter in managed_task_head.parameters()):
-            raise RuntimeError("Failed to restore the managed task module to float32 after model initialization")
-        managed_task_head.reset_parameters()
-
     # Freeze parameters after checkpoint loading and parallelization
     # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)
     if peft_config is not None:
         models_to_freeze = model.parts if hasattr(model, "parts") else [model]
         for mp in models_to_freeze:
             for name, param in mp.named_parameters():
-                if "lora_" not in name and not is_task_head_parameter(mp, name) and param.requires_grad:
+                if "lora_" not in name and param.requires_grad:
                     param.requires_grad_(False)
 
     if autopipeline is None:
@@ -885,8 +757,6 @@ def apply_model_infrastructure(
                     model.to_empty(device=device)
                 else:
                     raise
-
-    _sync_task_head_replicas(model, mesh, device)
 
     # Configure dense attention parallelism. Transformer Engine must know its
     # TP head partition even without CP; for CP, TE owns THD communication while

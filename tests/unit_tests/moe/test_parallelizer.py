@@ -979,31 +979,6 @@ def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):
     assert outer_call is not None and outer_call[1]["mesh"] is fsdp_mesh
 
 
-def test_apply_fsdp_does_not_double_wrap_pre_wrapped_task_head(monkeypatch):
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    monkeypatch.setattr(P, "MoE", DummyMoE)
-
-    fully_shard_mock = MagicMock()
-    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
-    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
-
-    block = DummyBlock(mlp=DummyMoE())
-    task_head = P.FSDPModule()
-    model = DummyModel([block], lm_head=task_head)
-    fsdp_mesh = object()
-
-    P.apply_fsdp(
-        model=model,
-        fsdp_mesh=fsdp_mesh,
-        ep_enabled=True,
-        ep_shard_enabled=False,
-    )
-
-    assert _find_call_by_first_arg(fully_shard_mock, task_head) is None
-    assert _find_call_by_first_arg(fully_shard_mock, block) is not None
-    assert _find_call_by_first_arg(fully_shard_mock, model) is not None
-
-
 def test_apply_fsdp_rejects_cross_root_tied_embeddings_without_outer_wrap(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
