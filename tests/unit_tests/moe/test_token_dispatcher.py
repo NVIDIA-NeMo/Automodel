@@ -20,22 +20,10 @@ import torch
 
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
-    TokenDispatcherConfig,
     _DeepepManager,
     _HybridEPManager,
     _HybridEPMetadataProcessor,
 )
-
-
-@pytest.mark.parametrize(
-    ("backend", "expected"),
-    [("hybridep", True), ("deepep", False), ("uccl_ep", False)],
-)
-def test_dispatcher_reports_uniform_token_count_requirement(backend, expected):
-    dispatcher = object.__new__(MoEFlexTokenDispatcher)
-    dispatcher.config = TokenDispatcherConfig(moe_flex_dispatcher_backend=backend)
-
-    assert dispatcher.requires_uniform_token_count is expected
 
 
 @pytest.fixture

@@ -252,7 +252,6 @@ def _repad_dsv4_packed_batch(
     cp_size: int,
     pad_multiple: int,
     padding_token_id: int,
-    sync_packed_length: bool = False,
     loss_mask: torch.Tensor | None = None,
 ) -> tuple[dict, torch.Tensor | None, torch.Tensor]:
     """Insert DSV4 compression-safe padding into packed BSHD rows before CP slicing.
@@ -261,9 +260,7 @@ def _repad_dsv4_packed_batch(
     compression additionally needs document boundaries to align to compressor
     windows; CSA then uses ``packed_seq_ids`` to reset the previous-window overlap.
     This routine rebuilds each row from real sequence spans, pads every span to
-    ``pad_multiple``, and appends row-level pack padding with sequence ID 0. When
-    requested for HybridEP, the final physical length is max-reduced across ranks
-    before CP slicing so every rank in a flattened DP x CP expert group is uniform.
+    ``pad_multiple``, and appends row-level pack padding with sequence ID 0.
     """
     if "seq_lens" not in batch:
         raise KeyError("DSV4 packed context parallelism requires `seq_lens` in the batch.")
@@ -377,13 +374,6 @@ def _repad_dsv4_packed_batch(
         row_lengths.append(rebuilt_primary[-1].shape[0])
 
     total_seq_len = _pad_length(max(row_lengths), cp_size * pad_multiple)
-    if sync_packed_length and dist.is_available() and dist.is_initialized():
-        # HybridEP flattens DP x CP into one EP group and requires every rank to
-        # contribute the same number of tokens. Different DP packs can acquire
-        # different amounts of per-document compression padding.
-        length = torch.tensor(total_seq_len, dtype=torch.int64, device=primary.device)
-        dist.all_reduce(length, op=dist.ReduceOp.MAX)
-        total_seq_len = int(length.item())
 
     def _right_pad_rows(rows: list[torch.Tensor], fill_value, *, dtype=None) -> torch.Tensor:
         padded = []
@@ -429,14 +419,11 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     loss_mask=None,
     padding_token_id: int = 0,
     pad_multiple: int | None = None,
-    sync_packed_length: bool = False,
 ):
     """Contiguously shard a batch for DeepSeek V4 Miles-style context parallelism.
 
     Exposed as ``ContextParallelSharder.shard_batch`` (via ``functools.partial`` to bind
-    ``pad_multiple``) and invoked by the CP dispatch. HybridEP can
-    first max-reduce packed lengths so every rank contributes a uniform token count.
-    Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
+    ``pad_multiple``) and invoked by the CP dispatch. Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
     K/V across CP ranks during forward. Returns ``(nullcontext, batch, layout)``;
     at CP size one, ``layout`` records the unchanged sequence length so token
     outputs can still use ``gather_token_tensor(trim=True)``.
@@ -457,8 +444,6 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             model inputs.
         padding_token_id: Token value used for physical sequence padding.
         pad_multiple: Required local sequence-length multiple.
-        sync_packed_length: Whether to max-reduce packed physical lengths across
-            the HybridEP reduction group before CP slicing.
 
     Returns:
         A null context factory, the local model-input mapping, and a
@@ -508,7 +493,6 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             cp_size=cp_size,
             pad_multiple=local_multiple,
             padding_token_id=padding_token_id,
-            sync_packed_length=sync_packed_length,
             loss_mask=loss_mask,
         )
 
