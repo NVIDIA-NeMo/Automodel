@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -48,6 +49,37 @@ from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3M
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
 from nemo_automodel.components.models.qwen3_vl_moe.state_dict_adapter import Qwen3VLMoeStateDictAdapter
+
+
+class _AllocatingKeysAdapter(StateDictAdapter):
+    """Test adapter whose normal conversion joins two tensors."""
+
+    def __init__(self) -> None:
+        self.converted_devices: list[torch.device] = []
+
+    def to_hf(self, state_dict, **kwargs):
+        self.converted_devices = [value.device for value in state_dict.values() if isinstance(value, torch.Tensor)]
+        return {"fused.weight": torch.cat((state_dict.pop("q.weight"), state_dict.pop("k.weight")), dim=0)}
+
+    def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
+        return hf_state_dict
+
+    def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+        return [(fqn, tensor)]
+
+
+def test_get_hf_state_dict_keys_uses_shape_only_tensors() -> None:
+    adapter = _AllocatingKeysAdapter()
+    state_dict = {
+        "q.weight": torch.ones(4, 8),
+        "k.weight": torch.ones(2, 8),
+    }
+
+    keys = adapter.get_hf_state_dict_keys(state_dict)
+
+    assert keys == ["fused.weight"]
+    assert adapter.converted_devices == [torch.device("meta"), torch.device("meta")]
+    assert list(state_dict) == ["q.weight", "k.weight"]
 
 
 def _assert_destinations_write_through(
@@ -98,7 +130,7 @@ def test_write_through_adapters_expose_aliasing_destinations(
     adapter = object.__new__(adapter_type)
     adapter.__dict__.update(adapter_attrs)
 
-    assert adapter.supports_write_through_checkpoint_load is True
+    assert adapter.supports_low_memory_dcp_load is True
 
     _assert_destinations_write_through(
         adapter,
@@ -124,7 +156,7 @@ def test_write_through_adapters_expose_aliasing_destinations(
         Qwen3OmniMoeStateDictAdapter,
     ],
 )
-def test_write_through_grouped_adapters_preserve_non_expert_storage_and_require_aliasing_backend(
+def test_low_memory_dcp_grouped_adapters_preserve_non_expert_storage_and_require_model_backed_experts(
     adapter_type: type[StateDictAdapter],
 ) -> None:
     moe_config = SimpleNamespace(n_routed_experts=2, moe_inter_dim=2, expert_activation="silu")
@@ -133,7 +165,7 @@ def test_write_through_grouped_adapters_preserve_non_expert_storage_and_require_
         moe_config,
         SimpleNamespace(experts="torch", dispatcher="torch"),
     )
-    assert adapter.supports_write_through_checkpoint_load is True
+    assert adapter.supports_low_memory_dcp_load is True
 
     _assert_destinations_write_through(
         adapter,
@@ -145,16 +177,21 @@ def test_write_through_grouped_adapters_preserve_non_expert_storage_and_require_
     )
 
     adapter.backend = SimpleNamespace(experts="te", dispatcher="torch")
-    assert adapter.supports_write_through_checkpoint_load is False
+    assert adapter.supports_low_memory_dcp_load is True
+
+    adapter.backend = SimpleNamespace(experts="te", dispatcher="deepep")
+    with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+        assert adapter.supports_low_memory_dcp_load is False
+    with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
+        assert adapter.supports_low_memory_dcp_load is True
 
     adapter.backend = SimpleNamespace(experts="torch", dispatcher="mok")
-    assert adapter.supports_write_through_checkpoint_load is False
+    assert adapter.supports_low_memory_dcp_load is False
 
 
 @pytest.mark.parametrize(
     "adapter_type",
     [
-        BailingMoeV2StateDictAdapter,
         DeepSeekV3StateDictAdapter,
         GlmMoeDsaStateDictAdapter,
         KimiK25VLStateDictAdapter,
@@ -165,19 +202,26 @@ def test_write_through_grouped_adapters_preserve_non_expert_storage_and_require_
         MiniMaxM3StateDictAdapter,
     ],
 )
-def test_materializing_grouped_expert_adapters_keep_frugal_load(adapter_type):
+def test_materializing_grouped_expert_adapters_do_not_enable_low_memory_dcp(adapter_type):
     adapter = object.__new__(adapter_type)
     adapter.moe_config = object()
     adapter.backend = SimpleNamespace(experts="torch", dispatcher="torch")
 
-    assert adapter.supports_write_through_checkpoint_load is False
+    assert adapter.supports_low_memory_dcp_load is False
 
 
-def test_gemma4_moe_adapter_loads_without_a_full_checkpoint_copy():
+def test_gemma4_moe_adapter_supports_low_memory_dcp():
     adapter = object.__new__(Gemma4MoEStateDictAdapter)
 
-    assert adapter.supports_write_through_checkpoint_load is False
-    assert adapter.supports_checkpoint_load_without_full_copy is True
+    assert adapter.supports_low_memory_dcp_load is True
+
+
+def test_ling_adapter_supports_low_memory_dcp():
+    adapter = object.__new__(BailingMoeV2StateDictAdapter)
+    adapter.moe_config = SimpleNamespace(expert_bias=False)
+    adapter.backend = SimpleNamespace(experts="torch_mm", dispatcher="torch")
+
+    assert adapter.supports_low_memory_dcp_load is True
 
 
 def test_dense_grouped_adapter_does_not_require_an_expert_backend():
@@ -185,13 +229,13 @@ def test_dense_grouped_adapter_does_not_require_an_expert_backend():
     adapter.moe_config = None
     adapter.backend = SimpleNamespace(experts="te", dispatcher="mok")
 
-    assert adapter.supports_write_through_checkpoint_load is True
+    assert adapter.supports_low_memory_dcp_load is True
 
 
-def test_nemotron_omni_delegates_direct_load_support_to_language_adapter():
+def test_nemotron_omni_delegates_low_memory_dcp_support_to_language_adapter():
     adapter = object.__new__(NemotronOmniStateDictAdapter)
-    adapter._llm_adapter = SimpleNamespace(supports_write_through_checkpoint_load=True)
-    assert adapter.supports_write_through_checkpoint_load is True
+    adapter._llm_adapter = SimpleNamespace(supports_low_memory_dcp_load=True)
+    assert adapter.supports_low_memory_dcp_load is True
 
-    adapter._llm_adapter.supports_write_through_checkpoint_load = False
-    assert adapter.supports_write_through_checkpoint_load is False
+    adapter._llm_adapter.supports_low_memory_dcp_load = False
+    assert adapter.supports_low_memory_dcp_load is False

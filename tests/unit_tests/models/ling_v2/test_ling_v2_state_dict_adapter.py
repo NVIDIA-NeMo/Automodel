@@ -78,7 +78,7 @@ def backend_config():
         attn="sdpa",
         linear="torch",
         rms_norm="torch",
-        experts="torch",
+        experts="torch_mm",
         dispatcher="torch",
         enable_hf_state_dict_adapter=False,
     )
@@ -222,3 +222,67 @@ class TestRoundTrip:
                 hf_sd[f"model.layers.{L}.attention.dense.weight"],
             )
         torch.testing.assert_close(roundtripped["model.word_embeddings.weight"], hf_sd["model.word_embeddings.weight"])
+
+
+class TestLowMemoryDcpLoad:
+    def test_uses_only_fused_qkv_temporaries(self, adapter, config, moe_config):
+        q_size = config.num_attention_heads * config.head_dim
+        kv_size = config.num_key_value_heads * config.head_dim
+        q_proj = torch.randn(q_size, config.hidden_size)
+        k_proj = torch.randn(kv_size, config.hidden_size)
+        v_proj = torch.randn(kv_size, config.hidden_size)
+        grouped_gate_up = torch.randn(
+            moe_config.n_routed_experts,
+            moe_config.dim,
+            2 * moe_config.moe_inter_dim,
+        )
+        grouped_down = torch.randn(
+            moe_config.n_routed_experts,
+            moe_config.moe_inter_dim,
+            moe_config.dim,
+        )
+        native = {
+            "model.layers.1.self_attn.q_proj.weight": q_proj,
+            "model.layers.1.self_attn.k_proj.weight": k_proj,
+            "model.layers.1.self_attn.v_proj.weight": v_proj,
+            "model.layers.1.mlp.experts.gate_and_up_projs": grouped_gate_up,
+            "model.layers.1.mlp.experts.down_projs": grouped_down,
+        }
+
+        destinations = adapter.to_hf(native, for_checkpoint_load=True)
+
+        fused_qkv = destinations["model.layers.1.attention.query_key_value.weight"]
+        assert fused_qkv.shape == (q_size + 2 * kv_size, config.hidden_size)
+        assert fused_qkv.numel() == q_proj.numel() + k_proj.numel() + v_proj.numel()
+        qkv_storage = {
+            q_proj.untyped_storage().data_ptr(),
+            k_proj.untyped_storage().data_ptr(),
+            v_proj.untyped_storage().data_ptr(),
+        }
+        assert fused_qkv.untyped_storage().data_ptr() not in qkv_storage
+
+        gate_destination = destinations["model.layers.1.mlp.experts.0.gate_proj.weight"]
+        up_destination = destinations["model.layers.1.mlp.experts.0.up_proj.weight"]
+        down_destination = destinations["model.layers.1.mlp.experts.0.down_proj.weight"]
+        assert gate_destination.untyped_storage().data_ptr() == grouped_gate_up.untyped_storage().data_ptr()
+        assert up_destination.untyped_storage().data_ptr() == grouped_gate_up.untyped_storage().data_ptr()
+        assert down_destination.untyped_storage().data_ptr() == grouped_down.untyped_storage().data_ptr()
+
+    def test_capability_matches_runtime_expert_storage(self, adapter, monkeypatch):
+        assert adapter.supports_low_memory_dcp_load is True
+
+        adapter.backend.experts = "te"
+        adapter.backend.dispatcher = "deepep"
+        monkeypatch.setattr("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", lambda: 1)
+        assert adapter.supports_low_memory_dcp_load is True
+
+        monkeypatch.setattr("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", lambda: 8)
+        assert adapter.supports_low_memory_dcp_load is False
+
+        adapter.backend.experts = "torch_mm"
+        adapter.backend.dispatcher = "mok"
+        assert adapter.supports_low_memory_dcp_load is False
+
+        adapter.backend.dispatcher = "torch"
+        adapter.moe_config.expert_bias = True
+        assert adapter.supports_low_memory_dcp_load is False

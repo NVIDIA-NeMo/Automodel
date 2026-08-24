@@ -1009,16 +1009,23 @@ class TestInplaceLoadViews:
     conversion function, so patches must target that module path.
     """
 
-    def test_expert_write_through_capability_matches_grouped_storage_aliasing(self):
+    def test_expert_checkpoint_storage_capability_matches_grouped_storage_aliasing(self):
         mixin = MockMoEStateDictMixin()
-        assert mixin._supports_write_through_expert_checkpoint_load is True
+        assert mixin._expert_checkpoint_tensors_use_model_storage is True
 
         mixin.backend.experts = "te"
-        assert mixin._supports_write_through_expert_checkpoint_load is False
+        mixin.backend.dispatcher = "deepep"
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+            assert mixin._expert_checkpoint_tensors_use_model_storage is False
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
+            assert mixin._expert_checkpoint_tensors_use_model_storage is True
+
+        mixin.backend.dispatcher = "torch"
+        assert mixin._expert_checkpoint_tensors_use_model_storage is True
 
         mixin.backend.experts = "gmm"
         mixin.backend.dispatcher = "mok"
-        assert mixin._supports_write_through_expert_checkpoint_load is False
+        assert mixin._expert_checkpoint_tensors_use_model_storage is False
 
     def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits):
         mixin._split_experts_weights = Mock(return_value=splits)
@@ -1139,13 +1146,15 @@ class TestInplaceLoadViews:
         # the copy_ would write the throwaway and the experts would never be loaded.
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         local_storage = torch.randn(2, 1024, 1024)
         splits = [local_storage[i] for i in range(2)]
         mock_dtensor = Mock()
 
-        result = self._run_inplace_conversion(
-            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
-        )
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+            result = self._run_inplace_conversion(
+                mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+            )
 
         assert result is not None
         converted = dict(result)
@@ -1186,6 +1195,7 @@ class TestInplaceLoadViews:
     def test_te_checkpoint_layout_views_are_reused(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         gate_up_storage = torch.arange(2 * 6 * 4, dtype=torch.float32).reshape(2, 6, 4)
         down_storage = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
 
@@ -1195,6 +1205,7 @@ class TestInplaceLoadViews:
         virtual_down = down_storage.transpose(-1, -2)
 
         with (
+            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8),
             patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
             patch("torch.empty_like") as empty_like,
         ):
@@ -1233,12 +1244,14 @@ class TestInplaceLoadViews:
         """Catch allocating a second model-sized destination for TE checkpoint views."""
         mixin = MockMoEStateDictMixin(n_experts=8, inter_dim=1024, dtype=torch.bfloat16)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         # The TE stack is 64 MiB. Reusing its checkpoint-layout views fits this 70 MiB budget; allocating blank
         # destinations of the same total size would double live allocation to 128 MiB.
         gate_up_storage = torch.empty((8, 2048, 2048), dtype=torch.bfloat16, device="cuda")
         virtual_gate_up = gate_up_storage.transpose(-1, -2)
 
         with (
+            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8),
             patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
             patch("nemo_automodel.components.moe.state_dict_mixin.gc.collect") as collect,
             patch("torch.cuda.empty_cache") as empty_cache,
@@ -1258,10 +1271,14 @@ class TestInplaceLoadViews:
     def test_temporary_checkpoint_views_round_trip_loaded_values(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         initialized_gate_up = torch.full((2, 4, 6), 99.0)
         initialized_down = torch.full((2, 3, 4), 99.0)
 
-        with patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False):
+        with (
+            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8),
+            patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
+        ):
             destinations = dict(
                 mixin._convert_single_merged_expert_to_hf_split_experts(
                     "model.layers.0.mlp.experts.gate_and_up_projs",
@@ -1304,6 +1321,7 @@ class TestInplaceLoadViews:
         # Same non-aliasing reason as the gate_and_up case, for the down_projs branch.
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         local_storage = torch.randn(2, 512, 1024)
         splits = [local_storage[i] for i in range(2)]
         mock_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
@@ -1311,7 +1329,8 @@ class TestInplaceLoadViews:
         mock_dtensor.shape = (2, 512, 1024)
         mock_dtensor.is_meta = False
 
-        result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+            result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
 
         assert result is not None and len(result) == 2
         for _, v in result:
