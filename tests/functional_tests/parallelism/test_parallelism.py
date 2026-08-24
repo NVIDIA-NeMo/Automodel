@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Parallel-vs-single-rank parity tests for production recipe topologies.
+"""Parallelism parity tests for production recipe topologies.
 
 Each script runs a randomly-initialized proxy of a real recipe twice with the
-same seed and data order -- once on a single rank, once with one parallelism
-axis enabled -- and asserts both follow the same loss and gradient-norm
-trajectory. Divergence means the sharding changed the computation.
+same seed and data order, changing exactly one parallelism axis between the two
+runs, and asserts both follow the same loss and gradient-norm trajectory.
+Divergence means the sharding changed the computation.
+
+The PP and TP tests compare a parallel run against a single-rank baseline. The
+EP test compares two 2-rank runs that differ only in ``ep_size``, so the data
+sharding and FSDP wrapping match and the bound can be tighter.
 
 Covers the gap from PR #2983 (commit 00f40419).
 """
@@ -28,6 +32,8 @@ TEST_FOLDER = "parallelism"
 GEMMA4_PP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_PP2_Parity.sh"
 GEMMA4_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_TP2_Parity.sh"
 PP_GRAD_ACCUM_PARITY_FILENAME = "L2_Parallelism_PP_Grad_Accum_Parity.sh"
+DEEPSEEK_V4_PP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_PP2_Parity.sh"
+DEEPSEEK_V4_EP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_EP2_Parity.sh"
 
 
 class TestParallelismParity:
@@ -39,3 +45,9 @@ class TestParallelismParity:
 
     def test_pp_grad_accum_parity(self):
         run_test_script(TEST_FOLDER, PP_GRAD_ACCUM_PARITY_FILENAME)
+
+    def test_deepseek_v4_pp2_parity(self):
+        run_test_script(TEST_FOLDER, DEEPSEEK_V4_PP2_PARITY_FILENAME)
+
+    def test_deepseek_v4_ep2_parity(self):
+        run_test_script(TEST_FOLDER, DEEPSEEK_V4_EP2_PARITY_FILENAME)
