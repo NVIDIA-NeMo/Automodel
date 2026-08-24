@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_automodel.engine import ForwardBackwardResult
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
 
@@ -135,7 +134,24 @@ def mock_recipe(mock_config, monkeypatch):
             intermediate_size=3072,
         )
         recipe.optimizer = [MagicMock()]
-        recipe.loss_fn = object()
+        engine_state = {"micro_step": 0}
+
+        def is_gradient_accumulation_boundary():
+            return engine_state["micro_step"] + 1 == 8
+
+        def engine_step():
+            engine_state["micro_step"] += 1
+            if engine_state["micro_step"] == 8:
+                recipe.optimizer[0].step()
+                recipe.optimizer[0].zero_grad(set_to_none=True)
+                engine_state["micro_step"] = 0
+
+        recipe.engine = SimpleNamespace(
+            is_gradient_accumulation_boundary=MagicMock(side_effect=is_gradient_accumulation_boundary),
+            step=MagicMock(side_effect=engine_step),
+            set_gradient_accumulation_steps=MagicMock(),
+        )
+        recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=MagicMock())
         recipe.dataloader = MagicMock()
         recipe.val_dataloader = None
         recipe.pp_enabled = False
@@ -156,17 +172,27 @@ def mock_recipe(mock_config, monkeypatch):
         recipe.step_scheduler = SimpleNamespace(step=0, gc_every_steps=None)
         recipe._dp_allreduce = MagicMock(side_effect=lambda x, include_cp=False: x)
         recipe.device_mesh = None
-        recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=MagicMock())
-        recipe.engine = MagicMock()
-        recipe.engine.forward_backward.return_value = ForwardBackwardResult(
-            loss=torch.tensor(0.5),
-            loss_sum=torch.tensor(12.0),
-            weight_sum=torch.tensor(24.0),
-            token_outputs=[],
-            batch_outputs=[],
-        )
-        recipe.engine.step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
         return recipe
+
+
+def _configure_one_iteration(recipe, batches):
+    """Trim the benchmark fixture to one two-microbatch optimizer window."""
+    recipe.cfg.step_scheduler.local_batch_size = 2
+    recipe.cfg.step_scheduler.global_batch_size = 4
+    recipe._get_dp_group_size = MagicMock(return_value=1)
+    recipe._bench_steps = 1
+    recipe._bench_warmup_steps = 0
+    recipe.dataloader.__iter__ = MagicMock(return_value=iter(batches))
+    recipe.timers._get_global_min_max_time = MagicMock(
+        return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
+    )
+    timer = MagicMock()
+    timer.active_time.return_value = 1.0
+    recipe.timers._timers = {
+        "setup": timer,
+        "iteration": timer,
+        "iteration_warmup": timer,
+    }
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
@@ -351,6 +377,13 @@ class TestBenchmarkingRecipeRunBenchmark:
     def test_run_benchmark_sets_models_to_train_mode(self, mock_recipe):
         """Test that run_benchmark sets all models to training mode."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+
+        # Mock _forward_backward_step to append loss to loss_buffer
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
         mock_recipe.timers._get_global_min_max_time = MagicMock(
             return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
@@ -386,6 +419,13 @@ class TestBenchmarkingRecipeRunBenchmark:
     def test_run_benchmark_calculates_gradient_accumulation_steps(self, mock_recipe):
         """Test that gradient accumulation steps are calculated correctly."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+
+        # Mock _forward_backward_step to append loss to loss_buffer
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
         mock_recipe.timers._get_global_min_max_time = MagicMock(
             return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
@@ -418,22 +458,85 @@ class TestBenchmarkingRecipeRunBenchmark:
             # global_batch_size=256, local_batch_size=4, dp_size=8
             # ga_steps = 256 / (4 * 8) = 8
             expected_ga_steps = 8
-            assert mock_recipe.engine.forward_backward.call_count == 30
-            assert all(
-                len(call.args[0]) == expected_ga_steps for call in mock_recipe.engine.forward_backward.call_args_list
+            # Verify forward_backward_step was called expected_ga_steps times per iteration
+            assert mock_recipe._forward_backward_step.call_count == 30 * expected_ga_steps
+            assert (
+                mock_recipe.engine.set_gradient_accumulation_steps.call_args_list == [((expected_ga_steps,), {})] * 30
             )
-            assert torch.cuda.nvtx.range_push.call_count == 30
-            assert torch.cuda.nvtx.range_pop.call_count == 30
-            torch.cuda.nvtx.range_push.assert_any_call("iteration_0_forward_backward")
-            torch.cuda.nvtx.range_push.assert_any_call("iteration_29_forward_backward")
-            timer_names = [call.args[0] for call in mock_recipe.timers.call_args_list]
-            assert timer_names.count("iteration_warmup") == 10
-            assert timer_names.count("iteration") == 20
-            assert timer_names.count("forward_backward") == 30
 
-    def test_run_benchmark_leaves_gradient_clearing_to_engine(self, mock_recipe):
-        """Test that the benchmark does not bypass Engine gradient ownership."""
+    def test_run_benchmark_normalizes_each_microbatch_by_global_window_tokens(self, mock_recipe, capsys):
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, -100]])},
+            {"input_ids": torch.tensor([[4, 5, 6]]), "labels": torch.tensor([[4, -100, -100]])},
+        ]
+        _configure_one_iteration(mock_recipe, batches)
+        denominators = []
+        numerators = [3.0, 6.0]
+
+        def forward_backward_step(index, batch, *, loss_buffer, num_label_tokens, **kwargs):
+            del batch, kwargs
+            denominators.append(num_label_tokens)
+            loss_buffer.append(torch.tensor(numerators[index] / num_label_tokens))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=forward_backward_step)
+
+        with patch("torch.distributed.barrier"):
+            mock_recipe.run_benchmark()
+
+        assert denominators == [3, 3]
+        mock_recipe.engine.set_gradient_accumulation_steps.assert_called_once_with(2)
+        assert "num_label_tokens=3 | loss=3.0000" in capsys.readouterr().out
+
+    def test_run_benchmark_pipeline_uses_training_optimizer_lifecycle(self, mock_recipe, monkeypatch, capsys):
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, -100]])},
+            {"input_ids": torch.tensor([[4, 5, 6]]), "labels": torch.tensor([[4, -100, -100]])},
+        ]
+        _configure_one_iteration(mock_recipe, batches)
+        mock_recipe.pp_enabled = True
+        mock_recipe.pp = SimpleNamespace(pp_batch_size=2, pp_microbatch_size=1)
+        mock_recipe.max_grad_norm = 0.75
+        mock_recipe._broadcast_from_last_pp_stage = MagicMock(side_effect=lambda tensor: tensor)
+        mock_recipe._step_pipeline_optimizer = MagicMock(return_value=torch.tensor(1.0))
+        prepare = MagicMock()
+        prepare_final = MagicMock()
+        prepare_after_first = MagicMock()
+        monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.prepare_for_grad_accumulation", prepare)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.prepare_for_final_backward", prepare_final)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.prepare_after_first_microbatch", prepare_after_first)
+        denominators = []
+
+        def forward_backward_step(index, batch, *, loss_buffer, num_label_tokens, **kwargs):
+            del batch, kwargs
+            denominators.append(num_label_tokens)
+            loss_buffer.append(torch.tensor([3.0, 6.0][index]))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=forward_backward_step)
+
+        with patch("torch.distributed.barrier"):
+            mock_recipe.run_benchmark()
+
+        assert denominators == [3, 3]
+        prepare.assert_called_once_with(mock_recipe.model_parts, pp_enabled=True)
+        prepare_final.assert_called_once_with(mock_recipe.model_parts, pp_enabled=True)
+        prepare_after_first.assert_called_once_with()
+        mock_recipe._step_pipeline_optimizer.assert_called_once_with(
+            num_label_tokens=3,
+            max_grad_norm=0.75,
+        )
+        mock_recipe._broadcast_from_last_pp_stage.assert_called_once()
+        assert "num_label_tokens=3 | loss=3.0000" in capsys.readouterr().out
+
+    def test_run_benchmark_zero_grads_per_iteration(self, mock_recipe):
+        """Test that gradients are zeroed at the start of each iteration."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+
+        # Mock _forward_backward_step to append loss to loss_buffer
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
         mock_recipe.timers._get_global_min_max_time = MagicMock(
             return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
@@ -463,15 +566,22 @@ class TestBenchmarkingRecipeRunBenchmark:
         with patch("torch.distributed.barrier"):
             mock_recipe.run_benchmark()
 
-            mock_recipe.optimizer[0].zero_grad.assert_not_called()
-            assert mock_recipe.engine.step.call_count == 30
+            # Should be called 30 times (once per iteration)
+            assert mock_recipe.optimizer[0].zero_grad.call_count == 30
 
     def test_run_benchmark_optimizer_step_per_iteration(self, mock_recipe):
-        """Test that Engine performs one optimizer step per iteration."""
+        """Test that optimizer step is called once per iteration."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
         graph_manager = MagicMock()
         mock_recipe.partial_cuda_graph_manager = graph_manager
         mock_recipe._partial_cuda_graph_capture_pending = True
+
+        # Mock _forward_backward_step to append loss to loss_buffer
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
         mock_recipe.timers._get_global_min_max_time = MagicMock(
             return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
@@ -501,16 +611,20 @@ class TestBenchmarkingRecipeRunBenchmark:
         with patch("torch.distributed.barrier"):
             mock_recipe.run_benchmark()
 
-            assert mock_recipe.engine.step.call_count == 30
-            for call in mock_recipe.engine.step.call_args_list:
-                assert call.kwargs["before_optimizer_step"] is mock_recipe.checkpointer.maybe_wait_for_staging
-            mock_recipe.optimizer[0].step.assert_not_called()
+            # Should be called 30 times (once per iteration)
+            assert mock_recipe.optimizer[0].step.call_count == 30
             graph_manager.capture.assert_called_once_with()
             assert mock_recipe._partial_cuda_graph_capture_pending is False
 
     def test_run_benchmark_calls_gc_hook_per_iteration(self, mock_recipe):
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
         mock_recipe._maybe_collect_garbage = MagicMock()
+
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         mock_recipe.timers._get_global_min_max_time = MagicMock(
             return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
         )
@@ -539,40 +653,13 @@ class TestBenchmarkingRecipeRunBenchmark:
 
         assert mock_recipe._maybe_collect_garbage.call_count == 30
 
-    def test_run_benchmark_balances_nvtx_after_engine_failure(self, mock_recipe):
-        """Test that the aggregate NVTX range closes when Engine fails."""
-        mock_recipe._get_dp_group_size = MagicMock(return_value=8)
-        mock_recipe._bench_steps = 1
-        mock_recipe._bench_warmup_steps = 0
-        mock_recipe.dataloader.__iter__ = MagicMock(
-            return_value=iter(
-                [
-                    {
-                        "input_ids": torch.tensor([[1, 2, 3]]),
-                        "labels": torch.tensor([[1, 2, 3]]),
-                        "position_ids": torch.tensor([[0, 1, 2]]),
-                    }
-                ]
-                * 8
-            )
-        )
-
-        mock_recipe.engine.forward_backward.side_effect = RuntimeError("benchmark backward failed")
-
-        with pytest.raises(RuntimeError, match="benchmark backward failed"):
-            mock_recipe.run_benchmark()
-
-        torch.cuda.nvtx.range_push.assert_called_once_with("iteration_0_forward_backward")
-        torch.cuda.nvtx.range_pop.assert_called_once_with()
-        mock_recipe.engine.step.assert_not_called()
-
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeHelpers:
     """Test helper methods and edge cases."""
 
     def test_benchmark_with_invalid_ga_config(self, mock_recipe):
-        """Test that invalid gradient accumulation config raises assertion."""
+        """Test that invalid gradient accumulation config raises a clear error."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
         # Set invalid batch sizes that will cause assertion error
         # global_batch_size=16, local_batch_size=4, dp_size=8
@@ -580,7 +667,7 @@ class TestBenchmarkingRecipeHelpers:
         mock_recipe.cfg.step_scheduler.local_batch_size = 4
         mock_recipe.cfg.step_scheduler.global_batch_size = 16
 
-        with pytest.raises(AssertionError, match="Global batch size must be divisible"):
+        with pytest.raises(ValueError, match="global_batch_size.*positive multiple"):
             mock_recipe.run_benchmark()
 
     def test_init_requires_benchmark_section(self):
@@ -683,10 +770,17 @@ class TestBenchmarkingRecipeWandBIntegration:
         mock_recipe.timers._get_global_min_max_time = MagicMock(return_value={"iteration": (0.0, 1.5)})
 
         with patch("nemo_automodel.recipes.llm.benchmark.calculate_mfu", return_value=50.0):
-            mock_recipe._log_iteration_metrics("iteration", peak_tflops=989, rank=0, iteration=10)
+            mock_recipe._log_iteration_metrics("iteration", ga_steps=4, peak_tflops=989, rank=0, iteration=10)
 
             # Verify wandb logging was called with correct parameters
-            expected_timer_names = ["iteration", "forward_backward", "optimizer"]
+            expected_timer_names = [
+                "iteration",
+                "optimizer",
+                "forward_backward_0",
+                "forward_backward_1",
+                "forward_backward_2",
+                "forward_backward_3",
+            ]
             mock_recipe.timers.write_to_wandb.assert_called_once_with(
                 names=expected_timer_names,
                 writer=mock_recipe.wandb_run,
@@ -880,17 +974,19 @@ class TestBenchmarkingRecipeSummaryData:
 class TestBenchmarkingRecipeLossCalculation:
     """Test loss calculation and synchronization."""
 
-    def test_engine_result_drives_reported_loss(self, mock_recipe, capsys):
-        """Test that Engine's reduced loss and weight sum are reported directly."""
+    def test_loss_buffer_accumulation(self, mock_recipe):
+        """Test that losses are accumulated in buffer during gradient accumulation."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
-        mock_recipe.engine.forward_backward.side_effect = None
-        mock_recipe.engine.forward_backward.return_value = ForwardBackwardResult(
-            loss=torch.tensor(0.625),
-            loss_sum=torch.tensor(10.625),
-            weight_sum=torch.tensor(17.0),
-            token_outputs=[],
-            batch_outputs=[],
-        )
+
+        # Track loss_buffer contents
+        captured_loss_buffers = []
+
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5 + ga_step_idx * 0.1))
+                captured_loss_buffers.append(list(loss_buffer))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
 
         # Mock timers
         mock_recipe.timers._get_global_min_max_time = MagicMock(
@@ -924,17 +1020,27 @@ class TestBenchmarkingRecipeLossCalculation:
         with patch("torch.distributed.barrier"):
             mock_recipe.run_benchmark()
 
-        assert "num_label_tokens=17 | loss=0.6250" in capsys.readouterr().out
-        datums, loss_fn = mock_recipe.engine.forward_backward.call_args.args
-        assert len(datums) == 8
-        assert all(len(batch) == 1 for batch in datums)
-        assert loss_fn == mock_recipe._engine_loss_fn
+        # Verify loss_buffer was populated correctly (8 GA steps)
+        assert len(captured_loss_buffers[-1]) == 8
 
-    def test_pp_engine_result_avoids_duplicate_recipe_collectives(self, mock_recipe):
-        """Test that the PP recipe trusts Engine-synchronized loss statistics."""
+    def test_dp_allreduce_called_for_loss(self, mock_recipe):
+        """Test that DP allreduce is called for loss synchronization."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
-        mock_recipe.pp_enabled = True
-        mock_recipe.__dict__["_dp_allreduce"] = MagicMock()
+        dp_allreduce_calls = []
+
+        def track_allreduce(tensor, include_cp=False):
+            dp_allreduce_calls.append({"tensor_shape": tensor.shape, "include_cp": include_cp})
+            return tensor
+
+        # Use __dict__ to bypass state tracking
+        mock_recipe.__dict__["_dp_allreduce"] = MagicMock(side_effect=track_allreduce)
+
+        # Mock forward_backward_step
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
 
         # Mock timers
         mock_recipe.timers._get_global_min_max_time = MagicMock(
@@ -965,13 +1071,13 @@ class TestBenchmarkingRecipeLossCalculation:
             )
         )
 
-        with (
-            patch("torch.distributed.barrier"),
-            patch("torch.distributed.send") as send,
-            patch("torch.distributed.recv") as recv,
-        ):
+        with patch("torch.distributed.barrier"):
             mock_recipe.run_benchmark()
 
-        mock_recipe._dp_allreduce.assert_not_called()
-        send.assert_not_called()
-        recv.assert_not_called()
+        # Verify DP allreduce was called
+        # Should be called twice per iteration: once for num_label_tokens, once for loss
+        assert len(dp_allreduce_calls) >= 2
+
+        # Verify loss reduction includes context parallelism
+        loss_reduction_calls = [call for call in dp_allreduce_calls if call["include_cp"]]
+        assert len(loss_reduction_calls) >= 1

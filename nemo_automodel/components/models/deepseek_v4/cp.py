@@ -437,13 +437,32 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     ``pad_multiple``) and invoked by the CP dispatch. HybridEP can
     first max-reduce packed lengths so every rank contributes a uniform token count.
     Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
-    K/V across CP ranks during forward. Returns ``(nullcontext, batch)``.
+    K/V across CP ranks during forward. Returns ``(nullcontext, batch, layout)``;
+    at CP size one, ``layout`` records the unchanged sequence length so token
+    outputs can still use ``gather_token_tensor(trim=True)``.
 
     ``pad_multiple`` is the required *per-CP-rank* shard multiple (from
     ``dsv4_cp_local_seq_multiple``); the global sequence is padded so it is divisible
     by ``cp_size`` and each local shard is divisible by ``pad_multiple`` (>= 2).
     At CP size one, the native THD route only marks packed input as THD and leaves
     its tensors and packing metadata unchanged.
+
+    Args:
+        cp_mesh: Context-parallel mesh that owns contiguous sequence shards.
+        tp_mesh: Tensor-parallel mesh, forwarded to the shared contiguous sharder.
+        batch: Mapping with ``input_ids`` of shape [batch, sequence] or
+            ``inputs_embeds`` of shape [batch, sequence, hidden], ``labels`` of
+            shape [batch, sequence], and optional packed-length metadata.
+        loss_mask: Optional tensor of shape [batch, sequence] sharded with the
+            model inputs.
+        padding_token_id: Token value used for physical sequence padding.
+        pad_multiple: Required local sequence-length multiple.
+        sync_packed_length: Whether to max-reduce packed physical lengths across
+            the HybridEP reduction group before CP slicing.
+
+    Returns:
+        A null context factory, the local model-input mapping, and a
+        :class:`ShardLayout` describing the global padded sequence.
     """
     import contextlib
 
@@ -462,7 +481,14 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             batch["labels"] = loss_mask
         elif loss_mask is not None:
             batch["loss_mask"] = loss_mask
-        return contextlib.nullcontext, batch, None
+        primary_name = "inputs_embeds" if isinstance(batch.get("inputs_embeds"), torch.Tensor) else "input_ids"
+        primary = batch.get(primary_name)
+        layout = None
+        if isinstance(primary, torch.Tensor) and primary.ndim > 0:
+            is_batched = primary.ndim > (2 if primary_name == "inputs_embeds" else 1)
+            seq_len = primary.shape[1] if is_batched else primary.shape[0]
+            layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len)
+        return contextlib.nullcontext, batch, layout
 
     local_multiple = max(int(pad_multiple or 2), 2)
 

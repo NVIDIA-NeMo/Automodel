@@ -706,7 +706,7 @@ def test_process_input_for_thd_2d_position_ids_unchanged():
     assert tuple(out["position_ids"].shape) == (B * S,)
 
 
-def test_process_input_for_thd_flattens_only_explicit_engine_loss_fields():
+def test_process_input_for_thd_preserves_unrecognized_fields():
     vision_mask = torch.tensor([[False, True, False], [True, False, True]])
     advantages = torch.arange(6, dtype=torch.float32).view(2, 3)
     batch = {
@@ -716,16 +716,16 @@ def test_process_input_for_thd_flattens_only_explicit_engine_loss_fields():
         "seq_lens": torch.tensor([[3], [3]]),
         "seq_lens_padded": torch.tensor([[3], [3]]),
         "_global_vision_mask": vision_mask,
-        "__engine_loss__advantages": advantages,
+        "advantages": advantages,
     }
 
     out = process_input_for_thd(batch)
 
     assert out["_global_vision_mask"] is vision_mask
-    assert torch.equal(out["__engine_loss__advantages"], advantages.flatten())
+    assert out["advantages"] is advantages
 
 
-def test_split_batch_into_thd_chunks_keeps_engine_loss_fields_on_the_token_stream():
+def test_split_batch_into_thd_chunks_splits_arbitrary_batch_tensors():
     advantages = torch.arange(8, dtype=torch.float32).view(2, 4)
     old_logprobs = -advantages
     batch = {
@@ -734,33 +734,30 @@ def test_split_batch_into_thd_chunks_keeps_engine_loss_fields_on_the_token_strea
         "position_ids": torch.arange(4).expand(2, -1),
         "seq_lens": torch.tensor([[4], [4]]),
         "seq_lens_padded": torch.tensor([[4], [4]]),
-        "__engine_loss__advantages": advantages,
-        "__engine_loss__old_logprobs": old_logprobs,
+        "advantages": advantages,
+        "old_logprobs": old_logprobs,
     }
 
     out = split_batch_into_thd_chunks(batch, num_chunks=2)
 
-    assert out["__engine_loss__advantages"].shape == (2, 4)
-    assert torch.equal(out["__engine_loss__advantages"], advantages)
-    assert torch.equal(out["__engine_loss__old_logprobs"], old_logprobs)
+    assert out["advantages"].shape == (2, 1, 4)
+    assert torch.equal(out["advantages"].squeeze(1), advantages)
+    assert torch.equal(out["old_logprobs"].squeeze(1), old_logprobs)
 
 
 def test_split_single_packed_row_uses_document_boundaries_for_pipeline_chunks():
-    advantages = torch.arange(8, dtype=torch.float32).unsqueeze(0)
     batch = {
         "input_ids": torch.arange(1, 9).unsqueeze(0),
         "labels": torch.arange(11, 19).unsqueeze(0),
         "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
         "seq_lens": torch.tensor([[2, 2, 2, 2]]),
         "seq_lens_padded": torch.tensor([[2, 2, 2, 2]]),
-        "__engine_loss__advantages": advantages,
     }
 
     out = split_batch_into_thd_chunks(batch, num_chunks=2)
 
     assert out["input_ids"].shape == (2, 4)
     assert out["input_ids"].tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
-    assert out["__engine_loss__advantages"].tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]
     assert out["cu_seqlens"].tolist() == [[0, 2, 4], [0, 2, 4]]
 
 

@@ -14,10 +14,9 @@
 
 """Tests for VLM context-parallel wiring in ``recipes/vlm/finetune.py``.
 
-Training forward/backward and CP sharding are owned by :class:`Engine`. These
-tests cover the VLM recipe responsibilities that remain around that core:
-pipeline media staging setup, vision-frame context publication, and the
-validation handoff plus epoch-level DP aggregation.
+The VLM recipe owns context-parallel sharding and executes pipeline schedules
+directly. These tests cover pipeline media staging setup, vision-frame context
+publication, and the validation handoff plus epoch-level DP aggregation.
 """
 
 from __future__ import annotations
@@ -161,7 +160,6 @@ def _patch_pp_setup_minimals(
     validation_loader_config=None,
 ):
     monkeypatch.setattr(vlm_finetune, "AutoPipeline", _FakePPModel)
-    monkeypatch.setattr("nemo_automodel.engine._engine.AutoPipeline", _FakePPModel)
     monkeypatch.setattr(
         vlm_finetune,
         "initialize_distributed",
@@ -309,10 +307,11 @@ def test_setup_always_stages_pp_media_under_pp(
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
     assert dataloader_calls[0]["cp_size"] == cp_size
-    assert trainer.engine.pipeline is trainer.pp
+    assert trainer.engine is None
+    assert isinstance(trainer.pp, _FakePPModel)
 
 
-def test_setup_stages_pp_validation_media_and_preserves_packing_wiring(monkeypatch):
+def test_setup_builds_pp_validation_without_training_media_staging(monkeypatch):
     dataloader_calls = []
     packing_resolutions = []
     configure_packing_calls = []
@@ -346,21 +345,26 @@ def test_setup_stages_pp_validation_media_and_preserves_packing_wiring(monkeypat
 
     assert len(dataloader_calls) == 2
     validation_call = dataloader_calls[1]
-    assert validation_call["pp_n_microbatches"] == 2
-    assert validation_call["packing_attn_implementation"] == "sdpa"
+    assert "pp_n_microbatches" not in validation_call
+    assert "packing_attn_implementation" not in validation_call
     assert validation_call["cp_size"] == 1
-    assert packing_resolutions == [{"model_attn_implementation": "sdpa", "cp_size": 1}]
-    assert configure_packing_calls == [{"attn_implementation": "sdpa"}]
+    assert packing_resolutions == []
+    assert configure_packing_calls == []
     assert trainer.val_dataloader == "val_dl"
 
 
-def test_setup_rejects_incomplete_pp_validation_batches(monkeypatch):
+def test_setup_allows_incomplete_pp_validation_batches_when_validation_is_skipped(monkeypatch):
     dataloader_calls = []
+
+    def _build_validation(**kwargs):
+        dataloader_calls.append(kwargs)
+        return SimpleNamespace(dataloader="val_dl", processor="processor")
+
     validation_loader_config = SimpleNamespace(
         drop_last=False,
         packing=None,
         resolve_packing_attn_implementation=lambda **kwargs: None,
-        build=lambda **kwargs: pytest.fail("validation loader must not build before drop_last validation"),
+        build=_build_validation,
     )
     _patch_pp_setup_minimals(
         monkeypatch,
@@ -371,13 +375,13 @@ def test_setup_rejects_incomplete_pp_validation_batches(monkeypatch):
     )
     trainer = FinetuneRecipeForVLM(_minimal_pp_setup_cfg())
 
-    with pytest.raises(ValueError, match=r"validation_dataloader\.drop_last=true"):
-        trainer.setup()
+    trainer.setup()
 
-    assert len(dataloader_calls) == 1
+    assert len(dataloader_calls) == 2
+    assert trainer.val_dataloader == "val_dl"
 
 
-def test_train_loop_runs_validation_when_pipeline_is_enabled():
+def test_train_loop_skips_validation_when_pipeline_is_enabled():
     class _SingleStepScheduler:
         epochs = (0,)
         step = 1
@@ -398,6 +402,7 @@ def test_train_loop_runs_validation_when_pipeline_is_enabled():
     recipe.step_scheduler = _SingleStepScheduler()
     recipe.val_dataloader = object()
     recipe.pp_enabled = True
+    recipe.max_grad_norm = 1.0
     recipe._make_progress_bar = MagicMock(return_value=None)
     recipe._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
     recipe.log_train_metrics = MagicMock()
@@ -413,6 +418,6 @@ def test_train_loop_runs_validation_when_pipeline_is_enabled():
 
     recipe.run_train_validation_loop()
 
-    recipe._run_validation_epoch.assert_called_once_with(recipe.val_dataloader)
-    recipe.log_val_metrics.assert_called_once_with(validation_metrics)
+    recipe._run_validation_epoch.assert_not_called()
+    recipe.log_val_metrics.assert_not_called()
     assert model_part.train.call_count == 2

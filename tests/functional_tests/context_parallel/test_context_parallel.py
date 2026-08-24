@@ -32,10 +32,7 @@ CP_NEMOTRON_V3_HYBRID_TEST_FILENAME = "L2_CP_NemotronV3_Hybrid_Test.sh"
 CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME = "L2_CP_Qwen3_5MoE_LinearAttn_Test.sh"
 CP_DENSE_PACKED_TEST_FILENAME = "L2_CP_Dense_Packed_Test.sh"
 TP_DENSE_PACKED_TEST_FILENAME = "L2_TP_Dense_Packed_Test.sh"
-PP_DENSE_PACKED_TEST_FILENAME = "L2_PP_Dense_Packed_Test.sh"
-PP_CP_DENSE_PACKED_TEST_FILENAME = "L2_PP_CP_Dense_Packed_Test.sh"
 TP_CP_DENSE_PACKED_TEST_FILENAME = "L2_TP_CP_Dense_Packed_Test.sh"
-PP_CP_DENSE_PACKED_REQUIRED_GPUS = 4
 TP_CP_DENSE_PACKED_REQUIRED_GPUS = 4
 
 
@@ -73,18 +70,6 @@ class TestContextParallelAttention:
     def test_tp_dense_packed(self):
         """Test packed THD parity for dense Llama, Qwen2, and Qwen3 with TP=2 and CP=1."""
         run_test_script(TEST_FOLDER, TP_DENSE_PACKED_TEST_FILENAME)
-
-    def test_pp_dense_packed(self):
-        """Test Engine PP=2 raw/final THD loss and gradient parity for dense Llama."""
-        run_test_script(TEST_FOLDER, PP_DENSE_PACKED_TEST_FILENAME)
-
-    @pytest.mark.skipif(
-        torch.cuda.device_count() < PP_CP_DENSE_PACKED_REQUIRED_GPUS,
-        reason="requires 4 GPUs for PP=2 x CP=2",
-    )
-    def test_pp_cp_dense_packed(self):
-        """Test Engine PP=2 x CP=2 raw/final THD token-output restoration."""
-        run_test_script(TEST_FOLDER, PP_CP_DENSE_PACKED_TEST_FILENAME)
 
     @pytest.mark.skipif(
         torch.cuda.device_count() < TP_CP_DENSE_PACKED_REQUIRED_GPUS,

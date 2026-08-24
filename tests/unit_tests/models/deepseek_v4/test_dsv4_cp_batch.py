@@ -23,11 +23,16 @@ sharder-only ``DeepseekV4ForCausalLM`` CP-prep hook (``prepare_model_inputs_for_
 from __future__ import annotations
 
 import contextlib
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+)
 from nemo_automodel.components.models.deepseek_v4 import cp as cpmod
 from nemo_automodel.components.models.deepseek_v4.cp import (
     dsv4_cp_enabled,
@@ -68,6 +73,15 @@ class _FakeMesh:
 
     def get_group(self) -> object:
         return self._group
+
+
+class _FakeDeviceMesh(dict):
+    """Minimal named device mesh containing one CP submesh."""
+
+    mesh_dim_names = ("cp",)
+
+    def __init__(self, cp_mesh: _FakeMesh):
+        super().__init__(cp=cp_mesh)
 
 
 def _shard(batch, *, cp_size, local_rank, **kwargs):
@@ -182,7 +196,14 @@ def test_cp_size_one_native_thd_preserves_packed_batch_without_padding():
     }
     expected = {key: value.clone() for key, value in batch.items()}
 
-    ctx, out, _ = _shard(batch, cp_size=1, local_rank=0, pad_multiple=8, padding_token_id=99)
+    cp_mesh = _FakeMesh(1)
+    sharder = ContextParallelSharder(
+        device_mesh=_FakeDeviceMesh(cp_mesh),
+        shard_batch=partial(make_dsv4_contiguous_shard_cp_batch_and_ctx, pad_multiple=8),
+        local_token_global_indices=contiguous_local_indices,
+        padding_token_id=99,
+    )
+    ctx, out = sharder.shard(batch)
 
     assert ctx is contextlib.nullcontext
     assert out["qkv_format"] == "thd"
@@ -191,6 +212,23 @@ def test_cp_size_one_native_thd_preserves_packed_batch_without_padding():
     assert "padding_mask" not in out
     for key, value in expected.items():
         torch.testing.assert_close(out[key], value)
+    assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (8, 8)
+    token_values = torch.arange(8, dtype=torch.float32).view(1, 8)
+    torch.testing.assert_close(sharder.gather_token_tensor(token_values, trim=True), token_values)
+
+
+def test_cp_size_one_final_thd_inputs_embeds_layout_uses_token_axis():
+    batch = {
+        "inputs_embeds": torch.randn(8, 3),
+        "labels": torch.arange(8),
+        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
+        "qkv_format": "thd",
+    }
+
+    _, out, layout = _shard(batch, cp_size=1, local_rank=0)
+
+    assert out["inputs_embeds"].shape == (8, 3)
+    assert (layout.original_seq_len, layout.padded_seq_len) == (8, 8)
 
 
 def test_contiguous_shard_pads_to_divisor():

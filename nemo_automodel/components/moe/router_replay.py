@@ -50,19 +50,17 @@ position. This assumes single-threaded model construction (the norm for recipe
 training); call :meth:`RouterReplay.clear_registry` before building a second
 model in the same process.
 
-For rollout-provided routing, :class:`RouterReplayAdapter` is the preferred
-Engine interface. It maps global decoder-layer ids without using the registry
-and consumes ``routed_experts`` only after the Engine has applied its packing
-and context-parallel token transform. It can bind either one eager model or the
-rank-local model parts of an AutoPipeline.
+For rollout-provided routing, :class:`RouterReplayAdapter` maps global
+decoder-layer ids without using the registry. Callers prepare routes in the
+same token order as the model input, then keep the adapter's replay context
+active through forward and backward.
 """
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from math import prod
-from typing import Any
 
 import torch
 from torch import nn
@@ -262,25 +260,21 @@ class _RouterReplayBinding:
 
 
 class RouterReplayAdapter:
-    """Bind rollout routes to model-scoped MoE gates for Engine execution.
+    """Bind rollout routes to model-scoped MoE gates.
 
-    The adapter is both the model-aware route formatter and the callable passed
-    as ``Engine(batch_context_fn=...)``. It deliberately ignores the legacy
-    process-global registry: decoder-layer ids determine the mapping, so sparse
-    hybrid MoE stacks and multiple models in one process remain unambiguous.
-    Do not nest the legacy process-global ``record``/``replay`` contexts around
-    an active adapter context when the same gate handles are registered.
+    The adapter deliberately ignores the legacy process-global registry:
+    decoder-layer ids determine the mapping, so sparse hybrid MoE stacks and
+    multiple models in one process remain unambiguous. Do not nest the legacy
+    process-global ``record``/``replay`` contexts around an active adapter
+    context when the same gate handles are registered.
 
     Args:
-        model: One complete eager model, or the rank-local model parts of an
-            AutoPipeline. Primary decoder blocks must expose numeric child ids
-            or a consistent integer ``layer_idx``. A block may contain at most
-            one module with a ``router_replay`` slot. An explicit model-part
-            sequence may contain no local routed layers (for example an
-            embedding-only or LM-head-only pipeline rank).
+        model: One complete model, or a sequence of rank-local model parts.
+            Primary decoder blocks must expose numeric child ids or a
+            consistent integer ``layer_idx``. A block may contain at most one
+            module with a ``router_replay`` slot. An explicit model-part
+            sequence may contain no local routed layers.
     """
-
-    field_name = "routed_experts"
 
     def __init__(self, model: nn.Module | Sequence[nn.Module]) -> None:
         is_model_parts = not isinstance(model, nn.Module)
@@ -383,96 +377,40 @@ class RouterReplayAdapter:
         """Global decoder-layer ids, in the model's replay order."""
         return self._layer_ids
 
-    def prepare_routed_experts(self, routed_experts: torch.Tensor) -> torch.Tensor:
-        """Convert rollout routes from sequence-last to Engine PER_TOKEN layout.
+    def replay(self, prepared_routes: torch.Tensor | None) -> AbstractContextManager[None]:
+        """Replay routes prepared in the model input's token order.
 
         Args:
-            routed_experts: Signed integer expert ids with shape
-                ``[batch, global_layers, topk, sequence]``. ``-1`` means that
-                the training gate should keep the token's complete live top-k;
-                a missing route row must therefore contain only ``-1``. A
-                replay row contains unique expert ids.
-
-        Returns:
-            A contiguous tensor with shape
-            ``[batch, sequence, global_layers, topk]``. Declare it as a
-            ``PER_TOKEN`` Datum field with pad value ``-1``.
-        """
-        self._validate_integral_routes(routed_experts)
-        if routed_experts.ndim != 4:
-            raise ValueError("sequence-last routed_experts must have shape [batch, global_layers, topk, sequence]")
-        return routed_experts.permute(0, 3, 1, 2).contiguous()
-
-    def __call__(
-        self,
-        model_inputs: Mapping[str, Any],
-        loss_fn_inputs: Mapping[str, Any],
-    ) -> AbstractContextManager[None]:
-        """Create replay context from one CP/packing-prepared Engine batch.
-
-        Args:
-            model_inputs: CP-local model inputs. ``input_ids`` has token shape
-                ``[batch, local_sequence]`` or ``[local_tokens]``;
-                ``inputs_embeds`` adds one trailing hidden axis.
-            loss_fn_inputs: CP-local loss/side-channel mapping. Optional
-                ``routed_experts`` has shape ``[batch, local_sequence,
-                global_layers, topk]`` or ``[local_tokens, global_layers,
-                topk]`` and signed integer dtype. The token axes are validated
-                against prepared ``weights`` when present, because models that
-                shard after embedding may retain full-length ``input_ids``.
+            prepared_routes: Signed integer expert ids with arbitrary token
+                axes followed by ``[global_layers, topk]``. Its flattened token
+                order must match the model input after any padding, packing, or
+                context-parallel sharding. ``-1`` keeps a token's complete live
+                top-k selection. ``None`` selects live routing.
 
         Returns:
             A context that replays this model's layer targets through forward,
-            loss, backward, and activation-checkpoint recomputation. Missing
-            ``routed_experts`` selects live routing and returns a no-op context.
+            backward, and activation-checkpoint recomputation.
         """
-        routed_experts = loss_fn_inputs.get(self.field_name)
-        if routed_experts is None:
+        if prepared_routes is None:
             return nullcontext()
-        if not isinstance(routed_experts, torch.Tensor):
-            raise TypeError("routed_experts must be a Tensor")
-        self._validate_integral_routes(routed_experts)
-        if routed_experts.ndim < 3:
-            raise ValueError("prepared routed_experts must have token axes followed by [global_layers, topk]")
+        if not isinstance(prepared_routes, torch.Tensor):
+            raise TypeError("prepared_routes must be a Tensor or None")
+        self._validate_integral_routes(prepared_routes)
+        if prepared_routes.ndim < 3:
+            raise ValueError("prepared_routes must have token axes followed by [global_layers, topk]")
         if not self._bindings:
             return nullcontext()
 
-        weights = loss_fn_inputs.get("weights")
-        if isinstance(weights, torch.Tensor) and weights.ndim > 0:
-            token_shape = tuple(weights.shape)
-            if routed_experts.ndim < weights.ndim + 2 or tuple(routed_experts.shape[: weights.ndim]) != token_shape:
-                raise ValueError(
-                    f"routed_experts token axes {tuple(routed_experts.shape[:-2])} do not match "
-                    f"the prepared loss weights {token_shape}"
-                )
-            expected_tokens = weights.numel()
-        else:
-            primary = model_inputs.get("input_ids")
-            if isinstance(primary, torch.Tensor):
-                expected_tokens = primary.numel()
-            else:
-                primary = model_inputs.get("inputs_embeds")
-                if not isinstance(primary, torch.Tensor) or primary.ndim < 2:
-                    raise ValueError(
-                        "loss inputs must contain token-shaped weights, or model inputs must contain input_ids "
-                        "or inputs_embeds"
-                    )
-                expected_tokens = prod(primary.shape[:-1])
-        route_tokens = prod(routed_experts.shape[:-2])
-        if route_tokens != expected_tokens:
-            raise ValueError(
-                f"routed_experts describes {route_tokens} tokens but the prepared model batch has {expected_tokens}"
-            )
-
-        num_layers, route_topk = routed_experts.shape[-2:]
+        route_tokens = prod(prepared_routes.shape[:-2])
+        num_layers, route_topk = prepared_routes.shape[-2:]
         max_layer_idx = self._bindings[-1].layer_idx
         if num_layers <= max_layer_idx:
             raise ValueError(
-                f"routed_experts has {num_layers} global layers but this model requires layer {max_layer_idx}"
+                f"prepared_routes has {num_layers} global layers but this model requires layer {max_layer_idx}"
             )
-        per_token = routed_experts.reshape(route_tokens, num_layers, route_topk)
+        per_token = prepared_routes.reshape(route_tokens, num_layers, route_topk)
         if route_topk != self._topk:
-            raise ValueError(f"routed_experts topk {route_topk} does not match model topk {self._topk}")
+            raise ValueError(f"prepared_routes topk {route_topk} does not match model topk {self._topk}")
         topology = self._topology_tensors.get(per_token.device)
         if topology is None:
             layer_indices = torch.tensor(self.layer_ids, device=per_token.device, dtype=torch.long)
@@ -495,21 +433,21 @@ class RouterReplayAdapter:
             unique_rows &= (selected[..., :-offset] != selected[..., offset:]).all(dim=-1)
         torch._assert_async(
             (missing_rows | (valid_rows & unique_rows)).all(),
-            "each routed_experts row must be all -1 or contain unique valid model expert ids",
+            "each prepared_routes row must be all -1 or contain unique valid model expert ids",
         )
         targets = list(selected.unbind(dim=1))
         return self._activate(targets)
 
     @staticmethod
-    def _validate_integral_routes(routed_experts: torch.Tensor) -> None:
+    def _validate_integral_routes(prepared_routes: torch.Tensor) -> None:
         """Validate a route tensor without changing its token or layer layout.
 
         Args:
-            routed_experts: Signed integer expert ids with arbitrary token axes
+            prepared_routes: Signed integer expert ids with arbitrary token axes
                 followed by ``[global_layers, topk]``.
         """
-        if routed_experts.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64}:
-            raise TypeError(f"routed_experts must use a signed integer dtype, got {routed_experts.dtype}")
+        if prepared_routes.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64}:
+            raise TypeError(f"prepared_routes must use a signed integer dtype, got {prepared_routes.dtype}")
 
     @contextmanager
     def _activate(self, targets: list[torch.Tensor]) -> Iterator[None]:

@@ -274,22 +274,12 @@ def process_input_for_thd(
     if max_seqlen is not None:
         result["max_seqlen"] = max_seqlen
 
-    # Engine-prefixed loss fields use the primary stream's [B, S] -> [T]
-    # transform. The prefix makes the token-layout intent explicit: model-owned
-    # tensors may coincidentally start with [B, S] but need their original
-    # layout (for example a VLM's global vision mask).
-    _consumed = {"input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded"}
+    # Pass through fields this function neither transforms nor consumes (for
+    # example VLM media tensors). Token-layout transforms must be explicit
+    # rather than inferred from a field-name convention.
+    _consumed = {"seq_lens", "seq_lens_padded"}
     for key, value in batch.items():
-        if key in result or key in _consumed:
-            continue
-        if (
-            key.startswith("__engine_loss__")
-            and isinstance(value, torch.Tensor)
-            and value.ndim >= 2
-            and tuple(value.shape[:2]) == (batch_size, seq_len)
-        ):
-            result[key] = value.reshape(total_tokens, *value.shape[2:])
-        else:
+        if key not in result and key not in _consumed:
             result[key] = value
 
     return result
@@ -548,7 +538,7 @@ def split_batch_into_thd_chunks(
                 if key in {"seq_lens", "seq_lens_padded"}:
                     chunk[key] = value.narrow(1, sequence_start, sequences_per_chunk)
                 elif (
-                    (key in token_keys or key.startswith("__engine_loss__"))
+                    key in token_keys
                     and isinstance(value, torch.Tensor)
                     and value.ndim >= 2
                     and tuple(value.shape[:2]) == (1, total_tokens)

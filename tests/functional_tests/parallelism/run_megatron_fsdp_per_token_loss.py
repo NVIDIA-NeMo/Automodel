@@ -27,7 +27,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
@@ -57,40 +56,21 @@ class TinyTokenModel(nn.Module):
         super().__init__()
         self.block = TinyBlock()
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Map numeric token rows ``[batch, 4]`` to outputs of the same shape.
-
-        Args:
-            input_ids: Numeric token features shaped ``[batch, sequence=4]``.
-            attention_mask: Engine-generated validity mask with shape
-                ``[batch, sequence=4]``. This token-independent projection does
-                not need to consume it.
-            padding_mask: Engine-generated padding indicator with shape
-                ``[batch, sequence=4]``; also unused by this projection.
-
-        Returns:
-            Projected per-token values shaped ``[batch, sequence=4]``.
-        """
-        del attention_mask, padding_mask
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Map numeric token rows ``[batch, 4]`` to outputs of the same shape."""
         return self.block(input_ids.to(torch.float32))
 
 
-def _windows(rank: int) -> tuple[list[Datum], list[Datum]]:
+def _windows(rank: int, device: torch.device) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
     """Build two rank-local windows with unequal global token denominators.
 
     Args:
         rank: Data-parallel rank, zero or one.
+        device: CUDA device on which to construct each microbatch.
 
     Returns:
-        Two one-Datum windows. ``input_ids`` and ``weights`` both have layout
-        ``[sequence=4]``; Engine collates them to ``[batch=1, sequence=4]``.
-        Across DP, the first and second windows have weight sums three and
-        four, respectively.
+        Two ``(input_ids, weights)`` microbatches with shape ``[1, 4]``.
+        Across DP, their weight sums are three and four, respectively.
     """
     if rank == 0:
         values_a, weights_a = [1, 2, 3, 4], [1.0, 0.0, 0.0, 0.0]
@@ -99,14 +79,13 @@ def _windows(rank: int) -> tuple[list[Datum], list[Datum]]:
         values_a, weights_a = [9, 10, 11, 12], [1.0, 1.0, 0.0, 0.0]
         values_b, weights_b = [13, 14, 15, 16], [0.0, 0.0, 0.0, 1.0]
 
-    def datum(values: list[int], weights: list[float]) -> Datum:
-        """Create one Datum with token values and weights shaped ``[sequence=4]``."""
-        return Datum(
-            model_inputs={"input_ids": torch.tensor(values)},
-            loss_fn_inputs={"weights": torch.tensor(weights)},
+    def microbatch(values: list[int], weights: list[float]) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.tensor([values], device=device),
+            torch.tensor([weights], device=device),
         )
 
-    return [datum(values_a, weights_a)], [datum(values_b, weights_b)]
+    return microbatch(values_a, weights_a), microbatch(values_b, weights_b)
 
 
 def _local_parameters(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -119,20 +98,18 @@ def _local_parameters(model: nn.Module) -> dict[str, torch.Tensor]:
     return parameters
 
 
-def _weighted_identity_loss(output: torch.Tensor, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+def _weighted_identity_loss(output: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """Return the weighted model-output numerator.
 
     Args:
         output: Model values shaped ``[batch=1, sequence=4]``.
-        loss_inputs: Collated mapping whose ``weights`` tensor has the same
-            ``[batch=1, sequence=4]`` layout.
+        weights: Per-token weights with the same ``[batch=1, sequence=4]`` layout.
 
     Returns:
-        Scalar weighted numerator. Engine applies the complete-window
-        denominator.
+        Scalar rank-local weighted numerator.
     """
-    assert output.shape == loss_inputs["weights"].shape
-    return (output * loss_inputs["weights"].to(output)).sum()
+    assert output.shape == weights.shape
+    return (output * weights.to(output)).sum()
 
 
 def _run_mode(
@@ -154,6 +131,7 @@ def _run_mode(
     """
     torch.manual_seed(1234)
     model = TinyTokenModel().cuda()
+    device = torch.device("cuda", torch.cuda.current_device())
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     config = MegatronFSDPConfig(
         zero_dp_strategy=3,
@@ -164,23 +142,35 @@ def _run_mode(
         calculate_per_token_loss=summed_gradients,
     )
     model, optimizer = MegatronFSDPManager(config, mesh_context.device_mesh).parallelize(model, optimizer)
+    windows = _windows(dist.get_rank(), device)
     engine = Engine(
         model,
-        device=torch.device("cuda", torch.cuda.current_device()),
+        optimizer=optimizer,
         mesh_context=mesh_context,
-        optimizers=optimizer,
         max_grad_norm=1e9,
+        gradient_accumulation_steps=len(windows),
     )
-    window_a, window_b = _windows(dist.get_rank())
-    result = engine.forward_backward([window_a, window_b], _weighted_identity_loss)
-    step_result = engine.step()
+
+    global_weight_sum = sum(weights.sum() for _, weights in windows)
+    dist.all_reduce(global_weight_sum)
+    reduction_scale = dist.get_world_size() / global_weight_sum
+
+    local_loss_sum = torch.zeros((), device=device)
+    for input_ids, weights in windows:
+        loss_sum = _weighted_identity_loss(engine(input_ids=input_ids), weights)
+        local_loss_sum += loss_sum.detach()
+        engine.backward(loss_sum * reduction_scale, scale_wrt_gas=False)
+        engine.step()
+
+    global_loss_sum = local_loss_sum.clone()
+    dist.all_reduce(global_loss_sum)
 
     statistics = (
-        result.loss_sum.item(),
-        result.weight_sum.item(),
-        result.loss.item(),
+        global_loss_sum.item(),
+        global_weight_sum.item(),
+        (global_loss_sum / global_weight_sum).item(),
     )
-    return statistics, float(step_result.grad_norm), _local_parameters(model)
+    return statistics, float(engine.get_global_grad_norm()), _local_parameters(model)
 
 
 def main() -> None:

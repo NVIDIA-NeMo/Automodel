@@ -14,12 +14,11 @@
 
 """cp2xpp2 layer-2 verification for the sunk pre-embed path (L1, 2/4 GPUs).
 
-Drives the real Datum Engine over an AutoPipeline under cp2xpp2 (4 GPUs) and
-an eager model under cp2xpp1 (2 GPUs) with a tiny random-init text-only config,
-exercising the whole
+Drives the REAL AutoPipeline split + schedule.step under cp2xpp2 (4 GPUs) and
+cp2xpp1 (2 GPUs) with a tiny random-init text-only config, exercising the whole
 sunk layer-2 contract: the sharder-only hook, the in-forward embed +
 shard_sequence_for_cp_round_robin, the asymmetric get_pipeline_stage_metas (full-length
-first-stage ids, local sharded outputs), and Engine-owned microbatch backward. Asserts:
+first-stage ids, local sharded outputs), and per-microbatch backward. Asserts:
 
   (1) 20 steps run clean -- no "backward through the graph a second time"
       (the double-backward the old shared pre-embed graph caused under PP*CP);
@@ -174,24 +173,16 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
 
-    from nemo_automodel.components.datasets.datum import Datum
-    from nemo_automodel.components.distributed.config import FSDP2Config
-    from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.moe.parallelizer import apply_cp
-    from nemo_automodel.engine import Engine, collate_prebatched
 
     pp1 = bool(os.environ.get("NEMO_CP_PP_TEST_PP1"))  # cp2xpp1 comparison leg
     pp_size = 1 if pp1 else 2
     cp_size = world // pp_size
-    mesh_context = MeshContext.build(
-        FSDP2Config(),
-        ParallelismSizes(dp_size=1, pp_size=pp_size, cp_size=cp_size),
-        world_size=world,
-    )
-    mesh = mesh_context.device_mesh
-    if mesh is None:
-        raise RuntimeError("FSDP2 CP/PP validation requires a device mesh")
+    mesh = init_device_mesh("cuda", (pp_size, 1, cp_size), mesh_dim_names=("pp", "dp", "cp"))
 
     which = os.environ.get("NEMO_CP_PP_MODEL", "minimax")
     torch.manual_seed(0)
@@ -204,20 +195,7 @@ def main():
     vocab = model.config.text_config.vocab_size
     mtp_used = {"any": False}
 
-    def loss_fn(output, loss_inputs):
-        """Return token losses in the Engine's CP-local token layout.
-
-        Args:
-            output: Model output whose logits have shape [batch, sequence, vocab].
-                MTP models may return one additional logits tensor of the same
-                shape per prediction depth.
-            loss_inputs: Mapping containing labels and weights with shape
-                [batch, sequence] in the same CP-local layout as the logits.
-
-        Returns:
-            Scalar weighted causal-LM numerator summed over the base and
-            optional MTP prediction depths.
-        """
+    def loss_fn(output, labels):
         # step3p7's last PP stage emits (logits, *mtp_per_depth_logits); minimax
         # emits a bare logits tensor. Handle both, threading the MTP depths.
         if isinstance(output, tuple):
@@ -225,17 +203,11 @@ def main():
         else:
             logits = getattr(output, "logits", output)
             mtp = list(getattr(output, "mtp_per_depth_logits", None) or [])
-        labels = loss_inputs["labels"]
-        weights = loss_inputs["weights"]
-        loss = F.cross_entropy(
-            logits.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100, reduction="none"
-        ).reshape_as(weights)
+        loss = F.cross_entropy(logits.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100)
         for m in mtp:
             mtp_used["any"] = True
-            loss = loss + F.cross_entropy(
-                m.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100, reduction="none"
-            ).reshape_as(weights)
-        return (loss * weights.to(loss)).sum()
+            loss = loss + F.cross_entropy(m.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100)
+        return loss
 
     def cp_only_parallelize(m, world_mesh, moe_mesh, *, dp_axis_names, cp_axis_name=None, **kw):
         if cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1:
@@ -246,7 +218,9 @@ def main():
         pp = AutoPipeline(
             world_mesh=mesh,
             moe_mesh=None,
-            **mesh_context.pipeline_axis_kwargs(),
+            pp_axis_name="pp",
+            dp_axis_names=("dp",),
+            cp_axis_name="cp",
             pp_schedule="1f1b",
             pp_microbatch_size=1,
             pp_batch_size=2,
@@ -254,19 +228,10 @@ def main():
             dtype=torch.bfloat16,
             pp_seq_len=seqlen,
         ).build(model, loss_fn=loss_fn, parallelize_fn=cp_only_parallelize)
-        model_part0 = pp.parts[0]
-        engine_model = pp
+        model_part0, has_last, has_first = pp.parts[0], pp.info.has_last_stage, pp.info.has_first_stage
     else:
-        cp_only_parallelize(model, mesh, None, **mesh_context.parallelize_axis_kwargs())
+        cp_only_parallelize(model, mesh, None, dp_axis_names=("dp",), cp_axis_name="cp")
         model_part0 = model
-        engine_model = model
-
-    engine = Engine(
-        engine_model,
-        device=device,
-        mesh_context=mesh_context,
-        collate_fn=collate_prebatched,
-    )
 
     losses = []
     for step in range(20):
@@ -274,13 +239,28 @@ def main():
         input_ids = torch.randint(2, vocab, (2, seqlen), device=device)
         dist.broadcast(input_ids, src=0)
         pos = torch.arange(seqlen, device=device).unsqueeze(0).expand(2, -1).contiguous()
-        labels = input_ids.clone()
-        datum = Datum(
-            model_inputs={"input_ids": input_ids.clone(), "position_ids": pos.clone()},
-            loss_fn_inputs={"labels": labels, "weights": torch.ones_like(labels, dtype=torch.float32)},
-        )
-        result = engine.forward_backward([[datum]], loss_fn)
-        losses.append(float(result.loss.detach()))
+        batch = {"input_ids": input_ids.clone(), "labels": input_ids.clone(), "position_ids": pos.clone()}
+        cp_sharder = ContextParallelSharder(model_part0, mesh, batch)
+        train_ctx, batch = cp_sharder.shard(batch)
+        labels = batch.pop("labels")
+        if pp_size > 1:
+            with train_ctx():
+                step_losses = [] if has_last else None
+                model_input = batch.pop("input_ids")
+                pp.update_seq_len(model_input.shape[1])
+                if has_first:
+                    pp.info.schedule.step(model_input, target=labels, losses=step_losses, **batch)
+                else:
+                    pp.info.schedule.step(target=labels, losses=step_losses, **batch)
+            # Per-microbatch loss_fn returns the microbatch mean; averaging over
+            # microbatches gives the batch mean, comparable to the cp2xpp1 leg.
+            local = torch.stack(step_losses).mean() if has_last else torch.tensor(0.0, device=device)
+        else:
+            with train_ctx():
+                out = model(input_ids=batch["input_ids"], position_ids=batch["position_ids"])
+                local = loss_fn(out, labels)  # full output so MTP depths are included
+                local.backward()
+        losses.append(float(local.detach()))
 
     # (3) embeddings receive gradients -- only the first PP stage owns embed_tokens.
     embed = model_part0.get_input_embeddings()
@@ -294,7 +274,7 @@ def main():
     last = torch.tensor(losses[-1], device=device)
     gflag = torch.tensor(1.0 if embed_grad else 0.0, device=device)
     mflag = torch.tensor(1.0 if mtp_used["any"] else 0.0, device=device)
-    dist.all_reduce(last, op=dist.ReduceOp.MAX)  # Engine synchronizes loss; MAX is a cross-rank sanity check.
+    dist.all_reduce(last, op=dist.ReduceOp.MAX)  # last stage holds the real loss
     dist.all_reduce(gflag, op=dist.ReduceOp.MAX)  # first stage owns embeddings
     dist.all_reduce(mflag, op=dist.ReduceOp.MAX)  # last stage owns the MTP heads
 

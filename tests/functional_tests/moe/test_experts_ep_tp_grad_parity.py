@@ -18,9 +18,9 @@ The custom-MoE tensor-parallel path keeps the token path (attention, router)
 replicated across TP ranks, so every TP rank feeds the same tokens into the
 expert-parallel all-gather and each expert gradient accumulates ``tp_size``
 identical contributions. This test drives the real ``GroupedExperts`` through
-the Datum Engine with tp=2 replicated tokens and a 2-rank EP mesh, then asserts
-that the existing gradient finalizer restores the single-process fp32 loss,
-gradients, global gradient norm, and one-step parameter update.
+an ordinary Engine forward, backward, and step with tp=2 replicated tokens and
+a 2-rank EP mesh. It asserts that the gradient finalizer restores the
+single-process fp32 loss, global gradient norm, and one-step parameter update.
 """
 
 from __future__ import annotations
@@ -36,11 +36,10 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
-from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
-from nemo_automodel.engine import Engine, collate_prebatched
+from nemo_automodel.engine import Engine
 
 _TP_SIZE = 2
 _WORLD_SIZE = _TP_SIZE
@@ -177,48 +176,29 @@ def _ep_tp_grad_parity_worker(rank: int, world_size: int, port: int) -> None:
         # TP path is active; get_expert_tp_replication_factor keys off it.
         experts._nemo_moe_tp_requires_replica_sync = True
 
-        # The Engine sees the TP-replicated token path and the EP experts as one
-        # ordinary forward/backward boundary.
+        # The task owns its inputs and scalar loss; Engine only executes the
+        # module, backward, distributed finalization, and optimizer update.
         x, weights, indices, token_mask = _global_inputs()
         loss_weights = _loss_weights()
-        datum = Datum(
-            model_inputs={
-                "input_ids": x,
-                "token_mask": token_mask,
-                "router_weights": weights,
-                "router_indices": indices,
-            },
-            loss_fn_inputs={"weights": loss_weights},
-        )
-        observed: dict[str, torch.Tensor] = {}
-
-        def loss_fn(output: torch.Tensor, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-            """Return squared expert outputs in the Engine loss-weight layout.
-
-            Args:
-                output: Tensor of shape [tokens, hidden] containing expert outputs.
-                loss_inputs: Mapping whose ``weights`` tensor has shape [tokens, hidden].
-
-            Returns:
-                Scalar weighted squared-loss numerator.
-            """
-            observed["output"] = output.detach()
-            return (output.square() * loss_inputs["weights"].to(output)).sum()
-
         model = _ExpertModel(experts)
         model._nemo_moe_tp_requires_replica_sync = True
         optimizer = torch.optim.SGD(model.parameters(), lr=_LEARNING_RATE)
         engine = Engine(
             model,
-            device="cpu",
             mesh_context=MeshContext.from_meshes(world_mesh, ep_mesh),
-            collate_fn=collate_prebatched,
-            optimizers=optimizer,
+            optimizer=optimizer,
             max_grad_norm=1e6,
         )
-        forward_backward_result = engine.forward_backward([[datum]], loss_fn)
-        torch.testing.assert_close(observed["output"], y_ref, rtol=1e-4, atol=1e-5)
-        torch.testing.assert_close(forward_backward_result.loss, loss_ref.to(torch.float64), rtol=1e-5, atol=1e-7)
+        output = engine(
+            input_ids=x,
+            token_mask=token_mask,
+            router_weights=weights,
+            router_indices=indices,
+        )
+        loss = (output.square() * loss_weights).sum() / loss_weights.sum()
+        engine.backward(loss, scale_wrt_gas=False)
+        torch.testing.assert_close(output.detach(), y_ref, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(loss.detach(), loss_ref, rtol=1e-5, atol=1e-7)
 
         n_local_experts = _N_EXPERTS // world_size
         start = rank * n_local_experts
@@ -237,20 +217,9 @@ def _ep_tp_grad_parity_worker(rank: int, world_size: int, port: int) -> None:
             experts.down_projs.grad.to_local(), _TP_SIZE * down_grad_ref_local, rtol=1e-4, atol=1e-5
         )
 
-        # Engine.step must remove exactly that factor before any parameter
-        # mutation. Capture the corrected gradients at its staging-fence hook;
-        # the method then performs the SGD update and clears all gradients.
-        corrected_grads: dict[str, torch.Tensor] = {}
-
-        def capture_corrected_grads() -> None:
-            corrected_grads["gate_up"] = experts.gate_and_up_projs.grad.to_local().detach().clone()
-            corrected_grads["down"] = experts.down_projs.grad.to_local().detach().clone()
-
-        step_result = engine.step(before_optimizer_step=capture_corrected_grads)
-        torch.testing.assert_close(corrected_grads["gate_up"], gate_up_grad_ref_local, rtol=1e-4, atol=1e-5)
-        torch.testing.assert_close(corrected_grads["down"], down_grad_ref_local, rtol=1e-4, atol=1e-5)
-        torch.testing.assert_close(step_result.grad_norm, reference_grad_norm, rtol=1e-5, atol=1e-7)
-        assert step_result.learning_rates == (_LEARNING_RATE,)
+        # Engine.step removes exactly that factor before parameter mutation.
+        engine.step()
+        torch.testing.assert_close(engine.get_global_grad_norm(), reference_grad_norm, rtol=1e-5, atol=1e-7)
         assert experts.gate_and_up_projs.grad is None
         assert experts.down_projs.grad is None
 

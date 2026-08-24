@@ -803,7 +803,18 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         *,
         num_chunks: int = 1,
     ) -> dict[str, Any]:
-        """Select native MuseGlimmer CP preparation for BSHD or packed TE THD."""
+        """Select native MuseGlimmer CP preparation for BSHD or packed TE THD.
+
+        Args:
+            batch: Mapping whose packed VLM ``input_ids`` and derived vision
+                mask have shape [batch, sequence].
+            num_chunks: Number of pipeline microbatch token streams.
+
+        Returns:
+            Model-input updates. For packed VLM, the global vision mask remains
+            [batch, sequence] and an empty ``_thd_local_indices`` slot asks the
+            TE sharder to replace it with its [local_tokens] partition.
+        """
         del num_chunks
         if batch.get("qkv_format") == "thd":
             max_real_seqlen = self._validate_thd_documents(batch)
@@ -819,6 +830,9 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
             if vision_mask is None:
                 vision_mask = (input_ids == self.config.patch_token_id) | (input_ids == self.config.video_token_id)
             model_inputs["_muse_glimmer_global_vision_mask"] = vision_mask
+            # Presence explicitly asks the framework-owned TE sharder to replace
+            # this placeholder with the partition it applies to the token stream.
+            model_inputs["_thd_local_indices"] = None
             return model_inputs
         self._set_te_cp_transport("all_gather")
         return {

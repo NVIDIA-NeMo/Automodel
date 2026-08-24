@@ -22,6 +22,7 @@ from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     _compute_mrope_position_ids,
     _shift_sample,
     neat_pack_dataset_vlm,
+    pack_vlm_samples,
 )
 
 
@@ -187,6 +188,45 @@ class TestBuildPackedVlmSample:
         assert result["seq_lens"] == [3, 2]
         assert result["seq_lens_padded"] == [4, 4]
         assert result["position_ids"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+
+
+def test_pack_vlm_samples_applies_shift_alignment_and_media_merge():
+    samples = [
+        _make_vlm_sample(4, has_image=True),
+        _make_vlm_sample(3),
+    ]
+
+    result = pack_vlm_samples(samples, padding_idx=0, sequence_alignment=4)
+
+    assert result["input_ids"].tolist() == [1, 2, 3, 0, 1, 2, 0, 0]
+    assert result["labels"].tolist() == [102, 103, 104, -100, 102, 103, -100, -100]
+    assert result["seq_lens"] == [3, 2]
+    assert result["seq_lens_padded"] == [4, 4]
+    assert result["n_images"] == 2
+
+
+def test_pack_vlm_samples_builds_and_shifts_mrope_positions():
+    def get_rope_index(input_ids, attention_mask=None):
+        seq_len = input_ids.shape[1]
+        positions = torch.arange(seq_len).expand(3, 1, seq_len)
+        return positions, torch.zeros(1)
+
+    result = pack_vlm_samples(
+        [_make_vlm_sample(4)],
+        padding_idx=0,
+        get_rope_index=get_rope_index,
+    )
+
+    assert result["position_ids"].shape == (3, 3)
+    assert result["position_ids"][0].tolist() == [0, 1, 2]
+
+    with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
+        pack_vlm_samples(
+            [_make_vlm_sample(4)],
+            padding_idx=0,
+            get_rope_index=get_rope_index,
+            sequence_alignment=2,
+        )
 
 
 class TestNeatPackDatasetVlm:

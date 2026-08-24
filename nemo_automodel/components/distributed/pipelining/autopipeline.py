@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import logging
-from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Callable, Literal
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.pipelining.microbatch import BlockMask, TensorChunkSpec
+from torch.distributed.pipelining.microbatch import _Replicate as ReplicateChunkSpec
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 from torch.distributed.pipelining.stage import PipelineStage
+from torch.utils._pytree import tree_map
 
 from nemo_automodel.components.distributed.pipelining.functional import (
     ParallelizeFnProtocol,
@@ -36,21 +36,16 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 
 logger = logging.getLogger(__name__)
 
-BatchContextFactory = Callable[[], AbstractContextManager[Any]]
-
 
 def _enable_input_gradients_for_pipeline_backward(stages: list[PipelineStage]) -> None:
-    """Re-enable autograd on activation receive buffers before training.
+    """Re-enable cached floating-point receive buffers before training.
 
-    PyTorch's pipeline ``schedule.eval()`` initializes non-first-stage receive
-    buffers while backward is disabled, so those floating-point buffers do not
-    require gradients. The schedule caches that forward infrastructure and
-    does not rebuild it when the next call is ``step()``. Re-enabling the
-    existing buffers is sufficient and avoids resetting stage metadata or
-    accumulated parameter gradients.
+    ``schedule.eval()`` creates cached non-first-stage receive buffers under
+    ``no_grad``.  A later ``schedule.step()`` reuses those buffers, so they must
+    require gradients again before backward.
     """
 
-    def enable(value: Any) -> None:
+    def enable(value: object) -> None:
         buffer = getattr(value, "buffer", None)
         if isinstance(buffer, torch.Tensor):
             if buffer.is_floating_point() or buffer.is_complex():
@@ -65,62 +60,6 @@ def _enable_input_gradients_for_pipeline_backward(stages: list[PipelineStage]) -
 
     for stage in stages:
         enable(getattr(stage, "args_recv_info", {}))
-
-
-@contextmanager
-def _stage_batch_contexts(
-    stages: list[PipelineStage],
-    batch_context_fns: list[BatchContextFactory],
-) -> Iterator[None]:
-    """Apply a repeatable batch context to each pipeline-stage phase.
-
-    PyTorch schedules identify the logical microbatch with the first argument
-    to every stage ``forward_one_chunk``/``backward_*_one_chunk`` call. Wrapping
-    those instance methods keeps the context aligned when schedules interleave
-    microbatches or activation checkpointing recomputes a forward during
-    backward. Original instance state is restored even when the schedule fails.
-
-    Args:
-        stages: Rank-local pipeline stages owned by one AutoPipeline.
-        batch_context_fns: One zero-argument context factory per logical
-            pipeline microbatch.
-
-    Yields:
-        ``None`` while the pipeline schedule executes.
-    """
-    missing = object()
-    originals: list[tuple[PipelineStage, str, Any]] = []
-    method_names = ("forward_one_chunk", "backward_one_chunk", "backward_weight_one_chunk")
-    try:
-        for stage in stages:
-            for method_name in method_names:
-                method = getattr(stage, method_name, None)
-                if not callable(method):
-                    continue
-                previous = getattr(stage, "__dict__", {}).get(method_name, missing)
-
-                def wrapped(
-                    chunk_id: int,
-                    *args: Any,
-                    _method: Callable[..., Any] = method,
-                    **kwargs: Any,
-                ) -> Any:
-                    if isinstance(chunk_id, bool) or not isinstance(chunk_id, int):
-                        raise TypeError(f"pipeline microbatch id must be an integer, got {chunk_id!r}")
-                    if chunk_id < 0 or chunk_id >= len(batch_context_fns):
-                        raise IndexError(f"pipeline microbatch id {chunk_id} is outside [0, {len(batch_context_fns)})")
-                    with batch_context_fns[chunk_id]():
-                        return _method(chunk_id, *args, **kwargs)
-
-                originals.append((stage, method_name, previous))
-                setattr(stage, method_name, wrapped)
-        yield
-    finally:
-        for stage, method_name, previous in reversed(originals):
-            if previous is missing:
-                delattr(stage, method_name)
-            else:
-                setattr(stage, method_name, previous)
 
 
 @dataclass
@@ -340,176 +279,85 @@ class AutoPipeline:
             effective_microbatch_size,
         )
 
-    def step_microbatches(
+    def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, object]) -> dict[str, object] | None:
+        """Build schedule chunking metadata for model-owned keyword layouts."""
+        model_parts = self._info.model_parts
+        if not model_parts:
+            raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
+
+        hook = getattr(model_parts[0], "get_pipeline_kwargs_chunk_dims", None)
+        if hook is None:
+            return None
+
+        custom_chunk_dims = hook(kwargs) or {}
+        for key in custom_chunk_dims:
+            if key not in kwargs:
+                raise ValueError(f"Model PP chunk hook returned unknown kwarg: {key}")
+        if not custom_chunk_dims:
+            return None
+
+        def default_spec(value):
+            if isinstance(value, (torch.Tensor, BlockMask)):
+                return TensorChunkSpec(0)
+            return ReplicateChunkSpec()
+
+        kwargs_chunk_spec = tree_map(default_spec, kwargs, is_leaf=lambda value: isinstance(value, BlockMask))
+        for key, split_dim in custom_chunk_dims.items():
+            kwargs_chunk_spec[key] = TensorChunkSpec(split_dim)
+        return kwargs_chunk_spec
+
+    def _run_schedule(
         self,
-        model_inputs: list[dict[str, Any]],
+        method_name: Literal["step", "eval"],
+        model_input: torch.Tensor,
         *,
-        loss_fn: Callable[[Any, int], Any],
-        losses: list[torch.Tensor] | None = None,
-        return_outputs: bool = False,
-        batch_context_fns: list[BatchContextFactory] | None = None,
-    ) -> Any:
-        """Run a schedule step over already prepared model microbatches.
-
-        The caller owns microbatch preparation. This method passes the prepared
-        inputs to the PyTorch schedule unchanged, while the schedule continues
-        to own execution order and backward calls.
-
-        Args:
-            model_inputs: Exactly :attr:`num_microbatches` complete model-input
-                mappings. Each mapping contains exactly one of ``input_ids`` or
-                ``inputs_embeds``; all remaining items are model keyword inputs.
-            loss_fn: Callback invoked as ``loss_fn(output, microbatch_index)``.
-                The index identifies the corresponding item in ``model_inputs``
-                regardless of the schedule's execution order.
-            losses: Mutable list populated by the schedule on the last stage.
-            return_outputs: Whether the last stage returns merged model outputs
-                when supported by the installed PyTorch version.
-            batch_context_fns: Optional repeatable context factory for each
-                logical microbatch. Each factory separately covers that
-                microbatch's stage forward and backward phases. The caller
-                wraps its loss callback with the same factory.
-
-        Returns:
-            The value returned by the underlying PyTorch pipeline schedule.
-        """
-        if self._info.stages is not None:
-            _enable_input_gradients_for_pipeline_backward(self._info.stages)
-        return self._run_prepared_microbatches(
-            model_inputs,
-            loss_fn=loss_fn,
-            losses=losses,
-            return_outputs=return_outputs,
-            schedule_method="step",
-            batch_context_fns=batch_context_fns,
-        )
-
-    def eval_microbatches(
-        self,
-        model_inputs: list[dict[str, Any]],
-        *,
-        loss_fn: Callable[[Any, int], Any],
-        losses: list[torch.Tensor] | None = None,
-        return_outputs: bool = True,
-        batch_context_fns: list[BatchContextFactory] | None = None,
-    ) -> Any:
-        """Run forward-only evaluation over already prepared model microbatches.
-
-        This is the forward-only counterpart to :meth:`step_microbatches`.
-        The caller owns microbatch preparation, while the pipeline schedule owns
-        pipeline communication and execution order. The underlying
-        ``schedule.eval`` path does not run backward.
-
-        Args:
-            model_inputs: Exactly :attr:`num_microbatches` complete model-input
-                mappings. Each mapping contains exactly one of ``input_ids`` or
-                ``inputs_embeds``; all remaining items are model keyword inputs.
-            loss_fn: Callback invoked as ``loss_fn(output, microbatch_index)``.
-                The index identifies the corresponding item in ``model_inputs``
-                regardless of the schedule's execution order.
-            losses: Mutable list populated by the schedule on the last stage.
-            return_outputs: Whether the last stage returns merged model outputs
-                when supported by the installed PyTorch version.
-            batch_context_fns: Optional repeatable context factory for each
-                logical microbatch. Each factory separately covers that
-                microbatch's stage forward phase. The caller wraps its loss
-                callback with the same factory.
-
-        Returns:
-            The value returned by the underlying PyTorch pipeline schedule.
-
-        Raises:
-            NotImplementedError: If the installed PyTorch pipeline schedule
-                does not provide forward-only ``eval`` execution.
-        """
-        return self._run_prepared_microbatches(
-            model_inputs,
-            loss_fn=loss_fn,
-            losses=losses,
-            return_outputs=return_outputs,
-            schedule_method="eval",
-            batch_context_fns=batch_context_fns,
-        )
-
-    def _run_prepared_microbatches(
-        self,
-        model_inputs: list[dict[str, Any]],
-        *,
-        loss_fn: Callable[[Any, int], Any],
+        target: torch.Tensor | None,
         losses: list[torch.Tensor] | None,
-        return_outputs: bool,
-        schedule_method: Literal["step", "eval"],
-        batch_context_fns: list[BatchContextFactory] | None,
-    ) -> Any:
-        """Run one schedule method with an exact prepared-microbatch split."""
+        kwargs: dict[str, object],
+    ) -> object:
+        """Run one schedule method with first-stage and model-owned chunking rules."""
         schedule = self._info.schedule
         if schedule is None:
-            raise RuntimeError("AutoPipeline.build() must be called before running a prepared PP schedule")
-        if len(model_inputs) != self.num_microbatches:
-            raise ValueError(f"Expected {self.num_microbatches} model input microbatches, got {len(model_inputs)}")
-        if batch_context_fns is not None and len(batch_context_fns) != self.num_microbatches:
-            raise ValueError(
-                f"Expected {self.num_microbatches} pipeline batch context factories, got {len(batch_context_fns)}"
-            )
+            raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule")
+        method = getattr(schedule, method_name, None)
+        if not callable(method):
+            raise NotImplementedError(f"The configured pipeline schedule does not support {method_name}()")
 
-        model_args_chunks: list[tuple[Any, ...]] = []
-        model_kwargs_chunks: list[dict[str, Any]] = []
-        for index, inputs in enumerate(model_inputs):
-            if not isinstance(inputs, dict):
-                raise TypeError(f"model input microbatch {index} must be a dict")
-            primary_names = [name for name in ("input_ids", "inputs_embeds") if name in inputs]
-            if len(primary_names) != 1:
-                raise ValueError(
-                    f"model input microbatch {index} must contain exactly one of input_ids or inputs_embeds"
-                )
-            kwargs = dict(inputs)
-            primary = kwargs.pop(primary_names[0])
-            model_args_chunks.append((primary,) if self._info.has_first_stage else ())
-            model_kwargs_chunks.append(kwargs)
+        schedule_args = (model_input,) if self._info.has_first_stage else ()
+        kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
+        if kwargs_chunk_spec is None:
+            return method(*schedule_args, target=target, losses=losses, **kwargs)
 
-        def indexed_loss(output: Any, microbatch_id: torch.Tensor) -> Any:
-            return loss_fn(output, int(microbatch_id.item()))
-
-        run_schedule = getattr(schedule, schedule_method, None)
-        if not callable(run_schedule):
-            if schedule_method == "eval":
-                raise NotImplementedError(
-                    "forward-only pipeline execution requires a PyTorch pipeline schedule with eval(); "
-                    "upgrade PyTorch or use non-pipeline Engine.forward"
-                )
-            raise RuntimeError("PyTorch pipeline schedule has no callable step method")
-        # ``schedule.eval`` forwards arbitrary kwargs to ``schedule.step`` and
-        # does not list ``return_outputs`` explicitly in supported PyTorch
-        # releases. Inspect step for both modes so eval can still suppress the
-        # otherwise-unused merged output without breaking older step APIs.
-        schedule_options = (
-            {"return_outputs": return_outputs}
-            if "return_outputs" in inspect.signature(schedule.step).parameters
-            else {}
-        )
-        previous_split_inputs = schedule._split_inputs
-        previous_loss_fn = schedule._loss_fn
-        schedule._split_inputs = lambda _args, _kwargs=None: (model_args_chunks, model_kwargs_chunks)
-        schedule._loss_fn = indexed_loss
+        previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
+        schedule._kwargs_chunk_spec = kwargs_chunk_spec
         try:
-            if batch_context_fns is None:
-                return run_schedule(
-                    target=torch.arange(self.num_microbatches, device=self.device),
-                    losses=losses,
-                    **schedule_options,
-                )
-            stages = self._info.stages
-            if stages is None:
-                raise RuntimeError("AutoPipeline.build() must create pipeline stages before using batch contexts")
-            with _stage_batch_contexts(stages, batch_context_fns):
-                return run_schedule(
-                    target=torch.arange(self.num_microbatches, device=self.device),
-                    losses=losses,
-                    **schedule_options,
-                )
+            return method(*schedule_args, target=target, losses=losses, **kwargs)
         finally:
-            schedule._loss_fn = previous_loss_fn
-            schedule._split_inputs = previous_split_inputs
+            schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
+
+    def step(
+        self,
+        model_input: torch.Tensor,
+        *,
+        target: torch.Tensor | None = None,
+        losses: list[torch.Tensor] | None = None,
+        **kwargs: object,
+    ) -> object:
+        """Run a training schedule step with model-owned input chunking."""
+        if self._info.stages is not None:
+            _enable_input_gradients_for_pipeline_backward(self._info.stages)
+        return self._run_schedule("step", model_input, target=target, losses=losses, kwargs=kwargs)
+
+    def eval(
+        self,
+        model_input: torch.Tensor,
+        *,
+        target: torch.Tensor | None = None,
+        losses: list[torch.Tensor] | None = None,
+        **kwargs: object,
+    ) -> object:
+        """Run a forward-only schedule step with model-owned input chunking."""
+        return self._run_schedule("eval", model_input, target=target, losses=losses, kwargs=kwargs)
 
     @property
     def parts(self) -> list[nn.Module]:
@@ -521,11 +369,6 @@ class AutoPipeline:
     @property
     def device(self) -> torch.device:
         return self._device
-
-    @property
-    def num_microbatches(self) -> int:
-        """Number of pipeline microbatches in one local batch."""
-        return self.pp_batch_size // self.pp_microbatch_size
 
     # -------------------------- Debug utilities --------------------------
     def list_stage_modules(self) -> list[list[str]]:

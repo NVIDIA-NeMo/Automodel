@@ -22,19 +22,18 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.datasets.datum import LossInputLayout
 from nemo_automodel.components.datasets.vlm.pp_media import (
     VLM_PP_MEDIA_KEY,
     chunk_step3_media,
     chunk_vlm_media,
     prepare_vlm_media_for_pp,
     stage_vlm_media_for_pp,
-    wrap_vlm_collate_for_pp,
 )
-from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
-from nemo_automodel.engine import ForwardBackwardResult
 from nemo_automodel.recipes._typed_config import (
     _STEP_SCHEDULER_RUNTIME_KEYS,
     _as_dict,
@@ -46,6 +45,34 @@ from nemo_automodel.recipes.vlm.finetune import (
     _get_model_name,
     build_model,
 )
+
+
+class _RecipeEngineStub:
+    """Minimal raw-forward Engine stand-in for recipe unit tests."""
+
+    def __init__(self, module, *, optimizer=None, grad_norm=0.0):
+        self.module = module
+        self.optimizer = optimizer
+        self.grad_norm = grad_norm
+        self.gradient_accumulation_steps = None
+
+    def __call__(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+    def backward(self, loss, *, scale_wrt_gas=False):
+        del scale_wrt_gas
+        loss.backward()
+
+    def step(self):
+        if self.optimizer is not None:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+
+    def get_global_grad_norm(self):
+        return self.grad_norm
+
+    def set_gradient_accumulation_steps(self, steps):
+        self.gradient_accumulation_steps = steps
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
@@ -380,23 +407,152 @@ class _TensorModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.supports = SimpleNamespace(mtp_enabled=False)
 
     def forward(self, **batch):
         return torch.zeros((), requires_grad=True)
 
 
-def _build_engine_recipe_for_optim_step(*, pp_enabled: bool = False):
-    """Build the smallest recipe state needed to exercise the Engine boundary."""
+@pytest.mark.cuda(False)
+def test_run_train_step_supports_tensor_outputs(monkeypatch):
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.dist_env = SimpleNamespace(device="cpu", rank=0, is_main=True)
+    recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
     recipe.moe_mesh = None
     recipe.loss_fn = object()
+    model = _TensorModel()
+    recipe.model_parts = [model]  # Now uses model_parts instead of model
+    recipe.pp_enabled = False  # Pipeline parallelism disabled
+    recipe.optimizer = [_DummyOptimizer()]  # Now a list
+    recipe.engine = _RecipeEngineStub(model, optimizer=recipe.optimizer[0], grad_norm=2.5)
+    # ``is_remote_logging_step`` is read by ``_forward_backward_step`` when the
+    # composite (gemma4 joint drafter) attaches drafter logits; default False
+    # so non-drafter test paths skip the log line.
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
+    recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+    recipe.cfg = _Cfg(fp8=None)
+    recipe.lr_scheduler = None
+    recipe.timestamp = 0.0
+    recipe.distributed_config = None
+
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+    recipe._get_cp_group_size = lambda: 1
+
+    batches = [
+        {
+            "labels": torch.tensor([[1, -100]]),
+            "input_ids": torch.tensor([[1, 2]]),
+        }
+    ]
+
+    logits_seen = {}
+
+    def fake_calculate_loss(*args, **kwargs):
+        logits_seen["value"] = kwargs["logits"]
+        return torch.tensor(1.0, requires_grad=True)
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+    )
+    calculate_mock = MagicMock(side_effect=fake_calculate_loss)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_loss", calculate_mock)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert isinstance(metrics, MetricsSample)
+    assert logits_seen["value"].requires_grad
+    assert calculate_mock.call_args.kwargs["num_label_tokens"] == 1
+    assert metrics.metrics["grad_norm"] == 2.5
+    assert recipe.optimizer[0].step_called
+    assert recipe.optimizer[0].zero_grad_called
+    assert recipe.engine.gradient_accumulation_steps == len(batches)
+
+
+@pytest.mark.cuda(False)
+def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=2)
+    recipe.processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=7))
     recipe.model_parts = [_TensorModel()]
-    recipe._has_joint_drafter = False
-    recipe.pp_enabled = pp_enabled
-    if pp_enabled:
-        recipe.pp = SimpleNamespace(info=SimpleNamespace(has_first_stage=True))
+    recipe.engine = _RecipeEngineStub(recipe.model_parts[0])
+    recipe.pp_enabled = False
+    recipe.magi = SimpleNamespace(enabled=False)
+    recipe.distributed_config = None
+    recipe.loss_fn = object()
+    recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=False)
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+    captured = {}
+
+    def make_thd_batch(model, device_mesh, batch, **kwargs):
+        captured.update(kwargs)
+        captured["qkv_format"] = batch.get("qkv_format")
+        return SimpleNamespace(shard=lambda actual: (nullcontext, actual))
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", make_thd_batch)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
+        lambda *args, **kwargs: torch.tensor(1.0, requires_grad=True),
+    )
+
+    recipe._forward_backward_step(
+        idx=0,
+        batch={
+            "input_ids": torch.tensor([[1, 2]]),
+            "labels": torch.tensor([[2, -100]]),
+            "qkv_format": "thd",
+        },
+        loss_buffer=[],
+        num_label_tokens=1,
+        num_batches=1,
+    )
+
+    assert captured["qkv_format"] == "thd"
+    assert "use_te" not in captured
+    assert "magi" not in captured
+    assert captured["padding_token_id"] == 7
+
+
+@pytest.mark.cuda(False)
+def test_forward_backward_step_rejects_mrope_thd_with_context_parallelism():
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=2)
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = False
+    recipe.magi = SimpleNamespace(enabled=False)
+
+    with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
+        recipe._forward_backward_step(
+            idx=0,
+            batch={
+                "input_ids": torch.tensor([[1, 2]]),
+                "labels": torch.tensor([[2, -100]]),
+                "position_ids": torch.zeros((3, 1, 2), dtype=torch.long),
+                "qkv_format": "thd",
+            },
+            loss_buffer=[],
+            num_label_tokens=1,
+            num_batches=1,
+        )
+
+
+def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
+    """Shared setup for _run_train_optim_step tests with pp_enabled=True."""
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu", rank=0, is_main=False)
+    # No "pp" in dim_names -> src_rank = mesh.reshape(-1)[-1].item(). With rank != src_rank
+    # and is_main=False, neither distributed send nor recv branch fires.
+    recipe.device_mesh = SimpleNamespace(mesh=torch.tensor([1]), mesh_dim_names=("dp",))
+    recipe.moe_mesh = None
+    recipe.loss_fn = object()
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = True
+    recipe.pp = SimpleNamespace(pp_batch_size=2, pp_microbatch_size=1)
     recipe.optimizer = [_DummyOptimizer()]
     recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
@@ -407,21 +563,40 @@ def _build_engine_recipe_for_optim_step(*, pp_enabled: bool = False):
     recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
     recipe._get_dp_group_size = lambda include_cp=True: 1
     recipe._get_cp_group_size = lambda: 1
-    recipe.engine = MagicMock()
-    recipe.engine.forward_backward.return_value = ForwardBackwardResult(
-        loss=torch.tensor(0.25),
-        loss_sum=torch.tensor(1.0),
-        weight_sum=torch.tensor(4.0),
-        token_outputs=[],
-        batch_outputs=[],
+
+    # Build a batch whose (labels != -100).sum() == num_label_tokens_in_batch.
+    seq = [1] * num_label_tokens_in_batch + [-100] * (4 - num_label_tokens_in_batch)
+    batches = [
+        {
+            "labels": torch.tensor([seq]),
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        }
+    ]
+    return recipe, batches
+
+
+def _patch_pp_optim_step_dependencies(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
+        lambda **kwargs: 0.0,
     )
-    recipe.engine.step.return_value = SimpleNamespace(grad_norm=2.5, learning_rates=(0.01,))
-    return recipe
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_grad_accumulation",
+        lambda model_parts, pp_enabled: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
+        lambda model_parts, pp_enabled: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_after_first_microbatch",
+        lambda: None,
+    )
 
 
 @pytest.mark.cuda(False)
-def test_run_train_step_passes_nested_prebatched_datums_to_engine():
-    recipe = _build_engine_recipe_for_optim_step(pp_enabled=True)
+def test_run_train_step_clears_first_microbatch_after_first_batch(monkeypatch):
+    recipe, _ = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=2)
     batches = [
         {
             "labels": torch.tensor([[1, -100, 2, -100]]),
@@ -432,195 +607,81 @@ def test_run_train_step_passes_nested_prebatched_datums_to_engine():
             "input_ids": torch.tensor([[5, 6, 7, 8]]),
         },
     ]
-    metrics = recipe._run_train_optim_step(batches)
+    events = []
 
-    datums, loss_fn = recipe.engine.forward_backward.call_args.args
-    assert [len(batch) for batch in datums] == [1, 1]
-    flat_datums = [batch[0] for batch in datums]
-    assert all(datum.model_inputs.keys() == {"input_ids"} for datum in flat_datums)
-    assert [datum.loss_fn_inputs["weights"].tolist() for datum in flat_datums] == [
-        [[True, False, True, False]],
-        [[False, True, False, True]],
-    ]
-    assert callable(loss_fn)
-    recipe.engine.step.assert_called_once_with(
-        before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging,
-    )
-    assert metrics.metrics["loss"] == pytest.approx(0.25)
-    assert metrics.metrics["grad_norm"] == pytest.approx(2.5)
-    assert metrics.metrics["lr"] == pytest.approx(0.01)
-    assert not recipe.optimizer[0].step_called
-    assert not recipe.optimizer[0].zero_grad_called
-
-
-@pytest.mark.cuda(False)
-def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call():
-    recipe = _build_engine_recipe_for_optim_step()
-    recipe._has_joint_drafter = True
-    recipe.step_scheduler.is_remote_logging_step = True
-    batches = [
-        {"labels": torch.tensor([[1, -100, 2]]), "input_ids": torch.tensor([[1, 2, 3]])},
-        {"labels": torch.tensor([[-100, 3, 4]]), "input_ids": torch.tensor([[4, 5, 6]])},
-    ]
-    recipe._compute_vlm_loss = MagicMock(side_effect=[torch.tensor(1.0), torch.tensor(2.0)])
-
-    def forward_backward(datums, loss_fn):
-        for (datum,) in datums:
-            loss_fn(object(), datum.loss_fn_inputs)
-        return ForwardBackwardResult(
-            loss=torch.tensor(0.25),
-            loss_sum=torch.tensor(1.0),
-            weight_sum=torch.tensor(4.0),
-            token_outputs=[],
-            batch_outputs=[],
-        )
-
-    recipe.engine.forward_backward.side_effect = forward_backward
-
-    recipe._run_train_optim_step(batches)
-
-    assert recipe._compute_vlm_loss.call_count == 2
-    first_call, second_call = recipe._compute_vlm_loss.call_args_list
-    assert first_call.kwargs["is_train"] is True
-    assert first_call.kwargs["log_drafter"] is True
-    assert first_call.kwargs["log_denominator"] == 4
-    assert second_call.kwargs["is_train"] is True
-    assert second_call.kwargs["log_drafter"] is False
-    assert second_call.kwargs["log_denominator"] == 4
-
-
-@pytest.mark.cuda(False)
-def test_train_step_does_not_reduce_drafter_denominator_for_regular_model():
-    recipe = _build_engine_recipe_for_optim_step()
-    recipe.step_scheduler.is_remote_logging_step = True
-    reductions = []
-
-    def allreduce(tensor, include_cp=False):
-        reductions.append(tensor.clone())
-        return tensor
-
-    recipe._dp_allreduce = allreduce
-    batch = {"labels": torch.tensor([[1, -100, 2]]), "input_ids": torch.tensor([[1, 2, 3]])}
-
-    recipe._run_train_optim_step([batch])
-
-    assert len(reductions) == 1  # Throughput tokens only; Engine owns the loss denominator.
-
-
-@pytest.mark.cuda(False)
-def test_run_train_step_uses_engine_for_empty_supervision():
-    recipe = _build_engine_recipe_for_optim_step()
-    recipe.engine.forward_backward.return_value = ForwardBackwardResult(
-        loss=torch.tensor(0.0),
-        loss_sum=torch.tensor(0.0),
-        weight_sum=torch.tensor(0.0),
-        token_outputs=[],
-        batch_outputs=[],
-    )
-    batch = {"labels": torch.full((1, 4), -100), "input_ids": torch.arange(4).reshape(1, 4)}
-    metrics = recipe._run_train_optim_step([batch])
-
-    recipe.engine.forward_backward.assert_called_once()
-    recipe.engine.step.assert_called_once()
-    assert metrics.metrics["loss"] == 0.0
-    assert metrics.metrics["num_label_tokens"] == 0
-    assert not recipe.optimizer[0].step_called
-
-
-@pytest.mark.cuda(False)
-def test_train_step_leaves_fp8_post_step_work_to_engine(monkeypatch):
-    recipe = _build_engine_recipe_for_optim_step()
-    recipe.cfg = _Cfg(
-        fp8={
-            "enabled": True,
-            "precompute_float8_dynamic_scale_for_fsdp": True,
-        }
-    )
-    recipe.device_mesh = {"dp_shard": SimpleNamespace(size=lambda: 2)}
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.precompute_float8_dynamic_scale_for_fsdp",
-        lambda _model: pytest.fail("the VLM recipe must not run FP8 post-step work directly"),
-        raising=False,
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_grad_accumulation",
+        lambda model_parts, pp_enabled: events.append("prepare"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
+        lambda model_parts, pp_enabled: events.append("final"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_after_first_microbatch",
+        lambda: events.append("after_first"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
+        lambda **kwargs: 0.0,
     )
 
-    batch = {"labels": torch.tensor([[1, 2]]), "input_ids": torch.tensor([[3, 4]])}
-    recipe._run_train_optim_step([batch])
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        events.append(f"forward_{idx}")
+        loss_buffer.append(torch.tensor(1.0))
 
-    recipe.engine.step.assert_called_once_with(
-        before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging,
-    )
+    recipe._forward_backward_step = fake_forward_backward_step
 
+    recipe._run_train_optim_step(batches, max_grad_norm=1.0)
 
-def test_make_engine_datum_filters_raw_media_off_first_pipeline_stage():
-    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.pp_enabled = True
-    recipe.pp = SimpleNamespace(info=SimpleNamespace(has_first_stage=False))
-    recipe.loss_fn = object()
-    media_chunks = {"pixel_values": [torch.ones(1, 2)]}
-    batch = {
-        "input_ids": torch.tensor([[1, 2]]),
-        "labels": torch.tensor([[2, -100]]),
-        "pixel_values": torch.ones(1, 3, 4, 4),
-        "image_grid_thw": torch.ones(1, 3, dtype=torch.long),
-        VLM_PP_MEDIA_KEY: media_chunks,
-    }
-
-    datum = recipe._make_engine_datum(batch)
-
-    assert datum.model_inputs["input_ids"] is batch["input_ids"]
-    assert "pixel_values" not in datum.model_inputs
-    assert "image_grid_thw" not in datum.model_inputs
-    assert VLM_PP_MEDIA_KEY not in datum.model_inputs
-    assert datum.loss_fn_input_layouts == {
-        "labels": LossInputLayout.PER_TOKEN,
-        "weights": LossInputLayout.PER_TOKEN,
-    }
-
-    recipe.pp.info.has_first_stage = True
-    first_stage_datum = recipe._make_engine_datum(batch)
-    assert first_stage_datum.model_inputs[VLM_PP_MEDIA_KEY] is media_chunks
+    assert events == ["prepare", "forward_0", "after_first", "final", "forward_1"]
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0)
 
 
-def test_engine_context_stages_pipeline_media_and_cleans_up(monkeypatch):
-    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.pp_enabled = True
-    model = _TensorModel()
-    recipe.model_parts = [model]
-    recipe.pp = SimpleNamespace(
-        info=SimpleNamespace(
-            has_first_stage=True,
-            schedule=None,
-            stages=[SimpleNamespace(is_first=True)],
-        )
-    )
-    recipe._cp_vision_frame_sharding_context = nullcontext
-    input_ids = torch.tensor([[1, 2]])
-    model_inputs = {
-        "input_ids": input_ids,
-        VLM_PP_MEDIA_KEY: {"pixel_values": [torch.ones(1, 2)]},
-    }
+@pytest.mark.cuda(False)
+def test_run_train_step_pp_zero_label_tokens_no_nan(monkeypatch):
+    """Regression for PR #1985: PP reporting loss must be 0.0 (not NaN) when num_label_tokens=0.
 
-    with recipe._engine_context(model_inputs):
-        assert model._vlm_pixel_values_chunks is not None
-        assert VLM_PP_MEDIA_KEY not in model_inputs
+    With pipeline parallelism enabled, _run_train_optim_step divides reporting_loss by
+    num_label_tokens. If every label in the batch is the ignore_index (-100), the divisor
+    is zero and the reported metric would be NaN without the guard at finetune.py:1136.
+    """
+    recipe, batches = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=0)
 
-    assert model._vlm_pixel_values_chunks is None
-    assert model._vlm_chunk_idx is None
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        # Mirror the PP path: append a finite per-microbatch sum loss. With the guard,
+        # this must still yield reporting_loss == 0.0.
+        loss_buffer.append(torch.tensor(5.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+    _patch_pp_optim_step_dependencies(monkeypatch)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert isinstance(metrics, MetricsSample)
+    assert metrics.metrics["num_label_tokens"] == 0
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.5)
+    loss = metrics.metrics["loss"]
+    assert loss == loss, f"reporting loss must not be NaN, got {loss}"
+    assert loss == 0.0, f"reporting loss must be 0.0 when num_label_tokens=0, got {loss}"
 
 
-def test_engine_pipeline_loss_reuses_configured_loss_and_thd_metadata():
-    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.pp_enabled = True
-    recipe.pipeline_loss_fn = MagicMock(return_value=torch.tensor(3.0))
-    output = torch.randn(1, 2, 4)
-    labels = torch.tensor([[1, 2]])
-    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+@pytest.mark.cuda(False)
+def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
+    """PP reporting loss is the summed microbatch loss divided by num_label_tokens."""
+    recipe, batches = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=4)
 
-    loss = recipe._engine_loss_fn(output, {"labels": labels, "cu_seqlens": cu_seqlens})
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        loss_buffer.append(torch.tensor(8.0))
 
-    assert loss.item() == 3.0
-    assert recipe.pipeline_loss_fn.cu_seqlens is cu_seqlens
-    recipe.pipeline_loss_fn.assert_called_once_with(output, labels)
+    recipe._forward_backward_step = fake_forward_backward_step
+    _patch_pp_optim_step_dependencies(monkeypatch)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert metrics.metrics["num_label_tokens"] == 4
+    assert metrics.metrics["loss"] == pytest.approx(8.0 / 4)
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(2.0)
 
 
 # -----------------------------------------------------------------------------
@@ -1464,6 +1525,642 @@ class TestCalculateLoss:
 
 
 # -----------------------------------------------------------------------------
+# PP Logic tests for _forward_backward_step
+# -----------------------------------------------------------------------------
+
+
+class _MockPPInfo:
+    """Mock PP info structure."""
+
+    def __init__(self, has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=True):
+        self.has_first_stage = has_first_stage
+        self.has_last_stage = has_last_stage
+        self._n_microbatches = n_microbatches
+        self._add_losses = add_losses
+
+        # Create a schedule mock that adds losses when called
+        self.schedule = MagicMock()
+        self.schedule._n_microbatches = n_microbatches
+
+        def step_side_effect(*args, **kwargs):
+            if self._add_losses and kwargs.get("losses") is not None:
+                # Add mock losses for each microbatch
+                for _ in range(n_microbatches):
+                    kwargs["losses"].append(torch.tensor(0.5))
+
+        self.schedule.step = MagicMock(side_effect=step_side_effect)
+
+
+class _MockAutoPipeline:
+    """Mock AutoPipeline for PP testing."""
+
+    def __init__(self, has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=True):
+        self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
+        self.info = self._info
+
+    def update_seq_len(self, seq_len: int) -> None:
+        # Dynamic seq-len hook is a no-op in tests; AutoPipeline exposes this for
+        # variable-length VLM batches.
+        return None
+
+    def step(self, model_input, **kwargs):
+        args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.step(*args, **kwargs)
+
+
+def _create_pp_recipe(model=None):
+    """Helper to create a PP recipe bypassing BaseRecipe tracking."""
+    if model is None:
+        model = _TensorModel()
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    # Initialize __dict__ directly to bypass BaseRecipe.__setattr__ tracking
+    recipe.__dict__["__state_tracked"] = set()
+    recipe.__dict__["dist_env"] = SimpleNamespace(device="cpu")
+    recipe.__dict__["device_mesh"] = None
+    recipe.__dict__["moe_mesh"] = None
+    recipe.__dict__["pp_enabled"] = True
+    recipe.__dict__["loss_fn"] = MagicMock()
+    recipe.__dict__["distributed_config"] = None
+    recipe.__dict__["cp_vision_frame_sharding"] = CpVisionFrameShardingConfig(enabled=True)
+    recipe.__dict__["model_parts"] = [model]
+    recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
+    return recipe
+
+
+def _prepare_pp_vlm_batch(batch, n_microbatches=2):
+    return prepare_vlm_media_for_pp(
+        batch,
+        batch_size=batch["input_ids"].shape[0],
+        n_microbatches=n_microbatches,
+    )
+
+
+class TestForwardBackwardStepPP:
+    """Tests for _forward_backward_step with pipeline parallelism enabled."""
+
+    @pytest.fixture
+    def pp_recipe(self):
+        """Create a recipe configured for PP testing."""
+        return _create_pp_recipe()
+
+    def test_pp_skips_validation_forward(self, pp_recipe, monkeypatch):
+        """Test that PP mode skips forward pass during validation."""
+        pp_recipe.pp = _MockAutoPipeline()
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch = {
+            "labels": torch.tensor([[1, 2]]),
+            "input_ids": torch.tensor([[1, 2]]),
+        }
+        loss_buffer = []
+
+        # Should return early without error
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=2,
+            num_batches=1,
+            is_train=False,  # Validation mode
+        )
+
+        # Loss buffer should be empty (no forward pass)
+        assert len(loss_buffer) == 0
+
+    def test_pp_vlm_chunking_equal_images_and_batch(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking when n_images == batch_size."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch_size = 4
+        # image_grid_hws: 4 images, each with different patch counts
+        image_grid_hws = torch.tensor([[2, 2], [3, 3], [2, 3], [4, 4]])  # patch counts: 4, 9, 6, 16
+        total_patches = 4 + 9 + 6 + 16  # = 35
+        pixel_values = torch.randn(total_patches, 3, 14, 14)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_hws": image_grid_hws,
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+        captured_chunks = {}
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._vlm_pixel_values_chunks]
+            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._vlm_image_grid_hws_chunks]
+            captured_chunks["chunk_idx"] = model._vlm_chunk_idx
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step = MagicMock(side_effect=step_side_effect)
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        # Verify chunking happened correctly
+        model = pp_recipe.model_parts[0]
+        assert captured_chunks["chunk_idx"] == 0
+        assert torch.equal(captured_chunks["pixel_values"][0], pixel_values[:13])
+        assert torch.equal(captured_chunks["pixel_values"][1], pixel_values[13:])
+        assert torch.equal(captured_chunks["image_grid"][0], image_grid_hws[:2])
+        assert torch.equal(captured_chunks["image_grid"][1], image_grid_hws[2:])
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+
+        # Verify schedule.step was called
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+        schedule_call = pp_recipe.pp.info.schedule.step.call_args
+        assert len(schedule_call.args) == 1
+        assert set(schedule_call.kwargs) == {"target", "losses"}
+
+        # Verify loss was computed
+        assert len(loss_buffer) == 1
+
+    def test_pp_step_receives_remaining_kwargs(self, pp_recipe, monkeypatch):
+        """The recipe passes remaining model kwargs through AutoPipeline.step."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        position_ids = torch.zeros(3, 2, 8, dtype=torch.long)
+        batch = {
+            "labels": torch.ones(2, 8, dtype=torch.long),
+            "input_ids": torch.ones(2, 8, dtype=torch.long),
+            "position_ids": position_ids,
+        }
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=[],
+            num_label_tokens=16,
+            num_batches=1,
+            is_train=True,
+        )
+
+        schedule_call = pp_recipe.pp.info.schedule.step.call_args
+        assert len(schedule_call.args) == 1
+        assert set(schedule_call.kwargs) == {"target", "losses", "position_ids"}
+        assert torch.equal(schedule_call.kwargs["position_ids"], position_ids)
+
+    def test_pp_vlm_chunking_videos_uses_video_grid_and_counts(self, pp_recipe, monkeypatch):
+        """Video tensors are chunked by per-sample video counts before schedule.step."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch_size = 4
+        video_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])
+        pixel_values_videos = torch.randn(int(video_grid_thw.prod(dim=1).sum().item()), 64)
+        n_videos_per_sample = torch.tensor([1, 0, 2, 1])
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+            assert "pixel_values_videos" not in kwargs
+            assert "video_grid_thw" not in kwargs
+            assert len(model._vlm_pixel_values_videos_chunks) == 2
+            assert len(model._vlm_video_grid_thw_chunks) == 2
+            assert model._vlm_video_grid_thw_chunks[0].shape[0] == 1
+            assert model._vlm_video_grid_thw_chunks[1].shape[0] == 3
+            assert model._vlm_pixel_values_videos_chunks[0].shape[0] == 4
+            assert model._vlm_pixel_values_videos_chunks[1].shape[0] == 9 + 6 + 16
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step.side_effect = step_side_effect
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+            "n_videos_per_sample": n_videos_per_sample,
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_videos_chunks is None
+        assert model._vlm_video_grid_thw_chunks is None
+        assert model._vlm_chunk_idx is None
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_image_and_video_mixed(self, pp_recipe, monkeypatch):
+        """When a batch carries both images and videos, both streams chunk independently
+        but share a single _vlm_chunk_idx initialized once at 0; both clean up to None."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch_size = 4
+
+        # n_images_per_sample=[2,0,1,0]: mb0 (samples 0..1) covers images 0..1; mb1 covers image 2.
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3]])  # patch counts: 4, 9, 6
+        pixel_values = torch.randn(int(image_grid_thw.prod(dim=1).sum().item()), 32)
+        n_images_per_sample = torch.tensor([2, 0, 1, 0])
+
+        # n_videos_per_sample=[1,0,2,1]: mb0 covers video 0; mb1 covers videos 1..3.
+        video_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])  # patch counts: 4, 9, 6, 16
+        pixel_values_videos = torch.randn(int(video_grid_thw.prod(dim=1).sum().item()), 64)
+        n_videos_per_sample = torch.tensor([1, 0, 2, 1])
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+
+            # Both modalities are popped before schedule.step so the schedule never
+            # tries to chunk the misaligned multimodal tensors along dim 0.
+            assert "pixel_values" not in kwargs
+            assert "image_grid_hws" not in kwargs
+            assert "image_grid_thw" not in kwargs
+            assert "pixel_values_videos" not in kwargs
+            assert "video_grid_thw" not in kwargs
+
+            assert len(model._vlm_pixel_values_chunks) == 2
+            assert len(model._vlm_image_grid_hws_chunks) == 2
+            assert model._vlm_image_grid_hws_chunks[0].shape[0] == 2
+            assert model._vlm_image_grid_hws_chunks[1].shape[0] == 1
+            assert model._vlm_pixel_values_chunks[0].shape[0] == 4 + 9
+            assert model._vlm_pixel_values_chunks[1].shape[0] == 6
+
+            assert len(model._vlm_pixel_values_videos_chunks) == 2
+            assert len(model._vlm_video_grid_thw_chunks) == 2
+            assert model._vlm_video_grid_thw_chunks[0].shape[0] == 1
+            assert model._vlm_video_grid_thw_chunks[1].shape[0] == 3
+            assert model._vlm_pixel_values_videos_chunks[0].shape[0] == 4
+            assert model._vlm_pixel_values_videos_chunks[1].shape[0] == 9 + 6 + 16
+
+            # Single shared cursor: image-branch sets it to 0 first, video branch resets to 0 again.
+            assert model._vlm_chunk_idx == 0
+
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step.side_effect = step_side_effect
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "n_images_per_sample": n_images_per_sample,
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+            "n_videos_per_sample": n_videos_per_sample,
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_pixel_values_videos_chunks is None
+        assert model._vlm_video_grid_thw_chunks is None
+        assert model._vlm_chunk_idx is None
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_with_image_grid_thw(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking with image_grid_thw (3D grid) instead of image_grid_hws."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch_size = 4
+        # image_grid_thw: 4 images with T, H, W dimensions (uses .prod(dim=1) for patch counts)
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])  # patch counts: 4, 9, 6, 16
+        total_patches = 4 + 9 + 6 + 16  # = 35
+        pixel_values = torch.randn(total_patches, 3, 14, 14)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,  # Using thw instead of hws
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        # Verify chunking happened correctly
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+
+        # Verify schedule.step was called
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+
+        # Verify loss was computed
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_qwen35_ep4_pp2_local_batch_images(self, pp_recipe, monkeypatch):
+        """Qwen3.5 35B EP4/PP2-style local batch keeps proper image chunks during schedule.step."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
+        patch_counts = image_grid_thw.prod(dim=1)
+        pixel_values = torch.arange(int(patch_counts.sum()) * 4, dtype=torch.float32).reshape(-1, 4)
+        batch = {
+            "labels": torch.randint(0, 100, (2, 10)),
+            "input_ids": torch.randint(0, 100, (2, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "n_images_per_sample": torch.tensor([1, 1]),
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+        captured_chunks = {}
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._vlm_pixel_values_chunks]
+            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._vlm_image_grid_hws_chunks]
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step = MagicMock(side_effect=step_side_effect)
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=20,
+            num_batches=1,
+            is_train=True,
+        )
+
+        split_at = int(patch_counts[0].item())
+        assert torch.equal(captured_chunks["pixel_values"][0], pixel_values[:split_at])
+        assert torch.equal(captured_chunks["pixel_values"][1], pixel_values[split_at:])
+        assert torch.equal(captured_chunks["image_grid"][0], image_grid_thw[:1])
+        assert torch.equal(captured_chunks["image_grid"][1], image_grid_thw[1:])
+        assert pp_recipe.model_parts[0]._vlm_pixel_values_chunks is None
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_mismatched_images_raises(self):
+        """When media cannot be aligned to samples, VLM PP data prep raises."""
+        batch_size = 4
+        image_grid_hws = torch.tensor([[2, 2], [3, 3]])
+        total_patches = 4 + 9
+        pixel_values = torch.randn(total_patches, 3, 14, 14)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_hws": image_grid_hws,
+        }
+
+        with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
+            _prepare_pp_vlm_batch(batch)
+
+    def test_pp_vlm_chunking_with_image_sizes(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking with image_sizes fallback (e.g., Mistral4-style)."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch_size = 4
+        # image_sizes: [N_images, 2] — no image_grid_hws or image_grid_thw
+        image_sizes = torch.tensor([[224, 224], [224, 224], [224, 224], [224, 224]])
+        # 4D pixel_values: [N_images, C, H, W]
+        pixel_values = torch.randn(batch_size, 3, 224, 224)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_sizes": image_sizes,
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_4d_pixel_values(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking when pixel_values is 4D [N, C, H, W]."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch_size = 4
+        image_grid_hws = torch.tensor([[224, 224], [224, 224], [224, 224], [224, 224]])
+        # 4D pixel_values — triggers the new dim==4 chunking path
+        pixel_values = torch.randn(batch_size, 3, 224, 224)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_hws": image_grid_hws,
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+        assert len(loss_buffer) == 1
+
+    def test_pp_last_stage_computes_loss(self, pp_recipe, monkeypatch):
+        """Test that last stage computes and buffers loss."""
+
+        def mock_schedule_step(*args, **kwargs):
+            # Simulate loss computation on last stage
+            if kwargs.get("losses") is not None:
+                kwargs["losses"].append(torch.tensor(0.5))
+                kwargs["losses"].append(torch.tensor(0.3))
+
+        pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=False)
+        pp.info.schedule.step = MagicMock(side_effect=mock_schedule_step)
+        pp_recipe.pp = pp
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch = {
+            "labels": torch.tensor([[1, 2]]),
+            "input_ids": torch.tensor([[1, 2]]),
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=2,
+            num_batches=1,
+            is_train=True,
+        )
+
+        # Loss should be sum of microbatch losses
+        assert len(loss_buffer) == 1
+        assert torch.isclose(loss_buffer[0], torch.tensor(0.8))
+
+    def test_pp_non_last_stage_returns_zero_loss(self, pp_recipe, monkeypatch):
+        """Test that non-last stage returns zero loss."""
+        pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=False, n_microbatches=2)
+        pp_recipe.pp = pp
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch = {
+            "labels": torch.tensor([[1, 2]]),
+            "input_ids": torch.tensor([[1, 2]]),
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=2,
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert len(loss_buffer) == 1
+        assert loss_buffer[0].item() == 0.0
+
+    def test_pp_non_first_stage_skips_input_ids(self, pp_recipe, monkeypatch):
+        """Test that non-first stage doesn't pass input_ids to schedule."""
+        step_calls = []
+
+        def mock_schedule_step(*args, **kwargs):
+            step_calls.append((args, kwargs))
+            # Add losses so torch.stack doesn't fail
+            if kwargs.get("losses") is not None:
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp = _MockAutoPipeline(has_first_stage=False, has_last_stage=True, n_microbatches=2, add_losses=False)
+        pp.info.schedule.step = MagicMock(side_effect=mock_schedule_step)
+        pp_recipe.pp = pp
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch = {
+            "labels": torch.tensor([[1, 2]]),
+            "input_ids": torch.tensor([[1, 2]]),
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=2,
+            num_batches=1,
+            is_train=True,
+        )
+
+        # Should be called without positional args (no input_ids)
+        assert len(step_calls) == 1
+        args, kwargs = step_calls[0]
+        assert len(args) == 0  # No positional args
+        assert "target" in kwargs
+
+
+# -----------------------------------------------------------------------------
 # FinetuneRecipeForVLM.setup() tests
 # -----------------------------------------------------------------------------
 
@@ -1517,6 +2214,379 @@ class TestFinetuneRecipeSetup:
         max_grad_norm = cfg.get("clip_grad_norm.max_norm", None)
 
         assert max_grad_norm == 0.5
+
+
+# -----------------------------------------------------------------------------
+# _forward_backward_step non-PP tests (FusedLinearCE path)
+# -----------------------------------------------------------------------------
+
+
+class _ModelOutput:
+    """Model output that supports both attribute access and 'in' operator."""
+
+    def __init__(self, logits, hidden_states=None):
+        self.logits = logits
+        self.hidden_states = hidden_states
+
+    def __contains__(self, key):
+        return hasattr(self, key) and getattr(self, key) is not None
+
+
+class _ModelWithHiddenStates(torch.nn.Module):
+    """Model that outputs hidden states for FusedLinearCE testing."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(10, 10)
+        self.lm_head = torch.nn.Linear(10, 50)
+
+    def forward(self, logits_to_keep=None, **kwargs):
+        hidden = torch.randn(2, 5, 10)
+        return _ModelOutput(
+            logits=self.lm_head(hidden),
+            hidden_states=[hidden],
+        )
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def _create_non_pp_recipe(model, device="cpu"):
+    """Helper to create a non-PP recipe bypassing BaseRecipe tracking."""
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    # Initialize __dict__ directly to bypass BaseRecipe.__setattr__ tracking
+    recipe.__dict__["__state_tracked"] = set()
+    recipe.__dict__["dist_env"] = SimpleNamespace(device=device)
+    recipe.__dict__["device_mesh"] = None
+    recipe.__dict__["moe_mesh"] = None
+    recipe.__dict__["pp_enabled"] = False
+    recipe.__dict__["distributed_config"] = None
+    recipe.__dict__["cp_vision_frame_sharding"] = CpVisionFrameShardingConfig(enabled=True)
+    recipe.__dict__["model_parts"] = [model]
+    recipe.__dict__["engine"] = _RecipeEngineStub(model)
+    recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
+    # ``is_remote_logging_step`` is read by ``_forward_backward_step`` to
+    # gate the joint-drafter loss-log line; default False so non-drafter
+    # test paths don't trip on the new attribute.
+    recipe.__dict__["step_scheduler"] = SimpleNamespace(is_remote_logging_step=False)
+    return recipe
+
+
+class _DummyCPSubMesh:
+    def __init__(self, size: int):
+        self._size = size
+        self._group = object()
+
+    def size(self) -> int:
+        return self._size
+
+    def get_group(self):
+        return self._group
+
+
+class _DummyCPDeviceMesh(dict):
+    def __init__(self, cp_size: int):
+        super().__init__()
+        self["cp"] = _DummyCPSubMesh(cp_size)
+        self.mesh_dim_names = ["cp"]
+
+
+class _CPPreEmbedModel(torch.nn.Module):
+    """Sunk model: sharder-only CP hook (consumes nothing; the forward embeds +
+    shards per microbatch). Records that the hook was invoked."""
+
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp=False)
+        self.hook_calls = []
+
+    def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
+        self.hook_calls.append(set(batch))
+        return {}
+
+    def forward(self, **kwargs):
+        raise AssertionError("forward should not run: ContextParallelSharder.shard raises first")
+
+
+class _CPPreEmbedStop(RuntimeError):
+    pass
+
+
+class TestForwardBackwardStepNonPP:
+    """Tests for _forward_backward_step without pipeline parallelism."""
+
+    def test_non_pp_cp_invokes_sharder_only_hook_and_keeps_inputs(self, monkeypatch):
+        # Sunk contract: the non-PP CP path invokes the sharder-only hook, which
+        # consumes nothing, so input_ids / pixel_values / mm_token_type_ids all
+        # reach ContextParallelSharder.shard intact (the model embeds + shards them in
+        # its own forward, not here).
+        model = _CPPreEmbedModel()
+        non_pp_recipe = _create_non_pp_recipe(model)
+        non_pp_recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
+
+        mm_token_type_ids = torch.tensor([[1, 1, 0, 0]])
+
+        def _capture_cp_batch(sharder, batch):
+            """Validate the global model-input mapping before CP transport.
+
+            Args:
+                sharder: Sharder configured by the VLM recipe.
+                batch: Mutable model-input mapping whose tensor values have
+                    global batch and sequence extents.
+            """
+            del sharder
+            assert "input_ids" in batch
+            assert "pixel_values" in batch
+            assert "mm_token_type_ids" in batch
+            torch.testing.assert_close(batch["mm_token_type_ids"], mm_token_type_ids)
+            assert "inputs_embeds" not in batch
+            raise _CPPreEmbedStop
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.ContextParallelSharder.shard",
+            _capture_cp_batch,
+        )
+
+        batch = {
+            "labels": torch.randint(0, 50, (1, 4)),
+            "input_ids": torch.randint(0, 100, (1, 4)),
+            "pixel_values": torch.randn(1, 3, 8, 8),
+            "image_position_ids": torch.zeros(1, 1, 2, dtype=torch.long),
+            "mm_token_type_ids": mm_token_type_ids,
+        }
+
+        with pytest.raises(_CPPreEmbedStop):
+            non_pp_recipe._forward_backward_step(
+                idx=0,
+                batch=batch,
+                loss_buffer=[],
+                num_label_tokens=4,
+                num_batches=1,
+                is_train=False,
+            )
+        assert len(model.hook_calls) == 1  # the CP hook ran before sharding
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="FusedLinearCE requires CUDA")
+    def test_non_pp_with_fused_linear_ce(self, monkeypatch):
+        """Test non-PP path with FusedLinearCrossEntropy."""
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+        # Model output class that supports both attribute access and 'in' operator
+        class ModelOutput:
+            def __init__(self, logits, hidden_states):
+                self.logits = logits
+                self.hidden_states = hidden_states
+
+            def __contains__(self, key):
+                return hasattr(self, key)
+
+        # Create CUDA model for FusedLinearCE - must use bf16/fp16 for backward
+        class CudaModelWithHiddenStates(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Keep lm_head in bfloat16 to match hidden states
+                self.lm_head = torch.nn.Linear(10, 50)
+
+            def forward(self, logits_to_keep=None, **kwargs):
+                # FusedLinearCE requires bf16/fp16 hidden states
+                hidden = torch.randn(2, 5, 10, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                # lm_head is already bfloat16, so no conversion needed
+                return ModelOutput(
+                    logits=self.lm_head(hidden),
+                    hidden_states=[hidden],
+                )
+
+            def get_output_embeddings(self):
+                return self.lm_head
+
+        # Create model and convert entirely to bfloat16
+        model = CudaModelWithHiddenStates().cuda().bfloat16()
+        non_pp_recipe = _create_non_pp_recipe(model, device="cuda")
+        non_pp_recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch = {
+            "labels": torch.randint(0, 50, (2, 5)),
+            "input_ids": torch.randint(0, 100, (2, 5)),
+        }
+        loss_buffer = []
+
+        non_pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=10,
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert len(loss_buffer) == 1
+        assert isinstance(loss_buffer[0], torch.Tensor)
+
+    def test_non_pp_fused_ce_requires_hidden_states(self, monkeypatch):
+        """Test that FusedLinearCE raises error when hidden_states not in output."""
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+        # Model output class that supports 'in' operator but has no hidden_states
+        class ModelOutputNoHiddenStates:
+            def __init__(self, logits):
+                self.logits = logits
+
+            def __contains__(self, key):
+                return hasattr(self, key)
+
+        # Model that doesn't output hidden_states
+        class BadModel(torch.nn.Module):
+            def forward(self, logits_to_keep=None, **kwargs):
+                return ModelOutputNoHiddenStates(logits=torch.randn(2, 5, 50))
+
+        non_pp_recipe = _create_non_pp_recipe(BadModel())
+        non_pp_recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch = {
+            "labels": torch.randint(0, 50, (2, 5)),
+            "input_ids": torch.randint(0, 100, (2, 5)),
+        }
+        loss_buffer = []
+
+        with pytest.raises(ValueError, match="FusedLinearCrossEntropy requires the model to output hidden states"):
+            non_pp_recipe._forward_backward_step(
+                idx=0,
+                batch=batch,
+                loss_buffer=loss_buffer,
+                num_label_tokens=10,
+                num_batches=1,
+                is_train=True,
+            )
+
+    def test_non_pp_with_masked_ce(self, monkeypatch):
+        """Test non-PP path with MaskedCrossEntropy."""
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+        class SimpleModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(10, 50)
+
+            def forward(self, **kwargs):
+                # Create logits through a layer so gradients can flow
+                x = torch.randn(2, 5, 10, requires_grad=True)
+                logits = self.linear(x)
+                return _ModelOutput(logits=logits, hidden_states=None)
+
+        non_pp_recipe = _create_non_pp_recipe(SimpleModel())
+        non_pp_recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch = {
+            "labels": torch.randint(0, 50, (2, 5)),
+            "input_ids": torch.randint(0, 100, (2, 5)),
+        }
+        loss_buffer = []
+
+        non_pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=10,
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert len(loss_buffer) == 1
+        assert isinstance(loss_buffer[0], torch.Tensor)
+
+    def test_non_pp_validation_mode_no_backward(self, monkeypatch):
+        """Test that validation mode doesn't call backward."""
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+        # Simple model for this test
+        class SimpleModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(10, 50)
+
+            def forward(self, **kwargs):
+                return _ModelOutput(logits=torch.randn(2, 5, 50), hidden_states=None)
+
+        non_pp_recipe = _create_non_pp_recipe(SimpleModel())
+        non_pp_recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch = {
+            "labels": torch.randint(0, 50, (2, 5)),
+            "input_ids": torch.randint(0, 100, (2, 5)),
+        }
+        loss_buffer = []
+
+        # Should complete without error and not call backward
+        non_pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=10,
+            num_batches=1,
+            is_train=False,  # Validation mode
+        )
+
+        assert len(loss_buffer) == 1
+
+    def test_non_pp_handles_dict_batch_values(self, monkeypatch):
+        """Test that nested dict values in batch are moved to device."""
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+        class SimpleModel(torch.nn.Module):
+            def forward(self, **kwargs):
+                return _ModelOutput(logits=torch.randn(2, 5, 50), hidden_states=None)
+
+        non_pp_recipe = _create_non_pp_recipe(SimpleModel())
+        non_pp_recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        # Batch with nested dict (like attention_mask dict)
+        batch = {
+            "labels": torch.randint(0, 50, (2, 5)),
+            "input_ids": torch.randint(0, 100, (2, 5)),
+            "nested": {
+                "inner_tensor": torch.ones(2, 5),
+                "none_value": None,
+            },
+        }
+        loss_buffer = []
+
+        # Should handle nested dict without error
+        non_pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=10,
+            num_batches=1,
+            is_train=False,
+        )
+
+        assert len(loss_buffer) == 1
 
 
 # -----------------------------------------------------------------------------
@@ -1712,8 +2782,6 @@ class TestRecipeTargetAllowlist:
 
 def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     """Patch heavy dependencies so FinetuneRecipeForVLM.setup() runs lightly."""
-    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.initialize_distributed",
         lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
@@ -1723,7 +2791,7 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.StatefulRNG", lambda *a, **k: "rng")
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
-        property(lambda self: SimpleNamespace(build=lambda: MaskedCrossEntropy(reduction="sum"))),
+        property(lambda self: SimpleNamespace(build=lambda: "loss_fn")),
     )
 
     def _stub_build_checkpoint_config(*a, **k):
@@ -1779,7 +2847,7 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
-        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[], grad_acc_steps=1),
     )
     monkeypatch.setattr("nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build", lambda self, *a, **k: [])
     monkeypatch.setattr(
@@ -1844,7 +2912,6 @@ def _patch_vlm_distributed_setup(
     monkeypatch,
     *,
     pp_enabled: bool,
-    calculate_per_token_loss: bool = False,
     scale_grads_in_schedule: bool = False,
 ):
     mesh_context = SimpleNamespace(
@@ -1869,24 +2936,12 @@ def _patch_vlm_distributed_setup(
         "nemo_automodel.recipes.vlm.finetune.create_distributed_setup_from_config",
         lambda cfg, world_size: SimpleNamespace(
             mesh_context=mesh_context,
-            strategy_config=SimpleNamespace(calculate_per_token_loss=calculate_per_token_loss),
+            strategy_config=None,
             pipeline_config=pipeline_config,
             moe_parallel_config=None,
             activation_checkpointing=False,
         ),
     )
-
-
-def test_vlm_setup_allows_calculate_per_token_loss(monkeypatch):
-    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
-    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
-    _patch_vlm_distributed_setup(monkeypatch, pp_enabled=False, calculate_per_token_loss=True)
-
-    trainer = FinetuneRecipeForVLM(cfg)
-    trainer.setup()
-
-    assert trainer.distributed_config.calculate_per_token_loss is True
-    assert trainer.engine is not None
 
 
 def test_vlm_setup_rejects_pipeline_schedule_gradient_scaling(monkeypatch):
@@ -1903,6 +2958,7 @@ def test_vlm_setup_rejects_pipeline_schedule_gradient_scaling(monkeypatch):
 def test_vlm_setup_supports_magi_pipeline_only_with_unit_local_batch(monkeypatch, local_batch_size):
     cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
     cfg.step_scheduler.local_batch_size = local_batch_size
+    cfg.step_scheduler.global_batch_size = local_batch_size
     cfg.distributed.pipeline = ConfigNode({"pp_microbatch_size": 1})
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
     _patch_vlm_distributed_setup(monkeypatch, pp_enabled=True)
@@ -1916,25 +2972,30 @@ def test_vlm_setup_supports_magi_pipeline_only_with_unit_local_batch(monkeypatch
             FinetuneRecipeForVLM(cfg).setup()
         return
 
+    class DummyAutoPipeline(SimpleNamespace):
+        pass
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.AutoPipeline", DummyAutoPipeline)
     model = DummyModel()
-    pipeline = object.__new__(AutoPipeline)
-    pipeline._info = SimpleNamespace(
-        model_parts=[model],
-        has_first_stage=True,
-        has_last_stage=False,
-        stages=[SimpleNamespace(is_first=True, is_last=False)],
-        schedule=MagicMock(),
+    pipeline = DummyAutoPipeline(
+        parts=[model],
+        pp_batch_size=1,
+        pp_microbatch_size=1,
+        scale_grads_in_schedule=False,
+        info=SimpleNamespace(
+            has_first_stage=True,
+            has_last_stage=False,
+            stages=[SimpleNamespace(is_first=True, is_last=False)],
+            schedule=MagicMock(),
+        ),
     )
-    pipeline.scale_grads_in_schedule = False
-    pipeline.pp_batch_size = 1
-    pipeline.pp_microbatch_size = 1
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *args, **kwargs: pipeline)
 
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
 
     assert trainer.pp is pipeline
-    assert trainer.engine.pipeline is pipeline
+    assert trainer.engine is None
 
 
 def test_vlm_setup_applies_prewarm_config(monkeypatch):
@@ -1998,251 +3059,6 @@ def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is False
-    assert trainer.engine is not None
-
-
-def test_vlm_setup_binds_optimizer_state_to_engine(monkeypatch):
-    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
-    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
-
-    trainer = FinetuneRecipeForVLM(cfg)
-    trainer.setup()
-
-    assert trainer.engine.optimizers == tuple(trainer.optimizer)
-    assert trainer.engine.lr_schedulers == tuple(trainer.lr_scheduler or ())
-    assert trainer.engine.max_grad_norm == trainer.max_grad_norm
-
-
-def test_vlm_setup_builds_engine_for_magi(monkeypatch):
-    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)
-    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.setup_magi",
-        lambda *args, **kwargs: SimpleNamespace(enabled=True),
-    )
-
-    trainer = FinetuneRecipeForVLM(cfg)
-    trainer.setup()
-
-    assert trainer.engine is not None
-
-
-def test_vlm_compute_loss_uses_final_thd_sequence_boundaries(monkeypatch):
-    recipe = object.__new__(FinetuneRecipeForVLM)
-    recipe.model_parts = [nn.Identity()]
-    recipe.loss_fn = object()
-    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=0.5, ignore_index=-100))
-    recipe.dist_env = SimpleNamespace(is_main=False)
-    recipe._get_dp_group = lambda include_cp=False: None
-    recipe._maybe_add_drafter_loss = lambda **kwargs: kwargs["base_loss"]
-    seen = {}
-
-    def fake_mtp_loss(*args, **kwargs):
-        seen.update(kwargs)
-        return torch.tensor(2.0)
-
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
-        lambda *args, **kwargs: torch.tensor(1.0),
-    )
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_mtp_loss", fake_mtp_loss)
-    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
-    out = SimpleNamespace(
-        logits=torch.zeros(5, 8),
-        mtp_per_depth_logits=[torch.zeros(5, 8)],
-        mtp_loss_scaling_factor=0.25,
-    )
-
-    loss = recipe._compute_vlm_loss(
-        out=out,
-        labels=torch.arange(5),
-        num_label_tokens=None,
-        is_train=True,
-        cu_seqlens=cu_seqlens,
-    )
-
-    assert loss.item() == pytest.approx(3.0)
-    assert seen["cu_seqlens"] is cu_seqlens
-
-
-def test_vlm_engine_loss_uses_explicit_mtp_targets_instead_of_thd_boundaries(monkeypatch):
-    recipe = object.__new__(FinetuneRecipeForVLM)
-    recipe.model_parts = [nn.Identity()]
-    recipe.loss_fn = object()
-    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=0.5, ignore_index=-100))
-    recipe.dist_env = SimpleNamespace(is_main=False)
-    recipe.pp_enabled = False
-    recipe._get_dp_group = lambda include_cp=False: None
-    recipe._get_cp_group_size = lambda: 2
-    recipe._maybe_add_drafter_loss = MagicMock(return_value=torch.tensor(3.0))
-    mtp_loss = MagicMock(return_value=torch.tensor(2.0))
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
-        MagicMock(return_value=torch.tensor(1.0)),
-    )
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_mtp_loss", mtp_loss)
-
-    labels = torch.arange(5)
-    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
-    targets = (torch.tensor([1, -100, 3, 4, -100]),)
-    out = SimpleNamespace(
-        logits=torch.zeros(5, 8),
-        mtp_per_depth_logits=[torch.zeros(5, 8)],
-        mtp_loss_scaling_factor=0.25,
-    )
-
-    loss = recipe._engine_loss_fn(
-        out,
-        {
-            "labels": labels,
-            "weights": labels.ne(-100),
-            "cu_seqlens": cu_seqlens,
-            "mtp_per_depth_targets": targets,
-        },
-    )
-
-    assert loss.item() == pytest.approx(3.0)
-    assert mtp_loss.call_args.kwargs["mtp_per_depth_targets"] is targets
-    assert mtp_loss.call_args.kwargs["cu_seqlens"] is None
-    assert mtp_loss.call_args.kwargs["labels"] is labels
-
-    with pytest.raises(RuntimeError, match="globally prepared per-depth targets"):
-        recipe._engine_loss_fn(
-            out,
-            {"labels": labels, "weights": labels.ne(-100), "cu_seqlens": cu_seqlens},
-        )
-
-
-def test_vlm_engine_validation_loss_uses_eval_path():
-    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.pp_enabled = False
-    expected = torch.tensor(5.0)
-    compute_loss = MagicMock(return_value=expected)
-    recipe._compute_vlm_loss = compute_loss
-
-    output = object()
-    labels = torch.tensor([[1, 2, -100]])
-    targets = (torch.tensor([[2, -100, -100]]),)
-    cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
-    loss_inputs = {
-        "labels": labels,
-        "weights": labels.ne(-100),
-        "cu_seqlens": cu_seqlens,
-        "mtp_per_depth_targets": targets,
-    }
-
-    loss = recipe._engine_validation_loss_fn(output, loss_inputs)
-
-    assert loss is expected
-    compute_loss.assert_called_once_with(
-        out=output,
-        labels=labels,
-        num_label_tokens=None,
-        is_train=False,
-        cu_seqlens=cu_seqlens,
-        mtp_per_depth_targets=targets,
-        log_drafter=False,
-        log_denominator=None,
-    )
-
-
-def test_vlm_validation_uses_engine_evaluate_and_aggregates_uneven_batches(monkeypatch):
-    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.model_parts = [MagicMock()]
-    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
-    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
-    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
-    recipe.pp_enabled = False
-    recipe.loss_fn = object()
-
-    engine = MagicMock()
-    engine.evaluate.side_effect = [
-        SimpleNamespace(
-            loss_sum=torch.tensor(4.0, dtype=torch.float64),
-            weight_sum=torch.tensor(2.0, dtype=torch.float64),
-            token_outputs=[],
-            batch_outputs=[],
-        ),
-        SimpleNamespace(
-            loss_sum=torch.tensor(9.0, dtype=torch.float64),
-            weight_sum=torch.tensor(3.0, dtype=torch.float64),
-            token_outputs=[],
-            batch_outputs=[],
-        ),
-    ]
-    recipe.engine = engine
-    allreduce = MagicMock(side_effect=lambda tensor, **kwargs: tensor)
-    recipe._dp_allreduce = allreduce
-    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.ScopedRNG",
-        lambda **kwargs: nullcontext(),
-    )
-
-    batches = [
-        {
-            "input_ids": torch.tensor([[1, 2, 3]]),
-            "labels": torch.tensor([[1, 2, -100]]),
-            "pixel_values": torch.ones(1, 3, 2, 2),
-        },
-        {
-            "input_ids": torch.tensor([[4, 5, 6, 7]]),
-            "labels": torch.tensor([[3, 4, 5, -100]]),
-            "pixel_values": torch.zeros(1, 3, 2, 2),
-        },
-    ]
-    metrics = recipe._run_validation_epoch(batches)
-
-    assert engine.evaluate.call_count == 2
-    for call, batch in zip(engine.evaluate.call_args_list, batches):
-        datum_batches, loss_fn = call.args
-        assert len(datum_batches) == len(datum_batches[0]) == 1
-        datum = datum_batches[0][0]
-        assert datum.model_inputs["input_ids"] is batch["input_ids"]
-        assert datum.model_inputs["pixel_values"] is batch["pixel_values"]
-        assert datum.loss_fn_inputs["labels"] is batch["labels"]
-        torch.testing.assert_close(datum.loss_fn_inputs["weights"], batch["labels"].ne(-100))
-        assert datum.loss_fn_input_layouts == {
-            "labels": LossInputLayout.PER_TOKEN,
-            "weights": LossInputLayout.PER_TOKEN,
-        }
-        assert loss_fn == recipe._engine_validation_loss_fn
-    assert allreduce.call_count == 2
-    assert all("include_cp" not in call.kwargs for call in allreduce.call_args_list)
-    recipe.model_parts[0].eval.assert_not_called()
-    assert metrics.metrics["val_loss"] == pytest.approx(13.0 / 5.0)
-    assert metrics.metrics["num_label_tokens"] == pytest.approx(5.0)
-
-
-@pytest.mark.parametrize(
-    "batches",
-    [
-        [],
-        [{"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[-100, -100]])}],
-    ],
-)
-def test_vlm_validation_rejects_zero_global_denominator(monkeypatch, batches):
-    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
-    recipe.pp_enabled = False
-    recipe.loss_fn = object()
-    recipe.engine = MagicMock()
-    recipe.engine.evaluate.return_value = SimpleNamespace(
-        loss_sum=torch.tensor(0.0, dtype=torch.float64),
-        weight_sum=torch.tensor(0.0, dtype=torch.float64),
-        token_outputs=[],
-        batch_outputs=[],
-    )
-    recipe._dp_allreduce = MagicMock(side_effect=lambda tensor, **kwargs: tensor)
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.ScopedRNG",
-        lambda **kwargs: nullcontext(),
-    )
-
-    with pytest.raises(ValueError, match="no supervised label tokens.*drop_last=true"):
-        recipe._run_validation_epoch(batches)
-
-    assert recipe._dp_allreduce.call_count == 2
 
 
 def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
@@ -2254,34 +3070,6 @@ def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is True
-
-
-def test_vlm_setup_rejects_loss_without_sum_contract(monkeypatch):
-    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)
-    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
-    monkeypatch.setattr(
-        "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
-        property(lambda self: SimpleNamespace(build=lambda: SimpleNamespace(reduction="mean"))),
-    )
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", lambda _model: True)
-
-    trainer = FinetuneRecipeForVLM(cfg)
-    with pytest.raises(ValueError, match="reduction='sum'"):
-        trainer.setup()
-
-
-def test_vlm_setup_builds_engine_for_eager_sum_loss(monkeypatch):
-    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
-    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)
-    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
-
-    trainer = FinetuneRecipeForVLM(cfg)
-    trainer.setup()
-
-    assert isinstance(trainer.loss_fn, MaskedCrossEntropy)
-    assert trainer.engine is not None
-    assert trainer.engine.mtp_ignore_index == trainer.cfg.mtp.ignore_index == -100
 
 
 def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
@@ -2423,95 +3211,6 @@ class TestChunkVlmMedia:
         assert vg_chunks[1].shape[0] == 3
         assert pv_chunks[0].shape[0] == 4
         assert pv_chunks[1].shape[0] == 9 + 6 + 16
-
-    def test_variable_resolution_list_chunks_by_sample_counts(self):
-        pixel_values = [torch.full((3, 8, 9 + index), index, dtype=torch.bfloat16) for index in range(5)]
-        image_grid = torch.tensor([[1, 2, 2], [1, 2, 3], [1, 3, 3], [1, 4, 2], [1, 2, 4]])
-        n_images_per_sample = torch.tensor([2, 0, 1, 2])
-
-        pv_chunks, ig_chunks = chunk_vlm_media(
-            pixel_values,
-            image_grid,
-            batch_size=4,
-            n_microbatches=2,
-            n_images_per_sample=n_images_per_sample,
-        )
-
-        assert [[id(value) for value in chunk] for chunk in pv_chunks] == [
-            [id(value) for value in pixel_values[:2]],
-            [id(value) for value in pixel_values[2:]],
-        ]
-        assert ig_chunks is not None
-        assert torch.equal(ig_chunks[0], image_grid[:2])
-        assert torch.equal(ig_chunks[1], image_grid[2:])
-
-    @pytest.mark.parametrize(
-        ("counts", "grid", "match"),
-        [
-            (torch.tensor([1, 1]), torch.ones(3, 3, dtype=torch.long), "length batch_size"),
-            (torch.tensor([1, -1, 3]), torch.ones(3, 3, dtype=torch.long), "non-negative"),
-            (torch.tensor([1, 1, 0]), torch.ones(3, 3, dtype=torch.long), "sum\\(n_images_per_sample\\)"),
-            (torch.tensor([1, 1, 1]), torch.ones(2, 3, dtype=torch.long), "image_grid.shape\\[0\\]"),
-        ],
-    )
-    def test_variable_resolution_list_strictly_validates_alignment(self, counts, grid, match):
-        pixel_values = [torch.ones(3, 8, 8) for _ in range(3)]
-
-        with pytest.raises(ValueError, match=match):
-            chunk_vlm_media(
-                pixel_values,
-                grid,
-                batch_size=3,
-                n_microbatches=2,
-                n_images_per_sample=counts,
-            )
-
-    def test_variable_resolution_list_rejects_non_tensor_values(self):
-        with pytest.raises(TypeError, match="list of tensors"):
-            chunk_vlm_media(
-                [torch.ones(3, 8, 8), "not-a-tensor"],
-                None,
-                batch_size=2,
-                n_microbatches=2,
-            )
-
-    def test_wrapper_chunks_variable_resolution_image_and_video_lists_without_grids(self):
-        images = [torch.ones(3, 8, 9 + index) for index in range(4)]
-        videos = [torch.ones(6, 10, 11 + index) for index in range(3)]
-
-        def collate_fn(_examples):
-            return {
-                "input_ids": torch.ones(4, 8, dtype=torch.long),
-                "pixel_values": images,
-                "n_images_per_sample": torch.tensor([2, 0, 1, 1]),
-                "pixel_values_videos": videos,
-                "n_videos_per_sample": torch.tensor([0, 1, 2, 0]),
-            }
-
-        prepared = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=2)([{}] * 4)
-        media = prepared[VLM_PP_MEDIA_KEY]
-
-        assert [[id(value) for value in chunk] for chunk in media["pixel_values"]] == [
-            [id(value) for value in images[:2]],
-            [id(value) for value in images[2:]],
-        ]
-        assert [[id(value) for value in chunk] for chunk in media["pixel_values_videos"]] == [
-            [id(value) for value in videos[:1]],
-            [id(value) for value in videos[1:]],
-        ]
-        assert "image_grid_hws" not in media
-        assert "video_grid_thw" not in media
-
-    def test_wrapper_rejects_variable_resolution_list_count_mismatch(self):
-        def collate_fn(_examples):
-            return {
-                "input_ids": torch.ones(3, 8, dtype=torch.long),
-                "pixel_values": [torch.ones(3, 8, 8) for _ in range(3)],
-                "n_images_per_sample": torch.tensor([1, 0, 1]),
-            }
-
-        with pytest.raises(ValueError, match="sum\\(n_images_per_sample\\)=2"):
-            wrap_vlm_collate_for_pp(collate_fn, n_microbatches=2)([{}] * 3)
 
     def test_uneven_batch_size_general_branch_covers_all_samples(self):
         """batch_size not divisible by n_microbatches must not drop trailing samples.

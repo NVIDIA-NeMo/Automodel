@@ -12,22 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public Datum Engine API."""
+"""Public training Engine API."""
 
-from nemo_automodel.engine._batch import collate_prebatched
 from nemo_automodel.engine._engine import Engine
-from nemo_automodel.engine.outputs import (
-    EvaluationResult,
-    ForwardBackwardResult,
-    LossOutput,
-    StepResult,
-)
 
-__all__ = [
-    "Engine",
-    "EvaluationResult",
-    "ForwardBackwardResult",
-    "LossOutput",
-    "StepResult",
-    "collate_prebatched",
-]
+__all__ = ["Engine"]

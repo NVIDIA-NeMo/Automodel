@@ -14,8 +14,8 @@
 
 """images x cp2xpp2 for minimax: the in-forward vision splice under CP+PP (L1, 2/4 GPU).
 
-Regression cover for images x context-parallelism x pipeline-parallelism through
-the Datum Engine after the pre-embed sink. Media rides the existing per-microbatch side channel
+Regression cover for images x context-parallelism x pipeline-parallelism after the
+pre-embed sink. Media rides the existing per-microbatch side channel
 (prepare_vlm_media_for_pp -> stage_vlm_media_for_pp -> stage-0 chunk pull); the
 in-forward embed + vision splice runs on the microbatch's full sequence with the
 CP ring dispatcher suspended around the (non-causal, unsharded) vision tower
@@ -32,7 +32,6 @@ Observed (bf16): cp2xpp2 == cp2xpp1 == 5.609686.
 
 import os
 import sys
-from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -133,25 +132,17 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
 
-    from nemo_automodel.components.datasets.datum import Datum
+    from torch.distributed.device_mesh import init_device_mesh
+
     from nemo_automodel.components.datasets.vlm.pp_media import prepare_vlm_media_for_pp, stage_vlm_media_for_pp
-    from nemo_automodel.components.distributed.config import FSDP2Config
-    from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
+    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.moe.parallelizer import apply_cp
-    from nemo_automodel.engine import Engine, collate_prebatched
 
     pp1 = bool(os.environ.get("NEMO_CP_PP_TEST_PP1"))
     pp_size = 1 if pp1 else 2
     cp_size = world // pp_size
-    mesh_context = MeshContext.build(
-        FSDP2Config(),
-        ParallelismSizes(dp_size=1, pp_size=pp_size, cp_size=cp_size),
-        world_size=world,
-    )
-    mesh = mesh_context.device_mesh
-    if mesh is None:
-        raise RuntimeError("FSDP2 CP/PP validation requires a device mesh")
+    mesh = init_device_mesh("cuda", (pp_size, 1, cp_size), mesh_dim_names=("pp", "dp", "cp"))
 
     torch.manual_seed(0)
     model = build_minimax(device)
@@ -162,23 +153,9 @@ def main():
     model.train()
     vocab = model.config.text_config.vocab_size
 
-    def loss_fn(output, loss_inputs):
-        """Return image-text token losses in the Engine's CP-local layout.
-
-        Args:
-            output: Model output whose logits have shape [batch, sequence, vocab].
-            loss_inputs: Mapping containing labels and weights with shape
-                [batch, sequence] in the same CP-local layout as the logits.
-
-        Returns:
-            Scalar weighted causal-LM loss numerator.
-        """
+    def loss_fn(output, labels):
         logits = output[0] if isinstance(output, tuple) else getattr(output, "logits", output)
-        labels = loss_inputs["labels"]
-        per_token_loss = F.cross_entropy(
-            logits.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100, reduction="none"
-        ).reshape_as(loss_inputs["weights"])
-        return (per_token_loss * loss_inputs["weights"].to(per_token_loss)).sum()
+        return F.cross_entropy(logits.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index=-100)
 
     def cp_only(m, world_mesh, moe_mesh, *, dp_axis_names, cp_axis_name=None, **kw):
         if cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1:
@@ -189,7 +166,9 @@ def main():
         pp = AutoPipeline(
             world_mesh=mesh,
             moe_mesh=None,
-            **mesh_context.pipeline_axis_kwargs(),
+            pp_axis_name="pp",
+            dp_axis_names=("dp",),
+            cp_axis_name="cp",
             pp_schedule="1f1b",
             pp_microbatch_size=1,
             pp_batch_size=2,
@@ -197,35 +176,10 @@ def main():
             dtype=torch.bfloat16,
             pp_seq_len=seqlen,
         ).build(model, loss_fn=loss_fn, parallelize_fn=cp_only)
-        model_part0 = pp.parts[0]
-        engine_model = pp
+        model_part0, has_last, has_first = pp.parts[0], pp.info.has_last_stage, pp.info.has_first_stage
     else:
-        cp_only(model, mesh, None, **mesh_context.parallelize_axis_kwargs())
+        cp_only(model, mesh, None, dp_axis_names=("dp",), cp_axis_name="cp")
         model_part0 = model
-        engine_model = model
-
-    def engine_context(model_inputs):
-        """Stage pre-chunked media for one Engine batch.
-
-        Args:
-            model_inputs: Mapping whose text tensors have shape [batch, sequence]
-                and whose PP media field contains per-microbatch tensor chunks.
-
-        Returns:
-            Context manager that stages media on PP stage zero, or a no-op context
-            for the eager comparison leg.
-        """
-        if pp_size > 1:
-            return stage_vlm_media_for_pp(pp, pp.parts, model_inputs)
-        return nullcontext()
-
-    engine = Engine(
-        engine_model,
-        device=device,
-        mesh_context=mesh_context,
-        collate_fn=collate_prebatched,
-        context_fn=engine_context,
-    )
 
     losses = []
     for step in range(20):
@@ -237,13 +191,31 @@ def main():
             batch = prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
         else:
             batch.update({"pixel_values": pv, "image_grid_thw": grid})
+        cp_sharder = ContextParallelSharder(model_part0, mesh, batch)
+        train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
-        datum = Datum(
-            model_inputs=batch,
-            loss_fn_inputs={"labels": labels, "weights": torch.ones_like(labels, dtype=torch.float32)},
-        )
-        result = engine.forward_backward([[datum]], loss_fn)
-        losses.append(float(result.loss.detach()))
+        if pp_size > 1:
+            with train_ctx(), stage_vlm_media_for_pp(pp, pp.parts, batch):
+                sl = [] if has_last else None
+                mi = batch.pop("input_ids")
+                pp.update_seq_len(mi.shape[1])
+                (
+                    pp.info.schedule.step(mi, target=labels, losses=sl, **batch)
+                    if has_first
+                    else pp.info.schedule.step(target=labels, losses=sl, **batch)
+                )
+            local = torch.stack(sl).mean() if has_last else torch.tensor(0.0, device=device)
+        else:
+            with train_ctx():
+                out = model(
+                    input_ids=batch["input_ids"],
+                    pixel_values=batch["pixel_values"],
+                    image_grid_thw=batch["image_grid_thw"],
+                    position_ids=batch["position_ids"],
+                )
+                local = loss_fn(out, labels)
+                local.backward()
+        losses.append(float(local.detach()))
 
     embed = model_part0.get_input_embeddings()
     egrad = (

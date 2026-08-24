@@ -164,6 +164,7 @@ High-throughput scalable training
 - ✅ **DCP** - Supports PyTorch DCP and SafeTensors, sharded and consolidated layouts, merge/reshard utilities, and Hugging Face-compatible outputs.
 - ✅ **Async checkpointing** - Can write checkpoints in the background to reduce training stalls caused by I/O.
 - ✅ **Dion and Muon optimizers** - Distributed optimizer integrations with typed recipe configuration.
+- ✅ **Training Engine** - DeepSpeed-style eager `forward`, `backward`, and `step` over already-distributed models.
 - ✅ **Environment Support** - SLURM, interactive, SkyPilot, and Kubernetes (via SkyPilot) launchers.
 
 SOTA algorithms
@@ -187,7 +188,7 @@ Agentic Development and UX
 - ✅ **Agent-friendly skills** - Curated [`skills/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/skills) for common dev tasks (recipe runs, model onboarding, CI).
 
 Planned for 26.08
-- 🔜 **Unified Engine API and recipes** - Introduce a common engine and consolidate the LLM and VLM recipe paths.
+- 🔜 **Pipeline and recipe consolidation** - Consolidate the LLM and VLM pipeline-training lifecycle behind one clear recipe boundary.
 - 🔜 **Composable component configuration** - Complete the typed config and `.build()` refactor across data and remaining components.
 - 🔜 **Packed long-context training with CP** - Combine THD sequence packing with context parallelism, including DeepSeek V4 coverage.
 - 🔜 **Kernel and runtime upgrades** - Add partial CUDA graphs, evaluate FlashAttention 3/4, and upgrade to DeepEP v2.

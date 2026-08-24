@@ -564,6 +564,30 @@ def _resolve_cp_sharder(
         # pre-flatten row shape is the caller's coordinate system and the stream
         # length is rows x cols.
         def _shard_batch_te(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+            """Prepare one TE THD batch and retain its applied token partition.
+
+            Args:
+                cp_mesh: Context-parallel mesh that partitions the token stream.
+                tp_mesh: Tensor-parallel mesh; unused by TE batch preparation.
+                batch: Mapping with ``input_ids`` of shape [batch, sequence] or
+                    ``inputs_embeds`` of shape [batch, sequence, hidden] before
+                    THD conversion. A present ``_thd_local_indices`` slot asks
+                    for the applied partition in the returned mapping.
+                loss_mask: Optional tensor of shape [batch, sequence]; unused by
+                    TE batch preparation.
+                padding_token_id: Token value used for physical THD padding.
+
+            Returns:
+                A null context factory, the THD mapping with token tensors of
+                shape [local_tokens, ...], and its :class:`ShardLayout`.
+            """
+            model_requests_local_indices = "_thd_local_indices" in batch
+            if model_requests_local_indices:
+                if num_chunks > 1:
+                    raise NotImplementedError(
+                        "Exposing TE local-token indices to a model does not support chunked THD batches."
+                    )
+                batch.pop("_thd_local_indices")
             final_thd = "cu_seqlens" in batch and "seq_lens" not in batch and "seq_lens_padded" not in batch
             primary = batch.get("inputs_embeds", batch.get("input_ids"))
             row_shape = (
@@ -601,6 +625,8 @@ def _resolve_cp_sharder(
                     padded_seq_len=stream_len if final_thd or row_shape is not None else None,
                     input_row_shape=row_shape,
                 )
+            if model_requests_local_indices:
+                prepped["_thd_local_indices"] = local_indices
             return contextlib.nullcontext, prepped, layout
 
         return ContextParallelSharder(shard_batch=_shard_batch_te)
@@ -891,12 +917,7 @@ def _shard_thd_chunk_for_te(
     local_indices = tex.thd_get_partitioned_indices(filtered_cu_seqlens_padded, total_tokens, cp_size, cp_rank)
     token_keys = {"input_ids", "inputs_embeds", "labels", "position_ids", "padding_mask"}
     for key, value in batch.items():
-        if (
-            (key in token_keys or key.startswith("__engine_loss__"))
-            and isinstance(value, torch.Tensor)
-            and value.ndim > 0
-            and value.shape[0] == total_tokens
-        ):
+        if key in token_keys and isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == total_tokens:
             batch[key] = value.index_select(0, local_indices)
 
     # Keep model-owned payloads (for example VLM media) by default. Only remove

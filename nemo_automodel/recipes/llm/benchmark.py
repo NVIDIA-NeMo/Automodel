@@ -20,6 +20,11 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
+from nemo_automodel.components.training.utils import (
+    prepare_after_first_microbatch,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+)
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -99,7 +104,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
     This class extends TrainFinetuneRecipeForNextTokenPrediction to provide
     a simplified benchmarking-focused training loop with timers and profiling support.
-    It reuses the parent's setup and Engine execution paths.
+    It reuses the setup() and _forward_backward_step() methods from the parent class.
     """
 
     def __init__(self, cfg):
@@ -283,6 +288,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         with timers and profiling support, similar to the original benchmarking script.
         """
         rank = self.dist_env.rank
+        device = self.dist_env.device
 
         # Get benchmarking config
         steps = self._bench_steps
@@ -302,8 +308,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Calculate gradient accumulation steps
         dp_size = self._get_dp_group_size()
-        ga_steps = global_batch_size // (local_batch_size * dp_size)
-        assert ga_steps > 0, "Global batch size must be divisible by local batch size * dp_size"
+        optimizer_microbatch_size = local_batch_size * dp_size
+        if global_batch_size < optimizer_microbatch_size or global_batch_size % optimizer_microbatch_size != 0:
+            raise ValueError(
+                f"global_batch_size ({global_batch_size}) must be a positive multiple of "
+                f"local_batch_size * dp_size ({optimizer_microbatch_size})"
+            )
+        ga_steps = global_batch_size // optimizer_microbatch_size
 
         if rank == 0:
             logger.info(f"Running {steps} iterations with {warmup_steps} warmup steps")
@@ -321,7 +332,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
                 torch.cuda.cudart().cudaProfilerStart()
-                # Per-window NVTX ranges below already delimit the work.
+                # Per-microbatch NVTX ranges below already delimit the work.
                 # Entering emit_nvtx() without closing it leaks RecordFunction
                 # callbacks into later DTensor/FSDP operations.
 
@@ -331,20 +342,58 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
+                # Materialize the optimizer window so the eager Engine and PP
+                # token normalization both use its actual number of batches.
                 batches = [next(dataloader_iter) for _ in range(ga_steps)]
-                datums = [self._make_engine_datum(batch) for batch in batches]
-                torch.cuda.nvtx.range_push(f"iteration_{i}_forward_backward")
-                try:
-                    with self.timers("forward_backward", log_level=2):
-                        forward_backward_result = self.engine.forward_backward(
-                            [[datum] for datum in datums], self._engine_loss_fn
+                num_label_tokens = sum((batch["labels"] != -100).sum().item() for batch in batches)
+                num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
+                num_label_tokens = self._dp_allreduce(num_label_tokens_tensor).item()
+                loss_buffer = []
+                if self.pp_enabled:
+                    self._set_moe_aux_loss_backward_scale(
+                        num_batches=len(batches),
+                        num_label_tokens=num_label_tokens,
+                    )
+                    prepare_for_grad_accumulation(self.model_parts, pp_enabled=True)
+                else:
+                    self.engine.set_gradient_accumulation_steps(len(batches))
+
+                for ga_step_idx, batch in enumerate(batches):
+                    if self.pp_enabled and ga_step_idx == len(batches) - 1:
+                        prepare_for_final_backward(self.model_parts, pp_enabled=True)
+
+                    torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
+
+                    with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
+                        self._forward_backward_step(
+                            ga_step_idx,
+                            batch,
+                            loss_buffer=loss_buffer,
+                            num_label_tokens=num_label_tokens,
+                            num_batches=len(batches),
+                            is_train=True,
                         )
-                finally:
+
                     torch.cuda.nvtx.range_pop()
 
-                with self.timers("optimizer", log_level=2):
-                    self.engine.step(before_optimizer_step=self.checkpointer.maybe_wait_for_staging)
-                    logger.debug("Optimizer step")
+                    if self.pp_enabled and ga_step_idx == 0:
+                        prepare_after_first_microbatch()
+
+                    if not self.pp_enabled:
+                        if self.engine.is_gradient_accumulation_boundary():
+                            self.checkpointer.maybe_wait_for_staging()
+                            with self.timers("optimizer", log_level=2):
+                                self.engine.step()
+                        else:
+                            self.engine.step()
+
+                if self.pp_enabled:
+                    with self.timers("optimizer", log_level=2):
+                        self._step_pipeline_optimizer(
+                            num_label_tokens=num_label_tokens,
+                            max_grad_norm=self.max_grad_norm,
+                        )
+                        logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
@@ -352,8 +401,20 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self.partial_cuda_graph_manager.capture()
                 self._partial_cuda_graph_capture_pending = False
 
-            num_label_tokens = int(forward_backward_result.weight_sum.item())
-            reporting_loss = forward_backward_result.loss.cpu().item()
+            # Calculate loss - following exact train_ft.py:1059-1071 pattern
+            reporting_loss = torch.sum(torch.stack(loss_buffer))
+            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
+
+            if self.pp_enabled:
+                reporting_loss = (
+                    reporting_loss.to(torch.float32) / num_label_tokens
+                    if num_label_tokens > 0
+                    else reporting_loss.to(torch.float32) * 0.0
+                )
+                reporting_loss = reporting_loss.to(self.dist_env.device)
+                reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
+
+            reporting_loss = reporting_loss.cpu().item()
 
             if rank == 0:
                 print(f"num_label_tokens={num_label_tokens} | loss={reporting_loss:.4f}")
@@ -369,7 +430,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self._log_moe_metrics(i, self.wandb_run.log)
 
             # Calculate and log MFU
-            self._log_iteration_metrics(iter_timer, peak_tflops, rank, i)
+            self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
 
             # Stop nsys profiling if configured
             if i == nsys_end and rank in nsys_ranks:
@@ -384,7 +445,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
 
-    def _log_iteration_metrics(self, iter_timer, peak_tflops, rank, iteration):
+    def _log_iteration_metrics(self, iter_timer, ga_steps, peak_tflops, rank, iteration):
         max_iter_time = self.timers._get_global_min_max_time([iter_timer], reset=False, barrier=False, normalizer=1.0)[
             iter_timer
         ][1]
@@ -400,7 +461,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             logger.info(f"MFU: {mfu:.6f}%")
 
         # Log detailed timers
-        timer_names = [iter_timer, "forward_backward", "optimizer"]
+        timer_names = [iter_timer, "optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
         # Log timers to wandb
         if self._wandb_enabled:
             self.timers.write_to_wandb(

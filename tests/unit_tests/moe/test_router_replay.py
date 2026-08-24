@@ -293,20 +293,8 @@ def test_multilayer_distribute_and_collect():
 
 
 # --------------------------------------------------------------------------- #
-# Engine adapter: layout conversion, global mapping, and scoped lifecycle
+# Model-scoped adapter: global mapping and scoped lifecycle
 # --------------------------------------------------------------------------- #
-
-
-def test_adapter_prepares_sequence_last_int16_routes():
-    adapter = RouterReplayAdapter(_AdapterModel())
-    sequence_last = torch.arange(2 * 5 * 2 * 3, dtype=torch.int16).reshape(2, 5, 2, 3)
-
-    prepared = adapter.prepare_routed_experts(sequence_last)
-
-    assert prepared.shape == (2, 3, 5, 2)
-    assert prepared.dtype == torch.int16
-    assert prepared.is_contiguous()
-    assert torch.equal(prepared, sequence_last.permute(0, 3, 1, 2))
 
 
 def test_adapter_maps_sparse_global_layers_and_applies_token_fallback():
@@ -329,20 +317,16 @@ def test_adapter_maps_sparse_global_layers_and_applies_token_fallback():
         ],
         dtype=torch.int16,
     )
-    sequence_last = torch.full((batch, num_layers, topk, sequence), -1, dtype=torch.int16)
-    sequence_last[:, 1] = layer_one.permute(0, 2, 1)
-    sequence_last[:, 3] = layer_three.permute(0, 2, 1)
-    prepared = adapter.prepare_routed_experts(sequence_last)
+    prepared = torch.full((batch, sequence, num_layers, topk), -1, dtype=torch.int16)
+    prepared[:, :, 1] = layer_one
+    prepared[:, :, 3] = layer_three
 
     live_one = torch.tensor([[0, 7], [0, 1], [3, 2], [7, 0]])
     live_three = torch.tensor([[1, 2], [2, 3], [3, 4], [4, 5]])
     gate_one = _adapter_gate(model, 1)
     gate_three = _adapter_gate(model, 3)
 
-    with adapter(
-        {"input_ids": torch.zeros(batch, sequence, dtype=torch.long)},
-        {"routed_experts": prepared},
-    ):
+    with adapter.replay(prepared):
         expected_one_target = layer_one.reshape(-1, topk).long()
         expected_three_target = layer_three.reshape(-1, topk).long()
         assert torch.equal(gate_one.router_replay.target_indices, expected_one_target)
@@ -400,10 +384,7 @@ def test_adapter_binds_sparse_layers_across_pipeline_model_parts():
     routes[:, 3] = torch.tensor([[5, 6], [7, 0]], dtype=torch.int16)
 
     assert adapter.layer_ids == (1, 3)
-    with adapter(
-        {"input_ids": torch.zeros(2, dtype=torch.long)},
-        {"routed_experts": routes},
-    ):
+    with adapter.replay(routes):
         torch.testing.assert_close(_adapter_gate(first_part, 1).router_replay.target_indices, routes[:, 1])
         torch.testing.assert_close(_adapter_gate(last_part, 3).router_replay.target_indices, routes[:, 3])
 
@@ -412,10 +393,10 @@ def test_adapter_allows_pipeline_rank_without_local_moe_layer():
     adapter = RouterReplayAdapter([_AdapterModel(num_layers=2, routed_layers=())])
 
     assert adapter.layer_ids == ()
-    with adapter(
-        {"input_ids": torch.zeros(2, dtype=torch.long)},
-        {"routed_experts": torch.zeros(2, 3, 2, dtype=torch.int16)},
-    ):
+    with adapter.replay(torch.zeros(2, 3, 2, dtype=torch.int16)):
+        pass
+
+    with adapter.replay(None):
         pass
 
 
@@ -430,25 +411,8 @@ def test_adapter_rejects_partial_moe_router_cuda_graph_before_installing_handle(
     assert gate.router_replay is None
 
 
-def test_adapter_uses_local_weights_when_model_primary_stays_full_length():
-    model = _AdapterModel(num_layers=3, routed_layers=(1,))
-    adapter = RouterReplayAdapter(model)
-    routes = torch.full((2, 3, 2), -1, dtype=torch.int16)
-    routes[:, 1] = torch.tensor([[1, 2], [3, 4]], dtype=torch.int16)
-
-    with adapter(
-        {"input_ids": torch.zeros(4, dtype=torch.long)},
-        {"weights": torch.ones(2), "routed_experts": routes},
-    ):
-        torch.testing.assert_close(
-            _adapter_gate(model, 1).router_replay.target_indices,
-            torch.tensor([[1, 2], [3, 4]], dtype=torch.int16),
-        )
-
-
-def test_engine_batch_context_adapter_replays_real_gate_and_preserves_router_gradient():
-    from nemo_automodel.components.datasets.datum import Datum, LossInputLayout
-    from nemo_automodel.engine import Engine, collate_prebatched
+def test_adapter_replays_real_gate_and_preserves_router_gradient():
+    from nemo_automodel.engine import Engine
 
     class EngineGateModel(nn.Module):
         def __init__(self):
@@ -458,18 +422,18 @@ def test_engine_batch_context_adapter_replays_real_gate_and_preserves_router_gra
             self.selected_indices = None
 
         def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-            """Return selected-router mass for one padded token batch.
+            """Return one selected-router weight for a padded token batch.
 
             Args:
                 input_ids: Token ids with shape ``[batch, sequence]``.
 
             Returns:
-                Selected probability mass with shape ``[batch, sequence]``.
+                First selected probability with shape ``[batch, sequence]``.
             """
             hidden = torch.nn.functional.one_hot(input_ids.reshape(-1) % 16, num_classes=16).to(torch.float32)
             weights, indices, _aux = run(self.model.layers["0"].gate, hidden)
             self.selected_indices = indices.detach().clone()
-            return weights.sum(dim=-1).reshape_as(input_ids)
+            return weights[..., 0].reshape_as(input_ids)
 
     model = EngineGateModel()
     adapter = RouterReplayAdapter(model)
@@ -479,35 +443,10 @@ def test_engine_batch_context_adapter_replays_real_gate_and_preserves_router_gra
         _weights, live_indices, _aux = run(model.model.layers["0"].gate, hidden)
     target = ((live_indices + 1) % 8).reshape(1, 3, 1, 2).to(torch.int16)
     assert not torch.equal(live_indices, target.reshape(-1, 2))
-    datum = Datum(
-        model_inputs={"input_ids": input_ids},
-        loss_fn_inputs={"weights": torch.ones_like(input_ids, dtype=torch.float32), "routed_experts": target},
-        loss_fn_input_layouts={
-            "weights": LossInputLayout.PER_TOKEN,
-            "routed_experts": LossInputLayout.PER_TOKEN,
-        },
-        loss_fn_input_pad_values={"routed_experts": -1},
-    )
-
-    def loss_fn(output, _loss_fn_inputs):
-        """Use selected router mass as one loss per padded token.
-
-        Args:
-            output: Selected router mass with shape ``[batch, sequence]``.
-            _loss_fn_inputs: Prepared token side channels with matching leading
-                ``[batch, sequence]`` axes.
-
-        Returns:
-            Scalar weighted loss numerator.
-        """
-        return (output * _loss_fn_inputs["weights"].to(output)).sum()
-
-    Engine(
-        model,
-        device="cpu",
-        collate_fn=collate_prebatched,
-        batch_context_fn=adapter,
-    ).forward_backward([[datum]], loss_fn)
+    engine = Engine(model, optimizer=torch.optim.SGD(model.parameters(), lr=0.1))
+    with adapter.replay(target):
+        output = engine(input_ids)
+        engine.backward(output.sum())
 
     torch.testing.assert_close(model.selected_indices, target.reshape(-1, 2).long())
     gate_grad = model.model.layers["0"].gate.weight.grad
@@ -543,10 +482,7 @@ def test_adapter_auto_installs_model_scoped_handles_and_restores_on_error():
     routes = torch.tensor([[[[-1, -1], [1, 2], [-1, -1]]]], dtype=torch.int16)
 
     with pytest.raises(RuntimeError, match="forward failed"):
-        with adapter_a(
-            {"input_ids": torch.zeros(1, 1, dtype=torch.long)},
-            {"routed_experts": routes},
-        ):
+        with adapter_a.replay(routes):
             assert replay_a.mode is RouterReplayMode.REPLAY
             assert replay_a.target_indices is not previous_a_target
             assert replay_b.mode is RouterReplayMode.RECORD
@@ -576,10 +512,7 @@ def test_adapter_keeps_trailing_unrecorded_tokens_on_live_routing():
     )
     live = torch.tensor([[6, 7], [4, 5], [7, 6], [5, 4]])
 
-    with adapter(
-        {"input_ids": torch.zeros(2, dtype=torch.long)},
-        {"routed_experts": routes},
-    ):
+    with adapter.replay(routes):
         replayed = gate(live)
 
     assert torch.equal(replayed[:2], torch.tensor([[1, 2], [3, 4]]))
@@ -591,22 +524,21 @@ def test_adapter_keeps_trailing_unrecorded_tokens_on_live_routing():
 @pytest.mark.parametrize(
     ("routes", "error", "match"),
     [
-        (torch.zeros(2, 3, 4, dtype=torch.int16), ValueError, "sequence-last routed_experts"),
-        (torch.zeros(1, 3, 2, 4), TypeError, "signed integer dtype"),
-        (torch.zeros(1, 3, 2, 4, dtype=torch.uint8), TypeError, "signed integer dtype"),
+        (torch.zeros(2, 4, dtype=torch.int16), ValueError, "token axes"),
+        (torch.zeros(1, 3, 2), TypeError, "signed integer dtype"),
+        (torch.zeros(1, 3, 2, dtype=torch.uint8), TypeError, "signed integer dtype"),
+        ([], TypeError, "Tensor or None"),
     ],
 )
-def test_adapter_prepare_rejects_invalid_rollout_layout(routes, error, match):
+def test_adapter_replay_rejects_invalid_routes(routes, error, match):
     adapter = RouterReplayAdapter(_AdapterModel())
     with pytest.raises(error, match=match):
-        adapter.prepare_routed_experts(routes)
+        adapter.replay(routes)
 
 
 @pytest.mark.parametrize(
     ("routes", "match"),
     [
-        (torch.zeros(2, 4, dtype=torch.int16), "token axes"),
-        (torch.zeros(3, 4, 2, dtype=torch.int16), "describes 3 tokens"),
         (torch.zeros(2, 3, 2, dtype=torch.int16), "requires layer 3"),
         (torch.zeros(2, 4, 1, dtype=torch.int16), "topk 1"),
     ],
@@ -614,10 +546,7 @@ def test_adapter_prepare_rejects_invalid_rollout_layout(routes, error, match):
 def test_adapter_rejects_invalid_prepared_layout(routes, match):
     adapter = RouterReplayAdapter(_AdapterModel(num_layers=5, routed_layers=(3,)))
     with pytest.raises(ValueError, match=match):
-        adapter(
-            {"input_ids": torch.zeros(2, dtype=torch.long)},
-            {"routed_experts": routes},
-        )
+        adapter.replay(routes)
 
 
 @pytest.mark.parametrize("bad_row", [[-1, 2], [-2, -2], [0, 8], [3, 3]])
@@ -627,10 +556,7 @@ def test_adapter_rejects_incomplete_or_invalid_expert_rows(bad_row):
     routes[0, 1] = torch.tensor(bad_row, dtype=torch.int16)
 
     with pytest.raises(RuntimeError, match="all -1 or contain unique valid model expert ids"):
-        adapter(
-            {"input_ids": torch.zeros(2, dtype=torch.long)},
-            {"weights": torch.ones(2), "routed_experts": routes},
-        )
+        adapter.replay(routes)
 
 
 # --------------------------------------------------------------------------- #

@@ -33,11 +33,11 @@ except ImportError:
 _lmdb_env_cache: dict[str, "lmdb.Environment"] = {}
 
 
-def _merge_media_values(values: list[Any], *, field_name: str) -> torch.Tensor | list[Any]:
+def merge_media_values(values: list[Any], *, field_name: str) -> torch.Tensor | list[Any]:
     """Merge media values while preserving the explicit ragged-list contract.
 
     Four-dimensional ``pixel_values`` use ``[media, channels, height, width]``.
-    Some processors emit a different image resolution for each Datum, so pad
+    Some processors emit a different image resolution for each sample, so pad
     those tensors on the right and bottom to the largest spatial extent before
     concatenating their media axes. Other tensor fields retain their processor-
     defined layout and must already be concatenable.
