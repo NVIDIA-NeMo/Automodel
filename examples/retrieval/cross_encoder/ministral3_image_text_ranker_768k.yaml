@@ -50,6 +50,7 @@ tokenizer:
   pretrained_model_name_or_path: /lustre/fsw/portfolios/llmservice/users/ronaya/model_checkpoints/Ministral-3-1B-Instruct-2512-BF16_llm_replaced_nemotron_3_embed_1B
   rerank_max_length: 4096
   use_prompt_template: true
+  export_as_stock_processor: false
   pad_to_multiple_of: 8
   image_longest_edge: 1284
 

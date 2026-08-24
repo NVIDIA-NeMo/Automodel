@@ -75,12 +75,16 @@ eval_datasets['MTEB_ALL_QUICK'] = [
     ('MTEB_ENG', ' --max_length 2048 --batch_size 16 '),
 ]
 
-eval_datasets["MMTEB_QUICK"] = [
-    ("MMTEB_QUICK", " --max_length 4096 "),
+eval_datasets["MMTEB_RETRIEVAL_QUICK"] = [
+    ("MMTEB_RETRIEVAL_QUICK", " --max_length 4096 "),
 ]
 
 eval_datasets["RTEB_QUICK"] = [
     ("RTEB_QUICK", " --max_length 4096 "),
+]
+
+eval_datasets["RTEB"] = [
+    ("RTEB", " --max_length 4096 "),
 ]
 
 eval_datasets["vidore_v3_complex_ocr"] = [
@@ -109,16 +113,38 @@ eval_datasets["VISION_EVAL"] = [
     ),
 ]
 
-eval_datasets["VISION_EVAL_MULTILINGUAL"] = [
+eval_datasets["RERANK_VISION_EVAL"] = [
+    ("dc10k", " --dataset_mapping VISION_EVAL --corpus_modalities image "),
+    (
+        "earnings_v2 "
+        "vidore_v3_finance_bank_reports_en "
+        "vidore_v3_military_technical_reports "
+        "vidore_v3_education_computer_science_en "
+        "vidore_v3_healthcare_fda_en "
+        "vidore_v3_hr_european_reports_en "
+        "vidore_v3_energy_reports_fr "
+        "vidore_v3_education_physics_fr "
+        "vidore_v3_luxury_financial_reports_fr",
+        " --dataset_mapping VISION_EVAL --corpus_modalities image ",
+    ),
+]
+
+eval_datasets["MIRACL_VISION"] = [
     (
         "miracl_vision_ko miracl_vision_ja miracl_vision_zh miracl_vision_ar "
         "miracl_vision_bn miracl_vision_en miracl_vision_fa miracl_vision_fi "
         "miracl_vision_fr miracl_vision_de miracl_vision_hi miracl_vision_id "
         "miracl_vision_ru miracl_vision_es miracl_vision_sw miracl_vision_te "
-        "miracl_vision_th miracl_vision_yo "
+        "miracl_vision_th miracl_vision_yo",
+        " --eval_type beir_embedding_eval --corpus_modalities image ",
+    ),
+]
+
+eval_datasets["CHINESE_KOREAN_VIDORE"] = [
+    (
         "kovidore_v2_cybersecurity kovidore_v2_economic kovidore_v2_energy kovidore_v2_hr "
         "zhvidore_v1_ocr",
-        " --eval_type beir_embedding_eval --corpus_modalities image ",
+        " --eval_type beir_embedding_eval ",
     ),
 ]
 
@@ -143,6 +169,22 @@ eval_datasets["TEXT_EVAL"] = [
         "test-context-es-question-vi "
         "mldr_en_sample_bge_400query mldr_it_full mldr_pt_full mldr_ja_full mldr_de_full",
         " --eval_type beir_embedding_eval --corpus_modalities text ",
+    ),
+]
+
+eval_datasets["RERANK_TEXT_EVAL"] = [
+    (
+        "bo767_text earnings_text fiqa nq_sample35 hotpotqa_sample35 techqa_beir "
+        "miracl_ar_sample miracl_de_sample miracl_en_sample miracl_es_sample "
+        "miracl_fi_sample miracl_fr_sample miracl_ja_sample miracl_ko_sample "
+        "miracl_ru_sample miracl_th_sample miracl_zh_sample "
+        "test-context-de-question-ar test-context-ar-question-es "
+        "test-context-en-question-zh test-context-hi-question-de "
+        "test-context-vi-question-ar test-context-zh-question-en "
+        "test-context-es-question-vi "
+        "mldr_en_sample_bge_400query mldr_it_full mldr_pt_full mldr_ja_full mldr_de_full",
+        " --dataset_mapping small_textqa_eval_20250508 "
+        "--corpus_modalities text --use_text_in_document True ",
     ),
 ]
 
