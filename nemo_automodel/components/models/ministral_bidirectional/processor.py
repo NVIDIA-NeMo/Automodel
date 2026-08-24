@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pixtral processor extensions for Ministral3 bi-encoder retrieval."""
+"""Pixtral processor extensions for Ministral3 retrieval models."""
 
 from __future__ import annotations
 
@@ -140,8 +140,9 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
     its tokenizer treats raw control markers as processor-owned, while its chat
     template marks externally supplied text for ordinary tokenization. Direct
     retrieval query/document helpers apply the same text marker because they do
-    not render the chat template. Saving changes only the processor class to the
-    stock Pixtral implementation; it does not change the configured behavior.
+    not render the chat template. Saving defaults to the stock Pixtral class for
+    portable bi-encoder checkpoints; cross-encoder recipes preserve this class
+    because their evaluation path requires its custom batching helper.
     """
 
     _export_as_stock_processor = True
@@ -228,6 +229,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         padding: bool | str = True,
         image_longest_edge: int | None = None,
         use_prompt_template: bool = False,
+        export_as_stock_processor: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -252,6 +254,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if image_longest_edge is not None:
             self.image_longest_edge = image_longest_edge
         self.use_prompt_template = use_prompt_template
+        self.export_as_stock_processor = export_as_stock_processor
 
     @property
     def image_longest_edge(self) -> int | None:
@@ -552,7 +555,11 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         push_to_hub: bool = False,
         **kwargs: Any,
     ) -> list[str]:
-        """Save a stock Pixtral processor without retrieval custom code.
+        """Save either a stock Pixtral processor or this custom processor.
+
+        Bi-encoder processors default to a portable stock export. Cross-encoder
+        recipes disable stock export because evaluation requires
+        ``process_queries_documents_crossencoder`` from this class.
 
         Args:
             save_directory: Directory for the standard Transformers processor assets.
@@ -560,13 +567,15 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             **kwargs: Additional arguments forwarded to the standard processor save.
 
         Returns:
-            Paths written by the standard processor save operation.
+            Paths written by the selected processor save operation.
         """
-        return self.get_hf_export_processor().save_pretrained(
-            save_directory,
-            push_to_hub=push_to_hub,
-            **kwargs,
-        )
+        if self.export_as_stock_processor:
+            return self.get_hf_export_processor().save_pretrained(
+                save_directory,
+                push_to_hub=push_to_hub,
+                **kwargs,
+            )
+        return PixtralProcessor.save_pretrained(self, save_directory, push_to_hub=push_to_hub, **kwargs)
 
     @staticmethod
     def _extract_document_fields(documents: dict[str, list[Any]] | list[dict[str, Any]]) -> tuple[list[Any], list[Any]]:

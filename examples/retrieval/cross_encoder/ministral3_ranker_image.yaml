@@ -49,6 +49,7 @@ tokenizer:
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512-BF16
   rerank_max_length: 4096
   use_prompt_template: true
+  export_as_stock_processor: false
   pad_to_multiple_of: 8
   image_longest_edge: 1540
 
