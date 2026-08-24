@@ -17,7 +17,7 @@
 # containers.
 #
 # Env knobs:
-#   PREDS=<preds.json>  SUBSET=lite SPLIT=test WORKERS=8 RUN_TAG=grade_sft_v5  INSTANCE_IDS=""
+#   PREDS=<preds.json>  SUBSET=verified SPLIT=test WORKERS=8 RUN_TAG=grade_sft  INSTANCE_IDS=""
 # Submit:
 #   PREDS=/lustre/.../runs/dryrun_sft_v5/preds.json RUN_TAG=grade_sft_v5 sbatch 05_grade_enroot.sub
 #SBATCH -A <account>

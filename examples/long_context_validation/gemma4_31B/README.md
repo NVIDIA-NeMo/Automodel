@@ -179,9 +179,10 @@ RUN_TAG=oh3_sft  NAME=gemma4cf   MODEL=<CoderForge-SFT consolidated> \
   SLICE=0:500 SUBSET=verified NOPARSER=1 MAX_TOKENS=16384 TP=2 DP=4 WORKERS=16 \
   sbatch --gpus-per-node=8 07_openhands3_run.sub
 
-# Grade both locally (always confirm enroot-errs=0 before trusting a 0.0 resolve)
-PREDS=<runs>/oh3_base/preds.json RUN_TAG=grade_base sbatch 05_grade_enroot.sub
-PREDS=<runs>/oh3_sft/preds.json  RUN_TAG=grade_sft  sbatch 05_grade_enroot.sub
+# Grade both locally (SUBSET must match the eval subset; always confirm enroot-errs=0
+# before trusting a 0.0 resolve)
+PREDS=<runs>/oh3_base/preds.json SUBSET=verified RUN_TAG=grade_base sbatch 05_grade_enroot.sub
+PREDS=<runs>/oh3_sft/preds.json  SUBSET=verified RUN_TAG=grade_sft  sbatch 05_grade_enroot.sub
 ```
 
 **Why `NOPARSER=1`.** A tool call is only usable if something parses the model's raw

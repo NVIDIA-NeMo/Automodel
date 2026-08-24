@@ -18,7 +18,7 @@
 # This imports every instance image ONCE at LOW concurrency + retries into the shared lustre
 # cache, so the agent runs + grader only read the cache (no concurrent pulls). CPU-only.
 #
-# Submit:  SUBSET=lite sbatch 06_prewarm_images.sub
+# Submit:  SUBSET=verified sbatch 06_prewarm_images.sub
 #SBATCH -A <account>
 #SBATCH -p cpu
 #SBATCH -t 06:00:00
