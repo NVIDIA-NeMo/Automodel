@@ -203,21 +203,13 @@ def test_summed_gradient_declaration_is_found_below_wrapper() -> None:
     assert engine._gradient_reduction_compensation(8) == pytest.approx(1.0 / 8.0)
 
 
-@pytest.mark.parametrize(
-    ("root_mode", "nested_mode", "error_type", "match"),
-    [
-        (True, False, ValueError, "mixes calculate_per_token_loss"),
-        ("yes", None, TypeError, "must be boolean"),
-    ],
-)
-def test_gradient_reduction_declarations_must_be_consistent(root_mode, nested_mode, error_type, match) -> None:
+def test_gradient_reduction_declarations_must_be_consistent() -> None:
     module = _Scale()
-    module.calculate_per_token_loss = root_mode
-    if nested_mode is not None:
-        module.mode_probe = nn.Identity()
-        module.mode_probe.calculate_per_token_loss = nested_mode
+    module.calculate_per_token_loss = True
+    module.mode_probe = nn.Identity()
+    module.mode_probe.calculate_per_token_loss = False
 
-    with pytest.raises(error_type, match=match):
+    with pytest.raises(ValueError, match="mixes calculate_per_token_loss"):
         Engine(module, optimizer=torch.optim.SGD(module.parameters(), lr=0.1))
 
 

@@ -68,11 +68,8 @@ def _uses_summed_gradient_reduction(module: nn.Module) -> bool:
     declared_modes: set[bool] = set()
     for child in module.modules():
         mode = getattr(child, "calculate_per_token_loss", sentinel)
-        if mode is sentinel:
-            continue
-        if not isinstance(mode, bool):
-            raise TypeError(f"model calculate_per_token_loss declarations must be boolean, got {mode!r}")
-        declared_modes.add(mode)
+        if mode is not sentinel:
+            declared_modes.add(bool(mode))
 
     if len(declared_modes) > 1:
         raise ValueError(
@@ -137,8 +134,6 @@ class Engine(nn.Module):
             raise TypeError(f"module must be an nn.Module, got {type(module).__name__}")
         if max_grad_norm is not None and max_grad_norm < 0:
             raise ValueError(f"max_grad_norm must be non-negative or None, got {max_grad_norm}")
-        if not isinstance(defer_fsdp_grad_sync, bool):
-            raise TypeError("defer_fsdp_grad_sync must be a bool")
 
         self.module = module
         self.optimizer = optimizer
@@ -200,18 +195,9 @@ class Engine(nn.Module):
         if self.optimizer is None:
             self._close_backward_context()
             raise RuntimeError("Engine.backward requires an optimizer")
-        if not isinstance(loss, torch.Tensor):
+        if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
             self._close_backward_context()
-            raise TypeError(f"loss must be a Tensor, got {type(loss).__name__}")
-        if loss.numel() != 1:
-            self._close_backward_context()
-            raise ValueError(f"loss must contain one value, got shape {tuple(loss.shape)}")
-        if not isinstance(retain_graph, bool):
-            self._close_backward_context()
-            raise TypeError("retain_graph must be a bool")
-        if not isinstance(scale_wrt_gas, bool):
-            self._close_backward_context()
-            raise TypeError("scale_wrt_gas must be a bool")
+            raise ValueError(f"loss must be a scalar Tensor, got {loss!r}")
 
         gradient_group_size = self._gradient_group_size()
         reduction_compensation = self._gradient_reduction_compensation(gradient_group_size)
@@ -287,7 +273,7 @@ class Engine(nn.Module):
 
     def set_gradient_accumulation_steps(self, steps: int) -> None:
         """Set the number of microsteps in the next optimizer window."""
-        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        if not isinstance(steps, int) or steps < 1:
             raise ValueError(f"gradient accumulation steps must be a positive integer, got {steps!r}")
         if self._micro_step != 0:
             raise RuntimeError("gradient accumulation steps cannot change during an active window")
