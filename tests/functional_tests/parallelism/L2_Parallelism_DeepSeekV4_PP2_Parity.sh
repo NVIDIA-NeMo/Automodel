@@ -13,19 +13,14 @@
 # limitations under the License.
 
 #!/bin/bash
-# Pipeline-parallel parity for the Gemma4 31B VLM recipe.
+# Pipeline-parallel parity for the DeepSeek-V4 Flash recipe.
 #
-# Runs the Gemma4 31B proxy twice with the same seed and data order -- once on a
-# single rank, once at pp_size=2 -- and asserts both follow the same loss and
-# gradient-norm trajectory. `dp_size` is 1 in both runs, so the dataloader yields
-# identical batches and any divergence is attributable to the pipeline split.
+# DeepSeek-V4 owns `get_pipeline_stage_metas`, so it carries extra tensors across
+# the stage boundary rather than just hidden states. The generic PP tests do not
+# cover that contract.
 #
-# Covers the gap from PR #2983 (commit 00f40419).
-#
-# Required CI environment:
-#   * `$TEST_DATA_DIR/hf_gemma4_e4b_2l/` -- staged Gemma4 processor (already
-#     required by L2_HF_Transformer_VLM_Gemma4_Joint_Drafter.sh).
-#   * `$HF_CACHE/mini_cord_v2/` -- the standard VLM mini dataset.
+# The proxy generates its own synthetic token sequences, so this test stages no
+# tokenizer or dataset.
 
 set -xeuo pipefail
 
@@ -34,50 +29,32 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 RUN_DIR=$(mktemp -d)
 LOG_FILE="$RUN_DIR/pp2.log"
-PROXY_CKPT="$RUN_DIR/proxy"
 cleanup() { rm -rf "$RUN_DIR"; }
 trap cleanup EXIT
 
-# Build the randomly-initialized proxy checkpoint. Both runs load the same
-# weights, which is what makes the two loss trajectories comparable at all.
-python tests/functional_tests/parallelism/make_gemma4_proxy_checkpoint.py \
-    --output-dir "$PROXY_CKPT" \
-    --processor-dir $TEST_DATA_DIR/hf_gemma4_e4b_2l/
-
 COMMON_ARGS=(
-    --config tests/functional_tests/parallelism/gemma4_31b_proxy.yaml
-    --model.pretrained_model_name_or_path "$PROXY_CKPT"
-    --processor.pretrained_model_name_or_path "$PROXY_CKPT"
-    --dataset.path_or_dataset $HF_CACHE/mini_cord_v2/
-    --dataset.split train
-    --dataset.limit_dataset_samples 32
-    --validation_dataset.path_or_dataset $HF_CACHE/mini_cord_v2/
-    --validation_dataset.split validation
-    --validation_dataset.limit_dataset_samples 8
+    --config tests/functional_tests/parallelism/deepseek_v4_proxy.yaml
     --step_scheduler.max_steps 6
     --step_scheduler.global_batch_size 4
     --step_scheduler.local_batch_size 2
+    --distributed.tp_size 1
+    --distributed.cp_size 1
+    --distributed.ep_size 1
 )
 
 # --- Baseline: single rank, no parallelism ---
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=1 --nnodes=1 -m coverage run \
-    examples/vlm_finetune/finetune.py \
+    examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --checkpoint.checkpoint_dir "$RUN_DIR/baseline" \
-    --distributed.tp_size 1 \
-    --distributed.cp_size 1 \
     --distributed.pp_size 1
 
-# --- Pipeline parallel: 2 ranks, pp_size=2 ---
+# --- Pipeline parallel: 2 ranks ---
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
-    examples/vlm_finetune/finetune.py \
+    examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --checkpoint.checkpoint_dir "$RUN_DIR/pp2" \
-    --distributed.tp_size 1 \
-    --distributed.cp_size 1 \
     --distributed.pp_size 2 \
-    --distributed.pipeline.pp_schedule 1f1b \
-    --distributed.pipeline.pp_microbatch_size 1 \
     2>&1 | tee "$LOG_FILE"
 
 # Guard against the `_precompute_stage_shapes` bug from PR #2983. Assert the
@@ -92,13 +69,18 @@ if ! grep -q "Precomputed pipeline stage shapes" "$LOG_FILE"; then
     exit 1
 fi
 
-# The gradient-norm bound is looser than the loss bound because the single-rank
-# baseline runs unwrapped while the pp2 run goes through FSDP2 in bf16.
-# global_batch_size is twice local_batch_size, so each step accumulates two
-# micro-batches -- the case PR #3530 fixed.
+# Loss here is ~10.9 (random init over a 32k vocab) and both legs compute it in
+# bf16, whose ~0.4% relative resolution at that magnitude is already ~0.04
+# absolute. 0.10 sits above that floor; a tighter absolute bound would be
+# measuring bf16, not pipeline parallelism.
+#
+# Gradient norm is the sensitive half of this check and is compared relatively,
+# so it is unaffected by the loss magnitude. The bound stays loose because the
+# single-rank baseline runs unwrapped while the pp2 run goes through FSDP2's
+# bf16 mixed-precision policy.
 python tests/functional_tests/parallelism/compare_parallel_parity.py \
     "$RUN_DIR/baseline/training.jsonl" \
     "$RUN_DIR/pp2/training.jsonl" \
     --axis pp \
-    --loss-tol 0.05 \
+    --loss-tol 0.10 \
     --grad-norm-rtol 0.20
