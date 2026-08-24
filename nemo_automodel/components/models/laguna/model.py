@@ -1054,7 +1054,7 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 layer.mlp.gate.update_bias()
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
-        """Select contiguous block-diagonal sharding for packed Laguna inputs.
+        """Select input preparation for packed Laguna inputs.
 
         Args:
             batch: Full packed batch with token tensors shaped [batch, sequence]
@@ -1062,14 +1062,18 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             num_chunks: Number of pipeline chunks; Laguna currently supports one.
 
         Returns:
-            A mapping containing the model-owned context-parallel sharder.
+            A mapping containing the model-owned context-parallel sharder for
+            SDPA. TE returns an empty mapping so the framework selects its native
+            THD sharder, including when context parallelism is disabled.
         """
         if num_chunks != 1:
             raise ValueError("Laguna packed context parallelism does not support pipeline microbatch chunking.")
         if batch.get("qkv_format") != "thd":
             raise ValueError("Laguna context parallelism requires packed THD inputs.")
+        if self.backend.attn == "te":
+            return {}
         if self.backend.attn != "sdpa":
-            raise ValueError("Laguna packed context parallelism requires model.backend.attn='sdpa'.")
+            raise ValueError("Laguna packed THD input preparation requires model.backend.attn='te' or 'sdpa'.")
 
         from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
 

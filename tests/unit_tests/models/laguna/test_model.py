@@ -341,6 +341,15 @@ def test_laguna_reports_sdpa_cp_and_packing_support():
     assert supports.supports_sequence_packing is True
 
 
+def test_laguna_te_thd_uses_framework_input_sharder():
+    model = LagunaForCausalLM(_dense_tiny_config(), backend=_sdpa_backend())
+    model.backend.attn = "te"
+
+    prepared = model.prepare_model_inputs_for_cp({"qkv_format": "thd"})
+
+    assert prepared == {}
+
+
 def test_laguna_packed_thd_rejects_non_te_attention():
     model = LagunaForCausalLM(_dense_tiny_config(), backend=_backend()).eval()
 
