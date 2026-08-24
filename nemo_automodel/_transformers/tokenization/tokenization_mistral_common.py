@@ -24,6 +24,12 @@ from typing import Any, Union, overload
 
 import numpy as np
 from huggingface_hub import create_repo
+from mistral_common.protocol.instruct.request import ChatCompletionRequest
+from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
+from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+from mistral_common.tokens.tokenizers.tekken import Tekkenizer
+from mistral_common.tokens.tokenizers.utils import download_tokenizer_from_hf_hub, get_one_valid_tokenizer_file
+
 from transformers.audio_utils import load_audio_as
 from transformers.tokenization_utils_base import (
     LARGE_INTEGER,
@@ -55,13 +61,6 @@ class ValidationMode(Enum):
     serving = "serving"
     finetuning = "finetuning"
     test = "test"
-
-
-from mistral_common.protocol.instruct.request import ChatCompletionRequest
-from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
-from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-from mistral_common.tokens.tokenizers.tekken import Tekkenizer
-from mistral_common.tokens.tokenizers.utils import download_tokenizer_from_hf_hub, get_one_valid_tokenizer_file
 
 
 if is_torch_available():
