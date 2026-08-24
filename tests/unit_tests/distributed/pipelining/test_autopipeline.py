@@ -949,43 +949,18 @@ class TestAutoPipelineUpdateSeqLen:
 
         captured_args = []
 
-        def mock_reset(
-            schedule,
-            stages,
-            model_config,
-            microbatch_size,
-            seq_len,
-            tensor_dtype=None,
-            first_stage_input_meta=None,
-        ):
-            captured_args.append(
-                (schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype, first_stage_input_meta)
-            )
+        def mock_reset(schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype=None):
+            captured_args.append((schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype))
 
         monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", mock_reset)
 
         ap.update_seq_len(256)
 
         assert len(captured_args) == 1
-        _, _, _, mb_size, sl, tensor_dtype, first_stage_input_meta = captured_args[0]
+        _, _, _, mb_size, sl, tensor_dtype = captured_args[0]
         assert mb_size == 2  # pp_microbatch_size
         assert sl == 256
         assert tensor_dtype is ap.dtype
-        assert first_stage_input_meta is None
-
-        # THD materialization collapses source examples into one synthetic
-        # batch row. The same sequence length must still refresh stage metadata
-        # when its effective batch extent changes.
-        ap.update_seq_len(256, microbatch_size=1)
-        assert len(captured_args) == 2
-        assert captured_args[-1][3:5] == (1, 256)
-
-        embeds = torch.empty(1, 256, 32, dtype=torch.bfloat16)
-        ap.update_seq_len(256, microbatch_size=1, input_tensor=embeds)
-        input_meta = captured_args[-1][-1]
-        assert input_meta.device.type == "meta"
-        assert input_meta.shape == embeds.shape
-        assert input_meta.dtype == embeds.dtype
 
     def test_update_seq_len_tracks_current(self, monkeypatch):
         """update_seq_len should track current seq_len and reset on change."""

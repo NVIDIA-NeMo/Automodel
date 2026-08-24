@@ -311,7 +311,6 @@ def _precompute_stage_shapes(
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
-    first_stage_input_meta: torch.Tensor | None = None,
 ) -> None:
     """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
 
@@ -355,15 +354,11 @@ def _precompute_stage_shapes(
                 seq_len=seq_len,
                 dtype=model_dtype,
             )
-            if stage.is_first and first_stage_input_meta is not None:
-                inputs_meta = (first_stage_input_meta,)
             _set_stage_metas(stage, inputs_meta, outputs_meta)
             continue
 
         # --- inputs_meta ---
-        if stage.is_first and first_stage_input_meta is not None:
-            inputs_meta = (first_stage_input_meta,)
-        elif stage.is_first:
+        if stage.is_first:
             # First stage receives input_ids: [mb, seq_len] int64
             inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
@@ -498,7 +493,6 @@ def reset_pp_stage_shapes(
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
-    first_stage_input_meta: torch.Tensor | None = None,
 ) -> None:
     """Reset pipeline stage infrastructure and recompute shapes for a new sequence length.
 
@@ -518,9 +512,6 @@ def reset_pp_stage_shapes(
         model_config: The HuggingFace model config (``model.config``).
         microbatch_size: Per-microbatch batch size used by the schedule.
         seq_len: Sequence length of the upcoming batch (e.g. ``input_ids.shape[1]``).
-        first_stage_input_meta: Optional exact metadata for the positional input
-            consumed by the first stage. This preserves floating-point
-            ``inputs_embeds`` and flat THD input shapes.
     """
     for stage in stages:
         # PyTorch <= 2.10 stores static metadata in these fields.
@@ -548,14 +539,7 @@ def reset_pp_stage_shapes(
         stage.grad_send_info = None
 
     # Analytically set shapes for the new seq_len (no forward pass)
-    _precompute_stage_shapes(
-        stages,
-        model_config,
-        microbatch_size,
-        seq_len,
-        tensor_dtype=tensor_dtype,
-        first_stage_input_meta=first_stage_input_meta,
-    )
+    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
 
     # Trigger _initialize_stage(s) on the next step() call.
     # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.

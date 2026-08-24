@@ -128,8 +128,6 @@ class AutoPipeline:
         )
         self._model_config = None
         self._pp_current_seq_len: int | None = None
-        self._pp_current_microbatch_size: int | None = None
-        self._pp_current_input_signature: tuple[tuple[int, ...], torch.dtype] | None = None
 
     def build(
         self,
@@ -191,14 +189,8 @@ class AutoPipeline:
     def info(self) -> PipelineInfo:
         return self._info
 
-    def update_seq_len(
-        self,
-        seq_len: int,
-        *,
-        microbatch_size: int | None = None,
-        input_tensor: torch.Tensor | None = None,
-    ) -> None:
-        """Reset pipeline stage infrastructure for a new input shape.
+    def update_seq_len(self, seq_len: int) -> None:
+        """Reset pipeline stage infrastructure for a new sequence length.
 
         VLM training batches can have wildly different sequence lengths across steps
         (image batches vs. text-only batches).  PyTorch's PipelineStage locks in recv
@@ -210,25 +202,8 @@ class AutoPipeline:
 
         Args:
             seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
-            microbatch_size: Materialized leading batch extent. Defaults to the
-                configured padded microbatch size. Packed THD streams use one
-                synthetic batch row even when they were formed from multiple
-                source examples.
-            input_tensor: Actual positional input for the first stage. When
-                provided, its shape and dtype define first-stage metadata;
-                this supports floating-point embeddings and flat THD tensors.
         """
-        effective_microbatch_size = self.pp_microbatch_size if microbatch_size is None else microbatch_size
-        input_signature = (
-            (tuple(input_tensor.shape), input_tensor.dtype) if isinstance(input_tensor, torch.Tensor) else None
-        )
-        if effective_microbatch_size <= 0:
-            raise ValueError(f"microbatch_size must be positive, got {effective_microbatch_size}")
-        if (
-            seq_len == self._pp_current_seq_len
-            and effective_microbatch_size == self._pp_current_microbatch_size
-            and input_signature == self._pp_current_input_signature
-        ):
+        if seq_len == self._pp_current_seq_len:
             return
         if self._model_config is None:
             raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
@@ -236,23 +211,12 @@ class AutoPipeline:
             self._info.schedule,
             self._info.stages,
             self._model_config,
-            effective_microbatch_size,
+            self.pp_microbatch_size,
             seq_len,
             tensor_dtype=self.dtype,
-            first_stage_input_meta=(
-                torch.empty(tuple(input_tensor.shape), device="meta", dtype=input_tensor.dtype)
-                if isinstance(input_tensor, torch.Tensor)
-                else None
-            ),
         )
         self._pp_current_seq_len = seq_len
-        self._pp_current_microbatch_size = effective_microbatch_size
-        self._pp_current_input_signature = input_signature
-        logger.debug(
-            "PP stage shapes updated for seq_len=%s, microbatch_size=%s",
-            seq_len,
-            effective_microbatch_size,
-        )
+        logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
 
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, object]) -> dict[str, object] | None:
         """Build schedule chunking metadata for model-owned keyword layouts."""
