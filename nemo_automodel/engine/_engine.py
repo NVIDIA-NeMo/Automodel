@@ -152,7 +152,7 @@ class Engine(nn.Module):
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Delegate a raw forward call to :attr:`module`."""
-        if not self._will_run_backward():
+        if self.optimizer is None or not self.module.training or not torch.is_grad_enabled():
             return self.module(*args, **kwargs)
         if self._backward_context is not None:
             raise RuntimeError("call Engine.backward() before starting another training forward")
@@ -286,9 +286,6 @@ class Engine(nn.Module):
     def get_global_grad_norm(self) -> torch.Tensor | float | None:
         """Return the global gradient norm measured at the latest optimizer step."""
         return self._global_grad_norm
-
-    def _will_run_backward(self) -> bool:
-        return self.optimizer is not None and self.module.training and torch.is_grad_enabled()
 
     def _close_backward_context(self, *exc_info: Any) -> None:
         context, self._backward_context = self._backward_context, None
