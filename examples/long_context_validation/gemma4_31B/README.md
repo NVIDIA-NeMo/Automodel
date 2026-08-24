@@ -151,9 +151,9 @@ LM head trainable — required to learn 48/49.
 
 Goal: check whether CoderForge SFT gives the **raw base** `google/gemma-4-31B` (a
 pretrained model with *no* instruction/agent tuning) any **agentic** ability at
-all, versus the un-SFT'd base. The scripts referenced below live in
-[`eval/`](./eval); parameterize the `/path/to/...` placeholders and `<account>`
-for your cluster.
+all, versus the un-SFT'd base. The scripts referenced below live in the shared
+[`../eval/`](../eval) directory (model-agnostic; reused by the qwen3-32b eval too) —
+parameterize the `/path/to/...` placeholders and `<account>` for your cluster.
 
 **Scaffold.** The [OpenHands](https://github.com/All-Hands-AI/OpenHands) v0.52.1
 3-tool surface (`execute_bash` / `str_replace_editor` / `finish`) — the exact tools
@@ -163,26 +163,26 @@ CoderForge trajectories were generated on — is presented to the served checkpo
 **Docker-less enroot** container. Grading is local-in-enroot with the official
 `swebench` spec (gold patches → 5/5 resolved, so the grader is trusted).
 
-**Steps** (from `eval/`):
+**Steps** (from `../eval/`):
 
 ```bash
-bash 00_setup_eval_tooling.sh                    # py3.10 venv + agent + swebench harness
-SUBSET=verified sbatch 06_prewarm_images.sub     # pre-import instance images once (CPU)
+bash setup_eval_tooling.sh                    # py3.10 venv + agent + swebench harness
+SUBSET=verified sbatch prewarm_images.sub     # pre-import instance images once (CPU)
 
 # Serve each checkpoint + run the 3-tool agent -> preds.json (serve+agent on one 8-GPU node).
 # NOPARSER=1 is REQUIRED for these checkpoints (see "Why NOPARSER=1" below); serve both the base
 # and the SFT identically so the base-vs-SFT delta reflects the model, not the serving config.
 RUN_TAG=oh3_base NAME=gemma4base MODEL=<base google/gemma-4-31B consolidated> \
   SLICE=0:500 SUBSET=verified NOPARSER=1 MAX_TOKENS=16384 TP=2 DP=4 WORKERS=16 \
-  sbatch --gpus-per-node=8 07_openhands3_run.sub
+  sbatch --gpus-per-node=8 openhands3_run.sub
 RUN_TAG=oh3_sft  NAME=gemma4cf   MODEL=<CoderForge-SFT consolidated> \
   SLICE=0:500 SUBSET=verified NOPARSER=1 MAX_TOKENS=16384 TP=2 DP=4 WORKERS=16 \
-  sbatch --gpus-per-node=8 07_openhands3_run.sub
+  sbatch --gpus-per-node=8 openhands3_run.sub
 
 # Grade both locally (SUBSET must match the eval subset; always confirm enroot-errs=0
 # before trusting a 0.0 resolve)
-PREDS=<runs>/oh3_base/preds.json SUBSET=verified RUN_TAG=grade_base sbatch 05_grade_enroot.sub
-PREDS=<runs>/oh3_sft/preds.json  SUBSET=verified RUN_TAG=grade_sft  sbatch 05_grade_enroot.sub
+PREDS=<runs>/oh3_base/preds.json SUBSET=verified RUN_TAG=grade_base sbatch grade_enroot.sub
+PREDS=<runs>/oh3_sft/preds.json  SUBSET=verified RUN_TAG=grade_sft  sbatch grade_enroot.sub
 ```
 
 **Why `NOPARSER=1`.** A tool call is only usable if something parses the model's raw

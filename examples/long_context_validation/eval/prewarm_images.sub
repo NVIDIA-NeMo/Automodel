@@ -18,7 +18,7 @@
 # This imports every instance image ONCE at LOW concurrency + retries into the shared lustre
 # cache, so the agent runs + grader only read the cache (no concurrent pulls). CPU-only.
 #
-# Submit:  SUBSET=verified sbatch 06_prewarm_images.sub
+# Submit:  SUBSET=verified sbatch prewarm_images.sub
 #SBATCH -A <account>
 #SBATCH -p cpu
 #SBATCH -t 06:00:00
@@ -32,7 +32,7 @@
 set -euxo pipefail
 
 CACHE=/path/to/coderforge_cache
-EVAL_DIR=/path/to/Automodel/examples/long_context_validation/gemma4_31B/eval
+EVAL_DIR=/path/to/Automodel/examples/long_context_validation/eval
 VENV="${CACHE}/eval_venv"
 SUBSET="${SUBSET:-verified}"; SPLIT="${SPLIT:-test}"; WORKERS="${WORKERS:-6}"
 

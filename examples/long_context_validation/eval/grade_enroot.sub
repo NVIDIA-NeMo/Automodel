@@ -19,7 +19,7 @@
 # Env knobs:
 #   PREDS=<preds.json>  SUBSET=verified SPLIT=test WORKERS=8 RUN_TAG=grade_sft  INSTANCE_IDS=""
 # Submit:
-#   PREDS=/lustre/.../runs/dryrun_sft_v5/preds.json RUN_TAG=grade_sft_v5 sbatch 05_grade_enroot.sub
+#   PREDS=/lustre/.../runs/dryrun_sft_v5/preds.json RUN_TAG=grade_sft_v5 sbatch grade_enroot.sub
 #SBATCH -A <account>
 #SBATCH -p cpu
 #SBATCH -t 06:00:00
@@ -33,7 +33,7 @@
 set -euxo pipefail
 
 CACHE=/path/to/coderforge_cache
-EVAL_DIR=/path/to/Automodel/examples/long_context_validation/gemma4_31B/eval
+EVAL_DIR=/path/to/Automodel/examples/long_context_validation/eval
 VENV="${CACHE}/eval_venv"
 
 PREDS="${PREDS:?set PREDS=<preds.json>}"

@@ -17,13 +17,17 @@
 # and runs oh3_run.py on ONE node (preemption-atomic: serve + agent share one allocation and die
 # together, so a preemption leaves no dangling vLLM endpoint; resubmit to resume, done instances skip).
 # Reuses the shared warm image
-# cache. Grade the resulting preds.json with 05_grade_enroot.sub.
+# cache. Grade the resulting preds.json with grade_enroot.sub.
 #
-# Env: MODEL NAME MAXLEN TP DP SUBSET SPLIT SLICE WORKERS MAX_TOKENS RUN_TAG
-# Submit (full 500 Verified, DP=4 -> submit with --gpus-per-node=8):
-#   RUN_TAG=oh3_sft  NAME=gemma4cf   SLICE=0:500 SUBSET=verified WORKERS=32 TP=2 DP=4 sbatch --gpus-per-node=8 07_openhands3_run.sub
-#   RUN_TAG=oh3_base NAME=gemma4base SLICE=0:500 SUBSET=verified WORKERS=32 TP=2 DP=4 \
-#     MODEL=/path/to/checkpoints/hf_gemma4_31b_it sbatch --gpus-per-node=8 07_openhands3_run.sub
+# Env: MODEL NAME MAXLEN TP DP SUBSET SPLIT SLICE WORKERS MAX_TOKENS RUN_TAG PARSER NOPARSER
+# Submit (full 500 Verified, DP=4 -> --gpus-per-node=8). MODEL is required; pick the tool-call
+# parser to match the checkpoint (see "PARSER CHOICE" below):
+#   # gemma4 base / base-SFT emit JSON-prior args -> disable the parser:
+#   MODEL=<consolidated ckpt> NAME=gemma4 RUN_TAG=oh3_gemma4 SLICE=0:500 SUBSET=verified \
+#     NOPARSER=1 MAX_TOKENS=16384 WORKERS=16 TP=2 DP=4 sbatch --gpus-per-node=8 openhands3_run.sub
+#   # qwen3-it emits hermes-style tool calls -> use the hermes parser:
+#   MODEL=<consolidated ckpt> NAME=qwen3 RUN_TAG=oh3_qwen3 SLICE=0:500 SUBSET=verified \
+#     PARSER=hermes WORKERS=16 TP=2 DP=4 sbatch --gpus-per-node=8 openhands3_run.sub
 #SBATCH -A <account>
 #SBATCH -p batch
 #SBATCH -t 04:00:00
@@ -37,11 +41,11 @@
 set -euxo pipefail
 
 CACHE=/path/to/coderforge_cache
-EVAL_DIR=/path/to/Automodel/examples/long_context_validation/gemma4_31B/eval
+EVAL_DIR=/path/to/Automodel/examples/long_context_validation/eval
 VENV="${CACHE}/eval_venv"
 SQSH=/path/to/vllm.sqsh
-MODEL="${MODEL:-/path/to/coderforge_ckpts/gemma4_31b_coderforge_cp8_64k_16node_0p3B/epoch_0_step_299/model/consolidated}"
-NAME="${NAME:-gemma4cf}"
+MODEL="${MODEL:?Set MODEL=<consolidated HF checkpoint dir or HF id>}"
+NAME="${NAME:-evalmodel}"   # served-model-name; any label, must match what the agent requests
 MAXLEN="${MAXLEN:-131072}"; PORT="${PORT:-8000}"; TP="${TP:-2}"; DP="${DP:-4}"
 DP_FLAG=""; [ "${DP}" -gt 1 ] && DP_FLAG="--data-parallel-size ${DP}"
 # WORKERS: high-attempt models (e.g. base gemma4-it, ~99% attempt) run many concurrent heavy
@@ -63,17 +67,19 @@ export MSWEA_ENROOT_SQSH_DIR="${SWEBENCH_IMAGES:-/path/to/coderforge_cache/swebe
 mkdir -p "${ENROOT_TEMP_PATH}" "${ENROOT_DATA_PATH}" "${ENROOT_CACHE_PATH}" "${MSWEA_ENROOT_SQSH_DIR}"
 
 # --- serve vLLM (background) ---
-# PARSER CHOICE depends on which tool-call ARG format the ckpt actually emits (measured, not assumed):
+# PARSER CHOICE: set PARSER=<vllm --tool-call-parser name> to match the tool-call ARG format the ckpt
+# emits, or NOPARSER=1 to disable the parser (oh3_run.py then recovers calls from `content`). Which to
+# use depends on the ckpt's MEASURED output (not assumed). gemma4 worked example:
 #   * base-SFT (gemma4_31b_base_*): emits JSON-PRIOR args `call:name{"command":"...","path":"..."}`
 #     (its pretrained JSON prior survives 800 SFT steps). vLLM's gemma4 parser expects gemma4-NATIVE
 #     unquoted `{command:<|"|>v<|"|>}` and MANGLES JSON-prior — it folds `{"`/`"` into the key
 #     (`{"command"`), so 100% of args are unusable (verified: 727/727 execute_bash returncode!=0,
 #     349/349 editor calls rejected). => USE NOPARSER=1: raw `call:name{...}` reaches `content` and
 #     oh3_run.py's json.loads-first fallback recovers the JSON-prior dict cleanly.
-#   * -it ckpts that emit gemma4-native args: leave the parser ON (default below).
+#   * gemma4-it (native args): PARSER=gemma4 (default). qwen3-it (hermes tool calls): PARSER=hermes.
 # Either way, temperature>0 + repetition_penalty (set in the run section) is required to stop the
 # temp-0 greedy degeneration that corrupted JSON string values on later turns of the base-SFT run.
-PARSER_FLAGS="--enable-auto-tool-choice --tool-call-parser gemma4"
+PARSER="${PARSER:-gemma4}"; PARSER_FLAGS="--enable-auto-tool-choice --tool-call-parser ${PARSER}"
 if [ "${NOPARSER:-0}" = "1" ]; then PARSER_FLAGS=""; export OH3_TOOL_CHOICE=none; fi
 srun --overlap --container-image="${SQSH}" --container-mounts=/lustre:/lustre --no-container-mount-home bash -lc "
   vllm serve '${MODEL}' --served-model-name '${NAME}' \
