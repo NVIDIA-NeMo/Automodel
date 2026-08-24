@@ -149,13 +149,17 @@ LM head trainable — required to learn 48/49.
 
 ## Phase 3 — SWE-bench Verified evaluation
 
-Goal: check whether CoderForge SFT gives the **raw base** `google/gemma-4-31B` (a
+### Goal
+
+Check whether CoderForge SFT gives the **raw base** `google/gemma-4-31B` (a
 pretrained model with *no* instruction/agent tuning) any **agentic** ability at
 all, versus the un-SFT'd base. The scripts referenced below live in the shared
 [`../eval/`](../eval) directory (model-agnostic; reused by the qwen3-32b eval too) —
 parameterize the `/path/to/...` placeholders and `<account>` for your cluster.
 
-**Scaffold.** The [OpenHands](https://github.com/All-Hands-AI/OpenHands) v0.52.1
+### Scaffold
+
+The [OpenHands](https://github.com/All-Hands-AI/OpenHands) v0.52.1
 3-tool surface (`execute_bash` / `str_replace_editor` / `finish`) — the exact tools
 CoderForge trajectories were generated on — is presented to the served checkpoint
 (vLLM, with the built-in `gemma4` tool-call parser **disabled** — `NOPARSER=1`; see
@@ -163,7 +167,7 @@ CoderForge trajectories were generated on — is presented to the served checkpo
 **Docker-less enroot** container. Grading is local-in-enroot with the official
 `swebench` spec (gold patches → 5/5 resolved, so the grader is trusted).
 
-**Steps** (from `../eval/`):
+### Steps (from `../eval/`)
 
 ```bash
 bash setup_eval_tooling.sh                    # py3.10 venv + agent + swebench harness
@@ -185,7 +189,9 @@ PREDS=<runs>/oh3_base/preds.json SUBSET=verified RUN_TAG=grade_base sbatch grade
 PREDS=<runs>/oh3_sft/preds.json  SUBSET=verified RUN_TAG=grade_sft  sbatch grade_enroot.sub
 ```
 
-**Why `NOPARSER=1`.** A tool call is only usable if something parses the model's raw
+### Note
+
+**1. Why `NOPARSER=1`:** A tool call is only usable if something parses the model's raw
 text into a structured `{name, arguments}` call. Both the raw base and the CoderForge
 SFT emit their arguments in the **base model's pretrained JSON prior** —
 `call:name{"command":"...","path":"..."}` (quoted JSON) — because 800 SFT steps don't
@@ -202,7 +208,7 @@ the same JSON prior, **both** must run with `NOPARSER=1` — and serving them id
 is what makes the base-vs-SFT comparison fair. (An `-it`/instruct checkpoint that emits
 Gemma-native args is the opposite case: leave the parser **on**, i.e. omit `NOPARSER`.)
 
-**Base serve note.** The raw base checkpoint is missing the `-it` model's serving
+**2. Base serve note:** The raw base checkpoint is missing the `-it` model's serving
 fields, so two things must be set up before it can tool-call at all:
 
 - **`response_schema`** — a field in the `-it` `tokenizer_config.json` that declares the
