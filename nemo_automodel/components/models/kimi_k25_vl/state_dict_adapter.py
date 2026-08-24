@@ -381,8 +381,9 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 llm_key = key.replace("language_model.model.", "model.")
                 llm_keys[llm_key] = value
             elif key.startswith("language_model.lm_head."):
-                native_key = key.replace("language_model.lm_head.", "lm_head.")
-                native_state_dict[native_key] = value
+                # The VL model's head lives at model.language_model.lm_head.*; a top-level
+                # "lm_head." key matches no parameter and strict=False leaves the head at init.
+                native_state_dict["model." + key] = value
             elif key.startswith("mm_projector."):
                 # Map HF mm_projector keys to our multi_modal_projector structure
                 # mm_projector.proj.0.* -> multi_modal_projector.linear_1.*
