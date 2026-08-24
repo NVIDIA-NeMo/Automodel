@@ -44,6 +44,51 @@ NeMo AutoModel includes a custom model registry that allows teams to:
 - Add custom implementations to extend support to models not yet covered upstream.
 - Provide optimized or faster implementations for specific models while retaining the same AutoModel interface.
 
+### Register an Architecture
+
+The registry matches an architecture name against the first value in the checkpoint's `config.json`
+`architectures` list. The name is case-sensitive. The registered class must be a `torch.nn.Module` class that is
+compatible with the selected `NeMoAutoModel*` loader and accepts the resolved Hugging Face config as its first
+constructor argument.
+
+#### Register in Python
+
+Call `register_architecture` before constructing or loading the model:
+
+```python
+from nemo_automodel import NeMoAutoModelForCausalLM, register_architecture
+
+from my_package.models import MyModelForCausalLM
+
+register_architecture("MyModelForCausalLM", MyModelForCausalLM)
+model = NeMoAutoModelForCausalLM.from_pretrained("my-org/my-model")
+```
+
+Registering a built-in or previously registered name raises `ValueError`, even when the same class is registered
+again. Pass `exist_ok=True` only when you intentionally want to replace the existing model class.
+
+#### Register from an Installed Package
+
+An installed package can advertise model classes without requiring application startup code. Add an entry point for
+each architecture to the package's `pyproject.toml`:
+
+```toml
+[project.entry-points."nemo_automodel.architectures"]
+MyModelForCausalLM = "my_package.models:MyModelForCausalLM"
+```
+
+The entry-point name is the architecture name, and its value must use the `module.path:ClassName` format. NeMo
+AutoModel discovers these entry points when its model registry initializes and imports the target module only when it
+resolves that architecture. Install the package before starting the Python process. If an entry-point name conflicts
+with a built-in or another discovered architecture, NeMo AutoModel skips it and logs a warning; use
+`register_architecture(..., exist_ok=True)` in application code for an intentional override.
+
+<Note>
+Architecture registration selects a model implementation after the Hugging Face config is resolved. It does not
+register a new `model_type`, so the checkpoint config must already be loadable by the installed versions of
+Transformers or NeMo AutoModel.
+</Note>
+
 ### Ready-to-Run Architectures
 
 The following table lists architectures represented by the ready-to-run YAML recipes in this repository. It includes both NeMo-native implementations and models that use the standard Hugging Face implementation path.

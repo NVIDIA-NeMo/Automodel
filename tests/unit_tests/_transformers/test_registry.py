@@ -596,3 +596,42 @@ def test_minimax_m3_vl_config_overrides_transformers_builtin():
     )
     # The concrete field the crash was about: our vision sub-config must default it.
     assert MiniMaxM3VLConfig().vision_config.rope_theta is not None
+
+
+def test_public_register_architecture(monkeypatch):
+    """register_architecture is importable from nemo_automodel."""
+    from nemo_automodel import register_architecture
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+    monkeypatch.setattr(reg, "ModelRegistry", inst)
+
+    class PublicModel:
+        pass
+
+    register_architecture("PublicArch", PublicModel)
+    assert inst.get_model_cls_from_model_arch("PublicArch") is PublicModel
+
+
+def test_entry_point_discovery_adds_lazy_entry(monkeypatch):
+    """Entry points in nemo_automodel.architectures are discovered and lazily loaded."""
+    import importlib.metadata
+
+    from nemo_automodel._transformers import registry as reg
+
+    class EntryModel:
+        pass
+
+    fake_ep = types.SimpleNamespace(name="EntryArch", value="fake.module:EntryModel")
+    monkeypatch.setattr(
+        importlib.metadata,
+        "entry_points",
+        lambda **kwargs: [fake_ep] if kwargs.get("group") == "nemo_automodel.architectures" else [],
+    )
+
+    inst = _new_registry_instance(reg)
+    assert "EntryArch" in inst.model_arch_name_to_cls._auto_map
+
+    # First resolution triggers import.
+    inst.model_arch_name_to_cls._modules["fake.module"] = types.SimpleNamespace(EntryModel=EntryModel)
+    assert inst.get_model_cls_from_model_arch("EntryArch") is EntryModel
