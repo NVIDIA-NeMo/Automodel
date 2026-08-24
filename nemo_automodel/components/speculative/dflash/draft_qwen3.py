@@ -279,6 +279,52 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         return residual + hidden_states
 
 
+def build_qwen3_dflash_draft_config(
+    target_config,
+    *,
+    num_draft_layers: int,
+    num_target_layers: int,
+    block_size: int,
+    dflash_config: dict,
+    attention_backend: str,
+) -> Qwen3Config:
+    """Build the DFlash draft config for a Qwen3-shaped target.
+
+    The draft is a small non-causal Qwen3 stack that reuses the target's
+    architecture defaults (head_dim, rope_theta, rms_norm_eps, ...) and only
+    shrinks the depth.
+
+    Args:
+        target_config: The target's config.
+        num_draft_layers: Number of draft decoder layers.
+        num_target_layers: Depth of the target; recorded so a reloaded draft
+            config still describes which target it was trained on.
+        block_size: DFlash block size.
+        dflash_config: The recipe's DFlash block (``mask_token_id``,
+            ``target_layer_ids``, and any subclass extras such as Domino's
+            projector fields).
+        attention_backend: The draft's attention implementation; must agree with
+            the mask format the trainer builds.
+
+    Returns:
+        The draft ``Qwen3Config``.
+    """
+    draft_config = target_config.to_dict()
+    draft_config["architectures"] = ["Qwen3DFlashDraftModel"]
+    draft_config["num_hidden_layers"] = num_draft_layers
+    # ``layer_types``/``max_window_layers`` are sized to the target's depth;
+    # rebuild them for the (shallower) draft. The DFlash attention never uses
+    # sliding windows, so every draft layer is full attention.
+    draft_config["layer_types"] = ["full_attention"] * num_draft_layers
+    draft_config["max_window_layers"] = num_draft_layers
+    draft_config["num_target_layers"] = num_target_layers
+    draft_config["block_size"] = block_size
+    draft_config["dflash_config"] = dflash_config
+    draft_config_obj = Qwen3Config.from_dict(draft_config)
+    draft_config_obj._attn_implementation = attention_backend
+    return draft_config_obj
+
+
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
     """Pick ``num_draft_layers`` target layers spread across the target's depth."""
     if num_draft_layers == 1:

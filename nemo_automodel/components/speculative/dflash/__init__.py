@@ -37,6 +37,7 @@ from nemo_automodel.components.speculative.dflash.domino_core import (
     DominoTrainerModule,
     get_lambda_base,
 )
+from nemo_automodel.components.speculative.dflash.draft_kimi_k3 import KimiK3DFlashDraftModel
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
     build_target_layer_ids,
@@ -67,6 +68,7 @@ __all__ = [
     "compute_accept_len",
     "get_lambda_base",
     "Qwen3DFlashDraftModel",
+    "KimiK3DFlashDraftModel",
     "Qwen3DFlash2DraftModel",
     "CandidateSelector",
     "GroupedDynamicCausalConv",
