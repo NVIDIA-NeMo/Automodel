@@ -430,6 +430,9 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 num_diffusion_tokens=num_diffusion_tokens,
                 num_ar_tokens=num_ar_tokens if has_causal else None,
                 causal_logits=causal_logits,
+                # Mixed forward kernels (scdd) score the corrupted token itself,
+                # which noise_mask alone cannot recover; absorbing losses ignore it.
+                noisy_input_ids=noisy_input_ids,
             )
             microbatch_loss = loss_result.total_loss
             dllm_loss = loss_result.dllm_loss.detach().clone()

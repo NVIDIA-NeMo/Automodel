@@ -98,6 +98,19 @@ class StateDictAdapter(ABC):
         """
         return list(self.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=False))
 
-    def convert_peft_target_module_to_hf(self, module_name: str) -> str:
-        """Convert a native PEFT target-module name to its Hugging Face namespace."""
-        return module_name
+    def map_peft_target_module_to_hf(self, name: str) -> str:
+        """Translate a PEFT target-module name to the HuggingFace layout.
+
+        adapter_config.json's target_modules are collected from native module
+        names. Adapters whose ``to_hf`` renames modules (e.g. Kimi K3's
+        ``mlp.experts.{E}.gate_proj`` -> ``block_sparse_moe.experts.{E}.w1``)
+        should override this with the same renames so PEFT can resolve the
+        entries against the converted checkpoint.
+
+        Args:
+            name: A target-module name in native layout.
+
+        Returns:
+            The name in HuggingFace layout. Defaults to the name unchanged.
+        """
+        return name

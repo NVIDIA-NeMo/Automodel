@@ -141,7 +141,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         key = re.sub(rf"^{hf_root}\.embed_tokens\.weight$", f"{self._hf_prefix}embeddings.weight", key)
         return key
 
-    def convert_peft_target_module_to_hf(self, module_name: str) -> str:
+    def map_peft_target_module_to_hf(self, module_name: str) -> str:
         """Map native PEFT target modules to the public Nemotron-H namespace."""
         return self._native_key_to_hf(module_name)
 

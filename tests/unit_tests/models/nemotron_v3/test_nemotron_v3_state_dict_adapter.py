@@ -100,6 +100,15 @@ class TestNemotronV3StateDictAdapter:
         adapter._uses_model_prefix = True
         assert adapter._hf_prefix == "model."
 
+    def test_peft_target_module_mapping_tracks_hf_prefix(self, config, moe_config, backend):
+        """PEFT target-module metadata uses the same public namespace as exported tensors."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        native_name = "model.layers.0.mixer.in_proj"
+
+        assert adapter.map_peft_target_module_to_hf(native_name) == "backbone.layers.0.mixer.in_proj"
+        adapter._uses_model_prefix = True
+        assert adapter.map_peft_target_module_to_hf(native_name) == native_name
+
     def test_expert_path_segment_property(self, config, moe_config, backend):
         """Test _expert_path_segment property returns 'mixer.experts'."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
