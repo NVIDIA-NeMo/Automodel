@@ -18,6 +18,8 @@
 #   automodel examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml --nproc-per-node 8
 #
 # EP size must divide num_experts (256). ep_size=8 -> 32 experts/rank.
+# Laguna currently uses SDPA with NEAT packing. Native THD packing and context
+# parallelism are not supported by this model implementation.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -90,7 +92,8 @@ dataset:
     trust_remote_code: false
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 1024
+  packing_strategy: neat
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -130,7 +133,7 @@ optimizer:
 wandb:
   enable: false
   project: laguna-xs-2p1-sft
-  name: laguna_xs_2p1_hellaswag_ep8_torch_dispatch
+  name: laguna_xs_2p1_hellaswag_ep8_neat_1k
   mode: online
 
 ci:
