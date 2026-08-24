@@ -568,24 +568,6 @@ tokenizer:
     assert [release.hf_model_id for release in releases] == ["org/student"]
 
 
-def test_model_release_discovery_ignores_verification_cards(tmp_path):
-    examples_dir = tmp_path / "examples" / "llm_finetune"
-    examples_dir.mkdir(parents=True)
-    (examples_dir / "model.yaml").write_text(
-        "model:\n  pretrained_model_name_or_path: org/recipe-model\n",
-        encoding="utf-8",
-    )
-    (examples_dir / "model_verification_card.yaml").write_text(
-        "model:\n  pretrained_model_name_or_path: org/card-only-model\n",
-        encoding="utf-8",
-    )
-    _commit_recipes(tmp_path)
-
-    releases = _load_model_releases(tmp_path, {})
-
-    assert [release.hf_model_id for release in releases] == ["org/recipe-model"]
-
-
 def test_model_release_rejects_recipe_additions_on_shallow_boundary(tmp_path):
     recipe_path = tmp_path / "examples" / "llm_finetune" / "model.yaml"
     recipe_path.parent.mkdir(parents=True)

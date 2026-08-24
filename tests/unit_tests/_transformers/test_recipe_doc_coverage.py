@@ -51,8 +51,6 @@ import yaml
 
 from tests.unit_tests._transformers.test_doc_coverage import _DOC_ARCH_ALIASES
 
-MODEL_VERIFICATION_CARD_SUFFIX = "_verification_card.yaml"
-
 
 def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
@@ -79,8 +77,6 @@ def _collect_recipe_model_ids(examples_dir: pathlib.Path) -> set[str]:
     """
     model_ids: set[str] = set()
     for yaml_path in examples_dir.rglob("*.yaml"):
-        if yaml_path.name.endswith(MODEL_VERIFICATION_CARD_SUFFIX):
-            continue
         try:
             with yaml_path.open("r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
@@ -227,15 +223,6 @@ def test_yaml_recipe_scan_finds_model_ids(recipe_model_ids: set[str]):
         f"YAML scanner found only {len(recipe_model_ids)} model IDs in examples/ — expected many more. "
         "Scanner may be broken."
     )
-
-
-def test_yaml_recipe_scan_ignores_model_verification_cards(tmp_path):
-    recipe = tmp_path / "recipe.yaml"
-    recipe.write_text("model:\n  pretrained_model_name_or_path: org/recipe-model\n", encoding="utf-8")
-    card = tmp_path / "model_verification_card.yaml"
-    card.write_text("model:\n  pretrained_model_name_or_path: org/card-only-model\n", encoding="utf-8")
-
-    assert _collect_recipe_model_ids(tmp_path) == {"org/recipe-model"}
 
 
 # HF org → doc-dir slug, for orgs whose docs/model-coverage/ subdirectory name
