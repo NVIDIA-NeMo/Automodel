@@ -67,14 +67,21 @@ The shipped example configs only cover a subset.
   `config.get_text_config()` and the draft consumes post-block hidden states, so
   images do not participate in drafting. Configs: `eagle3/gemma4_e2b_eagle3.yaml`,
   `gemma4_e4b_eagle3.yaml`, `gemma4_31b_eagle3.yaml`, `gemma4_26b_a4b_eagle3.yaml`.
-- **Kimi K3** (`KimiK3ForCausalLM`, `KimiK3ForConditionalGeneration`): EAGLE-3
-  only, using a dedicated NoPE-MLA draft class (eager attention, no context or
+- **Kimi K3** (`KimiK3ForCausalLM`, `KimiK3ForConditionalGeneration`): EAGLE-3,
+  using a dedicated NoPE-MLA draft class (eager attention, no context or
   tensor parallelism and no sequence packing, see
   `eagle3/README_kimi_k3.md`).
 - **DFlash / DFlash 2 / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`,
   `Qwen3_5MoeForConditionalGeneration` (the Qwen3.5 family, which `Qwen/Qwen3.8-27B`
-  belongs to; its decoder config is read from the nested `text_config`).
+  belongs to; its decoder config is read from the nested `text_config`). All
+  DFlash-family recipes reject `distributed.pp_size > 1`: online hidden-state
+  capture hooks one complete, non-pipelined target forward.
+- **DFlash on Kimi K3** (`KimiK3ForCausalLM`, `KimiK3ForConditionalGeneration`):
+  using a dedicated dense MLA draft class. Plain DFlash only (Domino's projector
+  head is Qwen3-only, and there is no DFlash 2 draft for it), and it requires
+  `attention_backend: sdpa`. Sequence packing and context parallelism are
+  rejected, because K3 owns both itself. See `dflash/README_kimi_k3.md`.
 - **DSpark**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
   (`Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration`),
