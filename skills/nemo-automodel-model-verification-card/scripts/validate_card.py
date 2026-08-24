@@ -133,17 +133,30 @@ def validate_card(card: object) -> list[str]:
 
             if name == "checkpoint_resume" and status == "verified":
                 comparison = _mapping(leaf.get("resume_comparison"), f"{location}.resume_comparison", errors)
-                shared_steps = comparison.get("shared_steps")
-                passed_steps = comparison.get("passed_steps")
-                if not isinstance(shared_steps, int) or shared_steps <= 0:
-                    errors.append(f"{location}.resume_comparison.shared_steps must be a positive integer")
-                if passed_steps != shared_steps:
-                    errors.append(f"{location}.resume_comparison.passed_steps must equal shared_steps")
-                for field in ("learning_rate_exact", "consumed_tokens_exact"):
-                    if comparison.get(field) is not True:
-                        errors.append(f"{location}.resume_comparison.{field} must be true")
-                if not _string(comparison.get("loss_tolerance")):
-                    errors.append(f"{location}.resume_comparison.loss_tolerance must be a non-empty string")
+                if not _string(comparison.get("reference_item")):
+                    errors.append(f"{location}.resume_comparison.reference_item must be a non-empty string")
+                sentinel_steps = comparison.get("sentinel_steps")
+                if (
+                    not isinstance(sentinel_steps, list)
+                    or len(sentinel_steps) < 2
+                    or any(not isinstance(step, int) or isinstance(step, bool) or step <= 0 for step in sentinel_steps)
+                ):
+                    errors.append(
+                        f"{location}.resume_comparison.sentinel_steps must contain at least two positive integers"
+                    )
+                elif sentinel_steps != sorted(set(sentinel_steps)):
+                    errors.append(f"{location}.resume_comparison.sentinel_steps must be strictly increasing")
+                for field in ("loss_relative_tolerance", "loss_absolute_tolerance"):
+                    value = comparison.get(field)
+                    if (
+                        not isinstance(value, (int, float))
+                        or isinstance(value, bool)
+                        or not math.isfinite(value)
+                        or value < 0
+                    ):
+                        errors.append(f"{location}.resume_comparison.{field} must be a finite non-negative number")
+                if comparison.get("sentinels_match") is not True:
+                    errors.append(f"{location}.resume_comparison.sentinels_match must be true")
 
             if name == "sft_long_context":
                 contract = _mapping(leaf.get("verification_contract"), f"{location}.verification_contract", errors)

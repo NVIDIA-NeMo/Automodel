@@ -61,11 +61,11 @@ Verified leaves in `training` or `performance` also contain the five standard `m
 
 ```yaml
 resume_comparison:
-  shared_steps: 50
-  passed_steps: 50
-  loss_tolerance: 1.0e-6 + 1% of abs(reference)
-  learning_rate_exact: true
-  consumed_tokens_exact: true
+  reference_item: pretrain
+  sentinel_steps: [51, 100]
+  loss_relative_tolerance: 1.0e-2
+  loss_absolute_tolerance: 1.0e-6
+  sentinels_match: true
 ```
 
 ## Unverified leaves

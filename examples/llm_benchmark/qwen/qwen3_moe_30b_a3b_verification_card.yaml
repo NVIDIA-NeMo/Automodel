@@ -58,7 +58,6 @@ items:
       status: verified
       precision: bf16
       automodel_commit: cb03cf61ae2da0a591516fac4f21cfc6eecf48c1 # pragma: allowlist secret
-      depends_on: pretrain
       last_verified: "2026-08-18"
       metrics:
         initial_loss: 7.3997955322
@@ -67,16 +66,14 @@ items:
         last_10_steps_model_tflops_per_gpu_avg: 136.5429
         last_10_steps_tokens_per_second_per_gpu_avg: 5934.4724
       resume_comparison:
-        shared_steps: 50
-        passed_steps: 50
-        loss_tolerance: 1.0e-6 + 1% of abs(reference)
-        maximum_absolute_loss_difference: 0.0007162094
-        maximum_relative_loss_difference: 0.0000970991
-        learning_rate_exact: true
-        consumed_tokens_exact: true
+        reference_item: pretrain
+        sentinel_steps: [51, 100]
+        loss_relative_tolerance: 1.0e-2
+        loss_absolute_tolerance: 1.0e-6
+        sentinels_match: true
       expected_result: >
-        All 50 shared losses pass the declared tolerance; learning rates and
-        processed-token counts match exactly after resuming in a fresh process.
+        Resumed losses at steps 51 and 100 match pretrain within the declared
+        relative and absolute tolerances after resuming in a fresh process.
 
   sft:
     H100:

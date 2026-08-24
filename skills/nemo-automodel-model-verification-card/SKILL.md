@@ -45,7 +45,7 @@ For every verified training item, record these five metrics from complete optimi
 - `last_10_steps_model_tflops_per_gpu_avg`
 - `last_10_steps_tokens_per_second_per_gpu_avg`
 
-For `checkpoint_resume`, resume directly from the middle pretrain checkpoint into a new output root. Compare every shared post-checkpoint loss using `abs(resumed - reference) <= 1e-6 + 0.01 * abs(reference)`, and require learning rate and processed-token counts to match exactly.
+For `checkpoint_resume`, resume directly from the middle pretrain checkpoint into a new output root. Follow the Megatron Bridge sentinel contract: identify the reference item, compare the first resumed and final step with separate relative and absolute loss tolerances, and set `sentinels_match: true` only when both comparisons pass.
 
 Treat timing, TFLOPS, and tokens/s from a functional convergence run as sanity observations. They do not verify `pretrain_performance`; that item requires a separate tuned run of the public benchmark recipe.
 
@@ -71,7 +71,7 @@ Then run the example YAML linter and focused unit tests for any shared YAML disc
 - Item leaves use only `verified` or `not_verified` and match the index.
 - Every verified item records the immutable AutoModel commit, date, precision, and concrete expected result.
 - Every verified training leaf includes all five metrics.
-- Resume evidence includes all shared steps, the declared tolerance, and exact LR/token checks.
+- Resume evidence identifies its reference item, sentinel steps, separate relative and absolute loss tolerances, and whether all sentinels match.
 - Long-context SFT uses CoderForge and sequence length 131072.
 - Performance is a separate item and uses a public benchmark recipe.
 - Recipe-owned workload settings are not duplicated in the card.
