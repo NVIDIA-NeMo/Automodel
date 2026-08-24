@@ -8,24 +8,44 @@ that link here — e.g. [`../gemma4_31B/`](../gemma4_31B) (Phase 3) and
 [`../qwen3_32b/`](../qwen3_32b) — so there is **one** eval harness, parameterized by
 `MODEL` / `NAME` / `PARSER` / topology, not a copy per model.
 
-How it works: **vLLM** serves the checkpoint; the **oh3 agent** drives the 3-tool
-loop against each SWE-bench instance's repo inside a **Docker-less enroot** container
-(the cluster has enroot + pyxis, no Docker); the resulting patches are graded
-**locally in enroot** with the official `swebench` spec.
-
 ## Scripts
 
 | Script | Role | Compute |
 |---|---|---|
-| `setup_eval_tooling.sh` | py3.10 venv + `mini-swe-agent` + `swebench` (one-time) | login |
+| `setup_eval_tooling.sh` | small isolated Python 3.10 venv + `mini-swe-agent` (the oh3 agent) + `swebench` — an isolated sandbox for the eval tooling (one-time) | login |
 | `prewarm_images.sub` | pre-import the per-instance enroot images **once** into a shared lustre cache (avoids Docker Hub throttling from concurrent pulls) | CPU |
-| `openhands3_run.sub` | serve vLLM + run the oh3 agent over a slice → `preds.json` | 1 node / 8 GPU |
+| `openhands3_run.sub` | serve vLLM + run the oh3 agent over a slice → `preds.json` | 1 node / 8 GPU (both models) |
 | `grade_enroot.sub` | apply patches + run FAIL_TO_PASS/PASS_TO_PASS in enroot → resolve rate | CPU |
 | `probe_indist.sub` | optional one-call smoke test: does the ckpt emit structured tool calls yet? | 2 GPU |
 
 Helpers (imported, not run directly): `oh3_run.py` (the agent), `enroot_env.py`
 (Docker-less enroot backend), `grade_enroot.py` (local grader), `prewarm_images.py`,
 `probe_indist.py`.
+
+## How it works
+
+```
+   the model              the "hands"            the workbench             the judge
+  ┌──────────┐          ┌────────────┐         ┌────────────┐          ┌──────────┐
+  │  vLLM    │◄────────►│ agent loop │────────►│  enroot    │          │ enroot + │
+  │ (serves  │  chat +  │ (oh3_run)  │  runs   │ per-task   │  patch   │ swebench │
+  │  ckpt)   │  tools   │            │ commands│  container │ ───────► │  tests   │
+  └──────────┘          └────────────┘         └────────────┘          └──────────┘
+     on GPUs               Python              one Linux box              on CPU
+```
+
+Each SWE-bench task is a real GitHub bug: a repo snapshot at the buggy commit plus a
+hidden test that passes only once the bug is fixed. The four phases:
+
+- **Serve** — vLLM loads the checkpoint and exposes an OpenAI-style endpoint the agent
+  calls once per turn.
+- **Agent** — `oh3_run.py` drives the 3-tool loop: ask the model for a tool call, run it,
+  feed the result back, repeat until it finishes or hits the turn cap.
+- **Sandbox** — each task runs in its own **enroot** container built from the task's
+  official SWE-bench image (the buggy repo, right commit, right deps). The agent's
+  `execute_bash` / file edits run *inside* it; the candidate patch is a `git diff`.
+- **Grade** — the patch is applied and the task's hidden tests (FAIL_TO_PASS /
+  PASS_TO_PASS) run in the same enroot image; both pass ⇒ **resolved**.
 
 ## Run order
 
@@ -78,13 +98,26 @@ reflects the model, not the serving config.
 ## Grading
 
 Grading runs the official `swebench` spec **locally inside the same enroot images**
-(no Docker, no cloud upload — the SWE-bench cloud grader returned "failed" for every
-submission on our account, including a gold-patch control). The harness prints an
-**`enroot-errs`** count: **it must be 0**, otherwise some per-instance containers failed
-to build and a `0.0` resolve rate is a false zero, not a real result. Sanity: feeding
-the gold patches resolves 5/5 (100%), so the grader is trusted.
+(no Docker, no cloud upload). The harness prints an **`enroot-errs`** count: **it must
+be 0**, otherwise some per-instance containers failed to build and a `0.0` resolve rate
+is a false zero, not a real result.
 
-## Cluster constraints (learned)
+**Gold-patch sanity (manual one-off).** To trust the grader, we ran it once on the
+dataset's *known-correct* solutions: set each candidate `model_patch` to the instance's
+reference `patch` (the gold solution) for 5 instances and grade that. Being the known
+good fix, it resolves **5/5 (100%)**, which validates the **grading harness** end-to-end
+— images build, the patch applies in `/testbed`, `eval_script` runs the FAIL_TO_PASS /
+PASS_TO_PASS tests, and scoring is correct — so a `0.0` on real preds is a genuine model
+result, not a broken grader. This was a manual one-off (there is no `--gold` flag) that
+deliberately bypasses the model, so it checks **only grading**, not the agent/serving path.
+
+## Per-model results
+
+Numbers, checkpoints, and model-specific serving notes live on the per-model pages:
+- Gemma4-31B: [`../gemma4_31B/README.md`](../gemma4_31B/README.md) (Phase 3).
+- Qwen3-32B: [`../qwen3_32b/`](../qwen3_32b) (eval added in a follow-up).
+
+## Gotchas
 
 - **enroot data path must be node-local** (`/tmp`), not lustre — lustre can't represent
   overlay whiteouts. The scripts set `ENROOT_*_PATH` under `/tmp`.
@@ -93,9 +126,3 @@ the gold patches resolves 5/5 (100%), so the grader is trusted.
 - **Don't strand GPUs.** No `--exclusive` (or explicit `--mem`/`--cpus-per-task`) with a
   GPU subset — the idle-GPU monitor auto-cancels such jobs; request `--gpus-per-node=N`.
   Serve + agent live in one job so no GPU sits idle and no dangling endpoint is left.
-
-## Per-model results
-
-Numbers, checkpoints, and model-specific serving notes live on the per-model pages:
-- Gemma4-31B: [`../gemma4_31B/README.md`](../gemma4_31B/README.md) (Phase 3).
-- Qwen3-32B: [`../qwen3_32b/`](../qwen3_32b) (eval added in a follow-up).
