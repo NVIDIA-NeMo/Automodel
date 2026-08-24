@@ -237,6 +237,7 @@ class TestGlm4MoeModel:
         assert model.moe_config.score_func == "sigmoid"  # GLM4 uses sigmoid
         assert model.moe_config.softmax_before_topk is False
         assert model.moe_config.apply_router_weight_after_down is True
+        assert model.moe_config.router_weights_fp32 is True
         assert model.moe_config.route_scale == glm_config.routed_scaling_factor
 
     def test_model_initializes_moe_config_with_expert_groups(self, glm_config, backend_config):

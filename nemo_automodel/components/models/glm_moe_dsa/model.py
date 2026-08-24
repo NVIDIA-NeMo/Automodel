@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Union
 
 import torch
@@ -171,6 +171,7 @@ class GlmMoeDsaModel(nn.Module):
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=False,
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -372,7 +373,11 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
-        self.backend = backend or BackendConfig()
+        resolved_backend = backend or BackendConfig()
+        # HF computes the GLM router projection and selected mixture weights in fp32.
+        if resolved_backend.gate_precision is None:
+            resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
+        self.backend = resolved_backend
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GlmMoeDsaModel(
             config,

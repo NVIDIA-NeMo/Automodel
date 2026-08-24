@@ -1419,24 +1419,40 @@ def test_source_load_parity_success_returns_no_deferred_failure(tmp_path):
     assert failure is None
 
 
-def test_source_load_parity_embeds_shape_diagnostic_in_schema_v3_metrics(tmp_path):
+def test_source_load_parity_emits_complete_schema_v3_metrics_once(tmp_path, capsys):
     logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
+    shape_diagnostic = {"schema_version": 1, "enforced": False, "points": {}}
     shape_report_path = tmp_path / "shape_diagnostics" / "phase_0_hf_shape.json"
     shape_report_path.parent.mkdir(parents=True)
-    shape_report_path.write_text('{"schema_version": 1, "enforced": false, "points": {}}\n')
+    shape_report_path.write_text(json.dumps(shape_diagnostic) + "\n")
+    router_diagnostic = {"schema_version": 1, "frameworks": ["hf", "automodel"]}
+    router_dir = tmp_path / "router_diagnostics"
+    router_dir.mkdir()
+    (router_dir / "phase_0_hf.pt").touch()
+    (router_dir / "phase_0_automodel.pt").touch()
 
-    failure = _compare_source_load_parity(
-        (logits, None, None),
-        logits.clone(),
-        None,
-        artifact_dir=tmp_path,
-        policy=_source_load_parity_policy({"parity_tolerance_profile": "strict"}),
-    )
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.router_diagnostics.compare_glm_router_captures",
+        return_value=router_diagnostic,
+    ):
+        failure = _compare_source_load_parity(
+            (logits, None, None),
+            logits.clone(),
+            None,
+            artifact_dir=tmp_path,
+            policy=_source_load_parity_policy({"parity_tolerance_profile": "strict"}),
+        )
 
     assert failure is None
     payload = json.loads((tmp_path / "parity_metrics" / "phase_0_source_load.json").read_text())
     assert payload["schema_version"] == 3
-    assert payload["shape_diagnostic"] == {"schema_version": 1, "enforced": False, "points": {}}
+    assert payload["shape_diagnostic"] == shape_diagnostic
+    assert payload["router_diagnostics"] == router_diagnostic
+    metric_lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("CHECKPOINT_PARITY_METRICS ")
+    ]
+    assert len(metric_lines) == 1
+    assert json.loads(metric_lines[0].removeprefix("CHECKPOINT_PARITY_METRICS ")) == payload
 
 
 def test_source_load_logit_skip_keeps_metrics_informational():

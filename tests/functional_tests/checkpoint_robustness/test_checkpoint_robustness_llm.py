@@ -535,6 +535,8 @@ def _compare_logits(
     reference_logits: torch.Tensor,
     candidate_logits: torch.Tensor,
     policy: _LogitParityPolicy,
+    *,
+    diagnostics: dict[str, object] | None = None,
 ) -> str | None:
     """Compute, persist, and optionally enforce one full-logit comparison.
 
@@ -543,6 +545,7 @@ def _compare_logits(
         reference_logits: Reference tensor of shape [..., vocab], with arbitrary leading token dimensions.
         candidate_logits: Candidate tensor of shape [..., vocab], matching ``reference_logits`` exactly.
         policy: Comparison identity, numerical profile, targeted overrides, and enforcement state.
+        diagnostics: Optional diagnostic evidence to embed in the emitted schema-v3 record.
 
     Returns:
         A failure message when an enforced gate fails, otherwise ``None``.
@@ -621,6 +624,8 @@ def _compare_logits(
         "metrics": metrics.to_dict(),
         "gate_metrics": gate_metrics.to_dict(),
     }
+    if diagnostics:
+        payload.update(diagnostics)
     report_dir = artifact_dir / "parity_metrics"
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"{policy.phase}_{policy.comparison}.json"
@@ -1679,16 +1684,10 @@ def _compare_source_load_parity(
                 f"Source-load parity shape mismatch: HF logits {hf_logits.shape} vs trainer logits "
                 f"{candidate_logits.shape}"
             )
-            parity_failure = _compare_logits(artifact_dir, hf_logits, candidate_logits, policy)
+            diagnostics: dict[str, object] = {}
             shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_0")
             if shape_report_path.exists():
-                _attach_parity_diagnostic(
-                    artifact_dir,
-                    phase="phase_0",
-                    comparison="source_load",
-                    key="shape_diagnostic",
-                    diagnostic=json.loads(shape_report_path.read_text()),
-                )
+                diagnostics["shape_diagnostic"] = json.loads(shape_report_path.read_text())
             hf_router_capture, automodel_router_capture, router_report = _router_diagnostic_paths(artifact_dir)
             if hf_router_capture.exists() or automodel_router_capture.exists():
                 if not hf_router_capture.exists() or not automodel_router_capture.exists():
@@ -1707,13 +1706,14 @@ def _compare_source_load_parity(
                     reference_logits=hf_logits,
                     candidate_logits=candidate_logits,
                 )
-                _attach_parity_diagnostic(
-                    artifact_dir,
-                    phase="phase_0",
-                    comparison="source_load",
-                    key="router_diagnostics",
-                    diagnostic=router_diagnostics,
-                )
+                diagnostics["router_diagnostics"] = router_diagnostics
+            parity_failure = _compare_logits(
+                artifact_dir,
+                hf_logits,
+                candidate_logits,
+                policy,
+                diagnostics=diagnostics,
+            )
             if parity_failure is not None:
                 raise AssertionError(parity_failure)
             print(
@@ -2317,21 +2317,17 @@ def _run_vanilla_hf_reload(
             )
             del hf_model
 
+        diagnostics: dict[str, object] = {}
+        shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_3")
+        if shape_report_path.exists():
+            diagnostics["shape_diagnostic"] = json.loads(shape_report_path.read_text())
         hf_reload_error = _compare_logits(
             artifact_dir,
             reference_logits,
             hf_logits,
             _hf_reload_parity_policy(custom_args),
+            diagnostics=diagnostics,
         )
-        shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_3")
-        if shape_report_path.exists():
-            _attach_parity_diagnostic(
-                artifact_dir,
-                phase="phase_3",
-                comparison="hf_export_reload",
-                key="shape_diagnostic",
-                diagnostic=json.loads(shape_report_path.read_text()),
-            )
         del hf_logits
         _release_model_memory()
         return hf_reload_error
@@ -2441,27 +2437,6 @@ def _run_hf_shape_diagnostic(
         router_diagnostics=router_summaries or None,
     )
     _persist_shape_diagnostic_report(report, _shape_diagnostic_report_path(artifact_dir, phase))
-
-
-def _attach_parity_diagnostic(
-    artifact_dir: Path,
-    *,
-    phase: str,
-    comparison: str,
-    key: str,
-    diagnostic: dict[str, object],
-) -> None:
-    """Attach full diagnostic evidence to one schema-v3 parity record."""
-    report_path = artifact_dir / "parity_metrics" / f"{phase}_{comparison}.json"
-    if not report_path.exists():
-        raise FileNotFoundError(f"Cannot attach {key}: parity report is missing at {report_path}")
-    payload = json.loads(report_path.read_text())
-    if payload.get("schema_version") != 3:
-        raise ValueError(f"Cannot attach {key} to unsupported parity schema {payload.get('schema_version')!r}")
-    payload[key] = diagnostic
-    temporary_report_path = report_path.with_suffix(".tmp")
-    temporary_report_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary_report_path.replace(report_path)
 
 
 def _source_load_artifact_paths(cfg) -> tuple[Path, Path]:

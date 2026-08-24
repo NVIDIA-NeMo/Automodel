@@ -240,6 +240,7 @@ class TestGlmMoeDsaModel:
         assert model.moe_config.n_activated_experts == config.num_experts_per_tok
         assert model.moe_config.score_func == "sigmoid"
         assert model.moe_config.softmax_before_topk is False
+        assert model.moe_config.router_weights_fp32 is True
         assert model.moe_config.route_scale == config.routed_scaling_factor
 
     def test_model_initializes_moe_config_with_expert_groups(self, config, backend_config):
