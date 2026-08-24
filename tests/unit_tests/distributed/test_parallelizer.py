@@ -1966,10 +1966,10 @@ class TestActivationCheckpointingKVSharing:
             rejects non-Module values when replacing a registered child module.
             """
 
-            def __init__(self, inner, context_fn=None):
+            def __init__(self, inner, **kwargs):
                 super().__init__()
                 self._inner = inner
-                self._context_fn = context_fn
+                self.kwargs = kwargs
 
             @property
             def _checkpoint_wrapped_module(self):
@@ -1982,7 +1982,7 @@ class TestActivationCheckpointingKVSharing:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
-            lambda module, **kwargs: _Wrapped(module),
+            lambda module, **kwargs: _Wrapped(module, **kwargs),
         )
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
@@ -2427,7 +2427,7 @@ class TestActivationCheckpointingKVSharing:
             assert not hasattr(layer, "mlp")
 
     # ------------------------------------------------------------------ #
-    # HF native gradient-checkpointing path
+    # HF-native gradient-checkpointing candidates
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -2451,25 +2451,28 @@ class TestActivationCheckpointingKVSharing:
         model.gradient_checkpointing_enable = MagicMock()  # type: ignore[attr-defined]
         return model
 
-    def test_hf_native_grad_ckpt_preserves_use_cache_with_kv_sharing(self, monkeypatch):
-        """Even when the HF native path is taken, use_cache stays True for KV-shared models."""
+    def test_hf_native_candidate_with_kv_sharing_uses_submodule_checkpointing(self, monkeypatch):
+        """KV-shared models preserve their cache and use submodule checkpointing."""
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20)
         self._run_parallelize(model)
 
         assert model.config.use_cache is True
-        model.gradient_checkpointing_enable.assert_called_once_with(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert all(not isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        assert all(isinstance(layer.mlp, self._Wrapped) for layer in model.model.layers)
 
-    def test_hf_native_grad_ckpt_disables_use_cache_and_uses_non_reentrant(self, monkeypatch):
-        """HF native checkpointing disables cache and avoids reentrant FSDP2 forward hooks."""
+    def test_hf_native_candidate_uses_non_reentrant_full_layer_checkpointing(self, monkeypatch):
+        """HF-native candidates use full-layer checkpoint wrappers instead of the HF API."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
         self._run_parallelize(model)
 
         assert model.config.use_cache is False
-        model.gradient_checkpointing_enable.assert_called_once_with(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert all(isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        assert all(layer.kwargs["checkpoint_impl"] is CheckpointImpl.NO_REENTRANT for layer in model.model.layers)
+        assert all(layer.kwargs["preserve_rng_state"] is True for layer in model.model.layers)
 
     def test_hf_native_grad_ckpt_skips_frozen_layers(self, monkeypatch):
         """Frozen layers force scoped submodule wrapping instead of whole-model HF native GC."""
@@ -2677,6 +2680,32 @@ class TestSingleGpuActivationCheckpointing:
             assert not isinstance(layer, CheckpointWrapper)
             assert isinstance(layer.mlp, CheckpointWrapper)
             assert isinstance(layer.self_attn, CheckpointWrapper)
+
+
+class TestFsdp2ShardingEnabled:
+    """`fsdp2_sharding_enabled` reports whether fully_shard — and its mixed-precision casts — apply."""
+
+    def test_disabled_on_single_rank_world(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
+
+        # The mesh is never inspected once the world is single-rank.
+        assert fsdp2_mod.fsdp2_sharding_enabled(MagicMock()) is False
+
+    def test_disabled_on_single_element_mesh(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 4)
+
+        assert fsdp2_mod.fsdp2_sharding_enabled(SimpleNamespace(size=lambda: 1)) is False
+
+    def test_enabled_on_multi_rank_mesh(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 4)
+
+        assert fsdp2_mod.fsdp2_sharding_enabled(SimpleNamespace(size=lambda: 4)) is True
 
 
 class TestSelectiveCheckpointSaveOps:

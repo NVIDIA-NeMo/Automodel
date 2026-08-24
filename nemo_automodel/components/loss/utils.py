@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -20,7 +20,7 @@ import torch.nn as nn
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 
 
-def _get_lm_head_module(model: nn.Module) -> Optional[nn.Module]:
+def _get_lm_head_module(model: nn.Module) -> nn.Module | None:
     """Return the model's LM-head module, if one can be found.
 
     Local copy of ``components.utils.model_utils.get_lm_head_module`` to keep
@@ -48,7 +48,7 @@ def _get_lm_head_weight(model: nn.Module) -> torch.Tensor:
     raise ValueError("lm_head.weight not found in model")
 
 
-def _get_final_hidden_states(model_output: Any) -> Optional[Any]:
+def _get_final_hidden_states(model_output: Any) -> Any | None:
     """Return the final hidden-states tensor from an HF-like model output.
 
     Local copy of ``components.training.model_output_utils.get_final_hidden_states``

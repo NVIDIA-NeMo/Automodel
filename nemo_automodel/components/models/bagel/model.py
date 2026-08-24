@@ -30,7 +30,7 @@ import logging
 import os
 import pathlib
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -152,7 +152,7 @@ class BagelModel(nn.Module):
     ``BagelForUnifiedMultimodal.forward``.
     """
 
-    def __init__(self, config: BagelConfig, backend: Optional[BagelBackendConfig] = None) -> None:
+    def __init__(self, config: BagelConfig, backend: BagelBackendConfig | None = None) -> None:
         super().__init__()
         self.config = config
         self.backend = resolve_bagel_backend(backend)
@@ -236,7 +236,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: BagelConfig, backend: Optional[BagelBackendConfig] = None) -> None:
+    def __init__(self, config: BagelConfig, backend: BagelBackendConfig | None = None) -> None:
         super().__init__()
         # Also covers the build_bagel_from_hf_backbones registry-bypass path, which
         # constructs this class directly. Reads the nested text_config tie flag via
@@ -398,26 +398,26 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         packed_text_indexes: torch.LongTensor,
         sample_lens: List[int],
         packed_position_ids: torch.LongTensor,
-        nested_attention_masks: Optional[List[torch.Tensor]] = None,
-        split_lens: Optional[List[int]] = None,
-        attn_modes: Optional[List[str]] = None,
+        nested_attention_masks: List[torch.Tensor] | None = None,
+        split_lens: List[int] | None = None,
+        attn_modes: List[str] | None = None,
         # --- understanding branch ---
-        packed_vit_tokens: Optional[torch.Tensor] = None,
-        packed_vit_token_indexes: Optional[torch.LongTensor] = None,
-        packed_vit_position_ids: Optional[torch.LongTensor] = None,
-        vit_token_seqlens: Optional[torch.Tensor] = None,
+        packed_vit_tokens: torch.Tensor | None = None,
+        packed_vit_token_indexes: torch.LongTensor | None = None,
+        packed_vit_position_ids: torch.LongTensor | None = None,
+        vit_token_seqlens: torch.Tensor | None = None,
         # --- generation branch (Stage 2) ---
-        padded_latent: Optional[torch.Tensor] = None,
-        patchified_vae_latent_shapes: Optional[List[Tuple[int, int]]] = None,
-        packed_latent_position_ids: Optional[torch.LongTensor] = None,
-        packed_vae_token_indexes: Optional[torch.LongTensor] = None,
-        packed_timesteps: Optional[torch.Tensor] = None,
-        mse_loss_indexes: Optional[torch.Tensor] = None,
+        padded_latent: torch.Tensor | None = None,
+        patchified_vae_latent_shapes: List[Tuple[int, int]] | None = None,
+        packed_latent_position_ids: torch.LongTensor | None = None,
+        packed_vae_token_indexes: torch.LongTensor | None = None,
+        packed_timesteps: torch.Tensor | None = None,
+        mse_loss_indexes: torch.Tensor | None = None,
         # --- loss ---
-        ce_loss_indexes: Optional[torch.Tensor] = None,
-        packed_label_ids: Optional[torch.Tensor] = None,
-        ce_loss_weights: Optional[torch.Tensor] = None,
-    ) -> Dict[str, Optional[torch.Tensor]]:
+        ce_loss_indexes: torch.Tensor | None = None,
+        packed_label_ids: torch.Tensor | None = None,
+        ce_loss_weights: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor | None]:
         """Run the BAGEL mixed-modal forward.
 
         Stage 1 (``visual_gen=False``) skips the flow-matching branch and MSE
@@ -524,8 +524,8 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         # Keep ``packed_latent_clean`` and ``noise`` around because the MSE
         # computation below uses them to form the
         # flow-matching velocity target ``v_t = noise - clean``.
-        packed_latent_clean: Optional[torch.Tensor] = None
-        noise: Optional[torch.Tensor] = None
+        packed_latent_clean: torch.Tensor | None = None
+        noise: torch.Tensor | None = None
         if self.config.visual_gen and padded_latent is not None:
             if (
                 patchified_vae_latent_shapes is None
@@ -598,7 +598,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
             last_hidden_state = last_hidden_state[mot_inv]
 
         # --- loss: CE (understanding) ---
-        ce: Optional[torch.Tensor] = None
+        ce: torch.Tensor | None = None
         if ce_loss_indexes is not None:
             if packed_label_ids is None:
                 raise ValueError("ce_loss_indexes was provided but packed_label_ids is None.")
@@ -611,7 +611,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         # 0 exactly, so
         # ``packed_timesteps > 0`` filters them out and only loss=1 positions
         # contribute to MSE.
-        mse: Optional[torch.Tensor] = None
+        mse: torch.Tensor | None = None
         if (
             self.config.visual_gen
             and mse_loss_indexes is not None

@@ -187,6 +187,8 @@ class TestNemotronV3Model:
         assert caps.supports_ep is False
         assert caps.supports_cp is True
         assert caps.supports_pp is True
+        assert caps.supports_mtp_cp is True
+        assert caps.supports_mtp_cp_pp is False
         assert caps.supports_tp is False
 
     def test_model_embedding_dimensions(self, config, backend):

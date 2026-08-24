@@ -13,7 +13,6 @@
 # limitations under the License.
 import warnings
 from functools import partial
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -36,6 +35,7 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
@@ -146,8 +146,8 @@ class FakeBalancedGate(nn.Module):
         self,
         x: torch.Tensor,
         token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        cp_mesh: DeviceMesh | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the gating mechanism.
 
@@ -217,7 +217,7 @@ class _GateRoutingCore(nn.Module):
     independent, parameterless CUDA graph boundary and survives model copies.
     """
 
-    def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Select experts and compute routing probabilities from projected scores."""
         return gate._route_scores(scores)
 
@@ -295,16 +295,16 @@ class Gate(nn.Module):
         # Cumulative expert load is a tensor representing the number of tokens
         # routed to each expert on the current rank, accumulated across gradient
         # accumulation steps.
-        self._cumulative_expert_load: Optional[torch.Tensor] = None
+        self._cumulative_expert_load: torch.Tensor | None = None
 
         # Load balance tracking (enabled externally via enable_load_balance_tracking)
         self._track_load_balance: bool = False
-        self._last_expert_load: Optional[torch.Tensor] = None
-        self._last_aux_loss: Optional[torch.Tensor] = None
+        self._last_expert_load: torch.Tensor | None = None
+        self._last_aux_loss: torch.Tensor | None = None
 
         # Rollout Routing Replay (R3): owns a handle only when enabled so the
         # default routing path stays a no-op.
-        self.router_replay: Optional[RouterReplay] = (
+        self.router_replay: RouterReplay | None = (
             RouterReplay() if getattr(config, "enable_routing_replay", False) else None
         )
         self.routing_core = _GateRoutingCore()
@@ -389,7 +389,7 @@ class Gate(nn.Module):
             return self.e_score_correction_bias.to_local()
         return self.e_score_correction_bias
 
-    def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Apply fixed-shape expert selection and probability math to router logits.
 
         Args:
@@ -516,8 +516,8 @@ class Gate(nn.Module):
         self,
         x: torch.Tensor,
         token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        cp_mesh: DeviceMesh | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the gating mechanism.
 
@@ -672,7 +672,7 @@ class Gate(nn.Module):
         original_scores: torch.Tensor,
         expert_load: torch.Tensor,
         token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
+        cp_mesh: DeviceMesh | None,
     ) -> torch.Tensor:
         """
         Computes the auxiliary loss for load balancing.
@@ -762,7 +762,12 @@ class MoE(nn.Module):
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
             self.gate.use_routing_core = "moe_router" in backend.cuda_graph.modules
-        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
+        if backend.dispatcher == "mok":
+            world_size = get_world_size_safe()
+            if world_size % 4 != 0:
+                raise ValueError(f"dispatcher='mok' requires world size to be divisible by 4; got {world_size}")
+            self.experts = GroupedExpertsMoK(config, backend)
+        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
                 "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",
@@ -827,24 +832,24 @@ class MoE(nn.Module):
             self.fc2_latent_proj = None
 
         # Set during model parallelization (see parallelizer.apply_cp)
-        self.cp_mesh: Optional[DeviceMesh] = None
+        self.cp_mesh: DeviceMesh | None = None
 
     def forward(
         self,
         x: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        cp_mesh: Optional[DeviceMesh] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass for the MoE module.
+        padding_mask: torch.Tensor | None = None,
+        cp_mesh: DeviceMesh | None = None,
+    ) -> torch.Tensor:
+        """Route tokens through shared and routed experts.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            padding_mask (Optional[torch.Tensor]): Boolean mask indicating padding positions.
+            x: Input tensor of shape ``[..., hidden]``.
+            padding_mask: Boolean tensor matching ``x.shape[:-1]`` where true
+                entries are padding.
+            cp_mesh: Optional context-parallel mesh used by the router.
 
         Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-            Optional[torch.Tensor]: Auxiliary loss for load balancing (if applicable).
+            Tensor with the same shape and dtype as ``x``.
         """
         if cp_mesh is None:
             cp_mesh = self.cp_mesh
@@ -863,17 +868,32 @@ class MoE(nn.Module):
         else:
             x_latent = x
 
-        weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+        if isinstance(self.experts, GroupedExpertsMoK):
+            # MoK requires every EP rank to dispatch the same pre-aligned physical
+            # token extent (at least 512 and divisible by 256). Its runtime validates
+            # the local extent. THD padding rows remain in dispatch, while token_mask
+            # excludes them from router load statistics and auxiliary losses.
+            weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+            y = self.experts(
+                x_latent,
+                weights,
+                indices,
+                self.shared_experts.gate_proj.weight,
+                self.shared_experts.up_proj.weight,
+                self.shared_experts.down_proj.weight,
+            )
+            z = None
+        else:
+            weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+            # Shared-expert output (optionally gated), computed inline on the main stream.
+            z = None
+            if self.shared_experts is not None:
+                z = self.shared_experts(x)
+                if self.shared_expert_gate is not None:
+                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
-        # Shared-expert output (optionally gated), computed inline on the main stream.
-        z = None
-        if self.shared_experts is not None:
-            z = self.shared_experts(x)
-            if self.shared_expert_gate is not None:
-                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
-
-        # Routed experts on the main stream.
-        y = self.experts(x_latent, token_mask, weights, indices)
+            # Routed experts on the main stream.
+            y = self.experts(x_latent, token_mask, weights, indices)
 
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)
@@ -903,6 +923,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)):
             # Delegate expert initialization to experts.py
             _init_expert_weights(module, buffer_device, init_std)
+        elif isinstance(module, GroupedExpertsMoK):
+            module.init_weights(buffer_device, init_std)
         elif isinstance(module, MLP):
             to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)

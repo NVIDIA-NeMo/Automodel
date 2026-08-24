@@ -191,11 +191,14 @@ class ModelSupports:
             "cp",
             "ep",
             "sequence_packing",
+            "mtp_cp",
+            "mtp_cp_pp",
             "cp_vision_frame_sharding",
             "gradient_checkpointing",
             "generate",
         )
         flags = ", ".join("{}={}".format(name, getattr(self, "supports_" + name)) for name in names)
+        flags += ", mtp_enabled={}".format(self.mtp_enabled)
         flags += ", is_custom_model={}".format(self.is_custom_model)
         return "ModelSupports({})".format(flags)
 
@@ -259,9 +262,10 @@ class ModelSupports:
             return True
         if _has_backend(self._model):
             backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
-            if _is_deepseek_v4(self._model) or _is_glm_moe_dsa(self._model):
-                # DSV4 owns its CP attention (Miles-style); gated on TileLang.
+            if _is_deepseek_v4(self._model):
                 return backend_attn == "tilelang"
+            if _is_glm_moe_dsa(self._model):
+                return backend_attn in ("tilelang", "cudnn")
             # Hybrids, and custom models that ship their own CP-aware attention and opt in
             # via ``_supports_cp_sdpa``, may run CP on either TE or SDPA attention.
             if _is_hybrid(self._model) or getattr(self._model, "_supports_cp_sdpa", False):
@@ -284,11 +288,13 @@ class ModelSupports:
         """``forward()`` accepts ``seq_lens`` for packed-sequence training."""
         model = self._model
         backend_attn = getattr(getattr(model, "backend", None), "attn", None)
+        model_owned_backends = getattr(model, "_packed_cp_attn_backends", ())
         sp_attn_backend = (
             getattr(model, "_supports_sdpa", False) is True
             or _uses_te_attention(model)
             or _uses_magi_attention(model)
             or (self.supports_thd and backend_attn == "tilelang")
+            or backend_attn in model_owned_backends
             # Models that build their own per-document masks (Kimi Linear's
             # document-blocked causal mask plus per-document KDA ``cu_seqlens``)
             # need no packing-aware attention backend.
@@ -304,6 +310,30 @@ class ModelSupports:
         except AttributeError:
             return False
         return capabilities.supports_thd
+
+    @property
+    def supports_mtp_cp(self) -> bool:
+        """Model owns a verified MTP training path under context parallelism."""
+        try:
+            capabilities = query_capabilities(self._model)
+        except AttributeError:
+            return False
+        return capabilities.supports_mtp_cp
+
+    @property
+    def supports_mtp_cp_pp(self) -> bool:
+        """Model owns a verified MTP training path with both CP and PP."""
+        try:
+            capabilities = query_capabilities(self._model)
+        except AttributeError:
+            return False
+        return capabilities.supports_mtp_cp_pp
+
+    @property
+    def mtp_enabled(self) -> bool:
+        """Whether MTP is active for this configured model instance."""
+        mtp_config = getattr(self._model, "mtp_config", None)
+        return bool(getattr(mtp_config, "enabled", False))
 
     @property
     def supports_cp_vision_frame_sharding(self) -> bool:
@@ -357,7 +387,7 @@ class ModelSupports:
         MagiAttention dispatches the packed sequence across the CP group with its
         own load-balancing solver and a per-document varlen mask, so it supports
         CP + packing (see ``context_parallel.magi.magi_prepare_packed_cp``). Models
-        with native THD support own their packed CP path in TileLang attention.
+        with native THD support own their packed CP path in an optimized attention backend.
         Models can restrict a model-owned packed CP path to specific attention
         backends with ``_packed_cp_attn_backends``.
         Models that own their CP end to end (``_owns_cp_attention``) shard the
@@ -451,6 +481,15 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
                 f"model:\n"
                 f"  backend:\n"
                 f"    attn: tilelang"
+            )
+        elif _is_glm_moe_dsa(model):
+            errors.append(
+                f"Context parallelism (cp_size={cp_size}) for {arch} requires "
+                f"the TileLang or cuDNN DSA attention backend.\n"
+                f"Please re-run with --distributed.cp_size=1 or switch attention backend:\n"
+                f"model:\n"
+                f"  backend:\n"
+                f"    attn: tilelang  # or cudnn"
             )
         elif _has_backend(model):
             errors.append(

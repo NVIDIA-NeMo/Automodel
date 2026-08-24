@@ -243,8 +243,14 @@ def test_recipe_config_resolves_nested_vlm_video_processor():
 
 def test_vlm_dataloader_selects_thd_collater(monkeypatch):
     processor = DummyProcessor()
+    packing_kwargs = {}
+
+    def _build_packing(self, dataset, **kwargs):
+        packing_kwargs.update(kwargs)
+        return dataset
+
     monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
-    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", _build_packing)
     config = VlmDataloaderConfig(
         dataset_config=StaticDatasetConfig([]),
         processor_config=VlmProcessorConfig(factory=lambda: processor),
@@ -258,10 +264,12 @@ def test_vlm_dataloader_selects_thd_collater(monkeypatch):
         dp_rank=0,
         dp_world_size=1,
         batch_size=2,
+        cp_size=4,
     )
 
     assert result.dataloader.collate_fn.func is packed_sequence_thd_vlm_collater
     assert result.dataloader.collate_fn.keywords == {"padding_idx": 0, "max_length": None}
+    assert packing_kwargs["cp_size"] == 4
 
 
 def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):

@@ -15,7 +15,7 @@
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -30,6 +30,7 @@ from nemo_automodel.components._peft.lora_kernel import (
 )
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 from nemo_automodel.shared.tp_linear import tp_linear_forward
 from nemo_automodel.shared.utils import dtype_from_str
@@ -52,7 +53,7 @@ class PeftConfig:
     dropout: float = 0.0
     dropout_position: Literal["pre", "post"] = "post"
     lora_A_init: str = "xavier"
-    lora_dtype: Optional[torch.dtype] = None
+    lora_dtype: torch.dtype | None = None
     use_memory_efficient_lora: bool = True
     use_triton: bool = False
     moe_rank_scaling: bool = False
@@ -539,6 +540,8 @@ def patch_moe_module(
     Returns:
         nn.Module: The LoRA-wrapped MoE module (GroupedExpertsLoRA or GroupedExpertsDeepEPLoRA).
     """
+    if isinstance(orig_module, GroupedExpertsMoK):
+        raise NotImplementedError("LoRA is not supported for Mixture-of-Kittens expert modules.")
     if isinstance(orig_module, GroupedExpertsTE):
         raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
     elif isinstance(orig_module, GroupedExpertsDeepEP):
@@ -615,7 +618,7 @@ def apply_lora_to_linear_modules(
     )
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
-        if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)):
+        if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE, GroupedExpertsMoK)):
             if matcher.match(module, name):
                 if peft_config.use_dora:
                     raise NotImplementedError("DoRA is not supported for MoE expert modules in Automodel yet.")

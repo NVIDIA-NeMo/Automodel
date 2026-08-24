@@ -39,6 +39,7 @@ from nemo_automodel.components.moe.layers import (
     Gate,
     MoE,
 )
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.multimodal_fsdp import (
@@ -55,10 +56,44 @@ from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
 )
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
+)
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 _CP_STREAM = None
+_EMPTY_TENSOR_DETERMINISM_CHECK = "moe_empty_tensor_dtype_tolerant"
+
+
+def _moe_checkpoint_metadata_fn(tensor: torch.Tensor):
+    """Checkpoint metadata that ignores dtype only for zero-element tensors.
+
+    Mixed-precision DeepEP can expose an empty routed-token tensor as BF16 in the
+    original forward and FP32 during backward recomputation. Empty tensors have no values
+    whose precision could differ, but PyTorch's default checkpoint check still
+    rejects the dtype-only metadata change. Preserve shape/device checks for every
+    tensor and dtype checks for every non-empty tensor.
+    """
+    return {
+        "shape": tensor.shape,
+        "dtype": tensor.dtype if tensor.numel() else None,
+        "device": tensor.device,
+    }
+
+
+def _register_moe_checkpoint_determinism_check() -> str:
+    """Register the narrow empty-tensor checker with PyTorch checkpointing."""
+    import torch.utils.checkpoint as torch_checkpoint
+
+    checks = getattr(torch_checkpoint, "_allowed_determinism_checks_to_fns", None)
+    if checks is None:
+        raise RuntimeError(
+            "This PyTorch version does not expose checkpoint determinism-check registration; "
+            "cannot safely tolerate empty MoE dtype changes."
+        )
+    checks[_EMPTY_TENSOR_DETERMINISM_CHECK] = _moe_checkpoint_metadata_fn
+    return _EMPTY_TENSOR_DETERMINISM_CHECK
 
 
 def _moe_shard_placement(param):
@@ -255,7 +290,7 @@ class ExpertParallel(ParallelStyle):
             dist_param.requires_grad = param.requires_grad
             module.register_parameter(name, dist_param)
 
-        if isinstance(module, GroupedExpertsDeepEP):
+        if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsMoK)):
             module.init_token_dispatcher(ep_mesh=device_mesh)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
@@ -582,6 +617,7 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
+                determinism_check=_register_moe_checkpoint_determinism_check(),
                 context_fn=_preserve_gate_load_during_recompute(
                     block,
                     _with_attention_backend_snapshot(selective_checkpointing_context_fn),
@@ -618,6 +654,10 @@ def apply_fsdp(
     # but trainable multimodal towers still get standalone FSDP units. Install
     # the same lazy-state guard as dense FSDP for modality-free batches.
     _patch_fsdp_accumulated_grad_guard()
+    # ``moe/fsdp_mixin`` drives post-backward by hand under pipeline parallelism,
+    # so a group can reach the reduction holding both reduce-dtype accumulations
+    # and a param-dtype gradient that arrived after its last no-sync reduction.
+    _patch_fsdp_uniform_reduce_dtype()
 
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
@@ -1003,6 +1043,8 @@ def parallelize_model(
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
+        parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
+        parallelizer_utils.reject_unsupported_mtp_cp(model)
         apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1

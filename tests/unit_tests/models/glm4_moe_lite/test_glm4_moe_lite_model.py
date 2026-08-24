@@ -231,6 +231,7 @@ class TestGlm4MoeLiteModel:
         assert model.moe_config.n_routed_experts == config.n_routed_experts
         assert model.moe_config.n_activated_experts == config.num_experts_per_tok
         assert model.moe_config.score_func == "sigmoid"
+        assert model.moe_config.apply_router_weight_after_down is True
 
     def test_forward_runs_all_layers(self, config, backend_config):
         model = Glm4MoeLiteModel(config, backend=backend_config)

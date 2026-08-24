@@ -50,6 +50,22 @@ class MoESplitExpertsStateDictMixin:
     # - self.backend: Backend configuration object
 
     @property
+    def supports_write_through_checkpoint_load(self) -> bool:
+        """Whether non-expert and grouped-expert destinations both alias model storage."""
+        experts_alias = self.moe_config is None or self._supports_write_through_expert_checkpoint_load
+        return self._supports_write_through_checkpoint_load and experts_alias
+
+    @property
+    def _supports_write_through_expert_checkpoint_load(self) -> bool:
+        """Whether all grouped expert destinations alias final model storage.
+
+        This only describes the shared expert conversion. Concrete adapters
+        must separately verify that their non-expert conversions also alias
+        model storage before opting into a write-through full-checkpoint load.
+        """
+        return self.backend.experts != "te" and self.backend.dispatcher != "mok"
+
+    @property
     def _is_gated_moe(self) -> bool:
         """Check if the MoE uses gated activation (e.g., SwiGLU) or non-gated (e.g., ReLU²)."""
         from nemo_automodel.components.moe.experts import is_gated_activation
@@ -248,7 +264,7 @@ class MoESplitExpertsStateDictMixin:
 
     def _concatenate_expert_weights(
         self, expert_weights_by_layer: dict[str, Any], n_experts: int
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Concatenate the weights of separate experts into GroupedExpert weights.
 
         Args:
@@ -820,12 +836,16 @@ class MoESplitExpertsStateDictMixin:
         # rebuild path: never mark these keys in-place-loaded when ``quantization`` is set.
         quantization = kwargs.get("quantization", False)
 
-        # GroupedExpertsTE (backend.experts == "te") exposes gate_and_up_projs/down_projs as a
-        # torch.stack COPY of TE's per-expert weight{i} params; it does not alias the model's
-        # grouped storage, so an in-place copy_ would write that throwaway buffer and leave the TE
-        # experts at their initial values. Force the rebuild path for it. Other expert backends
-        # keep a real aliasing stacked Parameter and are unaffected.
-        experts_alias_grouped_storage = getattr(getattr(self, "backend", None), "experts", None) != "te"
+        # GroupedExpertsTE (backend.experts == "te") exposes both virtual grouped tensors as
+        # torch.stack copies, so neither can be loaded through in-place views. GroupedExpertsMoK
+        # keeps separate contiguous gate/up parameters and exposes gate_and_up_projs through a
+        # torch.cat copy; its down_projs is still an aliasing transpose view. Treat the two native
+        # keys independently so MoK rebuilds gate/up during from_hf without giving up the
+        # zero-copy down-projection load.
+        backend = getattr(self, "backend", None)
+        grouped_storage_aliases = getattr(backend, "experts", None) != "te"
+        gate_up_storage_aliases = grouped_storage_aliases and getattr(backend, "dispatcher", None) != "mok"
+        down_storage_aliases = grouped_storage_aliases
 
         from nemo_automodel.components.moe.state_dict_utils import (
             is_dtensor,
@@ -845,7 +865,7 @@ class MoESplitExpertsStateDictMixin:
                 and len(splits) > 0
                 and not is_dtensor(splits[0])
                 and not quantization
-                and experts_alias_grouped_storage
+                and gate_up_storage_aliases
             )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
@@ -893,7 +913,7 @@ class MoESplitExpertsStateDictMixin:
                 and len(splits) > 0
                 and not is_dtensor(splits[0])
                 and not quantization
-                and experts_alias_grouped_storage
+                and down_storage_aliases
             )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)

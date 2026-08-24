@@ -22,6 +22,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
+    _all_reduce_scalar,
     clip_grad_norm,
     count_tail_padding,
     get_expert_tp_replication_factor,
@@ -101,7 +102,9 @@ def test_clip_grad_norm_with_pp_and_tp():
 
     device_mesh = Mock()
     device_mesh.mesh_dim_names = ["pp", "tp"]
-    device_mesh.__getitem__ = Mock(side_effect=lambda key: Mock(size=Mock(return_value=2)))
+    # device_type must be a real string: a DeviceMesh always exposes one, and the norm
+    # reduction compares it against the accumulator's device to pick the comm device.
+    device_mesh.__getitem__ = Mock(side_effect=lambda key: Mock(size=Mock(return_value=2), device_type="cpu"))
 
     grad_norm = clip_grad_norm(
         max_grad_norm=1.0,
@@ -125,7 +128,30 @@ def test_clip_grad_norm_works_without_pp():
         pp_enabled=False,
     )
 
+    assert isinstance(grad_norm, torch.Tensor)
     assert grad_norm > 0
+
+
+@pytest.mark.parametrize(
+    ("gradient", "expected"),
+    [
+        (0.0, 0.0),
+        (float("inf"), float("inf")),
+        (float("nan"), float("nan")),
+    ],
+)
+def test_clip_grad_norm_preserves_zero_and_nonfinite_results(gradient: float, expected: float):
+    """Branch-free scaling preserves the prior zero and non-finite norm behavior."""
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.full_like(model.weight, gradient)
+
+    grad_norm = clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
+
+    assert isinstance(grad_norm, torch.Tensor)
+    if math.isnan(expected):
+        assert torch.isnan(grad_norm)
+    else:
+        torch.testing.assert_close(grad_norm, torch.tensor(expected, dtype=grad_norm.dtype))
 
 
 def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
@@ -296,6 +322,69 @@ def test_clip_grad_norm_handles_empty_local_dtensor_shards(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+class _FakeMesh:
+    """Minimal DeviceMesh stand-in; ``_all_reduce_scalar`` needs only these two members."""
+
+    def __init__(self, device_type: str):
+        self.device_type = device_type
+
+    def get_group(self, mesh_dim=None):
+        return f"pg:{mesh_dim}"
+
+
+def test_all_reduce_scalar_reduces_in_place_when_devices_match(monkeypatch):
+    """Without CPU offload the scalar already sits on the mesh device: reduce in place.
+
+    This is the guard that the fix is inert for every non-offload recipe -- the same
+    tensor object goes into the same in-place all_reduce and comes back out.
+    """
+    seen = {}
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        seen["tensor"] = tensor
+        seen["group"] = group
+        tensor.add_(1.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    mesh = _FakeMesh("cpu")
+    scalar = torch.zeros((), dtype=torch.float64)
+    out = _all_reduce_scalar(scalar, torch.distributed.ReduceOp.MAX, mesh, 0)
+
+    assert out is scalar
+    assert seen["tensor"] is scalar
+    assert seen["group"] == "pg:0"
+    assert out.item() == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_all_reduce_scalar_moves_offloaded_scalar_to_mesh_device(monkeypatch):
+    """CPU-offloaded gradients must not be all-reduced on the NCCL group as CPU tensors.
+
+    Regression test for the CPUOffloadPolicy crash: FSDP2 leaves the local gradient
+    shard -- and therefore the norm accumulator derived from it -- on CPU, while the
+    mesh's process group is NCCL and has no CPU backend.
+    """
+    seen = {}
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        seen["device"] = tensor.device
+        tensor.add_(1.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    mesh = _FakeMesh("cuda")
+    scalar = torch.zeros((), dtype=torch.float64)  # on CPU, as under CPUOffloadPolicy
+    out = _all_reduce_scalar(scalar, torch.distributed.ReduceOp.SUM, mesh, 1)
+
+    # Pre-fix this was "cpu", which NCCL rejects with
+    # "No backend type associated with device type cpu".
+    assert seen["device"].type == "cuda"
+    # The result returns to the gradients' device so the clip math stays consistent.
+    assert out.device.type == "cpu"
+    assert out.item() == 1.0
 
 
 def test_clip_grad_norm_with_inf_norm():

@@ -26,6 +26,19 @@ class StateDictAdapter(ABC):
     state dict format and other model state dict formats.
     """
 
+    _supports_write_through_checkpoint_load: bool = False
+
+    @property
+    def supports_write_through_checkpoint_load(self) -> bool:
+        """Whether all checkpoint-load destinations write through to final model storage.
+
+        Adapters should set ``_supports_write_through_checkpoint_load`` only when every tensor produced by
+        ``to_hf`` for base-checkpoint loading is either the original model tensor or a view that writes through
+        to it. The checkpoint loader uses this guarantee to avoid materializing a converted full state dict on
+        the host.
+        """
+        return self._supports_write_through_checkpoint_load
+
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
@@ -84,3 +97,20 @@ class StateDictAdapter(ABC):
             Hugging Face state-dict keys in adapter iteration order.
         """
         return list(self.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=False))
+
+    def map_peft_target_module_to_hf(self, name: str) -> str:
+        """Translate a PEFT target-module name to the HuggingFace layout.
+
+        adapter_config.json's target_modules are collected from native module
+        names. Adapters whose ``to_hf`` renames modules (e.g. Kimi K3's
+        ``mlp.experts.{E}.gate_proj`` -> ``block_sparse_moe.experts.{E}.w1``)
+        should override this with the same renames so PEFT can resolve the
+        entries against the converted checkpoint.
+
+        Args:
+            name: A target-module name in native layout.
+
+        Returns:
+            The name in HuggingFace layout. Defaults to the name unchanged.
+        """
+        return name

@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -129,7 +129,7 @@ class DLLMStrategy(ABC):
         *,
         loss_buffer: list,
         num_diffusion_tokens: int,
-        num_ar_tokens: Optional[int] = None,
+        num_ar_tokens: int | None = None,
         num_batches: int,
         is_train: bool = True,
     ) -> None:
@@ -156,9 +156,9 @@ class DLLMStrategy(ABC):
         mask_token_id: int,
         *,
         eps: float,
-        block_size: Optional[int],
-        half_life_ratio: Optional[float],
-        generator: Optional[torch.Generator] = None,
+        block_size: int | None,
+        half_life_ratio: float | None,
+        generator: torch.Generator | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return ``(noisy_input_ids, noise_mask, p_mask)``.
 
@@ -319,7 +319,7 @@ class IDLMStrategy(DLLMStrategy):
         *,
         loss_buffer: list,
         num_diffusion_tokens: int,
-        num_ar_tokens: Optional[int] = None,
+        num_ar_tokens: int | None = None,
         num_batches: int,
         is_train: bool = True,
     ) -> None:
@@ -591,7 +591,7 @@ class DFlashStrategy(DLLMStrategy):
         recipe,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        loss_mask: Optional[torch.Tensor] = None,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         B = input_ids.size(0)
         device = input_ids.device
@@ -623,7 +623,7 @@ class DFlashStrategy(DLLMStrategy):
         input_ids: torch.Tensor,
         attn: torch.Tensor,
         num_blocks: int,
-        loss_mask: Optional[torch.Tensor] = None,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample ``num_blocks`` anchors **per sample** and gather block tensors.
 
@@ -748,7 +748,7 @@ class DFlashStrategy(DLLMStrategy):
         *,
         loss_buffer: list,
         num_diffusion_tokens: int,
-        num_ar_tokens: Optional[int] = None,
+        num_ar_tokens: int | None = None,
         num_batches: int,
         is_train: bool = True,
     ) -> None:
