@@ -291,32 +291,6 @@ def test_schedule_methods_split_mrope_position_ids_on_batch_axis(method_name):
     assert schedule._kwargs_chunk_spec is original_chunk_spec
 
 
-def test_training_reenables_cached_receive_buffer_gradients_after_eval():
-    pipeline = AutoPipeline(
-        world_mesh=FakeDeviceMesh(),
-        pp_axis_name="pp",
-        pp_schedule="1f1b",
-        pp_microbatch_size=1,
-        pp_batch_size=2,
-        device=torch.device("cpu"),
-    )
-    schedule = _ChunkingSchedule()
-    activation = types.SimpleNamespace(buffer=torch.zeros(1, 8))
-    token_ids = types.SimpleNamespace(buffer=torch.zeros(1, 8, dtype=torch.long))
-    pipeline._info.schedule = schedule
-    pipeline._info.model_parts = [_MropeChunkingPart()]
-    pipeline._info.has_first_stage = False
-    pipeline._info.stages = [types.SimpleNamespace(args_recv_info={0: (activation, token_ids)})]
-
-    pipeline.eval(torch.zeros(2, 8))
-    assert not activation.buffer.requires_grad
-
-    pipeline.step(torch.zeros(2, 8))
-
-    assert activation.buffer.requires_grad
-    assert not token_ids.buffer.requires_grad
-
-
 # -----------------------------
 # Core build/materialize tests
 # -----------------------------

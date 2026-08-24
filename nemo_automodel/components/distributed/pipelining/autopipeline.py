@@ -37,31 +37,6 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 logger = logging.getLogger(__name__)
 
 
-def _enable_input_gradients_for_pipeline_backward(stages: list[PipelineStage]) -> None:
-    """Re-enable cached floating-point receive buffers before training.
-
-    ``schedule.eval()`` creates cached non-first-stage receive buffers under
-    ``no_grad``.  A later ``schedule.step()`` reuses those buffers, so they must
-    require gradients again before backward.
-    """
-
-    def enable(value: object) -> None:
-        buffer = getattr(value, "buffer", None)
-        if isinstance(buffer, torch.Tensor):
-            if buffer.is_floating_point() or buffer.is_complex():
-                buffer.requires_grad_(True)
-            return
-        if isinstance(value, dict):
-            for item in value.values():
-                enable(item)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                enable(item)
-
-    for stage in stages:
-        enable(getattr(stage, "args_recv_info", {}))
-
-
 @dataclass
 class PipelineInfo:
     """Runtime state produced by pipeline-parallel setup."""
@@ -344,8 +319,6 @@ class AutoPipeline:
         **kwargs: object,
     ) -> object:
         """Run a training schedule step with model-owned input chunking."""
-        if self._info.stages is not None:
-            _enable_input_gradients_for_pipeline_backward(self._info.stages)
         return self._run_schedule("step", model_input, target=target, losses=losses, kwargs=kwargs)
 
     def eval(
