@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -82,7 +83,9 @@ class StateDictAdapter(ABC):
 
         Returns:
             List of (fqn, tensor) tuples in HuggingFace format.
-            Returns a list because some native tensors may split into multiple HF tensors.
+            The general adapter interface returns a list because transforming adapters may split one native tensor
+            into multiple Hugging Face tensors. Passthrough adapters return exactly one entry unless the key is
+            excluded.
         """
         pass
 
@@ -102,3 +105,52 @@ class StateDictAdapter(ABC):
             for key, value in state_dict.items()
         }
         return list(self.to_hf(shape_only_state, exclude_key_regex=r".*_extra_state.*", quantization=False))
+
+
+class PassthroughStateDictAdapter(StateDictAdapter):
+    """Adapter for models whose native tensors already have the exact Hugging Face representation.
+
+    Every tensor keeps the same key, value, shape, axis order, dtype, device, strides, and storage. Conversion only
+    creates a new Python mapping and may exclude selected keys; it never transforms or copies tensor data.
+    """
+
+    _supports_low_memory_dcp_load = True
+
+    def to_hf(
+        self,
+        state_dict: dict[str, Any],
+        exclude_key_regex: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Expose model tensors without changing their keys or tensor representation.
+
+        Args:
+            state_dict: Model state containing tensors of arbitrary shape and axis order. Tensor values retain their
+                exact value, shape, axis order, dtype, device, strides, and storage.
+            exclude_key_regex: Optional regular expression selecting keys to omit.
+            **kwargs: Compatibility options that do not alter passthrough tensors.
+
+        Returns:
+            A new mapping whose tensor values are the original tensor objects and therefore alias the input storage.
+        """
+        if exclude_key_regex is None:
+            return dict(state_dict)
+        return {key: value for key, value in state_dict.items() if not re.search(exclude_key_regex, key)}
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
+        """Expose exactly one unchanged tensor unless its key is excluded.
+
+        Args:
+            fqn: Fully qualified model tensor name.
+            tensor: Model tensor of arbitrary shape and axis order. The returned tensor is the same object, preserving
+                its value, shape, axis order, dtype, device, strides, and storage.
+            **kwargs: Adapter options, including an optional exclusion regex.
+
+        Returns:
+            One unchanged key/tensor pair, or an empty list when excluded. This passthrough implementation never
+            splits one tensor into multiple outputs.
+        """
+        exclude_key_regex = kwargs.get("exclude_key_regex")
+        if isinstance(exclude_key_regex, str) and re.search(exclude_key_regex, fqn):
+            return []
+        return [(fqn, tensor)]

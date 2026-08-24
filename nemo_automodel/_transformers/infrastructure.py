@@ -549,13 +549,6 @@ def apply_model_infrastructure(
         process_group=getattr(mesh, "process_group", None),
     )
 
-    # Handle checkpointer config updates if checkpointer is provided
-    if checkpointer is not None:
-        if checkpointer.config.dequantize_base_checkpoint is None:
-            checkpointer.config.dequantize_base_checkpoint = hasattr(
-                getattr(model, "config", None), "quantization_config"
-            )
-
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
     # This allows copy operations between meta tensors to succeed (they're no-ops)

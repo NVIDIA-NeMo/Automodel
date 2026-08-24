@@ -36,6 +36,7 @@ from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import Kimi
 from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinear48BStateDictAdapter
 from nemo_automodel.components.models.laguna.state_dict_adapter import LagunaStateDictAdapter
 from nemo_automodel.components.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
+from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.components.models.llava_onevision.state_dict_adapter import LlavaOneVisionStateDictAdapter
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import MiMoV2FlashStateDictAdapter
 from nemo_automodel.components.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
@@ -44,6 +45,8 @@ from nemo_automodel.components.models.muse_glimmer.state_dict_adapter import Mus
 from nemo_automodel.components.models.nemotron_omni.state_dict_adapter import NemotronOmniStateDictAdapter
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.models.qwen2_5_omni.state_dict_adapter import Qwen2_5OmniStateDictAdapter
+from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
+from nemo_automodel.components.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from nemo_automodel.components.models.qwen3_5.state_dict_adapter import Qwen3_5DenseStateDictAdapter
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
@@ -117,9 +120,12 @@ def _assert_destinations_write_through(
         pytest.param(BagelStateDictAdapter, {}, id="bagel"),
         pytest.param(Ernie4_5StateDictAdapter, {}, id="ernie4_5_dense"),
         pytest.param(Gemma4UnifiedStateDictAdapter, {}, id="gemma4_unified"),
+        pytest.param(LlamaStateDictAdapter, {}, id="llama"),
         pytest.param(LlavaOneVisionStateDictAdapter, {}, id="llava_onevision"),
         pytest.param(MuseGlimmerStateDictAdapter, {"uses_canonical_layout": True}, id="muse_glimmer"),
         pytest.param(Qwen2_5OmniStateDictAdapter, {"_uses_thinker_prefix": True}, id="qwen2_5_omni"),
+        pytest.param(Qwen2StateDictAdapter, {}, id="qwen2"),
+        pytest.param(Qwen3StateDictAdapter, {}, id="qwen3"),
         pytest.param(Qwen3_5DenseStateDictAdapter, {}, id="qwen3_5_dense"),
         pytest.param(Qwen3VLMoeStateDictAdapter, {}, id="qwen3_vl_moe"),
     ],
@@ -140,6 +146,18 @@ def test_write_through_adapters_expose_aliasing_destinations(
             "model.language_model.layers.0.mlp.experts.gate_and_up_projs": torch.zeros(2, 2, 4),
         },
     )
+
+
+@pytest.mark.parametrize("adapter_type", [LlamaStateDictAdapter, Qwen2StateDictAdapter, Qwen3StateDictAdapter])
+def test_passthrough_adapters_share_single_tensor_conversion(adapter_type: type[StateDictAdapter]) -> None:
+    adapter = object.__new__(adapter_type)
+    tensor = torch.zeros(2, 3)
+
+    converted = adapter.convert_single_tensor_to_hf("model.weight", tensor)
+    assert len(converted) == 1
+    assert converted[0][0] == "model.weight"
+    assert converted[0][1] is tensor
+    assert adapter.convert_single_tensor_to_hf("model.weight", tensor, exclude_key_regex=r"model\.weight") == []
 
 
 @pytest.mark.parametrize(
