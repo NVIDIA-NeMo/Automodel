@@ -26,8 +26,6 @@ from nemo_automodel.components.loss.loss import (
 from nemo_automodel.components.loss.vocab_parallel import (
     token_entropy,
     token_log_probs,
-    vocab_parallel_entropy,
-    vocab_parallel_log_probs,
 )
 
 __all__ = [

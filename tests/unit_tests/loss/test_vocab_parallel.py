@@ -21,20 +21,10 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from nemo_automodel.components import loss as loss_package
 from nemo_automodel.components.loss import (
     token_entropy,
     token_log_probs,
-    vocab_parallel_entropy,
-    vocab_parallel_log_probs,
 )
-
-
-def test_previous_names_remain_importable_without_being_advertised() -> None:
-    assert vocab_parallel_log_probs is token_log_probs
-    assert vocab_parallel_entropy is token_entropy
-    assert "vocab_parallel_log_probs" not in loss_package.__all__
-    assert "vocab_parallel_entropy" not in loss_package.__all__
 
 
 def _run_vocab_parallel_parity(rank: int, world_size: int, init_file: str) -> None:
