@@ -341,6 +341,14 @@ def _install_torch_and_layers_stubs(monkeypatch):
     experts_stub.GroupedExpertsTE = GroupedExpertsTE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.experts", experts_stub)
 
+    mok_experts_stub = types.ModuleType("nemo_automodel.components.moe.mok_experts")
+
+    class GroupedExpertsMoK:
+        pass
+
+    mok_experts_stub.GroupedExpertsMoK = GroupedExpertsMoK
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.mok_experts", mok_experts_stub)
+
 
 def _import_parallelizer_with_stubs(monkeypatch):
     import importlib
@@ -350,6 +358,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.moe.parallelizer",
         "nemo_automodel.components.moe.layers",
         "nemo_automodel.components.moe.experts",
+        "nemo_automodel.components.moe.mok_experts",
         "nemo_automodel.components.distributed.pipelining",
         "nemo_automodel.components.distributed.pipelining.config",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
@@ -2642,6 +2651,53 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
     # (preserving the selective policy) rather than collapsing to inner compile.
     for w in wrapped:
         assert getattr(w, sentinel_flag, False) is True
+
+
+@pytest.mark.parametrize("selective", [False, True])
+def test_apply_ac_repeated_mtp_checkpoints_dense_blocks_and_skips_moe(monkeypatch, selective):
+    """Weight-tied MTP AC skips only blocks with the unsafe shared experts group."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    if selective:
+        sentinel_flag = "_nemo_selective_ac"
+        dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+        dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=object())
+        dense_stub.SELECTIVE_AC_WRAPPER_FLAG = sentinel_flag
+        dense_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: context_fn
+        monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
+
+    wrapped = []
+
+    class _Wrapper:
+        def __init__(self, block):
+            self.block = block
+
+    def fake_wrapper(block, **_kwargs):
+        wrapper = _Wrapper(block)
+        wrapped.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    backbone = DummyBlock(mlp=object())
+    mtp_attention = DummyBlock(mlp=object())
+    mtp_moe = DummyBlock(mlp=DummyMoE())
+    model = types.SimpleNamespace(
+        model=DummyModel([backbone]),
+        mtp=types.SimpleNamespace(
+            layers=LayerContainer([mtp_attention, mtp_moe]),
+            mtp_config=types.SimpleNamespace(use_repeated_layer=True),
+        ),
+    )
+
+    P.apply_ac(model, selective=selective, hidden_size=8, num_experts=4)
+
+    assert [wrapper.block for wrapper in wrapped] == [backbone, mtp_attention]
+    assert set(model.model.layers.registered) == {"0"}
+    assert set(model.mtp.layers.registered) == {"0"}
+    if selective:
+        assert all(getattr(wrapper, sentinel_flag, False) for wrapper in wrapped)
 
 
 # ============================================================================
