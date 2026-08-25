@@ -48,6 +48,74 @@ class _PackedCPModel:
         self.supports_cp_with_sequence_packing = supported
 
 
+def _identity_cp_shard(sharder, batch):
+    """Bypass CP transport while preserving constructor-side strategy resolution.
+
+    Args:
+        sharder: Sharder whose resolved strategy is not exercised by this test.
+        batch: Mutable model-input mapping whose tensor values retain their
+            existing shapes.
+
+    Returns:
+        The null context factory and the same input mapping.
+    """
+    del sharder
+    return nullcontext, batch
+
+
+def _make_recipe_with_pp_stages(*, pp_enabled=True, has_first_stage=True, pp_microbatch_size=2):
+    first_stage = SimpleNamespace(is_first=True, inputs_meta=("old-first",))
+    later_stage = SimpleNamespace(is_first=False, inputs_meta=("old-later",))
+    recipe = SimpleNamespace(
+        pp_enabled=pp_enabled,
+        pp=SimpleNamespace(
+            pp_microbatch_size=pp_microbatch_size,
+            info=SimpleNamespace(has_first_stage=has_first_stage, stages=[first_stage, later_stage]),
+        ),
+    )
+    return recipe, first_stage, later_stage
+
+
+def test_maybe_set_pp_first_stage_embed_input_meta_sets_first_stage_meta():
+    recipe, first_stage, later_stage = _make_recipe_with_pp_stages(pp_microbatch_size=3)
+    model_input = torch.empty(5, 11, 13, dtype=torch.bfloat16)
+
+    FinetuneRecipeForVLM._maybe_set_pp_first_stage_embed_input_meta(recipe, model_input)
+
+    assert later_stage.inputs_meta == ("old-later",)
+    assert len(first_stage.inputs_meta) == 1
+    meta = first_stage.inputs_meta[0]
+    assert tuple(meta.shape) == (3, 11, 13)
+    assert meta.dtype == torch.bfloat16
+    assert meta.device.type == "meta"
+
+
+@pytest.mark.parametrize(
+    ("recipe_kwargs", "model_input"),
+    [
+        ({"pp_enabled": False}, torch.empty(5, 11, 13)),
+        ({"has_first_stage": False}, torch.empty(5, 11, 13)),
+        ({}, torch.empty(5, 11, 13, dtype=torch.int64)),
+        ({}, torch.empty(5, 11)),
+    ],
+)
+def test_maybe_set_pp_first_stage_embed_input_meta_guard_conditions(recipe_kwargs, model_input):
+    recipe, first_stage, later_stage = _make_recipe_with_pp_stages(**recipe_kwargs)
+
+    FinetuneRecipeForVLM._maybe_set_pp_first_stage_embed_input_meta(recipe, model_input)
+
+    assert first_stage.inputs_meta == ("old-first",)
+    assert later_stage.inputs_meta == ("old-later",)
+
+
+class _FakeCPMesh:
+    mesh_dim_names = ("cp",)
+
+    def __getitem__(self, key):
+        assert key == "cp"
+        return SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group")
+
+
 def test_cp_vision_frame_sharding_rejects_model_without_capability():
     policy = CpVisionFrameShardingConfig(enabled=True)
 
@@ -128,6 +196,130 @@ def test_cp_vision_frame_sharding_context_resets_published_group_after_failure(m
     assert events[0] == ("set", group, policy)
     assert events[1] == ("forward",)
     assert events[2] == ("reset", token)
+
+
+class _ScheduleSpy:
+    def __init__(self):
+        self.calls = []
+
+    def step(self, model_input=None, *, target=None, losses=None, **batch):
+        self.calls.append({"model_input": model_input, "target": target, "batch": batch})
+        if losses is not None:
+            losses.append(torch.tensor(1.25))
+
+
+class _PPSpy(SimpleNamespace):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.step_batches = []
+
+    def step(self, model_input, *, target=None, losses=None, **kwargs):
+        """Record and forward an AutoPipeline step.
+
+        Args:
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input.
+            target: Optional tensor of shape [batch, sequence] containing loss
+                targets.
+            losses: Optional mutable list populated with scalar loss tensors.
+            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+
+        Returns:
+            The value returned by the schedule spy.
+        """
+        self.step_batches.append(dict(kwargs))
+        schedule_args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+
+
+class _SunkSpyVLM:
+    """Sunk VLM: sharder-only CP hook (embeds/shards in forward, consumes nothing)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
+        # Sharder-only: nothing consumed, no inputs_embeds — input_ids stays full.
+        self.calls.append({"batch": dict(batch), "num_chunks": num_chunks})
+        return {}
+
+    def __call__(self, **kwargs):
+        raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
+
+
+def _run_nonfirst_stage_fbstep(monkeypatch, model):
+    """Drive _forward_backward_step for a non-first (has_first_stage=False) PP+CP stage."""
+    labels = torch.arange(12, dtype=torch.long).reshape(2, 6)
+    schedule = _ScheduleSpy()
+    seq_lens = []
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.device_mesh = _FakeCPMesh()
+    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.model_parts = [model]
+    recipe.pp_enabled = True
+    recipe.pp = _PPSpy(
+        pp_microbatch_size=2,
+        info=SimpleNamespace(
+            has_first_stage=False,
+            has_last_stage=True,
+            stages=[SimpleNamespace(is_first=False, inputs_meta=None)],
+            schedule=schedule,
+        ),
+        update_seq_len=seq_lens.append,
+    )
+    batch = {
+        "input_ids": torch.ones(2, 6, dtype=torch.long),
+        "pixel_values": torch.zeros(2, 3, 4, 4),
+        "labels": labels,
+    }
+    seen_cp_batch = {}
+
+    def _shard(sharder, cp_batch):
+        """Capture the global model-input mapping before CP transport.
+
+        Args:
+            sharder: Sharder configured by the VLM recipe.
+            cp_batch: Mutable model-input mapping whose tensor values have
+                global batch and sequence extents.
+
+        Returns:
+            The null context factory and the same input mapping.
+        """
+        del sharder
+        seen_cp_batch.update(cp_batch)
+        return nullcontext, cp_batch
+
+    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _shard)
+    monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
+
+    FinetuneRecipeForVLM._forward_backward_step(
+        recipe, 0, batch, loss_buffer=[], num_label_tokens=labels.numel(), num_batches=1
+    )
+    return seen_cp_batch, seq_lens, recipe.pp.step_batches, schedule.calls
+
+
+def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(monkeypatch):
+    """Regression: a sunk model must invoke its sharder-only hook on NON-first PP
+    stages under cp>1, so input_ids stays full-length and update_seq_len (which
+    drives the CP-aware stage metas) sees the FULL seq_len — not the local length
+    the generic sharder would produce, which would ÷cp a second time and truncate
+    the inter-stage hidden (the text-decoder RoPE size mismatch)."""
+    model = _SunkSpyVLM()
+    seen_cp_batch, seq_lens, step_batches, schedule_calls = _run_nonfirst_stage_fbstep(monkeypatch, model)
+
+    # Hook invoked on the non-first stage (this is the fix).
+    assert len(model.calls) == 1
+    # Sharder-only hook consumes nothing: input_ids stays full-length (seq=6).
+    assert "input_ids" in seen_cp_batch
+    assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
+    # All pp ranks feed the FULL seq_len to update_seq_len.
+    assert seq_lens == [6]
+    assert step_batches == [{}]
+    assert schedule_calls[0]["model_input"] is None
 
 
 class _FakePPModel:
@@ -421,3 +613,55 @@ def test_train_loop_skips_validation_when_pipeline_is_enabled():
     recipe._run_validation_epoch.assert_not_called()
     recipe.log_val_metrics.assert_not_called()
     assert model_part.train.call_count == 2
+
+
+def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
+    """``total_loss`` is all-reduced with include_cp=True, but ``total_tokens``
+    (measured pre-CP-shard) must NOT include CP — otherwise val_loss is scaled
+    down by cp_size. Guards the fix at finetune.py:_run_validation_epoch."""
+    # No-op replacements for the heavy collaborators.
+    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
+    monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
+    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
+
+    class _Model(torch.nn.Module):
+        def eval(self):  # noqa: D401
+            return self
+
+        def forward(self, **batch):
+            return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
+
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.model_parts = [_Model()]
+    recipe.loss_fn = object()  # not a FusedLinearCrossEntropy
+    recipe.device_mesh = None  # CP inactive -> skip pre-embed branch
+    recipe.pp_enabled = False
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
+    recipe._maybe_add_drafter_loss = lambda *, out, base_loss, labels, model, num_label_tokens: base_loss
+
+    allreduce_calls = []
+
+    def _fake_allreduce(tensor, include_cp=False):
+        allreduce_calls.append((tensor.tolist(), include_cp))
+        return tensor
+
+    recipe._dp_allreduce = _fake_allreduce
+
+    # One batch, 3 supervised tokens (-100 ignored).
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, -100, 4]]),
+    }
+
+    result = recipe._run_validation_epoch([batch])
+
+    # total_loss all-reduced WITH cp; total_tokens and num_label_tokens WITHOUT.
+    loss_call = allreduce_calls[0]
+    tokens_call = allreduce_calls[1]
+    assert loss_call[1] is True, "total_loss must include CP ranks"
+    assert tokens_call[1] is False, "total_tokens must NOT be summed over CP ranks"
+    # val_loss = (2.0 * 3 tokens) / 3 tokens == 2.0
+    assert result.metrics["val_loss"] == pytest.approx(2.0)
