@@ -209,7 +209,7 @@ For a measured exception that exceeds even its selected comparison profile:
 parity_tolerance_profile: relaxed
 parity_threshold_overrides:
   automodel_reload:
-    mean_kl: 4e-2
+    mean_kl: 0.04
     cosine_similarity: 0.99
 ```
 

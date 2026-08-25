@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import yaml as pyyaml
 from ruamel.yaml import YAML
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "tests" / "ci_tests" / "scripts"
@@ -350,7 +351,8 @@ def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
         env=env,
     )
 
-    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    # The checkpoint harness consumes the resolver output with PyYAML, whose YAML 1.1 scalar rules differ from ruamel.
+    robustness = pyyaml.safe_load(out.read_text())["ci"]["checkpoint_robustness"]
     assert "check_source_load_parity" not in robustness
     assert "skip_source_load_parity" not in robustness
     if recipe_path.stem == "step3p7_medpix_200b_lora_pp8ep8_8node":
