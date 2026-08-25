@@ -397,7 +397,7 @@ class TestDFlashDraftAccuracy:
 
         logits = torch.nn.functional.linear(hidden, weight, bias)
         ref = loss_fn(logits, target_ids, block_mask, num_tokens=B * T, block_size=bs)
-        fused = loss_fn.forward_fused(
+        fused, fused_correct = loss_fn.forward_fused_with_correct(
             hidden,
             weight,
             target_ids,
@@ -410,10 +410,11 @@ class TestDFlashDraftAccuracy:
         assert torch.allclose(ref.total_loss, fused.total_loss, atol=1e-4)
         assert torch.equal(ref.draft_correct_per_pos, fused.draft_correct_per_pos)
         assert torch.equal(ref.draft_count_per_pos, fused.draft_count_per_pos)
-        assert torch.equal(ref.draft_correct, fused.draft_correct)
+        assert torch.equal(fused_correct, logits.argmax(dim=-1) == target_ids)
+        assert len(loss_fn.forward_fused(hidden, weight, target_ids, block_mask, block_size=bs)) == 4
 
-    def test_fused_module_projection_matches_nonfused(self):
-        """Module projection preserves forward hooks and gathers chunk results."""
+    def test_fused_detailed_projection_matches_nonfused(self):
+        """Detailed fused projection returns correctness without expanding the shared output."""
         torch.manual_seed(4)
         B, N, bs, D, V = 2, 2, 4, 16, 32
         T = N * (bs - 1)
@@ -424,18 +425,18 @@ class TestDFlashDraftAccuracy:
         loss_fn = DFlashDecayLoss(loss_gamma=4.0, use_fused_linear_ce=True, chunk_size=3)
 
         ref = loss_fn(lm_head(hidden), target_ids, block_mask, num_tokens=B * T, block_size=bs)
-        fused = loss_fn.forward_fused(
+        fused, fused_correct = loss_fn.forward_fused_with_correct(
             hidden,
-            None,
+            lm_head.weight,
             target_ids,
             block_mask,
             num_tokens=B * T,
             block_size=bs,
-            lm_head=lm_head,
+            lm_head_bias=lm_head.bias,
         )
 
         torch.testing.assert_close(fused.total_loss, ref.total_loss, atol=1e-5, rtol=1e-5)
-        assert torch.equal(fused.draft_correct, ref.draft_correct)
+        assert torch.equal(fused_correct, lm_head(hidden).argmax(dim=-1) == target_ids)
 
     def test_paper_default_first_offset_weight_is_one(self):
         """The first predicted position of every block must have decay weight 1.0
@@ -452,12 +453,12 @@ class TestDFlashDraftAccuracy:
             # First weight of every block must be 1.0; weights must decay within a block.
             for b in range(n_blocks):
                 start = b * T_per
-                assert torch.isclose(w[start], torch.tensor(1.0)), (
-                    f"block_size={block_size}, block {b}: first weight {w[start].item()} != 1.0"
-                )
-                assert w[start] > w[start + T_per - 1], (
-                    f"block_size={block_size}, block {b}: weights do not decay within block"
-                )
+                assert torch.isclose(
+                    w[start], torch.tensor(1.0)
+                ), f"block_size={block_size}, block {b}: first weight {w[start].item()} != 1.0"
+                assert (
+                    w[start] > w[start + T_per - 1]
+                ), f"block_size={block_size}, block {b}: weights do not decay within block"
 
     def test_recipe_per_pos_metrics_dict_construction(self):
         """Lock the recipe-side contract: given the loss's per-rank
