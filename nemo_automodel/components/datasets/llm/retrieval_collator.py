@@ -539,6 +539,27 @@ class ContextAwareRerankerCollator(CrossEncoderCollator):
         self.passage_max_length = passage_max_length
         raw = instructions if instructions is not None else self.DEFAULT_INSTRUCTIONS
         self.instructions = self._normalize_instructions(raw)
+        # Validate up front rather than at collation time. _format_one selects the
+        # instruction by which context fields SURVIVE the drop, so a misspelled key silently
+        # yields no entry for a real mode; falling back would train a context-bearing prompt
+        # under the no-context instruction, which is invisible in the loss and only shows up
+        # as a model that ignores its context at eval. Both directions are errors: an
+        # unrecognised key is a typo, and a missing one leaves a reachable mode unspecified.
+        supported = set(self.DEFAULT_INSTRUCTIONS)
+        unknown = set(self.instructions) - supported
+        if unknown:
+            raise ValueError(
+                "instructions contains unsupported context modes: "
+                f"{sorted(sorted(k) for k in unknown)}; supported modes are "
+                f"{sorted(sorted(k) for k in supported)}"
+            )
+        missing = supported - set(self.instructions)
+        if missing:
+            raise ValueError(
+                "instructions is missing an entry for context modes: "
+                f"{sorted(sorted(k) for k in missing)}; every mode reachable under the drop "
+                "probabilities needs its own instruction"
+            )
         self.reasoning_drop_prob = reasoning_drop_prob
         self.global_query_drop_prob = global_query_drop_prob
         self.drop_seed = drop_seed
@@ -627,7 +648,7 @@ class ContextAwareRerankerCollator(CrossEncoderCollator):
         # Choosing it beforehand made a dropped row keep the richer instruction while its
         # prompt no longer carried that context.
         present = frozenset(f for f, flag in (("reasoning", has_r), ("global_query", has_gq)) if flag)
-        instruction = self.instructions.get(present, self.DEFAULT_INSTRUCTIONS[frozenset()])
+        instruction = self.instructions[present]
 
         # Build the <Query> block. The user-generated query is tagged #Query in every mode
         # that has a marker, matching DEFAULT_SYSTEM's "based on the Query"; the wider

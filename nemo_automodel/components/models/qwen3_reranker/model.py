@@ -103,6 +103,19 @@ class Qwen3RerankerConfig(Qwen3Config):
         rope_params = output.pop("rope_parameters", None)
         if rope_params and isinstance(rope_params, dict):
             output.setdefault("rope_theta", rope_params.get("rope_theta", 1_000_000))
+            # Carry the scaling across rather than dropping it with the dict it lived in.
+            # rope_parameters nests the scaling config; popping the dict and then defaulting
+            # rope_scaling to None silently discards a non-default RoPE scale, so the saved
+            # checkpoint reloads in HF or vLLM with different position encoding than it was
+            # trained with. Everything except rope_theta and the type discriminator is the
+            # scaling payload.
+            scaling = {k: v for k, v in rope_params.items()
+                       if k not in ("rope_theta", "rope_type", "type")}
+            rope_type = rope_params.get("rope_type") or rope_params.get("type")
+            if scaling:
+                if rope_type:
+                    scaling["rope_type"] = rope_type
+                output.setdefault("rope_scaling", scaling)
         output.setdefault("rope_scaling", None)
         # vLLM manages its own KV cache; ensure use_cache is True.
         output["use_cache"] = True
@@ -198,11 +211,19 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         kwargs.pop("logits_to_keep", None)
         kwargs.pop("num_logits_to_keep", None)
 
+        # return_dict=True is required, not cosmetic: last_hidden_state is only reachable on a
+        # ModelOutput, and this call does not forward the wrapper's return_dict. With
+        # config.use_return_dict False the decoder hands back a plain tuple and the attribute
+        # access below raises. Pin it here so the wrapper's own return_dict setting -- which
+        # controls the shape WE return -- cannot change how we read the decoder. Popped from
+        # kwargs first so an explicit caller value cannot override it.
+        kwargs.pop("return_dict", None)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            return_dict=True,
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
