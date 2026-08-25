@@ -52,7 +52,6 @@ from nemo_automodel.shared.multimodal_fsdp import (
     normalize_frozen_multimodal_sharding,
     shard_multimodal_module,
 )
-from nemo_automodel.shared.owner_sharding import get_model_owned_dtensor_spec
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
@@ -718,7 +717,9 @@ def apply_fsdp(
     # parameter set while preserving the normal nn.Module path.
     outer_parameters = model.parameters() if hasattr(model, "parameters") else ()
     externally_sharded_params = prepared_model_owned_dtensors | {
-        parameter for parameter in outer_parameters if get_model_owned_dtensor_spec(parameter) is not None
+        parameter
+        for parameter in outer_parameters
+        if getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
     }
     if externally_sharded_params:
         logger.info(

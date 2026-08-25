@@ -25,7 +25,6 @@ from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.shared.owner_sharding import get_model_owned_dtensor_spec
 
 
 class _EngramOnlyModel(nn.Module):
@@ -60,10 +59,7 @@ def _engram_scale_and_norm_worker(rank: int, world_size: int, store_path: str) -
         assert isinstance(model.table.weight, DTensor)
         assert tuple(model.table.weight.shape) == (6, 2)
         assert tuple(model.table.weight.placements) == (Shard(0),)
-        owner_spec = get_model_owned_dtensor_spec(model.table.weight)
-        assert owner_spec is not None
-        assert owner_spec.process_group is dist.group.WORLD
-        assert owner_spec.gradient_divisor == float(world_size)
+        assert model.table.weight._nemo_model_owned_grad_divisor == float(world_size)
         model.table.weight.grad = torch.full_like(model.table.weight, float(rank + 1))
 
         total_norm = scale_grads_and_clip_grad_norm(

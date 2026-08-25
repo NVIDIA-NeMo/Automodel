@@ -25,7 +25,6 @@ from torch.distributed.tensor import DTensor, Shard
 from nemo_automodel.components.checkpoint import stateful_wrappers
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
-from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec
 
 
 class _FakeTEFusedAdam(torch.optim.Optimizer):
@@ -73,10 +72,7 @@ class _ModelOwnedDTensorOptimizerModel(nn.Module):
             stride=(2, 1),
         )
         self.weight = nn.Parameter(weight)
-        self.weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
-            process_group=process_group,
-            gradient_divisor=float(world_size),
-        )
+        self.weight._nemo_model_owned_grad_divisor = float(world_size)
 
 
 def _make_distributed_checkpointer(rank: int, checkpoint_dir: str) -> Checkpointer:

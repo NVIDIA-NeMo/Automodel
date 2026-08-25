@@ -317,7 +317,7 @@ def test_local_engram_table_matches_torch_embedding_forward_and_backward() -> No
     ).build(process_group=None, dtype=torch.float32)
     assert table.global_row_start == table.local_row_start == 0
     assert table.global_row_end == table.local_row_end == 12
-    assert not hasattr(table.weight, "_nemo_model_owned_dtensor_spec")
+    assert not hasattr(table.weight, "_nemo_model_owned_grad_divisor")
     reference_weight = torch.arange(36, dtype=torch.float32).view(12, 3) / 10
     table.weight.detach().copy_(reference_weight)
     global_ids = torch.tensor([[0, 7, 7], [11, 1, 6]])
@@ -429,11 +429,11 @@ def _engram_meta_dtensor_lifecycle_worker(rank: int, world_size: int, store_path
         assert table.weight.to_local().device.type == "cpu"
         assert tuple(table.weight.shape) == (12, 3)
         assert tuple(table.weight.placements) == (Shard(0),)
-        assert not hasattr(table.weight, "_nemo_model_owned_dtensor_spec")
+        assert not hasattr(table.weight, "_nemo_model_owned_grad_divisor")
         table.reset_parameters()
         table.mark_sharding_contract()
         assert torch.isfinite(table.weight.to_local()).all()
-        assert hasattr(table.weight, "_nemo_model_owned_dtensor_spec")
+        assert hasattr(table.weight, "_nemo_model_owned_grad_divisor")
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

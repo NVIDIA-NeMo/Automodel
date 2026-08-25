@@ -19,8 +19,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec
-
 
 class DummyParam:
     """Mock parameter with requires_grad attribute."""
@@ -1044,10 +1042,7 @@ def test_apply_fsdp_excludes_model_owned_shard_from_block_and_root(monkeypatch):
     monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
 
     owner_weight = DummyParam()
-    owner_weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
-        process_group=None,
-        gradient_divisor=1.0,
-    )
+    owner_weight._nemo_model_owned_grad_divisor = 1.0
 
     class OwnerShardedBlock(DummyBlock):
         def parameters(self):
@@ -1089,6 +1084,7 @@ def test_apply_fsdp_prepares_and_excludes_final_model_owned_dtensor_identity(mon
     # exercises the production type guard instead of mixing the real and
     # stubbed torch modules.
     distributed_weight = P.nn.Parameter()
+    distributed_weight._nemo_model_owned_grad_divisor = 2.0
 
     class ModelOwnedDTensorBlock(DummyBlock):
         def parameters(self):
@@ -1105,11 +1101,6 @@ def test_apply_fsdp_prepares_and_excludes_final_model_owned_dtensor_identity(mon
     block = ModelOwnedDTensorBlock(mlp=DummyMoE())
     model = ModelOwnedDTensorModel([block])
     fsdp_mesh = object()
-    monkeypatch.setattr(
-        P,
-        "get_model_owned_dtensor_spec",
-        lambda parameter: object() if parameter is distributed_weight else None,
-    )
 
     P.apply_fsdp(
         model=model,

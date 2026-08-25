@@ -22,7 +22,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
-from nemo_automodel.shared.owner_sharding import get_model_owned_dtensor_spec
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -316,7 +315,11 @@ def clip_grad_norm(
     can_use_torch_clip = use_torch_clip_grad_norm and pp_mesh is None
     if can_use_torch_clip:
         for p in parameters:
-            if isinstance(p, DTensor) or isinstance(p.grad, DTensor) or get_model_owned_dtensor_spec(p) is not None:
+            if (
+                isinstance(p, DTensor)
+                or isinstance(p.grad, DTensor)
+                or getattr(p, "_nemo_model_owned_grad_divisor", None) is not None
+            ):
                 can_use_torch_clip = False
                 break
 
@@ -463,7 +466,7 @@ def scale_grads_and_clip_grad_norm(
             ep_ratio *= float(expert_tp_replication_factor)
 
     has_model_owned_sharded_params = any(
-        get_model_owned_dtensor_spec(parameter) is not None
+        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
         for model_part in model_parts
         for parameter in model_part.parameters()
     )
@@ -476,9 +479,9 @@ def scale_grads_and_clip_grad_norm(
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
-                owner_spec = get_model_owned_dtensor_spec(p)
-                if owner_spec is not None:
-                    p.grad.div_(float(owner_spec.gradient_divisor))
+                owner_divisor = getattr(p, "_nemo_model_owned_grad_divisor", None)
+                if owner_divisor is not None:
+                    p.grad.div_(float(owner_divisor))
                 if ep_ratio is not None:
                     # Scale expert gradients by the FSDP/EP ratio and by any
                     # identical TP token replicas that were gathered inside EP.
@@ -495,7 +498,7 @@ def scale_grads_and_clip_grad_norm(
                         and isinstance(p.grad, torch.Tensor)
                         and _TE_EXPERT_PARAM_PATTERN.search(name) is not None
                     )
-                    if owner_spec is None and (is_ep_sharded_dtensor or is_expert_param):
+                    if owner_divisor is None and (is_ep_sharded_dtensor or is_expert_param):
                         p.grad.div_(ep_ratio)
 
     # Clip with the existing PP/EP-aware helper
