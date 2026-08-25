@@ -57,26 +57,10 @@ def _resolve_fp8_scale_precompute(module: nn.Module) -> Callable[[nn.Module], No
 
 
 def _uses_summed_gradient_reduction(module: nn.Module) -> bool:
-    """Detect MegatronFSDP's summed-gradient reduction contract.
-
-    MegatronFSDP publishes ``calculate_per_token_loss`` on its wrapper. Walk
-    the module tree as well so ordinary wrapper layers do not hide that
-    declaration. Modules without a declaration use PyTorch's usual averaged
-    distributed-gradient contract.
-    """
-    sentinel = object()
-    declared_modes: set[bool] = set()
-    for child in module.modules():
-        mode = getattr(child, "calculate_per_token_loss", sentinel)
-        if mode is not sentinel:
-            declared_modes.add(bool(mode))
-
-    if len(declared_modes) > 1:
-        raise ValueError(
-            "model mixes calculate_per_token_loss=True and False; "
-            "Engine requires one gradient-reduction mode per optimizer window"
-        )
-    return declared_modes == {True}
+    """Detect MegatronFSDP's summed-gradient reduction contract. It publishes
+    ``calculate_per_token_loss`` on its wrapper, which may sit below other
+    wrapper layers, so walk the whole module tree."""
+    return any(getattr(child, "calculate_per_token_loss", False) for child in module.modules())
 
 
 class Engine(nn.Module):
@@ -126,14 +110,10 @@ class Engine(nn.Module):
             raise NotImplementedError(
                 "Engine supports eager modules only; execute AutoPipeline with its pipeline schedule"
             )
-        if mesh_context is not None and getattr(mesh_context, "pp_enabled", False):
+        if mesh_context is not None and mesh_context.pp_enabled:
             raise NotImplementedError(
                 "Engine supports eager modules only; execute pipeline stages with their pipeline schedule"
             )
-        if not isinstance(module, nn.Module):
-            raise TypeError(f"module must be an nn.Module, got {type(module).__name__}")
-        if max_grad_norm is not None and max_grad_norm < 0:
-            raise ValueError(f"max_grad_norm must be non-negative or None, got {max_grad_norm}")
 
         self.module = module
         self.optimizer = optimizer
@@ -142,7 +122,6 @@ class Engine(nn.Module):
         self.max_grad_norm = max_grad_norm
         self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
 
-        self._gradient_accumulation_steps = 1
         self._micro_step = 0
         self._backward_context: AbstractContextManager[Any] | None = None
         self._global_grad_norm: torch.Tensor | float | None = None
@@ -199,8 +178,8 @@ class Engine(nn.Module):
             self._close_backward_context()
             raise ValueError(f"loss must be a scalar Tensor, got {loss!r}")
 
-        gradient_group_size = self._gradient_group_size()
-        reduction_compensation = self._gradient_reduction_compensation(gradient_group_size)
+        # Compensate backends that sum distributed gradients instead of averaging.
+        reduction_compensation = 1.0 / self._gradient_group_size() if self._summed_gradient_reduction else 1.0
         scale = reduction_compensation
         if scale_wrt_gas:
             scale /= self._gradient_accumulation_steps
@@ -265,15 +244,14 @@ class Engine(nn.Module):
         self._micro_step = 0
 
     def zero_grad(self) -> None:
-        """Clear gradients through the optimizer, or through the module if absent."""
-        if self.optimizer is not None:
-            self.optimizer.zero_grad(set_to_none=True)
-        else:
-            self.module.zero_grad(set_to_none=True)
+        """Clear gradients through the optimizer."""
+        if self.optimizer is None:
+            raise RuntimeError("Engine.zero_grad requires an optimizer")
+        self.optimizer.zero_grad(set_to_none=True)
 
     def set_gradient_accumulation_steps(self, steps: int) -> None:
         """Set the number of microsteps in the next optimizer window."""
-        if not isinstance(steps, int) or steps < 1:
+        if steps < 1:
             raise ValueError(f"gradient accumulation steps must be a positive integer, got {steps!r}")
         if self._micro_step != 0:
             raise RuntimeError("gradient accumulation steps cannot change during an active window")
@@ -290,7 +268,7 @@ class Engine(nn.Module):
     def _close_backward_context(self, *exc_info: Any) -> None:
         context, self._backward_context = self._backward_context, None
         if context is not None:
-            context.__exit__(*exc_info if exc_info else (None, None, None))
+            context.__exit__(*(exc_info or (None, None, None)))
 
     def _context_parallel_size(self) -> int:
         return self.mesh_context.cp_size if self.mesh_context is not None else 1
@@ -304,7 +282,3 @@ class Engine(nn.Module):
         if dist.is_available() and dist.is_initialized():
             return dist.get_world_size(group=group)
         return 1
-
-    def _gradient_reduction_compensation(self, gradient_group_size: int) -> float:
-        """Preserve averaged-reducer semantics for summed-gradient backends."""
-        return 1.0 / gradient_group_size if self._summed_gradient_reduction else 1.0

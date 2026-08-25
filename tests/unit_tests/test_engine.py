@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import inspect
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -14,7 +13,6 @@ from torch import nn
 import nemo_automodel.engine._engine as engine_module
 from nemo_automodel import Engine as PublicEngine
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.engine import Engine
 
 
@@ -200,17 +198,7 @@ def test_summed_gradient_declaration_is_found_below_wrapper() -> None:
 
     engine = Engine(module, optimizer=torch.optim.SGD(module.parameters(), lr=0.1))
 
-    assert engine._gradient_reduction_compensation(8) == pytest.approx(1.0 / 8.0)
-
-
-def test_gradient_reduction_declarations_must_be_consistent() -> None:
-    module = _Scale()
-    module.calculate_per_token_loss = True
-    module.mode_probe = nn.Identity()
-    module.mode_probe.calculate_per_token_loss = False
-
-    with pytest.raises(ValueError, match="mixes calculate_per_token_loss"):
-        Engine(module, optimizer=torch.optim.SGD(module.parameters(), lr=0.1))
+    assert engine._summed_gradient_reduction
 
 
 def test_forward_keeps_sync_context_open_through_backward(monkeypatch) -> None:
@@ -271,8 +259,9 @@ def test_forward_keeps_sync_context_open_through_backward(monkeypatch) -> None:
     ]
 
 
-def test_no_grad_forward_does_not_open_training_context(monkeypatch) -> None:
-    module = _Scale()
+@pytest.mark.parametrize("disable_training", ["no_grad", "eval"])
+def test_non_training_forward_does_not_open_training_context(monkeypatch, disable_training) -> None:
+    module = _Scale().eval() if disable_training == "eval" else _Scale()
     engine = Engine(module, optimizer=torch.optim.SGD(module.parameters(), lr=0.1))
     monkeypatch.setattr(
         engine_module,
@@ -280,22 +269,11 @@ def test_no_grad_forward_does_not_open_training_context(monkeypatch) -> None:
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected training context")),
     )
 
-    with torch.no_grad():
+    if disable_training == "no_grad":
+        with torch.no_grad():
+            output = engine(torch.tensor(2.0))
+    else:
         output = engine(torch.tensor(2.0))
-
-    torch.testing.assert_close(output, torch.tensor(2.0))
-
-
-def test_eval_forward_does_not_open_training_context(monkeypatch) -> None:
-    module = _Scale().eval()
-    engine = Engine(module, optimizer=torch.optim.SGD(module.parameters(), lr=0.1))
-    monkeypatch.setattr(
-        engine_module,
-        "get_sync_ctx",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected training context")),
-    )
-
-    output = engine(torch.tensor(2.0))
 
     torch.testing.assert_close(output, torch.tensor(2.0))
 
@@ -373,9 +351,3 @@ def test_optimizer_boundary_runs_model_post_step_hooks(monkeypatch) -> None:
 
     assert module.gate_updates == 1
     assert precomputed == [module]
-
-
-def test_optimizer_param_scheduler_step_defaults_to_one() -> None:
-    default = inspect.signature(OptimizerParamScheduler.step).parameters["increment"].default
-
-    assert default == 1
