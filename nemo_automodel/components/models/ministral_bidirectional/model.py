@@ -143,6 +143,8 @@ class Mistral3BidirectionalModel(Mistral3Model):
         config_dict.pop("model_type", None)
         config_dict.pop("auto_map", None)
         config_dict.pop("task_instructions", None)
+        # Causality is a text-tower policy. A top-level value is also forwarded to Pixtral vision attention.
+        config_dict.pop("is_causal", None)
         text_config = config_dict.get("text_config")
         is_causal = False
         if isinstance(text_config, dict):
@@ -155,7 +157,6 @@ class Mistral3BidirectionalModel(Mistral3Model):
 
         export_config = Mistral3Config.from_dict(config_dict)
         export_config.architectures = ["Mistral3Model"]
-        export_config.is_causal = is_causal
         export_config.text_config.is_causal = is_causal
         return export_config
 

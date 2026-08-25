@@ -1027,8 +1027,24 @@ def _tiny_mistral3_bidirectional_vlm_config() -> Mistral3BidirectionalConfig:
     return config
 
 
-def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp_path):
+def test_mistral3_vlm_causal_export_scopes_attention_policy_to_text_tower():
+    """Portable VLM export must not apply text causality to the vision tower."""
     config = _tiny_mistral3_bidirectional_vlm_config()
+    assert hasattr(config.text_config, "is_causal")
+    config.text_config.is_causal = True
+
+    export_config = Mistral3BidirectionalModel(config).get_hf_export_config()
+    serialized_config = export_config.to_dict()
+
+    assert "is_causal" not in serialized_config
+    assert serialized_config["text_config"]["is_causal"] is True
+    assert serialized_config["vision_config"].get("is_causal", False) is False
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp_path, is_causal):
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.text_config.is_causal = is_causal
     config.task_instructions = {"query": "stale query: "}
     training_config = config.to_dict()
     assert training_config["model_type"] == "mistral3_bidirec"
@@ -1085,9 +1101,9 @@ def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp
     assert type(reloaded) is Mistral3Model
     assert saved_config["model_type"] == "mistral3"
     assert saved_config["architectures"] == ["Mistral3Model"]
-    assert saved_config["is_causal"] is False
+    assert "is_causal" not in saved_config
     assert saved_config["pooling"] == "avg"
-    assert saved_config["text_config"]["is_causal"] is False
+    assert saved_config["text_config"]["is_causal"] is is_causal
     assert "auto_map" not in saved_config["text_config"]
     assert "auto_map" not in saved_config["vision_config"]
     assert "auto_map" not in saved_config
@@ -1114,7 +1130,10 @@ def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp
     changed_ids[0, -1] = 5
     with torch.no_grad():
         changed = reloaded(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
-    assert not torch.allclose(actual[0, 0], changed[0, 0], atol=1e-6)
+    if is_causal:
+        torch.testing.assert_close(actual[0, 0], changed[0, 0])
+    else:
+        assert not torch.allclose(actual[0, 0], changed[0, 0], atol=1e-6)
 
 
 def test_mistral3_vlm_portable_export_requires_processor(tmp_path):
