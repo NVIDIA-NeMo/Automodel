@@ -143,6 +143,7 @@ def _training_fixture():
         clip_grad_max_norm=100.0,
         grad_clip_foreach=False,
         check_loss=True,
+        defer_fsdp_grad_sync=True,
     )
     micro_batch = {
         "image_latents": torch.zeros(1, 1, 1, 1),
@@ -212,6 +213,7 @@ def _checkpoint_recipe(checkpoint_dir: Path, base_weight: float) -> TrainDiffusi
     recipe.clip_grad_max_norm = 100.0
     recipe.grad_clip_foreach = False
     recipe.check_loss = True
+    recipe.defer_fsdp_grad_sync = True
     recipe.cpu_offload = False
     recipe.peft_config = None
 

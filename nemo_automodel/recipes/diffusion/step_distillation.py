@@ -26,6 +26,7 @@ import torch.distributed as dist
 from torch import nn
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.training.utils import (
     clip_grad_norm,
     prepare_after_first_microbatch,
@@ -339,7 +340,8 @@ class _DMD2Objective:
         num_microbatches = len(batch_group)
 
         for index, micro_batch in enumerate(batch_group):
-            if index == num_microbatches - 1:
+            is_final_microbatch = index == num_microbatches - 1
+            if is_final_microbatch:
                 prepare_for_final_backward([active_model], pp_enabled=False)
 
             (
@@ -354,30 +356,42 @@ class _DMD2Objective:
                 "encoder_hidden_states": text_embeddings,
                 "encoder_hidden_states_mask": text_mask,
             }
-            if student_phase:
-                losses = self.dmd_pipeline.compute_student_loss(
-                    latents,
-                    noise,
-                    negative_encoder_hidden_states=negative_embeddings,
-                    negative_encoder_hidden_states_mask=negative_mask,
-                    **kwargs,
-                )
-            else:
-                losses = self.dmd_pipeline.compute_fake_score_loss(latents, noise, **kwargs)
+            # Defer FSDP2's gradient reduce-scatter to the last microbatch. The
+            # prepare_for_* helpers above are gated on a method only the MoE mixin
+            # defines, so both are no-ops for a diffusers transformer -- without this
+            # context `fsdp.defer_fsdp_grad_sync` has no effect here and every
+            # microbatch pays a full reduce-scatter set. Mirrors what the non-DMD2
+            # branch of this recipe already does.
+            sync_context = get_sync_ctx(
+                active_model,
+                is_final_microbatch,
+                defer_fsdp_grad_sync=recipe.defer_fsdp_grad_sync,
+            )
+            with sync_context:
+                if student_phase:
+                    losses = self.dmd_pipeline.compute_student_loss(
+                        latents,
+                        noise,
+                        negative_encoder_hidden_states=negative_embeddings,
+                        negative_encoder_hidden_states_mask=negative_mask,
+                        **kwargs,
+                    )
+                else:
+                    losses = self.dmd_pipeline.compute_fake_score_loss(latents, noise, **kwargs)
 
-            total = losses["total"]
-            if recipe.check_loss and not torch.isfinite(total).all():
-                raise FloatingPointError(f"Non-finite DMD2 {phase} loss at step {global_step}.")
-            (total / num_microbatches).backward()
-            reported_total = total.detach()
+                total = losses["total"]
+                if recipe.check_loss and not torch.isfinite(total).all():
+                    raise FloatingPointError(f"Non-finite DMD2 {phase} loss at step {global_step}.")
+                (total / num_microbatches).backward()
+                reported_total = total.detach()
 
-            if not student_phase and self.discriminator_optimizer is not None:
-                discriminator_losses = self.dmd_pipeline.compute_discriminator_loss(latents, noise, **kwargs)
-                discriminator_total = discriminator_losses["total"]
-                if recipe.check_loss and not torch.isfinite(discriminator_total).all():
-                    raise FloatingPointError(f"Non-finite DMD2 discriminator loss at step {global_step}.")
-                (discriminator_total / num_microbatches).backward()
-                reported_total = reported_total + discriminator_total.detach()
+                if not student_phase and self.discriminator_optimizer is not None:
+                    discriminator_losses = self.dmd_pipeline.compute_discriminator_loss(latents, noise, **kwargs)
+                    discriminator_total = discriminator_losses["total"]
+                    if recipe.check_loss and not torch.isfinite(discriminator_total).all():
+                        raise FloatingPointError(f"Non-finite DMD2 discriminator loss at step {global_step}.")
+                    (discriminator_total / num_microbatches).backward()
+                    reported_total = reported_total + discriminator_total.detach()
 
             total_losses.append(reported_total)
             if index == 0:
@@ -577,9 +591,15 @@ class _DMD2Objective:
             return
         dp_size = recipe._get_dp_group_size()
         for parameter in self.discriminator.parameters():
-            if parameter.grad is not None:
-                dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM, group=recipe._get_dp_group())
-                parameter.grad.div_(dp_size)
+            if parameter.grad is None:
+                # Skipping would make the number of collectives rank-dependent, and one
+                # rank taking a different branch deadlocks the job with no diagnostic --
+                # no timeout message, no rank identification. Materializing a zero costs
+                # one allocation and keeps every rank issuing the same collectives in the
+                # same order.
+                parameter.grad = torch.zeros_like(parameter)
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM, group=recipe._get_dp_group())
+            parameter.grad.div_(dp_size)
 
     def _require_ready(self) -> None:
         if (
