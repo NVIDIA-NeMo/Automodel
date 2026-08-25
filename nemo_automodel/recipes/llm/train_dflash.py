@@ -144,7 +144,7 @@ def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_
         )
 
 
-def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
+def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device, process_group=None) -> bool:
     """Min-reduce a per-rank "this micro-batch has valid anchors" flag.
 
     Under DDP a data-dependent ``NoValidAnchorsError`` skip is per-rank: if one
@@ -158,8 +158,45 @@ def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
     if not is_ddp or not (dist.is_available() and dist.is_initialized()):
         return bool(local_has_valid)
     flag = torch.tensor([local_has_valid], device=device, dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=process_group)
     return bool(flag.item())
+
+
+def _normalize_ddp_loss(
+    loss: torch.Tensor,
+    loss_weight: torch.Tensor,
+    is_ddp: bool,
+    process_group=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Weight a local mean so DDP produces the global weighted-mean gradient.
+
+    DFlash micro-batches can contain different numbers of valid weighted anchor
+    positions on different data-parallel ranks. DDP averages rank gradients, so
+    backpropagating each rank's local mean directly would give every rank equal
+    weight. Scaling by ``local_weight * dp_size / global_weight`` compensates for
+    that averaging. The second return value is the detached global mean for
+    consistent logging on the main rank.
+
+    Args:
+        loss: Scalar tensor containing this rank's local weighted-mean loss.
+        loss_weight: Scalar tensor containing this rank's summed loss weights.
+        is_ddp: Whether the trainer module is wrapped in DDP.
+        process_group: Draft data-parallel process group, or ``None`` for world.
+
+    Returns:
+        Tuple of the scaled scalar loss for backward and the detached scalar
+        global weighted mean for logging.
+    """
+    if not is_ddp or not (dist.is_available() and dist.is_initialized()):
+        return loss, loss.detach()
+
+    weight = loss_weight.detach().to(device=loss.device, dtype=loss.dtype)
+    stats = torch.stack((loss.detach() * weight, weight))
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=process_group)
+    global_weight = stats[1].clamp_min(torch.finfo(stats.dtype).tiny)
+    dp_size = dist.get_world_size(group=process_group)
+    scaled_loss = loss * (weight * dp_size / global_weight)
+    return scaled_loss, stats[0] / global_weight
 
 
 def _submesh_or_none(device_mesh, name: str):
@@ -643,6 +680,14 @@ class TrainDFlashRecipe(BaseRecipe):
             doc_remaining=target_batch.doc_remaining,
         )
 
+    def _loss_terms(self, metrics) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Return differentiable local-mean loss terms and their denominators.
+
+        Composite trainers override this when their terms use different valid
+        sets and therefore need separate distributed normalization.
+        """
+        return ((metrics.loss, metrics.loss_weight),)
+
     def _log_extra_train_metrics(self, epoch_idx: int) -> None:
         """Hook for subclasses to log extra per-step metrics at a log point (no-op here)."""
 
@@ -1039,6 +1084,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 last_batch_idx = -1
                 num_batches = len(self.train_dataloader)
                 is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
+                draft_ddp_group = self._draft_ddp_process_group() if is_ddp else None
                 for batch_idx, batch in enumerate(self.train_dataloader):
                     last_batch_idx = batch_idx
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -1060,7 +1106,6 @@ class TrainDFlashRecipe(BaseRecipe):
                         local_has_valid = 1
                         try:
                             metrics = self._run_trainer_step(target_batch)
-                            loss = metrics.loss / self.grad_accumulation_steps
                         except NoValidAnchorsError:
                             # Every sample in this micro-batch is too short to form a
                             # block; nothing to learn from it on this rank.
@@ -1069,14 +1114,23 @@ class TrainDFlashRecipe(BaseRecipe):
                         # leaves one rank issuing its gradient all-reduce alone (DDP
                         # hang) or desyncs the accumulation windows: if ANY rank has no
                         # valid anchors, ALL ranks skip this micro-batch together.
-                        all_have_valid = _all_ranks_have_valid(local_has_valid, is_ddp, self.device)
+                        all_have_valid = _all_ranks_have_valid(
+                            local_has_valid, is_ddp, self.device, process_group=draft_ddp_group
+                        )
                         if all_have_valid:
+                            normalized_terms = [
+                                _normalize_ddp_loss(term, weight, is_ddp, process_group=draft_ddp_group)
+                                for term, weight in self._loss_terms(metrics)
+                            ]
+                            loss = sum(term for term, _ in normalized_terms)
+                            global_loss = sum(logged for _, logged in normalized_terms)
+                            loss = loss / self.grad_accumulation_steps
                             loss.backward()
                     if not all_have_valid:
                         self._skipped_micro_batches += 1
                         continue
 
-                    running_loss += metrics.loss.detach().item()
+                    running_loss += global_loss.item()
                     running_acc += metrics.accuracy.detach().item()
                     running_micro += 1
                     # Accumulated here, past the skip ``continue`` above, so a
@@ -1086,7 +1140,7 @@ class TrainDFlashRecipe(BaseRecipe):
                         totals = running_extra.setdefault(name, [0.0, 0.0])
                         totals[0] += numerator
                         totals[1] += denominator
-                    epoch_loss += metrics.loss.detach().item()
+                    epoch_loss += global_loss.item()
                     micro_step += 1
                     pending_micro_batches += 1
 
