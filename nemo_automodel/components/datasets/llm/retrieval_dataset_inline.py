@@ -470,6 +470,12 @@ def _group_aware_split(dataset, validation_fraction: float, group_key: str | Non
         groups = list(range(len(dataset)))
         row_groups = groups
     else:
+        if group_key not in dataset.column_names:
+            raise ValueError(
+                f"validation_group_key={group_key!r} is not a column of the dataset; "
+                f"available columns are {sorted(dataset.column_names)}. The split key must be "
+                "requested as an extra column so it survives loading."
+            )
         row_groups = dataset[group_key]
         # load_datasets fills absent extra columns with None, so a group key that is present
         # on some rows and missing on others reaches here as a mix of str and None. sorted()
