@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import yaml as pyyaml
 from ruamel.yaml import YAML
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "tests" / "ci_tests" / "scripts"
@@ -316,20 +317,134 @@ def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
     assert "resume_first_loss_threshold" not in resolved["ci"]["checkpoint_robustness"]
 
 
-def test_qwen3_moe_lora_robustness_keeps_source_and_checkpoint_gates(tmp_path):
-    """Qwen MoE LoRA retains both source-load and checkpoint reload coverage."""
-    recipe_path = REPO_ROOT / "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml"
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_lora.yaml",
+        "examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml",
+        "examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml",
+        "examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml",
+        "examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml",
+        "examples/llm_finetune/llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml",
+        "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml",
+        "examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml",
+        "examples/llm_finetune/mistral/mistral_7b_hellaswag_fp8.yaml",
+        "examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml",
+        "examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml",
+        "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",
+        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml",
+        "examples/vlm_finetune/mistral4/mistral4_medpix.yaml",
+        "examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml",
+        "examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml",
+        "examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml",
+        "examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml",
+    ],
+)
+def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
+    """The calibration cohort runs every phase and documents any informational logit gate."""
+    recipe_path = REPO_ROOT / recipe_path
     out = tmp_path / "resolved.yaml"
-    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    # The checkpoint harness consumes the resolver output with PyYAML, whose YAML 1.1 scalar rules differ from ruamel.
+    robustness = pyyaml.safe_load(out.read_text())["ci"]["checkpoint_robustness"]
+    assert "check_source_load_parity" not in robustness
+    assert "skip_source_load_parity" not in robustness
+    if recipe_path.stem == "step3p7_medpix_200b_lora_pp8ep8_8node":
+        assert robustness["parity_tolerance_profile"] == "relaxed"
+        assert robustness["parity_threshold_overrides"] == {
+            "automodel_reload": {"mean_kl": 4e-2, "cosine_similarity": 0.99}
+        }
+        assert robustness["resume_tolerance_profile"] == "relaxed"
+    assert "skip_automodel_reload_logit_parity" not in robustness
+    informational_source_and_hf = {
+        "gemma4_26b_a4b_moe",
+        "step3p7_medpix_200b_lora_pp8ep8_8node",
+    }
+    if recipe_path.stem in informational_source_and_hf:
+        assert robustness["skip_source_load_logit_parity"] is True
+        assert robustness["skip_hf_reload_logit_parity"] is True
+    else:
+        assert "skip_source_load_logit_parity" not in robustness
+        assert "skip_hf_reload_logit_parity" not in robustness
+    assert "skip_hf_reload" not in robustness
+    assert "skip_resume" not in robustness
+
+
+@pytest.mark.parametrize(
+    "recipe_name",
+    [
+        "customizer_gpt_oss_full_sft.yaml",
+        "customizer_gpt_oss_full_sft_chat.yaml",
+        "customizer_gpt_oss_peft.yaml",
+        "customizer_gpt_oss_peft_packing.yaml",
+    ],
+)
+def test_gpt_oss_customizers_use_routed_moe_parity_profile(tmp_path, recipe_name):
+    """GPT-OSS Customizer variants retain parity gates with the routed-MoE profile."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/gpt_oss" / recipe_name
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
     _run_resolver(
         ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
         env=env,
     )
 
     robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
-    assert robustness["check_source_load_parity"] is True
-    assert "skip_automodel_logit_parity" not in robustness
-    assert robustness["skip_hf_logit_parity"] is True
+    assert robustness["parity_tolerance_profile"] == "relaxed"
+    assert "skip_source_load_logit_parity" not in robustness
+    assert "skip_hf_reload_logit_parity" not in robustness
+    assert "skip_resume" not in robustness
+
+
+@pytest.mark.parametrize(
+    ("recipe_path", "expected_resume_profile"),
+    [
+        ("examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft.yaml", None),
+        ("examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft_chat.yaml", "relaxed"),
+        ("examples/llm_finetune/qwen/qwen3_moe_30b_hellaswag.yaml", None),
+    ],
+)
+def test_additional_routed_moe_configs_enable_resume(tmp_path, recipe_path, expected_resume_profile):
+    """Expanded routed-MoE coverage keeps resume active with narrowly calibrated loss drift."""
+    recipe_path = REPO_ROOT / recipe_path
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert "skip_resume" not in robustness
+    if expected_resume_profile is None:
+        assert "resume_tolerance_profile" not in robustness
+    else:
+        assert robustness["resume_tolerance_profile"] == expected_resume_profile
+    assert "parity_tolerance_profile" not in robustness
+    assert "resume_first_loss_threshold" not in robustness
+    assert "resume_loss_threshold" not in robustness
+
+
+def test_nemotron_nano_4b_peft_uses_cached_family_tokenizer(tmp_path):
+    """The offline recipe uses one complete family tokenizer for training and parity."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/nemotron/nemotron_nano_4b_squad_peft.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    resolved = yaml.load(out.open())
+    tokenizer_name = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    assert resolved["dataset"]["tokenizer"]["pretrained_model_name_or_path"] == tokenizer_name
+    assert resolved["ci"]["checkpoint_robustness"]["tokenizer_name"] == tokenizer_name
 
 
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
@@ -339,17 +454,23 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "step_scheduler: {global_batch_size: 8}\n"
         "ci:\n"
         "  checkpoint_robustness:\n"
-        "    check_source_load_parity: true             # fixture arg, must NOT become top-level\n"
-        "    skip_automodel_logit_parity: true          # fixture arg, must NOT become top-level\n"
-        "    skip_hf_logit_parity: true                 # fixture arg, must NOT become top-level\n"
+        "    skip_source_load_parity: true               # fixture arg, must NOT become top-level\n"
+        "    skip_source_load_logit_parity: true         # fixture arg, must NOT become top-level\n"
+        "    skip_automodel_reload_logit_parity: true    # fixture arg, must NOT become top-level\n"
+        "    skip_hf_reload_logit_parity: true           # fixture arg, must NOT become top-level\n"
         "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
-        "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
+        "    parity_threshold_overrides:                 # fixture arg, must NOT become top-level\n"
+        "      source_load: {mean_kl: 1e-2}\n"
+        "      automodel_reload: {p95_kl: 2e-2, cosine_similarity: 0.998}\n"
+        "      hf_reload: {mean_kl: 3e-2}\n"
+        "      cross_tp: {cosine_similarity: 0.997}\n"
         "    training_reproducibility_loss_threshold: 1e-2  # fixture arg, must NOT become top-level\n"
         "    resume_tolerance_profile: relaxed             # fixture arg, must NOT become top-level\n"
         "    resume_first_loss_threshold: 1e-6           # fixture arg, must NOT become top-level\n"
-        "    source_load_kl_threshold: 1e-2              # fixture arg, must NOT become top-level\n"
-        "    source_load_mean_kl_threshold: 1e-3         # fixture arg, must NOT become top-level\n"
-        "    source_load_cosine_threshold: 0.999         # fixture arg, must NOT become top-level\n"
+        "    parity_sequence_length: 1024                # fixture arg, must NOT become top-level\n"
+        "    parity_tolerance_profile: strict            # fixture arg, must NOT become top-level\n"
+        "    parity_tolerance_profile_overrides:         # fixture arg, must NOT become top-level\n"
+        "      hf_reload: relaxed\n"
         "    tokenizer_name: nvidia/Test                 # fixture arg, must NOT become top-level\n"
         "    dataset.limit_dataset_samples: 500          # dotted -> applied as override\n"
     )
@@ -362,29 +483,36 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["dataset"]["limit_dataset_samples"] == 500
     # Fixture args stay under ci.checkpoint_robustness for the consumer (pytest) to read,
     # and do NOT pollute the top level.
-    assert "hf_kl_threshold" not in resolved
-    assert "check_source_load_parity" not in resolved
-    assert "skip_automodel_logit_parity" not in resolved
-    assert "skip_hf_logit_parity" not in resolved
+    assert "parity_threshold_overrides" not in resolved
+    assert "skip_source_load_parity" not in resolved
+    assert "skip_source_load_logit_parity" not in resolved
+    assert "skip_automodel_reload_logit_parity" not in resolved
+    assert "skip_hf_reload_logit_parity" not in resolved
     assert "hf_adapter_ignored_key_prefix" not in resolved
     assert "training_reproducibility_loss_threshold" not in resolved
     assert "resume_tolerance_profile" not in resolved
     assert "resume_first_loss_threshold" not in resolved
-    assert "source_load_kl_threshold" not in resolved
-    assert "source_load_mean_kl_threshold" not in resolved
-    assert "source_load_cosine_threshold" not in resolved
+    assert "parity_sequence_length" not in resolved
+    assert "parity_tolerance_profile" not in resolved
+    assert "parity_tolerance_profile_overrides" not in resolved
     assert "tokenizer_name" not in resolved
-    assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
-    assert resolved["ci"]["checkpoint_robustness"]["check_source_load_parity"] is True
-    assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_logit_parity"] is True
-    assert resolved["ci"]["checkpoint_robustness"]["skip_hf_logit_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["parity_threshold_overrides"] == {
+        "source_load": {"mean_kl": 1e-2},
+        "automodel_reload": {"p95_kl": 2e-2, "cosine_similarity": 0.998},
+        "hf_reload": {"mean_kl": 3e-2},
+        "cross_tp": {"cosine_similarity": 0.997},
+    }
+    assert resolved["ci"]["checkpoint_robustness"]["skip_source_load_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_source_load_logit_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_reload_logit_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_hf_reload_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
     assert resolved["ci"]["checkpoint_robustness"]["training_reproducibility_loss_threshold"] == 1e-2
     assert resolved["ci"]["checkpoint_robustness"]["resume_tolerance_profile"] == "relaxed"
     assert resolved["ci"]["checkpoint_robustness"]["resume_first_loss_threshold"] == 1e-6
-    assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
-    assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3
-    assert resolved["ci"]["checkpoint_robustness"]["source_load_cosine_threshold"] == 0.999
+    assert resolved["ci"]["checkpoint_robustness"]["parity_sequence_length"] == 1024
+    assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile"] == "strict"
+    assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile_overrides"] == {"hf_reload": "relaxed"}
 
 
 @pytest.mark.parametrize(
@@ -412,12 +540,8 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     assert resolved["checkpoint"]["enabled"] is True
     assert resolved["checkpoint"]["model_save_format"] == "safetensors"
     assert resolved["checkpoint"]["save_consolidated"] is True
-    if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
-        # Opted out: source-load logit KL tracks the host's reduction order for
-        # this recipe's DeepEP MoE routing, not checkpoint integrity.
-        assert robustness["check_source_load_parity"] is False
-    else:
-        assert robustness["check_source_load_parity"] is True
+    assert "skip_source_load_parity" not in robustness
+    assert "check_source_load_parity" not in robustness
     assert robustness["tokenizer_name"] == resolved["model"]["pretrained_model_name_or_path"]
     if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
         assert resolved["distributed"]["multimodal"]["frozen_sharding"] == "replicate"
@@ -428,28 +552,37 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
         assert robustness["hf_source_post_load_dequantize"] is True
-        assert robustness["kl_threshold"] == 5e-2
-        assert robustness["source_load_kl_threshold"] == 1e-2
-        assert robustness["source_load_mean_kl_threshold"] == 2e-3
-        assert robustness["source_load_cosine_threshold"] == 0.999
-        assert robustness["hf_kl_threshold"] == 5e-2
+        assert "parity_tolerance_profile" not in robustness
+        assert robustness["parity_tolerance_profile_overrides"] == {"hf_reload": "relaxed"}
+        for key in (
+            "kl_threshold",
+            "source_load_kl_threshold",
+            "source_load_mean_kl_threshold",
+            "source_load_cosine_threshold",
+            "hf_kl_threshold",
+        ):
+            assert key not in robustness
     if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
-        assert robustness["hf_kl_threshold"] == 2.5e-2
         assert "resume_loss_threshold" not in robustness
         assert robustness["training_reproducibility_loss_threshold"] == 2e-2
-        assert robustness["source_load_kl_threshold"] == 4e-2
-        assert robustness["source_load_mean_kl_threshold"] == 7e-3
+        for key in (
+            "hf_kl_threshold",
+            "source_load_kl_threshold",
+            "source_load_mean_kl_threshold",
+            "source_load_cosine_threshold",
+        ):
+            assert key not in robustness
     if Path(recipe_path).stem == "qwen3_5_35b":
         assert robustness["experts_implementation"] == "grouped_mm"
         for key in (
             "hf_keep_in_fp32_modules",
             "resume_loss_threshold",
+            "hf_kl_threshold",
+            "source_load_cosine_threshold",
+            "source_load_kl_threshold",
+            "source_load_mean_kl_threshold",
         ):
             assert key not in robustness
-        assert robustness["hf_kl_threshold"] == 1e-1
-        assert robustness["source_load_cosine_threshold"] == 0.9985
-        assert robustness["source_load_kl_threshold"] == 1e-1
-        assert robustness["source_load_mean_kl_threshold"] == 1e-2
         assert resolved["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy")
         assert resolved["model"]["backend"]["experts"] == "torch_mm"
         assert resolved["step_scheduler"]["global_batch_size"] == 16
@@ -473,6 +606,9 @@ def test_retrieval_checkpoint_robustness_retains_calibrated_resume_threshold(tmp
     )
 
     robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["parity_tolerance_profile"] == "standard"
+    for removed_key in ("check_hf_reload", "check_resume", "cosine_threshold", "hf_cosine_threshold"):
+        assert removed_key not in robustness
     assert robustness["resume_loss_threshold"] == 5e-2
     assert robustness["training_reproducibility_loss_threshold"] == 5e-2
 
