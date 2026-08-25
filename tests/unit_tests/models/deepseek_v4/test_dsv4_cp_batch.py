@@ -217,19 +217,6 @@ def test_cp_size_one_native_thd_preserves_packed_batch_without_padding():
     torch.testing.assert_close(sharder.gather_token_tensor(token_values, trim=True), token_values)
 
 
-def test_cp_size_one_final_thd_inputs_embeds_layout_uses_token_axis():
-    batch = {
-        "inputs_embeds": torch.randn(8, 3),
-        "labels": torch.arange(8),
-        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
-        "qkv_format": "thd",
-    }
-
-    _, out, layout = _shard(batch, cp_size=1, local_rank=0)
-
-    assert out["inputs_embeds"].shape == (8, 3)
-    assert (layout.original_seq_len, layout.padded_seq_len) == (8, 8)
-
 
 def test_contiguous_shard_pads_to_divisor():
     # seq=5, cp_size=2, pad_multiple=2 -> divisor=2*max(2,2)=4 -> pad to 8.

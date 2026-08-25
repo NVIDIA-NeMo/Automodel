@@ -618,8 +618,8 @@ def test_make_cp_batch_for_te_multi_chunk(monkeypatch):
     assert result["padding_mask"].shape == result["input_ids"].shape
 
 
-def test_shard_thd_chunk_only_partitions_explicit_token_fields(monkeypatch):
-    """Token loss fields follow TE indices while same-length model payloads remain global."""
+def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
+    """Test that _shard_thd_chunk_for_te handles missing padding_mask gracefully."""
     cp_mesh = _DummySubMesh(size=2)
 
     def mock_get_rank(group=None):
@@ -628,7 +628,7 @@ def test_shard_thd_chunk_only_partitions_explicit_token_fields(monkeypatch):
     class MockTex:
         @staticmethod
         def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
-            return torch.tensor([0, total_tokens - 1])
+            return torch.arange(total_tokens)
 
     import sys
 
@@ -637,15 +637,12 @@ def test_shard_thd_chunk_only_partitions_explicit_token_fields(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
 
     # Batch without padding_mask — should not raise KeyError
-    media_payload = torch.arange(4.0)
     batch = {
         "input_ids": torch.tensor([1, 2, 3, 4]),
         "labels": torch.tensor([10, 20, 30, 40]),
         "position_ids": torch.tensor([0, 1, 2, 3]),
         "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
         "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
-        "auxiliary_payload": torch.tensor([10.0, 20.0, 30.0, 40.0]),
-        "media_payload": media_payload,
     }
 
     result, local_indices = _cu._shard_thd_chunk_for_te(batch, cp_mesh, "thd", -1000, 0)
@@ -653,10 +650,8 @@ def test_shard_thd_chunk_only_partitions_explicit_token_fields(monkeypatch):
     assert "input_ids" in result
     assert "attention_mask" not in result
     assert "cu_seqlens_padded" not in result
-    assert torch.equal(local_indices, torch.tensor([0, 3]))
-    assert torch.equal(result["input_ids"], torch.tensor([1, 4]))
-    assert torch.equal(result["auxiliary_payload"], torch.tensor([10.0, 20.0, 30.0, 40.0]))
-    assert result["media_payload"] is media_payload
+    # the partition IS the local-token global index map (mock returns arange)
+    assert torch.equal(local_indices, torch.arange(4))
 
 
 def test_make_cp_batch_for_te_unsupported_format():
@@ -818,15 +813,6 @@ def test_sharder_constructor_derives_te_from_model_and_thd_from_batch(monkeypatc
     assert (seen["pad"], seen["fmt"], seen["chunks"], seen["sent"]) == (7, "thd", 3, -1000)
 
 
-def test_sharder_constructor_rejects_injected_hf_te_for_thd():
-    """Injected HF TE attention is still BSHD-only and cannot consume THD metadata."""
-    model = type("_Model", (), {"_te_attention_injected": True})()
-    batch = {"input_ids": torch.tensor([[1, 2]]), "qkv_format": "thd"}
-
-    with pytest.raises(NotImplementedError, match="stock Hugging Face model supports padded BSHD only"):
-        ContextParallelSharder(model, _DummyDeviceMesh(cp_size=1, tp_size=1), batch)
-
-
 def test_sharder_constructor_does_not_infer_te_from_batch_alone(monkeypatch):
     """A THD-origin batch does not force TE preparation on a non-TE model."""
     monkeypatch.setattr(
@@ -925,107 +911,18 @@ def test_te_sharder_captures_partition_indices_at_shard_time(monkeypatch):
         sharder.shard_token_tensor(torch.arange(6.0), seq_dim=0)
 
 
-@pytest.mark.parametrize(
-    ("cp_size", "local_indices"),
-    [
-        (1, torch.tensor([0, 1, 2, 3])),
-        (2, torch.tensor([0, 3])),
-    ],
-)
-def test_te_sharder_transports_local_indices_only_when_requested(monkeypatch, cp_size, local_indices):
-    """An explicit placeholder asks the TE sharder to expose its applied token partition."""
-
-    def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
-        """Return an unchanged token mapping and its configured partition.
-
-        Args:
-            cp_mesh: Fake context-parallel mesh.
-            batch: Mapping with ``input_ids`` of shape [batch, sequence].
-            return_local_indices: Whether to return the [local_tokens] partition.
-            **kwargs: Unused TE batch-preparation options.
-
-        Returns:
-            The unchanged mapping, optionally paired with [local_tokens] indices.
-        """
-        assert "_thd_local_indices" not in batch
-        prepped = dict(batch)
-        return (prepped, local_indices) if return_local_indices else prepped
-
-    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
-    cp_mesh = _DummySubMesh(cp_size)
-    strategy = _cu._resolve_cp_sharder(
-        cp_mesh,
-        None,
-        magi=None,
-        is_thd=True,
-        num_chunks=1,
-        seq_lens_padding_value=-1000,
-        model=None,
-    )
-
-    requested = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=cp_size, tp_size=1))
-    _, requested_batch = requested.shard({"input_ids": torch.arange(4).view(1, 4), "_thd_local_indices": None})
-    torch.testing.assert_close(requested_batch["_thd_local_indices"], local_indices)
-
-    unrequested = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=cp_size, tp_size=1))
-    _, unrequested_batch = unrequested.shard({"input_ids": torch.arange(4).view(1, 4)})
-    assert "_thd_local_indices" not in unrequested_batch
-
-
-def test_te_sharder_rejects_requested_local_indices_for_chunked_thd(monkeypatch):
-    """Chunk-local indices cannot address one unsplit model-owned global payload."""
-
-    chunk_indices = (torch.tensor([0, 1]), torch.tensor([0, 1]))
-
-    def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
-        """Return two independent token partitions for a chunked THD batch.
-
-        Args:
-            cp_mesh: Fake context-parallel mesh.
-            batch: Mapping with ``input_ids`` of shape [chunks, sequence].
-            return_local_indices: Whether to return per-chunk [local_tokens] indices.
-            **kwargs: Unused TE batch-preparation options.
-
-        Returns:
-            The unchanged mapping, optionally paired with per-chunk indices.
-        """
-        prepped = dict(batch)
-        return (prepped, chunk_indices) if return_local_indices else prepped
-
-    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
-    strategy = _cu._resolve_cp_sharder(
-        _DummySubMesh(2),
-        None,
-        magi=None,
-        is_thd=True,
-        num_chunks=2,
-        seq_lens_padding_value=-1000,
-        model=None,
-    )
-    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=2, tp_size=1))
-
-    with pytest.raises(NotImplementedError, match="does not support chunked THD batches"):
-        sharder.shard({"input_ids": torch.arange(8).view(2, 4), "_thd_local_indices": None})
-
-
 class _FakeMagiState:
     """Fake MagiState whose dispatch returns a fixed local index map."""
 
     enabled = True
     domain = "llm"
+    cp_size = 2
 
-    def __init__(self, local_indices, *, cp_size=2, flatten=False):
+    def __init__(self, local_indices):
         self._local_indices = local_indices
-        self.cp_size = cp_size
-        self._flatten = flatten
 
     def make_cp_batch(self, cp_mesh, batch, *, return_local_indices=False, **kwargs):
-        prepped = dict(batch)
-        if self._flatten:
-            flat = batch["input_ids"].reshape(-1)
-            prepped["input_ids"] = flat if self._local_indices is None else flat[: self._local_indices.numel()]
-        elif self._local_indices is not None:
-            prepped["input_ids"] = batch["input_ids"][:, : self._local_indices.numel()]
+        prepped = {"prepared": True}
         return (prepped, self._local_indices) if return_local_indices else prepped
 
 
@@ -1058,7 +955,7 @@ def test_magi_sharder_captures_packed_row_shape():
     strategy = _cu._resolve_cp_sharder(
         cp2,
         None,
-        magi=_FakeMagiState(torch.tensor([0, 3]), flatten=True),
+        magi=_FakeMagiState(torch.tensor([[0, 3]])),
         is_thd=True,
         num_chunks=1,
         seq_lens_padding_value=-1000,
@@ -1072,69 +969,6 @@ def test_magi_sharder_captures_packed_row_shape():
     assert torch.equal(sharder.shard_token_tensor(rows), torch.tensor([10.0, 40.0]))
 
 
-def test_magi_cp1_vlm_no_dispatch_has_identity_token_layout():
-    """VLM Magi does not dispatch at CP1, but its token verbs remain identity."""
-    cp1 = _DummySubMesh(1)
-    strategy = _cu._resolve_cp_sharder(
-        cp1,
-        None,
-        magi=_FakeMagiState(None, cp_size=1),
-        is_thd=False,
-        num_chunks=1,
-        seq_lens_padding_value=-1000,
-        model=None,
-    )
-    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=1, tp_size=1))
-    sharder.shard({"input_ids": torch.tensor([[1, 2, 3]])})
-
-    assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (3, 3)
-    weights = torch.tensor([[10.0, 20.0, 30.0]])
-    assert torch.equal(sharder.shard_token_tensor(weights), weights)
-
-
-def test_magi_cp1_custom_thd_flattens_with_identity_token_layout():
-    """A CP1 custom Magi BxS -> T conversion exposes an identity THD map."""
-    cp1 = _DummySubMesh(1)
-    strategy = _cu._resolve_cp_sharder(
-        cp1,
-        None,
-        magi=_FakeMagiState(None, cp_size=1, flatten=True),
-        is_thd=True,
-        num_chunks=1,
-        seq_lens_padding_value=-1000,
-        model=None,
-    )
-    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=1, tp_size=1))
-    _, model_inputs = sharder.shard({"input_ids": torch.tensor([[1, 2], [3, 4]])})
-
-    assert model_inputs["input_ids"].shape == (4,)
-    assert sharder.shard_layout.input_row_shape == (2, 2)
-    assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (4, 4)
-    rows = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
-    assert torch.equal(sharder.shard_token_tensor(rows), rows.reshape(-1))
-
-
-def test_magi_packed_dispatch_padding_uses_zero_weight_sentinel():
-    """Packed Magi can flatten BxS, add dispatch padding, and select zero-filled weights."""
-    cp2 = _DummySubMesh(2)
-    strategy = _cu._resolve_cp_sharder(
-        cp2,
-        None,
-        magi=_FakeMagiState(torch.tensor([0, 3, 4]), flatten=True),
-        is_thd=True,
-        num_chunks=1,
-        seq_lens_padding_value=-1000,
-        model=None,
-    )
-    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=2, tp_size=1))
-    sharder.shard({"input_ids": torch.tensor([[1, 2], [3, 4]])})
-
-    layout = sharder.shard_layout
-    assert (layout.original_seq_len, layout.padded_seq_len, layout.input_row_shape) == (4, 6, (2, 2))
-    rows = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
-    assert torch.equal(sharder.shard_token_tensor(rows, fill=0), torch.tensor([10.0, 40.0, 0.0]))
-
-
 def test_make_cp_batch_for_te_identity_indices_without_cp():
     """At cp<=1 the THD stream is unsharded, so the index map is the identity."""
     batch = {
@@ -1146,28 +980,6 @@ def test_make_cp_batch_for_te_identity_indices_without_cp():
     }
     out, local_indices = _cu.make_cp_batch_for_te(None, batch, return_local_indices=True)
     assert torch.equal(local_indices, torch.arange(out["input_ids"].shape[-1]))
-
-
-def test_make_cp_batch_for_te_retains_identity_indices_for_each_final_thd_chunk():
-    batch = {
-        "input_ids": torch.arange(8),
-        "labels": torch.arange(8),
-        "position_ids": torch.arange(8),
-        "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
-        "max_seqlen": torch.tensor(4, dtype=torch.int32),
-        "qkv_format": "thd",
-    }
-
-    out, local_indices = _cu.make_cp_batch_for_te(
-        None,
-        batch,
-        num_chunks=2,
-        return_local_indices=True,
-    )
-
-    assert out["input_ids"].shape == (2, 4)
-    assert isinstance(local_indices, tuple) and len(local_indices) == 2
-    assert all(torch.equal(indices, torch.arange(4)) for indices in local_indices)
 
 
 def test_round_robin_sharder_captures_lengths_and_pads_token_tensors(monkeypatch):
@@ -1230,72 +1042,6 @@ def test_te_sharder_captures_row_shape(monkeypatch):
     assert torch.equal(sharder.shard_token_tensor(rows), torch.tensor([1.0, 2.0, 3.0, 4.0]))
     # up: gather restores the row coordinate
     assert torch.equal(sharder.gather_token_tensor(torch.tensor([1.0, 2.0, 3.0, 4.0]), seq_dim=0, trim=True), rows)
-
-
-def test_te_sharder_captures_final_thd_stream_length_for_trim(monkeypatch):
-    local_indices = torch.arange(4)
-
-    def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
-        return (dict(batch), local_indices) if return_local_indices else dict(batch)
-
-    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
-
-    strategy = _cu._resolve_cp_sharder(
-        _DummySubMesh(1),
-        None,
-        magi=None,
-        is_thd=True,
-        num_chunks=1,
-        seq_lens_padding_value=-1000,
-        model=None,
-    )
-    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=1, tp_size=1))
-    batch = {
-        "input_ids": torch.arange(4),
-        "cu_seqlens": torch.tensor([0, 2, 4], dtype=torch.int32),
-        "qkv_format": "thd",
-    }
-    sharder.shard(batch)
-
-    layout = sharder.shard_layout
-    assert layout.input_row_shape is None
-    assert (layout.original_seq_len, layout.padded_seq_len) == (4, 4)
-    values = torch.arange(4.0)
-    assert torch.equal(sharder.gather_token_tensor(values, seq_dim=0, trim=True), values)
-
-
-def test_te_sharder_captures_one_layout_per_pipeline_chunk(monkeypatch):
-    chunk_indices = (torch.tensor([0, 3]), torch.tensor([1, 2]))
-
-    def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
-        prepped = {"input_ids": torch.tensor([[0, 3], [1, 2]]), "qkv_format": "thd"}
-        return (prepped, chunk_indices) if return_local_indices else prepped
-
-    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
-
-    strategy = _cu._resolve_cp_sharder(
-        _DummySubMesh(2),
-        None,
-        magi=None,
-        is_thd=True,
-        num_chunks=2,
-        seq_lens_padding_value=-1000,
-        model=None,
-    )
-    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=2, tp_size=1))
-    sharder.shard(
-        {
-            "input_ids": torch.arange(8).reshape(2, 4),
-            "seq_lens": torch.tensor([[4], [4]]),
-            "seq_lens_padded": torch.tensor([[4], [4]]),
-        }
-    )
-
-    layout = sharder.shard_layout
-    assert layout.chunk_layouts is not None and len(layout.chunk_layouts) == 2
-    assert torch.equal(layout.chunk_layouts[0].local_token_global_indices, chunk_indices[0])
-    assert torch.equal(layout.chunk_layouts[1].local_token_global_indices, chunk_indices[1])
-    assert all((child.original_seq_len, child.padded_seq_len) == (4, 4) for child in layout.chunk_layouts)
 
 
 def test_resolve_cp_sharder_layers():

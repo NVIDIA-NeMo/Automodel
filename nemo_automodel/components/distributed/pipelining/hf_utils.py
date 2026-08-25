@@ -124,31 +124,6 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         causal_mask_mapping: dict | None = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
-        """Run one generic decoder pipeline stage.
-
-        Args:
-            input_ids: Token IDs ``[B, S]`` on the first stage, or floating-point
-                hidden states ``[B, S, H]`` on later stages. Packed pipeline
-                microbatches retain a singleton batch axis: ``[1, T]`` or
-                ``[1, T, H]``.
-            attention_mask: Optional padded attention mask ``[B, S]``. Packed
-                THD attention ignores this mask and uses document boundaries.
-            position_ids: Positions ``[B, S]`` or packed positions ``[1, T]``.
-            past_key_values: Optional padded-generation cache; unsupported for
-                packed THD training.
-            inputs_embeds: Hidden states ``[B, S, H]`` or packed ``[1, T, H]``.
-            use_cache: Whether to update a padded-generation cache.
-            cache_position: Optional padded cache positions ``[S]``.
-            causal_mask_mapping: Optional padded causal masks keyed by attention
-                type. THD layers receive ``None`` and use ``cu_seqlens`` instead.
-            **kwargs: Model metadata. Packed THD inputs set ``qkv_format='thd'``
-                and carry ``cu_seqlens`` ``[1, N + 1]`` plus scalar
-                ``max_seqlen``; CP may also supply ``cp_size`` and ``cp_rank``.
-
-        Returns:
-            Hidden states ``[B, S, H]`` (packed: ``[1, T, H]``), either directly
-            for a pipeline stage or in ``BaseModelOutputWithPast``.
-        """
         # For VLM models the text components (embed_tokens, layers, norm) live on a
         # nested text module (e.g. model.language_model) rather than directly on self.
         # get_text_module returns self when no nesting exists (e.g. LlamaModel).
@@ -170,65 +145,30 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 else:
                     raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
 
-        is_thd = kwargs.get("qkv_format") == "thd"
-        if is_thd:
-            if past_key_values is not None:
-                raise ValueError("Packed THD training does not support past_key_values.")
-            if position_ids is None:
-                raise ValueError("Packed THD input requires position_ids.")
+        if use_cache and past_key_values is None:
+            from transformers.cache_utils import DynamicCache
 
-            kwargs.pop("padding_mask", None)
-            if inputs_embeds.ndim > 2:
-                inputs_embeds = inputs_embeds.squeeze(0)
-            if inputs_embeds.ndim != 2:
-                raise ValueError(
-                    f"Packed pipeline THD hidden states must be [1, T, H], got {tuple(inputs_embeds.shape)}."
-                )
-            if position_ids.ndim > 1:
-                position_ids = position_ids.squeeze(0)
-            if position_ids.ndim != 1:
-                raise ValueError(f"Packed pipeline THD position_ids must be [1, T], got {tuple(position_ids.shape)}.")
-            for key, value in kwargs.items():
-                if not isinstance(value, torch.Tensor):
-                    continue
-                if key == "max_seqlen":
-                    kwargs[key] = value.item()
-                    continue
-                if value.ndim > 1:
-                    value = value.squeeze(0)
-                if key in ("cu_seqlens", "cu_seqlens_padded"):
-                    value = value[value != -1000].contiguous()
-                kwargs[key] = value
+            past_key_values = DynamicCache()
 
-            attention_mask = None
-            cache_position = None
-            causal_mask_mapping = {"full_attention": None}
-            use_cache = False
-        else:
-            if use_cache and past_key_values is None:
-                from transformers.cache_utils import DynamicCache
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
 
-                past_key_values = DynamicCache()
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
 
-            if cache_position is None:
-                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-                cache_position = torch.arange(
-                    past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-                )
-
-            if position_ids is None:
-                position_ids = cache_position.unsqueeze(0)
-
-            # Attention mask handling (compilation-friendly):
-            # causal_mask_mapping is precomputed in the data pipeline (default_collater +
-            # add_causal_masks_to_batch) and passed to the first stage. The PP schedule
-            # cannot forward this dict to non-first stages, which therefore arrive with
-            # causal_mask_mapping=None. Build it once per stage and cache it (see
-            # _build_or_reuse_pp_causal_mask) instead of recomputing every microbatch.
-            if causal_mask_mapping is None:
-                causal_mask_mapping = _build_or_reuse_pp_causal_mask(
-                    self, inputs_embeds, attention_mask, cache_position, position_ids
-                )
+        # Attention mask handling (compilation-friendly):
+        # causal_mask_mapping is precomputed in the data pipeline (default_collater +
+        # add_causal_masks_to_batch) and passed to the first stage. The PP schedule
+        # cannot forward this dict to non-first stages, which therefore arrive with
+        # causal_mask_mapping=None. Build it once per stage and cache it (see
+        # _build_or_reuse_pp_causal_mask) instead of recomputing every microbatch.
+        if causal_mask_mapping is None:
+            causal_mask_mapping = _build_or_reuse_pp_causal_mask(
+                self, inputs_embeds, attention_mask, cache_position, position_ids
+            )
 
         hidden_states = inputs_embeds
 
@@ -236,15 +176,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         position_embeddings = None
         rotary_emb = get_text_module(self).rotary_emb
         if rotary_emb is not None:
-            if is_thd:
-                position_embeddings = rotary_emb(
-                    hidden_states,
-                    position_ids,
-                    qkv_format="thd",
-                    cp_size=kwargs.get("cp_size", 1),
-                )
-            else:
-                position_embeddings = rotary_emb(hidden_states, position_ids)
+            position_embeddings = rotary_emb(hidden_states, position_ids)
 
         if hasattr(text_module, "layers") and text_module.layers is not None:
             # Works for dict-like or list-like containers
@@ -264,15 +196,11 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    **(kwargs if is_thd else {}),
                 )
                 hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
         if hasattr(text_module, "norm") and text_module.norm is not None:
             hidden_states = text_module.norm(hidden_states)
-
-        if is_thd:
-            hidden_states = hidden_states.unsqueeze(0)
 
         if model_class_name == "PipelineStage":
             return hidden_states
