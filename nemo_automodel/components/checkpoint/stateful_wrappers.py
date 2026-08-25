@@ -138,67 +138,6 @@ def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
                 state["max_exp_avg_sq"] = _zeros_like_optimizer_param(param)
 
 
-def _te_fused_adam_type() -> type | None:
-    """Return Transformer Engine's FusedAdam type when it is installed."""
-    if not HAS_TE:
-        return None
-    try:
-        from transformer_engine.pytorch.optimizers import FusedAdam
-    except ImportError:
-        return None
-    return FusedAdam
-
-
-def _materialize_missing_te_fused_adam_state(optimizer: torch.optim.Optimizer) -> None:
-    """Build TE FusedAdam destinations before DCP reads optimizer payloads.
-
-    Transformer Engine initializes its per-parameter moments and master state
-    lazily in ``step()``. A fresh optimizer therefore exposes no destinations
-    to :func:`get_optimizer_state_dict`, and DCP can otherwise return from a
-    resume without loading any numerical optimizer state. Use TE's public
-    ``initialize_state`` method directly so no parameter update or step-counter
-    advance occurs.
-
-    Args:
-        optimizer: Optimizer that may be a Transformer Engine FusedAdam.
-    """
-    fused_adam_type = _te_fused_adam_type()
-    if fused_adam_type is None or not isinstance(optimizer, fused_adam_type):
-        return
-    initialize_state = getattr(optimizer, "initialize_state", None)
-    if not callable(initialize_state):
-        raise RuntimeError("Transformer Engine FusedAdam does not expose the required initialize_state method")
-
-    master_weights = bool(getattr(optimizer, "master_weights", False))
-    store_param_remainders = bool(getattr(optimizer, "store_param_remainders", False))
-    expected_state_names = {"exp_avg", "exp_avg_sq"}
-    if master_weights:
-        expected_state_names.add("master_param")
-
-    for group in optimizer.param_groups:
-        parameters = list(group["params"])
-        if not parameters:
-            continue
-        if "step" not in group:
-            capturable = bool(getattr(optimizer, "capturable", group.get("capturable", False)))
-            if capturable:
-                group["step"] = torch.tensor([0], dtype=torch.int, device=parameters[0].device)
-            else:
-                group["step"] = 0
-        for parameter in parameters:
-            state = optimizer.state[parameter]
-            if not state:
-                use_remainders = store_param_remainders and parameter.dtype == torch.bfloat16
-                initialize_state(parameter, use_remainders)
-                state = optimizer.state[parameter]
-            missing = expected_state_names - set(state)
-            if missing:
-                raise RuntimeError(
-                    "Transformer Engine FusedAdam has partially initialized state for one parameter: "
-                    f"missing {sorted(missing)}, present {sorted(state)}"
-                )
-
-
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
     """Extract only trainable PEFT adapter weights, bypassing DCP.
 
@@ -697,9 +636,6 @@ class OptimizerState:
         Returns:
             Dictionary containing the optimizer and scheduler state dicts, optionally offloaded to CPU.
         """
-        for optimizer in self.optimizer:
-            _materialize_missing_te_fused_adam_state(optimizer)
-
         # For PEFT models with quantized parameters or expert parallelism, bypass
         # PyTorch DCP's get_optimizer_state_dict() which fails because DCP cannot
         # build a consistent parameter-ID-to-FQN mapping when the model contains

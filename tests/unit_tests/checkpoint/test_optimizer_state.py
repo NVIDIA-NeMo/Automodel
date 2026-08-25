@@ -22,28 +22,8 @@ from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.checkpoint import stateful_wrappers
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
-
-
-class _FakeTEFusedAdam(torch.optim.Optimizer):
-    """CPU stand-in for TE's lazy optimizer-state initialization contract."""
-
-    def __init__(self, parameter: nn.Parameter, *, capturable: bool = False) -> None:
-        super().__init__([parameter], {"lr": 0.01})
-        self.master_weights = True
-        self.store_param_remainders = True
-        self.capturable = capturable
-        self.initialize_calls = 0
-
-    def initialize_state(self, parameter: nn.Parameter, store_param_remainders: bool) -> None:
-        """Materialize the three numerical slots without updating the parameter."""
-        self.initialize_calls += 1
-        self.state[parameter]["exp_avg"] = torch.zeros_like(parameter, dtype=torch.float32)
-        self.state[parameter]["exp_avg_sq"] = torch.zeros_like(parameter, dtype=torch.float32)
-        master_dtype = torch.int16 if store_param_remainders else torch.float32
-        self.state[parameter]["master_param"] = torch.zeros_like(parameter, dtype=master_dtype)
 
 
 class _ModelOwnedDTensorOptimizerModel(nn.Module):
@@ -328,47 +308,6 @@ def test_flattened_untagged_optimizer_state_preserves_existing_checkpoint_schema
     assert actual_state.keys() == expected_state.keys()
     assert actual_state["state.weight.exp_avg"] is expected_state["state.weight.exp_avg"]
     assert actual_state["param_groups.weight.lr"] == expected_state["param_groups.weight.lr"]
-
-
-@pytest.mark.parametrize("capturable", [False, True])
-def test_optimizer_state_materializes_te_fused_adam_load_destinations(monkeypatch, capturable: bool) -> None:
-    """Fresh TE FusedAdam state and its group step exist before DCP planning."""
-    model = nn.Linear(2, 1, bias=False, dtype=torch.bfloat16)
-    optimizer = _FakeTEFusedAdam(model.weight, capturable=capturable)
-    monkeypatch.setattr(stateful_wrappers, "_te_fused_adam_type", lambda: _FakeTEFusedAdam)
-
-    def fake_get_optimizer_state_dict(model_arg, optimizer_arg, *, options):
-        del model_arg, options
-        state = optimizer_arg.state[model.weight]
-        assert set(state) == {"exp_avg", "exp_avg_sq", "master_param"}
-        assert state["exp_avg"].dtype == torch.float32
-        assert state["exp_avg_sq"].dtype == torch.float32
-        assert state["master_param"].dtype == torch.int16
-        step = optimizer_arg.param_groups[0]["step"]
-        if capturable:
-            torch.testing.assert_close(step, torch.tensor([0], dtype=torch.int), rtol=0, atol=0)
-        else:
-            assert step == 0
-        return {"state.weight.exp_avg": state["exp_avg"]}
-
-    monkeypatch.setattr(stateful_wrappers, "get_optimizer_state_dict", fake_get_optimizer_state_dict)
-    state_dict = OptimizerState(model, optimizer).state_dict()
-    assert state_dict["optim"].keys() == {"state.weight.exp_avg"}
-    assert optimizer.initialize_calls == 1
-
-    OptimizerState(model, optimizer).state_dict()
-    assert optimizer.initialize_calls == 1
-
-
-def test_optimizer_state_rejects_partially_initialized_te_fused_adam(monkeypatch) -> None:
-    """A partial TE state is corruption, not permission to overwrite slots."""
-    model = nn.Linear(2, 1, bias=False, dtype=torch.bfloat16)
-    optimizer = _FakeTEFusedAdam(model.weight)
-    optimizer.state[model.weight]["exp_avg"] = torch.zeros_like(model.weight, dtype=torch.float32)
-    monkeypatch.setattr(stateful_wrappers, "_te_fused_adam_type", lambda: _FakeTEFusedAdam)
-
-    with pytest.raises(RuntimeError, match="partially initialized state.*exp_avg_sq.*master_param"):
-        OptimizerState(model, optimizer).state_dict()
 
 
 def test_native_multi_optimizer_state_dcp_round_trip(tmp_path):
