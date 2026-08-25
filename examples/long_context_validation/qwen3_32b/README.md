@@ -127,6 +127,10 @@ NPROC_PER_NODE=16 NUM_THREADS=5 bash <ckpt>/epoch_0_step_<N>/model/consolidate.s
 _Training / validation loss curve (wandb):
 <https://wandb.ai/Nemo-automodel/long_context_validation_qwen3_32b/workspace?nw=nwuserathittenaman>._
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/examples/long_context_validation/qwen3_32b/qwen3_32b_coderforge_sft.png" alt="Qwen3-32B SFT training loss curve on CoderForge" width="700">
+</p>
+
 ## Phase 3 — SWE-bench Verified evaluation
 
 ### Goal
