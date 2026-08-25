@@ -33,6 +33,17 @@ from nemo_automodel.components.moe.state_dict_utils import (
 _LORA_EXPERT_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
 
 
+def get_world_size_safe() -> int:
+    """Return the distributed world size before or after process-group initialization.
+
+    Returns:
+        The initialized process-group size, or ``WORLD_SIZE`` before initialization.
+    """
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
 class MoESplitExpertsStateDictMixin:
     """Mixin class providing MoE state dict conversion utilities.
 
@@ -79,9 +90,7 @@ class MoESplitExpertsStateDictMixin:
             return False
         if self.backend.dispatcher not in {"deepep", "hybridep", "uccl_ep"}:
             return True
-        if torch.distributed.is_initialized():
-            return torch.distributed.get_world_size() == 1
-        return int(os.environ.get("WORLD_SIZE", "1")) == 1
+        return get_world_size_safe() == 1
 
     @property
     def _is_gated_moe(self) -> bool:
@@ -874,6 +883,17 @@ class MoESplitExpertsStateDictMixin:
         inter_dim = self.moe_config.moe_inter_dim
         prefix = prefix_override if prefix_override is not None else self._hf_prefix
         expert_segment = self._expert_path_segment
+
+        # MoE expert LoRA keys do not depend on the runtime backend or its checkpoint storage aliases.
+        # When v4_compatible=True, emit per-expert split keys. Otherwise, adapters that explicitly opt in emit the
+        # fused ParamWrapper format; unvalidated adapters retain the legacy per-expert format.
+        v4_compatible = kwargs.get("v4_compatible", False)
+        for suffix in _LORA_EXPERT_SUFFIXES:
+            if f".{expert_segment}.{suffix}" in fqn and fqn.endswith(f".{suffix}"):
+                if not v4_compatible and self._v5_peft_target_parameters:
+                    return self._convert_lora_to_paramwrapper(fqn, tensor)
+                return self._convert_lora_expert_to_hf(fqn, tensor, n_experts, inter_dim, expert_segment)
+
         # Quantization casts each split with ``value.to(float8_e4m3fn)``, creating storage separate from the model's
         # grouped weights. DCP must not treat that cast as model weight memory, or the model would keep its random
         # expert values. Quantized loads therefore rebuild the grouped expert tensor after the read.
@@ -998,17 +1018,5 @@ class MoESplitExpertsStateDictMixin:
                     gc.collect(0)
                     torch.cuda.empty_cache()
             return result
-
-        # MoE expert LoRA keys: convert to HF-PEFT-compatible format.
-        # When v4_compatible=True: per-expert split keys (v4 format).
-        # When v4_compatible=False and the adapter explicitly opts in: fused
-        # ParamWrapper format (v5). Unvalidated adapters retain the legacy
-        # per-expert format even when v4_compatible is not requested.
-        v4_compatible = kwargs.get("v4_compatible", False)
-        for suffix in _LORA_EXPERT_SUFFIXES:
-            if f".{expert_segment}.{suffix}" in fqn and fqn.endswith(f".{suffix}"):
-                if not v4_compatible and self._v5_peft_target_parameters:
-                    return self._convert_lora_to_paramwrapper(fqn, tensor)
-                return self._convert_lora_expert_to_hf(fqn, tensor, n_experts, inter_dim, expert_segment)
 
         return None
