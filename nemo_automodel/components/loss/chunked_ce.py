@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -165,8 +164,8 @@ class ChunkedCrossEntropy(nn.Module):
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        num_label_tokens: Optional[int] = None,
+        mask: torch.Tensor | None = None,
+        num_label_tokens: int | None = None,
     ) -> torch.Tensor:
         """Computes cross-entropy loss in chunks to handle long sequences more efficiently.
 
