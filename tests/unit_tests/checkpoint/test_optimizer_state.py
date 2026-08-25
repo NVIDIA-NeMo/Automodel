@@ -25,9 +25,7 @@ from torch.distributed.tensor import DTensor, Shard
 from nemo_automodel.components.checkpoint import stateful_wrappers
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
-from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec, OwnerShardedParameterSpec
-
-_TEST_OWNER_STATE_NAMESPACE = "__test_owner_sharded_v1"
+from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec
 
 
 class _FakeTEFusedAdam(torch.optim.Optimizer):
@@ -78,23 +76,6 @@ class _ModelOwnedDTensorOptimizerModel(nn.Module):
         self.weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
             process_group=process_group,
             gradient_divisor=float(world_size),
-            legacy_optimizer_state_namespace=_TEST_OWNER_STATE_NAMESPACE,
-        )
-
-
-class _LegacyOwnerOptimizerModel(nn.Module):
-    """Pre-DTensor local owner parameter used to create bridge checkpoints."""
-
-    def __init__(self, process_group: torch.distributed.ProcessGroup, *, global_rows: int = 8) -> None:
-        super().__init__()
-        world_size = torch.distributed.get_world_size(process_group)
-        if global_rows % world_size:
-            raise ValueError("global_rows must divide evenly over the test process group")
-        self.weight = nn.Parameter(torch.zeros(global_rows // world_size, 2))
-        self.weight._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
-            process_group=process_group,
-            gradient_divisor=float(world_size),
-            optimizer_state_namespace=_TEST_OWNER_STATE_NAMESPACE,
         )
 
 
@@ -165,155 +146,6 @@ def _make_stepped_adam_parts(
     return model_parts, optimizers
 
 
-class _OwnerShardedOptimizerModel(nn.Module):
-    """Tiny model with one replicated and one model-owned parameter shard."""
-
-    def __init__(self, process_group: torch.distributed.ProcessGroup) -> None:
-        super().__init__()
-        self.regular = nn.Parameter(torch.ones(2))
-        self.owner = nn.Parameter(torch.ones(2))
-        self.owner._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
-            process_group=process_group,
-            gradient_divisor=2.0,
-            optimizer_state_namespace=_TEST_OWNER_STATE_NAMESPACE,
-        )
-
-
-class _NamedOwnerShardModel(nn.Module):
-    """Owner-sharded parameter with a caller-selected FQN for multi-part tests."""
-
-    def __init__(self, process_group: torch.distributed.ProcessGroup, name: str) -> None:
-        super().__init__()
-        self.register_parameter(name, nn.Parameter(torch.ones(2)))
-        parameter = self.get_parameter(name)
-        parameter._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
-            process_group=process_group,
-            gradient_divisor=2.0,
-            optimizer_state_namespace=_TEST_OWNER_STATE_NAMESPACE,
-        )
-
-
-def _run_owner_sharded_optimizer_dcp_round_trip(
-    rank: int,
-    world_size: int,
-    init_file: str,
-    checkpoint_dir: str,
-) -> None:
-    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
-    torch.distributed.init_process_group(
-        "gloo",
-        init_method=f"file://{init_file}",
-        rank=rank,
-        world_size=world_size,
-    )
-    try:
-        source_model = _OwnerShardedOptimizerModel(torch.distributed.group.WORLD)
-        source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=0.01)
-        source_model.regular.grad = torch.ones_like(source_model.regular)
-        source_model.owner.grad = torch.full_like(source_model.owner, float(rank + 1))
-        source_optimizer.step()
-
-        regular_state = source_optimizer.state[source_model.regular]
-        owner_state = source_optimizer.state[source_model.owner]
-        regular_state["exp_avg"].fill_(7.0)
-        regular_state["exp_avg_sq"].fill_(8.0)
-        owner_state["step"].fill_(rank + 10)
-        owner_state["exp_avg"].fill_(rank + 1)
-        owner_state["exp_avg_sq"].fill_(rank + 2)
-        expected_owner_state = {name: value.clone() for name, value in owner_state.items()}
-
-        local_state = OptimizerState(source_model, source_optimizer).state_dict()["optim"]
-        assert "state.regular.exp_avg" in local_state
-        assert "state.owner.exp_avg" not in local_state
-        owner_key = next(
-            key
-            for key in local_state
-            if key.startswith(f"state.{_TEST_OWNER_STATE_NAMESPACE}") and key.endswith(".exp_avg")
-        )
-        assert owner_key == (f"state.{_TEST_OWNER_STATE_NAMESPACE}.owner_rank_{rank}.global_rank_{rank}.owner.exp_avg")
-        topology_key = f"{_TEST_OWNER_STATE_NAMESPACE}.metadata.global_rank_{rank}.owner.owner_world_size"
-        assert local_state[topology_key] == world_size
-        assert "param_groups.owner.lr" in local_state
-
-        mismatched_topology_state = {"optim": dict(local_state)}
-        mismatched_topology_state["optim"][topology_key] += 1
-        with pytest.raises(RuntimeError, match="Optimizer-state resharding is unsupported"):
-            OptimizerState(source_model, source_optimizer).load_state_dict(mismatched_topology_state)
-
-        legacy_state = {"optim": {}}
-        owner_prefix = f"state.{_TEST_OWNER_STATE_NAMESPACE}.owner_rank_{rank}.global_rank_{rank}.owner."
-        for key, value in local_state.items():
-            if key == topology_key:
-                continue
-            legacy_key = f"state.owner.{key.removeprefix(owner_prefix)}" if key.startswith(owner_prefix) else key
-            legacy_state["optim"][legacy_key] = value
-        with pytest.raises(RuntimeError, match="Legacy owner-sharded optimizer state cannot be resumed safely"):
-            OptimizerState(source_model, source_optimizer).load_state_dict(legacy_state)
-
-        checkpointer = Checkpointer(
-            CheckpointingConfig(
-                checkpoint_dir=checkpoint_dir,
-                model_save_format="safetensors",
-                save_consolidated=False,
-                is_peft=False,
-            ),
-            dp_rank=rank,
-            tp_rank=0,
-            pp_rank=0,
-            process_group=torch.distributed.group.WORLD,
-        )
-        checkpointer.save_optimizer(source_optimizer, source_model, checkpoint_dir)
-        checkpoint_keys = FileSystemReader(os.path.join(checkpoint_dir, "optim")).read_metadata().state_dict_metadata
-        assert "optim.state.regular.exp_avg" in checkpoint_keys
-        for owner_rank in range(world_size):
-            assert (
-                f"optim.state.{_TEST_OWNER_STATE_NAMESPACE}.owner_rank_{owner_rank}."
-                f"global_rank_{owner_rank}.owner.exp_avg"
-            ) in checkpoint_keys
-
-        target_model = _OwnerShardedOptimizerModel(torch.distributed.group.WORLD)
-        target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=0.5)
-        assert target_model.owner is not source_model.owner
-        checkpointer.load_optimizer(target_optimizer, target_model, checkpoint_dir)
-
-        target_regular_state = target_optimizer.state[target_model.regular]
-        target_owner_state = target_optimizer.state[target_model.owner]
-        torch.testing.assert_close(target_regular_state["exp_avg"], regular_state["exp_avg"])
-        torch.testing.assert_close(target_regular_state["exp_avg_sq"], regular_state["exp_avg_sq"])
-        for name, expected in expected_owner_state.items():
-            torch.testing.assert_close(target_owner_state[name], expected)
-
-        source_parts = [
-            _NamedOwnerShardModel(torch.distributed.group.WORLD, "owner_a"),
-            _NamedOwnerShardModel(torch.distributed.group.WORLD, "owner_b"),
-        ]
-        source_optimizers = [torch.optim.AdamW(part.parameters()) for part in source_parts]
-        expected_part_moments = []
-        for part_index, (part, optimizer) in enumerate(zip(source_parts, source_optimizers, strict=True)):
-            parameter = next(part.parameters())
-            parameter.grad = torch.full_like(parameter, float(rank + part_index + 1))
-            optimizer.step()
-            optimizer.state[parameter]["exp_avg"].fill_(10 * (part_index + 1) + rank)
-            expected_part_moments.append(optimizer.state[parameter]["exp_avg"].clone())
-        combined_state = OptimizerState(source_parts, source_optimizers).state_dict()
-
-        target_parts = [
-            _NamedOwnerShardModel(torch.distributed.group.WORLD, "owner_a"),
-            _NamedOwnerShardModel(torch.distributed.group.WORLD, "owner_b"),
-        ]
-        target_optimizers = [torch.optim.AdamW(part.parameters()) for part in target_parts]
-        OptimizerState(target_parts, target_optimizers).load_state_dict(combined_state)
-        for part, optimizer, expected in zip(
-            target_parts,
-            target_optimizers,
-            expected_part_moments,
-            strict=True,
-        ):
-            torch.testing.assert_close(optimizer.state[next(part.parameters())]["exp_avg"], expected)
-    finally:
-        torch.distributed.destroy_process_group()
-
-
 def _run_native_dtensor_optimizer_save(
     rank: int,
     world_size: int,
@@ -335,7 +167,6 @@ def _run_native_dtensor_optimizer_save(
         checkpointer.save_optimizer(optimizer, model, checkpoint_dir)
         torch.distributed.barrier()
         metadata = FileSystemReader(os.path.join(checkpoint_dir, "optim")).read_metadata().state_dict_metadata
-        assert not any(_TEST_OWNER_STATE_NAMESPACE in key for key in metadata)
         exp_avg_metadata = metadata["optim.state.weight.exp_avg"]
         assert tuple(exp_avg_metadata.size) == (8, 2)
         assert len(exp_avg_metadata.chunks) == world_size
@@ -371,63 +202,6 @@ def _run_native_dtensor_optimizer_load(
         metadata = FileSystemReader(os.path.join(resaved_checkpoint_dir, "optim")).read_metadata().state_dict_metadata
         assert tuple(metadata["optim.state.weight.exp_avg"].size) == (8, 2)
         assert len(metadata["optim.state.weight.exp_avg"].chunks) == world_size
-        assert not any(_TEST_OWNER_STATE_NAMESPACE in key for key in metadata)
-    finally:
-        torch.distributed.destroy_process_group()
-
-
-def _run_legacy_owner_optimizer_save(
-    rank: int,
-    world_size: int,
-    init_file: str,
-    checkpoint_dir: str,
-) -> None:
-    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
-    torch.distributed.init_process_group(
-        "gloo",
-        init_method=f"file://{init_file}",
-        rank=rank,
-        world_size=world_size,
-    )
-    try:
-        model = _LegacyOwnerOptimizerModel(torch.distributed.group.WORLD)
-        optimizer = torch.optim.AdamW([model.weight], lr=0.031, foreach=False)
-        _fill_row_coded_adam_state(model, optimizer, rank)
-        checkpointer = _make_distributed_checkpointer(rank, checkpoint_dir)
-        checkpointer.save_optimizer(optimizer, model, checkpoint_dir)
-        torch.distributed.barrier()
-        metadata = FileSystemReader(os.path.join(checkpoint_dir, "optim")).read_metadata().state_dict_metadata
-        assert any(_TEST_OWNER_STATE_NAMESPACE in key for key in metadata)
-        assert "optim.state.weight.exp_avg" not in metadata
-    finally:
-        torch.distributed.destroy_process_group()
-
-
-def _run_legacy_owner_optimizer_load(
-    rank: int,
-    world_size: int,
-    init_file: str,
-    checkpoint_dir: str,
-    expect_topology_rejection: bool,
-) -> None:
-    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
-    torch.distributed.init_process_group(
-        "gloo",
-        init_method=f"file://{init_file}",
-        rank=rank,
-        world_size=world_size,
-    )
-    try:
-        model = _ModelOwnedDTensorOptimizerModel(torch.distributed.group.WORLD)
-        optimizer = torch.optim.AdamW([model.weight], lr=0.9, foreach=False)
-        checkpointer = _make_distributed_checkpointer(rank, checkpoint_dir)
-        if expect_topology_rejection:
-            with pytest.raises(RuntimeError, match="Cross-topology legacy optimizer resharding is unsupported"):
-                checkpointer.load_optimizer(optimizer, model, checkpoint_dir)
-            return
-        checkpointer.load_optimizer(optimizer, model, checkpoint_dir)
-        _assert_row_coded_adam_state(model, optimizer, rank)
-        assert optimizer.param_groups[0]["lr"] == 0.031
     finally:
         torch.distributed.destroy_process_group()
 
@@ -663,42 +437,6 @@ def test_native_pipeline_optimizer_state_dcp_round_trip_across_ranks(tmp_path):
     )
 
 
-def test_owner_sharded_optimizer_state_rejects_untyped_marker():
-    model = nn.Linear(2, 1, bias=False)
-    model.weight._nemo_owner_sharded_spec = object()
-    optimizer = torch.optim.AdamW(model.parameters())
-
-    with pytest.raises(TypeError, match="must be an OwnerShardedParameterSpec"):
-        OptimizerState(model, optimizer).state_dict()
-
-
-def test_owner_sharded_optimizer_state_rejects_ambiguous_distributed_owner():
-    model = nn.Linear(2, 1, bias=False)
-    model.weight._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
-        process_group=None,
-        gradient_divisor=2.0,
-        optimizer_state_namespace=_TEST_OWNER_STATE_NAMESPACE,
-    )
-    optimizer = torch.optim.AdamW(model.parameters())
-
-    with (
-        patch("torch.distributed.is_initialized", return_value=True),
-        patch("torch.distributed.get_world_size", return_value=2),
-        pytest.raises(RuntimeError, match="unique owner identity cannot be derived"),
-    ):
-        OptimizerState(model, optimizer).state_dict()
-
-
-def test_owner_sharded_optimizer_state_dcp_round_trip_across_ranks(tmp_path):
-    world_size = 2
-    torch.multiprocessing.spawn(
-        _run_owner_sharded_optimizer_dcp_round_trip,
-        args=(world_size, str(tmp_path / "dist_init"), str(tmp_path / "checkpoint")),
-        nprocs=world_size,
-        join=True,
-    )
-
-
 def test_model_owned_dtensor_optimizer_state_reshards_world_two_to_four(tmp_path):
     checkpoint_dir = str(tmp_path / "native-dtensor-checkpoint")
     torch.multiprocessing.spawn(
@@ -715,28 +453,6 @@ def test_model_owned_dtensor_optimizer_state_reshards_world_two_to_four(tmp_path
             checkpoint_dir,
             str(tmp_path / "native-dtensor-resaved"),
         ),
-        nprocs=4,
-        join=True,
-    )
-
-
-def test_legacy_owner_optimizer_loads_same_topology_and_rejects_reshard(tmp_path):
-    checkpoint_dir = str(tmp_path / "legacy-owner-checkpoint")
-    torch.multiprocessing.spawn(
-        _run_legacy_owner_optimizer_save,
-        args=(2, str(tmp_path / "legacy-save-init"), checkpoint_dir),
-        nprocs=2,
-        join=True,
-    )
-    torch.multiprocessing.spawn(
-        _run_legacy_owner_optimizer_load,
-        args=(2, str(tmp_path / "legacy-load-same-init"), checkpoint_dir, False),
-        nprocs=2,
-        join=True,
-    )
-    torch.multiprocessing.spawn(
-        _run_legacy_owner_optimizer_load,
-        args=(4, str(tmp_path / "legacy-load-reshard-init"), checkpoint_dir, True),
         nprocs=4,
         join=True,
     )

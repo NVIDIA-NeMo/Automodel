@@ -270,7 +270,4 @@ def test_engram_owner_markers_are_restored_after_meta_materialization() -> None:
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     assert torch.isfinite(table.weight).all()
     assert torch.count_nonzero(table.weight) > 0
-    owner_spec = table.weight._nemo_owner_sharded_spec
-    assert owner_spec.process_group is None
-    assert owner_spec.gradient_divisor == 1.0
-    assert owner_spec.optimizer_state_namespace == "__nemo_engram_owner_v1"
+    assert not hasattr(table.weight, "_nemo_model_owned_dtensor_spec")

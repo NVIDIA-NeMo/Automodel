@@ -64,7 +64,6 @@ def _engram_scale_and_norm_worker(rank: int, world_size: int, store_path: str) -
         assert owner_spec is not None
         assert owner_spec.process_group is dist.group.WORLD
         assert owner_spec.gradient_divisor == float(world_size)
-        assert owner_spec.legacy_optimizer_state_namespace == "__nemo_engram_owner_v1"
         model.table.weight.grad = torch.full_like(model.table.weight, float(rank + 1))
 
         total_norm = scale_grads_and_clip_grad_norm(

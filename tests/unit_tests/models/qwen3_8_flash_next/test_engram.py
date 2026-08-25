@@ -317,10 +317,7 @@ def test_local_engram_table_matches_torch_embedding_forward_and_backward() -> No
     ).build(process_group=None, dtype=torch.float32)
     assert table.global_row_start == table.local_row_start == 0
     assert table.global_row_end == table.local_row_end == 12
-    owner_spec = table.weight._nemo_owner_sharded_spec
-    assert owner_spec.process_group is None
-    assert owner_spec.gradient_divisor == 1.0
-    assert owner_spec.optimizer_state_namespace == "__nemo_engram_owner_v1"
+    assert not hasattr(table.weight, "_nemo_model_owned_dtensor_spec")
     reference_weight = torch.arange(36, dtype=torch.float32).view(12, 3) / 10
     table.weight.detach().copy_(reference_weight)
     global_ids = torch.tensor([[0, 7, 7], [11, 1, 6]])

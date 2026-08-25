@@ -29,7 +29,7 @@ from nemo_automodel.components.training.utils import (
     move_to_device,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.shared.owner_sharding import OwnerShardedParameterSpec
+from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec
 
 
 def test_docstring_example():
@@ -184,10 +184,9 @@ def test_clip_grad_norm_disables_torch_fast_path_for_owner_shard(monkeypatch):
     """A model-owned local shard requires the contract's global norm group."""
     model = torch.nn.Linear(2, 1, bias=False)
     model.weight.grad = torch.tensor([[3.0, 4.0]])
-    model.weight._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
+    model.weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
         process_group=None,
         gradient_divisor=1.0,
-        optimizer_state_namespace="__test_owner_v1",
     )
 
     torch_clip_mock = Mock(return_value=torch.tensor(-1.0))
@@ -582,10 +581,9 @@ class TestScaleGradsAndClipGradNorm:
         """Owner scaling is declared by the model and independent of DP arguments."""
         model = nn.Linear(2, 1, bias=False)
         model.weight.grad = torch.full_like(model.weight, 8.0)
-        model.weight._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
+        model.weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
             process_group=None,
             gradient_divisor=4.0,
-            optimizer_state_namespace="__test_owner_v1",
         )
 
         scale_grads_and_clip_grad_norm(

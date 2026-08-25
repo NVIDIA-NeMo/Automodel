@@ -22,10 +22,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
-from nemo_automodel.shared.owner_sharding import (
-    get_model_owned_dtensor_spec,
-    get_owner_sharded_parameter_spec,
-)
+from nemo_automodel.shared.owner_sharding import get_model_owned_dtensor_spec
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -120,12 +117,12 @@ def _clip_grad_norm_impl(
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
 ) -> torch.Tensor:
-    """Compute and clip the norm of local, DTensor, and owner-sharded gradients.
+    """Compute and clip the norm of local and DTensor gradients.
 
     Args:
         parameters: One parameter tensor or an iterable of parameter tensors
             with arbitrary shapes. DTensors retain their declared mesh and
-            placements; owner-sharded parameters remain rank-local tensors.
+            placements.
         max_norm: Maximum allowed global gradient norm.
         norm_type: Norm exponent, including ``inf``.
         error_if_nonfinite: Whether to raise for a non-finite global norm.
@@ -148,26 +145,11 @@ def _clip_grad_norm_impl(
         if p.grad is None:
             continue
 
-        owner_spec = get_owner_sharded_parameter_spec(p)
         if isinstance(p, DTensor):
             # Create a hashable key from device_mesh and placements
             mesh_id = id(p.device_mesh)
             placements_tuple = tuple(str(placement) for placement in p.placements)
             key = (mesh_id, placements_tuple)
-        elif owner_spec is not None:
-            owner_process_group = owner_spec.process_group
-            if owner_process_group is None and torch.distributed.is_initialized():
-                distributed_world_size = torch.distributed.get_world_size()
-                if distributed_world_size > 1:
-                    raise RuntimeError(
-                        "Cannot compute the global norm of an owner-sharded parameter whose process_group "
-                        f"is None in a distributed world of size {distributed_world_size}."
-                    )
-            # These are regular local Parameters whose logical values are
-            # physically partitioned over the owner group. Keep them separate
-            # so the scalar reduction includes each owner's disjoint values
-            # exactly once.
-            key = ("owner_sharded", id(owner_process_group))
         else:
             # Regular tensor - group separately
             key = ("regular", "regular")
@@ -203,9 +185,6 @@ def _clip_grad_norm_impl(
     for group_params in sharding_groups.values():
         first = group_params[0]
         is_dtensor = isinstance(first, DTensor)
-        owner_spec = get_owner_sharded_parameter_spec(first)
-        owner_process_group = owner_spec.process_group if owner_spec is not None else None
-        is_owner_shard = owner_spec is not None
         # Partial placements can't be reduced via sum-of-local-norms; materialize
         # those per-grad (each full_tensor() is a same-shape collective, safe).
         has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
@@ -226,8 +205,6 @@ def _clip_grad_norm_impl(
                 if isinstance(pl, Replicate):
                     continue
                 local_max = _all_reduce_scalar(local_max, torch.distributed.ReduceOp.MAX, mesh, dim_idx)
-        elif is_owner_shard and owner_process_group is not None:
-            torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX, group=owner_process_group)
 
         if is_inf:
             group_norms.append(local_max)
@@ -253,8 +230,6 @@ def _clip_grad_norm_impl(
                 if isinstance(pl, Replicate):
                     continue
                 local_val = _all_reduce_scalar(local_val, torch.distributed.ReduceOp.SUM, mesh, dim_idx)
-        elif is_owner_shard and owner_process_group is not None:
-            torch.distributed.all_reduce(local_val, op=torch.distributed.ReduceOp.SUM, group=owner_process_group)
 
         group_norms.append(local_max * local_val.pow(1.0 / norm_type))
 
@@ -341,7 +316,7 @@ def clip_grad_norm(
     can_use_torch_clip = use_torch_clip_grad_norm and pp_mesh is None
     if can_use_torch_clip:
         for p in parameters:
-            if isinstance(p, DTensor) or isinstance(p.grad, DTensor) or get_owner_sharded_parameter_spec(p) is not None:
+            if isinstance(p, DTensor) or isinstance(p.grad, DTensor) or get_model_owned_dtensor_spec(p) is not None:
                 can_use_torch_clip = False
                 break
 
@@ -488,7 +463,7 @@ def scale_grads_and_clip_grad_norm(
             ep_ratio *= float(expert_tp_replication_factor)
 
     has_model_owned_sharded_params = any(
-        get_owner_sharded_parameter_spec(parameter) is not None or get_model_owned_dtensor_spec(parameter) is not None
+        get_model_owned_dtensor_spec(parameter) is not None
         for model_part in model_parts
         for parameter in model_part.parameters()
     )
@@ -501,7 +476,7 @@ def scale_grads_and_clip_grad_norm(
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
-                owner_spec = get_owner_sharded_parameter_spec(p) or get_model_owned_dtensor_spec(p)
+                owner_spec = get_model_owned_dtensor_spec(p)
                 if owner_spec is not None:
                     p.grad.div_(float(owner_spec.gradient_divisor))
                 if ep_ratio is not None:

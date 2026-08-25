@@ -444,8 +444,8 @@ def test_get_hf_state_dict_keys_lists_all_global_shards_without_table_views(
     native_table = table.state_dict()["weight"]
 
     with patch.object(
-        adapter,
-        "_table_checkpoint_views",
+        torch.Tensor,
+        "narrow",
         side_effect=AssertionError("key discovery must not construct rank-local table views"),
     ):
         keys = adapter.get_hf_state_dict_keys(
@@ -464,7 +464,6 @@ def test_get_hf_state_dict_keys_lists_all_global_shards_without_table_views(
         f"{_TABLE_PREFIX}.shard_3.weight",
         buffer_key,
     ]
-    assert adapter._pending_table_aliases == {}
 
 
 def test_from_hf_drops_table_aliases_and_marks_native_weight_loaded(
@@ -485,32 +484,6 @@ def test_from_hf_drops_table_aliases_and_marks_native_weight_loaded(
     assert adapter.view_loaded_native_keys == {_TABLE_KEY}
     torch.testing.assert_close(table.weight[:4], torch.full((4, 3), 2.0))
     torch.testing.assert_close(table.weight[4:], torch.full((4, 3), 3.0))
-
-
-def test_from_hf_rejects_materialized_table_instead_of_concatenating(
-    adapter: Qwen3_8_FlashNextStateDictAdapter,
-    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
-) -> None:
-    """Independent ``[4, 3]`` shard tensors cannot trigger a hidden global allocation."""
-    destinations = adapter.to_hf({_TABLE_KEY: table.state_dict()["weight"]})
-    materialized = {key: value.clone() for key, value in destinations.items()}
-
-    with pytest.raises(RuntimeError, match="not the write-through view"):
-        adapter.from_hf(materialized)
-
-    assert adapter.view_loaded_native_keys == set()
-
-
-def test_from_hf_requires_every_local_physical_shard(
-    adapter: Qwen3_8_FlashNextStateDictAdapter,
-    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
-) -> None:
-    """A partially populated local ``[8, 3]`` owner shard is rejected."""
-    destinations = adapter.to_hf({_TABLE_KEY: table.state_dict()["weight"]})
-    destinations.pop(f"{_TABLE_PREFIX}.shard_3.weight")
-
-    with pytest.raises(RuntimeError, match="missing=.*shard_3"):
-        adapter.from_hf(destinations)
 
 
 def test_adapter_rejects_owner_ranges_that_cut_a_checkpoint_shard(

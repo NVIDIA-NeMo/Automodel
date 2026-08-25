@@ -13,10 +13,8 @@
 # limitations under the License.
 
 import logging
-import re
-from dataclasses import dataclass
 from functools import partial
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 
@@ -51,7 +49,6 @@ if HAS_TE:
     te_base.TransformerEngineBaseModule.set_extra_state = _safe_set_extra_state
     te_ops.BasicOperation.set_extra_state = _safe_op_set_extra_state
 
-from torch.distributed.checkpoint.metadata import BytesStorageMetadata, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -59,7 +56,6 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
-from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -68,500 +64,11 @@ from nemo_automodel.components.checkpoint.utils import (
     is_tied_word_embeddings,
     materialize_missing_tied_lm_head,
 )
-from nemo_automodel.shared.owner_sharding import (
-    ModelOwnedDTensorSpec,
-    get_model_owned_dtensor_spec,
-    get_owner_sharded_parameter_spec,
-)
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _PREFIX = "model."
 _OPTIMIZER_PARTS_KEY = "optimizer_parts"
 _OPTIMIZER_PART_KEY_PREFIX = "stage_"
-
-
-@dataclass
-class _LegacyDTensorStateDestination:
-    """One logical optimizer state temporarily exposed under a legacy key."""
-
-    logical_key: str
-    legacy_key: str
-    logical_value: Any
-
-
-@dataclass
-class _LegacyModelOwnedDTensorLoad:
-    """Mutable bridge state kept between DCP load preparation and finalization."""
-
-    destinations: list[_LegacyDTensorStateDestination]
-    metadata_keys: dict[str, int]
-
-
-def _model_owned_dtensor_optimizer_specs(
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-) -> dict[str, tuple[torch.Tensor, ModelOwnedDTensorSpec]]:
-    """Return canonical FQNs and contracts for optimizer-tracked model DTensors."""
-    marked_parameters: dict[int, torch.Tensor] = {}
-    for parameter_group in optimizer.param_groups:
-        for parameter in parameter_group["params"]:
-            spec = get_model_owned_dtensor_spec(parameter)
-            if spec is None:
-                continue
-            parameter_id = id(parameter)
-            if parameter_id in marked_parameters:
-                raise RuntimeError("A model-owned DTensor appears more than once in the optimizer.")
-            marked_parameters[parameter_id] = parameter
-    if not marked_parameters:
-        return {}
-
-    fqns_by_parameter_id: dict[int, set[str]] = {parameter_id: set() for parameter_id in marked_parameters}
-    for name, parameter in model.named_parameters(remove_duplicate=False):
-        if id(parameter) in fqns_by_parameter_id:
-            fqns_by_parameter_id[id(parameter)].add(canonical_parameter_fqn(name))
-
-    result: dict[str, tuple[torch.Tensor, ModelOwnedDTensorSpec]] = {}
-    for parameter_id, parameter in marked_parameters.items():
-        fqns = fqns_by_parameter_id[parameter_id]
-        if len(fqns) != 1:
-            raise RuntimeError(
-                "Cannot checkpoint a model-owned DTensor optimizer parameter: "
-                f"expected exactly one canonical model FQN, found {sorted(fqns)}."
-            )
-        fqn = next(iter(fqns))
-        spec = get_model_owned_dtensor_spec(parameter)
-        assert spec is not None
-        if fqn in result:
-            raise RuntimeError(f"Duplicate model-owned DTensor parameter FQN '{fqn}'.")
-        result[fqn] = (parameter, spec)
-    return result
-
-
-def _owner_sharded_optimizer_state_prefixes(
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-) -> dict[str, tuple[str, str, int]]:
-    """Return stable DCP namespaces for model-owned parameter shards.
-
-    Owner-sharded tensors deliberately remain ordinary ``Parameter`` objects
-    instead of DTensors. PyTorch DCP would consequently classify their optimizer
-    tensors as replicated by FQN and retain only one rank's value. A versioned,
-    model-supplied namespace and owner identity make those tensors rank-distinct
-    without gathering them.
-
-    The state namespace uses both the semantic owner rank and global rank so
-    multiple owner groups cannot collide in one DCP collective.  Separate
-    rank-local metadata records the owner-group size.  Resuming therefore
-    requires the same owner-group membership, owner-rank-to-row mapping, and rank
-    count as the checkpoint; optimizer-state resharding across a different owner
-    topology is unsupported. Ordinary optimizer keys and owner-sharded keys
-    without a distributed owner group are unchanged.
-
-    Args:
-        model: Model whose tagged owner parameter has rank-local shape
-            ``[local_rows, embedding_dim]``.
-        optimizer: Optimizer containing that exact parameter identity.
-
-    Returns:
-        Mapping from canonical parameter FQN to its versioned state prefix,
-        topology-metadata key, and owner-group size.
-    """
-    marked_parameters: dict[int, torch.Tensor] = {}
-    for parameter_group in optimizer.param_groups:
-        for parameter in parameter_group["params"]:
-            if get_owner_sharded_parameter_spec(parameter) is None:
-                continue
-            parameter_id = id(parameter)
-            if parameter_id in marked_parameters:
-                raise RuntimeError("A tagged owner-sharded parameter appears more than once in the optimizer.")
-            marked_parameters[parameter_id] = parameter
-    if not marked_parameters:
-        return {}
-
-    fqns_by_parameter_id: dict[int, set[str]] = {parameter_id: set() for parameter_id in marked_parameters}
-    for name, parameter in model.named_parameters(remove_duplicate=False):
-        if id(parameter) in fqns_by_parameter_id:
-            fqns_by_parameter_id[id(parameter)].add(canonical_parameter_fqn(name))
-
-    prefixes: dict[str, tuple[str, str, int]] = {}
-    for parameter_id, parameter in marked_parameters.items():
-        fqns = fqns_by_parameter_id[parameter_id]
-        if len(fqns) != 1:
-            raise RuntimeError(
-                "Cannot checkpoint a tagged owner-sharded optimizer parameter: "
-                f"expected exactly one canonical model FQN, found {sorted(fqns)}."
-            )
-        fqn = next(iter(fqns))
-        spec = get_owner_sharded_parameter_spec(parameter)
-        assert spec is not None
-        process_group = spec.process_group
-        if process_group is None:
-            distributed_world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-            if distributed_world_size > 1:
-                raise RuntimeError(
-                    "Cannot checkpoint owner-sharded optimizer state for "
-                    f"'{fqn}': its process_group is None in a distributed world of size "
-                    f"{distributed_world_size}, so a unique owner identity cannot be derived."
-                )
-            continue
-        if not torch.distributed.is_initialized():
-            raise RuntimeError(
-                "Cannot checkpoint owner-sharded optimizer state for "
-                f"'{fqn}': torch.distributed is not initialized for its owner process group."
-            )
-
-        try:
-            owner_world_size = torch.distributed.get_world_size(process_group)
-            owner_rank = torch.distributed.get_rank(process_group)
-            global_rank = torch.distributed.get_rank()
-        except (RuntimeError, TypeError, ValueError) as error:
-            raise RuntimeError(
-                "Cannot checkpoint owner-sharded optimizer state for "
-                f"'{fqn}': failed to derive an identity from its owner process group."
-            ) from error
-        if owner_world_size < 1 or owner_rank < 0 or owner_rank >= owner_world_size:
-            raise RuntimeError(
-                "Cannot checkpoint owner-sharded optimizer state for "
-                f"'{fqn}': current global rank {global_rank} is not a valid member of its owner process group "
-                f"(owner rank {owner_rank}, size {owner_world_size})."
-            )
-
-        if fqn in prefixes:
-            raise RuntimeError(f"Duplicate owner-sharded optimizer parameter FQN '{fqn}'.")
-        prefixes[fqn] = (
-            f"state.{spec.optimizer_state_namespace}.owner_rank_{owner_rank}.global_rank_{global_rank}.{fqn}.",
-            f"{spec.optimizer_state_namespace}.metadata.global_rank_{global_rank}.{fqn}.owner_world_size",
-            owner_world_size,
-        )
-    return prefixes
-
-
-def _namespace_owner_sharded_optimizer_state(
-    state_dict: dict[str, Any],
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-) -> tuple[dict[str, Any], set[str]]:
-    """Make only tagged parameter state keys rank-distinct for DCP.
-
-    Args:
-        state_dict: Flattened optimizer mapping. Tensor values for an owner
-            parameter have the same rank-local shape as that parameter or are
-            scalar step values.
-        model: Model that owns the tagged rank-local parameter shard.
-        optimizer: Optimizer whose parameter identities define the state keys.
-
-    Returns:
-        Flattened mapping with owner state under rank-distinct keys and the set
-        of keys created for owner state or topology metadata. Tensor values
-        alias the corresponding input values; they are not copied.
-    """
-    prefixes = _owner_sharded_optimizer_state_prefixes(model, optimizer)
-    if not prefixes:
-        return state_dict, set()
-
-    namespaced: dict[str, Any] = {
-        metadata_key: owner_world_size for _, metadata_key, owner_world_size in prefixes.values()
-    }
-    owner_keys = set(namespaced)
-    for key, value in state_dict.items():
-        output_key = key
-        for fqn, (owner_prefix, _, _) in prefixes.items():
-            fqn_prefix = f"state.{fqn}."
-            if key.startswith(fqn_prefix):
-                output_key = f"{owner_prefix}{key.removeprefix(fqn_prefix)}"
-                owner_keys.add(output_key)
-                break
-        if output_key in namespaced:
-            raise RuntimeError(f"Owner-sharded optimizer state key collision for '{output_key}'.")
-        namespaced[output_key] = value
-    return namespaced, owner_keys
-
-
-def _restore_owner_sharded_optimizer_state_keys(
-    state_dict: dict[str, Any],
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-) -> dict[str, Any]:
-    """Remove the current owner's DCP namespace before optimizer restore.
-
-    Args:
-        state_dict: Flattened DCP optimizer mapping. Tensor values for an owner
-            parameter have the same rank-local shape as that parameter or are
-            scalar step values.
-        model: Model that owns the tagged rank-local parameter shard.
-        optimizer: Optimizer whose parameter identities define restored keys.
-
-    Returns:
-        Flattened mapping with the current owner's state restored to ordinary
-        optimizer FQNs. Tensor values alias the corresponding input values.
-    """
-    prefixes = _owner_sharded_optimizer_state_prefixes(model, optimizer)
-    if not prefixes:
-        return state_dict
-
-    for fqn, (_, metadata_key, current_owner_world_size) in prefixes.items():
-        if metadata_key not in state_dict:
-            raise RuntimeError(
-                "Owner-sharded optimizer checkpoint is missing topology metadata for "
-                f"'{fqn}'. Legacy owner-sharded optimizer state cannot be resumed safely; "
-                "load the model weights and reset the optimizer."
-            )
-        checkpoint_owner_world_size = state_dict[metadata_key]
-        if checkpoint_owner_world_size != current_owner_world_size:
-            raise RuntimeError(
-                "Owner-sharded optimizer checkpoint topology does not match the current owner group for "
-                f"'{fqn}': checkpoint size {checkpoint_owner_world_size}, current size "
-                f"{current_owner_world_size}. Optimizer-state resharding is unsupported."
-            )
-
-    metadata_keys = {metadata_key for _, metadata_key, _ in prefixes.values()}
-    restored: dict[str, Any] = {}
-    for key, value in state_dict.items():
-        if key in metadata_keys:
-            continue
-        output_key = key
-        for fqn, (owner_prefix, _, _) in prefixes.items():
-            if key.startswith(owner_prefix):
-                output_key = f"state.{fqn}.{key.removeprefix(owner_prefix)}"
-                break
-        if output_key in restored:
-            raise RuntimeError(f"Owner-sharded optimizer state key collision for '{output_key}'.")
-        restored[output_key] = value
-    return restored
-
-
-def _validate_legacy_tensor_metadata(
-    checkpoint_key: str,
-    metadata: Any,
-    destination: torch.Tensor,
-) -> None:
-    """Validate one legacy local tensor before exposing its load destination."""
-    if not isinstance(metadata, TensorStorageMetadata):
-        raise RuntimeError(f"Legacy model-owned optimizer state '{checkpoint_key}' is not tensor metadata.")
-    if tuple(metadata.size) != tuple(destination.shape):
-        raise RuntimeError(
-            f"Legacy model-owned optimizer state '{checkpoint_key}' has shape {tuple(metadata.size)}, "
-            f"but the current local DTensor shard expects {tuple(destination.shape)}."
-        )
-    if metadata.properties.dtype != destination.dtype:
-        raise RuntimeError(
-            f"Legacy model-owned optimizer state '{checkpoint_key}' has dtype {metadata.properties.dtype}, "
-            f"but the current destination expects {destination.dtype}."
-        )
-    expected_offsets = (0,) * destination.ndim
-    if len(metadata.chunks) != 1:
-        raise RuntimeError(
-            f"Legacy model-owned optimizer state '{checkpoint_key}' must contain exactly one local chunk."
-        )
-    chunk = metadata.chunks[0]
-    if tuple(chunk.offsets) != expected_offsets or tuple(chunk.sizes) != tuple(destination.shape):
-        raise RuntimeError(
-            f"Legacy model-owned optimizer state '{checkpoint_key}' has unsupported chunk metadata "
-            f"offsets={tuple(chunk.offsets)}, sizes={tuple(chunk.sizes)}."
-        )
-
-
-def _prepare_legacy_model_owned_dtensor_load(
-    state_dict: dict[str, Any],
-    checkpoint_metadata: Mapping[str, Any],
-    model_optimizer_pairs: list[tuple[torch.nn.Module, torch.optim.Optimizer]],
-) -> tuple[dict[str, Any], _LegacyModelOwnedDTensorLoad | None]:
-    """Expose local aliases when loading pre-DTensor owner checkpoints.
-
-    New checkpoints contain one logical DTensor FQN and use native DCP
-    resharding.  A legacy checkpoint instead contains one unrelated FQN per
-    owner rank.  This bridge supports only the identical owner topology: every
-    rank exposes its current local DTensor storage under its former key, then
-    restores the logical key after DCP has populated that storage.
-    """
-    optimizer_state = state_dict.get("optim")
-    if not isinstance(optimizer_state, dict):
-        return state_dict, None
-
-    specs: dict[str, tuple[torch.Tensor, ModelOwnedDTensorSpec]] = {}
-    for model, optimizer in model_optimizer_pairs:
-        for fqn, value in _model_owned_dtensor_optimizer_specs(model, optimizer).items():
-            if fqn in specs:
-                raise RuntimeError(f"Duplicate model-owned DTensor optimizer FQN '{fqn}' across model parts.")
-            specs[fqn] = value
-    if not specs:
-        return state_dict, None
-
-    prepared_optimizer_state = dict(optimizer_state)
-    destinations: list[_LegacyDTensorStateDestination] = []
-    topology_destinations: dict[str, int] = {}
-    checkpoint_keys = set(checkpoint_metadata)
-
-    for fqn, (parameter, spec) in specs.items():
-        namespace = spec.legacy_optimizer_state_namespace
-        native_checkpoint_prefix = f"optim.state.{fqn}."
-        native_checkpoint_keys = {key for key in checkpoint_keys if key.startswith(native_checkpoint_prefix)}
-        if namespace is None:
-            continue
-
-        escaped_namespace = re.escape(namespace)
-        escaped_fqn = re.escape(fqn)
-        legacy_state_pattern = re.compile(
-            rf"^optim\.state\.{escaped_namespace}\.owner_rank_(\d+)\.global_rank_(\d+)\."
-            rf"{escaped_fqn}\.(.+)$"
-        )
-        legacy_metadata_pattern = re.compile(
-            rf"^optim\.{escaped_namespace}\.metadata\.global_rank_(\d+)\."
-            rf"{escaped_fqn}\.owner_world_size$"
-        )
-        legacy_states: dict[tuple[int, int], dict[str, tuple[str, Any]]] = {}
-        legacy_topology_keys: dict[int, str] = {}
-        for checkpoint_key, metadata in checkpoint_metadata.items():
-            state_match = legacy_state_pattern.fullmatch(checkpoint_key)
-            if state_match is not None:
-                pair = (int(state_match.group(1)), int(state_match.group(2)))
-                slot = state_match.group(3)
-                if slot in legacy_states.setdefault(pair, {}):
-                    raise RuntimeError(
-                        f"Legacy model-owned optimizer checkpoint contains duplicate slot '{slot}' for {fqn}."
-                    )
-                legacy_states[pair][slot] = (checkpoint_key, metadata)
-                continue
-            topology_match = legacy_metadata_pattern.fullmatch(checkpoint_key)
-            if topology_match is not None:
-                global_rank = int(topology_match.group(1))
-                if global_rank in legacy_topology_keys:
-                    raise RuntimeError(
-                        f"Legacy model-owned optimizer checkpoint contains duplicate topology metadata for {fqn}."
-                    )
-                legacy_topology_keys[global_rank] = checkpoint_key
-
-        if not legacy_states and not legacy_topology_keys:
-            continue
-        if native_checkpoint_keys:
-            raise RuntimeError(
-                f"Optimizer checkpoint mixes native DTensor and legacy owner state for '{fqn}'; refusing an "
-                "ambiguous restore."
-            )
-        if not torch.distributed.is_initialized():
-            raise RuntimeError("Legacy distributed optimizer state requires torch.distributed to be initialized.")
-        owner_ranks = tuple(torch.distributed.get_process_group_ranks(spec.process_group))
-        expected_pairs = {(owner_rank, global_rank) for owner_rank, global_rank in enumerate(owner_ranks)}
-        if set(legacy_states) != expected_pairs or set(legacy_topology_keys) != set(owner_ranks):
-            raise RuntimeError(
-                "Legacy model-owned optimizer checkpoint topology does not match the current owner group for "
-                f"'{fqn}': checkpoint owners={sorted(legacy_states)}, metadata ranks={sorted(legacy_topology_keys)}, "
-                f"current owners={sorted(expected_pairs)}. Cross-topology legacy optimizer resharding is unsupported; "
-                "restore once with the original topology and save a native DTensor checkpoint."
-            )
-
-        logical_prefix = f"state.{fqn}."
-        logical_entries = {
-            key.removeprefix(logical_prefix): (key, value)
-            for key, value in prepared_optimizer_state.items()
-            if key.startswith(logical_prefix)
-        }
-        if not logical_entries:
-            raise RuntimeError(
-                f"The current optimizer did not materialize state destinations for model-owned DTensor '{fqn}'."
-            )
-        expected_slots = set(logical_entries)
-        for pair, states in legacy_states.items():
-            if set(states) != expected_slots:
-                raise RuntimeError(
-                    f"Legacy model-owned optimizer slots for '{fqn}' at owner/global rank {pair} do not match "
-                    f"the current optimizer: checkpoint={sorted(states)}, current={sorted(expected_slots)}."
-                )
-
-        owner_rank = torch.distributed.get_rank(spec.process_group)
-        global_rank = torch.distributed.get_rank()
-        current_pair = (owner_rank, global_rank)
-        if current_pair not in legacy_states:
-            raise RuntimeError(f"Current owner/global rank {current_pair} has no legacy optimizer state for '{fqn}'.")
-        for slot, (logical_key, logical_value) in logical_entries.items():
-            full_checkpoint_key, metadata = legacy_states[current_pair][slot]
-            legacy_key = full_checkpoint_key.removeprefix("optim.")
-            if isinstance(logical_value, DTensor):
-                destination = logical_value.to_local()
-            elif isinstance(logical_value, torch.Tensor):
-                if logical_value.ndim != 0:
-                    raise RuntimeError(
-                        f"Plain optimizer state '{logical_key}' is non-scalar and has no DTensor sharding metadata."
-                    )
-                destination = logical_value
-            else:
-                destination = logical_value
-
-            if isinstance(destination, torch.Tensor):
-                _validate_legacy_tensor_metadata(full_checkpoint_key, metadata, destination)
-            elif not isinstance(metadata, BytesStorageMetadata):
-                raise RuntimeError(f"Legacy scalar optimizer state '{full_checkpoint_key}' has tensor metadata.")
-
-            prepared_optimizer_state.pop(logical_key)
-            if legacy_key in prepared_optimizer_state:
-                raise RuntimeError(f"Legacy optimizer load key collision for '{legacy_key}'.")
-            prepared_optimizer_state[legacy_key] = destination
-            destinations.append(
-                _LegacyDTensorStateDestination(
-                    logical_key=logical_key,
-                    legacy_key=legacy_key,
-                    logical_value=logical_value,
-                )
-            )
-
-        topology_key = legacy_topology_keys[global_rank].removeprefix("optim.")
-        if topology_key in prepared_optimizer_state:
-            raise RuntimeError(f"Legacy optimizer topology key collision for '{topology_key}'.")
-        prepared_optimizer_state[topology_key] = len(owner_ranks)
-        topology_destinations[topology_key] = len(owner_ranks)
-
-    if not destinations:
-        return state_dict, None
-    prepared_state_dict = dict(state_dict)
-    prepared_state_dict["optim"] = prepared_optimizer_state
-    return prepared_state_dict, _LegacyModelOwnedDTensorLoad(destinations, topology_destinations)
-
-
-@torch.no_grad()
-def _finalize_legacy_model_owned_dtensor_load(
-    state_dict: dict[str, Any],
-    bridge: _LegacyModelOwnedDTensorLoad | None,
-) -> dict[str, Any]:
-    """Restore logical DTensor optimizer keys after legacy local aliases load."""
-    if bridge is None:
-        return state_dict
-    optimizer_state = state_dict.get("optim")
-    if not isinstance(optimizer_state, dict):
-        raise RuntimeError("Loaded optimizer state is missing its 'optim' mapping.")
-    finalized_optimizer_state = dict(optimizer_state)
-
-    for topology_key, expected_world_size in bridge.metadata_keys.items():
-        checkpoint_world_size = finalized_optimizer_state.pop(topology_key, None)
-        if checkpoint_world_size != expected_world_size:
-            raise RuntimeError(
-                f"Legacy optimizer topology metadata '{topology_key}' has owner size {checkpoint_world_size}, "
-                f"expected {expected_world_size}."
-            )
-
-    for destination in bridge.destinations:
-        if destination.legacy_key not in finalized_optimizer_state:
-            raise RuntimeError(f"Legacy optimizer load did not populate '{destination.legacy_key}'.")
-        loaded_value = finalized_optimizer_state.pop(destination.legacy_key)
-        logical_value = destination.logical_value
-        if isinstance(logical_value, DTensor):
-            if not isinstance(loaded_value, torch.Tensor):
-                raise RuntimeError(f"Legacy optimizer tensor '{destination.legacy_key}' loaded a non-tensor value.")
-            logical_value.to_local().copy_(loaded_value)
-            restored_value = logical_value
-        elif isinstance(logical_value, torch.Tensor):
-            if not isinstance(loaded_value, torch.Tensor):
-                raise RuntimeError(f"Legacy optimizer tensor '{destination.legacy_key}' loaded a non-tensor value.")
-            logical_value.copy_(loaded_value)
-            restored_value = logical_value
-        else:
-            restored_value = loaded_value
-        if destination.logical_key in finalized_optimizer_state:
-            raise RuntimeError(f"Logical optimizer load key collision for '{destination.logical_key}'.")
-        finalized_optimizer_state[destination.logical_key] = restored_value
-
-    finalized_state_dict = dict(state_dict)
-    finalized_state_dict["optim"] = finalized_optimizer_state
-    return finalized_state_dict
 
 
 def _is_quantized_module(module: torch.nn.Module) -> bool:
@@ -1182,8 +689,6 @@ class OptimizerState:
             or any(_has_expert_parallelism(model_part) for model_part in self.model)
             or any(_has_quantized_params(model_part) for model_part in self.model)
         )
-        self._legacy_model_owned_dtensor_load: _LegacyModelOwnedDTensorLoad | None = None
-        self._load_prepared = False
 
     def state_dict(self) -> dict[str, Any]:
         """
@@ -1225,20 +730,7 @@ class OptimizerState:
                 get_optimizer_state_dict,
                 options=StateDictOptions(flatten_optimizer_state_dict=True, cpu_offload=self.cpu_offload),
             )
-            optimizer_state_dict = {}
-            for model_part, optimizer in zip(self.model, self.optimizer, strict=True):
-                part_state_dict, owner_keys = _namespace_owner_sharded_optimizer_state(
-                    func(model_part, optimizer),
-                    model_part,
-                    optimizer,
-                )
-                overlapping_owner_keys = optimizer_state_dict.keys() & owner_keys
-                if overlapping_owner_keys:
-                    raise RuntimeError(
-                        "Owner-sharded optimizer state keys overlap across model parts: "
-                        f"{sorted(overlapping_owner_keys)}"
-                    )
-                optimizer_state_dict.update(part_state_dict)
+            optimizer_state_dict = {k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()}
 
         state_dict = {
             "optim": optimizer_state_dict,
@@ -1247,50 +739,6 @@ class OptimizerState:
             state_dict["sched"] = self.scheduler[0].state_dict()
 
         return state_dict
-
-    def prepare_load_state_dict(
-        self,
-        state_dict: dict[str, Any],
-        checkpoint_metadata: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        """Prepare native or legacy destinations before DCP reads payloads.
-
-        Args:
-            state_dict: Current optimizer destinations produced by
-                :meth:`state_dict`.
-            checkpoint_metadata: Complete DCP state metadata keyed by the
-                serialized ``optim.*`` names.
-
-        Returns:
-            The original native state mapping, or a same-topology legacy view
-            whose tensor destinations alias the native DTensor local shards.
-        """
-        if self._load_prepared:
-            raise RuntimeError("OptimizerState load destinations were prepared more than once.")
-        if self._use_native_optimizer_state:
-            self._load_prepared = True
-            return state_dict
-        prepared, bridge = _prepare_legacy_model_owned_dtensor_load(
-            state_dict,
-            checkpoint_metadata,
-            list(zip(self.model, self.optimizer, strict=True)),
-        )
-        self._legacy_model_owned_dtensor_load = bridge
-        self._load_prepared = True
-        return prepared
-
-    def finalize_load_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        """Restore logical optimizer keys after DCP populated load destinations."""
-        if not self._load_prepared:
-            raise RuntimeError("OptimizerState load destinations must be prepared before finalization.")
-        try:
-            return _finalize_legacy_model_owned_dtensor_load(
-                state_dict,
-                self._legacy_model_owned_dtensor_load,
-            )
-        finally:
-            self._legacy_model_owned_dtensor_load = None
-            self._load_prepared = False
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """
@@ -1325,16 +773,9 @@ class OptimizerState:
                     optimizer.load_state_dict(optimizer_parts[part_key])
         else:
             # sets our state dicts on the optimizer, now that we've loaded
-            optimizer_state_dict = state_dict["optim"]
-            for model_part, optimizer in zip(self.model, self.optimizer, strict=True):
-                optimizer_state_dict = _restore_owner_sharded_optimizer_state_keys(
-                    optimizer_state_dict,
-                    model_part,
-                    optimizer,
-                )
             func = partial(
                 set_optimizer_state_dict,
-                optim_state_dict=optimizer_state_dict,
+                optim_state_dict=state_dict["optim"],
                 options=StateDictOptions(flatten_optimizer_state_dict=True),
             )
             list(map(func, self.model, self.optimizer))

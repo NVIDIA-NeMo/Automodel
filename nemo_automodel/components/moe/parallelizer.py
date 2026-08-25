@@ -52,10 +52,7 @@ from nemo_automodel.shared.multimodal_fsdp import (
     normalize_frozen_multimodal_sharding,
     shard_multimodal_module,
 )
-from nemo_automodel.shared.owner_sharding import (
-    get_model_owned_dtensor_spec,
-    get_owner_sharded_parameter_spec,
-)
+from nemo_automodel.shared.owner_sharding import get_model_owned_dtensor_spec
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
@@ -709,18 +706,7 @@ def apply_fsdp(
     prepare_model_owned_dtensors = getattr(model, "_nemo_prepare_model_owned_dtensors", None)
     prepared_model_owned_dtensors: set[nn.Parameter] = set()
     if prepare_model_owned_dtensors is not None:
-        prepared = prepare_model_owned_dtensors(fsdp_mesh)
-        if prepared is None:
-            raise TypeError("_nemo_prepare_model_owned_dtensors must return an iterable of Parameters")
-        prepared_model_owned_dtensors = set(prepared)
-        registered_parameter_ids = {id(parameter) for parameter in model.parameters()}
-        for parameter in prepared_model_owned_dtensors:
-            if not isinstance(parameter, nn.Parameter):
-                raise TypeError("_nemo_prepare_model_owned_dtensors returned a non-Parameter value")
-            if id(parameter) not in registered_parameter_ids:
-                raise RuntimeError("A model-owned DTensor returned by the model is not a registered parameter")
-            if get_model_owned_dtensor_spec(parameter) is None:
-                raise RuntimeError("A prepared model-owned DTensor is missing its typed sharding contract")
+        prepared_model_owned_dtensors = set(prepare_model_owned_dtensors(fsdp_mesh))
 
     # Some trainable parameters are already physically sharded by model-owned
     # communication. Letting FSDP shard those local owner partitions again
@@ -732,10 +718,7 @@ def apply_fsdp(
     # parameter set while preserving the normal nn.Module path.
     outer_parameters = model.parameters() if hasattr(model, "parameters") else ()
     externally_sharded_params = prepared_model_owned_dtensors | {
-        parameter
-        for parameter in outer_parameters
-        if get_owner_sharded_parameter_spec(parameter) is not None
-        or get_model_owned_dtensor_spec(parameter) is not None
+        parameter for parameter in outer_parameters if get_model_owned_dtensor_spec(parameter) is not None
     }
     if externally_sharded_params:
         logger.info(

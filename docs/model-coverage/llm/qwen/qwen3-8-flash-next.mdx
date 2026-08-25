@@ -129,9 +129,8 @@ setup.
   All-to-All collectives during recomputation is not supported.
 - Native distributed checkpoints store the PLE parameter and optimizer tensors
   under their global DTensor FQNs, so DCP can reshard them when the owner world
-  size changes. Checkpoints from the earlier rank-local owner format can be
-  loaded only with their original owner topology; save once in the native
-  DTensor format before changing topology.
+  size changes. Checkpoints from the earlier rank-local owner format are not
+  supported; resume from a native DTensor checkpoint or restart the optimizer.
 - CP is limited to language-only, non-packed, right-tail-padded inputs with
   TP=PP=1. Packed sequences, left/interior padding, TP, PP, MTP, and
   vision/video training remain unsupported.

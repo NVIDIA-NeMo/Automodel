@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_automodel.shared.owner_sharding import OwnerShardedParameterSpec
+from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec
 
 
 class DummyParam:
@@ -1044,10 +1044,9 @@ def test_apply_fsdp_excludes_model_owned_shard_from_block_and_root(monkeypatch):
     monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
 
     owner_weight = DummyParam()
-    owner_weight._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
+    owner_weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
         process_group=None,
         gradient_divisor=1.0,
-        optimizer_state_namespace="__test_owner_v1",
     )
 
     class OwnerShardedBlock(DummyBlock):

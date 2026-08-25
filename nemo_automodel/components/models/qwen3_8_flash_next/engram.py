@@ -33,10 +33,8 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     qwen3_8_flash_next_cp_left_halo,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGroupedRMSNorm
-from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec, OwnerShardedParameterSpec
+from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
-
-_QWEN3_8_FLASH_NEXT_OWNER_OPTIMIZER_STATE_NAMESPACE = "__nemo_engram_owner_v1"
 
 QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS = (
     23703573157769,
@@ -347,47 +345,18 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         self.reset_parameters()
 
     def mark_sharding_contract(self) -> None:
-        """Restore the contract matching the current parameter representation."""
-        if isinstance(self.weight, DTensor):
-            self.mark_model_owned_dtensor_weight()
-        else:
-            self.mark_owner_weight()
+        """Stamp the model-owned contract on the current weight.
 
-    def mark_owner_weight(self) -> None:
-        """Stamp the model-owned sharding contract on the current Parameter.
-
-        AutoModel materializes meta parameters after FSDP wrapping by replacing
-        their ``Parameter`` objects.  Custom tensor attributes do not survive
-        that replacement, so the top-level model calls this method again after
-        materialization and dtype casting.
+        Meta materialization and dtype casting can replace the Parameter
+        object, and custom tensor attributes do not survive that replacement,
+        so the top-level model calls this again afterwards.  The single-rank
+        reference table (plain Parameter, no process group) needs no contract.
         """
         if isinstance(self.weight, DTensor):
-            raise TypeError("A distributed Engram DTensor must use the model-owned DTensor contract")
-        self.weight._nemo_owner_sharded_spec = OwnerShardedParameterSpec(
-            process_group=self.process_group,
-            gradient_divisor=float(self.owner_world_size),
-            # Preserve optimizer resume compatibility with checkpoints created
-            # before the shared owner-sharding contract became model-agnostic.
-            optimizer_state_namespace=_QWEN3_8_FLASH_NEXT_OWNER_OPTIMIZER_STATE_NAMESPACE,
-        )
-
-    def mark_model_owned_dtensor_weight(self) -> None:
-        """Restore the runtime contract on a materialized PLE DTensor.
-
-        Meta materialization preserves the DTensor parameter identity and
-        placements, but arbitrary tensor attributes are not guaranteed to
-        survive.  The top-level model therefore calls this method after weight
-        initialization and dtype casting.
-        """
-        if not isinstance(self.weight, DTensor):
-            raise TypeError("The distributed Engram weight must be a DTensor before its runtime contract is marked")
-        if self.process_group is None:
-            raise RuntimeError("A single-rank reference Engram table must not use the distributed DTensor contract")
-        self.weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
-            process_group=self.process_group,
-            gradient_divisor=float(self.owner_world_size),
-            legacy_optimizer_state_namespace=_QWEN3_8_FLASH_NEXT_OWNER_OPTIMIZER_STATE_NAMESPACE,
-        )
+            self.weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
+                process_group=self.process_group,
+                gradient_divisor=float(self.owner_world_size),
+            )
 
     def parallelize_weight(self, fsdp_mesh: DeviceMesh) -> nn.Parameter:
         """Represent the already-local owner shard as one global DTensor.
@@ -443,7 +412,7 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
                     "Engram DTensor is already attached to a different mesh: "
                     f"current={current_mesh_ranks}, requested={mesh_ranks}"
                 )
-            self.mark_model_owned_dtensor_weight()
+            self.mark_sharding_contract()
             return self.weight
 
         if tuple(self.weight.shape) != expected_local_shape:
@@ -462,7 +431,7 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             stride=(self.embedding_dim, 1),
         )
         self.weight = nn.Parameter(distributed_weight, requires_grad=requires_grad)
-        self.mark_model_owned_dtensor_weight()
+        self.mark_sharding_contract()
         return self.weight
 
     @torch.no_grad()
