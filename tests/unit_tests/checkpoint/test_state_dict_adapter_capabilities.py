@@ -180,9 +180,15 @@ def test_low_memory_dcp_grouped_adapters_preserve_non_expert_storage_and_require
     assert adapter.supports_low_memory_dcp_load is True
 
     adapter.backend = SimpleNamespace(experts="te", dispatcher="deepep")
-    with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+    with (
+        patch("nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False),
+        patch.dict("os.environ", {"WORLD_SIZE": "8"}),
+    ):
         assert adapter.supports_low_memory_dcp_load is False
-    with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
+    with (
+        patch("nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False),
+        patch.dict("os.environ", {"WORLD_SIZE": "1"}),
+    ):
         assert adapter.supports_low_memory_dcp_load is True
 
     adapter.backend = SimpleNamespace(experts="torch", dispatcher="mok")

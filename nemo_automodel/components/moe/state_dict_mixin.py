@@ -13,13 +13,13 @@
 # limitations under the License.
 
 import gc
+import os
 import re
 from typing import Any, Optional
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
@@ -79,7 +79,9 @@ class MoESplitExpertsStateDictMixin:
             return False
         if self.backend.dispatcher not in {"deepep", "hybridep", "uccl_ep"}:
             return True
-        return get_world_size_safe() == 1
+        if torch.distributed.is_initialized():
+            return torch.distributed.get_world_size() == 1
+        return int(os.environ.get("WORLD_SIZE", "1")) == 1
 
     @property
     def _is_gated_moe(self) -> bool:

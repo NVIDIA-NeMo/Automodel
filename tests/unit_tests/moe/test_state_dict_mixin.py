@@ -1054,9 +1054,19 @@ class TestInplaceLoadViews:
 
         mixin.backend.experts = "te"
         mixin.backend.dispatcher = "deepep"
-        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+        with (
+            patch(
+                "nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False
+            ),
+            patch.dict("os.environ", {"WORLD_SIZE": "8"}),
+        ):
             assert mixin._expert_checkpoint_tensors_use_model_storage is False
-        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
+        with (
+            patch(
+                "nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False
+            ),
+            patch.dict("os.environ", {"WORLD_SIZE": "1"}),
+        ):
             assert mixin._expert_checkpoint_tensors_use_model_storage is True
 
         mixin.backend.dispatcher = "torch"
@@ -1190,7 +1200,12 @@ class TestInplaceLoadViews:
         splits = [local_storage[i] for i in range(2)]
         mock_dtensor = Mock()
 
-        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+        with (
+            patch(
+                "nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False
+            ),
+            patch.dict("os.environ", {"WORLD_SIZE": "8"}),
+        ):
             result = self._run_inplace_conversion(
                 mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
             )
@@ -1244,7 +1259,10 @@ class TestInplaceLoadViews:
         virtual_down = down_storage.transpose(-1, -2)
 
         with (
-            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8),
+            patch(
+                "nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False
+            ),
+            patch.dict("os.environ", {"WORLD_SIZE": "8"}),
             patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
             patch("torch.empty_like") as empty_like,
         ):
@@ -1290,7 +1308,10 @@ class TestInplaceLoadViews:
         virtual_gate_up = gate_up_storage.transpose(-1, -2)
 
         with (
-            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8),
+            patch(
+                "nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False
+            ),
+            patch.dict("os.environ", {"WORLD_SIZE": "8"}),
             patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
             patch("nemo_automodel.components.moe.state_dict_mixin.gc.collect") as collect,
             patch("torch.cuda.empty_cache") as empty_cache,
@@ -1315,7 +1336,10 @@ class TestInplaceLoadViews:
         initialized_down = torch.full((2, 3, 4), 99.0)
 
         with (
-            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8),
+            patch(
+                "nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False
+            ),
+            patch.dict("os.environ", {"WORLD_SIZE": "8"}),
             patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
         ):
             destinations = dict(
@@ -1368,7 +1392,12 @@ class TestInplaceLoadViews:
         mock_dtensor.shape = (2, 512, 1024)
         mock_dtensor.is_meta = False
 
-        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+        with (
+            patch(
+                "nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False
+            ),
+            patch.dict("os.environ", {"WORLD_SIZE": "8"}),
+        ):
             result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
 
         assert result is not None and len(result) == 2
