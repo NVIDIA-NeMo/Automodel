@@ -43,18 +43,18 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install the pinned uv and uvx on the system path so runtime user overrides can
-# execute them. This also overwrites the base image's vulnerable copies.
-ENV UV_VERSION="0.11.24"
+# Pin uv and uvx with patched quinn-proto (GHSA-4w2j-m93h-cj5j) on the system path.
+# Remove the base image's root-local copies so stale vulnerable binaries are not shipped.
+ENV UV_VERSION="0.11.26"
 ARG TARGETARCH
 RUN case "${TARGETARCH}" in \
         amd64) \
             uv_arch="x86_64"; \
-            uv_sha256="5ce1ad074a78f96c5c8122088bb85a12eb282195bc1453151a48762e4fc31fed"; \
+            uv_sha256="6426a73c3837e6e2483ee344cbc00f36394d179afcba6183cb77437e67db4af0"; \
             ;; \
         arm64) \
             uv_arch="aarch64"; \
-            uv_sha256="e22c66d36a0098b17cff80a8647e0b8c58202af899d4e9eb820fc7ad126435a1"; \
+            uv_sha256="befa1a59c91e96eb601b0fd9a97c03dd666f17baba644b2b4db9c59a767e387e"; \
             ;; \
         *) \
             echo "Unsupported TARGETARCH for uv: ${TARGETARCH}" >&2; \
@@ -68,7 +68,8 @@ RUN case "${TARGETARCH}" in \
     tar -xzf "/tmp/${uv_archive}" -C /tmp && \
     install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uv" /usr/local/bin/uv && \
     install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uvx" /usr/local/bin/uvx && \
-    rm -rf "/tmp/${uv_archive}" "/tmp/uv-${uv_arch}-unknown-linux-gnu"
+    rm -rf "/tmp/${uv_archive}" "/tmp/uv-${uv_arch}-unknown-linux-gnu" && \
+    rm -f /root/.local/bin/uv /root/.local/bin/uvx
 ENV PATH="/usr/local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
@@ -225,7 +226,7 @@ RUN pip install "aiohttp>=3.14.3" \
         "GitPython>=3.1.59" \
         "jaraco-context>=6.1.0" \
         "jupyter-server>=2.20.0" \
-        "jupyterlab>=4.5.7" \
+        "jupyterlab>=4.5.10" \
         "mistune>=3.3.0" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
