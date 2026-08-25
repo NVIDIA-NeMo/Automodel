@@ -688,6 +688,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
+        if getattr(self.loss_fn, "reduction", None) != "sum":
+            raise ValueError("Global-token-normalized finetuning requires a loss with reduction='sum'")
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
@@ -729,8 +731,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        if getattr(self.loss_fn, "reduction", None) != "sum":
-            raise ValueError("Global-token-normalized finetuning requires a loss with reduction='sum'")
         attn_implementation = None
         if (
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0

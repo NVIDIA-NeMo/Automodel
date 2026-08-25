@@ -568,6 +568,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
             self.loss_fn = MaskedCrossEntropy()
+        if getattr(self.loss_fn, "reduction", None) != "sum":
+            raise ValueError("Global-token-normalized VLM finetuning requires a loss with reduction='sum'")
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -638,8 +640,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
         self.dataloader = dataloader_build.dataloader
         self.processor = dataloader_build.processor
-        if getattr(self.loss_fn, "reduction", None) != "sum":
-            raise ValueError("Global-token-normalized VLM finetuning requires a loss with reduction='sum'")
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
