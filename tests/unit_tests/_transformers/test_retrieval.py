@@ -30,6 +30,7 @@ from transformers import (
     LlamaConfig,
     Ministral3Config,
     Mistral3Config,
+    Mistral3ForConditionalGeneration,
     PretrainedConfig,
     PreTrainedTokenizerFast,
 )
@@ -38,7 +39,6 @@ from transformers.models.ministral3.modeling_ministral3 import (
     Ministral3Model,
 )
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model as HFMistral3Model
-
 
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
@@ -49,6 +49,7 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
     Mistral3BidirectionalModel,
+    Mistral3VLBidirectionalForSequenceClassification,
 )
 
 
@@ -170,6 +171,31 @@ def test_ministral_vlm_load_restores_all_towers(tmp_path, load_path):
 
     assert isinstance(backbone, Mistral3BidirectionalModel)
     _assert_state_dict_equal(expected_state_dict, backbone.state_dict())
+
+
+def test_mistral_vlm_reranker_load_restores_all_backbone_weights(tmp_path):
+    """Cross-encoder loading restores every shared stock Mistral3 VLM weight."""
+    from nemo_automodel._transformers import retrieval
+
+    source = Mistral3ForConditionalGeneration(_tiny_mistral3_vlm_config("ministral3"))
+    model_dir = tmp_path / "mistral3_vlm_reranker"
+    source.save_pretrained(model_dir)
+
+    reranker = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="score",
+        num_labels=1,
+    )
+
+    assert isinstance(reranker, Mistral3VLBidirectionalForSequenceClassification)
+    source_state = source.state_dict()
+    reranker_state = reranker.state_dict()
+    for source_key, source_weight in source_state.items():
+        if source_key == "lm_head.weight":
+            continue
+        target_key = source_key.replace("model.language_model.model.", "model.language_model.")
+        assert target_key in reranker_state, f"Missing restored weight: {target_key}"
+        assert torch.equal(source_weight, reranker_state[target_key]), f"Weight mismatch for {target_key}"
 
 
 @pytest.mark.parametrize(
