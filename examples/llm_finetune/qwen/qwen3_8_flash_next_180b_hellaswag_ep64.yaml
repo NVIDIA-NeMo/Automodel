@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Full-parameter, language-only Qwen4-Exp 180B SFT on HellaSwag.
+# Full-parameter, language-only Qwen3.8-Flash-Next 180B SFT on HellaSwag.
 #
 # Hardware target: 8 nodes x 8 GPUs (64 GPUs), EP64, no PP/TP/CP.  The 512
 # routed experts and the 51.2B-parameter Engram table are both owner-sharded
@@ -21,16 +21,16 @@
 # shards.
 #
 # From the AutoModel repository root:
-#   export QWEN4_EXP_MODEL_PATH=../brightdelta-180b-bf16_vv1
+#   export QWEN3_8_FLASH_NEXT_MODEL_PATH=../brightdelta-180b-bf16_vv1
 #   # Required on the validated pool0 image: its injected SPXC provider
 #   # corrupted cross-node PLE payloads, while NCCL's internal IB path passed
 #   # the full forward/backward/optimizer smoke.
 #   export NCCL_NET_PLUGIN=none
 #   export NCCL_NET=IB
-#   cp slurm.sub qwen4_exp_180b.sub
-#   # In qwen4_exp_180b.sub set CONFIG to this YAML, -N 8, and -t 04:00:00,
+#   cp slurm.sub qwen3_8_flash_next_180b.sub
+#   # In qwen3_8_flash_next_180b.sub set CONFIG to this YAML, -N 8, and -t 04:00:00,
 #   # then configure the cluster account/container mounts and run:
-#   sbatch qwen4_exp_180b.sub
+#   sbatch qwen3_8_flash_next_180b.sub
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -53,9 +53,9 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: nemo_automodel.components.models.qwen4_exp.config.Qwen4ExpConfig.from_pretrained
-    pretrained_model_name_or_path: ${oc.env:QWEN4_EXP_MODEL_PATH,../brightdelta-180b-bf16_vv1}
-    name_or_path: ${oc.env:QWEN4_EXP_MODEL_PATH,../brightdelta-180b-bf16_vv1}
+    _target_: nemo_automodel.components.models.qwen3_8_flash_next.config.Qwen3_8_FlashNextConfig.from_pretrained
+    pretrained_model_name_or_path: ${oc.env:QWEN3_8_FLASH_NEXT_MODEL_PATH,../brightdelta-180b-bf16_vv1}
+    name_or_path: ${oc.env:QWEN3_8_FLASH_NEXT_MODEL_PATH,../brightdelta-180b-bf16_vv1}
     language_model_only: true
   trust_remote_code: false
   load_base_model: true
@@ -77,7 +77,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ${oc.env:QWEN4_EXP_OUTPUT_DIR,checkpoints/qwen4_exp_180b_hellaswag_ep64}
+  checkpoint_dir: ${oc.env:QWEN3_8_FLASH_NEXT_OUTPUT_DIR,checkpoints/qwen3_8_flash_next_180b_hellaswag_ep64}
   model_save_format: safetensors
   save_consolidated: false
 
@@ -104,7 +104,7 @@ dataset:
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: ${oc.env:QWEN4_EXP_MODEL_PATH,../brightdelta-180b-bf16_vv1}
+    pretrained_model_name_or_path: ${oc.env:QWEN3_8_FLASH_NEXT_MODEL_PATH,../brightdelta-180b-bf16_vv1}
     trust_remote_code: false
 
 packed_sequence:
@@ -126,7 +126,7 @@ validation_dataset:
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: ${oc.env:QWEN4_EXP_MODEL_PATH,../brightdelta-180b-bf16_vv1}
+    pretrained_model_name_or_path: ${oc.env:QWEN3_8_FLASH_NEXT_MODEL_PATH,../brightdelta-180b-bf16_vv1}
     trust_remote_code: false
 
 validation_dataloader:
@@ -174,8 +174,8 @@ clip_grad_norm:
 
 wandb:
   enable: false
-  project: qwen4-exp-180b-sft
-  name: qwen4_exp_180b_hellaswag_ep64
+  project: qwen3-8-flash-next-180b-sft
+  name: qwen3_8_flash_next_180b_hellaswag_ep64
   dir: wandb
 
 ci:

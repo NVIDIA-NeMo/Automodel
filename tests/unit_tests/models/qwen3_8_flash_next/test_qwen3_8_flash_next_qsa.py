@@ -12,25 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Focused CPU tests for Qwen4-Exp compressed QSA and sparse GQA."""
+"""Focused CPU tests for Qwen3.8-Flash-Next compressed QSA and sparse GQA."""
 
 import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen4_exp import layers as qwen4_exp_layers
-from nemo_automodel.components.models.qwen4_exp import qsa as qwen4_exp_qsa
-from nemo_automodel.components.models.qwen4_exp.config import Qwen4ExpTextConfig
-from nemo_automodel.components.models.qwen4_exp.layers import Qwen4ExpQSAAttention
-from nemo_automodel.components.models.qwen4_exp.qsa import (
-    Qwen4ExpQSAIndexer,
+from nemo_automodel.components.models.qwen3_8_flash_next import layers as qwen3_8_flash_next_layers
+from nemo_automodel.components.models.qwen3_8_flash_next import qsa as qwen3_8_flash_next_qsa
+from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
+from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
+    Qwen3_8_FlashNextQSAIndexer,
     gathered_qsa_gqa_attention,
     select_qsa_token_ids,
 )
 
 
-def _config(*, token_budget: int = 8, compress_ratio: int = 2) -> Qwen4ExpTextConfig:
-    return Qwen4ExpTextConfig(
+def _config(*, token_budget: int = 8, compress_ratio: int = 2) -> Qwen3_8_FlashNextTextConfig:
+    return Qwen3_8_FlashNextTextConfig(
         vocab_size=32,
         hidden_size=8,
         intermediate_size=16,
@@ -195,7 +195,7 @@ def test_qsa_first_sparse_query_is_position_2051() -> None:
 
 def test_qsa_indexer_supports_only_right_tail_padding() -> None:
     config = _config(token_budget=4, compress_ratio=2)
-    indexer = Qwen4ExpQSAIndexer(config, _backend())
+    indexer = Qwen3_8_FlashNextQSAIndexer(config, _backend())
     indexer.init_weights()
     hidden_states = torch.randn(2, 5, config.hidden_size)
     attention_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], dtype=torch.bool)
@@ -213,7 +213,7 @@ def test_qsa_indexer_supports_only_right_tail_padding() -> None:
 def test_qsa_main_qkv_backward_and_frozen_hookable_indexer() -> None:
     torch.manual_seed(11)
     config = _config(token_budget=4, compress_ratio=2)
-    attention = Qwen4ExpQSAAttention(config, layer_idx=0, backend=_backend())
+    attention = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=_backend())
     attention.init_weights(torch.device("cpu"))
     attention.train()
     captured: list[torch.Tensor] = []
@@ -241,20 +241,20 @@ def test_qsa_main_qkv_backward_and_frozen_hookable_indexer() -> None:
 
 def test_qsa_attention_trims_fixed_routing_width_for_short_sequences(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(token_budget=8, compress_ratio=2)
-    attention = Qwen4ExpQSAAttention(config, layer_idx=0, backend=_backend())
+    attention = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=_backend())
     attention.init_weights(torch.device("cpu"))
     full_routing_shapes: list[tuple[int, ...]] = []
     compute_routing_shapes: list[tuple[int, ...]] = []
     handle = attention.indexer.register_forward_hook(
         lambda _module, _args, output: full_routing_shapes.append(tuple(output.shape))
     )
-    original_attention = qwen4_exp_layers.qsa_gqa_attention
+    original_attention = qwen3_8_flash_next_layers.qsa_gqa_attention
 
     def capture_compute_width(*args, **kwargs):
         compute_routing_shapes.append(tuple(args[3].shape))
         return original_attention(*args, **kwargs)
 
-    monkeypatch.setattr(qwen4_exp_layers, "qsa_gqa_attention", capture_compute_width)
+    monkeypatch.setattr(qwen3_8_flash_next_layers, "qsa_gqa_attention", capture_compute_width)
     hidden_states = torch.randn(1, 3, config.hidden_size)
     output = attention(hidden_states, freqs_cis=_freqs(1, 3), attention_mask=torch.ones(1, 3))
     handle.remove()
@@ -266,7 +266,7 @@ def test_qsa_attention_trims_fixed_routing_width_for_short_sequences(monkeypatch
 
 def test_qsa_attention_rejects_empty_sequences_clearly() -> None:
     config = _config()
-    attention = Qwen4ExpQSAAttention(config, layer_idx=0, backend=_backend())
+    attention = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=_backend())
 
     with pytest.raises(ValueError, match="non-empty sequence"):
         attention(
@@ -279,7 +279,7 @@ def test_frozen_indexer_survives_meta_materialization_and_checkpoint_load() -> N
     from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 
     with torch.device("meta"):
-        indexer = Qwen4ExpQSAIndexer(_config(), _backend())
+        indexer = Qwen3_8_FlashNextQSAIndexer(_config(), _backend())
     assert all(parameter.is_meta for parameter in indexer.parameters())
     assert all(not parameter.requires_grad for parameter in indexer.parameters())
 
@@ -336,7 +336,7 @@ def test_qsa_tilelang_backend_bypasses_generic_parent_initializer() -> None:
     backend = _backend()
     backend.attn = "tilelang"
 
-    attention = Qwen4ExpQSAAttention(_config(), layer_idx=0, backend=backend)
+    attention = Qwen3_8_FlashNextQSAAttention(_config(), layer_idx=0, backend=backend)
 
     assert attention.backend is backend
     assert attention.backend.attn == "tilelang"
@@ -354,7 +354,7 @@ def test_qsa_tilelang_backend_uses_cpu_oracle(monkeypatch: pytest.MonkeyPatch) -
     def fail_if_called(*_args, **_kwargs):
         pytest.fail("CPU QSA must not call the TileLang kernel")
 
-    monkeypatch.setattr(qwen4_exp_qsa, "tilelang_sparse_gqa_attention", fail_if_called)
-    actual = qwen4_exp_qsa.qsa_gqa_attention(query, key, value, selected, backend="tilelang")
+    monkeypatch.setattr(qwen3_8_flash_next_qsa, "tilelang_sparse_gqa_attention", fail_if_called)
+    actual = qwen3_8_flash_next_qsa.qsa_gqa_attention(query, key, value, selected, backend="tilelang")
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -298,8 +298,8 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
         ),
         (
-            "Qwen4ExpForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen4_exp.model", "Qwen4ExpForConditionalGeneration"),
+            "Qwen3_8_FlashNextForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_8_flash_next.model", "Qwen3_8_FlashNextForConditionalGeneration"),
         ),
         (
             "Step3p6ForConditionalGeneration",
@@ -348,8 +348,11 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
     "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),
-    "qwen4_exp": ("nemo_automodel.components.models.qwen4_exp.config", "Qwen4ExpConfig"),
-    "qwen4_exp_text": ("nemo_automodel.components.models.qwen4_exp.config", "Qwen4ExpTextConfig"),
+    "qwen3_8_flash_next": ("nemo_automodel.components.models.qwen3_8_flash_next.config", "Qwen3_8_FlashNextConfig"),
+    "qwen3_8_flash_next_text": (
+        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "Qwen3_8_FlashNextTextConfig",
+    ),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }

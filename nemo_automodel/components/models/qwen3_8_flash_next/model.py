@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Trainable Qwen4-Exp conditional-generation model.
+"""Trainable Qwen3.8-Flash-Next conditional-generation model.
 
 This implementation uses the checkpoint's compressed-block QSA router and a
 fused TileLang sparse-GQA path for CUDA BF16 long-sequence SFT, with a PyTorch
@@ -50,24 +50,24 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-from .config import Qwen4ExpConfig, Qwen4ExpTextConfig
-from .cp import Qwen4ExpCPContext, shard_batch_for_qwen4_cp
+from .config import Qwen3_8_FlashNextConfig, Qwen3_8_FlashNextTextConfig
+from .cp import Qwen3_8_FlashNextCPContext, shard_batch_for_qwen3_8_flash_next_cp
 from .engram import (
-    QWEN4_EXP_NGRAM_PADDED_ROWS,
-    Qwen4ExpEngramTableConfig,
-    Qwen4ExpNGramEmbedding,
-    Qwen4ExpPLELayer,
+    QWEN3_8_FLASH_NEXT_NGRAM_PADDED_ROWS,
+    Qwen3_8_FlashNextEngramTableConfig,
+    Qwen3_8_FlashNextNGramEmbedding,
+    Qwen3_8_FlashNextPLELayer,
 )
-from .layers import Qwen4ExpDecoderLayer, Qwen4ExpHyperConnection
-from .state_dict_adapter import Qwen4ExpStateDictAdapter
+from .layers import Qwen3_8_FlashNextDecoderLayer, Qwen3_8_FlashNextHyperConnection
+from .state_dict_adapter import Qwen3_8_FlashNextStateDictAdapter
 
 
 @dataclass
-class Qwen4ExpCausalLMOutput(CausalLMOutputWithPast):
+class Qwen3_8_FlashNextCausalLMOutput(CausalLMOutputWithPast):
     """Causal-LM output with optional per-layer HC states for parity capture."""
 
 
-def _qwen4_exp_backend(backend: BackendConfig | None = None) -> BackendConfig:
+def _qwen3_8_flash_next_backend(backend: BackendConfig | None = None) -> BackendConfig:
     """Return a backend whose rotary path supports text and multimodal layouts."""
     resolved = copy.copy(backend) if backend is not None else BackendConfig()
     resolved.rope_fusion = False
@@ -87,8 +87,8 @@ def _default_owner_group() -> dist.ProcessGroup | None:
     return dist.group.WORLD
 
 
-class Qwen4ExpTextModelBackend(nn.Module):
-    """Qwen4-Exp text decoder with four HC streams and one PLE layer.
+class Qwen3_8_FlashNextTextModelBackend(nn.Module):
+    """Qwen3.8-Flash-Next text decoder with four HC streams and one PLE layer.
 
     Args:
         config: Text architecture configuration.
@@ -109,13 +109,13 @@ class Qwen4ExpTextModelBackend(nn.Module):
 
     def __init__(
         self,
-        config: Qwen4ExpTextConfig,
+        config: Qwen3_8_FlashNextTextConfig,
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
         moe_overrides: dict[str, Any] | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
-        engram_table_config: Qwen4ExpEngramTableConfig | None = None,
+        engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,
     ) -> None:
         super().__init__()
         if moe_config is not None and moe_overrides is not None:
@@ -173,15 +173,15 @@ class Qwen4ExpTextModelBackend(nn.Module):
                         "ple_embed_dim must divide evenly over all n-gram heads; "
                         f"got {config.ple_embed_dim} and {ngram_heads} heads"
                     )
-                table_config = engram_table_config or Qwen4ExpEngramTableConfig(
-                    num_embeddings=QWEN4_EXP_NGRAM_PADDED_ROWS,
+                table_config = engram_table_config or Qwen3_8_FlashNextEngramTableConfig(
+                    num_embeddings=QWEN3_8_FLASH_NEXT_NGRAM_PADDED_ROWS,
                     embedding_dim=config.ple_embed_dim // ngram_heads,
                     initializer_range=config.initializer_range,
                 )
                 owner_group = engram_process_group if engram_process_group is not None else _default_owner_group()
                 if owner_group is None and engram_table_config is None:
                     raise RuntimeError(
-                        "The released Qwen4-Exp PLE table must be constructed after "
+                        "The released Qwen3.8-Flash-Next PLE table must be constructed after "
                         "torch.distributed initialization so its 320M rows are owner-sharded. "
                         "Pass an explicit tiny engram_table_config only for a single-rank test."
                     )
@@ -189,13 +189,13 @@ class Qwen4ExpTextModelBackend(nn.Module):
                     process_group=owner_group,
                     dtype=self.model_dtype,
                 )
-                ple_embedding = Qwen4ExpNGramEmbedding(
+                ple_embedding = Qwen3_8_FlashNextNGramEmbedding(
                     table,
                     ngram_size=config.ngram_size,
                     heads_per_ngram=config.heads_per_ngram,
                     eos_token_id=config.eos_token_id,
                 )
-                ple = Qwen4ExpPLELayer(
+                ple = Qwen3_8_FlashNextPLELayer(
                     ple_embedding,
                     hidden_size=config.hidden_size,
                     hc_count=config.hc_count,
@@ -205,7 +205,7 @@ class Qwen4ExpTextModelBackend(nn.Module):
                     backend=backend,
                     dtype=self.model_dtype,
                 )
-            self.layers[str(layer_idx)] = Qwen4ExpDecoderLayer(
+            self.layers[str(layer_idx)] = Qwen3_8_FlashNextDecoderLayer(
                 layer_idx,
                 config,
                 self.moe_config,
@@ -213,7 +213,7 @@ class Qwen4ExpTextModelBackend(nn.Module):
                 ple=ple,
             )
 
-        self.hyper_connection_mixer = Qwen4ExpHyperConnection(
+        self.hyper_connection_mixer = Qwen3_8_FlashNextHyperConnection(
             hidden_size=config.hidden_size,
             hc_count=config.hc_count,
             lowrank_size=config.hc_lowrank,
@@ -248,7 +248,7 @@ class Qwen4ExpTextModelBackend(nn.Module):
         past_key_values: object | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
-        _qwen4_cp_context: Qwen4ExpCPContext | None = None,
+        _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
         **attn_kwargs: Any,
     ) -> BaseModelOutputWithPast:
         """Run the HC decoder and final HC mixer.
@@ -268,7 +268,7 @@ class Qwen4ExpTextModelBackend(nn.Module):
             use_cache: Cache request; ``True`` is unsupported.
             output_hidden_states: Include embedding, per-layer HC, and final
                 collapsed states for parity diagnostics.
-            _qwen4_cp_context: Internal contiguous CP metadata. Its replicated
+            _qwen3_8_flash_next_cp_context: Internal contiguous CP metadata. Its replicated
                 raw-ID and padding tensors have shape ``[batch,
                 global_sequence]``; model activations remain local
                 ``[batch, sequence, hidden]`` tensors.
@@ -279,12 +279,12 @@ class Qwen4ExpTextModelBackend(nn.Module):
             ``[batch, sequence, hidden_size]``.
         """
         if past_key_values is not None or use_cache:
-            raise NotImplementedError("Qwen4-Exp training does not support recurrent or KV caches")
-        if getattr(self, "_cp_enabled", False) and _qwen4_cp_context is None:
+            raise NotImplementedError("Qwen3.8-Flash-Next training does not support recurrent or KV caches")
+        if getattr(self, "_cp_enabled", False) and _qwen3_8_flash_next_cp_context is None:
             raise RuntimeError(
-                "Qwen4-Exp context parallelism is enabled, but the model-owned contiguous batch context is missing"
+                "Qwen3.8-Flash-Next context parallelism is enabled, but the model-owned contiguous batch context is missing"
             )
-        if _qwen4_cp_context is not None:
+        if _qwen3_8_flash_next_cp_context is not None:
             packed_keys = (
                 "cu_seqlens",
                 "cu_seqlens_q",
@@ -300,14 +300,14 @@ class Qwen4ExpTextModelBackend(nn.Module):
                 "max_seqlen_kv",
             )
             if attn_kwargs.get("qkv_format") == "thd" or any(attn_kwargs.get(key) is not None for key in packed_keys):
-                raise NotImplementedError("Qwen4-Exp context parallelism does not support packed/THD inputs")
+                raise NotImplementedError("Qwen3.8-Flash-Next context parallelism does not support packed/THD inputs")
             if attention_mask is not None and attention_mask.ndim != 2:
                 raise NotImplementedError(
-                    "Qwen4-Exp context parallelism requires a non-packed [batch, local_sequence] attention mask"
+                    "Qwen3.8-Flash-Next context parallelism requires a non-packed [batch, local_sequence] attention mask"
                 )
         if input_ids is None:
             if self.config.ple_layer_ids:
-                raise ValueError("input_ids are required because Qwen4-Exp PLE hashes raw token IDs")
+                raise ValueError("input_ids are required because Qwen3.8-Flash-Next PLE hashes raw token IDs")
             if inputs_embeds is None:
                 raise ValueError("Either input_ids or inputs_embeds must be provided")
         if inputs_embeds is None:
@@ -316,14 +316,16 @@ class Qwen4ExpTextModelBackend(nn.Module):
             input_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
 
         batch_size, sequence_length, _ = inputs_embeds.shape
-        if _qwen4_cp_context is not None:
-            if sequence_length != _qwen4_cp_context.local_sequence_length:
+        if _qwen3_8_flash_next_cp_context is not None:
+            if sequence_length != _qwen3_8_flash_next_cp_context.local_sequence_length:
                 raise ValueError(
-                    "Qwen4-Exp local input length disagrees with its CP context; "
-                    f"got local={sequence_length}, context={_qwen4_cp_context.local_sequence_length}"
+                    "Qwen3.8-Flash-Next local input length disagrees with its CP context; "
+                    f"got local={sequence_length}, context={_qwen3_8_flash_next_cp_context.local_sequence_length}"
                 )
             if position_ids is None:
-                raise ValueError("Qwen4-Exp context parallelism requires global position_ids from its batch sharder")
+                raise ValueError(
+                    "Qwen3.8-Flash-Next context parallelism requires global position_ids from its batch sharder"
+                )
             candidate_positions = (
                 position_ids[1:] if position_ids.ndim == 3 and position_ids.shape[0] == 4 else position_ids
             )
@@ -331,7 +333,7 @@ class Qwen4ExpTextModelBackend(nn.Module):
                 repeated_text_positions = candidate_positions[:1].expand_as(candidate_positions)
                 if not bool(torch.equal(candidate_positions, repeated_text_positions)):
                     raise NotImplementedError(
-                        "Qwen4-Exp CP supports ordinary text positions only; genuinely different multi-axis mRoPE "
+                        "Qwen3.8-Flash-Next CP supports ordinary text positions only; genuinely different multi-axis mRoPE "
                         "streams and packed THD are unsupported"
                     )
         if position_ids is None:
@@ -359,7 +361,7 @@ class Qwen4ExpTextModelBackend(nn.Module):
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 position_ids=position_ids,
-                cp_context=_qwen4_cp_context,
+                cp_context=_qwen3_8_flash_next_cp_context,
                 **attn_kwargs,
             )
             if captured_states is not None:
@@ -390,22 +392,22 @@ class Qwen4ExpTextModelBackend(nn.Module):
         self.hyper_connection_mixer.init_weights(init_std=self.config.initializer_range)
 
 
-class Qwen4ExpModel(nn.Module):
-    """Language-only Qwen4-Exp decoder wrapper."""
+class Qwen3_8_FlashNextModel(nn.Module):
+    """Language-only Qwen3.8-Flash-Next decoder wrapper."""
 
     def __init__(
         self,
-        config: Qwen4ExpConfig,
+        config: Qwen3_8_FlashNextConfig,
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
         moe_overrides: dict[str, Any] | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
-        engram_table_config: Qwen4ExpEngramTableConfig | None = None,
+        engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.language_model = Qwen4ExpTextModelBackend(
+        self.language_model = Qwen3_8_FlashNextTextModelBackend(
             config.text_config,
             backend,
             moe_config=moe_config,
@@ -423,10 +425,10 @@ class Qwen4ExpModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         past_key_values: object | None = None,
         output_hidden_states: bool | None = None,
-        _qwen4_cp_context: Qwen4ExpCPContext | None = None,
+        _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
-        """Run the language-only Qwen4-Exp decoder.
+        """Run the language-only Qwen3.8-Flash-Next decoder.
 
         Args:
             input_ids: Raw IDs of shape ``[batch, sequence]``; required for
@@ -439,7 +441,7 @@ class Qwen4ExpModel(nn.Module):
                 ``[batch, sequence, hidden_size]``.
             past_key_values: Cache state; unsupported for training.
             output_hidden_states: Capture decoder HC states.
-            _qwen4_cp_context: Internal contiguous CP metadata with replicated
+            _qwen3_8_flash_next_cp_context: Internal contiguous CP metadata with replicated
                 raw-ID/padding tensors of shape ``[batch, global_sequence]``.
             **kwargs: Text-attention backend arguments.
 
@@ -454,13 +456,13 @@ class Qwen4ExpModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_hidden_states=output_hidden_states,
-            _qwen4_cp_context=_qwen4_cp_context,
+            _qwen3_8_flash_next_cp_context=_qwen3_8_flash_next_cp_context,
             **kwargs,
         )
 
 
-class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """Trainable language-only Qwen4-Exp causal-LM wrapper."""
+class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    """Trainable language-only Qwen3.8-Flash-Next causal-LM wrapper."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["_fp32_params"]
@@ -479,12 +481,12 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     @classmethod
     def from_config(
         cls,
-        config: Qwen4ExpConfig,
+        config: Qwen3_8_FlashNextConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         **kwargs: Any,
-    ) -> Qwen4ExpForConditionalGeneration:
-        """Construct from a parsed Qwen4-Exp configuration."""
+    ) -> Qwen3_8_FlashNextForConditionalGeneration:
+        """Construct from a parsed Qwen3.8-Flash-Next configuration."""
         return cls(config, moe_config=moe_config, backend=backend, **kwargs)
 
     @classmethod
@@ -493,26 +495,26 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         pretrained_model_name_or_path: str,
         *model_args: Any,
         **kwargs: Any,
-    ) -> Qwen4ExpForConditionalGeneration:
+    ) -> Qwen3_8_FlashNextForConditionalGeneration:
         """Construct architecture from a local/HF config before checkpoint load."""
-        config = Qwen4ExpConfig.from_pretrained(pretrained_model_name_or_path)
+        config = Qwen3_8_FlashNextConfig.from_pretrained(pretrained_model_name_or_path)
         config.language_model_only = True
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
         self,
-        config: Qwen4ExpConfig,
+        config: Qwen3_8_FlashNextConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         *,
         engram_process_group: dist.ProcessGroup | None = None,
-        engram_table_config: Qwen4ExpEngramTableConfig | None = None,
+        engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,
         **kwargs: Any,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         if not config.language_model_only:
             raise NotImplementedError(
-                "Qwen4-Exp AutoModel support is currently language-only; set "
+                "Qwen3.8-Flash-Next AutoModel support is currently language-only; set "
                 "config.language_model_only=True. Vision and video training have not been validated."
             )
         super().__init__()
@@ -520,8 +522,8 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         if kwargs:
             raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
         self.config = config
-        self.backend = _qwen4_exp_backend(backend)
-        self.model = Qwen4ExpModel(
+        self.backend = _qwen3_8_flash_next_backend(backend)
+        self.model = Qwen3_8_FlashNextModel(
             config,
             self.backend,
             moe_config=moe_config,
@@ -550,14 +552,14 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         if self.backend.enable_hf_state_dict_adapter:
             if len(config.text_config.ple_layer_ids) != 1:
                 raise ValueError(
-                    "Qwen4-Exp checkpoint loading requires exactly one PLE layer; "
+                    "Qwen3.8-Flash-Next checkpoint loading requires exactly one PLE layer; "
                     f"got ple_layer_ids={config.text_config.ple_layer_ids}"
                 )
             ple_idx = int(config.text_config.ple_layer_ids[0]) - 1
             ple = self.model.language_model.layers[str(ple_idx)].ple
             if ple is None:
                 raise RuntimeError(f"Configured PLE layer {ple_idx} was not constructed")
-            self.state_dict_adapter = Qwen4ExpStateDictAdapter(
+            self.state_dict_adapter = Qwen3_8_FlashNextStateDictAdapter(
                 config.text_config,
                 self.moe_config,
                 self.backend,
@@ -601,18 +603,18 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             table = layer.ple.ple_embedding.ngram_embedding
             parameter = table.parallelize_weight(fsdp_mesh)
             if id(parameter) not in {id(registered) for registered in self.parameters()}:
-                raise RuntimeError("The parallelized Engram DTensor is not registered on the Qwen4-Exp model")
+                raise RuntimeError("The parallelized Engram DTensor is not registered on the Qwen3.8-Flash-Next model")
             parameters.add(parameter)
         return parameters
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
-        """Return Qwen4-Exp's contiguous model-owned CP batch sharder.
+        """Return Qwen3.8-Flash-Next's contiguous model-owned CP batch sharder.
 
         Args:
             batch: Full-sequence batch. Token-aligned tensors have shape
                 ``[batch, global_sequence, ...]`` and remain unchanged until
                 the returned sharder is invoked.
-            num_chunks: Accepted for the framework hook contract; Qwen4-Exp
+            num_chunks: Accepted for the framework hook contract; Qwen3.8-Flash-Next
                 shards each non-packed batch directly and does not use it.
 
         Returns:
@@ -624,7 +626,7 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         return {
             "cp_sharder": ContextParallelSharder(
                 shard_batch=partial(
-                    shard_batch_for_qwen4_cp,
+                    shard_batch_for_qwen3_8_flash_next_cp,
                     pad_multiple=self.config.text_config.indexer_compress_ratio,
                 ),
                 local_token_global_indices=contiguous_local_indices,
@@ -642,9 +644,9 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
-        _qwen4_cp_context: Qwen4ExpCPContext | None = None,
+        _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
         **kwargs: Any,
-    ) -> Qwen4ExpCausalLMOutput:
+    ) -> Qwen3_8_FlashNextCausalLMOutput:
         """Run language-only generation and project final HC-mixed states.
 
         Args:
@@ -667,7 +669,7 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
                 ``config.output_hidden_states=True`` returns only the final
                 state for fused linear cross entropy without retaining every
                 decoder activation.
-            _qwen4_cp_context: Internal contiguous CP metadata with replicated
+            _qwen3_8_flash_next_cp_context: Internal contiguous CP metadata with replicated
                 raw-ID/padding tensors of shape ``[batch, global_sequence]``.
             **kwargs: Text-attention backend metadata.
 
@@ -677,7 +679,7 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         """
         del labels
         if use_cache:
-            raise NotImplementedError("Qwen4-Exp training does not support caches")
+            raise NotImplementedError("Qwen3.8-Flash-Next training does not support caches")
         capture_all_hidden_states = output_hidden_states is True
         return_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -689,7 +691,7 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
             output_hidden_states=capture_all_hidden_states,
-            _qwen4_cp_context=_qwen4_cp_context,
+            _qwen3_8_flash_next_cp_context=_qwen3_8_flash_next_cp_context,
             **kwargs,
         )
         lm_output = compute_lm_head_logits(
@@ -698,7 +700,7 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             logits_to_keep,
             output_hidden_states=return_hidden_states,
         )
-        return Qwen4ExpCausalLMOutput(
+        return Qwen3_8_FlashNextCausalLMOutput(
             logits=lm_output.logits,
             past_key_values=None,
             hidden_states=outputs.hidden_states if capture_all_hidden_states else lm_output.hidden_states,
@@ -729,4 +731,4 @@ class Qwen4ExpForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
                 layer.ple.ple_embedding.ngram_embedding.mark_sharding_contract()
 
 
-ModelClass = Qwen4ExpForConditionalGeneration
+ModelClass = Qwen3_8_FlashNextForConditionalGeneration

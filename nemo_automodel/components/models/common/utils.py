@@ -287,7 +287,7 @@ class BackendConfig:
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
-            For Qwen4-Exp, "tilelang" selects fused sparse GQA on CUDA BF16;
+            For Qwen3.8-Flash-Next, "tilelang" selects fused sparse GQA on CUDA BF16;
             CPU execution retains the PyTorch numerical oracle.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").

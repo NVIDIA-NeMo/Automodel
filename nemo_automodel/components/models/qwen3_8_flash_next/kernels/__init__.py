@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optional fused kernels for Qwen4-Exp.
+"""Optional fused kernels for Qwen3.8-Flash-Next.
 
 The sparse-GQA TileLang kernels are Apache-2.0 adaptations of the Miles
 DeepSeek-V4 kernels vendored elsewhere in AutoModel. Per-file headers preserve

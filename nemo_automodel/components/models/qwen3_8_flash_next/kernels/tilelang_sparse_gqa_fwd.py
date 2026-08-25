@@ -19,16 +19,16 @@
 #   Source: miles_plugins/models/deepseek_v4/ops/kernel/tilelang_sparse_mla_fwd.py
 #   License: Apache-2.0
 #   Upstream copyright: Copyright 2025 Zhipu AI
-# This Qwen4-Exp adaptation separates K from V, maps GQA KV heads onto a
+# This Qwen3.8-Flash-Next adaptation separates K from V, maps GQA KV heads onto a
 # pseudo-batch, and specializes the head dimension to 256.
 
-"""TileLang forward kernel for Qwen4-Exp token-indexed sparse GQA."""
+"""TileLang forward kernel for Qwen3.8-Flash-Next token-indexed sparse GQA."""
 
 import math
 
 import torch
 
-from nemo_automodel.components.models.qwen4_exp.kernels._tilelang import T, tilelang
+from nemo_automodel.components.models.qwen3_8_flash_next.kernels._tilelang import T, tilelang
 
 _HEAD_DIM = 256
 _TOPK_TILE = 64
@@ -176,7 +176,7 @@ def _padded_head_count(heads: int) -> int:
     padded = max(_MIN_PADDED_HEADS, 1 << (heads - 1).bit_length())
     if padded > _MAX_PADDED_HEADS:
         raise NotImplementedError(
-            f"Qwen4-Exp TileLang sparse GQA supports at most {_MAX_PADDED_HEADS} query heads per KV head; got {heads}"
+            f"Qwen3.8-Flash-Next TileLang sparse GQA supports at most {_MAX_PADDED_HEADS} query heads per KV head; got {heads}"
         )
     return padded
 
@@ -234,7 +234,7 @@ def sparse_gqa_fwd_interface(
     if token_ids.shape[:2] != (pseudo_batch, query_length):
         raise ValueError(f"token_ids must start with {(pseudo_batch, query_length)}, got {tuple(token_ids.shape)}")
     if dim != _HEAD_DIM:
-        raise NotImplementedError(f"Qwen4-Exp TileLang sparse GQA requires head_dim={_HEAD_DIM}, got {dim}")
+        raise NotImplementedError(f"Qwen3.8-Flash-Next TileLang sparse GQA requires head_dim={_HEAD_DIM}, got {dim}")
     if heads < 1 or query_length < 1 or kv_length < 1 or token_ids.shape[-1] < 1:
         raise ValueError("query heads, sequence lengths, and top-k width must all be positive")
     if query.dtype != torch.bfloat16 or key.dtype != torch.bfloat16 or value.dtype != torch.bfloat16:
@@ -243,7 +243,7 @@ def sparse_gqa_fwd_interface(
         raise TypeError(f"token_ids must be int32 or int64, got {token_ids.dtype}")
     tensors = (query, key, value, token_ids)
     if not all(tensor.is_cuda for tensor in tensors):
-        raise RuntimeError("Qwen4-Exp TileLang sparse GQA requires CUDA tensors")
+        raise RuntimeError("Qwen3.8-Flash-Next TileLang sparse GQA requires CUDA tensors")
     if any(tensor.device != query.device for tensor in tensors[1:]):
         raise ValueError("query, key, value, and token_ids must share one CUDA device")
     if block_size != _TOPK_TILE:
@@ -295,7 +295,7 @@ def tilelang_sparse_gqa_fwd(
     token_ids: torch.Tensor,
     softmax_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run Qwen4-Exp sparse GQA from its native BSHD tensors.
+    """Run Qwen3.8-Flash-Next sparse GQA from its native BSHD tensors.
 
     This wrapper turns each KV head into a pseudo-batch row, so one fused MQA
     kernel handles each 12-query-head Qwen GQA group without repeating K/V to

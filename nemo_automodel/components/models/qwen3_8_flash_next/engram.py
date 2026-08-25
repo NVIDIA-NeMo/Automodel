@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen4-Exp raw-token Engram lookup and product-level embedding (PLE)."""
+"""Qwen3.8-Flash-Next raw-token Engram lookup and product-level embedding (PLE)."""
 
 from __future__ import annotations
 
@@ -28,19 +28,22 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
-from nemo_automodel.components.models.qwen4_exp.cp import Qwen4ExpCPContext, qwen4_cp_left_halo
-from nemo_automodel.components.models.qwen4_exp.layers import Qwen4ExpGroupedRMSNorm
+from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
+    Qwen3_8_FlashNextCPContext,
+    qwen3_8_flash_next_cp_left_halo,
+)
+from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGroupedRMSNorm
 from nemo_automodel.shared.owner_sharding import ModelOwnedDTensorSpec, OwnerShardedParameterSpec
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-_QWEN4_EXP_OWNER_OPTIMIZER_STATE_NAMESPACE = "__nemo_engram_owner_v1"
+_QWEN3_8_FLASH_NEXT_OWNER_OPTIMIZER_STATE_NAMESPACE = "__nemo_engram_owner_v1"
 
-QWEN4_EXP_LAYER_MULTIPLIERS = (
+QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS = (
     23703573157769,
     20109073645365,
     8052911324071,
 )
-QWEN4_EXP_NGRAM_HEAD_VOCAB_SIZES = (
+QWEN3_8_FLASH_NEXT_NGRAM_HEAD_VOCAB_SIZES = (
     20000003,
     20000023,
     20000033,
@@ -58,7 +61,7 @@ QWEN4_EXP_NGRAM_HEAD_VOCAB_SIZES = (
     20000161,
     20000171,
 )
-QWEN4_EXP_NGRAM_HEAD_OFFSETS = (
+QWEN3_8_FLASH_NEXT_NGRAM_HEAD_OFFSETS = (
     0,
     20000003,
     40000026,
@@ -76,7 +79,7 @@ QWEN4_EXP_NGRAM_HEAD_OFFSETS = (
     280001114,
     300001275,
 )
-QWEN4_EXP_NGRAM_PADDED_ROWS = 320001536
+QWEN3_8_FLASH_NEXT_NGRAM_PADDED_ROWS = 320001536
 
 
 def _fixed_capacity_all_to_all(
@@ -227,7 +230,7 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
 
 
 @dataclass(frozen=True)
-class Qwen4ExpEngramTableConfig:
+class Qwen3_8_FlashNextEngramTableConfig:
     """Declarative shape and initialization settings for the PLE embedding table.
 
     Args:
@@ -256,7 +259,7 @@ class Qwen4ExpEngramTableConfig:
         process_group: dist.ProcessGroup | None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-    ) -> Qwen4ExpOwnerShardedEmbedding:
+    ) -> Qwen3_8_FlashNextOwnerShardedEmbedding:
         """Build a local or row-owner-sharded embedding table.
 
         Args:
@@ -273,7 +276,7 @@ class Qwen4ExpEngramTableConfig:
             shape ``[..., embedding_dim]``. With a process group, the global row
             axis is sharded contiguously and evenly across its ranks.
         """
-        return Qwen4ExpOwnerShardedEmbedding(
+        return Qwen3_8_FlashNextOwnerShardedEmbedding(
             self,
             process_group=process_group,
             device=device,
@@ -281,7 +284,7 @@ class Qwen4ExpEngramTableConfig:
         )
 
 
-class Qwen4ExpOwnerShardedEmbedding(nn.Module):
+class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
     """Trainable contiguous row-owner embedding with bidirectional All-to-All.
 
     Rank ``r`` owns rows ``[r * local_rows, (r + 1) * local_rows)``. Each
@@ -301,7 +304,7 @@ class Qwen4ExpOwnerShardedEmbedding(nn.Module):
 
     def __init__(
         self,
-        config: Qwen4ExpEngramTableConfig,
+        config: Qwen3_8_FlashNextEngramTableConfig,
         *,
         process_group: dist.ProcessGroup | None,
         device: torch.device | str | None = None,
@@ -365,7 +368,7 @@ class Qwen4ExpOwnerShardedEmbedding(nn.Module):
             gradient_divisor=float(self.owner_world_size),
             # Preserve optimizer resume compatibility with checkpoints created
             # before the shared owner-sharding contract became model-agnostic.
-            optimizer_state_namespace=_QWEN4_EXP_OWNER_OPTIMIZER_STATE_NAMESPACE,
+            optimizer_state_namespace=_QWEN3_8_FLASH_NEXT_OWNER_OPTIMIZER_STATE_NAMESPACE,
         )
 
     def mark_model_owned_dtensor_weight(self) -> None:
@@ -383,7 +386,7 @@ class Qwen4ExpOwnerShardedEmbedding(nn.Module):
         self.weight._nemo_model_owned_dtensor_spec = ModelOwnedDTensorSpec(
             process_group=self.process_group,
             gradient_divisor=float(self.owner_world_size),
-            legacy_optimizer_state_namespace=_QWEN4_EXP_OWNER_OPTIMIZER_STATE_NAMESPACE,
+            legacy_optimizer_state_namespace=_QWEN3_8_FLASH_NEXT_OWNER_OPTIMIZER_STATE_NAMESPACE,
         )
 
     def parallelize_weight(self, fsdp_mesh: DeviceMesh) -> nn.Parameter:
@@ -762,8 +765,8 @@ class Qwen4ExpOwnerShardedEmbedding(nn.Module):
         return returned_values[unsort_indices].reshape(*original_shape, self.embedding_dim)
 
 
-class Qwen4ExpNGramEmbedding(nn.Module):
-    """Hash raw token IDs into the packed Qwen4-Exp PLE table.
+class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
+    """Hash raw token IDs into the packed Qwen3.8-Flash-Next PLE table.
 
     The first ``heads_per_ngram`` heads hash bigrams, the next group hashes
     trigrams, and so on. Previous-token context resets *after* an EOS token.
@@ -793,9 +796,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_size: int = 3,
         heads_per_ngram: int = 8,
         eos_token_id: int = 248044,
-        layer_multipliers: tuple[int, ...] = QWEN4_EXP_LAYER_MULTIPLIERS,
-        ngram_heads_vocab_sizes: tuple[int, ...] = QWEN4_EXP_NGRAM_HEAD_VOCAB_SIZES,
-        ngram_heads_offsets: tuple[int, ...] = QWEN4_EXP_NGRAM_HEAD_OFFSETS,
+        layer_multipliers: tuple[int, ...] = QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS,
+        ngram_heads_vocab_sizes: tuple[int, ...] = QWEN3_8_FLASH_NEXT_NGRAM_HEAD_VOCAB_SIZES,
+        ngram_heads_offsets: tuple[int, ...] = QWEN3_8_FLASH_NEXT_NGRAM_HEAD_OFFSETS,
     ) -> None:
         super().__init__()
         if ngram_size < 2:
@@ -958,15 +961,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         """
         if sequence_start < 0 or sequence_end < sequence_start or sequence_end > global_input_ids.shape[1]:
             raise ValueError(
-                "Invalid Qwen4-Exp PLE global slice "
+                "Invalid Qwen3.8-Flash-Next PLE global slice "
                 f"[{sequence_start}, {sequence_end}) for sequence length {global_input_ids.shape[1]}"
             )
         global_ngram_ids = self._hash_input_ids(global_input_ids)
         return self._lookup_ngram_ids(global_ngram_ids[:, sequence_start:sequence_end])
 
 
-class Qwen4ExpPLELayer(nn.Module):
-    """Contextualize Qwen4-Exp n-gram values and return an HC-sized delta.
+class Qwen3_8_FlashNextPLELayer(nn.Module):
+    """Contextualize Qwen3.8-Flash-Next n-gram values and return an HC-sized delta.
 
     Args:
         ple_embedding: Raw-token n-gram embedding whose output has shape
@@ -982,7 +985,7 @@ class Qwen4ExpPLELayer(nn.Module):
 
     def __init__(
         self,
-        ple_embedding: Qwen4ExpNGramEmbedding,
+        ple_embedding: Qwen3_8_FlashNextNGramEmbedding,
         *,
         hidden_size: int,
         hc_count: int,
@@ -1024,17 +1027,17 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
             dtype=parameter_dtype,
         )
-        self.norm_key = Qwen4ExpGroupedRMSNorm(
+        self.norm_key = Qwen3_8_FlashNextGroupedRMSNorm(
             self.hc_hidden_size,
             group_size=hidden_size,
             eps=rms_norm_eps,
         )
-        self.norm_query = Qwen4ExpGroupedRMSNorm(
+        self.norm_query = Qwen3_8_FlashNextGroupedRMSNorm(
             self.hc_hidden_size,
             group_size=hidden_size,
             eps=rms_norm_eps,
         )
-        self.norm_conv = Qwen4ExpGroupedRMSNorm(
+        self.norm_conv = Qwen3_8_FlashNextGroupedRMSNorm(
             self.hc_hidden_size,
             group_size=hidden_size,
             eps=rms_norm_eps,
@@ -1054,7 +1057,7 @@ class Qwen4ExpPLELayer(nn.Module):
 
     def _apply_branch_norm(
         self,
-        norm: Qwen4ExpGroupedRMSNorm,
+        norm: Qwen3_8_FlashNextGroupedRMSNorm,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """Apply a flattened grouped norm while retaining explicit HC branches.
@@ -1075,7 +1078,7 @@ class Qwen4ExpPLELayer(nn.Module):
     def _causal_short_conv(
         self,
         hidden_states: torch.Tensor,
-        cp_context: Qwen4ExpCPContext | None = None,
+        cp_context: Qwen3_8_FlashNextCPContext | None = None,
     ) -> torch.Tensor:
         """Apply the PLE causal depthwise convolution with left zero history.
 
@@ -1093,7 +1096,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if cp_context is None:
             channels_first = F.pad(hidden_states.transpose(1, 2), (left_padding, 0))
         else:
-            left_halo = qwen4_cp_left_halo(hidden_states, cp_context, history=left_padding)
+            left_halo = qwen3_8_flash_next_cp_left_halo(hidden_states, cp_context, history=left_padding)
             channels_first = torch.cat((left_halo, hidden_states), dim=1).transpose(1, 2)
         convolved = F.conv1d(
             channels_first,
@@ -1109,7 +1112,7 @@ class Qwen4ExpPLELayer(nn.Module):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         *,
-        cp_context: Qwen4ExpCPContext | None = None,
+        cp_context: Qwen3_8_FlashNextCPContext | None = None,
     ) -> torch.Tensor:
         """Compute the PLE delta injected before the layer's attention HC read.
 

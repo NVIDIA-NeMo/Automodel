@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Autograd adapter for native Qwen4-Exp TileLang sparse GQA kernels."""
+"""Autograd adapter for native Qwen3.8-Flash-Next TileLang sparse GQA kernels."""
 
 from __future__ import annotations
 
@@ -20,15 +20,15 @@ import math
 
 import torch
 
-from nemo_automodel.components.models.qwen4_exp.kernels.tilelang_sparse_gqa_bwd import (
+from nemo_automodel.components.models.qwen3_8_flash_next.kernels.tilelang_sparse_gqa_bwd import (
     sparse_gqa_bwd_interface,
 )
-from nemo_automodel.components.models.qwen4_exp.kernels.tilelang_sparse_gqa_fwd import (
+from nemo_automodel.components.models.qwen3_8_flash_next.kernels.tilelang_sparse_gqa_fwd import (
     sparse_gqa_fwd_interface,
 )
 
 
-class Qwen4SparseGQAAttention(torch.autograd.Function):
+class Qwen3_8_FlashNextSparseGQAAttention(torch.autograd.Function):
     """Autograd bridge for one pseudo-batched sparse-GQA kernel invocation."""
 
     @staticmethod
@@ -84,7 +84,7 @@ def tilelang_sparse_gqa_attention(
 
     The public tensors retain the model's BSHD layout. Each of the ``Hkv`` KV
     heads becomes a pseudo-batch row containing its ``Hq / Hkv`` query heads.
-    Qwen4-Exp therefore maps ``Hq=24, Hkv=2`` to ``Bp=B*2, H=12`` and pads the
+    Qwen3.8-Flash-Next therefore maps ``Hq=24, Hkv=2`` to ``Bp=B*2, H=12`` and pads the
     small head group to 16 only for the kernel. K and V remain independent
     ``D=256`` tensors throughout.
 
@@ -112,7 +112,7 @@ def tilelang_sparse_gqa_attention(
     if batch < 1 or seq_len < 1 or num_query_heads < 1:
         raise ValueError("batch size, query length, and query-head count must be positive")
     if head_dim != 256:
-        raise ValueError(f"Qwen4-Exp sparse GQA requires head_dim=256, got {head_dim}")
+        raise ValueError(f"Qwen3.8-Flash-Next sparse GQA requires head_dim=256, got {head_dim}")
     if key.shape[1] == 0:
         raise ValueError("sparse GQA requires at least one key/value token")
 
@@ -126,7 +126,7 @@ def tilelang_sparse_gqa_attention(
     if token_ids.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"token_ids must be int32 or int64, got {token_ids.dtype}")
     if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
-        raise TypeError("Qwen4-Exp TileLang sparse GQA requires BF16 query, key, and value")
+        raise TypeError("Qwen3.8-Flash-Next TileLang sparse GQA requires BF16 query, key, and value")
     if any(tensor.device != query.device for tensor in (key, value, token_ids)):
         raise ValueError("query, key, value, and token_ids must be on the same device")
 
@@ -140,7 +140,7 @@ def tilelang_sparse_gqa_attention(
     padded_group_heads = max(16, _next_power_of_two(group_heads))
     if padded_group_heads > 64:
         raise NotImplementedError(
-            f"Qwen4-Exp TileLang sparse GQA supports at most 64 query heads per KV head, got {group_heads}"
+            f"Qwen3.8-Flash-Next TileLang sparse GQA supports at most 64 query heads per KV head, got {group_heads}"
         )
 
     # [B,S,Hkv,G,D] -> [B,Hkv,S,G,D] -> [B*Hkv,S,G,D].
@@ -184,7 +184,7 @@ def tilelang_sparse_gqa_attention(
     )
     safe_ids = torch.cat((safe_first_id.unsqueeze(-1), pseudo_ids[..., 1:]), dim=-1).contiguous()
 
-    pseudo_output = Qwen4SparseGQAAttention.apply(
+    pseudo_output = Qwen3_8_FlashNextSparseGQAAttention.apply(
         pseudo_query,
         pseudo_key,
         pseudo_value,
@@ -203,4 +203,4 @@ def tilelang_sparse_gqa_attention(
     )
 
 
-__all__ = ["Qwen4SparseGQAAttention", "tilelang_sparse_gqa_attention"]
+__all__ = ["Qwen3_8_FlashNextSparseGQAAttention", "tilelang_sparse_gqa_attention"]

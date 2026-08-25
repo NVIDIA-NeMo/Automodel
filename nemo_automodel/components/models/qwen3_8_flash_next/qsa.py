@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen4-Exp QSA routing, fused sparse GQA, and its PyTorch oracle.
+"""Qwen3.8-Flash-Next QSA routing, fused sparse GQA, and its PyTorch oracle.
 
-The supplied Qwen4-Exp reference is an inference implementation: its indexer
+The supplied Qwen3.8-Flash-Next reference is an inference implementation: its indexer
 returns integer top-k IDs and defines neither an auxiliary indexer loss nor a
 straight-through gradient.  This module therefore freezes the indexer weights
 explicitly.  Routing is still recomputed from the current hidden states on
@@ -30,10 +30,13 @@ from torch import nn
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
+from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
+    Qwen3_8_FlashNextCPContext,
+    qwen3_8_flash_next_cp_all_gather,
+)
+from nemo_automodel.components.models.qwen3_8_flash_next.kernels._tilelang import HAS_TILELANG
+from nemo_automodel.components.models.qwen3_8_flash_next.kernels.sparse_attention import tilelang_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
-from nemo_automodel.components.models.qwen4_exp.cp import Qwen4ExpCPContext, qwen4_cp_all_gather
-from nemo_automodel.components.models.qwen4_exp.kernels._tilelang import HAS_TILELANG
-from nemo_automodel.components.models.qwen4_exp.kernels.sparse_attention import tilelang_sparse_gqa_attention
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # The gathered implementation is a numerical oracle and CPU fallback, not the
@@ -66,27 +69,27 @@ def right_padded_sequence_lengths(
         return torch.full((batch_size,), sequence_length, dtype=torch.long, device=device)
     if attention_mask.ndim != 2 or tuple(attention_mask.shape) != (batch_size, sequence_length):
         raise NotImplementedError(
-            "Qwen4-Exp QSA currently requires a non-packed [batch, sequence] right-tail attention mask; "
+            "Qwen3.8-Flash-Next QSA currently requires a non-packed [batch, sequence] right-tail attention mask; "
             f"got {tuple(attention_mask.shape)}"
         )
     mask = attention_mask.to(device=device)
     if mask.dtype != torch.bool:
         binary = (mask == 0) | (mask == 1)
         if not bool(binary.all()):
-            raise ValueError("Qwen4-Exp QSA attention_mask must contain only binary 0/1 values")
+            raise ValueError("Qwen3.8-Flash-Next QSA attention_mask must contain only binary 0/1 values")
     valid = mask.bool()
     lengths = valid.sum(dim=-1, dtype=torch.long)
     expected = torch.arange(sequence_length, device=device).unsqueeze(0) < lengths.unsqueeze(1)
     if not bool(torch.equal(valid, expected)):
         raise NotImplementedError(
-            "Qwen4-Exp QSA currently supports only right-tail padding (1...10...0); "
+            "Qwen3.8-Flash-Next QSA currently supports only right-tail padding (1...10...0); "
             "left padding, interior padding, and packed masks are not supported"
         )
     return lengths
 
 
 def apply_qsa_rope(states: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Apply the Qwen4 attention RoPE to indexer states.
+    """Apply the Qwen3.8-Flash-Next attention RoPE to indexer states.
 
     Args:
         states: Index query or compressed-key states ``[B, N, H, D_index]``.
@@ -399,7 +402,7 @@ def qsa_gqa_attention(
 
     CPU execution always uses the oracle so model construction, checkpoint
     inspection, and distributed CPU parity tests do not require TileLang.
-    CUDA execution is strict: Qwen4-Exp sparse GQA requires TileLang, and
+    CUDA execution is strict: Qwen3.8-Flash-Next sparse GQA requires TileLang, and
     missing dependencies or unsupported backends/dtypes are reported rather
     than silently falling back to the much larger gathered implementation.
     """
@@ -413,17 +416,17 @@ def qsa_gqa_attention(
         )
     if backend != "tilelang":
         raise RuntimeError(
-            "Qwen4-Exp CUDA QSA requires backend.attn='tilelang'; "
+            "Qwen3.8-Flash-Next CUDA QSA requires backend.attn='tilelang'; "
             "call gathered_qsa_gqa_attention directly for a numerical oracle"
         )
     if not HAS_TILELANG:
         raise RuntimeError(
-            "Qwen4-Exp TileLang QSA was requested on CUDA, but tilelang is not installed. "
+            "Qwen3.8-Flash-Next TileLang QSA was requested on CUDA, but tilelang is not installed. "
             "Install tilelang; the PyTorch oracle is available only through "
             "gathered_qsa_gqa_attention for explicit numerical tests."
         )
     if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
-        raise RuntimeError("Qwen4-Exp TileLang QSA requires CUDA BF16 query, key, and value tensors")
+        raise RuntimeError("Qwen3.8-Flash-Next TileLang QSA requires CUDA BF16 query, key, and value tensors")
     return tilelang_sparse_gqa_attention(
         query,
         key,
@@ -433,8 +436,8 @@ def qsa_gqa_attention(
     )
 
 
-class Qwen4ExpQSAIndexer(nn.Module):
-    """Frozen, hookable Qwen4-Exp compressed-block indexer.
+class Qwen3_8_FlashNextQSAIndexer(nn.Module):
+    """Frozen, hookable Qwen3.8-Flash-Next compressed-block indexer.
 
     ``forward`` has no cache or mutable routing state and returns the complete
     logical-ID tensor ``[B, S, indexer_budget + compress_ratio - 1]``.  A normal
@@ -460,7 +463,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
         if self.num_query_heads <= 0 or self.head_dim <= 0:
             raise ValueError("QSA index head count and dimension must be positive")
         if self.num_key_heads != 1:
-            raise ValueError(f"Qwen4-Exp QSA requires one index KV head, got {self.num_key_heads}")
+            raise ValueError(f"Qwen3.8-Flash-Next QSA requires one index KV head, got {self.num_key_heads}")
         if self.compress_ratio <= 1 or self.token_budget <= 0 or self.token_budget % self.compress_ratio != 0:
             raise ValueError("QSA indexer_budget must be positive and divisible by indexer_compress_ratio > 1")
         if self.query_chunk_size <= 0:
@@ -490,13 +493,13 @@ class Qwen4ExpQSAIndexer(nn.Module):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        cp_context: Qwen4ExpCPContext | None = None,
+        cp_context: Qwen3_8_FlashNextCPContext | None = None,
     ) -> torch.Tensor:
         """Return selected logical token IDs for every physical query row.
 
         Args:
             hidden_states: Decoder block input ``[B, S, hidden_size]``.
-            freqs_cis: Composed Qwen4 rotary values ``[B, S, D_rope]`` stored
+            freqs_cis: Composed Qwen3.8-Flash-Next rotary values ``[B, S, D_rope]`` stored
                 as concatenated cosine/sine halves.
             attention_mask: Optional binary right-tail mask ``[B, S]``.
             cp_context: Optional contiguous CP metadata. When present,
@@ -552,7 +555,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
         compressed_freqs = freqs_cis[:, : num_blocks * self.compress_ratio : self.compress_ratio]
         compressed_key = apply_qsa_rope(self.k_layernorm(compressed_key), compressed_freqs)
         if cp_context is not None:
-            compressed_key = qwen4_cp_all_gather(
+            compressed_key = qwen3_8_flash_next_cp_all_gather(
                 compressed_key,
                 cp_context,
                 sequence_dim=1,
@@ -579,7 +582,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
 
 __all__ = [
-    "Qwen4ExpQSAIndexer",
+    "Qwen3_8_FlashNextQSAIndexer",
     "apply_qsa_rope",
     "gathered_qsa_gqa_attention",
     "qsa_gqa_attention",

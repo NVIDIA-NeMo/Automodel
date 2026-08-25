@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for the exact Qwen4-Exp HyperConnection equations."""
+"""CPU tests for the exact Qwen3.8-Flash-Next HyperConnection equations."""
 
 import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen4_exp.layers import (
-    Qwen4ExpGroupedRMSNorm,
-    Qwen4ExpHyperConnection,
+from nemo_automodel.components.models.qwen3_8_flash_next.layers import (
+    Qwen3_8_FlashNextGroupedRMSNorm,
+    Qwen3_8_FlashNextHyperConnection,
 )
 
 
@@ -43,7 +43,7 @@ def _reference_group_norm(x: torch.Tensor, weight: torch.Tensor, groups: int, ep
 
 
 def test_grouped_rms_norm_is_branch_local() -> None:
-    norm = Qwen4ExpGroupedRMSNorm(hidden_size=12, group_size=4, eps=1e-6)
+    norm = Qwen3_8_FlashNextGroupedRMSNorm(hidden_size=12, group_size=4, eps=1e-6)
     x = torch.tensor([[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, -1.0, -2.0, -3.0, -4.0]])
     norm.weight.detach().copy_(torch.linspace(-0.2, 0.2, 12))
 
@@ -55,7 +55,7 @@ def test_grouped_rms_norm_is_branch_local() -> None:
 
 def test_hyperconnection_matches_reference_read_and_write() -> None:
     torch.manual_seed(7)
-    layer = Qwen4ExpHyperConnection(
+    layer = Qwen3_8_FlashNextHyperConnection(
         hidden_size=4,
         hc_count=3,
         lowrank_size=5,
@@ -83,7 +83,7 @@ def test_hyperconnection_matches_reference_read_and_write() -> None:
 
 
 def test_final_hyperconnection_has_read_only_state_dict() -> None:
-    layer = Qwen4ExpHyperConnection(
+    layer = Qwen3_8_FlashNextHyperConnection(
         hidden_size=4,
         hc_count=2,
         lowrank_size=3,

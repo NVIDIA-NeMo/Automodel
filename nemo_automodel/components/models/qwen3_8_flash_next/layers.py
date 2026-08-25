@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen4-Exp model-local layers.
+"""Qwen3.8-Flash-Next model-local layers.
 
-The HyperConnection equations in this module follow the Qwen4-Exp reference
+The HyperConnection equations in this module follow the Qwen3.8-Flash-Next reference
 implementation. They are intentionally not shared with DeepSeek-V4: that model
 uses a different Sinkhorn-based HyperConnection parameterization.
 """
@@ -34,17 +34,20 @@ from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelS
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
+    Qwen3_8_FlashNextCPContext,
+    qwen3_8_flash_next_cp_all_gather,
+)
+from nemo_automodel.components.models.qwen3_8_flash_next.qsa import Qwen3_8_FlashNextQSAIndexer, qsa_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
-from nemo_automodel.components.models.qwen4_exp.cp import Qwen4ExpCPContext, qwen4_cp_all_gather
-from nemo_automodel.components.models.qwen4_exp.qsa import Qwen4ExpQSAIndexer, qsa_gqa_attention
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
-class Qwen4ExpRMSNormGated(nn.Module):
-    """Qwen4 GDN output normalization with its checkpoint-selected gate.
+class Qwen3_8_FlashNextRMSNormGated(nn.Module):
+    """Qwen3.8-Flash-Next GDN output normalization with its checkpoint-selected gate.
 
-    Transformers' Qwen3.5 GatedDeltaNet hard-codes a SiLU output gate.  Qwen4
+    Transformers' Qwen3.5 GatedDeltaNet hard-codes a SiLU output gate.  Qwen3.8-Flash-Next
     keeps the same projections and delta-rule core but sets
     ``output_gate_type='sigmoid'``.  Keeping this model-local module avoids
     changing the shared Qwen3.5 execution contract.
@@ -59,7 +62,7 @@ class Qwen4ExpRMSNormGated(nn.Module):
     ) -> None:
         super().__init__()
         if activation not in ("sigmoid", "silu"):
-            raise ValueError(f"Unsupported Qwen4 GDN output gate {activation!r}")
+            raise ValueError(f"Unsupported Qwen3.8-Flash-Next GDN output gate {activation!r}")
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.variance_epsilon = eps
         self.activation = activation
@@ -93,13 +96,13 @@ class Qwen4ExpRMSNormGated(nn.Module):
         self.weight.fill_(1.0)
 
 
-class Qwen4ExpGatedDeltaNet(CPAwareGatedDeltaNet):
-    """CP-aware GatedDeltaNet with Qwen4's sigmoid output gate."""
+class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
+    """CP-aware GatedDeltaNet with Qwen3.8-Flash-Next's sigmoid output gate."""
 
     def __init__(self, config: object, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
         output_gate_type = str(getattr(config, "output_gate_type", "sigmoid"))
-        self.norm = Qwen4ExpRMSNormGated(
+        self.norm = Qwen3_8_FlashNextRMSNormGated(
             self.head_v_dim,
             eps=float(getattr(config, "rms_norm_eps")),
             activation=output_gate_type,
@@ -124,9 +127,9 @@ class Qwen4ExpGatedDeltaNet(CPAwareGatedDeltaNet):
                 local_sequence]`` or repeated text-RoPE axes of shape ``[axes,
                 batch, local_sequence]``.
             seq_index: Optional local positions of shape ``[local_sequence]``
-                or ``[batch, local_sequence]``; ignored because Qwen4-Exp's
+                or ``[batch, local_sequence]``; ignored because Qwen3.8-Flash-Next's
                 model-owned layout is always contiguous.
-            blockdiag_state: Packed CP metadata. Qwen4-Exp does not support it.
+            blockdiag_state: Packed CP metadata. Qwen3.8-Flash-Next does not support it.
 
         Returns:
             Local GDN output of shape ``[batch, local_sequence, hidden]`` in
@@ -134,11 +137,11 @@ class Qwen4ExpGatedDeltaNet(CPAwareGatedDeltaNet):
         """
         del seq_index
         if blockdiag_state is not None:
-            raise NotImplementedError("Qwen4-Exp GDN context parallelism does not support packed sequences")
+            raise NotImplementedError("Qwen3.8-Flash-Next GDN context parallelism does not support packed sequences")
         if self._cp_mesh is None or self._cp_mesh.size() <= 1:
-            raise RuntimeError("Qwen4-Exp contiguous GDN CP requires an active CP mesh")
+            raise RuntimeError("Qwen3.8-Flash-Next contiguous GDN CP requires an active CP mesh")
         if position_ids is None:
-            raise ValueError("Qwen4-Exp contiguous GDN CP requires global position_ids")
+            raise ValueError("Qwen3.8-Flash-Next contiguous GDN CP requires global position_ids")
 
         cp_group = self._cp_mesh.get_group()
         global_sequence_length = hidden_states.shape[1] * self._cp_mesh.size()
@@ -161,7 +164,7 @@ class Qwen4ExpGatedDeltaNet(CPAwareGatedDeltaNet):
         )
 
 
-class Qwen4ExpGroupedRMSNorm(nn.Module):
+class Qwen3_8_FlashNextGroupedRMSNorm(nn.Module):
     """Gemma-style RMS normalization over fixed-width HyperConnection branches.
 
     Args:
@@ -180,7 +183,7 @@ class Qwen4ExpGroupedRMSNorm(nn.Module):
         super().__init__()
         if hidden_size <= 0 or group_size <= 0 or hidden_size % group_size != 0:
             raise ValueError(
-                "Qwen4ExpGroupedRMSNorm requires positive, divisible widths; "
+                "Qwen3_8_FlashNextGroupedRMSNorm requires positive, divisible widths; "
                 f"got hidden_size={hidden_size}, group_size={group_size}"
             )
         self.hidden_size = hidden_size
@@ -213,7 +216,7 @@ class Qwen4ExpGroupedRMSNorm(nn.Module):
 
 
 @dataclass(frozen=True)
-class Qwen4ExpHyperConnectionResidual:
+class Qwen3_8_FlashNextHyperConnectionResidual:
     """Residual tensors retained between a HyperConnection read and write.
 
     Attributes:
@@ -225,8 +228,8 @@ class Qwen4ExpHyperConnectionResidual:
     normalized_states: torch.Tensor
 
 
-class Qwen4ExpHyperConnection(nn.Module):
-    """Qwen4-Exp gated HyperConnection read/write transform.
+class Qwen3_8_FlashNextHyperConnection(nn.Module):
+    """Qwen3.8-Flash-Next gated HyperConnection read/write transform.
 
     A read normalizes ``hc_count`` streams independently, predicts a feature
     gate, and averages the gated streams to one block input. A write predicts
@@ -262,7 +265,7 @@ class Qwen4ExpHyperConnection(nn.Module):
     ) -> None:
         super().__init__()
         if hc_count <= 1:
-            raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {hc_count}")
+            raise ValueError(f"Qwen3.8-Flash-Next requires hc_count > 1, got {hc_count}")
         if hidden_size <= 0 or lowrank_size <= 0:
             raise ValueError(f"hidden_size and lowrank_size must be positive, got {hidden_size}, {lowrank_size}")
         self.hidden_size = hidden_size
@@ -272,7 +275,7 @@ class Qwen4ExpHyperConnection(nn.Module):
         self.use_combine = use_combine
         parameter_dtype = get_dtype(dtype, torch.bfloat16)
 
-        self.hc_norm = Qwen4ExpGroupedRMSNorm(
+        self.hc_norm = Qwen3_8_FlashNextGroupedRMSNorm(
             self.flat_hidden_size,
             group_size=hidden_size,
             eps=rms_norm_eps,
@@ -303,7 +306,7 @@ class Qwen4ExpHyperConnection(nn.Module):
             else None
         )
 
-    def mix(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, Qwen4ExpHyperConnectionResidual]:
+    def mix(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, Qwen3_8_FlashNextHyperConnectionResidual]:
         """Collapse HC streams to the input of an attention or MoE block.
 
         Args:
@@ -324,13 +327,13 @@ class Qwen4ExpHyperConnection(nn.Module):
             gates.unflatten(-1, (self.hc_count, self.hidden_size))
             * normalized.unflatten(-1, (self.hc_count, self.hidden_size))
         ).mean(dim=-2)
-        residual = Qwen4ExpHyperConnectionResidual(hidden_states, normalized)
+        residual = Qwen3_8_FlashNextHyperConnectionResidual(hidden_states, normalized)
         return mixed, residual
 
     def combine(
         self,
         block_output: torch.Tensor,
-        residual: Qwen4ExpHyperConnectionResidual,
+        residual: Qwen3_8_FlashNextHyperConnectionResidual,
     ) -> torch.Tensor:
         """Inject one block output into every HC stream.
 
@@ -369,8 +372,8 @@ class Qwen4ExpHyperConnection(nn.Module):
             nn.init.trunc_normal_(self.block_inject_weight.weight, mean=0.0, std=init_std)
 
 
-class Qwen4ExpQSAAttention(Qwen3NextAttention):
-    """Qwen4-Exp gated attention with compressed-block QSA routing.
+class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
+    """Qwen3.8-Flash-Next gated attention with compressed-block QSA routing.
 
     The main query/key/value, output gate, and output projection retain the
     Qwen3-Next equations.  A separate frozen indexer returns logical token IDs,
@@ -390,7 +393,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
         self.attn_module = None
         self.attn_func = None
         self._cp_mesh: DeviceMesh | None = None
-        self.indexer = Qwen4ExpQSAIndexer(config, backend)
+        self.indexer = Qwen3_8_FlashNextQSAIndexer(config, backend)
 
     def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
         """Install the contiguous CP mesh used for QSA K/V exchange."""
@@ -402,7 +405,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        cp_context: Qwen4ExpCPContext | None = None,
+        cp_context: Qwen3_8_FlashNextCPContext | None = None,
         **attn_kwargs: object,
     ) -> torch.Tensor:
         """Select compressed blocks and run model-owned sparse GQA.
@@ -424,15 +427,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
         """
         if x.ndim != 3:
             raise NotImplementedError(
-                f"Qwen4-Exp QSA currently requires non-packed [batch, sequence, hidden] inputs; got {tuple(x.shape)}"
+                f"Qwen3.8-Flash-Next QSA currently requires non-packed [batch, sequence, hidden] inputs; got {tuple(x.shape)}"
             )
         if x.shape[1] == 0:
-            raise ValueError("Qwen4-Exp QSA requires a non-empty sequence")
+            raise ValueError("Qwen3.8-Flash-Next QSA requires a non-empty sequence")
         if attn_kwargs.get("cu_seqlens") is not None:
-            raise NotImplementedError("Qwen4-Exp QSA packed THD attention is not yet supported")
+            raise NotImplementedError("Qwen3.8-Flash-Next QSA packed THD attention is not yet supported")
         cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
         if cp_active and cp_context is None:
-            raise RuntimeError("Qwen4-Exp QSA has an active CP mesh but did not receive model-owned batch metadata")
+            raise RuntimeError(
+                "Qwen3.8-Flash-Next QSA has an active CP mesh but did not receive model-owned batch metadata"
+            )
         if cp_context is not None:
             # QSA discards the inherited dense attention module so the shared
             # parallelizer installs this model-owned mesh. The batch context is
@@ -440,7 +445,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
             if self._cp_mesh is not None:
                 cp_group = self._cp_mesh.get_group()
                 if cp_context.size != self._cp_mesh.size() or cp_context.rank != dist.get_rank(cp_group):
-                    raise RuntimeError("Qwen4-Exp QSA CP context does not match the installed CP mesh")
+                    raise RuntimeError("Qwen3.8-Flash-Next QSA CP context does not match the installed CP mesh")
 
         selected_token_ids = self.indexer(
             x,
@@ -471,8 +476,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
             rope_fusion=False,
         )
         if cp_context is not None:
-            key = qwen4_cp_all_gather(key, cp_context, sequence_dim=1, differentiable=True)
-            value = qwen4_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
+            key = qwen3_8_flash_next_cp_all_gather(key, cp_context, sequence_dim=1, differentiable=True)
+            value = qwen3_8_flash_next_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
 
         attn_output = qsa_gqa_attention(
             query,
@@ -498,12 +503,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
         self.indexer.init_weights(init_std=init_std)
 
 
-class Qwen4ExpDecoderLayer(nn.Module):
-    """One Qwen4-Exp decoder layer with two learned HyperConnections.
+class Qwen3_8_FlashNextDecoderLayer(nn.Module):
+    """One Qwen3.8-Flash-Next decoder layer with two learned HyperConnections.
 
     Args:
         layer_idx: Zero-based decoder index.
-        config: Qwen4-Exp text configuration.
+        config: Qwen3.8-Flash-Next text configuration.
         moe_config: Native MoE configuration.
         backend: Attention, linear, and expert backend configuration.
         ple: Optional Engram-derived PLE module. The checkpoint installs it
@@ -538,14 +543,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
         # PLE's owner-sharded lookup uses mutable distributed collectives.
         # PyTorch's selective TorchDispatch checkpoint context cannot safely
         # cache those side effects, so the MoE parallelizer leaves only this
-        # decoder block eager while checkpointing every other Qwen4 block.
+        # decoder block eager while checkpointing every other Qwen3.8-Flash-Next block.
         self._nemo_disable_activation_checkpointing = ple is not None
         if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen4ExpGatedDeltaNet(config, layer_idx)
+            self.linear_attn = Qwen3_8_FlashNextGatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
-            self.self_attn = Qwen4ExpQSAAttention(config, layer_idx, backend)
+            self.self_attn = Qwen3_8_FlashNextQSAAttention(config, layer_idx, backend)
         else:
-            raise ValueError(f"Unsupported Qwen4-Exp layer type {self.layer_type!r}")
+            raise ValueError(f"Unsupported Qwen3.8-Flash-Next layer type {self.layer_type!r}")
 
         self.mlp = MoE(moe_config, backend)
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
@@ -557,8 +562,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             "backend": backend,
             "dtype": dtype,
         }
-        self.attn_hyper_connection = Qwen4ExpHyperConnection(**hc_kwargs)
-        self.mlp_hyper_connection = Qwen4ExpHyperConnection(**hc_kwargs)
+        self.attn_hyper_connection = Qwen3_8_FlashNextHyperConnection(**hc_kwargs)
+        self.mlp_hyper_connection = Qwen3_8_FlashNextHyperConnection(**hc_kwargs)
 
     def _expand_initial_streams(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Expand a one-stream decoder input into the persistent HC layout.
@@ -575,7 +580,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             return hidden_states
         if hidden_states.shape[-1] != self.hidden_size:
             raise ValueError(
-                "Qwen4-Exp decoder input must contain one stream or all HC streams; "
+                "Qwen3.8-Flash-Next decoder input must contain one stream or all HC streams; "
                 f"got width {hidden_states.shape[-1]}"
             )
         return torch.cat([hidden_states] * self.hc_count, dim=-1)
@@ -589,7 +594,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-        cp_context: Qwen4ExpCPContext | None = None,
+        cp_context: Qwen3_8_FlashNextCPContext | None = None,
         **attn_kwargs: object,
     ) -> torch.Tensor:
         """Run PLE, attention/GDN, and top-10 MoE updates.
@@ -647,7 +652,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mlp_input, mlp_residual = self.mlp_hyper_connection.mix(hidden_states)
         mlp_module = unwrap_checkpoint_wrapper(self.mlp)
         if not isinstance(mlp_module, MoE):
-            raise TypeError(f"Qwen4-Exp requires an MoE block, got {type(mlp_module).__name__}")
+            raise TypeError(f"Qwen3.8-Flash-Next requires an MoE block, got {type(mlp_module).__name__}")
         mlp_output = self.mlp(mlp_input, padding_mask)
         return self.mlp_hyper_connection.combine(mlp_output, mlp_residual)
 

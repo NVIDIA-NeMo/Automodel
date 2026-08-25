@@ -12,20 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU execution tests for the Qwen4-Exp HC decoder."""
+"""CPU execution tests for the Qwen3.8-Flash-Next HC decoder."""
 
 import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen4_exp.config import Qwen4ExpConfig, Qwen4ExpTextConfig
-from nemo_automodel.components.models.qwen4_exp.engram import Qwen4ExpEngramTableConfig
-from nemo_automodel.components.models.qwen4_exp.model import ModelClass, Qwen4ExpForConditionalGeneration
+from nemo_automodel.components.models.qwen3_8_flash_next.config import (
+    Qwen3_8_FlashNextConfig,
+    Qwen3_8_FlashNextTextConfig,
+)
+from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.model import (
+    ModelClass,
+    Qwen3_8_FlashNextForConditionalGeneration,
+)
 from nemo_automodel.components.moe.layers import MoEConfig
 
 
-def _tiny_config() -> Qwen4ExpConfig:
-    text = Qwen4ExpTextConfig(
+def _tiny_config() -> Qwen3_8_FlashNextConfig:
+    text = Qwen3_8_FlashNextTextConfig(
         vocab_size=64,
         hidden_size=16,
         intermediate_size=32,
@@ -61,10 +67,10 @@ def _tiny_config() -> Qwen4ExpConfig:
         eos_token_id=1,
         tie_word_embeddings=False,
     )
-    return Qwen4ExpConfig(text_config=text, language_model_only=True, tie_word_embeddings=False)
+    return Qwen3_8_FlashNextConfig(text_config=text, language_model_only=True, tie_word_embeddings=False)
 
 
-def _tiny_moe_config(config: Qwen4ExpTextConfig) -> MoEConfig:
+def _tiny_moe_config(config: Qwen3_8_FlashNextTextConfig) -> MoEConfig:
     return MoEConfig(
         dim=config.hidden_size,
         inter_dim=config.hidden_size,
@@ -90,8 +96,8 @@ def _tiny_moe_config(config: Qwen4ExpTextConfig) -> MoEConfig:
     )
 
 
-def test_model_class_alias_selects_qwen4_exp_conditional_generation() -> None:
-    assert ModelClass is Qwen4ExpForConditionalGeneration
+def test_model_class_alias_selects_qwen3_8_flash_next_conditional_generation() -> None:
+    assert ModelClass is Qwen3_8_FlashNextForConditionalGeneration
 
 
 def test_multimodal_configuration_fails_closed() -> None:
@@ -99,14 +105,14 @@ def test_multimodal_configuration_fails_closed() -> None:
     config.language_model_only = False
 
     with pytest.raises(NotImplementedError, match="currently language-only"):
-        Qwen4ExpForConditionalGeneration.from_config(
+        Qwen3_8_FlashNextForConditionalGeneration.from_config(
             config,
             moe_config=_tiny_moe_config(config.text_config),
             backend=BackendConfig(enable_hf_state_dict_adapter=False),
         )
 
 
-def test_tiny_qwen4_exp_forward_backward_and_state_layout() -> None:
+def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout() -> None:
     config = _tiny_config()
     backend = BackendConfig(
         linear="torch",
@@ -116,7 +122,7 @@ def test_tiny_qwen4_exp_forward_backward_and_state_layout() -> None:
         dispatcher="torch",
         enable_hf_state_dict_adapter=False,
     )
-    model = Qwen4ExpForConditionalGeneration.from_config(
+    model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
         config,
         moe_config=_tiny_moe_config(config.text_config),
         backend=backend,
@@ -152,7 +158,7 @@ def test_tiny_qwen4_exp_forward_backward_and_state_layout() -> None:
 def test_output_hidden_states_defaults_to_model_config() -> None:
     config = _tiny_config()
     config.output_hidden_states = True
-    model = Qwen4ExpForConditionalGeneration.from_config(
+    model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
         config,
         moe_config=_tiny_moe_config(config.text_config),
         backend=BackendConfig(
@@ -190,7 +196,7 @@ def test_qsa_sparse_training_runs_above_budget() -> None:
         dispatcher="torch",
         enable_hf_state_dict_adapter=False,
     )
-    model = Qwen4ExpForConditionalGeneration.from_config(
+    model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
         config,
         moe_config=_tiny_moe_config(config.text_config),
         backend=backend,
@@ -221,7 +227,7 @@ def test_released_ple_table_requires_distributed_owner_group() -> None:
     )
 
     with pytest.raises(RuntimeError, match="must be constructed after torch.distributed initialization"):
-        Qwen4ExpForConditionalGeneration.from_config(
+        Qwen3_8_FlashNextForConditionalGeneration.from_config(
             config,
             moe_config=_tiny_moe_config(config.text_config),
             backend=backend,
@@ -243,9 +249,9 @@ def test_engram_owner_markers_are_restored_after_meta_materialization() -> None:
         dispatcher="torch",
         enable_hf_state_dict_adapter=False,
     )
-    table_config = Qwen4ExpEngramTableConfig(num_embeddings=36, embedding_dim=2, initializer_range=0.05)
+    table_config = Qwen3_8_FlashNextEngramTableConfig(num_embeddings=36, embedding_dim=2, initializer_range=0.05)
     with torch.device("meta"):
-        model = Qwen4ExpForConditionalGeneration.from_config(
+        model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
             config,
             moe_config=_tiny_moe_config(config.text_config),
             backend=backend,

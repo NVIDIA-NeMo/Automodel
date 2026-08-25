@@ -23,7 +23,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.models.qwen4_exp.engram import Qwen4ExpEngramTableConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.owner_sharding import get_model_owned_dtensor_spec
 
@@ -33,7 +33,7 @@ class _EngramOnlyModel(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.table = Qwen4ExpEngramTableConfig(
+        self.table = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=6,
             embedding_dim=2,
             initializer_range=0.0,

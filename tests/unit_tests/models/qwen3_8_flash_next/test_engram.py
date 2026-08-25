@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exact CPU and two-rank gradient tests for Qwen4-Exp PLE."""
+"""Exact CPU and two-rank gradient tests for Qwen3.8-Flash-Next PLE."""
 
 from __future__ import annotations
 
@@ -28,13 +28,13 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen4_exp.engram import (
-    QWEN4_EXP_LAYER_MULTIPLIERS,
-    QWEN4_EXP_NGRAM_HEAD_OFFSETS,
-    QWEN4_EXP_NGRAM_HEAD_VOCAB_SIZES,
-    Qwen4ExpEngramTableConfig,
-    Qwen4ExpNGramEmbedding,
-    Qwen4ExpPLELayer,
+from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
+    QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS,
+    QWEN3_8_FLASH_NEXT_NGRAM_HEAD_OFFSETS,
+    QWEN3_8_FLASH_NEXT_NGRAM_HEAD_VOCAB_SIZES,
+    Qwen3_8_FlashNextEngramTableConfig,
+    Qwen3_8_FlashNextNGramEmbedding,
+    Qwen3_8_FlashNextPLELayer,
 )
 
 
@@ -54,8 +54,8 @@ class _RowIdLookup(nn.Module):
         return global_ids.unsqueeze(-1)
 
 
-def _tiny_ngram_embedding(table: nn.Module) -> Qwen4ExpNGramEmbedding:
-    return Qwen4ExpNGramEmbedding(
+def _tiny_ngram_embedding(table: nn.Module) -> Qwen3_8_FlashNextNGramEmbedding:
+    return Qwen3_8_FlashNextNGramEmbedding(
         table,
         ngram_size=3,
         heads_per_ngram=2,
@@ -76,9 +76,9 @@ def _parallelize_owner_table(table: nn.Module) -> None:
     table.parallelize_weight(mesh)
 
 
-def _tiny_ple() -> Qwen4ExpPLELayer:
+def _tiny_ple() -> Qwen3_8_FlashNextPLELayer:
     table = nn.Embedding(36, 2)
-    ple = Qwen4ExpPLELayer(
+    ple = Qwen3_8_FlashNextPLELayer(
         _tiny_ngram_embedding(table),
         hidden_size=2,
         hc_count=2,
@@ -109,12 +109,12 @@ def _tiny_ple() -> Qwen4ExpPLELayer:
 
 
 def test_checkpoint_hash_fixture_uses_raw_ids_and_resets_after_eos() -> None:
-    embedding = Qwen4ExpNGramEmbedding(_RowIdLookup())
+    embedding = Qwen3_8_FlashNextNGramEmbedding(_RowIdLookup())
     input_ids = torch.tensor([[10, 11, 248044, 12, 13]])
 
     actual = embedding(input_ids).squeeze(-1)
 
-    # Frozen from the qwen4-main SGLang implementation with the three buffers
+    # Frozen from the reference SGLang implementation with the three buffers
     # loaded from brightdelta-180b-bf16_vv1. In particular, token 12 cannot see
     # token 11 across the preceding EOS boundary.
     expected = torch.tensor(
@@ -214,9 +214,9 @@ def test_checkpoint_hash_fixture_uses_raw_ids_and_resets_after_eos() -> None:
         ]
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert tuple(embedding.layer_multipliers.tolist()) == QWEN4_EXP_LAYER_MULTIPLIERS
-    assert tuple(embedding.ngram_heads_vocab_sizes.tolist()) == QWEN4_EXP_NGRAM_HEAD_VOCAB_SIZES
-    assert tuple(embedding.ngram_heads_offsets.tolist()) == QWEN4_EXP_NGRAM_HEAD_OFFSETS
+    assert tuple(embedding.layer_multipliers.tolist()) == QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS
+    assert tuple(embedding.ngram_heads_vocab_sizes.tolist()) == QWEN3_8_FLASH_NEXT_NGRAM_HEAD_VOCAB_SIZES
+    assert tuple(embedding.ngram_heads_offsets.tolist()) == QWEN3_8_FLASH_NEXT_NGRAM_HEAD_OFFSETS
 
 
 def test_tiny_hash_fixture_proves_packed_head_offsets() -> None:
@@ -293,7 +293,7 @@ def test_ple_rejects_collapsed_hidden_state() -> None:
 
 def test_ple_uses_explicit_model_dtype_and_zero_start_conv() -> None:
     table = nn.Embedding(36, 2, dtype=torch.bfloat16)
-    ple = Qwen4ExpPLELayer(
+    ple = Qwen3_8_FlashNextPLELayer(
         _tiny_ngram_embedding(table),
         hidden_size=2,
         hc_count=2,
@@ -310,7 +310,7 @@ def test_ple_uses_explicit_model_dtype_and_zero_start_conv() -> None:
 
 
 def test_local_engram_table_matches_torch_embedding_forward_and_backward() -> None:
-    table = Qwen4ExpEngramTableConfig(
+    table = Qwen3_8_FlashNextEngramTableConfig(
         num_embeddings=12,
         embedding_dim=3,
         initializer_range=0.0,
@@ -345,7 +345,7 @@ def _owner_sharded_gradient_worker(rank: int, world_size: int, store_path: str) 
             rank=rank,
             world_size=world_size,
         )
-        config = Qwen4ExpEngramTableConfig(
+        config = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=12,
             embedding_dim=3,
             initializer_range=0.0,
@@ -415,7 +415,7 @@ def _engram_meta_dtensor_lifecycle_worker(rank: int, world_size: int, store_path
             world_size=world_size,
         )
         with torch.device("meta"):
-            table = Qwen4ExpEngramTableConfig(
+            table = Qwen3_8_FlashNextEngramTableConfig(
                 num_embeddings=12,
                 embedding_dim=3,
                 initializer_range=0.02,
@@ -460,7 +460,7 @@ def _owner_sharded_misroute_worker(rank: int, world_size: int, store_path: str) 
             rank=rank,
             world_size=world_size,
         )
-        table = Qwen4ExpEngramTableConfig(
+        table = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=12,
             embedding_dim=3,
             initializer_range=0.0,
@@ -553,7 +553,7 @@ def _owner_sharded_route_metadata_worker(rank: int, world_size: int, store_path:
             rank=rank,
             world_size=world_size,
         )
-        table = Qwen4ExpEngramTableConfig(
+        table = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=12,
             embedding_dim=3,
             initializer_range=0.0,

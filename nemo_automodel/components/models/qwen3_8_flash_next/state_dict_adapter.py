@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""State-dict conversion for Qwen4-Exp and its owner-sharded Engram table.
+"""State-dict conversion for Qwen3.8-Flash-Next and its owner-sharded Engram table.
 
 The dense, grouped-MoE, shared-expert, and GatedDeltaNet parameters use the
-same checkpoint layouts as Qwen3.5-MoE.  Qwen4-Exp's PLE table is different:
+same checkpoint layouts as Qwen3.5-MoE.  Qwen3.8-Flash-Next's PLE table is different:
 the checkpoint stores 128 physical tensors while the native module registers
 one rank-local owner shard.  This adapter exposes only the complete physical
 checkpoint shards owned by the current rank as views of that local parameter.
@@ -23,7 +23,7 @@ The checkpoint reader therefore writes directly into final model storage and
 the 51.2-billion-parameter global table is never concatenated or materialized.
 
 The released checkpoint also contains an MTP predictor.  The current
-Qwen4-Exp target is ordinary full SFT and intentionally does not construct
+Qwen3.8-Flash-Next target is ordinary full SFT and intentionally does not construct
 MTP, so those checkpoint keys are explicitly ignored in both directions.
 """
 
@@ -38,8 +38,8 @@ from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import Qwen3_5MoeStateDictAdapter
-from nemo_automodel.components.models.qwen4_exp.config import Qwen4ExpTextConfig
-from nemo_automodel.components.models.qwen4_exp.engram import Qwen4ExpOwnerShardedEmbedding
+from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextOwnerShardedEmbedding
 from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.layers import MoEConfig
 
@@ -70,11 +70,11 @@ def _same_tensor_region(left: torch.Tensor, right: torch.Tensor) -> bool:
     return left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
 
 
-class Qwen4ExpStateDictAdapter(Qwen3_5MoeStateDictAdapter):
-    """Convert Qwen4-Exp checkpoints without gathering the global PLE table.
+class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
+    """Convert Qwen3.8-Flash-Next checkpoints without gathering the global PLE table.
 
     Args:
-        config: Qwen4-Exp text configuration.  Exactly one one-based PLE layer
+        config: Qwen3.8-Flash-Next text configuration.  Exactly one one-based PLE layer
             ID is required by the released architecture.
         moe_config: Native grouped-MoE configuration.
         backend: Native backend configuration used by the model.
@@ -93,7 +93,7 @@ class Qwen4ExpStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         ``[experts, output, input]`` and native ``[experts, input, output]``.
     """
 
-    # For a valid Qwen4-Exp model state, dense tensors are identities, grouped
+    # For a valid Qwen3.8-Flash-Next model state, dense tensors are identities, grouped
     # experts are transpose views, intrinsic GDN state is already fp32, and PLE
     # shards are narrow views.  Checkpointer separately disables its
     # write-through fast path for dequantizing base-checkpoint loads, whose FP8
@@ -102,10 +102,10 @@ class Qwen4ExpStateDictAdapter(Qwen3_5MoeStateDictAdapter):
 
     def __init__(
         self,
-        config: Qwen4ExpTextConfig,
+        config: Qwen3_8_FlashNextTextConfig,
         moe_config: MoEConfig,
         backend: BackendConfig,
-        engram_table: Qwen4ExpOwnerShardedEmbedding,
+        engram_table: Qwen3_8_FlashNextOwnerShardedEmbedding,
         dtype: torch.dtype = torch.bfloat16,
         pretrained_model_name_or_path: str | None = None,
     ) -> None:
@@ -120,7 +120,7 @@ class Qwen4ExpStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         )
         if len(config.ple_layer_ids) != 1:
             raise ValueError(
-                "Qwen4-Exp checkpoint conversion requires exactly one PLE layer; "
+                "Qwen3.8-Flash-Next checkpoint conversion requires exactly one PLE layer; "
                 f"got ple_layer_ids={config.ple_layer_ids}"
             )
         if config.split_ngram_parts <= 0:

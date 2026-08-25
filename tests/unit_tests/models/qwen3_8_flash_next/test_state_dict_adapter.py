@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Focused CPU tests for Qwen4-Exp state-dict conversion."""
+"""Focused CPU tests for Qwen3.8-Flash-Next state-dict conversion."""
 
 from __future__ import annotations
 
@@ -32,21 +32,21 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingF
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.qwen4_exp.config import Qwen4ExpTextConfig
-from nemo_automodel.components.models.qwen4_exp.engram import (
-    Qwen4ExpEngramTableConfig,
-    Qwen4ExpOwnerShardedEmbedding,
+from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
+    Qwen3_8_FlashNextEngramTableConfig,
+    Qwen3_8_FlashNextOwnerShardedEmbedding,
 )
-from nemo_automodel.components.models.qwen4_exp.state_dict_adapter import Qwen4ExpStateDictAdapter
+from nemo_automodel.components.models.qwen3_8_flash_next.state_dict_adapter import Qwen3_8_FlashNextStateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
 
 _TABLE_KEY = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
 _TABLE_PREFIX = _TABLE_KEY.removesuffix(".weight")
 
 
-def _make_text_config(*, split_ngram_parts: int = 4) -> Qwen4ExpTextConfig:
+def _make_text_config(*, split_ngram_parts: int = 4) -> Qwen3_8_FlashNextTextConfig:
     """Build the tiny architecture contract used by adapter tests."""
-    return Qwen4ExpTextConfig(
+    return Qwen3_8_FlashNextTextConfig(
         vocab_size=32,
         hidden_size=3,
         intermediate_size=4,
@@ -118,14 +118,14 @@ class _TinyOwnerShardedCheckpointModel(HFCheckpointingMixin, nn.Module):
         self.model.language_model.layers = nn.ModuleList([nn.Module(), nn.Module()])
         self.model.language_model.layers[1].ple = nn.Module()
         self.model.language_model.layers[1].ple.ple_embedding = nn.Module()
-        self.model.language_model.layers[1].ple.ple_embedding.ngram_embedding = Qwen4ExpEngramTableConfig(
+        self.model.language_model.layers[1].ple.ple_embedding.ngram_embedding = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=256,
             embedding_dim=3,
         ).build(
             process_group=process_group,
             dtype=torch.float32,
         )
-        self.state_dict_adapter = Qwen4ExpStateDictAdapter(
+        self.state_dict_adapter = Qwen3_8_FlashNextStateDictAdapter(
             config=self.config,
             moe_config=_make_moe_config(),
             backend=_make_backend(),
@@ -144,7 +144,7 @@ class _TinyOwnerShardedCheckpointModel(HFCheckpointingMixin, nn.Module):
         )
 
     @property
-    def engram_table(self) -> Qwen4ExpOwnerShardedEmbedding:
+    def engram_table(self) -> Qwen3_8_FlashNextOwnerShardedEmbedding:
         """Return this rank's physical owner shard."""
         return self.model.language_model.layers[1].ple.ple_embedding.ngram_embedding
 
@@ -304,9 +304,9 @@ def _run_model_checkpoint_resharded_load(
 
 
 @pytest.fixture
-def text_config() -> Qwen4ExpTextConfig:
+def text_config() -> Qwen3_8_FlashNextTextConfig:
     """Build a tiny architecture config with four physical PLE shards."""
-    return Qwen4ExpTextConfig(
+    return Qwen3_8_FlashNextTextConfig(
         vocab_size=32,
         hidden_size=3,
         intermediate_size=4,
@@ -368,15 +368,15 @@ def backend() -> BackendConfig:
 
 
 @pytest.fixture
-def table() -> Qwen4ExpOwnerShardedEmbedding:
+def table() -> Qwen3_8_FlashNextOwnerShardedEmbedding:
     """Build a real rank-1-of-2 table without starting a process group."""
     owner_group = Mock()
     with (
-        patch("nemo_automodel.components.models.qwen4_exp.engram.dist.is_initialized", return_value=True),
-        patch("nemo_automodel.components.models.qwen4_exp.engram.dist.get_world_size", return_value=2),
-        patch("nemo_automodel.components.models.qwen4_exp.engram.dist.get_rank", return_value=1),
+        patch("nemo_automodel.components.models.qwen3_8_flash_next.engram.dist.is_initialized", return_value=True),
+        patch("nemo_automodel.components.models.qwen3_8_flash_next.engram.dist.get_world_size", return_value=2),
+        patch("nemo_automodel.components.models.qwen3_8_flash_next.engram.dist.get_rank", return_value=1),
     ):
-        return Qwen4ExpEngramTableConfig(num_embeddings=16, embedding_dim=3).build(
+        return Qwen3_8_FlashNextEngramTableConfig(num_embeddings=16, embedding_dim=3).build(
             process_group=owner_group,
             dtype=torch.float32,
         )
@@ -384,13 +384,13 @@ def table() -> Qwen4ExpOwnerShardedEmbedding:
 
 @pytest.fixture
 def adapter(
-    text_config: Qwen4ExpTextConfig,
+    text_config: Qwen3_8_FlashNextTextConfig,
     moe_config: MoEConfig,
     backend: BackendConfig,
-    table: Qwen4ExpOwnerShardedEmbedding,
-) -> Qwen4ExpStateDictAdapter:
+    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
+) -> Qwen3_8_FlashNextStateDictAdapter:
     """Build an adapter whose rank owns global table rows ``[8, 16)``."""
-    return Qwen4ExpStateDictAdapter(
+    return Qwen3_8_FlashNextStateDictAdapter(
         config=text_config,
         moe_config=moe_config,
         backend=backend,
@@ -400,8 +400,8 @@ def adapter(
 
 
 def test_to_hf_emits_only_local_aliasing_physical_shards(
-    adapter: Qwen4ExpStateDictAdapter,
-    table: Qwen4ExpOwnerShardedEmbedding,
+    adapter: Qwen3_8_FlashNextStateDictAdapter,
+    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
 ) -> None:
     """The local ``[8, 3]`` table becomes two ``[4, 3]`` write-through views."""
     with torch.no_grad():
@@ -435,8 +435,8 @@ def test_to_hf_emits_only_local_aliasing_physical_shards(
 
 
 def test_get_hf_state_dict_keys_lists_all_global_shards_without_table_views(
-    adapter: Qwen4ExpStateDictAdapter,
-    table: Qwen4ExpOwnerShardedEmbedding,
+    adapter: Qwen3_8_FlashNextStateDictAdapter,
+    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
 ) -> None:
     """Every rank advertises all four PLE keys without touching local table storage."""
     buffer_key = "model.language_model.layers.1.ple.ple_embedding.layer_multipliers"
@@ -468,8 +468,8 @@ def test_get_hf_state_dict_keys_lists_all_global_shards_without_table_views(
 
 
 def test_from_hf_drops_table_aliases_and_marks_native_weight_loaded(
-    adapter: Qwen4ExpStateDictAdapter,
-    table: Qwen4ExpOwnerShardedEmbedding,
+    adapter: Qwen3_8_FlashNextStateDictAdapter,
+    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
 ) -> None:
     """DCP-style writes remain in the local ``[8, 3]`` weight after aliases are dropped."""
     buffer_key = "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets"
@@ -488,8 +488,8 @@ def test_from_hf_drops_table_aliases_and_marks_native_weight_loaded(
 
 
 def test_from_hf_rejects_materialized_table_instead_of_concatenating(
-    adapter: Qwen4ExpStateDictAdapter,
-    table: Qwen4ExpOwnerShardedEmbedding,
+    adapter: Qwen3_8_FlashNextStateDictAdapter,
+    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
 ) -> None:
     """Independent ``[4, 3]`` shard tensors cannot trigger a hidden global allocation."""
     destinations = adapter.to_hf({_TABLE_KEY: table.state_dict()["weight"]})
@@ -502,8 +502,8 @@ def test_from_hf_rejects_materialized_table_instead_of_concatenating(
 
 
 def test_from_hf_requires_every_local_physical_shard(
-    adapter: Qwen4ExpStateDictAdapter,
-    table: Qwen4ExpOwnerShardedEmbedding,
+    adapter: Qwen3_8_FlashNextStateDictAdapter,
+    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
 ) -> None:
     """A partially populated local ``[8, 3]`` owner shard is rejected."""
     destinations = adapter.to_hf({_TABLE_KEY: table.state_dict()["weight"]})
@@ -514,17 +514,17 @@ def test_from_hf_requires_every_local_physical_shard(
 
 
 def test_adapter_rejects_owner_ranges_that_cut_a_checkpoint_shard(
-    text_config: Qwen4ExpTextConfig,
+    text_config: Qwen3_8_FlashNextTextConfig,
     moe_config: MoEConfig,
     backend: BackendConfig,
-    table: Qwen4ExpOwnerShardedEmbedding,
+    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
 ) -> None:
     """A range such as ``[6, 14)`` cannot expose full ``[4, 3]`` DCP targets."""
     table.global_row_start = 6
     table.global_row_end = 14
 
     with pytest.raises(ValueError, match="align to complete physical checkpoint shards"):
-        Qwen4ExpStateDictAdapter(
+        Qwen3_8_FlashNextStateDictAdapter(
             config=text_config,
             moe_config=moe_config,
             backend=backend,
@@ -533,7 +533,7 @@ def test_adapter_rejects_owner_ranges_that_cut_a_checkpoint_shard(
 
 
 def test_grouped_experts_and_fp32_gdn_use_inherited_qwen35_conversion(
-    adapter: Qwen4ExpStateDictAdapter,
+    adapter: Qwen3_8_FlashNextStateDictAdapter,
 ) -> None:
     """Expert ``[E, in, out]`` transposes and fp32-holder routing round-trip."""
     gate_up = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
@@ -573,15 +573,15 @@ def test_grouped_experts_and_fp32_gdn_use_inherited_qwen35_conversion(
 
 
 def test_adapter_advertises_nonquantized_write_through_loading(
-    adapter: Qwen4ExpStateDictAdapter,
+    adapter: Qwen3_8_FlashNextStateDictAdapter,
 ) -> None:
     """The loader may bypass host staging for valid BF16/fp32 model state."""
     assert adapter.supports_write_through_checkpoint_load
 
 
 def test_table_export_honors_exclude_regex(
-    adapter: Qwen4ExpStateDictAdapter,
-    table: Qwen4ExpOwnerShardedEmbedding,
+    adapter: Qwen3_8_FlashNextStateDictAdapter,
+    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
 ) -> None:
     """Filtering one ``[4, 3]`` physical shard does not create a replacement copy."""
     converted = adapter.to_hf(
@@ -594,8 +594,8 @@ def test_table_export_honors_exclude_regex(
 
 def test_hf_storage_reader_writes_only_owned_shards_through_views(
     tmp_path: Path,
-    adapter: Qwen4ExpStateDictAdapter,
-    table: Qwen4ExpOwnerShardedEmbedding,
+    adapter: Qwen3_8_FlashNextStateDictAdapter,
+    table: Qwen3_8_FlashNextOwnerShardedEmbedding,
 ) -> None:
     """A real DCP read fills rank 1's two ``[4, 3]`` views and skips shards 0/1."""
     checkpoint = {

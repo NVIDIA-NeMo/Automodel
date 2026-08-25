@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contiguous context parallelism for the language-only Qwen4-Exp model."""
+"""Contiguous context parallelism for the language-only Qwen3.8-Flash-Next model."""
 
 from __future__ import annotations
 
@@ -33,8 +33,8 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 
 
 @dataclass(frozen=True)
-class Qwen4ExpCPContext:
-    """Per-forward metadata for Qwen4-Exp's contiguous CP sequence shard.
+class Qwen3_8_FlashNextCPContext:
+    """Per-forward metadata for Qwen3.8-Flash-Next's contiguous CP sequence shard.
 
     Attributes:
         group: Process group whose rank-ordered shards form one sequence, or
@@ -62,37 +62,41 @@ class Qwen4ExpCPContext:
     def __post_init__(self) -> None:
         """Validate the replicated metadata and contiguous rank mapping."""
         if self.size <= 0 or self.rank < 0 or self.rank >= self.size:
-            raise ValueError(f"Invalid Qwen4-Exp CP rank/size: rank={self.rank}, size={self.size}")
+            raise ValueError(f"Invalid Qwen3.8-Flash-Next CP rank/size: rank={self.rank}, size={self.size}")
         if self.global_input_ids.ndim != 2 or self.global_input_ids.dtype not in (
             torch.int32,
             torch.int64,
             torch.long,
         ):
             raise ValueError(
-                "Qwen4-Exp CP global_input_ids must be int32/int64 [batch, global_sequence]; "
+                "Qwen3.8-Flash-Next CP global_input_ids must be int32/int64 [batch, global_sequence]; "
                 f"got shape={tuple(self.global_input_ids.shape)}, dtype={self.global_input_ids.dtype}"
             )
         if self.global_padding_mask.shape != self.global_input_ids.shape:
             raise ValueError(
-                "Qwen4-Exp CP global padding/ID axes differ: "
+                "Qwen3.8-Flash-Next CP global padding/ID axes differ: "
                 f"mask={tuple(self.global_padding_mask.shape)}, ids={tuple(self.global_input_ids.shape)}"
             )
         if self.global_padding_mask.dtype != torch.bool:
-            raise ValueError(f"Qwen4-Exp CP global_padding_mask must be bool, got {self.global_padding_mask.dtype}")
+            raise ValueError(
+                f"Qwen3.8-Flash-Next CP global_padding_mask must be bool, got {self.global_padding_mask.dtype}"
+            )
         if self.global_padding_mask.device != self.global_input_ids.device:
-            raise ValueError("Qwen4-Exp CP global padding mask and raw IDs must be on the same device")
+            raise ValueError("Qwen3.8-Flash-Next CP global padding mask and raw IDs must be on the same device")
         if self.local_sequence_length <= 0:
-            raise ValueError(f"Qwen4-Exp CP local sequence length must be positive, got {self.local_sequence_length}")
+            raise ValueError(
+                f"Qwen3.8-Flash-Next CP local sequence length must be positive, got {self.local_sequence_length}"
+            )
         expected_global_length = self.local_sequence_length * self.size
         if self.global_input_ids.shape[1] != expected_global_length:
             raise ValueError(
-                "Qwen4-Exp CP global sequence must equal local_sequence_length * size; "
+                "Qwen3.8-Flash-Next CP global sequence must equal local_sequence_length * size; "
                 f"got global={self.global_input_ids.shape[1]}, local={self.local_sequence_length}, size={self.size}"
             )
         expected_start = self.rank * self.local_sequence_length
         if self.local_sequence_start != expected_start:
             raise ValueError(
-                "Qwen4-Exp CP local start must use contiguous rank order; "
+                "Qwen3.8-Flash-Next CP local start must use contiguous rank order; "
                 f"got start={self.local_sequence_start}, expected={expected_start}"
             )
 
@@ -126,18 +130,18 @@ def _validate_right_tail_mask(mask: torch.Tensor, input_ids: torch.Tensor) -> to
     """
     if mask.ndim != 2 or mask.shape != input_ids.shape:
         raise NotImplementedError(
-            "Qwen4-Exp CP requires a non-packed [batch, sequence] attention/padding mask; "
+            "Qwen3.8-Flash-Next CP requires a non-packed [batch, sequence] attention/padding mask; "
             f"got mask={tuple(mask.shape)}, input_ids={tuple(input_ids.shape)}"
         )
     mask = mask.to(device=input_ids.device)
     if mask.dtype != torch.bool and not bool(((mask == 0) | (mask == 1)).all()):
-        raise ValueError("Qwen4-Exp CP masks must contain only binary 0/1 values")
+        raise ValueError("Qwen3.8-Flash-Next CP masks must contain only binary 0/1 values")
     valid = mask.bool()
     lengths = valid.sum(dim=-1, dtype=torch.long)
     positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
     if not bool(torch.equal(valid, positions < lengths.unsqueeze(1))):
         raise NotImplementedError(
-            "Qwen4-Exp CP supports only right-tail padding; left padding, interior padding, and packing are unsupported"
+            "Qwen3.8-Flash-Next CP supports only right-tail padding; left padding, interior padding, and packing are unsupported"
         )
     return valid
 
@@ -168,7 +172,7 @@ def _pad_right(tensor: torch.Tensor, length: int, value: int | bool) -> torch.Te
     return torch.cat((tensor, padding), dim=1)
 
 
-def shard_batch_for_qwen4_cp(
+def shard_batch_for_qwen3_8_flash_next_cp(
     cp_mesh: DeviceMesh,
     tp_mesh: DeviceMesh | None,
     batch: dict[str, Any],
@@ -177,12 +181,12 @@ def shard_batch_for_qwen4_cp(
     padding_token_id: int = 0,
     pad_multiple: int = 4,
 ) -> tuple[Callable[[], contextlib.AbstractContextManager[Any]], dict[str, Any], ShardLayout]:
-    """Validate, pad, and contiguously shard a Qwen4-Exp text batch.
+    """Validate, pad, and contiguously shard a Qwen3.8-Flash-Next text batch.
 
     Args:
         cp_mesh: One-dimensional CP device mesh. Rank ``r`` owns the contiguous
             global interval ``[r * local_sequence, (r + 1) * local_sequence)``.
-        tp_mesh: Optional TP device mesh. Qwen4-Exp CP requires this mesh to be
+        tp_mesh: Optional TP device mesh. Qwen3.8-Flash-Next CP requires this mesh to be
             absent or size one.
         batch: Mutable full-sequence batch. ``input_ids``, ``labels``, and
             optional ``attention_mask``/``padding_mask`` have shape ``[batch,
@@ -196,11 +200,11 @@ def shard_batch_for_qwen4_cp(
 
     Returns:
         A null context factory, the mutated batch containing local token
-        tensors plus a replicated :class:`Qwen4ExpCPContext`, and the global
+        tensors plus a replicated :class:`Qwen3_8_FlashNextCPContext`, and the global
         pre/post-padding :class:`ShardLayout`.
     """
     if tp_mesh is not None and tp_mesh.size() > 1:
-        raise NotImplementedError("Qwen4-Exp context parallelism cannot be composed with tensor parallelism")
+        raise NotImplementedError("Qwen3.8-Flash-Next context parallelism cannot be composed with tensor parallelism")
     packed_keys = (
         "cu_seqlens",
         "cu_seqlens_q",
@@ -216,21 +220,21 @@ def shard_batch_for_qwen4_cp(
         "max_seqlen_kv",
     )
     if batch.get("qkv_format") == "thd" or any(batch.get(key) is not None for key in packed_keys):
-        raise NotImplementedError("Qwen4-Exp context parallelism does not support packed/THD batches")
+        raise NotImplementedError("Qwen3.8-Flash-Next context parallelism does not support packed/THD batches")
     if "input_ids" not in batch or "inputs_embeds" in batch:
         raise NotImplementedError(
-            "Qwen4-Exp context parallelism requires raw input_ids as the sole primary stream for PLE hashing"
+            "Qwen3.8-Flash-Next context parallelism requires raw input_ids as the sole primary stream for PLE hashing"
         )
     full_input_ids = batch["input_ids"]
     if full_input_ids.ndim != 2 or full_input_ids.dtype not in (torch.int32, torch.int64, torch.long):
         raise ValueError(
-            "Qwen4-Exp CP input_ids must be an int32/int64 [batch, sequence] tensor; "
+            "Qwen3.8-Flash-Next CP input_ids must be an int32/int64 [batch, sequence] tensor; "
             f"got shape={tuple(full_input_ids.shape)}, dtype={full_input_ids.dtype}"
         )
     if full_input_ids.shape[1] == 0:
-        raise ValueError("Qwen4-Exp context parallelism requires a non-empty sequence")
+        raise ValueError("Qwen3.8-Flash-Next context parallelism requires a non-empty sequence")
     if pad_multiple <= 1:
-        raise ValueError(f"Qwen4-Exp CP pad_multiple must exceed one, got {pad_multiple}")
+        raise ValueError(f"Qwen3.8-Flash-Next CP pad_multiple must exceed one, got {pad_multiple}")
 
     attention_mask = batch.get("attention_mask")
     padding_mask = batch.get("padding_mask")
@@ -238,13 +242,13 @@ def shard_batch_for_qwen4_cp(
         global_valid_mask = _validate_right_tail_mask(attention_mask, full_input_ids)
         if padding_mask is not None:
             if padding_mask.dtype != torch.bool and not bool(((padding_mask == 0) | (padding_mask == 1)).all()):
-                raise ValueError("Qwen4-Exp CP padding_mask must contain only binary 0/1 values")
+                raise ValueError("Qwen3.8-Flash-Next CP padding_mask must contain only binary 0/1 values")
             padding_valid_mask = _validate_right_tail_mask(padding_mask.logical_not(), full_input_ids)
             if not bool(torch.equal(global_valid_mask, padding_valid_mask)):
-                raise ValueError("Qwen4-Exp CP attention_mask and padding_mask disagree")
+                raise ValueError("Qwen3.8-Flash-Next CP attention_mask and padding_mask disagree")
     elif padding_mask is not None:
         if padding_mask.dtype != torch.bool and not bool(((padding_mask == 0) | (padding_mask == 1)).all()):
-            raise ValueError("Qwen4-Exp CP padding_mask must contain only binary 0/1 values")
+            raise ValueError("Qwen3.8-Flash-Next CP padding_mask must contain only binary 0/1 values")
         global_valid_mask = _validate_right_tail_mask(padding_mask.logical_not(), full_input_ids)
     else:
         global_valid_mask = torch.ones_like(full_input_ids, dtype=torch.bool)
@@ -266,13 +270,13 @@ def shard_batch_for_qwen4_cp(
         pad_multiple=pad_multiple,
     )
     if layout is None or layout.padded_seq_len is None:
-        raise RuntimeError("Qwen4-Exp CP sharding did not report its padded global sequence length")
+        raise RuntimeError("Qwen3.8-Flash-Next CP sharding did not report its padded global sequence length")
 
     cp_size = cp_mesh.size()
     cp_group = cp_mesh.get_group() if cp_size > 1 else None
     if cp_size > 1:
         if not (dist.is_available() and dist.is_initialized()):
-            raise RuntimeError("Qwen4-Exp CP size greater than one requires torch.distributed initialization")
+            raise RuntimeError("Qwen3.8-Flash-Next CP size greater than one requires torch.distributed initialization")
         cp_rank = dist.get_rank(cp_group)
     else:
         cp_rank = 0
@@ -282,8 +286,10 @@ def shard_batch_for_qwen4_cp(
     local_sequence_start = cp_rank * local_sequence_length
     expected_local_ids = global_input_ids[:, local_sequence_start : local_sequence_start + local_sequence_length]
     if not bool(torch.equal(sharded_batch["input_ids"], expected_local_ids)):
-        raise RuntimeError("Qwen4-Exp CP sharder produced local raw IDs inconsistent with its global PLE context")
-    sharded_batch["_qwen4_cp_context"] = Qwen4ExpCPContext(
+        raise RuntimeError(
+            "Qwen3.8-Flash-Next CP sharder produced local raw IDs inconsistent with its global PLE context"
+        )
+    sharded_batch["_qwen3_8_flash_next_cp_context"] = Qwen3_8_FlashNextCPContext(
         group=cp_group,
         rank=cp_rank,
         size=cp_size,
@@ -302,9 +308,9 @@ def shard_batch_for_qwen4_cp(
     )
 
 
-def qwen4_cp_all_gather(
+def qwen3_8_flash_next_cp_all_gather(
     tensor: torch.Tensor,
-    context: Qwen4ExpCPContext,
+    context: Qwen3_8_FlashNextCPContext,
     *,
     sequence_dim: int = 1,
     differentiable: bool = True,
@@ -316,7 +322,7 @@ def qwen4_cp_all_gather(
             ``context.local_sequence_length`` (or a fixed compressed fraction
             of it shared by every rank). All non-sequence axes are replicated
             in shape across the CP group.
-        context: Qwen4-Exp contiguous CP metadata.
+        context: Qwen3.8-Flash-Next contiguous CP metadata.
         sequence_dim: Axis on which rank-ordered parts are concatenated.
         differentiable: Use PyTorch's autograd-aware collective. Set ``False``
             only for frozen routing values or integer metadata.
@@ -328,7 +334,7 @@ def qwen4_cp_all_gather(
     if context.size <= 1:
         return tensor
     if context.group is None:
-        raise RuntimeError("Qwen4-Exp CP context is missing its process group")
+        raise RuntimeError("Qwen3.8-Flash-Next CP context is missing its process group")
     if differentiable:
         parts = differentiable_all_gather(tensor.contiguous(), group=context.group)
     else:
@@ -337,9 +343,9 @@ def qwen4_cp_all_gather(
     return torch.cat(tuple(parts), dim=sequence_dim)
 
 
-def qwen4_cp_left_halo(
+def qwen3_8_flash_next_cp_left_halo(
     tensor: torch.Tensor,
-    context: Qwen4ExpCPContext,
+    context: Qwen3_8_FlashNextCPContext,
     *,
     history: int,
 ) -> torch.Tensor:
@@ -353,7 +359,7 @@ def qwen4_cp_left_halo(
     Args:
         tensor: Local sequence tensor of shape ``[batch, local_sequence,
             channels]`` using contiguous rank order.
-        context: Qwen4-Exp contiguous CP metadata.
+        context: Qwen3.8-Flash-Next contiguous CP metadata.
         history: Number of immediately preceding global tokens required.
 
     Returns:
@@ -362,18 +368,18 @@ def qwen4_cp_left_halo(
     """
     if tensor.ndim != 3 or tensor.shape[1] != context.local_sequence_length:
         raise ValueError(
-            "Qwen4-Exp CP halo input must be [batch, local_sequence, channels]; "
+            "Qwen3.8-Flash-Next CP halo input must be [batch, local_sequence, channels]; "
             f"got {tuple(tensor.shape)} for local_sequence={context.local_sequence_length}"
         )
     if history < 0:
-        raise ValueError(f"Qwen4-Exp CP halo history must be non-negative, got {history}")
+        raise ValueError(f"Qwen3.8-Flash-Next CP halo history must be non-negative, got {history}")
     if history == 0:
         return tensor[:, :0]
     if context.size <= 1:
         return tensor.new_zeros((tensor.shape[0], history, tensor.shape[2]))
 
     tail_length = min(history, context.local_sequence_length)
-    gathered_tails = qwen4_cp_all_gather(
+    gathered_tails = qwen3_8_flash_next_cp_all_gather(
         tensor[:, -tail_length:],
         context,
         sequence_dim=1,
@@ -394,4 +400,9 @@ def qwen4_cp_left_halo(
     return preceding + collective_anchor
 
 
-__all__ = ["Qwen4ExpCPContext", "qwen4_cp_all_gather", "qwen4_cp_left_halo", "shard_batch_for_qwen4_cp"]
+__all__ = [
+    "Qwen3_8_FlashNextCPContext",
+    "qwen3_8_flash_next_cp_all_gather",
+    "qwen3_8_flash_next_cp_left_halo",
+    "shard_batch_for_qwen3_8_flash_next_cp",
+]

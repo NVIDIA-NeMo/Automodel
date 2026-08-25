@@ -19,11 +19,11 @@
 #   Source: miles_plugins/models/deepseek_v4/ops/kernel/tilelang_sparse_mla_bwd.py
 #   License: Apache-2.0
 #   Upstream copyright: Copyright 2025 Zhipu AI
-# This Qwen4-Exp adaptation separates K from V, computes native D=256 GQA
+# This Qwen3.8-Flash-Next adaptation separates K from V, computes native D=256 GQA
 # gradients, and maps each physical KV head onto a pseudo-batch row.
 
 # ruff: noqa
-"""TileLang backward kernel for Qwen4-Exp token-level sparse GQA.
+"""TileLang backward kernel for Qwen3.8-Flash-Next token-level sparse GQA.
 
 The low-level kernel consumes the pseudo-batch layout prepared by
 ``sparse_attention.py``: every physical KV head becomes one batch row, so the
@@ -41,7 +41,7 @@ import math
 
 import torch
 
-from nemo_automodel.components.models.qwen4_exp.kernels._tilelang import T, tilelang
+from nemo_automodel.components.models.qwen3_8_flash_next.kernels._tilelang import T, tilelang
 
 
 @tilelang.jit(out_idx=[-1])
@@ -412,19 +412,19 @@ def sparse_gqa_bwd_interface(
     if key.shape[1] == 0:
         raise ValueError("sparse GQA requires at least one key/value token")
     if dim != 256:
-        raise ValueError(f"Qwen4-Exp sparse GQA requires head_dim=256, got {dim}")
+        raise ValueError(f"Qwen3.8-Flash-Next sparse GQA requires head_dim=256, got {dim}")
     if heads < 16 or heads != 1 << (heads - 1).bit_length():
         raise ValueError(f"pseudo-batch query heads must be a power of two >= 16, got {heads}")
 
     compute_tensors = (query, key, value, output, doutput)
     if any(tensor.dtype != torch.bfloat16 for tensor in compute_tensors):
-        raise TypeError("Qwen4-Exp TileLang sparse GQA backward requires BF16 compute tensors")
+        raise TypeError("Qwen3.8-Flash-Next TileLang sparse GQA backward requires BF16 compute tensors")
     if lse.dtype != torch.float32:
         raise TypeError(f"lse must be FP32, got {lse.dtype}")
     if token_ids.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"token_ids must be int32 or int64, got {token_ids.dtype}")
     if not all(tensor.is_cuda for tensor in (*compute_tensors, token_ids, lse)):
-        raise RuntimeError("Qwen4-Exp TileLang sparse GQA backward requires CUDA tensors")
+        raise RuntimeError("Qwen3.8-Flash-Next TileLang sparse GQA backward requires CUDA tensors")
     if any(tensor.device != query.device for tensor in (*compute_tensors[1:], token_ids, lse)):
         raise ValueError("all sparse-GQA backward tensors must be on the same device")
 

@@ -1,12 +1,12 @@
 ---
-title: "Qwen4-Exp"
-description: "Fine-tune the language-only Qwen4-Exp Engram MoE checkpoint with FSDP2, expert parallelism, and context parallelism."
-slug: model-coverage/large-language-models/qwen/qwen4-exp
+title: "Qwen3.8-Flash-Next"
+description: "Fine-tune the language-only Qwen3.8-Flash-Next Engram MoE checkpoint with FSDP2, expert parallelism, and context parallelism."
+slug: model-coverage/large-language-models/qwen/qwen3-8-flash-next
 ---
 
-Qwen4-Exp is a hybrid-attention MoE model with four persistent HyperConnection
+Qwen3.8-Flash-Next is a hybrid-attention MoE model with four persistent HyperConnection
 streams and an Engram-derived product-level embedding (PLE). NeMo AutoModel
-supports the language-only `Qwen4ExpForConditionalGeneration` path for
+supports the language-only `Qwen3_8_FlashNextForConditionalGeneration` path for
 supervised fine-tuning. All backbone parameters are trainable except the QSA
 indexers, whose reference path exposes discrete top-k IDs but no auxiliary
 loss or straight-through gradient.
@@ -16,7 +16,7 @@ loss or straight-through gradient.
 | | |
 |---|---|
 | **Task** | Text generation (MoE, hybrid attention, Engram PLE) |
-| **Architecture** | `Qwen4ExpForConditionalGeneration` |
+| **Architecture** | `Qwen3_8_FlashNextForConditionalGeneration` |
 | **Decoder** | 48 layers: 36 GatedDeltaNet and 12 QSA sparse-attention layers |
 | **Experts** | 512 routed experts, top-10 routing, plus one shared expert per layer |
 | **PLE** | One 51.2B-parameter table in decoder layer 2 |
@@ -31,7 +31,7 @@ loss or straight-through gradient.
   up to 512 causal groups (2,048 tokens), appends the incomplete causal tail,
   and evaluates main GQA only on those selected token IDs. Every layer has
   separate learned HyperConnection reads and writes for attention and MoE.
-- The first decoder layer uses the normal Qwen4-Exp GatedDeltaNet and MoE
+- The first decoder layer uses the normal Qwen3.8-Flash-Next GatedDeltaNet and MoE
   skeleton without PLE. The second decoder layer first adds PLE values derived
   from eight raw-token bigram hashes and eight raw-token trigram hashes.
 - The PLE table has 320,001,536 padded rows of width 160. Its 51.2 billion
@@ -101,9 +101,9 @@ was 0.00054, and the maximum absolute difference was 0.00267. Final losses were
 
 | Recipe | Description |
 |---|---|
-| [qwen4_exp_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen4_exp_180b_hellaswag_ep64.yaml) | 100-step SFT on HellaSwag with FSDP2, EP64, and world-sized PLE ownership |
+| [qwen3_8_flash_next_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml) | 100-step SFT on HellaSwag with FSDP2, EP64, and world-sized PLE ownership |
 
-Set `QWEN4_EXP_MODEL_PATH` to the checkpoint directory, allocate eight nodes
+Set `QWEN3_8_FLASH_NEXT_MODEL_PATH` to the checkpoint directory, allocate eight nodes
 with eight GPUs per node, and launch the recipe through your cluster launcher.
 See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node
 setup.

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint-compatible configuration classes for Qwen4-Exp."""
+"""Checkpoint-compatible configuration classes for Qwen3.8-Flash-Next."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ from typing import Any
 from transformers.configuration_utils import PretrainedConfig
 
 
-class Qwen4ExpTextConfig(PretrainedConfig):
-    """Configuration for the Qwen4-Exp HyperConnection, PLE, hybrid-MoE text backbone."""
+class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
+    """Configuration for the Qwen3.8-Flash-Next HyperConnection, PLE, hybrid-MoE text backbone."""
 
-    model_type = "qwen4_exp_text"
+    model_type = "qwen3_8_flash_next_text"
     base_config_key = "text_config"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -97,7 +97,7 @@ class Qwen4ExpTextConfig(PretrainedConfig):
         **kwargs: Any,
     ) -> None:
         if hc_count <= 1:
-            raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {hc_count}.")
+            raise ValueError(f"Qwen3.8-Flash-Next requires hc_count > 1, got {hc_count}.")
 
         if rope_parameters is not None:
             rope_parameters = dict(rope_parameters)
@@ -143,9 +143,9 @@ class Qwen4ExpTextConfig(PretrainedConfig):
             mtp = dict(mtp)
 
         # Match the SGLang reference ordering: initialize the generic config
-        # before assigning Qwen4-Exp's custom RoPE and hybrid-layer fields.
+        # before assigning Qwen3.8-Flash-Next's custom RoPE and hybrid-layer fields.
         # This also avoids stale Transformers releases trying to validate
-        # Qwen4-Exp's mRoPE-only keys as generic default-RoPE keys.
+        # Qwen3.8-Flash-Next's mRoPE-only keys as generic default-RoPE keys.
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -260,10 +260,10 @@ class Qwen4ExpTextConfig(PretrainedConfig):
         return max(int(self.ngram_size) - 1, 0)
 
 
-class Qwen4ExpVisionConfig(PretrainedConfig):
-    """Configuration for the Qwen4-Exp Qwen3-VL-style vision tower."""
+class Qwen3_8_FlashNextVisionConfig(PretrainedConfig):
+    """Configuration for the Qwen3.8-Flash-Next Qwen3-VL-style vision tower."""
 
-    model_type = "qwen4_exp"
+    model_type = "qwen3_8_flash_next"
     base_config_key = "vision_config"
 
     def __init__(
@@ -299,18 +299,18 @@ class Qwen4ExpVisionConfig(PretrainedConfig):
         self.deepstack_visual_indexes = [] if deepstack_visual_indexes is None else list(deepstack_visual_indexes)
 
 
-class Qwen4ExpConfig(PretrainedConfig):
-    """Top-level configuration for Qwen4-Exp conditional generation checkpoints."""
+class Qwen3_8_FlashNextConfig(PretrainedConfig):
+    """Top-level configuration for Qwen3.8-Flash-Next conditional generation checkpoints."""
 
-    model_type = "qwen4_exp"
-    architectures = ["Qwen4ExpForConditionalGeneration"]
-    sub_configs = {"text_config": Qwen4ExpTextConfig, "vision_config": Qwen4ExpVisionConfig}
+    model_type = "qwen3_8_flash_next"
+    architectures = ["Qwen3_8_FlashNextForConditionalGeneration"]
+    sub_configs = {"text_config": Qwen3_8_FlashNextTextConfig, "vision_config": Qwen3_8_FlashNextVisionConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        text_config: dict[str, Any] | Qwen4ExpTextConfig | None = None,
-        vision_config: dict[str, Any] | Qwen4ExpVisionConfig | None = None,
+        text_config: dict[str, Any] | Qwen3_8_FlashNextTextConfig | None = None,
+        vision_config: dict[str, Any] | Qwen3_8_FlashNextVisionConfig | None = None,
         image_token_id: int = 248056,
         video_token_id: int = 248057,
         vision_start_token_id: int = 248053,
@@ -333,14 +333,14 @@ class Qwen4ExpConfig(PretrainedConfig):
         )
 
         if isinstance(vision_config, dict):
-            vision_config = Qwen4ExpVisionConfig(**vision_config)
+            vision_config = Qwen3_8_FlashNextVisionConfig(**vision_config)
         elif vision_config is None:
-            vision_config = Qwen4ExpVisionConfig()
+            vision_config = Qwen3_8_FlashNextVisionConfig()
 
         if isinstance(text_config, dict):
-            text_config = Qwen4ExpTextConfig(**text_config)
+            text_config = Qwen3_8_FlashNextTextConfig(**text_config)
         elif text_config is None:
-            text_config = Qwen4ExpTextConfig(**text_kwargs)
+            text_config = Qwen3_8_FlashNextTextConfig(**text_kwargs)
 
         self.text_config = text_config
         self.vision_config = vision_config
@@ -352,6 +352,6 @@ class Qwen4ExpConfig(PretrainedConfig):
         self.rope_parameters = dict(rope_parameters or getattr(text_config, "rope_parameters", {}))
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
-            architectures=architectures or ["Qwen4ExpForConditionalGeneration"],
+            architectures=architectures or ["Qwen3_8_FlashNextForConditionalGeneration"],
             **kwargs,
         )

@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optional H100 correctness tests for Qwen4-Exp TileLang sparse GQA."""
+"""Optional H100 correctness tests for Qwen3.8-Flash-Next TileLang sparse GQA."""
 
 import pytest
 import torch
 
-from nemo_automodel.components.models.qwen4_exp.kernels._tilelang import HAS_TILELANG
-from nemo_automodel.components.models.qwen4_exp.kernels.sparse_attention import tilelang_sparse_gqa_attention
-from nemo_automodel.components.models.qwen4_exp.qsa import gathered_qsa_gqa_attention, qsa_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.kernels._tilelang import HAS_TILELANG
+from nemo_automodel.components.models.qwen3_8_flash_next.kernels.sparse_attention import tilelang_sparse_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.qsa import gathered_qsa_gqa_attention, qsa_gqa_attention
 
 
 def _can_run_hopper_tilelang() -> bool:

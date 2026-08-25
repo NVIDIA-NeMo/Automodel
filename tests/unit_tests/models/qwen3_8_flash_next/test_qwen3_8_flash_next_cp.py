@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU and two-rank Gloo parity tests for Qwen4-Exp context parallelism."""
+"""CPU and two-rank Gloo parity tests for Qwen3.8-Flash-Next context parallelism."""
 
 from __future__ import annotations
 
@@ -32,15 +32,24 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
-from nemo_automodel.components.models.qwen4_exp.config import Qwen4ExpTextConfig
-from nemo_automodel.components.models.qwen4_exp.cp import Qwen4ExpCPContext, shard_batch_for_qwen4_cp
-from nemo_automodel.components.models.qwen4_exp.engram import Qwen4ExpNGramEmbedding, Qwen4ExpPLELayer
-from nemo_automodel.components.models.qwen4_exp.layers import Qwen4ExpGatedDeltaNet, Qwen4ExpQSAAttention
-from nemo_automodel.components.models.qwen4_exp.model import (
-    Qwen4ExpForConditionalGeneration,
-    Qwen4ExpTextModelBackend,
+from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
+    Qwen3_8_FlashNextCPContext,
+    shard_batch_for_qwen3_8_flash_next_cp,
 )
-from nemo_automodel.components.models.qwen4_exp.qsa import select_qsa_token_ids
+from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
+    Qwen3_8_FlashNextNGramEmbedding,
+    Qwen3_8_FlashNextPLELayer,
+)
+from nemo_automodel.components.models.qwen3_8_flash_next.layers import (
+    Qwen3_8_FlashNextGatedDeltaNet,
+    Qwen3_8_FlashNextQSAAttention,
+)
+from nemo_automodel.components.models.qwen3_8_flash_next.model import (
+    Qwen3_8_FlashNextForConditionalGeneration,
+    Qwen3_8_FlashNextTextModelBackend,
+)
+from nemo_automodel.components.models.qwen3_8_flash_next.qsa import select_qsa_token_ids
 
 
 class _FakeMesh:
@@ -72,9 +81,9 @@ def _backend() -> BackendConfig:
     )
 
 
-def _qsa_config() -> Qwen4ExpTextConfig:
+def _qsa_config() -> Qwen3_8_FlashNextTextConfig:
     """Return a tiny QSA config whose sparse rows cross the CP rank boundary."""
-    return Qwen4ExpTextConfig(
+    return Qwen3_8_FlashNextTextConfig(
         vocab_size=128,
         hidden_size=8,
         intermediate_size=16,
@@ -109,9 +118,9 @@ def _qsa_config() -> Qwen4ExpTextConfig:
     )
 
 
-def _gdn_config() -> Qwen4ExpTextConfig:
+def _gdn_config() -> Qwen3_8_FlashNextTextConfig:
     """Return a tiny GDN config used to inspect contiguous-state wiring."""
-    return Qwen4ExpTextConfig(
+    return Qwen3_8_FlashNextTextConfig(
         vocab_size=32,
         hidden_size=8,
         intermediate_size=16,
@@ -146,26 +155,26 @@ def _freqs(sequence_length: int) -> torch.Tensor:
 
 
 def test_model_advertises_and_returns_its_contiguous_cp_sharder() -> None:
-    model = object.__new__(Qwen4ExpForConditionalGeneration)
+    model = object.__new__(Qwen3_8_FlashNextForConditionalGeneration)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(text_config=SimpleNamespace(indexer_compress_ratio=4))
 
     prepared = model.prepare_model_inputs_for_cp({}, num_chunks=1)
 
-    assert Qwen4ExpForConditionalGeneration._owns_cp_attention is True
-    assert Qwen4ExpForConditionalGeneration.ModelCapabilities.supports_cp is True
+    assert Qwen3_8_FlashNextForConditionalGeneration._owns_cp_attention is True
+    assert Qwen3_8_FlashNextForConditionalGeneration.ModelCapabilities.supports_cp is True
     assert set(prepared) == {"cp_sharder"}
     sharder = prepared["cp_sharder"]
     assert isinstance(sharder, ContextParallelSharder)
     assert sharder.local_token_global_indices is contiguous_local_indices
-    assert sharder.shard_batch.func is shard_batch_for_qwen4_cp
+    assert sharder.shard_batch.func is shard_batch_for_qwen3_8_flash_next_cp
     assert sharder.shard_batch.keywords["pad_multiple"] == 4
 
 
-def _tiny_ple() -> Qwen4ExpPLELayer:
+def _tiny_ple() -> Qwen3_8_FlashNextPLELayer:
     """Construct a deterministic tiny PLE with a real trainable table."""
     table = nn.Embedding(36, 2)
-    ngram = Qwen4ExpNGramEmbedding(
+    ngram = Qwen3_8_FlashNextNGramEmbedding(
         table,
         ngram_size=3,
         heads_per_ngram=2,
@@ -174,7 +183,7 @@ def _tiny_ple() -> Qwen4ExpPLELayer:
         ngram_heads_vocab_sizes=(5, 7, 11, 13),
         ngram_heads_offsets=(0, 5, 12, 23),
     )
-    ple = Qwen4ExpPLELayer(
+    ple = Qwen3_8_FlashNextPLELayer(
         ngram,
         hidden_size=2,
         hc_count=2,
@@ -197,7 +206,7 @@ def _cp_context(
     world_size: int,
     group: dist.ProcessGroup,
     global_input_ids: torch.Tensor,
-) -> Qwen4ExpCPContext:
+) -> Qwen3_8_FlashNextCPContext:
     """Build contiguous CP metadata for a replicated raw sequence.
 
     Args:
@@ -210,7 +219,7 @@ def _cp_context(
         Context whose local interval has length ``global_sequence / world_size``.
     """
     local_length = global_input_ids.shape[1] // world_size
-    return Qwen4ExpCPContext(
+    return Qwen3_8_FlashNextCPContext(
         group=group,
         rank=rank,
         size=world_size,
@@ -262,18 +271,18 @@ def test_sharder_rejects_unsupported_layouts_before_collectives(extra: dict[str,
         **extra,
     }
     with pytest.raises((NotImplementedError, ValueError), match=match):
-        shard_batch_for_qwen4_cp(_FakeMesh(2), None, batch)
+        shard_batch_for_qwen3_8_flash_next_cp(_FakeMesh(2), None, batch)
 
 
 def test_sharder_rejects_tp_composition() -> None:
     batch = {"input_ids": torch.arange(4).view(1, 4), "labels": torch.arange(4).view(1, 4)}
     with pytest.raises(NotImplementedError, match="tensor parallelism"):
-        shard_batch_for_qwen4_cp(_FakeMesh(2), _FakeMesh(2), batch)
+        shard_batch_for_qwen3_8_flash_next_cp(_FakeMesh(2), _FakeMesh(2), batch)
 
 
 def test_sharder_normalizes_integer_padding_mask_to_bool() -> None:
     input_ids = torch.arange(4).view(1, 4)
-    _, batch, _ = shard_batch_for_qwen4_cp(
+    _, batch, _ = shard_batch_for_qwen3_8_flash_next_cp(
         _FakeMesh(1),
         None,
         {
@@ -288,7 +297,7 @@ def test_sharder_normalizes_integer_padding_mask_to_bool() -> None:
 
 
 def test_cp_enabled_text_model_requires_model_owned_batch_context() -> None:
-    model = Qwen4ExpTextModelBackend(_qsa_config(), _backend())
+    model = Qwen3_8_FlashNextTextModelBackend(_qsa_config(), _backend())
     model._cp_enabled = True
     with pytest.raises(RuntimeError, match="batch context is missing"):
         model(
@@ -329,7 +338,7 @@ def test_gdn_override_synthesizes_one_contiguous_global_segment(monkeypatch: pyt
         return hidden_states + 1
 
     monkeypatch.setattr(CPAwareGatedDeltaNet, "_forward_with_cp", _capture_base_cp)
-    layer = Qwen4ExpGatedDeltaNet(_gdn_config(), layer_idx=0)
+    layer = Qwen3_8_FlashNextGatedDeltaNet(_gdn_config(), layer_idx=0)
     group_sentinel = object()
     layer._cp_mesh = _FakeMesh(2, group_sentinel)
     hidden_states = torch.randn(1, 4, 8)
@@ -387,7 +396,7 @@ def _distributed_cp_parity_worker(rank: int, world_size: int, store_path: str) -
         # Batch contract: no user mask and a non-divisible length must create
         # synthetic padding that is ignored by labels, QSA, and MoE.
         unpadded_ids = torch.arange(10, dtype=torch.long).view(1, 10)
-        _, local_batch, layout = shard_batch_for_qwen4_cp(
+        _, local_batch, layout = shard_batch_for_qwen3_8_flash_next_cp(
             cp_mesh,
             None,
             {"input_ids": unpadded_ids.clone(), "labels": unpadded_ids.clone()},
@@ -405,8 +414,8 @@ def _distributed_cp_parity_worker(rank: int, world_size: int, store_path: str) -
         expected_labels = expected_ids[:, start : start + 8].clone()
         expected_labels[expected_padding] = -100
         torch.testing.assert_close(local_batch["labels"], expected_labels)
-        batch_context = local_batch["_qwen4_cp_context"]
-        assert isinstance(batch_context, Qwen4ExpCPContext)
+        batch_context = local_batch["_qwen3_8_flash_next_cp_context"]
+        assert isinstance(batch_context, Qwen3_8_FlashNextCPContext)
         torch.testing.assert_close(batch_context.global_input_ids, expected_ids)
         torch.testing.assert_close(
             batch_context.global_padding_mask,
@@ -417,9 +426,9 @@ def _distributed_cp_parity_worker(rank: int, world_size: int, store_path: str) -
         # gradients, and globally summed parameter gradients.
         torch.manual_seed(123)
         qsa_config = _qsa_config()
-        reference_qsa = Qwen4ExpQSAAttention(qsa_config, layer_idx=0, backend=_backend())
+        reference_qsa = Qwen3_8_FlashNextQSAAttention(qsa_config, layer_idx=0, backend=_backend())
         reference_qsa.init_weights(torch.device("cpu"))
-        cp_qsa = Qwen4ExpQSAAttention(qsa_config, layer_idx=0, backend=_backend())
+        cp_qsa = Qwen3_8_FlashNextQSAAttention(qsa_config, layer_idx=0, backend=_backend())
         cp_qsa.load_state_dict(reference_qsa.state_dict())
         cp_qsa.setup_cp_attention(cp_mesh)
         qsa_ids = torch.tensor([[5, 7, 11, 13, 17, 19, 23, 29]], dtype=torch.long)
@@ -522,7 +531,7 @@ def _distributed_cp_parity_worker(rank: int, world_size: int, store_path: str) -
 def test_two_rank_qsa_ple_and_sharder_match_cp1(tmp_path: Path) -> None:
     mp.spawn(
         _distributed_cp_parity_worker,
-        args=(2, str(tmp_path / "qwen4-exp-cp-gloo")),
+        args=(2, str(tmp_path / "qwen3-8-flash-next-cp-gloo")),
         nprocs=2,
         join=True,
     )

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lazy TileLang import shim for Qwen4-Exp kernels."""
+"""Lazy TileLang import shim for Qwen3.8-Flash-Next kernels."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def _load_tilelang() -> tuple[Any, Any]:
         import tilelang as real_tilelang
         from tilelang import language as real_language
     except ImportError as exc:
-        raise UnavailableError(f"tilelang is required for Qwen4-Exp TileLang kernels: {exc}") from exc
+        raise UnavailableError(f"tilelang is required for Qwen3.8-Flash-Next TileLang kernels: {exc}") from exc
     return real_tilelang, real_language
 
 
