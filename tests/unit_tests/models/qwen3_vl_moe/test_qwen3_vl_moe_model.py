@@ -511,12 +511,11 @@ class TestQwen3VLMoeForConditionalGeneration:
         squeezed_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
         squeezed_position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
         squeezed_padding_mask = torch.ones(batch, seq_len, dtype=torch.bool, device=device)
-        squeezed_kwargs = {"foo": "bar"}
         squeeze_input_kwargs = {}
 
         def fake_squeeze(input_ids, position_ids, padding_mask, kwargs):
             squeeze_input_kwargs.update(kwargs)
-            return squeezed_ids, squeezed_position_ids, squeezed_padding_mask, squeezed_kwargs
+            return squeezed_ids, squeezed_position_ids, squeezed_padding_mask, kwargs
 
         # Mock the model.model.forward to avoid internal tensor operations
         mock_hidden = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
@@ -551,8 +550,9 @@ class TestQwen3VLMoeForConditionalGeneration:
             assert squeeze_args[1] is position_ids
             assert squeeze_args[2] is padding_mask
             assert squeeze_args[3]["qkv_format"] == "thd"
-            assert "pixel_values" not in squeeze_input_kwargs
-            assert "image_grid_thw" not in squeeze_input_kwargs
+            # Media tensors flow through squeeze_input_for_thd, which skips them.
+            assert squeeze_input_kwargs["pixel_values"] is pixel_values
+            assert squeeze_input_kwargs["image_grid_thw"] is image_grid_thw
 
             # Verify model.model.forward was called
             mock_model_forward.assert_called_once()
