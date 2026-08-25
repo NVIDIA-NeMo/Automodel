@@ -75,6 +75,8 @@ class DFlash2StepMetrics:
         valid_blocks: Scalar tensor containing the number of evaluated draft blocks.
         base_loss: Scalar tensor containing the backbone block-CE term.
         selector_loss: Scalar tensor containing the candidate-selection CE term.
+        selector_loss_denominator: Scalar tensor containing the effective
+            denominator for the candidate-selection CE term.
         base_accuracy: Scalar tensor containing backbone top-1 token accuracy.
         base_correct_tokens: Scalar tensor containing backbone correct-token count.
         base_accept_len: Scalar tensor containing backbone mean acceptance length.
@@ -94,6 +96,7 @@ class DFlash2StepMetrics:
     valid_blocks: torch.Tensor
     base_loss: torch.Tensor
     selector_loss: torch.Tensor
+    selector_loss_denominator: torch.Tensor
     base_accuracy: torch.Tensor
     base_correct_tokens: torch.Tensor
     base_accept_len: torch.Tensor
@@ -116,6 +119,8 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         loss_decay_gamma: float | None = None,
         selector_loss_weight: float = 1.0,
         sliding_window: int | None = None,
+        *,
+        max_total_anchors: int | None = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -127,6 +132,7 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
             sliding_window=sliding_window,
+            max_total_anchors=max_total_anchors,
         )
         if getattr(draft_model, "candidate_selector", None) is None:
             raise ValueError(
@@ -290,8 +296,9 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             accept_len=accept_len.detach(),
             accept_len_sum=accept_len_sum.detach(),
             valid_blocks=valid_blocks.detach(),
-            base_loss=loss_out.total_loss.detach(),
-            selector_loss=selector_loss.detach(),
+            base_loss=loss_out.total_loss,
+            selector_loss=selector_loss,
+            selector_loss_denominator=selector_weights.sum().detach(),
             base_accuracy=(base_correct_tokens / denominator).detach(),
             base_correct_tokens=base_correct_tokens.detach(),
             base_accept_len=base_accept_len.detach(),

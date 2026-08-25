@@ -137,6 +137,20 @@ def test_flex_attention_forces_regular_kernel_for_short_dynamic_queries(monkeypa
     captured_options = []
 
     def fake_flex_attention(_module, query, _key, _value, _mask, **kwargs):
+        """Record kernel options while preserving the attention output contract.
+
+        Args:
+            _module: Attention module (unused by this test double).
+            query: Tensor of shape ``[batch, heads, query, head_dim]``.
+            _key: Tensor of shape ``[batch, heads, key_value, head_dim]``.
+            _value: Tensor of shape ``[batch, heads, key_value, head_dim]``.
+            _mask: Flex-attention block mask, or ``None``.
+            **kwargs: Attention options, including ``kernel_options``.
+
+        Returns:
+            Attention output tensor of shape ``[batch, query, heads, head_dim]``
+            and ``None`` for attention weights.
+        """
         captured_options.append(kwargs["kernel_options"])
         return query.transpose(1, 2), None
 
