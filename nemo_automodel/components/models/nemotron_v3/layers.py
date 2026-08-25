@@ -38,6 +38,28 @@ def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone()
 
 
+def _cast_latent_projection_input_to_weight_dtype(
+    module: nn.Module, inputs: tuple[torch.Tensor, ...]
+) -> tuple[torch.Tensor, ...] | None:
+    """Align a latent expert activation with the output projection's compute dtype.
+
+    Args:
+        module: Nemotron V3 latent output projection whose weight has shape
+            ``[hidden, moe_latent]``.
+        inputs: Positional inputs whose first tensor has shape ``[tokens, moe_latent]``.
+
+    Returns:
+        ``None`` when the activation already matches the projection weight dtype;
+        otherwise, positional inputs with the first tensor cast to that dtype and
+        with the same shape and device.
+    """
+    hidden_states = inputs[0]
+    weight = module.get_parameter("weight")
+    if hidden_states.dtype == weight.dtype:
+        return None
+    return (hidden_states.to(dtype=weight.dtype), *inputs[1:])
+
+
 class NemotronV3Attention(nn.Module):
     """GQA attention for NemotronV3 (no RoPE), compatible with TE/SDPA backends."""
 
@@ -698,6 +720,11 @@ class NemotronV3Block(nn.Module):
                 backend.gate_precision = torch.float32
 
             self.mixer = MoE(moe_config, backend)
+            if self.mixer.fc2_latent_proj is not None:
+                self.mixer.fc2_latent_proj.register_forward_pre_hook(
+                    _cast_latent_projection_input_to_weight_dtype,
+                    prepend=True,
+                )
         else:
             raise ValueError(f"Invalid block_type: {self.block_type}")
 

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -273,6 +275,30 @@ class TestNemotronV3Block:
         assert block.block_type == "moe"
         assert hasattr(block.mixer, "gate")
         assert hasattr(block.mixer, "experts")
+
+    def test_latent_moe_output_projection_casts_fp32_expert_output(self, config, backend, moe_config):
+        """Test FP32 expert output is cast before the BF16 latent projection."""
+        config.layers_block_type = ["moe"]
+        latent_size = 128
+        latent_moe_config = replace(moe_config, moe_latent_size=latent_size)
+        block = NemotronV3Block(config, layer_idx=0, moe_config=latent_moe_config, backend=backend)
+        projection = block.mixer.fc2_latent_proj
+
+        assert projection is not None
+        assert projection.weight.dtype == torch.bfloat16
+
+        expert_output = torch.randn(4, latent_size, dtype=torch.float32, requires_grad=True)
+        output = projection(expert_output)
+
+        assert output.shape == (4, config.hidden_size)
+        assert output.dtype == torch.bfloat16
+
+        output.float().square().mean().backward()
+        assert expert_output.grad is not None
+        assert expert_output.grad.dtype == torch.float32
+        assert torch.isfinite(expert_output.grad).all()
+        assert projection.weight.grad is not None
+        assert torch.isfinite(projection.weight.grad).all()
 
     def test_block_init_invalid_type(self, config, backend):
         """Test block initialization with invalid layer type raises error."""
