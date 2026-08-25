@@ -318,7 +318,12 @@ class Qwen4ExpHyperConnection(nn.Module):
         if hidden_states.shape[-1] != self.flat_hidden_size:
             raise ValueError(f"Expected HC width {self.flat_hidden_size}, got {hidden_states.shape[-1]}")
         normalized = self.hc_norm(hidden_states)
-        gates = F.silu(self.input_mix_weight_down(normalized) / self.hc_count)
+        # FSDP may keep the residual stream in fp32 while materializing the
+        # projection weights in bf16 for compute. Match the projection dtype at
+        # the linear boundary, then combine its gates with the original
+        # normalized stream so the caller's residual dtype is preserved.
+        projection_input = normalized.to(dtype=self.input_mix_weight_down.weight.dtype)
+        gates = F.silu(self.input_mix_weight_down(projection_input) / self.hc_count)
         gates = torch.sigmoid(self.input_mix_weight_up(gates))
         mixed = (
             gates.unflatten(-1, (self.hc_count, self.hidden_size))
@@ -350,7 +355,8 @@ class Qwen4ExpHyperConnection(nn.Module):
             raise ValueError(f"Expected block output width {self.hidden_size}, got {block_output.shape[-1]}")
         if residual.hidden_states.shape[-1] != self.flat_hidden_size:
             raise ValueError(f"Expected residual width {self.flat_hidden_size}, got {residual.hidden_states.shape[-1]}")
-        injection_gate = 2.0 * torch.sigmoid(self.block_inject_weight(residual.normalized_states) / self.hc_count)
+        projection_input = residual.normalized_states.to(dtype=self.block_inject_weight.weight.dtype)
+        injection_gate = 2.0 * torch.sigmoid(self.block_inject_weight(projection_input) / self.hc_count)
         streams = residual.hidden_states.unflatten(-1, (self.hc_count, self.hidden_size))
         injection = block_output.unsqueeze(-2) * injection_gate.unsqueeze(-1)
         return (streams + injection).flatten(-2)

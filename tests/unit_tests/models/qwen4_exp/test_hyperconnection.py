@@ -82,6 +82,43 @@ def test_hyperconnection_matches_reference_read_and_write() -> None:
     torch.testing.assert_close(actual_combined, expected_combined, rtol=1e-6, atol=1e-6)
 
 
+def test_hyperconnection_preserves_fp32_residual_with_bf16_projections() -> None:
+    torch.manual_seed(11)
+    layer = Qwen4ExpHyperConnection(
+        hidden_size=4,
+        hc_count=2,
+        lowrank_size=3,
+        rms_norm_eps=1e-6,
+        backend=BackendConfig(linear="torch"),
+        dtype=torch.bfloat16,
+    )
+    x = torch.randn(2, 3, 8, requires_grad=True)
+    block_output = torch.randn(2, 3, 4, dtype=torch.bfloat16, requires_grad=True)
+
+    mixed, residual = layer.mix(x)
+    combined = layer.combine(block_output, residual)
+
+    normalized = _reference_group_norm(x, layer.hc_norm.weight, groups=2, eps=1e-6)
+    projection_input = normalized.to(torch.bfloat16)
+    read_gate = F.silu(F.linear(projection_input, layer.input_mix_weight_down.weight) / 2)
+    read_gate = torch.sigmoid(F.linear(read_gate, layer.input_mix_weight_up.weight)).unflatten(-1, (2, 4))
+    expected_mixed = (read_gate * normalized.unflatten(-1, (2, 4))).mean(dim=-2)
+    write_gate = 2.0 * torch.sigmoid(F.linear(projection_input, layer.block_inject_weight.weight) / 2)
+    expected_combined = (x.unflatten(-1, (2, 4)) + block_output.unsqueeze(-2) * write_gate.unsqueeze(-1)).flatten(-2)
+
+    assert mixed.dtype == torch.float32
+    assert combined.dtype == torch.float32
+    torch.testing.assert_close(mixed, expected_mixed, rtol=0, atol=0)
+    torch.testing.assert_close(combined, expected_combined, rtol=0, atol=0)
+
+    (mixed.square().mean() + combined.square().mean()).backward()
+    assert x.grad is not None and x.grad.dtype == torch.float32 and torch.isfinite(x.grad).all()
+    assert block_output.grad is not None and block_output.grad.dtype == torch.bfloat16
+    for parameter in layer.parameters():
+        assert parameter.grad is not None and parameter.grad.dtype == parameter.dtype
+        assert torch.isfinite(parameter.grad).all()
+
+
 def test_final_hyperconnection_has_read_only_state_dict() -> None:
     layer = Qwen4ExpHyperConnection(
         hidden_size=4,
