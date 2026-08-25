@@ -16,6 +16,7 @@
 
 # ruff: noqa: E741
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -304,3 +305,102 @@ def test_apply_lora_respects_memory_efficient_lora_toggle():
     assert not getattr(mlp, "_lora_mlp_fused", False)
     assert mlp.forward.__func__ is original_forward
     assert install_fused_lora_mlp(mlp) == 0
+
+
+_PROJS = ("gate_proj", "up_proj", "down_proj")
+
+
+def _mixed_precision_mlp(activation, memory_efficient, lora_dtype=None):
+    """A BF16-weight MLP with LoRA applied through the production entry point.
+
+    ``apply_lora_to_linear_modules`` is what training actually calls: it patches the projections and
+    then installs the fused MLP wrapper, so this exercises the real routing rather than reaching for
+    the fused helpers directly.
+    """
+    from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+    from nemo_automodel.components.moe.layers import MLP
+
+    torch.manual_seed(0)
+    # FSDP2 param_dtype=bf16 leaves the frozen base weights in bf16.
+    mlp = MLP(dim=32, inter_dim=48, backend="torch", dtype=torch.bfloat16, activation=activation)
+    config = PeftConfig(
+        target_modules=list(_PROJS),
+        dim=4,
+        alpha=4,
+        use_triton=False,
+        use_memory_efficient_lora=memory_efficient,
+        lora_dtype=lora_dtype,
+    )
+    apply_lora_to_linear_modules(mlp, config)
+    for proj in _PROJS:
+        mod = getattr(mlp, proj, None)
+        if mod is not None:  # lora_B inits to zeros; randomize so the LoRA path is exercised
+            nn.init.normal_(mod.lora_B.weight, std=0.02)
+    return mlp
+
+
+def _lora_grads(mlp):
+    return {
+        f"{proj}.{ab}": getattr(getattr(mlp, proj), ab).weight.grad
+        for proj in _PROJS
+        if getattr(mlp, proj, None) is not None
+        for ab in ("lora_A", "lora_B")
+    }
+
+
+def _autocast_backward(mlp, x0, gout):
+    """Run one forward/backward under BF16 autocast, as mixed-precision training does."""
+    x = x0.clone().requires_grad_(True)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = mlp(x)
+    (out.float() * gout).sum().backward()
+    return out, x.grad, _lora_grads(mlp)
+
+
+def _rel(a, b):
+    return (a.float() - b.float()).abs().max().item() / (b.float().abs().max().item() + 1e-9)
+
+
+@pytest.mark.parametrize(
+    ("activation", "expected_backward"),
+    [("swiglu", "LoRASwiGLUMLPFunctionBackward"), ("relu2", "LoRAReLU2MLPFunctionBackward")],
+)
+@pytest.mark.parametrize(
+    ("case", "act_dtype", "lora_dtype"),
+    [
+        # FSDP2 param_dtype=bf16 with output_dtype=fp32: fp32 activations meet bf16 compute weights.
+        ("fp32_activations", torch.float32, None),
+        # lora_dtype keeps the adapters in another dtype than the (bf16) base weights.
+        ("fp32_adapters", torch.bfloat16, torch.float32),
+    ],
+)
+def test_fused_mlp_mixed_dtype_matches_unfused(case, act_dtype, lora_dtype, activation, expected_backward):
+    """The fused MLP must handle every mixed-dtype layout the per-linear path handles, and agree with it.
+
+    Both fused paths used to raise "expected m1 and m2 to have the same dtype" here: the custom
+    backward recomputed its matmuls outside autocast (so an fp32 saved activation met bf16 weights),
+    and the forward's ``addmm_`` is not autocast-eligible (so an fp32 adapter met the bf16 base).
+    """
+    lora_grad_dtype = lora_dtype or torch.bfloat16
+    fused = _mixed_precision_mlp(activation, memory_efficient=True, lora_dtype=lora_dtype)
+    unfused = _mixed_precision_mlp(activation, memory_efficient=False, lora_dtype=lora_dtype)
+    assert getattr(fused, "_lora_mlp_fused", False), "production entry point did not install the fused MLP"
+    assert not getattr(unfused, "_lora_mlp_fused", False)
+
+    x0 = torch.randn(2, 8, 32, dtype=act_dtype)
+    gout = torch.randn(2, 8, 32, dtype=torch.float32)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert type(fused(x0).grad_fn).__name__ == expected_backward  # fusion is really routed to
+
+    out_f, dx_f, grads_f = _autocast_backward(fused, x0, gout)
+    out_u, dx_u, grads_u = _autocast_backward(unfused, x0, gout)
+
+    # Every gradient must come back in the dtype of the input it belongs to.
+    assert dx_f.dtype == dx_u.dtype == act_dtype
+    for name, grad in grads_f.items():
+        assert grad is not None and grad.dtype == lora_grad_dtype, name
+
+    assert _rel(out_f, out_u) < 2e-2
+    assert _rel(dx_f, dx_u) < 2e-2
+    for name in grads_f:
+        assert _rel(grads_f[name], grads_u[name]) < 2e-2, f"grad mismatch for {name}"

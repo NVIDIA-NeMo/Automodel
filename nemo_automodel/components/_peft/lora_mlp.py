@@ -85,6 +85,27 @@ def _use_triton(*tensors) -> bool:
     return HAVE_TRITON and all(t.is_cuda and t.is_contiguous() for t in tensors)
 
 
+def _cast(dtype, *tensors):
+    """Cast tensors to ``dtype``. ``Tensor.to`` returns the tensor itself when it already matches."""
+    return tuple(t.to(dtype) for t in tensors)
+
+
+def _like_input(grad, inp):
+    """Return ``grad`` on the device and in the dtype of the input it belongs to.
+
+    Autograd rejects a gradient whose device or dtype differs from its input's.
+
+    * Device: under pipeline-parallel graph construction torch tracks the LoRA parameters on the meta
+      device while the activations (and the grads computed from them) are on cuda, so it rejected the
+      cuda grads ("invalid gradient ... expected device meta but got cuda").
+    * Dtype: under mixed precision (FSDP2 ``param_dtype=bf16`` with fp32 activations) the gradients
+      come out in the lower forward compute dtype while the input they belong to is fp32.
+
+    Both are no-ops in normal single-device, uniform-dtype training.
+    """
+    return grad.to(device=inp.device, dtype=inp.dtype)
+
+
 def _swiglu_fwd(e, g):
     """h = silu(e) * g."""
     if not _use_triton(e, g):
@@ -137,13 +158,18 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
 
         # Build each projection in-place (base buffer += scaled LoRA delta) to avoid an extra
         # tokens x out buffer per projection. forward runs outside autograd, so this is safe.
+        # ``addmm_`` is not autocast-eligible — an in-place op cannot change its output dtype — so
+        # unlike the ``F.linear`` calls its operands are *not* auto-cast and must already be in the
+        # base projection's dtype. They are not when the adapters are held in a different dtype than
+        # the base (``lora_dtype``), which the per-linear path handles via autocast; cast to keep the
+        # fused path identical to it. A no-op when the dtypes already agree.
         e = F.linear(x2, gW)  # gate_out (saved)
-        e.addmm_(F.linear(x2, gA) * gS, gB.t())
+        e.addmm_(*_cast(e.dtype, F.linear(x2, gA) * gS, gB.t()))
         g = F.linear(x2, uW)  # up_out (saved)
-        g.addmm_(F.linear(x2, uA) * uS, uB.t())
+        g.addmm_(*_cast(g.dtype, F.linear(x2, uA) * uS, uB.t()))
         h = _swiglu_fwd(e, g)  # down-projection input (recomputed in backward)
         out = F.linear(h, dW)
-        out.addmm_(F.linear(h, dA) * dS, dB.t())
+        out.addmm_(*_cast(out.dtype, F.linear(h, dA) * dS, dB.t()))
 
         # Save only x / gate_out / up_out; the SwiGLU activation and down-input are recomputed.
         ctx.save_for_backward(x2, e, g, gA, gB, uA, uB, dA, dB)
@@ -167,48 +193,57 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         dY = grad_out.reshape(-1, grad_out.shape[-1])
         needs_x = ctx.needs_input_grad[0]
 
+        # A custom backward runs outside autocast, so nothing re-applies the forward's compute dtype
+        # here. Under mixed precision (FSDP2 ``param_dtype=bf16`` with fp32 activations) the saved
+        # ``x`` is fp32 while the base/LoRA weights are bf16, and the matmuls below would raise
+        # "expected m1 and m2 to have the same dtype". ``e`` is a forward matmul output, so its dtype
+        # *is* the forward compute dtype (the one autocast picked): run everything in it, exactly as
+        # autograd would through autocast's own cast nodes, and hand each gradient back in its
+        # input's dtype. Every cast is a no-op when the dtypes already agree, so the uniform-dtype
+        # path allocates nothing extra; ``e``/``g`` are already in the compute dtype and stay
+        # untouched so the in-place SwiGLU backward keeps writing into the saved buffers.
+        compute_dtype = e.dtype
+        dY, xc = _cast(compute_dtype, dY, x)
+        gW, uW, dW = _cast(compute_dtype, gW, uW, dW)
+        gAc, gBc, uAc, uBc, dAc, dBc = _cast(compute_dtype, gA, gB, uA, uB, dA, dB)
+
         # Grad of the down-projection input h = silu(e)*g (does not need h itself):
         # d_h = dY@dW + dS*(dY@dB)@dA. This is the only new (N, inter) buffer in backward.
-        d_P = dS * (dY @ dB)  # (N, r)
-        d_h = torch.addmm(dY @ dW, d_P, dA)  # (N, inter)
+        d_P = dS * (dY @ dBc)  # (N, r)
+        d_h = torch.addmm(dY @ dW, d_P, dAc)  # (N, inter)
 
         # Recompute SwiGLU and produce (h, d_g, d_e) in the (d_h, e, g) buffers (in place).
         h, d_g, d_e = _swiglu_bwd_inplace(d_h, e, g)
 
         # ---- down LoRA grads (use recomputed h): out = h@dW.T + dS*(h@dA.T)@dB.T ----
-        P = F.linear(h, dA)  # (N, r)
+        P = F.linear(h, dAc)  # (N, r)
         d_dB = dS * (dY.t() @ P)  # (hidden, r)
         d_dA = d_P.t() @ h  # (r, inter)
 
         # ---- up: g = x@uW.T + uS*(x@uA.T)@uB.T ----
-        Q = F.linear(x, uA)  # (N, r)
+        Q = F.linear(xc, uAc)  # (N, r)
         d_uB = uS * (d_g.t() @ Q)  # (inter, r)
-        d_Q = uS * (d_g @ uB)  # (N, r)
-        d_uA = d_Q.t() @ x  # (r, hidden)
+        d_Q = uS * (d_g @ uBc)  # (N, r)
+        d_uA = d_Q.t() @ xc  # (r, hidden)
 
         # ---- gate: e = x@gW.T + gS*(x@gA.T)@gB.T ----
-        R = F.linear(x, gA)  # (N, r)
+        R = F.linear(xc, gAc)  # (N, r)
         d_gB = gS * (d_e.t() @ R)  # (inter, r)
-        d_R = gS * (d_e @ gB)  # (N, r)
-        d_gA = d_R.t() @ x  # (r, hidden)
+        d_R = gS * (d_e @ gBc)  # (N, r)
+        d_gA = d_R.t() @ xc  # (r, hidden)
 
         d_x = None
         if needs_x:
             # gate base+lora (d_e@gW + d_R@gA) plus up base+lora (d_g@uW + d_Q@uA)
-            d_x = torch.addmm(d_e @ gW, d_R, gA)
-            d_x = d_x.addmm_(d_g, uW).addmm_(d_Q, uA).view(ctx.orig_shape)
+            d_x = torch.addmm(d_e @ gW, d_R, gAc)
+            d_x = d_x.addmm_(d_g, uW).addmm_(d_Q, uAc).view(ctx.orig_shape)
 
-        # Each returned gradient must live on the same device as its corresponding input. Under
-        # pipeline-parallel graph construction torch tracks the LoRA parameters on the meta device
-        # while the activations (and the grads computed from them) are on cuda, so it rejected the
-        # cuda grads ("invalid gradient ... expected device meta but got cuda"). Move each LoRA grad
-        # onto its parameter's device: a no-op in normal single-device training, and correct in the
-        # PP/meta graph pass (the real gradients still flow on the cuda execution passes).
-        d_gA, d_gB = d_gA.to(gA.device), d_gB.to(gB.device)
-        d_uA, d_uB = d_uA.to(uA.device), d_uB.to(uB.device)
-        d_dA, d_dB = d_dA.to(dA.device), d_dB.to(dB.device)
+        # Hand every gradient back on its input's device and in its input's dtype (see _like_input).
+        d_gA, d_gB = _like_input(d_gA, gA), _like_input(d_gB, gB)
+        d_uA, d_uB = _like_input(d_uA, uA), _like_input(d_uB, uB)
+        d_dA, d_dB = _like_input(d_dA, dA), _like_input(d_dB, dB)
         if d_x is not None:
-            d_x = d_x.to(x.device)
+            d_x = _like_input(d_x, x)
 
         # order matches forward(x, gW, gA, gB, gS, uW, uA, uB, uS, dW, dA, dB, dS)
         return (d_x, None, d_gA, d_gB, None, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
@@ -289,12 +324,14 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         """Compute the fused ReLU² MLP output, saving only x and up_out for backward."""
         orig_shape = x.shape
         x2 = x.reshape(-1, orig_shape[-1])
+        # See LoRASwiGLUMLPFunction.forward: ``addmm_`` is not autocast-eligible, so cast its operands
+        # to the base projection's dtype for a ``lora_dtype`` that differs from the base weights.
         e = F.linear(x2, uW)  # up_out (saved)
-        e.addmm_(F.linear(x2, uA) * uS, uB.t())
+        e.addmm_(*_cast(e.dtype, F.linear(x2, uA) * uS, uB.t()))
         relu_e = torch.relu(e)
         f = relu_e * relu_e  # down-projection input (recomputed in backward)
         out = F.linear(f, dW)
-        out.addmm_(F.linear(f, dA) * dS, dB.t())
+        out.addmm_(*_cast(out.dtype, F.linear(f, dA) * dS, dB.t()))
         ctx.save_for_backward(x2, e, uA, uB, dA, dB)
         ctx.bases = (uW, dW)
         ctx.scales = (uS, dS)
@@ -310,36 +347,42 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         dY = grad_out.reshape(-1, grad_out.shape[-1])
         needs_x = ctx.needs_input_grad[0]
 
+        # See LoRASwiGLUMLPFunction.backward: a custom backward runs outside autocast, so recompute in
+        # the forward compute dtype (``e``'s, since ``e`` is a forward matmul output) and hand every
+        # gradient back in its input's dtype. All no-ops when the tensors already share a dtype.
+        compute_dtype = e.dtype
+        dY, xc = _cast(compute_dtype, dY, x)
+        uW, dW = _cast(compute_dtype, uW, dW)
+        uAc, uBc, dAc, dBc = _cast(compute_dtype, uA, uB, dA, dB)
+
         relu_e = torch.relu(e)
         f = relu_e * relu_e  # recompute down-projection input
 
         # ---- down: out = f@dW.T + dS*(f@dA.T)@dB.T ----
-        d_P = dS * (dY @ dB)  # (N, r)
-        P = F.linear(f, dA)  # (N, r)
+        d_P = dS * (dY @ dBc)  # (N, r)
+        P = F.linear(f, dAc)  # (N, r)
         d_dB = dS * (dY.t() @ P)  # (hidden, r)
         d_dA = d_P.t() @ f  # (r, inter)
-        d_f = torch.addmm(dY @ dW, d_P, dA)  # (N, inter)
+        d_f = torch.addmm(dY @ dW, d_P, dAc)  # (N, inter)
 
         # ---- ReLU²: d(relu(e)**2)/de = 2*relu(e). Reuse d_f's buffer for d_e. ----
         d_e = d_f.mul_(2.0 * relu_e)
 
         # ---- up: e = x@uW.T + uS*(x@uA.T)@uB.T ----
-        Q = F.linear(x, uA)  # (N, r)
+        Q = F.linear(xc, uAc)  # (N, r)
         d_uB = uS * (d_e.t() @ Q)  # (inter, r)
-        d_Q = uS * (d_e @ uB)  # (N, r)
-        d_uA = d_Q.t() @ x  # (r, hidden)
+        d_Q = uS * (d_e @ uBc)  # (N, r)
+        d_uA = d_Q.t() @ xc  # (r, hidden)
 
         d_x = None
         if needs_x:
-            d_x = torch.addmm(d_e @ uW, d_Q, uA).view(ctx.orig_shape)
+            d_x = torch.addmm(d_e @ uW, d_Q, uAc).view(ctx.orig_shape)
 
-        # See LoRASwiGLUMLPFunction.backward: return each LoRA grad on its parameter's device so the
-        # pipeline-parallel meta graph pass (params on meta, activations on cuda) doesn't reject the
-        # cuda grads. No-op in normal single-device training.
-        d_uA, d_uB = d_uA.to(uA.device), d_uB.to(uB.device)
-        d_dA, d_dB = d_dA.to(dA.device), d_dB.to(dB.device)
+        # Hand every gradient back on its input's device and in its input's dtype (see _like_input).
+        d_uA, d_uB = _like_input(d_uA, uA), _like_input(d_uB, uB)
+        d_dA, d_dB = _like_input(d_dA, dA), _like_input(d_dB, dB)
         if d_x is not None:
-            d_x = d_x.to(x.device)
+            d_x = _like_input(d_x, x)
 
         # order matches forward(x, uW, uA, uB, uS, dW, dA, dB, dS)
         return (d_x, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
