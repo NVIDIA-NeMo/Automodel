@@ -92,7 +92,7 @@ A tool call is only usable if something parses the model's raw text into a struc
   Use this when a built-in parser drops or mangles the args — e.g. **gemma4 base / base-SFT**
   emit JSON-prior args the `gemma4` parser corrupts, and **Qwen3** uses `NOPARSER=1` because
   the strict `hermes` parser drops calls with control chars in code args (its lenient
-  `parse_hermes_tool_calls` fallback recovers them). See the per-model pages.
+  `parse_hermes_tool_calls` fallback recovers them). See the per-model pages for more details.
 
 Serve base vs SFT (or any two checkpoints you compare) **identically** so the delta
 reflects the model, not the serving config.

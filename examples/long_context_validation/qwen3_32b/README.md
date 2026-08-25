@@ -3,7 +3,7 @@
 End-to-end SFT pipeline on [togethercomputer/CoderForge-Preview](https://huggingface.co/datasets/togethercomputer/CoderForge-Preview)
 to validate **context parallelism (CP)** in NeMo AutoModel on the **dense Qwen3-32B**
 at a **128K** context length, then evaluate on
-[SWE-bench Verified](https://www.swebench.com/verified) (eval in a follow-up PR).
+[SWE-bench Verified](https://www.swebench.com/verified).
 
 CoderForge ships OpenHands agent **trajectories** (multi-turn assistant/tool
 exchanges) in OpenAI chat format. Trajectories are long (median ~38K tokens with the
@@ -193,7 +193,5 @@ Base vs the CoderForge-SFT (gentler `lr 5e-6`) checkpoints, same harness, all 50
 | SFT step 399 | 120 | 24.0% |
 | **SFT step 499** | **122** | **24.4%** |
 
-CoderForge SFT lifts Qwen3-32B **+6.2 points** (18.2% → 24.4%) — a real SWE-bench gain, and the
-gentler LR kept improving through the early checkpoints (the goal of this long-context CP-SFT
-validation). _(A first `lr 1e-5` run peaked then regressed, which is why the recipe uses `5e-6`.)_
+CoderForge SFT lifts Qwen3-32B **+6.2 points** (18.2% → 24.4%) — a real SWE-bench gain.
 
