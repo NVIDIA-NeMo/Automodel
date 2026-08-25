@@ -209,8 +209,8 @@ class TestMagiState:
         expected_indices = torch.tensor([[0, 2]])
         calls = []
 
-        def prepare(model, batch, cp_group, *, return_local_indices):
-            calls.append((model, batch, cp_group, return_local_indices))
+        def prepare(model, batch, cp_group):
+            calls.append((model, batch, cp_group))
             return expected_batch, object(), expected_indices
 
         monkeypatch.setattr(mu, "magi_prepare_batch", prepare)
@@ -232,7 +232,7 @@ class TestMagiState:
         assert train_ctx is nullcontext
         assert out is expected_batch
         assert local_indices is expected_indices
-        assert calls == [(model, batch, group, True)]
+        assert calls == [(model, batch, group)]
 
     def test_prepare_llm_batch_hf_packed_rejects_lost_document_boundaries(self):
         st = MagiState(enabled=True, custom=False, cp_group=None, cp_size=1)
@@ -372,7 +372,6 @@ class TestMagiPrepareBatch:
             model,
             batch,
             _FakeGroup(2),
-            return_local_indices=True,
         )
 
         assert returned_key is expected_key
@@ -485,14 +484,7 @@ class TestPackedCpDocSeqlens:
             "labels": torch.tensor([20, 21, 22, 23, 24, 25]),
             "cu_seqlens_padded": torch.tensor([0, 3, 6]),
         }
-        default_result = mu.magi_prepare_packed_cp(model, batch, _FakeGroup(2))
-        assert len(default_result) == 2
-        assert not any(torch.equal(value, torch.arange(6)) and pad_value == 6 for value, pad_value in dispatch_calls)
-
-        dispatch_calls.clear()
-        out, returned_key, local_indices = mu.magi_prepare_packed_cp(
-            model, batch, _FakeGroup(2), return_local_indices=True
-        )
+        out, returned_key, local_indices = mu.magi_prepare_packed_cp(model, batch, _FakeGroup(2))
 
         assert returned_key is expected_key
         assert torch.equal(out["position_ids"], torch.tensor([2, 0, 1, 0]))

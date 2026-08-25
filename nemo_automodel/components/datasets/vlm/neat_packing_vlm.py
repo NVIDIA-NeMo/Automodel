@@ -423,10 +423,6 @@ def _build_packed_vlm_sample(
                 all_token_type_ids[key].extend([0] * padded_seq_len)
                 continue
             token_types = torch.as_tensor(token_types).reshape(-1).tolist()
-            if len(token_types) != seq_len:
-                raise ValueError(
-                    f"Packed VLM {key} must match the shifted token length; got {len(token_types)} and {seq_len}."
-                )
             all_token_type_ids[key].extend(token_types + [0] * pad)
 
         if has_mrope and "position_ids" in sample:
@@ -599,8 +595,7 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
             raise ValueError(f"sequence_alignment must be at least 1, got {sequence_alignment}.")
         self.sequence_alignment = sequence_alignment
         self.get_rope_index = get_rope_index
-        self.has_mrope = get_rope_index is not None
-        if self.has_mrope and self.sequence_alignment > 1:
+        if get_rope_index is not None and self.sequence_alignment > 1:
             raise NotImplementedError("Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented.")
         self.max_retries = max_retries
 
@@ -614,7 +609,7 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
 
         for sample_idx in bin_indices:
             sample = self.inner[sample_idx]  # tokenize + load media
-            seq_len = sample["input_ids"][:-1].shape[0]
+            seq_len = len(sample["input_ids"]) - 1
             aligned_seq_len = _aligned_length(seq_len, self.sequence_alignment)
 
             # The aligned length is the actual capacity consumed by THD CP.
@@ -635,7 +630,7 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
         total = 0
         kept: list[dict] = []
         for sample in samples:
-            slen = sample["input_ids"][:-1].shape[0]
+            slen = len(sample["input_ids"]) - 1
             aligned_slen = _aligned_length(slen, self.sequence_alignment)
             if total + aligned_slen <= self.pack_size:
                 kept.append(sample)

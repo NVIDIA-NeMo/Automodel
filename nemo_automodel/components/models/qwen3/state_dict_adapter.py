@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import torch
 from transformers import Qwen3Config
@@ -72,12 +73,7 @@ class Qwen3StateDictAdapter:
             return dict(state_dict)
         return {key: value for key, value in state_dict.items() if not re.search(exclude_key_regex, key)}
 
-    def convert_single_tensor_to_hf(
-        self,
-        fqn: str,
-        tensor: torch.Tensor,
-        **kwargs: object,
-    ) -> list[tuple[str, torch.Tensor]]:
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Return one already-HuggingFace-format tensor.
 
         Args:

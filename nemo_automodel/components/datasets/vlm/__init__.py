@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel._transformers.utils import resolve_get_rope_index
-
-from .collate_fns import neat_packed_vlm_collater, packed_sequence_thd_vlm_collater
 from .datasets import (
     PreTokenizedDatasetWrapper,
     RobustDatasetWrapper,
@@ -24,9 +21,7 @@ from .datasets import (
     make_unimm_chat_dataset,
 )
 from .mock import build_mock_vlm_dataset
-from .neat_packing_vlm import pack_vlm_samples
 from .samplers import LengthGroupedSampler
-from .utils import merge_media_values
 
 __all__ = [
     "make_rdr_dataset",
@@ -37,9 +32,4 @@ __all__ = [
     "PreTokenizedDatasetWrapper",
     "RobustDatasetWrapper",
     "LengthGroupedSampler",
-    "pack_vlm_samples",
-    "merge_media_values",
-    "resolve_get_rope_index",
-    "neat_packed_vlm_collater",
-    "packed_sequence_thd_vlm_collater",
 ]

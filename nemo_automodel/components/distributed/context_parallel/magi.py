@@ -510,8 +510,6 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     batch: dict,
     cp_group: dist.ProcessGroup | None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    *,
-    return_local_indices: bool = False,
 ):
     """Dispatch a (batch_size==1) sequence for MagiAttention on the HF path.
 
@@ -528,11 +526,10 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
         batch: dict with at least ``input_ids`` of shape ``[1, S]``.
         cp_group: CP process group (size 1 -> identity shard).
         chunk_size: dispatch solver chunk size.
-        return_local_indices: Also return the dispatched global token indices.
 
     Returns:
-        ``(new_batch, key)`` by default. With ``return_local_indices=True``,
-        also returns the map from the local token stream to the global input.
+        ``(new_batch, key, local_indices)`` where ``local_indices`` maps the
+        local token stream to the global input.
     """
     from magi_attention.api import dispatch, get_position_ids, magi_attn_varlen_key
     from magi_attention.api.functools import compute_pad_size
@@ -570,11 +567,9 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
 
     local_input = dispatch(input_ids.squeeze(0), key=key).unsqueeze(0)  # [1, local_S]
     position_ids = get_position_ids(key).unsqueeze(0).to(device)  # [1, local_S]
-    local_indices = None
-    if return_local_indices:
-        local_indices = dispatch(
-            torch.arange(seqlen, device=device, dtype=torch.long), key=key, pad_value=seqlen
-        ).unsqueeze(0)
+    local_indices = dispatch(
+        torch.arange(seqlen, device=device, dtype=torch.long), key=key, pad_value=seqlen
+    ).unsqueeze(0)
 
     _set_cp_group_on_attention(model.module if hasattr(model, "module") else model, cp_group)
 
@@ -587,7 +582,7 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
         new_batch["labels"] = dispatch(batch["labels"].squeeze(0), key=key, pad_value=-100).unsqueeze(0)
     # Remove anything that no longer matches the dispatched layout.
     new_batch.pop("attention_mask", None)
-    return (new_batch, key, local_indices) if return_local_indices else (new_batch, key)
+    return new_batch, key, local_indices
 
 
 def _packed_cp_doc_seqlens(batch: dict, total_len: int) -> list:
@@ -620,9 +615,7 @@ def _packed_cp_doc_seqlens(batch: dict, total_len: int) -> list:
     return seqlens
 
 
-def magi_prepare_packed_cp(  # pragma: no cover - requires GPU + magi_attention
-    model, batch: dict, cp_group, *, return_local_indices: bool = False
-):
+def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - requires GPU + magi_attention
     """Context-parallel prep for a packed (THD) batch on the custom-model path.
 
     Takes a *global* THD batch (flat ``input_ids``/``labels``/``position_ids`` plus
@@ -634,12 +627,9 @@ def magi_prepare_packed_cp(  # pragma: no cover - requires GPU + magi_attention
     each rank computes a per-shard loss that the recipe's cross-CP reduction sums
     into the global loss (like TE-CP).
 
-    Args:
-        return_local_indices: Also return the dispatched global token indices.
-
     Returns:
-        ``(new_batch, key)`` by default. With ``return_local_indices=True``,
-        also returns the map from the local token stream to the global input.
+        ``(new_batch, key, local_indices)`` where ``local_indices`` maps the
+        local token stream to the global input.
     """
     from magi_attention.api import dispatch, get_position_ids
 
@@ -657,11 +647,9 @@ def magi_prepare_packed_cp(  # pragma: no cover - requires GPU + magi_attention
     local_input = dispatch(input_ids, key=key)
     local_pos = get_position_ids(key).to(local_input.device)
     total_len = input_ids.numel()
-    local_indices = None
-    if return_local_indices:
-        local_indices = dispatch(
-            torch.arange(total_len, device=input_ids.device, dtype=torch.long), key=key, pad_value=total_len
-        )
+    local_indices = dispatch(
+        torch.arange(total_len, device=input_ids.device, dtype=torch.long), key=key, pad_value=total_len
+    )
     # Shard labels the same way as the input (like TE-CP): each rank computes the
     # loss on its own shard and the recipe's cross-CP reduction sums the shards
     # into the global loss. (Undispatching logits to global instead would make
@@ -678,7 +666,7 @@ def magi_prepare_packed_cp(  # pragma: no cover - requires GPU + magi_attention
         # magi dispatch permutation.
         "qkv_format": "thd",
     }
-    return (new_batch, key, local_indices) if return_local_indices else (new_batch, key)
+    return new_batch, key, local_indices
 
 
 def _iter_language_model_attention(model):
@@ -810,17 +798,17 @@ class MagiState:
                     "magi backend (model.backend.attn='magi')."
                 )
             # HF path: dispatch the (single causal) sequence across the CP group.
-            batch, _, local_indices = magi_prepare_batch(model, batch, self.cp_group, return_local_indices=True)
+            batch, _, local_indices = magi_prepare_batch(model, batch, self.cp_group)
         elif self.custom and self.cp_size > 1 and is_thd:
             # Custom-model CP packed path: build the *global* THD layout (no TE
             # sharding) then dispatch it with magi's own load-balancing solver.
             batch = make_cp_batch_for_te(None, batch, qkv_format="thd", padding_token_id=pad_id, num_chunks=1)
-            batch, _, local_indices = magi_prepare_packed_cp(model, batch, self.cp_group, return_local_indices=True)
+            batch, _, local_indices = magi_prepare_packed_cp(model, batch, self.cp_group)
         elif self.custom and self.cp_size > 1:
             # A plain causal custom-model batch uses the same dist key and
             # dispatch as the HF path. The custom attention callable reads the
             # key from the active CP group instead of the stamped modules.
-            batch, _, local_indices = magi_prepare_batch(model, batch, self.cp_group, return_local_indices=True)
+            batch, _, local_indices = magi_prepare_batch(model, batch, self.cp_group)
         elif is_thd:
             # cp=1 packing: THD conversion (no sharding) so the batch carries
             # cu_seqlens -> the magi attn_func builds the per-document mask.

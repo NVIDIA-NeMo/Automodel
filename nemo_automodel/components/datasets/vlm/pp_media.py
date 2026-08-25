@@ -70,8 +70,6 @@ def chunk_vlm_media(
         are views of ``pixel_values``; list chunks retain references to the original media tensors.
     """
     if isinstance(pixel_values, list):
-        if not all(isinstance(value, torch.Tensor) for value in pixel_values):
-            raise TypeError("variable-resolution pixel_values must be a list of tensors")
         if n_images_per_sample is None:
             if len(pixel_values) != batch_size:
                 raise ValueError(
@@ -80,22 +78,7 @@ def chunk_vlm_media(
                 )
             media_counts = torch.ones(batch_size, dtype=torch.long)
         else:
-            if not isinstance(n_images_per_sample, torch.Tensor) or n_images_per_sample.ndim != 1:
-                raise ValueError("n_images_per_sample must be a one-dimensional tensor")
-            if n_images_per_sample.numel() != batch_size:
-                raise ValueError(
-                    f"n_images_per_sample must have length batch_size={batch_size}, "
-                    f"got shape={tuple(n_images_per_sample.shape)}."
-                )
-            if (
-                n_images_per_sample.dtype == torch.bool
-                or n_images_per_sample.is_floating_point()
-                or n_images_per_sample.is_complex()
-            ):
-                raise ValueError("n_images_per_sample must contain integer media counts")
             media_counts = n_images_per_sample.to(dtype=torch.long, device="cpu")
-            if bool((media_counts < 0).any()):
-                raise ValueError("n_images_per_sample must contain non-negative media counts")
 
         total_media = int(media_counts.sum().item())
         if total_media != len(pixel_values):
@@ -103,14 +86,11 @@ def chunk_vlm_media(
                 "VLM PP chunking cannot align variable-resolution media with sample counts: "
                 f"len(pixel_values)={len(pixel_values)}, sum(n_images_per_sample)={total_media}."
             )
-        if image_grid is not None:
-            if not isinstance(image_grid, torch.Tensor) or image_grid.ndim == 0:
-                raise ValueError("image_grid must be a non-scalar tensor when variable-resolution media uses a grid")
-            if image_grid.shape[0] != total_media:
-                raise ValueError(
-                    "VLM PP chunking cannot align image_grid with variable-resolution media: "
-                    f"image_grid.shape[0]={image_grid.shape[0]}, len(pixel_values)={total_media}."
-                )
+        if image_grid is not None and image_grid.shape[0] != total_media:
+            raise ValueError(
+                "VLM PP chunking cannot align image_grid with variable-resolution media: "
+                f"image_grid.shape[0]={image_grid.shape[0]}, len(pixel_values)={total_media}."
+            )
 
         media_offsets = torch.cat((torch.zeros(1, dtype=torch.long), media_counts.cumsum(dim=0)))
         samples_per_mb = -(-batch_size // n_microbatches)

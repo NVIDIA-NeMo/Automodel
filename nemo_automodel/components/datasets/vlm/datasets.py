@@ -39,12 +39,99 @@ if TYPE_CHECKING:
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
     _lmdb_env_cache,
-    _media_token_mismatch,
     _preload_media,
     json2token,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_processor_token_id(processor, attr_names, token_names):
+    """Resolve a model-specific media token id from processor/config/tokenizer."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
+    config = getattr(processor, "config", None)
+    for source in (processor, config, tokenizer, getattr(tokenizer, "config", None)):
+        if source is None:
+            continue
+        for attr in attr_names:
+            value = getattr(source, attr, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                try:
+                    token_id = tokenizer.convert_tokens_to_ids(value)
+                except Exception:
+                    continue
+                if isinstance(token_id, int) and token_id != unk_id:
+                    return token_id
+    for token in token_names:
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            continue
+        if isinstance(token_id, int) and token_id != unk_id:
+            return token_id
+    return None
+
+
+def _grid_media_token_count(grid, merge_size: int) -> int:
+    """Return the number of merged media tokens described by a processor grid."""
+    if grid is None:
+        return 0
+    grid_t = torch.as_tensor(grid)
+    if grid_t.numel() == 0:
+        return 0
+    if grid_t.ndim == 1:
+        grid_t = grid_t.view(1, -1)
+    merge_len = int(merge_size) ** 2
+    return int((grid_t.to(torch.long).prod(dim=-1) // merge_len).sum().item())
+
+
+def _media_token_mismatch(input_ids, processor_inputs, processor) -> str | None:
+    """Return a mismatch description for resolvable media grids and token ids.
+
+    Args:
+        input_ids: Canonical processor token ids with shape ``[sequence]``.
+        processor_inputs: Processor-ready model inputs containing optional image
+            or video grids.
+        processor: Processor/tokenizer used to resolve model-specific media ids
+            and spatial merge factors.
+
+    Returns:
+        A short mismatch description, or ``None`` when the grid/token counts
+        agree or the processor does not expose enough information to check.
+    """
+    image_token_id = _resolve_processor_token_id(
+        processor,
+        ("image_token_id", "image_token_index", "image_token"),
+        ("<|image_pad|>", "<image>", "<|image|>"),
+    )
+    video_token_id = _resolve_processor_token_id(
+        processor,
+        ("video_token_id", "video_token_index", "video_token"),
+        ("<|video_pad|>", "<video>", "<|video|>"),
+    )
+
+    image_grid = processor_inputs.get("image_grid_thw")
+    if image_grid is not None and image_token_id is not None:
+        image_merge_size = getattr(getattr(processor, "image_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(image_grid, image_merge_size)
+        actual = int((input_ids == image_token_id).sum().item())
+        if actual != expected:
+            return f"image tokens={actual}, expected={expected}"
+
+    video_grid = processor_inputs.get("video_grid_thw")
+    if video_grid is not None and video_token_id is not None:
+        video_merge_size = getattr(getattr(processor, "video_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(video_grid, video_merge_size)
+        actual = int((input_ids == video_token_id).sum().item())
+        if actual != expected:
+            return f"video tokens={actual}, expected={expected}"
+
+    return None
+
 
 
 @dataclass
