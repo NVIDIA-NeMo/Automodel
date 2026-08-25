@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -148,6 +151,151 @@ class _DummyModel(torch.nn.Module):
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
         self.config = SimpleNamespace()
+
+
+class _TinyDDPModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base = torch.nn.Linear(1, 1, bias=False)
+        self.extension = torch.nn.Linear(1, 1, bias=False)
+        self.extension.weight.requires_grad_(False)
+        self.config = SimpleNamespace()
+
+    def forward(self, inputs, logits_to_keep=None):
+        return self.base(inputs) + self.extension(inputs)
+
+
+class _SelectTrainableParameter:
+    def __init__(self, name):
+        self.name = name
+        self.calls = 0
+
+    def instantiate(self, model):
+        self.calls += 1
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name == self.name)
+
+
+def _run_model_ready_hook_ddp(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+        from nemo_automodel.components.distributed.config import DDPConfig
+        from nemo_automodel.components.distributed.ddp import DDPManager
+
+        hook = _SelectTrainableParameter("extension.weight")
+        model = apply_model_infrastructure(
+            model=_TinyDDPModel(),
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=DDPManager(DDPConfig()),
+            model_ready_hooks=[hook],
+        )
+
+        for _ in range(2):
+            model.zero_grad(set_to_none=True)
+            model(torch.tensor([[float(rank + 1)]])).sum().backward()
+
+        assert hook.calls == 1
+        assert model.module.base.weight.grad is None
+        Path(result_dir, f"rank_{rank}.txt").write_text(str(model.module.extension.weight.grad.item()))
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_model_ready_hooks_run_before_ddp_reducer_construction(tmp_path):
+    """Hook-selected parameters are synchronized and excluded parameters stay out of DDP."""
+    torch.multiprocessing.spawn(
+        _run_model_ready_hook_ddp,
+        args=(2, str(tmp_path / "gloo_init"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+    assert [float((tmp_path / f"rank_{rank}.txt").read_text()) for rank in range(2)] == [1.5, 1.5]
+
+
+def test_metadata_only_hook_does_not_freeze_parameter_created_during_parallelization():
+    """Hook presence alone must not turn trainability into a closed-world policy."""
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+    model = _DummyModel()
+    hook = MagicMock()
+
+    def add_parallel_parameter(model, *_args, **_kwargs):
+        model.register_parameter("parallel_parameter", torch.nn.Parameter(torch.ones(1)))
+        return model
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", side_effect=add_parallel_parameter),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
+        apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_ready_hooks=[hook],
+        )
+
+    hook.instantiate.assert_called_once_with(model)
+    assert model.parallel_parameter.requires_grad
+
+
+@pytest.mark.parametrize("use_hook", [False, True])
+def test_peft_trainability_paths_freeze_new_parallel_parameter(use_hook):
+    """PEFT preserves hook overrides without changing its default freeze path."""
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+    model = _TinyDDPModel()
+    model.register_parameter("lora_disabled", torch.nn.Parameter(torch.ones(1)))
+    hook = _SelectTrainableParameter("extension.weight")
+    peft_config = SimpleNamespace(lora_A_init=None, use_triton=False)
+    selection_kwargs = {"model_ready_hooks": [hook]} if use_hook else {}
+
+    def replace_and_add_parameters(model, *_args, **_kwargs):
+        for module in (model.base, model.extension):
+            module.weight = torch.nn.Parameter(module.weight.detach().clone())
+        model.lora_disabled = torch.nn.Parameter(model.lora_disabled.detach().clone())
+        model.register_parameter("parallel_parameter", torch.nn.Parameter(torch.ones(1)))
+        return model
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._apply_peft_and_lower_precision", return_value=model),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", side_effect=replace_and_add_parameters),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
+        apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            peft_config=peft_config,
+            **selection_kwargs,
+        )
+
+    assert not model.base.weight.requires_grad
+    assert model.extension.weight.requires_grad is use_hook
+    assert model.lora_disabled.requires_grad is not use_hook
+    assert not model.parallel_parameter.requires_grad
 
 
 def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():

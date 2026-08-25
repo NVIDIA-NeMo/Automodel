@@ -77,6 +77,7 @@ from nemo_automodel.components.utils.model_utils import (
     init_empty_weights,
     print_trainable_parameters,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
@@ -483,6 +484,7 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
+    model_ready_hooks=None,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -521,6 +523,8 @@ def apply_model_infrastructure(
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
+        model_ready_hooks: Config-instantiable hooks run after model transforms and
+            freezing, but before distributed wrapping. Default: None.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -636,6 +640,27 @@ def apply_model_infrastructure(
     # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
     enable_radio_vit_fused_attn(model)
 
+    # Explicit trainability overrides must run before distributed wrappers
+    # inspect requires_grad. Existing PEFT-only configurations retain their
+    # post-shard freeze path below.
+    preserve_pre_wrap_trainability = peft_config is not None and bool(model_ready_hooks)
+    if preserve_pre_wrap_trainability:
+        for name, param in model.named_parameters():
+            if "lora_" not in name and param.requires_grad:
+                param.requires_grad_(False)
+
+    for hook_cfg in model_ready_hooks or []:
+        hook_cfg.instantiate(model)
+
+    pre_shard_trainability = (
+        {
+            canonical_parameter_fqn(name).replace("_orig_mod.", ""): param.requires_grad
+            for name, param in model.named_parameters(remove_duplicate=False)
+        }
+        if preserve_pre_wrap_trainability
+        else None
+    )
+
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         loss_fn = MaskedCrossEntropy()
@@ -724,9 +749,23 @@ def apply_model_infrastructure(
         checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
     )
 
-    # Freeze parameters after checkpoint loading and parallelization
-    # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)
-    if peft_config is not None:
+    # Sharding and checkpoint materialization may replace Parameter objects.
+    # Under PEFT, restore the pre-wrap policy by name and freeze unmatched
+    # parameters created during parallelization.
+    if pre_shard_trainability is not None:
+        if hasattr(model, "parts"):
+            trainability_models = model.parts
+        elif isinstance(model_wrapper, (DDPManager, MegatronFSDPManager)):
+            trainability_models = [getattr(model, "module", model)]
+        else:
+            trainability_models = [model]
+        for mp in trainability_models:
+            for name, param in mp.named_parameters():
+                name = canonical_parameter_fqn(name).replace("_orig_mod.", "")
+                requires_grad = pre_shard_trainability.get(name, "lora_" in name)
+                if param.requires_grad != requires_grad:
+                    param.requires_grad_(requires_grad)
+    elif peft_config is not None:
         models_to_freeze = model.parts if hasattr(model, "parts") else [model]
         for mp in models_to_freeze:
             for name, param in mp.named_parameters():

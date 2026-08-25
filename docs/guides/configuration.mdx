@@ -59,6 +59,26 @@ Only load configuration files and `_target_` values from trusted sources. A YAML
 
 </Warning>
 
+## Run Hooks Before Distributed Wrapping
+
+The LLM and VLM fine-tuning recipes accept a top-level `model_ready_hooks` list for out-of-tree model setup that must happen before optimizer construction:
+
+```yaml
+model_ready_hooks:
+  - _target_: your_package.training.configure_model
+    trainable_pattern: "extension.*"
+```
+
+Each `_target_` is called once, in list order, with the unwrapped model as its first positional argument and the remaining fields as keyword arguments. For the preceding example, the callable signature is `configure_model(model, trainable_pattern: str)`. The return value is ignored.
+
+Hooks run after configured PEFT and freezing, but before tensor, pipeline, or data-parallel wrapping and before optimizer construction. Use them to configure existing model-owned extensions or select the final trainable parameter set. Running before distributed wrapping ensures DDP and FSDP include the same trainable parameters as the optimizer. An exception aborts recipe setup. Omitting `model_ready_hooks` leaves setup unchanged.
+
+<Note>
+With meta-device initialization or post-shard checkpoint loading, pretrained tensor values are not available at hook time. Hooks may update trainability and non-tensor metadata on existing modules, but must not register new parameters or inspect or restore pretrained tensor data.
+</Note>
+
+This extension point is implemented in the `TrainFinetuneRecipeForNextTokenPrediction` and `FinetuneRecipeForVLM` setup paths. Subclasses that call these implementations with `super().setup()` inherit the hook, including the LLM and VLM knowledge-distillation recipes, diffusion-LM SFT recipes, and next-token benchmarking. Multi-model composite targets must define which component owns the hook and are rejected until they do; other recipe families do not run these hooks unless they explicitly add support.
+
 ## Distributed Section (Strategy-Based)
 
 The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema. Use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`. You can also configure parallelism sizes, such as `dp_size`, `tp_size`, and `pp_size`, and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. For examples, see the [Pipeline Parallelism with AutoPipeline](/development/pipeline-parallelism) guide and the recipe configs.

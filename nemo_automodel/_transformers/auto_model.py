@@ -416,6 +416,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         kwargs = dict(kwargs)  # Defensive copy so retries get clean state
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
+        model_ready_hooks = kwargs.pop("model_ready_hooks", None)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
 
         def _retry(**override):
@@ -426,6 +427,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **kwargs,
                 "has_packed_sequence": has_packed_sequence,
                 "freeze_config": freeze_config,
+                "model_ready_hooks": model_ready_hooks,
                 "cache_dir": cache_dir,
             }
             return cls._build_model(
@@ -636,6 +638,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             freeze_config=freeze_config,
             weights_already_loaded=weights_already_loaded,
             inject_te_attention=inject_te_attention,
+            model_ready_hooks=model_ready_hooks,
         )
 
         return model

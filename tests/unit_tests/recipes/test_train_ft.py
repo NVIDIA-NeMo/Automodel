@@ -953,9 +953,15 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     # Stub model/optimizer creation
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+
+    def _build_model(*args, model_ready_hooks=None, **kwargs):
+        for hook_cfg in model_ready_hooks or []:
+            hook_cfg.instantiate(dummy_model)
+        return dummy_model
+
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.build_model",
-        lambda *a, **k: dummy_model,
+        _build_model,
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
@@ -1107,6 +1113,55 @@ def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     trainer.setup()
 
     assert not hasattr(cfg.model, "torch_dtype")
+
+
+def select_trainable_parameter(model: nn.Module, name: str) -> None:
+    """Config-instantiable hook that leaves only ``name`` trainable."""
+    for parameter_name, parameter in model.named_parameters():
+        parameter.requires_grad_(parameter_name == name)
+
+
+def test_model_ready_hooks_run_before_optimizer_build(monkeypatch):
+    """The optimizer observes trainability changes made by model_ready_hooks."""
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    cfg.model_ready_hooks = [
+        ConfigNode(
+            {
+                "_target_": "tests.unit_tests.recipes.test_train_ft.select_trainable_parameter",
+                "name": "layer2.weight",
+            }
+        )
+    ]
+
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    trainable_at_optimizer_build = []
+
+    def _opt_build(model, *a, **k):
+        trainable_at_optimizer_build.extend(
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        )
+        return [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)]
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(build=_opt_build)),
+    )
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainable_at_optimizer_build == ["layer2.weight"]
+
+
+def test_model_ready_hooks_absent_is_noop(monkeypatch):
+    """Without a model_ready_hooks section, setup is unchanged."""
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert all(parameter.requires_grad for parameter in trainer.model_parts[0].parameters())
 
 
 def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):

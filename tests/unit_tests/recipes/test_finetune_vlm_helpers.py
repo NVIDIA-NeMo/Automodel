@@ -183,8 +183,8 @@ def test_build_model_and_optimizer_basic():
     assert isinstance(optim[0], torch.optim.Optimizer)
 
 
-def test_build_model_passes_freeze_config():
-    """Test that freeze_config is passed to model instantiation."""
+def test_build_model_passes_freeze_config_and_model_ready_hooks():
+    """Freeze config and model-ready hooks are passed to model instantiation."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
     captured_kwargs = {}
@@ -206,17 +206,20 @@ def test_build_model_passes_freeze_config():
         def to_dict(self):
             return {"freeze_language_model": False, "freeze_vision_tower": True}
 
+    model_ready_hooks = [object()]
     with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=FreezeConfig(),
             cfg_peft=None,
             seed=123,
+            model_ready_hooks=model_ready_hooks,
         )
 
     # Verify freeze_config was passed to model instantiation
     assert "freeze_config" in captured_kwargs
     assert captured_kwargs["freeze_config"] == {"freeze_language_model": False, "freeze_vision_tower": True}
+    assert captured_kwargs["model_ready_hooks"] is model_ready_hooks
 
 
 def test_build_model_passes_distributed_setup():
@@ -2775,6 +2778,31 @@ class TestRecipeTargetAllowlist:
         targets = _accepted_targets()
         assert Gemma4WithDrafter.from_pretrained in targets
 
+    def test_model_ready_hooks_reject_composite_target(self, monkeypatch):
+        """A composite must define which submodel owns a pre-wrapping hook."""
+
+        class Gemma4WithDrafter:
+            @classmethod
+            def from_pretrained(cls):
+                return cls()
+
+        fake_mod = types.ModuleType(_GEMMA4_COMPOSITE_MOD)
+        fake_mod.Gemma4WithDrafter = Gemma4WithDrafter
+        monkeypatch.setitem(sys.modules, _GEMMA4_COMPOSITE_MOD, fake_mod)
+        cfg_model = SimpleNamespace(
+            _target_=Gemma4WithDrafter.from_pretrained,
+            get=lambda key, default=None: getattr(cfg_model, key, default),
+        )
+
+        with pytest.raises(ValueError, match="single-model NeMoAutoModel"):
+            build_model(
+                cfg_model=cfg_model,
+                cfg_freeze=None,
+                cfg_peft=None,
+                seed=42,
+                model_ready_hooks=[object()],
+            )
+
     def test_is_recipe_target_none_returns_false(self):
         from nemo_automodel.recipes.vlm.finetune import _is_recipe_target
 
@@ -2841,7 +2869,13 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     )
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: dummy_model)
+
+    def _build_model(*args, model_ready_hooks=None, **kwargs):
+        for hook_cfg in model_ready_hooks or []:
+            hook_cfg.instantiate(dummy_model)
+        return dummy_model
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", _build_model)
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
         property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
@@ -2921,6 +2955,43 @@ def _minimal_vlm_cfg(
     if prewarm is not None:
         cfg["prewarm"] = prewarm
     return ConfigNode(cfg)
+
+
+def select_vlm_trainable_parameter(model: nn.Module, name: str) -> None:
+    """Config-instantiable hook that leaves only ``name`` trainable."""
+    for parameter_name, parameter in model.named_parameters():
+        parameter.requires_grad_(parameter_name == name)
+
+
+def test_vlm_model_ready_hooks_run_before_optimizer_build(monkeypatch):
+    """The VLM optimizer observes trainability changes made by model_ready_hooks."""
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+    cfg.model_ready_hooks = [
+        ConfigNode(
+            {
+                "_target_": "tests.unit_tests.recipes.test_finetune_vlm_helpers.select_vlm_trainable_parameter",
+                "name": "language_model.weight",
+            }
+        )
+    ]
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    trainable_at_optimizer_build = []
+
+    def _opt_build(model, *a, **k):
+        trainable_at_optimizer_build.extend(
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        )
+        return [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)]
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(build=_opt_build)),
+    )
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert trainable_at_optimizer_build == ["language_model.weight"]
 
 
 def test_vlm_setup_applies_prewarm_config(monkeypatch):

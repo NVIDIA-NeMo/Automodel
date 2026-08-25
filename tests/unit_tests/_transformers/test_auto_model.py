@@ -1739,6 +1739,8 @@ class TestBuildModelRetryDepth:
         build_kwargs["is_hf_model"] = False
         dummy_manager_cls = type("DummyManager", (), {})
         build_kwargs["model_wrapper"] = dummy_manager_cls()
+        model_ready_hooks = [object()]
+        build_kwargs["model_ready_hooks"] = model_ready_hooks
         sentinel_model = MagicMock()
         captured = {}
 
@@ -1763,6 +1765,7 @@ class TestBuildModelRetryDepth:
 
         assert captured["is_meta_device"] is False
         assert captured["weights_already_loaded"] is False
+        assert captured["model_ready_hooks"] is model_ready_hooks
 
 
 class TestNeMoAutoModelForMultimodalLM:

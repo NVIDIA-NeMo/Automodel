@@ -183,6 +183,7 @@ def build_model(
     distributed_setup: DistributedSetup | None = None,
     cfg_qat=None,
     unfreeze_modules: list[str] | None = None,
+    model_ready_hooks=None,
     sdpa_method: list[str] | None = None,
     device_mesh=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
@@ -199,6 +200,7 @@ def build_model(
         distributed_setup: Resolved distributed topology and policy object.
         cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
         unfreeze_modules: List of module names/substrings to unfreeze.
+        model_ready_hooks: Config-instantiable hooks to run before distributed wrapping.
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
@@ -208,6 +210,7 @@ def build_model(
         kwargs = {
             "has_packed_sequence": has_packed_sequence,
             "peft_config": cfg_peft,
+            "model_ready_hooks": model_ready_hooks,
             "sdpa_method": sdpa_method,
         }
         if distributed_setup is not None:
@@ -292,6 +295,7 @@ def build_model(
                 pretrained_model_name_or_path=None,
                 load_base_model=False,
                 cache_dir=hf_constants.HF_HUB_CACHE,
+                model_ready_hooks=model_ready_hooks,
             )
 
     # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
@@ -620,6 +624,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
             cfg_qat=self.cfg.get("qat", None),
+            model_ready_hooks=self.cfg.get("model_ready_hooks", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.embedding_row_repair_report = None

@@ -178,6 +178,7 @@ def build_model(
     cfg_compile=None,
     distributed_setup: DistributedSetup | None = None,
     cfg_quantization=None,
+    model_ready_hooks=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
@@ -185,10 +186,12 @@ def build_model(
         The instantiated model and optimizer.
     """
     with ScopedRNG(seed=seed, ranked=True):
+        target = cfg_model.get("_target_", None)
         # Build infrastructure kwargs
         kwargs = {
             "peft_config": cfg_peft,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
+            "model_ready_hooks": model_ready_hooks,
         }
         if distributed_setup is not None:
             kwargs["distributed_setup"] = distributed_setup
@@ -204,7 +207,12 @@ def build_model(
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
-        if _is_recipe_target(cfg_model.get("_target_", None)):
+        if _is_recipe_target(target):
+            if model_ready_hooks and target not in _model_ready_hook_targets():
+                raise ValueError(
+                    "model_ready_hooks require a single-model NeMoAutoModel target; "
+                    f"composite target {target} must define its own pre-wrapping hook semantics"
+                )
             model = cfg_model.instantiate(**kwargs)
         else:
             raise ValueError(
@@ -212,9 +220,21 @@ def build_model(
                 "Add the entrypoint to `_accepted_targets()` in this module "
                 "if you're onboarding a new wrapper that absorbs the recipe's "
                 "infrastructure kwargs. "
-                f"Got model target: {cfg_model.get('_target_', None)}"
+                f"Got model target: {target}"
             )
     return model
+
+
+def _model_ready_hook_targets() -> set:
+    """Return single-model entrypoints that can run hooks before distributed wrapping."""
+    return {
+        NeMoAutoModelForCausalLM.from_pretrained,
+        NeMoAutoModelForCausalLM.from_config,
+        NeMoAutoModelForImageTextToText.from_pretrained,
+        NeMoAutoModelForImageTextToText.from_config,
+        NeMoAutoModelForMultimodalLM.from_pretrained,
+        NeMoAutoModelForMultimodalLM.from_config,
+    }
 
 
 def _accepted_targets() -> set:
@@ -235,14 +255,7 @@ def _accepted_targets() -> set:
     requires the optional ``transformers.models.gemma4_assistant`` module
     that ships with ``transformers>=5.8.0.dev``.
     """
-    accepted = {
-        NeMoAutoModelForCausalLM.from_pretrained,
-        NeMoAutoModelForCausalLM.from_config,
-        NeMoAutoModelForImageTextToText.from_pretrained,
-        NeMoAutoModelForImageTextToText.from_config,
-        NeMoAutoModelForMultimodalLM.from_pretrained,
-        NeMoAutoModelForMultimodalLM.from_config,
-    }
+    accepted = _model_ready_hook_targets()
     try:
         from nemo_automodel.components.models.gemma4_drafter.composite import (
             Gemma4WithDrafter,
@@ -541,6 +554,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
+            model_ready_hooks=self.cfg.get("model_ready_hooks", None),
         )
         capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
         _validate_cp_vision_frame_sharding_support(capability_model, self.cp_vision_frame_sharding)
