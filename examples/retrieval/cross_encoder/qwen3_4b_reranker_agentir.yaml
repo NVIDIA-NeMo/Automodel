@@ -48,7 +48,7 @@
 # 25.8 / 24.7 / 24.8 / 24.8 over 2,000 rows. The draw is a hash of
 # (drop_seed, epoch, field, query), so it is identical across runs, workers and ranks.
 #
-# VALIDATION SPLIT. validation_group_key: global_query holds every sub-query of one
+# VALIDATION SPLIT. validation_group_key: global_qid holds every sub-query of one
 # originating question on the same side of the split. Keying on query_id instead would place
 # sibling sub-queries of the same question on opposite sides, which leaks.
 #
@@ -92,7 +92,7 @@ dataset:
   data_type: train
   # Held out by group so every row of a query lands on one side.
   validation_fraction: 0.1
-  validation_group_key: global_query
+  validation_group_key: global_qid
   reasoning_column: reasoning
   global_query_column: global_query
   do_shuffle: false
@@ -121,7 +121,7 @@ validation_dataset:
   n_passages: 8
   data_type: validation
   validation_fraction: 0.1
-  validation_group_key: global_query
+  validation_group_key: global_qid
   reasoning_column: reasoning
   global_query_column: global_query
   seed: 42
