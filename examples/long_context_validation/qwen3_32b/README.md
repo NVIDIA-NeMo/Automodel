@@ -127,4 +127,73 @@ NPROC_PER_NODE=16 NUM_THREADS=5 bash <ckpt>/epoch_0_step_<N>/model/consolidate.s
 _Training / validation loss curve (wandb):
 <https://wandb.ai/Nemo-automodel/long_context_validation_qwen3_32b/workspace?nw=nwuserathittenaman>._
 
-## Phase 3 — SWE-bench Verified evaluation — *next*
+## Phase 3 — SWE-bench Verified evaluation
+
+### Goal
+
+Does CoderForge SFT lift Qwen3-32B's **SWE-bench Verified** resolve rate above the base?
+Qwen3-32B already tool-calls, so the base already resolves ~18% — the question is whether
+SFT gives a real **uplift**. Uses the shared, model-agnostic [`../eval/`](../eval) harness
+(see its [README](../eval/README.md) for how it works); this page only adds the Qwen3
+knobs and results.
+
+### Scaffold
+
+Same 3-tool OpenHands agent (`execute_bash` / `str_replace_editor` / `finish`) over vLLM +
+Docker-less enroot, graded locally with the official `swebench` spec. Two Qwen3 specifics:
+it emits **hermes**-style tool calls (`<tool_call>{...}</tool_call>`) and runs with its
+native **thinking** mode on. Serve base and SFT identically so the delta is the model.
+
+### Steps (from `../eval/`)
+
+```bash
+bash setup_eval_tooling.sh                    # one-time: venv + agent + swebench
+SUBSET=verified sbatch prewarm_images.sub     # pre-import instance images once (CPU)
+
+# Serve each checkpoint + run the agent -> preds.json (one 8-GPU node, TP=4 x DP=2).
+# MODEL = a *consolidated* HF ckpt dir; NOPARSER=1 + thinking-on (see Note).
+RUN_TAG=qwen3_base NAME=qwen3 MODEL=<base Qwen/Qwen3-32B> \
+  SLICE=0:500 SUBSET=verified NOPARSER=1 MAX_TOKENS=16384 TP=4 DP=2 WORKERS=16 \
+  OH3_ENABLE_THINKING=1 OH3_TEMPERATURE=0.6 sbatch --gpus-per-node=8 openhands3_run.sub
+RUN_TAG=qwen3_sft  NAME=qwen3 MODEL=<CoderForge-SFT consolidated> \
+  SLICE=0:500 SUBSET=verified NOPARSER=1 MAX_TOKENS=16384 TP=4 DP=2 WORKERS=16 \
+  OH3_ENABLE_THINKING=1 OH3_TEMPERATURE=0.6 sbatch --gpus-per-node=8 openhands3_run.sub
+
+# Grade both (SUBSET must match; confirm enroot-errs=0 before trusting a 0.0 resolve)
+PREDS=<runs>/qwen3_base/preds.json SUBSET=verified RUN_TAG=grade_qwen3_base sbatch grade_enroot.sub
+PREDS=<runs>/qwen3_sft/preds.json  SUBSET=verified RUN_TAG=grade_qwen3_sft  sbatch grade_enroot.sub
+```
+
+### Note
+
+**1. Why `NOPARSER=1` (not `PARSER=hermes`):** Qwen3 emits hermes `<tool_call>{...}</tool_call>`
+calls, but vLLM's built-in `hermes` parser does a *strict* `json.loads` that chokes on control
+characters in code arguments and silently dropped ~1,873 calls. `NOPARSER=1` routes the raw text
+to `content`, where `oh3_run.py`'s `parse_hermes_tool_calls` (`json.loads(strict=False)`) recovers
+them.
+
+**2. Thinking-on:** `OH3_ENABLE_THINKING=1` + `OH3_TEMPERATURE=0.6` turn on Qwen3's native
+`<think>` reasoning (Qwen3's recommended thinking sampling). This was the biggest lever — it
+lifted the **base** from 10.8% → **18.2%** on the full 500.
+
+**3. Serving:** one 8-GPU node, `TP=4 × DP=2` (2 replicas), `MAX_TOKENS=16384` (thinking needs
+headroom). Point `MODEL` at a **consolidated** HF checkpoint (Phase 2's `consolidate.sh`); if the
+SFT dir lacks the tokenizer / chat-template files, copy them from `Qwen/Qwen3-32B` before serving.
+
+### Result — CoderForge SFT lifts the resolve rate
+
+Base vs the CoderForge-SFT (gentler `lr 5e-6`) checkpoints, same harness, all 500 Verified:
+
+| Checkpoint | Resolved / 500 | Resolve rate |
+|---|---|---|
+| Base `Qwen3-32B` (thinking-on) | 91 | **18.2%** |
+| SFT step 99  | 109 | 21.8% |
+| SFT step 199 | 100 | 20.0% |
+| SFT step 299 | 109 | 21.8% |
+| SFT step 399 | 120 | 24.0% |
+| **SFT step 499** | **122** | **24.4%** |
+
+CoderForge SFT lifts Qwen3-32B **+6.2 points** (18.2% → 24.4%) — a real SWE-bench gain, and the
+gentler LR kept improving through the early checkpoints (the goal of this long-context CP-SFT
+validation). _(A first `lr 1e-5` run peaked then regressed, which is why the recipe uses `5e-6`.)_
+

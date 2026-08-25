@@ -89,8 +89,10 @@ A tool call is only usable if something parses the model's raw text into a struc
   `PARSER=hermes` for a Qwen3-it checkpoint that emits `<tool_call>{...}</tool_call>`.
 - **`NOPARSER=1`**: disable the parser (sets `tool_choice=none`) so raw `call:name{...}`
   reaches `content`, where `oh3_run.py`'s `json.loads`/hermes fallbacks recover the call.
-  Use this for checkpoints whose args don't match any built-in parser — e.g. the
-  **gemma4 base / base-SFT** emit JSON-prior args that vLLM's `gemma4` parser mangles.
+  Use this when a built-in parser drops or mangles the args — e.g. **gemma4 base / base-SFT**
+  emit JSON-prior args the `gemma4` parser corrupts, and **Qwen3** uses `NOPARSER=1` because
+  the strict `hermes` parser drops calls with control chars in code args (its lenient
+  `parse_hermes_tool_calls` fallback recovers them). See the per-model pages.
 
 Serve base vs SFT (or any two checkpoints you compare) **identically** so the delta
 reflects the model, not the serving config.
