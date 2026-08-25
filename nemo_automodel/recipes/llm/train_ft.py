@@ -1153,8 +1153,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_buffer.append(local_loss.clone().detach())
         else:
             model = self.model_parts[0]
-            grad_ctx = nullcontext() if is_train else torch.no_grad()
-            with train_ctx(), fp8_ctx, grad_ctx:
+            with train_ctx(), fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory

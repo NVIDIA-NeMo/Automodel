@@ -342,8 +342,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
-                # Materialize the optimizer window so the eager Engine and PP
-                # token normalization both use its actual number of batches.
+                # Materialize the optimizer window: num_label_tokens must be
+                # all-reduced before the first forward.
                 batches = [next(dataloader_iter) for _ in range(ga_steps)]
                 num_label_tokens = sum((batch["labels"] != -100).sum().item() for batch in batches)
                 num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
@@ -351,15 +351,15 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 loss_buffer = []
                 if self.pp_enabled:
                     self._set_moe_aux_loss_backward_scale(
-                        num_batches=len(batches),
+                        num_batches=ga_steps,
                         num_label_tokens=num_label_tokens,
                     )
                     prepare_for_grad_accumulation(self.model_parts, pp_enabled=True)
                 else:
-                    self.engine.set_gradient_accumulation_steps(len(batches))
+                    self.engine.set_gradient_accumulation_steps(ga_steps)
 
                 for ga_step_idx, batch in enumerate(batches):
-                    if self.pp_enabled and ga_step_idx == len(batches) - 1:
+                    if self.pp_enabled and ga_step_idx == ga_steps - 1:
                         prepare_for_final_backward(self.model_parts, pp_enabled=True)
 
                     torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
@@ -370,7 +370,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                             batch,
                             loss_buffer=loss_buffer,
                             num_label_tokens=num_label_tokens,
-                            num_batches=len(batches),
+                            num_batches=ga_steps,
                             is_train=True,
                         )
 
@@ -382,9 +382,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     if not self.pp_enabled:
                         if self.engine.is_gradient_accumulation_boundary():
                             self.checkpointer.maybe_wait_for_staging()
-                            with self.timers("optimizer", log_level=2):
-                                self.engine.step()
-                        else:
+                        with self.timers("optimizer", log_level=2):
                             self.engine.step()
 
                 if self.pp_enabled:

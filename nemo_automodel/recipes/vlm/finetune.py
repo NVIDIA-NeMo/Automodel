@@ -28,7 +28,7 @@ except ImportError:
 import logging
 import pathlib
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Protocol
 
 import mlflow
@@ -971,8 +971,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             loss_buffer.append(local_loss.clone().detach())
         else:
             model = self.model_parts[0]
-            grad_ctx = nullcontext() if is_train else torch.no_grad()
-            with self._cp_vision_frame_sharding_context(), train_ctx(), grad_ctx:
+            with self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1073,6 +1072,48 @@ class FinetuneRecipeForVLM(BaseRecipe):
             grad_reduce_group=self._get_dp_group(include_cp=True),
         )
 
+    def _step_pipeline_optimizer(self, *, num_label_tokens: int, max_grad_norm: float | None) -> torch.Tensor | float:
+        """Finalize pipeline gradients and perform one complete optimizer update."""
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm=max_grad_norm,
+            model_parts=self.model_parts,
+            norm_type=2.0,
+            pp_enabled=True,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name="pp",
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+        )
+
+        self.checkpointer.maybe_wait_for_staging()
+        for optimizer in self.optimizer:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+            for model_part in self.model_parts:
+                model_part.update_moe_gate_bias()
+
+        if self.lr_scheduler is not None:
+            for scheduler in self.lr_scheduler:
+                scheduler.step(1)
+
+        fp8_config = self.cfg.get("fp8", None)
+        if (
+            fp8_config is not None
+            and fp8_config.get("enabled", False)
+            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
+            and self.device_mesh is not None
+            and self.device_mesh["dp_shard"].size() > 1
+        ):
+            precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
+
+        return grad_norm
+
     def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
@@ -1117,43 +1158,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.engine.step()
 
         if self.pp_enabled:
-            grad_norm = scale_grads_and_clip_grad_norm(
-                max_grad_norm=max_grad_norm,
-                model_parts=self.model_parts,
-                norm_type=2.0,
-                pp_enabled=True,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-                pp_axis_name="pp",
-                foreach=True,
+            grad_norm = self._step_pipeline_optimizer(
                 num_label_tokens=num_label_tokens,
-                dp_group_size=self._get_dp_group_size(include_cp=True),
-                expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+                max_grad_norm=max_grad_norm,
             )
-
-            self.checkpointer.maybe_wait_for_staging()
-            for opt in self.optimizer:
-                opt.step()
-                opt.zero_grad(set_to_none=True)
-
-            if hasattr(self.model_parts[0], "update_moe_gate_bias"):
-                for mp in self.model_parts:
-                    mp.update_moe_gate_bias()
-
-            if self.lr_scheduler is not None:
-                for scheduler in self.lr_scheduler:
-                    scheduler.step(1)
-
-            fp8_config = self.cfg.get("fp8", None)
-            if (
-                fp8_config is not None
-                and fp8_config.get("enabled", False)
-                and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
-                and self.device_mesh is not None
-                and self.device_mesh["dp_shard"].size() > 1
-            ):
-                precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
         else:
             grad_norm = self.engine.get_global_grad_norm()
 
@@ -1237,9 +1245,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.engine(logits_to_keep=1, **batch)
+                        out = self.model_parts[0](logits_to_keep=1, **batch)
                     else:
-                        out = self.engine(**batch)
+                        out = self.model_parts[0](**batch)
                     local_loss = calculate_loss(
                         self.loss_fn,
                         logits=getattr(out, "logits", out),

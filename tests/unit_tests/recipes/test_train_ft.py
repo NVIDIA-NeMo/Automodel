@@ -50,32 +50,7 @@ from nemo_automodel.recipes.llm.train_ft import (
 )
 
 
-class _RecipeEngineStub:
-    """Minimal raw-forward Engine stand-in for recipe unit tests."""
-
-    def __init__(self, module, *, optimizer=None, grad_norm=0.0):
-        self.module = module
-        self.optimizer = optimizer
-        self.grad_norm = grad_norm
-        self.gradient_accumulation_steps = None
-
-    def __call__(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-
-    def backward(self, loss, *, scale_wrt_gas=False):
-        del scale_wrt_gas
-        loss.backward()
-
-    def step(self):
-        if self.optimizer is not None:
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-    def get_global_grad_norm(self):
-        return self.grad_norm
-
-    def set_gradient_accumulation_steps(self, steps):
-        self.gradient_accumulation_steps = steps
+from tests.unit_tests.recipes.engine_stub import RecipeEngineStub as _RecipeEngineStub
 
 
 def test_recipe_config_resolves_mfu_settings():
@@ -1201,9 +1176,6 @@ def test_setup_pipeline_matrix(
     parts[0]._pp_return_hidden_states_supported = True
     if pipeline_thd_kind == "native":
         parts[0].supports_thd = True
-    elif pipeline_thd_kind == "stock_hf":
-        parts[0]._te_attention_injected = True
-        parts[0].forward = MagicMock()
     pipeline = DummyAutoPipeline(
         parts=parts,
         pp_batch_size=local_batch_size,

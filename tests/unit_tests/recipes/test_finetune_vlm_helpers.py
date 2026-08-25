@@ -47,32 +47,7 @@ from nemo_automodel.recipes.vlm.finetune import (
 )
 
 
-class _RecipeEngineStub:
-    """Minimal raw-forward Engine stand-in for recipe unit tests."""
-
-    def __init__(self, module, *, optimizer=None, grad_norm=0.0):
-        self.module = module
-        self.optimizer = optimizer
-        self.grad_norm = grad_norm
-        self.gradient_accumulation_steps = None
-
-    def __call__(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-
-    def backward(self, loss, *, scale_wrt_gas=False):
-        del scale_wrt_gas
-        loss.backward()
-
-    def step(self):
-        if self.optimizer is not None:
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-
-    def get_global_grad_norm(self):
-        return self.grad_norm
-
-    def set_gradient_accumulation_steps(self, steps):
-        self.gradient_accumulation_steps = steps
+from tests.unit_tests.recipes.engine_stub import RecipeEngineStub as _RecipeEngineStub
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
