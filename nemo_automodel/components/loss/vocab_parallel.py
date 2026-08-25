@@ -48,8 +48,7 @@ def _shifted_local_logits(
     global vocabulary offset, and the vocabulary-shard mesh dimension.
     """
     shard_error = (
-        "logits must have exactly one Shard placement on the last vocabulary axis; "
-        f"got placements={logits.placements}"
+        f"logits must have exactly one Shard placement on the last vocabulary axis; got placements={logits.placements}"
     )
     vocab_mesh_dim = None
     for mesh_dim, placement in enumerate(logits.placements):

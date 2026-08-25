@@ -133,7 +133,6 @@ def _media_token_mismatch(input_ids, processor_inputs, processor) -> str | None:
     return None
 
 
-
 @dataclass
 class RdrDatasetConfig:
     """Construction-time configuration for the RDR dataset."""

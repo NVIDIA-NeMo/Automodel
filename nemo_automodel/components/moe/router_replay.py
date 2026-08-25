@@ -333,8 +333,7 @@ class RouterReplayAdapter:
                 gate.router_replay = replay
             if not isinstance(replay, RouterReplay):
                 raise TypeError(
-                    f"decoder block {layer_idx} router_replay must be RouterReplay or None, "
-                    f"got {type(replay).__name__}"
+                    f"decoder block {layer_idx} router_replay must be RouterReplay or None, got {type(replay).__name__}"
                 )
             if id(replay) in seen_replays:
                 raise ValueError("one RouterReplay handle is attached to more than one decoder block")

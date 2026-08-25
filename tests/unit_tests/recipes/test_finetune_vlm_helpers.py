@@ -45,8 +45,6 @@ from nemo_automodel.recipes.vlm.finetune import (
     _get_model_name,
     build_model,
 )
-
-
 from tests.unit_tests.recipes.engine_stub import RecipeEngineStub as _RecipeEngineStub
 
 
