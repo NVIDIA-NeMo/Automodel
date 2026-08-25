@@ -179,6 +179,7 @@ def test_attach_sets_metadata_keys_and_method():
         "_packed_seq_ids",
         "padding_mask",
         "_gemma4_vision_group_ids",
+        "_gemma4_has_vision_tokens",
     )
     assert module._cp_manual_metadata_seq_dims == {
         "mm_token_type_ids": 1,
@@ -782,6 +783,39 @@ def test_manual_attention_entry_sets_gqa_when_head_counts_differ(monkeypatch):
         kwargs={},
     )
     assert out.shape == q.shape
+
+
+def test_manual_attention_entry_promotes_rank_uniform_vision_flag(monkeypatch):
+    module = _flex_module(sliding_window=4, use_bidirectional_attention="vision")
+    module._cp_manual_metadata = {
+        "_gemma4_vision_group_ids": torch.zeros(1, 4, dtype=torch.long),
+        "_gemma4_has_vision_tokens": True,
+    }
+    q = torch.randn(1, 2, 4, 8)
+    cp_mesh = SimpleNamespace(get_group=lambda: object(), size=lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    captured = {}
+
+    def fake_run(attention_module, ctx):
+        captured["ctx"] = ctx
+        return ctx.query
+
+    monkeypatch.setattr(cpa, "_run_gemma4_cp_ring_attention", fake_run)
+    cpa._gemma4_cp_manual_attention(
+        module,
+        q,
+        q.clone(),
+        q.clone(),
+        cp_mesh=cp_mesh,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=True,
+        scale=None,
+        enable_gqa=False,
+        kwargs={},
+    )
+    assert captured["ctx"].use_vision_bidirectional is True
+    assert "_gemma4_has_vision_tokens" not in captured["ctx"].metadata
 
 
 # ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ import logging
 import math
 import os
 import random
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -132,7 +132,7 @@ class FlowMatchingPipeline:
         # Logging
         log_interval: int = 100,
         summary_log_interval: int = 10,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ):
         """
         Initialize the FlowMatching pipeline.
@@ -220,7 +220,7 @@ class FlowMatchingPipeline:
     def sample_timesteps(
         self,
         batch_size: int,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, str]:
         """
         Sample timesteps and compute sigma values with flow shift.
@@ -324,8 +324,8 @@ class FlowMatchingPipeline:
         model_pred: torch.Tensor,
         target: torch.Tensor,
         sigma: torch.Tensor,
-        batch: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        batch: Dict[str, Any] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Compute flow matching loss with optional weighting.
 
@@ -377,7 +377,7 @@ class FlowMatchingPipeline:
         global_step: int = 0,
         collect_metrics: bool = True,
         check_loss: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, Dict[str, Any]]:
         """
         Execute a single training step with flow matching.
 
@@ -653,7 +653,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
 
 def create_pipeline(
     adapter_type: str,
-    adapter_kwargs: Optional[Dict[str, Any]] = None,
+    adapter_kwargs: Dict[str, Any] | None = None,
     **pipeline_kwargs,
 ) -> FlowMatchingPipeline:
     """

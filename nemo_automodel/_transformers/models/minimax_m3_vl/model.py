@@ -397,6 +397,12 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # the standard CP path (mask-strip hook + is_causal); sparse layers require the
     # CP-aware indexer attention for a correct global-sequence bias.
     _supports_cp_sdpa = True
+    # MiniMaxM3CPSparseAttention derives per-document ids from the packed position ids
+    # and builds its own block mask, so packing needs no packing-aware attention backend.
+    _owns_packed_attention = True
+    # The same attention shards the packed sequence in forward and carries the document
+    # boundaries into every layer, so it owns the packed CP path end to end.
+    _owns_cp_attention = True
     # The state-dict adapter fully populates every tensor from the checkpoint
     # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
     # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.

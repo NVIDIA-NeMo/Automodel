@@ -713,6 +713,7 @@ class TestGemma4ForConditionalGeneration:
         torch.testing.assert_close(prepared["inputs_embeds"][:, 0, :], base_embeds[:, 0, :])
         torch.testing.assert_close(prepared["inputs_embeds"][:, 1, :], image_features)
         torch.testing.assert_close(prepared["inputs_embeds"][:, 2:, :], base_embeds[:, 2:, :])
+        assert prepared["_gemma4_has_vision_tokens"] is True
 
     def test_dense_cp_forward_calls_text_model_with_inputs_embeds(self, dense_config, backend_config, device):
         model = Gemma4ForConditionalGeneration(dense_config, backend=backend_config)

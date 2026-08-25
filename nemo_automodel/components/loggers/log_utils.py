@@ -18,7 +18,7 @@ import sys
 import warnings
 from functools import partial
 from logging import Filter, LogRecord
-from typing import Callable, Optional, Union
+from typing import Callable, Union
 
 # Pydantic v2 emits UnsupportedFieldAttributeWarning for Field(repr=...) /
 # Field(frozen=...) used inside 3.12-style `type` aliases in third-party libs.
@@ -166,7 +166,7 @@ def _ensure_root_handler_with_formatter(formatter: logging.Formatter) -> None:
 
 def setup_logging(
     logging_level: int = logging.INFO,
-    modules_to_filter: Optional[list[str]] = None,
+    modules_to_filter: list[str] | None = None,
     set_level_for_all_loggers: bool = False,
 ) -> None:
     """

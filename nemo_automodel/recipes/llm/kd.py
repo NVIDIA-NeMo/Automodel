@@ -42,7 +42,7 @@ import logging
 import time
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import wandb
@@ -781,7 +781,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             else:
                 loss_buffer.append(torch.tensor(0.0, device=self.dist_env.device))
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
         Args:
@@ -882,7 +882,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             },
         )
 
-    def _run_train_optim_step_pp(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step_pp(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step when pipeline parallelism is enabled."""
         num_label_tokens = torch.tensor(sum((b["labels"] != -100).sum().item() for b in batches), dtype=torch.long)
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()

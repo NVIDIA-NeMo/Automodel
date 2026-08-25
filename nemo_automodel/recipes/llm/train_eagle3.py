@@ -214,39 +214,65 @@ def _validate_cp_gates(
     target_attn_implementation: str | None = None,
     seq_length: int | None = None,
     cp_zigzag: bool = False,
+    cp_mode: str = "ring",
 ) -> None:
-    """Reject context-parallel combinations the EAGLE-3 target path cannot honor.
+    """Reject context-parallel combinations the EAGLE-3 path cannot honor.
 
-    CP shards the target forward along the sequence and forces ``is_causal`` (the
-    self_attn hooks strip the attention_mask), so it is incompatible with sequence
-    packing (which needs the 4D block-causal mask) and with the remote backend
-    (whose target runs out-of-process). Under CP the frozen target must route
-    through HuggingFace ``F.scaled_dot_product_attention`` -- that is the call the
-    K/V-gather hook intercepts -- and the draft runs the flash-attn ring, so all of
-    the target-backend / kernel / divisibility preconditions are checked here so a
-    misconfig fails at setup rather than mid-forward.
+    Two CP compute modes are supported for the draft:
+
+    * ``"ring"`` shards the frozen target too and forces ``is_causal`` (the
+      self_attn K/V-gather hook strips the attention_mask), so it is incompatible
+      with sequence packing (which needs the 4D block-causal mask); it pins the
+      flash-attn 2.8.x ring kernels and needs the HF-SDPA target so the hook can
+      intercept ``F.scaled_dot_product_attention``.
+    * ``"ulysses"`` runs the draft attention as an all-to-all over the full
+      (gathered) sequence, so it composes with packing and leaves the target on its
+      normal forward -- only sequence divisibility by ``cp_size`` applies.
+
+    The remote backend is unsupported under CP in either mode (the target runs
+    out-of-process). Preconditions are checked here so a misconfig fails at setup
+    rather than mid-forward.
     """
-    if cp_size > 1 and backend == "remote":
+    if cp_size <= 1:
+        return
+    if cp_mode not in ("ring", "ulysses"):
+        raise ValueError(f"Unknown cp_mode={cp_mode!r}; expected 'ring' or 'ulysses'.")
+    if backend == "remote":
         raise NotImplementedError(
             "Context parallelism (cp_size>1) is only supported with the colocated target "
             "backend; the remote backend runs the target out-of-process."
         )
-    if cp_size > 1 and packed_sequence_size > 0:
+    if cp_mode == "ulysses":
+        if cp_zigzag:
+            raise NotImplementedError(
+                "cp_zigzag is a ring-only sharding layout; set cp_zigzag=false for "
+                "cp_mode=ulysses (the all-to-all path is inherently load-balanced)."
+            )
+        # Ulysses reuses the ring's flash-attn dense/varlen private kernels, pinned to
+        # the 2.8.x positional signature, so require that exact version (not just import).
+        from nemo_automodel.components.speculative.eagle.ring_attention import require_flash_attn_version
+
+        require_flash_attn_version()
+        if seq_length is not None and seq_length % cp_size != 0:
+            raise ValueError(
+                f"Context parallelism (ulysses) requires seq_length ({seq_length}) divisible by cp_size ({cp_size})."
+            )
+        return
+    # ring mode
+    if packed_sequence_size > 0:
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) is not yet supported with sequence packing; CP "
-            "strips the 4D block-causal mask that packing relies on. Set cp_size=1 or "
+            "Context parallelism cp_mode=ring is not supported with sequence packing; the ring is "
+            "single-document causal. Use cp_mode=ulysses for CP + packing, or set cp_size=1 / "
             "packed_sequence_size=0."
         )
-    if cp_size <= 1:
-        return
     if not target_force_hf:
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+            "Context parallelism (cp_mode=ring) requires recipe_args.target_force_hf=true so the "
             "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
         )
     if target_attn_implementation != "sdpa":
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa. "
+            "Context parallelism (cp_mode=ring) requires recipe_args.target_attn_implementation=sdpa. "
             "The K/V-gather hook intercepts F.scaled_dot_product_attention; any other backend "
             "(e.g. flash_attention_2, the HF auto-select default when flash-attn is installed) "
             "bypasses the hook, so each rank silently attends only its own shard."
@@ -526,6 +552,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # from device_mesh when a colocated target builds one (None otherwise).
         self.cp_mesh = None
         self.dp_mesh = None
+        # CP compute mode for the draft: "ring" (default) or "ulysses" (all-to-all,
+        # composes with sequence packing). Set from config in _setup_online_target.
+        self.cp_mode = "ring"
         if self.cached_target_path is None:
             selected_token_ids, selected_token_mask = self._setup_online_target(
                 recipe_cfg, target_path, draft_base_config
@@ -658,7 +687,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if self.cp_group is not None:
                 from nemo_automodel.components.speculative.eagle.draft_llama import attach_eagle3_cp_attention
 
-                attach_eagle3_cp_attention(self.draft_model, self.cp_group, zigzag=self.cp_zigzag)
+                if self.cp_mode == "ulysses":
+                    n_heads = self.draft_model.config.num_attention_heads
+                    if n_heads % self.cp_mesh.size() != 0:
+                        raise ValueError(
+                            f"cp_mode=ulysses requires the draft num_attention_heads ({n_heads}) divisible by "
+                            f"cp_size ({self.cp_mesh.size()}); the all-to-all splits heads across cp ranks."
+                        )
+                attach_eagle3_cp_attention(self.draft_model, self.cp_group, mode=self.cp_mode, zigzag=self.cp_zigzag)
             trainer_module = Eagle3TrainerModule(
                 self.draft_model,
                 selected_token_ids=selected_token_ids,
@@ -976,6 +1012,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # submeshes are only built later, inside the colocated path).
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
+        self.cp_mode = recipe_cfg.get("cp_mode", "ring")
         _validate_cp_gates(
             cp_size,
             backend,
@@ -984,6 +1021,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             target_attn_implementation=recipe_cfg.get("target_attn_implementation", None),
             seq_length=int(recipe_cfg.get("seq_length", 0) or 0) or None,
             cp_zigzag=bool(recipe_cfg.get("cp_zigzag", False)),
+            cp_mode=self.cp_mode,
         )
         _validate_tp_gates(tp_size, backend, cp_size)
         # ``draft_base_config`` is None on the paths that never build a draft
@@ -1101,10 +1139,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # the draft trainer module). Mark the parameters explicitly so no future
         # code path accidentally trains the target -- matching EAGLE-1/2.
         self.target_model.requires_grad_(False)
+        # Ulysses CP shards only the draft (via the all-to-all attention): the target
+        # runs its normal full-sequence forward (block-causal under packing) and
+        # _maybe_shard_cp slices the gathered hidden states to the draft's shard. Ring
+        # CP instead shards the target here (cp_mesh drives run_target_cp_forward_and_gather).
+        target_cp_mesh = None if self.cp_mode == "ulysses" else self.cp_mesh
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
-            cp_mesh=self.cp_mesh,
+            cp_mesh=target_cp_mesh,
         )
 
     def _load_kimi_k3_target(self, recipe_cfg, target_path, text_config):
@@ -1317,10 +1360,20 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """Shard the draft supervision along the sequence for context parallelism.
 
         The target emits full-sequence aux/logits (gathered); the draft runs sharded,
-        so gather every ``[B, S, ...]`` tensor to this rank's cp shard (via a global
-        index) and inject the matching global ``position_ids``. The index is the
-        contiguous shard by default, or the load-balanced zig-zag layout (rank ``r``
-        owns chunks ``r`` and ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+        so every ``[batch, sequence, ...]`` tensor in ``inputs`` is index-selected to
+        this rank's cp shard (via a global index). Non-packed runs then get global
+        ``position_ids`` (the shard's indices); packed runs keep their sliced
+        per-document ``position_ids``. The index is the contiguous shard by default,
+        or the load-balanced zig-zag layout (rank ``r`` owns chunks ``r`` and
+        ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+
+        Args:
+            inputs: Trainer-input mapping; tensor values shaped
+                ``[batch, sequence, ...]`` (matching the full sequence length) are
+                sharded along the sequence axis, others pass through unchanged.
+
+        Returns:
+            The same mapping with sequence-length tensors replaced by their cp shard.
         """
         if getattr(self, "cp_group", None) is None:
             return inputs
@@ -1356,7 +1409,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
             for k, v in inputs.items()
         }
-        out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
+        # Synthesize position_ids only when the caller did not supply them: the
+        # non-packed path has none, so the shard's global indices are its positions.
+        # The packed path carries per-document position_ids (reset at each document
+        # boundary), already sliced to this shard above; overwriting them with a
+        # global arange would corrupt the packed RoPE.
+        if "position_ids" not in out:
+            out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
         return out
 
     def _all_reduce_draft_grads_over_cp(self) -> None:

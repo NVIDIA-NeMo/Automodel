@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -73,8 +73,8 @@ class Gemma4JointOutput:
     logits: torch.Tensor
     drafter_logits: list[torch.Tensor] = field(default_factory=list)
     drafter_loss_weight: float = 1.0
-    hidden_states: Optional[tuple] = None
-    loss: Optional[torch.Tensor] = None
+    hidden_states: tuple | None = None
+    loss: torch.Tensor | None = None
 
 
 class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
@@ -224,20 +224,20 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
     @classmethod
     def from_pretrained(
         cls,
-        base_path: Optional[str] = None,
-        drafter_path: Optional[str] = None,
+        base_path: str | None = None,
+        drafter_path: str | None = None,
         *,
-        pretrained_model_name_or_path: Optional[str] = None,
+        pretrained_model_name_or_path: str | None = None,
         drafter_loss_weight: float = 1.0,
         drafter_num_steps: int = 1,
         freeze_base_for_drafter: bool = False,
         share_embedding_with_base: bool = False,
         base_activation_checkpointing: bool = False,
         torch_dtype: Any = None,
-        attn_implementation: Optional[str] = None,
-        use_liger_kernel: Optional[bool] = None,
-        use_sdpa_patching: Optional[bool] = None,
-        text_config: Optional[dict] = None,
+        attn_implementation: str | None = None,
+        use_liger_kernel: bool | None = None,
+        use_sdpa_patching: bool | None = None,
+        text_config: dict | None = None,
         peft_config: Any = None,
         device_mesh: Any = None,
         moe_mesh: Any = None,
@@ -245,7 +245,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         pipeline_config: Any = None,
         distributed_setup: Any = None,
         freeze_config: Any = None,
-        cache_dir: Optional[str] = None,
+        cache_dir: str | None = None,
         **kwargs,
     ) -> "Gemma4WithDrafter":
         """Build the composite by loading base and drafter via the NeMoAuto paths.
@@ -427,9 +427,9 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
     # ------------------------------------------------------------------
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> Gemma4JointOutput:
         """Joint forward: base first, then drafter consuming the base's outputs.
@@ -506,7 +506,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         # KV cache rather than building its own. ``position_ids`` and the
         # token-side ``attention_mask`` are likewise constant across rounds.
         drafter_logits_list: list[torch.Tensor] = []
-        prev_last_hidden_state: Optional[torch.Tensor] = None
+        prev_last_hidden_state: torch.Tensor | None = None
         for k in range(self.drafter_num_steps):
             if k == 0:
                 embed_k = base_embed_layer(input_ids)
@@ -581,7 +581,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
     def save_pretrained(
         self,
         save_directory: str,
-        checkpointer: Optional["Checkpointer"] = None,
+        checkpointer: "Checkpointer" | None = None,
         tokenizer: Any = None,
         **kwargs,
     ) -> None:
@@ -621,7 +621,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
     def load_pretrained(
         self,
         load_directory: str,
-        checkpointer: Optional["Checkpointer"] = None,
+        checkpointer: "Checkpointer" | None = None,
         **kwargs,
     ) -> None:
         """Load weights from the two-subdir layout written by ``save_pretrained``.

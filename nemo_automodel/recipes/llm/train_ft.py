@@ -32,7 +32,7 @@ import pathlib
 import time
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import mlflow
 import torch
@@ -52,7 +52,6 @@ from nemo_automodel._transformers.infrastructure import (
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
-from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
@@ -151,7 +150,8 @@ def _should_pack_validation(
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
     """Return whether the recipe should attach PP causal-mask precomputation."""
-    return getattr(model_config, "model_type", None) != "deepseek_v4"
+    # TODO: Replace model-type exceptions with a shared mask-ownership capability.
+    return getattr(model_config, "model_type", None) not in ("deepseek_v4", "glm_moe_dsa")
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
@@ -353,7 +353,7 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
     """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``.
 
     ``None`` when PP is disabled, the model config can't be loaded, or the model
-    computes masks internally (e.g. ``deepseek_v4``).  Passed to
+    computes masks internally (e.g. ``deepseek_v4`` or ``glm_moe_dsa``).  Passed to
     :meth:`DataloaderConfig.build` as ``collate_wrapper``.
     """
     if not pp_enabled:
@@ -777,7 +777,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for mp in self.model_parts:
                 enable_load_balance_tracking(mp)
 
-        self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
+        self.mfu_calculator = self.cfg.mfu.build(model=self.model_parts[0])
 
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)
@@ -1192,7 +1192,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
         Args:
@@ -1302,7 +1302,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 step_flops = self._dp_allreduce(
                     torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
                 ).item()
-                mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
+                mfu = calculate_mfu(
+                    step_flops / 1e12,
+                    self.dist_env.world_size,
+                    time_delta,
+                    reference_mfu=mfu_calculator.reference_mfu,
+                )
 
         reporting_loss = torch.sum(torch.stack(loss_buffer))
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)

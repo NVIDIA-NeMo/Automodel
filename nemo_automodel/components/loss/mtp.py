@@ -14,7 +14,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, Optional, overload
+from typing import Literal, overload
 
 import torch
 import torch.distributed as dist
@@ -333,10 +333,10 @@ class PipelineCausalLMLoss(nn.Module):
         self.ignore_index = ignore_index
         self.grad_reduce_group = grad_reduce_group
         # Legacy THD-pack fallback used when the model has no seq_idx tail.
-        self.cu_seqlens: Optional[torch.Tensor] = None
+        self.cu_seqlens: torch.Tensor | None = None
 
     @staticmethod
-    def _extract_seq_idx_tail(output) -> tuple[Optional[torch.Tensor], object]:
+    def _extract_seq_idx_tail(output) -> tuple[torch.Tensor | None, object]:
         """Detect and strip a trailing per-microbatch seq_idx from output.
 
         Convention: with MTP enabled the last-stage output is

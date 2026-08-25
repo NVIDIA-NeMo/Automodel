@@ -14,7 +14,7 @@
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -232,7 +232,7 @@ class Mistral4StateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional[DeviceMesh] = None,
+        device_mesh: DeviceMesh | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         state_dict = self._strip_prefix(hf_state_dict)
@@ -244,7 +244,7 @@ class Mistral4StateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
@@ -375,7 +375,7 @@ class Mistral4MultimodalStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional[DeviceMesh] = None,
+        device_mesh: DeviceMesh | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
@@ -394,7 +394,7 @@ class Mistral4MultimodalStateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:

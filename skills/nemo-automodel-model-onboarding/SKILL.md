@@ -178,7 +178,12 @@ Implement files in dependency order:
 2. **rope_utils.py** (if needed) -- RoPE implementation
 3. **layers.py** (if needed) -- Attention, MLP, decoder block classes
 4. **model.py** -- The main `ForCausalLM` (or `ForConditionalGeneration`) class
-5. **state_dict_adapter.py** -- HF weight conversion
+5. **state_dict_adapter.py** -- HF weight conversion. Leave
+   `supports_write_through_checkpoint_load` disabled unless every load
+   destination returned by `to_hf` writes through to final model storage for
+   every supported backend and configuration. Any opt-in needs a focused
+   write-through storage test; allocating conversions can otherwise create a
+   model-sized device temporary and cause an out-of-memory failure.
 6. **__init__.py** -- Re-export the main model class
 
 See the pattern files for detailed implementation guidance:
@@ -421,7 +426,8 @@ that only surface in a full parity comparison.
 - [ ] Implemented layers.py (if custom layers needed)
 - [ ] Implemented rope_utils.py (if custom RoPE needed)
 - [ ] Implemented model.py with `HFCheckpointingMixin`
-- [ ] Implemented state_dict_adapter.py
+- [ ] Implemented state_dict_adapter.py; any write-through opt-in proves writes reach model storage and reports
+  `False` for allocating variants
 - [ ] Implemented __init__.py with re-export
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
 - [ ] Registered custom config in `_CUSTOM_CONFIG_REGISTRATIONS` (if applicable)

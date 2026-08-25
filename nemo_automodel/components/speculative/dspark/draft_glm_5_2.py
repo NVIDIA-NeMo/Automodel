@@ -28,8 +28,6 @@ always dense, and GLM's sparse top-k machinery belongs to the target model, not
 this draft.
 """
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -59,7 +57,7 @@ def _glm_5_2_eager_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: torch.Tensor | None,
     scaling: float,
 ) -> torch.Tensor:
     """Dense eager attention over an additive mask (no GQA repeat, no sink).
@@ -148,9 +146,9 @@ class Glm5_2DSparkAttention(nn.Module):
         hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         freqs_cis: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         del kwargs
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden_states.shape[1]
@@ -201,13 +199,13 @@ class Glm5_2DSparkDecoderLayer(nn.Module):
 
     def forward(
         self,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[object] = None,
-        use_cache: Optional[bool] = False,
-        freqs_cis: Optional[torch.Tensor] = None,
+        target_hidden_states: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: object | None = None,
+        use_cache: bool | None = False,
+        freqs_cis: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del position_ids, past_key_value, use_cache, kwargs
@@ -366,8 +364,8 @@ class Glm5_2DSparkModel(nn.Module):
     def predict_confidence_step(
         self,
         hidden_states: torch.Tensor,
-        prev_token_ids: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+        prev_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         if self.confidence_head is None:
             return None
         if self.confidence_head_with_markov:
@@ -384,7 +382,7 @@ class Glm5_2DSparkModel(nn.Module):
         *,
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, proposal_len = base_logits.shape[:2]
         if proposal_len == 0:
@@ -410,7 +408,7 @@ class Glm5_2DSparkModel(nn.Module):
         *,
         prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert base_logits.ndim == 2, (
             f"sample_draft_token_step expects base_logits shaped [batch, vocab], got {tuple(base_logits.shape)}."
@@ -433,10 +431,10 @@ class Glm5_2DSparkModel(nn.Module):
         self,
         *,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        past_key_values: Optional[object] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden_states: torch.Tensor | None = None,
+        past_key_values: object | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -463,7 +461,7 @@ class Glm5_2DSparkModel(nn.Module):
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        target_last_hidden_states: Optional[torch.Tensor] = None,
+        target_last_hidden_states: torch.Tensor | None = None,
     ) -> DSparkForwardOutput:
         bsz, seq_len = input_ids.shape
         device = input_ids.device

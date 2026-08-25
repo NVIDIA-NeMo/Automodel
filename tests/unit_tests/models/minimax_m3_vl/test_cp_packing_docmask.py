@@ -79,3 +79,49 @@ def test_multi_batch_independent_docids():
     pos = torch.tensor([[0, 1, 0, 1], [0, 1, 2, 3]])  # batch row 0 packed (2 docs), row 1 single
     doc = cp_document_ids(pos)
     assert doc.tolist() == [[0, 0, 1, 1], [0, 0, 0, 0]]
+
+
+class TestPackedCpCapability:
+    """The packed-CP path this module tests must be visible to the capability gate.
+
+    ``_validate_cp_packing_support`` rejects CP + VLM sequence packing unless the
+    model advertises a packed-CP route. MiniMax M3 owns both halves -- it builds
+    its own per-document mask (above) and shards the packed sequence in ``forward``
+    -- so it must declare the flags that describe that, or a supported recipe such
+    as ``minimax_m3_vl_sft_tulu3_text_cp8_16k`` is refused before training starts.
+    """
+
+    def _supports_at_cp8(self, model):
+        """Build a capability view at the failing job's mesh (cp8/pp4/ep32).
+
+        Args:
+            model: Live MiniMax VLM instance; the caller must keep it referenced,
+                since ``ModelSupports`` only holds a weak reference to it.
+
+        Returns:
+            The ``ModelSupports`` view for that model at cp_size=8.
+        """
+        import types
+
+        from nemo_automodel._transformers.capabilities import ModelSupports
+
+        return ModelSupports(model, types.SimpleNamespace(cp_size=8, tp_size=1, pp_size=4, ep_size=32))
+
+    def test_declares_packed_and_cp_attention_ownership(self):
+        from nemo_automodel._transformers.models.minimax_m3_vl.model import (
+            MiniMaxM3SparseForConditionalGeneration,
+        )
+
+        assert MiniMaxM3SparseForConditionalGeneration._owns_packed_attention is True
+        assert MiniMaxM3SparseForConditionalGeneration._owns_cp_attention is True
+
+    def test_packed_cp_is_accepted_on_the_sdpa_backend(self, vlm_model):
+        """cp_size>1 with packing must be allowed, as the tulu3 cp8 recipe needs."""
+        from nemo_automodel.recipes.vlm.finetune import _validate_cp_packing_support
+
+        supports = self._supports_at_cp8(vlm_model)
+
+        assert supports.supports_sequence_packing is True
+        assert supports.supports_cp_with_sequence_packing is True
+        # The recipe-level gate that rejected the nemo-ci job must now pass.
+        _validate_cp_packing_support(supports, packing_enabled=True, cp_size=8)

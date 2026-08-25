@@ -51,7 +51,7 @@ class _NeMoAutoModelForRetrievalBase:
     from ``nemo_automodel.retrieval.modeling``.
     """
 
-    _ENCODER_CLS_NAME: Optional[str] = None  # "BiEncoderModel" or "CrossEncoderModel"
+    _ENCODER_CLS_NAME: str | None = None  # "BiEncoderModel" or "CrossEncoderModel"
 
     @classmethod
     def from_pretrained(
@@ -60,12 +60,12 @@ class _NeMoAutoModelForRetrievalBase:
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: List[SDPBackend] | None = None,
         torch_dtype="auto",
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        peft_config: Optional[dict] = None,
+        peft_config: dict | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
