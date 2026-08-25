@@ -77,12 +77,6 @@ class MockMoEModel(MoEFSDPSyncMixin):
         if has_embed_tokens:
             model.embed_tokens = MockFSDPModule()
 
-    def get_submodule(self, target):
-        module = self
-        for name in target.split("."):
-            module = getattr(module, name)
-        return module
-
 
 class MockOuterFSDPMoEModel(MockFSDPModule, MoEFSDPSyncMixin):
     """Mock MoE model whose FSDP root is the outer wrapper."""

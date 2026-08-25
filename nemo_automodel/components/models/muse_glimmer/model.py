@@ -812,8 +812,7 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
 
         Returns:
             Model-input updates. For packed VLM, the global vision mask remains
-            [batch, sequence] and an empty ``_thd_local_indices`` slot asks the
-            TE sharder to replace it with its [local_tokens] partition.
+            [batch, sequence].
         """
         del num_chunks
         if batch.get("qkv_format") == "thd":
@@ -830,9 +829,6 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
             if vision_mask is None:
                 vision_mask = (input_ids == self.config.patch_token_id) | (input_ids == self.config.video_token_id)
             model_inputs["_muse_glimmer_global_vision_mask"] = vision_mask
-            # Presence explicitly asks the framework-owned TE sharder to replace
-            # this placeholder with the partition it applies to the token stream.
-            model_inputs["_thd_local_indices"] = None
             return model_inputs
         self._set_te_cp_transport("all_gather")
         return {

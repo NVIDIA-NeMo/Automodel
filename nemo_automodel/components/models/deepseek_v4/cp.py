@@ -423,8 +423,9 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     """Contiguously shard a batch for DeepSeek V4 Miles-style context parallelism.
 
     Exposed as ``ContextParallelSharder.shard_batch`` (via ``functools.partial`` to bind
-    ``pad_multiple``) and invoked by the CP dispatch. Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
-    K/V across CP ranks during forward. Returns ``(nullcontext, batch, layout)``;
+    ``pad_multiple``) and invoked by the CP dispatch. Each CP rank then keeps one
+    ``seq_start:seq_end`` slice; DSV4 attention all-gathers K/V across CP ranks
+    during forward. Returns ``(nullcontext, batch, layout)``;
     at CP size one, ``layout`` records the unchanged sequence length so token
     outputs can still use ``gather_token_tensor(trim=True)``.
 

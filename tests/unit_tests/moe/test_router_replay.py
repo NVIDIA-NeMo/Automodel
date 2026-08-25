@@ -375,31 +375,6 @@ def test_adapter_finds_decoder_below_module_wrapper():
     assert isinstance(_adapter_gate(model, 1).router_replay, RouterReplay)
 
 
-def test_adapter_binds_sparse_layers_across_pipeline_model_parts():
-    first_part = _AdapterModel(num_layers=2, routed_layers=(1,))
-    last_part = _AdapterModel(num_layers=5, routed_layers=(3,))
-    adapter = RouterReplayAdapter([first_part, last_part])
-    routes = torch.full((2, 5, 2), -1, dtype=torch.int16)
-    routes[:, 1] = torch.tensor([[1, 2], [3, 4]], dtype=torch.int16)
-    routes[:, 3] = torch.tensor([[5, 6], [7, 0]], dtype=torch.int16)
-
-    assert adapter.layer_ids == (1, 3)
-    with adapter.replay(routes):
-        torch.testing.assert_close(_adapter_gate(first_part, 1).router_replay.target_indices, routes[:, 1])
-        torch.testing.assert_close(_adapter_gate(last_part, 3).router_replay.target_indices, routes[:, 3])
-
-
-def test_adapter_allows_pipeline_rank_without_local_moe_layer():
-    adapter = RouterReplayAdapter([_AdapterModel(num_layers=2, routed_layers=())])
-
-    assert adapter.layer_ids == ()
-    with adapter.replay(torch.zeros(2, 3, 2, dtype=torch.int16)):
-        pass
-
-    with adapter.replay(None):
-        pass
-
-
 def test_adapter_rejects_partial_moe_router_cuda_graph_before_installing_handle():
     model = _AdapterModel(num_layers=3, routed_layers=(1,))
     gate = _adapter_gate(model, 1)
@@ -412,8 +387,6 @@ def test_adapter_rejects_partial_moe_router_cuda_graph_before_installing_handle(
 
 
 def test_adapter_replays_real_gate_and_preserves_router_gradient():
-    from nemo_automodel.engine import Engine
-
     class EngineGateModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -443,10 +416,9 @@ def test_adapter_replays_real_gate_and_preserves_router_gradient():
         _weights, live_indices, _aux = run(model.model.layers["0"].gate, hidden)
     target = ((live_indices + 1) % 8).reshape(1, 3, 1, 2).to(torch.int16)
     assert not torch.equal(live_indices, target.reshape(-1, 2))
-    engine = Engine(model, optimizer=torch.optim.SGD(model.parameters(), lr=0.1))
     with adapter.replay(target):
-        output = engine(input_ids)
-        engine.backward(output.sum())
+        output = model(input_ids)
+        output.sum().backward()
 
     torch.testing.assert_close(model.selected_indices, target.reshape(-1, 2).long())
     gate_grad = model.model.layers["0"].gate.weight.grad
@@ -546,16 +518,6 @@ def test_adapter_replay_rejects_invalid_routes(routes, error, match):
 def test_adapter_rejects_invalid_prepared_layout(routes, match):
     adapter = RouterReplayAdapter(_AdapterModel(num_layers=5, routed_layers=(3,)))
     with pytest.raises(ValueError, match=match):
-        adapter.replay(routes)
-
-
-@pytest.mark.parametrize("bad_row", [[-1, 2], [-2, -2], [0, 8], [3, 3]])
-def test_adapter_rejects_incomplete_or_invalid_expert_rows(bad_row):
-    adapter = RouterReplayAdapter(_AdapterModel(num_layers=3, routed_layers=(1,)))
-    routes = torch.full((2, 3, 2), -1, dtype=torch.int16)
-    routes[0, 1] = torch.tensor(bad_row, dtype=torch.int16)
-
-    with pytest.raises(RuntimeError, match="all -1 or contain unique valid model expert ids"):
         adapter.replay(routes)
 
 

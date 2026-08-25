@@ -487,7 +487,6 @@ def test_cp_preparation_selects_aux_only_bshd_and_framework_thd_sharders():
         packed_vlm["_muse_glimmer_global_vision_mask"],
         torch.tensor([[False, True, True, False]]),
     )
-    assert packed_vlm["_thd_local_indices"] is None
 
 
 def test_packed_thd_requires_documents_within_muse_glimmer_sliding_window():
