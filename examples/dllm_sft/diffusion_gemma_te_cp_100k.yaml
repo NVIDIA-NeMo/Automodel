@@ -1,0 +1,115 @@
+# Two-node (16 GPU) DiffusionGemma SFT proof at a genuine 100K-token context.
+#
+# Prepare four streamed FineWeb-Edu passkey samples:
+#   python examples/dllm_sft/prep_diffusion_gemma_long_context.py \
+#     --target-tokens 100000 --num-samples 4
+#
+# Launch on two 8-GPU nodes with torchrun. CP=16 is the entire multi-node world.
+
+recipe: DiffusionGemmaSFTRecipe
+seed: 42
+
+step_scheduler:
+  global_batch_size: 1
+  local_batch_size: 1
+  log_remote_every_steps: 1
+  ckpt_every_steps: 100000
+  val_every_steps: 100000
+  max_steps: 2
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: google/diffusiongemma-26B-A4B-it
+  torch_dtype: float32
+  canvas_length: 256
+  self_conditioning: true
+  freeze_router: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: torch
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 16
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: float32
+  autocast_dtype: bfloat16
+  offload_policy: null
+  moe:
+    reshard_after_forward: false
+
+dllm:
+  mode: block_diffusion
+  block_size: 256
+  vocab_size: 262144
+  eps: 0.001
+  pad_block_size: 256
+  pad_seq_len_divisible: 256
+  encoder_loss_weight: 1.0
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.95, 0.99]
+  eps: 1.0e-8
+  lr: 1.5e-4
+  weight_decay: 1.0e-4
+
+clip_grad_norm:
+  max_norm: 1.0
+
+lr_scheduler:
+  lr_warmup_steps: 1
+  init_lr: 0.0
+  lr_decay_style: cosine
+  min_lr: 1.5e-5
+
+checkpoint:
+  enabled: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: diffusion_gemma_long_100k.jsonl
+  split: train
+  shuffle_seed: 42
+  seq_length: 100096
+  truncation: true
+  unshifted: true
+  mask_history: true
+  chat_template: examples/dllm_sft/diffusion_gemma_chat_template.jinja
+  tokenizer:
+    pretrained_model_name_or_path: google/diffusiongemma-26B-A4B-it
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+wandb:
+  enable: false
+
+ci:
+  recipe_owner: akoumpa
+  nodes: 2
+  time: "02:00:00"

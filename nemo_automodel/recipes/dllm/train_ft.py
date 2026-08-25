@@ -50,6 +50,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loggers.mlflow_utils import to_float_metrics
 from nemo_automodel.components.loss.dllm_loss import encoder_ar_loss
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.models.diffusion_gemma.attention_mask import build_block_diffusion_training_mask
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
@@ -859,6 +860,11 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         tok = getattr(self, "tokenizer", None)
         pad_id = getattr(tok, "pad_token_id", None) if tok is not None else None
         self._pad_token_id = int(pad_id) if pad_id is not None else 0
+        self._fused_encoder_loss = FusedLinearCrossEntropy(
+            ignore_index=-100,
+            logit_softcapping=getattr(model, "final_logit_softcapping", 0) or 0,
+            reduction="sum",
+        )
 
         # Freeze the router on the live model (the config flag also freezes it in
         # __init__, but freezing here is idempotent and covers from_config paths).
@@ -907,6 +913,9 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             # the AR denominator counts the same positions the AR loss scores.
             ar = attn.to(dtype=torch.bool) if attn is not None else loss_mask.bool()
             num_ar += int((ar[:, :-1] & ar[:, 1:]).sum().item())
+        # CP ranks hold disjoint token shards of the same examples, so the
+        # denominator is reduced over data replicas only (not multiplied by
+        # CP). Backward's include_cp scaling combines those local numerators.
         num_diffusion = self._dp_allreduce(torch.tensor(num_diffusion, dtype=torch.long)).item()
         num_ar = self._dp_allreduce(torch.tensor(num_ar, dtype=torch.long)).item()
         # Guard a degenerate all-pad step against divide-by-zero in the loss.
@@ -1167,9 +1176,22 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         loss_mask = window["loss_mask"]
         p_mask = window["p_mask"]
 
+        # Align the next-token AR targets before CP changes the encoder layout.
+        # The model-owned sharder extends these with ignored dummy canvas slots.
+        encoder_labels = torch.full_like(clean_input_ids, -100)
+        ar_pairs = ar_full_loss_mask[:, :-1] & ar_full_loss_mask[:, 1:]
+        encoder_labels[:, :-1] = torch.where(ar_pairs, clean_input_ids[:, 1:], -100)
+        batch["encoder_labels"] = encoder_labels
+
         model = self.model_parts[0]
-        cp_sharder = ContextParallelSharder(None, self.device_mesh, batch)
+        cp_sharder = ContextParallelSharder(model, self.device_mesh, batch)
         train_ctx, batch = cp_sharder.shard(batch)
+        encoder_labels = batch.pop("encoder_labels")
+        if "cp_canvas_indices" in batch:
+            target_ids = cp_sharder.shard_token_tensor(target_ids, fill=self._pad_token_id)
+            noise_mask = cp_sharder.shard_token_tensor(noise_mask, fill=False)
+            loss_mask = cp_sharder.shard_token_tensor(loss_mask, fill=False)
+            p_mask = cp_sharder.shard_token_tensor(p_mask, fill=1.0)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
         sync_ctx = (
             get_sync_ctx(
@@ -1190,6 +1212,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             out = model(**batch)
             logits = getattr(out, "logits", out)
             encoder_logits = getattr(out, "encoder_logits", None)
+            encoder_hidden_states = getattr(out, "encoder_hidden_states", None)
             del out
 
             loss_result = self.dllm_loss_fn(
@@ -1225,6 +1248,15 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
                     clean_input_ids,
                     valid_mask=ar_full_loss_mask,
                     num_tokens=num_ar_tokens,
+                )
+                microbatch_loss = microbatch_loss + self._encoder_loss_weight * ar_loss
+            elif is_train and encoder_hidden_states is not None and self._encoder_loss_weight > 0.0:
+                ar_loss = self._fused_encoder_loss(
+                    encoder_hidden_states,
+                    encoder_labels,
+                    model.lm_head.weight,
+                    num_label_tokens=num_ar_tokens,
+                    grad_reduce_group=self._get_dp_group(include_cp=True),
                 )
                 microbatch_loss = microbatch_loss + self._encoder_loss_weight * ar_loss
 
