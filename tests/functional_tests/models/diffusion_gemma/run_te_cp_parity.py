@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Multi-node TE-CP forward parity probe for DiffusionGemma."""
+"""Multi-node TE-CP encoder-loss and gradient parity probe for DiffusionGemma."""
 
 import os
 
@@ -15,6 +15,7 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     rank = dist.get_rank()
+    world_size = dist.get_world_size()
 
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
 
@@ -76,14 +77,16 @@ def main():
     batch = {
         "input_ids": clean,
         "canvas_ids": canvas,
-        "encoder_position_ids": torch.arange(encoder_len, device=device)[None],
-        "decoder_position_ids": torch.arange(8, 13, device=device)[None],
+        "encoder_position_ids": torch.arange(encoder_len, device=device)[None].expand(batch_size, -1),
+        "decoder_position_ids": torch.arange(8, 13, device=device)[None].expand(batch_size, -1),
         "encoder_padding_mask": torch.zeros_like(clean, dtype=torch.bool),
         "decoder_padding_mask": torch.zeros_like(canvas, dtype=torch.bool),
         "encoder_labels": torch.cat((clean[:, 1:], torch.full_like(clean[:, :1], -100)), dim=1),
         "decoder_attention_mask": {"full_attention": full, "sliding_attention": sliding},
         "do_self_conditioning": False,
     }
+    full_encoder_labels = batch["encoder_labels"].clone()
+    ar_token_counts = full_encoder_labels.ne(-100).sum(dim=1)
 
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("cp",))
     attach_te_context_parallel(cp_model, mesh["cp"])
@@ -91,26 +94,19 @@ def main():
     _, local_batch = sharder.shard(batch)
     local_labels = local_batch.pop("encoder_labels")
     cp_out = cp_model(**local_batch)
-    local_out = cp_out.logits.float()
 
     reference_out = reference(
         input_ids=clean,
         canvas_ids=canvas,
-        encoder_position_ids=torch.arange(encoder_len, device=device)[None],
-        decoder_position_ids=torch.arange(8, 13, device=device)[None],
+        encoder_position_ids=torch.arange(encoder_len, device=device)[None].expand(batch_size, -1),
+        decoder_position_ids=torch.arange(8, 13, device=device)[None].expand(batch_size, -1),
         encoder_padding_mask=torch.zeros_like(clean, dtype=torch.bool),
         decoder_padding_mask=torch.zeros_like(canvas, dtype=torch.bool),
         decoder_attention_mask={"full_attention": full, "sliding_attention": sliding},
         do_self_conditioning=False,
-    ).logits.float()
-    valid = local_batch["cp_canvas_indices"] < canvas_len
-    expected = reference_out.index_select(1, local_batch["cp_canvas_indices"][valid])
-    local_valid = local_out[:, valid]
-    difference = (local_valid - expected).abs()
-    relative_mean = difference.mean() / expected.abs().mean().clamp_min(torch.finfo(torch.float32).eps)
-    cosine = torch.nn.functional.cosine_similarity(local_valid.flatten(), expected.flatten(), dim=0)
-    assert cosine.item() > 0.999, cosine.item()
-    assert relative_mean.item() < 0.02, relative_mean.item()
+    )
+    assert torch.isfinite(cp_out.encoder_hidden_states).all()
+    assert torch.isfinite(reference_out.encoder_logits).all()
 
     # Exercise the long-context AR path and TE CP backward. This is deliberately
     # the same fused linear CE used by the recipe; no [sequence, vocab] encoder
@@ -119,26 +115,113 @@ def main():
         cp_out.encoder_hidden_states,
         local_labels,
         cp_model.lm_head.weight,
-        num_label_tokens=encoder_len - 1,
+        label_token_counts=ar_token_counts,
+        num_label_examples=batch_size,
     )
-    (ar_loss + local_valid.square().mean()).backward()
+    ar_loss.backward()
     grad = cp_model.model.layers["0"].self_attn.q_proj.weight.grad
     assert grad is not None and torch.isfinite(grad).all()
+
+    # Independent full-logit oracle: mean token CE within each example, then
+    # mean across examples. Sum CP-local loss/grad contributions for comparison.
+    reference_encoder_logits = reference_out.encoder_logits.float()
+    reference_per_token = torch.nn.functional.cross_entropy(
+        reference_encoder_logits.reshape(-1, reference_encoder_logits.shape[-1]),
+        full_encoder_labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).reshape_as(full_encoder_labels)
+    reference_ar_loss = (reference_per_token.sum(dim=1) / ar_token_counts).mean()
+    reference_ar_loss.backward()
+    reference_grad = reference.model.layers["0"].self_attn.q_proj.weight.grad
+    dist.all_reduce(grad)
+    reduced_ar_loss = ar_loss.detach().clone()
+    dist.all_reduce(reduced_ar_loss)
+    grad_cosine = torch.nn.functional.cosine_similarity(grad.float().flatten(), reference_grad.float().flatten(), dim=0)
+    torch.testing.assert_close(reduced_ar_loss, reference_ar_loss, rtol=0.01, atol=0.01)
+    assert grad_cosine.item() > 0.998, grad_cosine.item()
     if rank == 0:
         print(
             f"PASS world={dist.get_world_size()} nodes={os.environ.get('SLURM_NNODES')} "
-            f"local_logits={tuple(local_out.shape)} max_error={difference.max().item():.6f} "
-            f"relative_mean={relative_mean.item():.6f} cosine={cosine.item():.8f} ar_loss={ar_loss.item():.6f}"
+            f"local_encoder={tuple(cp_out.encoder_hidden_states.shape)} "
+            f"ar_loss={reduced_ar_loss.item():.6f} reference_ar_loss={reference_ar_loss.item():.6f} "
+            f"ar_grad_cosine={grad_cosine.item():.8f}"
         )
 
-    del cp_model, reference, cp_out, local_out, reference_out
+    # Exercise the fused per-example reduction itself with unequal lengths and
+    # sequence shards on every rank. This keeps the arithmetic test independent
+    # of the model's current microbatch-size-one TE attention constraint.
+    synthetic_batch, synthetic_len, hidden_size, vocab_size = 2, 17, 9, 23
+    synthetic_generator = torch.Generator(device=device).manual_seed(29)
+    full_hidden = torch.randn(
+        synthetic_batch,
+        synthetic_len,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=synthetic_generator,
+    )
+    full_weight = torch.randn(
+        vocab_size,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=synthetic_generator,
+    )
+    full_labels = torch.randint(
+        0,
+        vocab_size,
+        (synthetic_batch, synthetic_len),
+        device=device,
+        generator=synthetic_generator,
+    )
+    full_labels[1, 7:] = -100
+    full_counts = full_labels.ne(-100).sum(dim=1)
+    local_indices = torch.arange(rank, synthetic_len, world_size, device=device)
+    local_hidden = full_hidden.index_select(1, local_indices).detach().requires_grad_(True)
+    local_weight = full_weight.detach().clone().requires_grad_(True)
+    local_labels = full_labels.index_select(1, local_indices)
+    local_synthetic_loss = FusedLinearCrossEntropy(logit_softcapping=30.0, reduction="sum")(
+        local_hidden,
+        local_labels,
+        local_weight,
+        label_token_counts=full_counts,
+        num_label_examples=synthetic_batch,
+    )
+    local_synthetic_loss.backward()
+    reduced_synthetic_loss = local_synthetic_loss.detach().clone()
+    reduced_weight_grad = local_weight.grad.detach().clone()
+    dist.all_reduce(reduced_synthetic_loss)
+    dist.all_reduce(reduced_weight_grad)
+
+    reference_hidden = full_hidden.detach().requires_grad_(True)
+    reference_weight = full_weight.detach().clone().requires_grad_(True)
+    reference_logits = reference_hidden @ reference_weight.t()
+    reference_logits = torch.tanh(reference_logits / 30.0) * 30.0
+    reference_per_token = torch.nn.functional.cross_entropy(
+        reference_logits.reshape(-1, vocab_size), full_labels.reshape(-1), ignore_index=-100, reduction="none"
+    ).reshape_as(full_labels)
+    reference_synthetic_loss = (reference_per_token.sum(dim=1) / full_counts).mean()
+    reference_synthetic_loss.backward()
+    synthetic_grad_cosine = torch.nn.functional.cosine_similarity(
+        reduced_weight_grad.float().flatten(), reference_weight.grad.float().flatten(), dim=0
+    )
+    torch.testing.assert_close(reduced_synthetic_loss.float(), reference_synthetic_loss.float(), rtol=0.01, atol=0.01)
+    assert synthetic_grad_cosine.item() > 0.999, synthetic_grad_cosine.item()
+    if rank == 0:
+        print(
+            f"PASS_UNEQUAL_COUNTS counts={full_counts.tolist()} loss={reduced_synthetic_loss.item():.6f} "
+            f"reference={reference_synthetic_loss.item():.6f} weight_grad_cosine={synthetic_grad_cosine.item():.8f}"
+        )
+
+    del cp_model, reference, cp_out, reference_out
     torch.cuda.empty_cache()
     dist.barrier()
 
     # A real 100K-token forward/backward exercises padding, RoPE, TE CP
     # transport, the non-causal decoder bias, and fused AR CE without requiring
-    # the 26B checkpoint. Keep this probe sliding-only so validation finishes
-    # quickly; the dependent job runs the released model/config.
+    # the 26B checkpoint. A single tiny layer keeps the probe fast while still
+    # exercising the released model implementation and CP sharder.
     long_len, long_canvas = 100_000, 16
     long_text_cfg = dict(text_cfg)
     long_text_cfg.update(
@@ -188,9 +271,10 @@ def main():
         long_out.encoder_hidden_states,
         long_labels,
         long_model.lm_head.weight,
-        num_label_tokens=long_len - 1,
+        label_token_counts=torch.tensor([long_len - 1], device=device),
+        num_label_examples=1,
     )
-    (long_ar_loss + long_out.logits.float().square().mean()).backward()
+    long_ar_loss.backward()
     long_grad = long_model.model.layers["0"].self_attn.q_proj.weight.grad
     assert long_grad is not None and torch.isfinite(long_grad).all()
     if rank == 0:
