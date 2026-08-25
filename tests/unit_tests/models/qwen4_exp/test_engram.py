@@ -309,6 +309,53 @@ def test_ple_uses_explicit_model_dtype_and_zero_start_conv() -> None:
     torch.testing.assert_close(ple.conv1d.weight, torch.zeros_like(ple.conv1d.weight))
 
 
+def test_ple_casts_fp32_owner_table_to_bfloat16_compute() -> None:
+    fp32_table = nn.Embedding(36, 2, dtype=torch.float32)
+    ple = Qwen4ExpPLELayer(
+        _tiny_ngram_embedding(fp32_table),
+        hidden_size=2,
+        hc_count=2,
+        ple_embed_dim=8,
+        backend=BackendConfig(linear="torch"),
+        dtype=torch.bfloat16,
+        conv_kernel_size=4,
+    )
+    reference_table = nn.Embedding(36, 2, dtype=torch.bfloat16)
+    reference = Qwen4ExpPLELayer(
+        _tiny_ngram_embedding(reference_table),
+        hidden_size=2,
+        hc_count=2,
+        ple_embed_dim=8,
+        backend=BackendConfig(linear="torch"),
+        dtype=torch.bfloat16,
+        conv_kernel_size=4,
+    )
+    with torch.no_grad():
+        fp32_table.weight.copy_(fp32_table.weight.to(torch.bfloat16))
+        reference.load_state_dict(ple.state_dict())
+
+    input_ids = torch.tensor([[10, 11, 12]])
+    hidden_states = torch.randn(1, 3, 4, dtype=torch.bfloat16, requires_grad=True)
+    reference_hidden_states = hidden_states.detach().clone().requires_grad_(True)
+
+    actual = ple(hidden_states, input_ids)
+    expected = reference(reference_hidden_states, input_ids)
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(hidden_states.grad, reference_hidden_states.grad, rtol=0, atol=0)
+    assert fp32_table.weight.grad is not None
+    assert fp32_table.weight.grad.dtype == torch.float32
+    assert torch.isfinite(fp32_table.weight.grad).all()
+    assert ple.key_proj.weight.grad is not None
+    assert ple.key_proj.weight.grad.dtype == torch.bfloat16
+    assert torch.isfinite(ple.key_proj.weight.grad).all()
+
+
 def test_local_engram_table_matches_torch_embedding_forward_and_backward() -> None:
     table = Qwen4ExpEngramTableConfig(
         num_embeddings=12,

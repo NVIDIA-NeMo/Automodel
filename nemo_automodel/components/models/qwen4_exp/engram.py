@@ -1161,6 +1161,11 @@ class Qwen4ExpPLELayer(nn.Module):
                 f"Expected PLE embeddings with shape {(*hidden_states.shape[:2], self.ple_embed_dim)}, "
                 f"got {tuple(embeddings.shape)}"
             )
+        # The model-owned table is excluded from FSDP and can retain fp32
+        # master-weight storage while the surrounding block computes in bf16.
+        # Match the block activation dtype at the projection boundary; autograd
+        # casts the table gradient back to the parameter's storage dtype.
+        embeddings = embeddings.to(dtype=hidden_states.dtype)
         key = self.key_proj(embeddings).unflatten(-1, (self.hc_count, self.hidden_size))
         value = self.value_proj(embeddings)
         query = hidden_states.unflatten(-1, (self.hc_count, self.hidden_size))
