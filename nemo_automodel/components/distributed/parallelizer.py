@@ -406,17 +406,17 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
             else:
-                if (
-                    _should_use_hf_native_gradient_checkpointing(
-                        model,
-                        layer_groups,
-                        ac_scopes,
-                        enable_compile=enable_compile,
-                    )
-                    and not _has_kv_sharing
+                if _should_use_hf_native_gradient_checkpointing(
+                    model,
+                    layer_groups,
+                    ac_scopes,
+                    enable_compile=enable_compile,
                 ):
                     # Work around a PyTorch FSDP2 bug that skips mixed-precision input casts during
                     # checkpoint recomputation. Remove when the minimum PyTorch version is 2.13.
+                    #
+                    # KV-shared models belong on this path too; they rode the equivalent HF-native
+                    # full-layer path until #3513 rewrote this branch.
                     apply_full_layer_checkpointing_to_layers(model, ac_layers)
                 else:
                     apply_submodule_checkpointing(ac_layers, _has_kv_sharing)

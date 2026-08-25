@@ -2451,15 +2451,24 @@ class TestActivationCheckpointingKVSharing:
         model.gradient_checkpointing_enable = MagicMock()  # type: ignore[attr-defined]
         return model
 
-    def test_hf_native_candidate_with_kv_sharing_uses_submodule_checkpointing(self, monkeypatch):
-        """KV-shared models preserve their cache and use submodule checkpointing."""
+    def test_hf_native_candidate_with_kv_sharing_uses_full_layer_checkpointing(self, monkeypatch):
+        """KV-shared models keep whole-block checkpointing, so attention is recomputed.
+
+        ``apply_submodule_checkpointing`` deliberately leaves ``self_attn``
+        unwrapped for KV-shared models, so routing them there drops attention
+        activations from checkpointing entirely and inflates peak memory. The
+        cache contract is unchanged: ``use_cache`` still stays on.
+        """
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20)
         self._run_parallelize(model)
 
         assert model.config.use_cache is True
         model.gradient_checkpointing_enable.assert_not_called()
-        assert all(not isinstance(layer, self._Wrapped) for layer in model.model.layers)
-        assert all(isinstance(layer.mlp, self._Wrapped) for layer in model.model.layers)
+        assert all(isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        # Whole-block wrapping, not the sub-module fallback that skips self_attn.
+        inner_layers = [layer._checkpoint_wrapped_module for layer in model.model.layers]
+        assert all(not isinstance(inner.mlp, self._Wrapped) for inner in inner_layers)
+        assert all(not isinstance(inner.self_attn, self._Wrapped) for inner in inner_layers)
 
     def test_hf_native_candidate_uses_non_reentrant_full_layer_checkpointing(self, monkeypatch):
         """HF-native candidates use full-layer checkpoint wrappers instead of the HF API."""
