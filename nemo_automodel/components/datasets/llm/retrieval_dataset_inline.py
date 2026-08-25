@@ -471,6 +471,17 @@ def _group_aware_split(dataset, validation_fraction: float, group_key: str | Non
         row_groups = groups
     else:
         row_groups = dataset[group_key]
+        # load_datasets fills absent extra columns with None, so a group key that is present
+        # on some rows and missing on others reaches here as a mix of str and None. sorted()
+        # then raises TypeError from inside dataset construction, which reads as a library
+        # bug rather than as the data problem it is. Fail with the column name instead.
+        missing = sum(1 for g in row_groups if g is None or (isinstance(g, str) and not g.strip()))
+        if missing:
+            raise ValueError(
+                f"validation_group_key={group_key!r} is missing or blank on {missing} of "
+                f"{len(row_groups)} rows; every row needs a group value or the split cannot "
+                "keep a group on one side"
+            )
         groups = sorted(set(row_groups))
 
     shuffled = list(groups)
