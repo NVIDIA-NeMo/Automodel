@@ -23,11 +23,13 @@ import nemo_automodel.components.attention.dflash_mask as dflash_mask
 from nemo_automodel.components.attention.dflash_mask import create_dflash_block_mask, create_dflash_sdpa_mask
 
 
-def _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_size, causal=False):
+def _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_size, causal=False, sliding_window=None):
     """Element-level reference mask (pure Python loops, obviously correct).
 
     Mirrors the rules from the DFlash paper §4.2:
-    - Block b attends to context positions ``< anchor[b]`` (causal prefix).
+    - Block b attends to context positions ``< anchor[b]`` (causal prefix), and,
+      when ``sliding_window`` is set, only those within the window of the query's
+      own sequence position ``anchor[b] + offset``.
     - Block b attends to its own noise positions (bidirectional, or causal in-block
       when ``causal=True`` -- the JetSpec mask, where offset i sees only j <= i).
     - Different blocks invisible. A padded-anchor block (keep=False) drops its
@@ -48,6 +50,8 @@ def _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_siz
             for k in range(KV_LEN):
                 is_ctx = k < ctx_len
                 ctx_ok = is_ctx and (k < anchor) and keep
+                if ctx_ok and sliding_window is not None:
+                    ctx_ok = (anchor + q_off) - k < sliding_window
                 is_noise = k >= ctx_len
                 kv_block = (k - ctx_len) // block_size if is_noise else -1
                 kv_off = (k - ctx_len) - kv_block * block_size if is_noise else -1
@@ -258,3 +262,57 @@ def test_flex_block_mask_matches_reference():
     if dense.shape == ref.shape:
         # ref ⊆ dense
         assert torch.all(dense | ~ref), "ref positions must be present in BlockMask"
+
+
+def test_sdpa_mask_sliding_window_matches_reference():
+    """The window must be measured from the query's own position, not the anchor.
+
+    A block's later offsets sit further along the sequence, so their window slides
+    with them; measuring from the anchor alone would keep ``block_size - 1`` context
+    tokens too many at the far edge.
+    """
+    ctx_len, block_size, window = 40, 4, 12
+    anchors = torch.tensor([[5, 20, 33]])
+    keep = torch.ones(1, 3, dtype=torch.bool)
+
+    produced = create_dflash_sdpa_mask(
+        anchors, keep, ctx_len, block_size, torch.device("cpu"), torch.float32, sliding_window=window
+    )
+    expected = _reference_dflash_mask(anchors, keep, ctx_len, block_size, sliding_window=window)
+    assert torch.equal(produced == 0.0, expected)
+
+
+def test_sliding_window_only_narrows_context_and_never_empties_a_row():
+    """A window may drop context but must not touch in-block attention.
+
+    Every query keeps its own block, so no row can become fully masked -- a fully
+    masked row NaNs the dense softmax and contaminates the whole sample.
+    """
+    ctx_len, block_size = 64, 4
+    anchors = torch.tensor([[60, 62]])
+    keep = torch.ones(1, 2, dtype=torch.bool)
+    kwargs = dict(device=torch.device("cpu"), dtype=torch.float32)
+
+    full = create_dflash_sdpa_mask(anchors, keep, ctx_len, block_size, **kwargs) == 0.0
+    windowed = create_dflash_sdpa_mask(anchors, keep, ctx_len, block_size, sliding_window=8, **kwargs) == 0.0
+
+    assert (windowed <= full).all(), "the window must only remove visibility"
+    assert windowed.sum() < full.sum(), "an 8-token window must actually drop context"
+    assert windowed.any(dim=-1).all(), "no query row may be fully masked"
+    assert torch.equal(windowed[..., ctx_len:], full[..., ctx_len:])
+
+
+def test_flex_mask_mod_matches_sdpa_under_sliding_window():
+    """The flex and dense backends must encode the same windowed mask."""
+    from torch.nn.attention.flex_attention import create_mask
+
+    ctx_len, block_size, window, n = 48, 4, 10, 3
+    anchors = torch.tensor([[7, 21, 40]])
+    keep = torch.tensor([[True, True, False]])
+
+    mask_mod = dflash_mask.build_dflash_mask_mod(anchors, keep, ctx_len, block_size, n, False, None, None, window)
+    flex = create_mask(mask_mod, B=1, H=1, Q_LEN=n * block_size, KV_LEN=ctx_len + n * block_size, device="cpu")
+    dense = create_dflash_sdpa_mask(
+        anchors, keep, ctx_len, block_size, torch.device("cpu"), torch.float32, sliding_window=window
+    )
+    assert torch.equal(flex[:, 0], (dense == 0.0)[:, 0])
