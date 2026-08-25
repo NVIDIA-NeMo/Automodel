@@ -43,11 +43,34 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv; drop the base image's own /usr/local/bin copy (vulnerable rustls-webpki)
-ENV UV_VERSION="0.11.24"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
-    rm -f /usr/local/bin/uv /usr/local/bin/uvx
-ENV PATH="/root/.local/bin:$PATH"
+# Pin uv and uvx with patched quinn-proto (GHSA-4w2j-m93h-cj5j) on the system path.
+# Remove the base image's root-local copies so stale vulnerable binaries are not shipped.
+ENV UV_VERSION="0.11.26"
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) \
+            uv_arch="x86_64"; \
+            uv_sha256="6426a73c3837e6e2483ee344cbc00f36394d179afcba6183cb77437e67db4af0"; \
+            ;; \
+        arm64) \
+            uv_arch="aarch64"; \
+            uv_sha256="befa1a59c91e96eb601b0fd9a97c03dd666f17baba644b2b4db9c59a767e387e"; \
+            ;; \
+        *) \
+            echo "Unsupported TARGETARCH for uv: ${TARGETARCH}" >&2; \
+            exit 1; \
+            ;; \
+    esac && \
+    uv_archive="uv-${uv_arch}-unknown-linux-gnu.tar.gz" && \
+    curl -fLSs -o "/tmp/${uv_archive}" \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${uv_archive}" && \
+    echo "${uv_sha256}  /tmp/${uv_archive}" | sha256sum -c - && \
+    tar -xzf "/tmp/${uv_archive}" -C /tmp && \
+    install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uv" /usr/local/bin/uv && \
+    install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uvx" /usr/local/bin/uvx && \
+    rm -rf "/tmp/${uv_archive}" "/tmp/uv-${uv_arch}-unknown-linux-gnu" && \
+    rm -f /root/.local/bin/uv /root/.local/bin/uvx
+ENV PATH="/usr/local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
@@ -188,7 +211,7 @@ RUN pip install "aiohttp>=3.14.3" \
         "GitPython>=3.1.59" \
         "jaraco-context>=6.1.0" \
         "jupyter-server>=2.20.0" \
-        "jupyterlab>=4.5.7" \
+        "jupyterlab>=4.5.10" \
         "mistune>=3.3.0" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
