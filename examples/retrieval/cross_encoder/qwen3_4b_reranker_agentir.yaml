@@ -26,6 +26,9 @@
 #
 #   {
 #     "query_id":     "<str>",     required, unique per row
+#     "global_qid":   "<str>",     required, the session id -- shared by every turn of one
+#                                  trajectory, and by every labeling variant of the same
+#                                  question. This is the split key (validation_group_key)
 #     "query":        "<str>",     required, the sub-query actually issued
 #     "reasoning":    "<str>",     optional, the trace that motivated the sub-query
 #     "global_query": "<str>",     optional, the originating question the sub-query serves
@@ -49,8 +52,11 @@
 # (drop_seed, epoch, field, query), so it is identical across runs, workers and ranks.
 #
 # VALIDATION SPLIT. validation_group_key: global_qid holds every sub-query of one
-# originating question on the same side of the split. Keying on query_id instead would place
-# sibling sub-queries of the same question on opposite sides, which leaks.
+# originating question on the same side of the split. Keying on query_id would place sibling
+# sub-queries on opposite sides, which leaks -- and in the mixes query_id is not even unique,
+# since one sub-query appears once per labeling variant. Keying on global_query text is also
+# wrong: it is a long free-text field, and a session whose rows disagree by one character
+# splits in two.
 #
 #   automodel examples/retrieval/cross_encoder/qwen3_4b_reranker_agentir.yaml --nproc-per-node 8
 recipe: TrainCrossEncoderRecipe
