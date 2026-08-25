@@ -347,8 +347,53 @@ def test_mok_mxfp8_quantizes_only_routed_weights_with_required_layouts(
         assert all(actual_item is expected_item for actual_item, expected_item in zip(actual, expected, strict=True))
     if retain_until_optimizer_step:
         assert runtime._mxfp8_weights is mxfp8_weights
-        mok_experts.clear_mok_mxfp8_optimizer_step_cache((runtime,))
+        runtime._invalidate_mxfp8_cache()
     assert runtime._mxfp8_weights is None
+
+
+def test_mok_mxfp8_optimizer_post_hook_refreshes_cached_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    quantization_calls: list[torch.Tensor] = []
+
+    def fake_quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        quantization_calls.append(weight)
+        return weight, weight, weight, weight
+
+    monkeypatch.setattr(mok_experts, "_mxfp8_weight_both", fake_quantize)
+    experts = GroupedExpertsMoK(
+        _valid_moe_config(),
+        BackendConfig(dispatcher="mok", mok={"precision": "mxfp8"}),
+    )
+    optimizer = torch.optim.AdamW(experts.parameters(), lr=1.0e-3, foreach=False)
+    mok_experts.enable_mok_mxfp8_optimizer_step_cache([experts], [optimizer])
+    routed_weights = (
+        experts.routed_gate_weights,
+        experts.routed_up_weights,
+        experts.routed_down_weights,
+    )
+
+    first = experts.runtime._get_mxfp8_weights(*routed_weights)
+    assert experts.runtime._get_mxfp8_weights(*routed_weights) is first
+    assert len(quantization_calls) == 3
+    generation = experts.runtime._mxfp8_cache_generation
+
+    sum(parameter.float().sum() for parameter in experts.parameters()).backward()
+    optimizer.step()
+
+    assert experts.runtime._mxfp8_cache_generation == generation + 1
+    assert experts.runtime._mxfp8_weights is None
+    refreshed = experts.runtime._get_mxfp8_weights(*routed_weights)
+    assert refreshed is not first
+    assert len(quantization_calls) == 6
+
+
+def test_mok_mxfp8_cache_requires_one_optimizer_per_model_part() -> None:
+    experts = GroupedExpertsMoK(
+        _valid_moe_config(),
+        BackendConfig(dispatcher="mok", mok={"precision": "mxfp8"}),
+    )
+
+    with pytest.raises(ValueError, match="one optimizer per model part"):
+        mok_experts.enable_mok_mxfp8_optimizer_step_cache([experts], [])
 
 
 @pytest.mark.parametrize(
@@ -732,6 +777,85 @@ def test_mok_manual_backward_maps_gradients_to_autograd_inputs() -> None:
         (shared_down.grad, 8),
     ):
         torch.testing.assert_close(actual, torch.full_like(actual, expected))
+
+
+def test_mok_mxfp8_autograd_restores_saved_weight_layouts() -> None:
+    @dataclass(frozen=True)
+    class FakeSchedule:
+        peer_rank: torch.Tensor
+
+    @dataclass(frozen=True)
+    class FakeForwardContext:
+        hidden: torch.Tensor
+
+    routed_layouts = tuple(
+        tuple(torch.full((1,), projection * 4 + layout) for layout in range(4)) for projection in range(3)
+    )
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.backward_layouts: tuple[tuple[torch.Tensor, ...], ...] | None = None
+
+        def forward(
+            self, x: torch.Tensor, *args: torch.Tensor
+        ) -> tuple[torch.Tensor, object, object, tuple[tuple[torch.Tensor, ...], ...]]:
+            del args
+            return (
+                x.clone(),
+                FakeSchedule(torch.zeros(1, dtype=torch.int32)),
+                FakeForwardContext(x.clone()),
+                routed_layouts,
+            )
+
+        def backward(
+            self,
+            schedule: object,
+            forward_context: object,
+            grad_output: torch.Tensor,
+            x: torch.Tensor,
+            router_weights: torch.Tensor,
+            shared_gate_weights: torch.Tensor,
+            shared_up_weights: torch.Tensor,
+            shared_down_weights: torch.Tensor,
+            routed_gate_weights: torch.Tensor,
+            routed_up_weights: torch.Tensor,
+            routed_down_weights: torch.Tensor,
+            mxfp8_weights: tuple[tuple[torch.Tensor, ...], ...],
+        ) -> tuple[torch.Tensor, ...]:
+            del schedule, forward_context, grad_output
+            self.backward_layouts = mxfp8_weights
+            return (
+                torch.ones_like(x),
+                torch.ones_like(router_weights),
+                torch.ones_like(routed_gate_weights),
+                torch.ones_like(routed_up_weights),
+                torch.ones_like(routed_down_weights),
+                torch.ones_like(shared_gate_weights),
+                torch.ones_like(shared_up_weights),
+                torch.ones_like(shared_down_weights),
+            )
+
+    runtime = FakeRuntime()
+    tensors = [torch.randn(2, 2, requires_grad=True) for _ in range(8)]
+    output = mok_experts._MoKAutogradFunction.apply(
+        runtime,
+        tensors[0],
+        tensors[1],
+        torch.zeros(2, 2, dtype=torch.int64),
+        tensors[2],
+        tensors[3],
+        tensors[4],
+        tensors[5],
+        tensors[6],
+        tensors[7],
+    )
+    output.sum().backward()
+
+    assert runtime.backward_layouts is not None
+    for actual_projection, expected_projection in zip(runtime.backward_layouts, routed_layouts, strict=True):
+        for actual, expected in zip(actual_projection, expected_projection, strict=True):
+            torch.testing.assert_close(actual, expected)
+    assert all(tensor.grad is not None for tensor in tensors)
 
 
 def test_mok_context_uses_checkpoint_saved_tensor_hooks() -> None:

@@ -376,10 +376,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
                         opt.step()
-                    if mok_mxfp8_runtimes := getattr(self, "_mok_mxfp8_runtimes", ()):
-                        from nemo_automodel.components.moe.mok_experts import clear_mok_mxfp8_optimizer_step_cache
-
-                        clear_mok_mxfp8_optimizer_step_cache(mok_mxfp8_runtimes)
                     logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager

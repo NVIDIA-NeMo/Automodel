@@ -69,7 +69,16 @@ def _load_mok_ops():
 def _mxfp8_weight_both(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prequantize both MoK MXFP8 layouts in one kernel launch."""
+    """Prequantize both MoK MXFP8 layouts in one kernel launch.
+
+    Args:
+        weight: Contiguous BF16 tensor of shape
+            [local_experts, output_features, input_features].
+
+    Returns:
+        Normal E4M3 weight, its E8M0 block scales, transposed E4M3 weight,
+        and its E8M0 block scales in the opaque layouts consumed by MoK.
+    """
     weight_fp8, weight_scale, weight_t_fp8, weight_t_scale = _load_mok_ops().mxfp8_quantize(weight, True, True)
     if weight_fp8 is None or weight_scale is None or weight_t_fp8 is None or weight_t_scale is None:
         raise RuntimeError("MoK MXFP8 quantization did not return both requested weight layouts")
@@ -157,11 +166,21 @@ class _MoKRuntime:
         self.swiglu_limit = None if swiglu_limit == 0.0 else float(swiglu_limit)
         self.config: object | None = None
         self.ep_group: dist.ProcessGroup | None = None
-        self._mxfp8_cache_key: tuple[object, ...] | None = None
+        self._mxfp8_cache_generation = 0
+        self._mxfp8_cached_generation: int | None = None
         self._mxfp8_weights: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...] | None = None
         self._retain_mxfp8_cache_until_optimizer_step = False
 
     def _get_workspace(self, x: torch.Tensor, topk: int) -> object:
+        """Return MoK's workspace for one local activation shape.
+
+        Args:
+            x: Contiguous BF16 tensor of shape [tokens, hidden].
+            topk: Number of activated experts per token.
+
+        Returns:
+            Opaque MoK workspace shared by schedule construction and kernels.
+        """
         return _mok_functional.get_workspace(
             self.config,
             self.ep_group,
@@ -171,38 +190,37 @@ class _MoKRuntime:
             topk=topk,
         )
 
-    @staticmethod
-    def _weight_cache_key(weight: torch.Tensor) -> tuple[object, ...]:
-        """Identify one materialized routed weight without retaining the BF16 tensor."""
-        try:
-            version: int | None = weight._version
-        except RuntimeError:  # Inference tensors do not expose a version counter.
-            version = None
-        return (weight.device, weight.data_ptr(), weight.storage_offset(), weight.shape, weight.stride(), version)
-
     def _get_mxfp8_weights(
         self,
         routed_gate_weights: torch.Tensor,
         routed_up_weights: torch.Tensor,
         routed_down_weights: torch.Tensor,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...]:
-        """Prequantize all weight layouts once and reuse them through AC and backward.
+        """Prequantize all routed-weight layouts once per optimizer generation.
 
-        The cache is local to one MoE layer. It is retained through backward and,
-        during training, across microbatches until the optimizer updates the BF16
-        weights. Its key includes storage identity and tensor version so a
-        rematerialized or modified weight cannot reuse stale quantized data.
+        Args:
+            routed_gate_weights: Contiguous BF16 tensor of shape
+                [local_experts, expert_intermediate, hidden].
+            routed_up_weights: Contiguous BF16 tensor of shape
+                [local_experts, expert_intermediate, hidden].
+            routed_down_weights: Contiguous BF16 tensor of shape
+                [local_experts, hidden, expert_intermediate].
+
+        Returns:
+            Gate, up, and down projection layouts. Each entry contains the normal
+            E4M3 weight, its E8M0 block scales, the transposed E4M3 weight, and its
+            E8M0 block scales in the opaque layouts consumed by MoK.
         """
         weights = (routed_gate_weights, routed_up_weights, routed_down_weights)
-        cache_key = tuple(self._weight_cache_key(weight) for weight in weights)
-        if self._mxfp8_weights is None or self._mxfp8_cache_key != cache_key:
+        if self._mxfp8_weights is None or self._mxfp8_cached_generation != self._mxfp8_cache_generation:
             self._mxfp8_weights = tuple(_mxfp8_weight_both(weight) for weight in weights)
-            self._mxfp8_cache_key = cache_key
+            self._mxfp8_cached_generation = self._mxfp8_cache_generation
         return self._mxfp8_weights
 
-    def _clear_mxfp8_forward_cache(self) -> None:
-        """Drop runtime references when their BF16 source weights may change."""
-        self._mxfp8_cache_key = None
+    def _invalidate_mxfp8_cache(self) -> None:
+        """Advance the BF16-weight generation and drop its quantized tensors."""
+        self._mxfp8_cache_generation += 1
+        self._mxfp8_cached_generation = None
         self._mxfp8_weights = None
 
     def initialize(self, ep_mesh: DeviceMesh, *, n_routed_experts: int) -> None:
@@ -264,8 +282,11 @@ class _MoKRuntime:
                 [local_experts, hidden, expert_intermediate].
 
         Returns:
-            Tuple containing output of shape [tokens, hidden], an opaque MoK schedule,
-            and an opaque MoK forward context.
+            Tuple containing the BF16 output of shape [tokens, hidden], an opaque
+            MoK schedule, an opaque MoK forward context, and prequantized routed
+            weights. The weights are ``None`` for BF16. For MXFP8 they contain the
+            gate, up, and down projections, each represented by
+            ``(weight_fp8, weight_scale, weight_t_fp8, weight_t_scale)``.
         """
         if self.ep_group is None or self.config is None:
             raise RuntimeError("MoK expert runtime was used before expert-parallel initialization")
@@ -338,6 +359,10 @@ class _MoKRuntime:
                 [local_experts, expert_intermediate, hidden].
             routed_down_weights: Contiguous BF16 tensor of shape
                 [local_experts, hidden, expert_intermediate].
+            mxfp8_weights: Prequantized gate, up, and down projections. Each is a
+                tuple ``(weight_fp8, weight_scale, weight_t_fp8, weight_t_scale)``
+                in MoK's opaque E4M3/E8M0 layouts. Must be non-``None`` for MXFP8
+                and ``None`` for BF16.
 
         Returns:
             Tuple of gradients for ``x``, router weights, three routed weights,
@@ -381,7 +406,7 @@ class _MoKRuntime:
             )
         finally:
             if not self._retain_mxfp8_cache_until_optimizer_step:
-                self._clear_mxfp8_forward_cache()
+                self._invalidate_mxfp8_cache()
 
 
 class _MoKAutogradFunction(torch.autograd.Function):
@@ -707,6 +732,7 @@ class GroupedExpertsMoK(nn.Module):
             canonical_down = routed_down.new_empty((routed_down.size(0), inter_dim, self.config.dim))
             canonical_down.normal_(mean=0.0, std=init_std)
             routed_down.copy_(canonical_down.transpose(-1, -2))
+        self.runtime._invalidate_mxfp8_cache()
 
     def _save_to_state_dict(
         self,
@@ -764,22 +790,48 @@ class GroupedExpertsMoK(nn.Module):
                         f"Cannot load {down_key}: expected local shape {expected_down_shape}, got {tuple(down.shape)}"
                     )
                 _local_tensor(self.routed_down_weights).copy_(down.transpose(-1, -2))
+        self.runtime._invalidate_mxfp8_cache()
 
 
-def enable_mok_mxfp8_optimizer_step_cache(model_parts: list[nn.Module]) -> tuple[_MoKRuntime, ...]:
-    """Keep prequantized routed weights across microbatches with unchanged weights."""
-    runtimes = tuple(
-        module.runtime
+def enable_mok_mxfp8_optimizer_step_cache(
+    model_parts: list[nn.Module], optimizers: list[torch.optim.Optimizer]
+) -> None:
+    """Retain MXFP8 weights within a step and invalidate them after optimizer updates.
+
+    Args:
+        model_parts: Pipeline model parts paired one-to-one with ``optimizers``.
+        optimizers: Optimizers whose post-step hooks own cache invalidation.
+    """
+    runtimes_by_part = tuple(
+        tuple(
+            module.runtime
+            for module in model_part.modules()
+            if isinstance(module, GroupedExpertsMoK) and module.runtime.mok_config.precision == "mxfp8"
+        )
         for model_part in model_parts
-        for module in model_part.modules()
-        if isinstance(module, GroupedExpertsMoK) and module.runtime.mok_config.precision == "mxfp8"
     )
-    for runtime in runtimes:
-        runtime._retain_mxfp8_cache_until_optimizer_step = True
-    return runtimes
+    if not any(runtimes_by_part):
+        return
+    if len(runtimes_by_part) != len(optimizers):
+        raise ValueError(
+            f"MoK MXFP8 cache expected one optimizer per model part, got {len(optimizers)} optimizers "
+            f"for {len(model_parts)} parts"
+        )
 
+    for runtimes, optimizer in zip(runtimes_by_part, optimizers, strict=True):
+        if not runtimes:
+            continue
+        for runtime in runtimes:
+            runtime._retain_mxfp8_cache_until_optimizer_step = True
 
-def clear_mok_mxfp8_optimizer_step_cache(runtimes: tuple[_MoKRuntime, ...]) -> None:
-    """Invalidate prequantized weights immediately after their BF16 masters update."""
-    for runtime in runtimes:
-        runtime._clear_mxfp8_forward_cache()
+        def invalidate_cache_after_step(
+            _optimizer: torch.optim.Optimizer,
+            _args: tuple[object, ...],
+            _kwargs: dict[str, object],
+            *,
+            runtimes: tuple[_MoKRuntime, ...] = runtimes,
+        ) -> None:
+            for runtime in runtimes:
+                runtime._invalidate_mxfp8_cache()
+
+        optimizer.register_step_post_hook(invalidate_cache_after_step)

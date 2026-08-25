@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Full pretrained GLM-5.2 100-step mock-data run on 16x4 GB200 GPUs.
+# Full pretrained GLM-5.2 100-step FineWeb run on 16x4 GB200 GPUs.
+# Point dataset.file_pattern at NanoGPT-format FineWeb shards before launching.
 #
 # Per-node command for a 16-node launcher, MoK MXFP8 (default):
-#   automodel examples/llm_pretrain/glm/glm_5.2_mok_mxfp8_mock_8k.yaml --nproc-per-node 4
+#   automodel examples/llm_pretrain/glm/glm_5.2_mok_mxfp8_fineweb_8k.yaml --nproc-per-node 4
 #
 # Matched HybridEP BF16 baseline:
-#   automodel examples/llm_pretrain/glm/glm_5.2_mok_mxfp8_mock_8k.yaml --nproc-per-node 4 \
+#   automodel examples/llm_pretrain/glm/glm_5.2_mok_mxfp8_fineweb_8k.yaml --nproc-per-node 4 \
 #     --model.backend.dispatcher=hybridep --model.backend.mok.precision=bf16 \
-#     --wandb.name=glm-5.2-hep-bf16-mock-8k
+#     --wandb.name=glm-5.2-hep-bf16-fineweb-8k
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -92,15 +93,16 @@ loss_fn:
   fp32_upcast: true
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  vocab_size: 154880
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  file_pattern: /path/to/fineweb_train_*.bin  # REPLACE THIS
   seq_len: 8192
-  num_samples: 100000
-  batch_size: 1
+  shuffle_files: false
+  align_to_bos: false
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: null
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
   num_workers: 0
 
 optimizer:
@@ -125,13 +127,35 @@ wandb:
   enable: false
   entity: ${oc.env:WANDB_ENTITY,Nemo-automodel}
   project: ${oc.env:WANDB_PROJECT,mok}
-  name: glm-5.2-mok-mxfp8-mock-8k
-  group: mxfp8-core-convergence100-glm52-mock-8k
+  name: glm-5.2-mok-mxfp8-fineweb-8k
+  group: mxfp8-core-convergence100-glm52-fineweb-8k
   mode: online
-  dir: ${oc.env:WANDB_DIR,training_logs/wandb}
+  dir: training_logs/wandb
 
 ci:
   recipe_owner: HuiyingLi
-  time: "00:40:00"
-  nodes: 16
+  time: "00:30:00"
+  nodes: 1
   cluster_tag: gb200
+  env_vars:
+    REQUIRE_FINITE_METRICS: "true"
+  nightly:
+    step_scheduler.global_batch_size: 4
+    step_scheduler.local_batch_size: 1
+    step_scheduler.max_steps: 4
+    model.load_base_model: false
+    model.config.num_hidden_layers: 4
+    model.backend.enable_hf_state_dict_adapter: false
+    distributed.activation_checkpointing: false
+    distributed.ep_size: 4
+    checkpoint.enabled: false
+    dataset:
+      _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+      vocab_size: 1024
+      seq_len: 1024
+      num_samples: 16
+      batch_size: 1
+    dataloader:
+      _target_: torch.utils.data.DataLoader
+      batch_size: null
+      num_workers: 0
