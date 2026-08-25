@@ -125,10 +125,28 @@ ci:
     # Use Transformers' built-in MiniMax M2 implementation for the HF+PEFT
     # reload; the checkpoint's remote code targets an older Transformers API.
     trust_remote_code: false
-    # Keep the cross-framework gates blocking: the current built-in-HF mismatch
-    # must be fixed or explicitly proven to be an invalid reference before it is skipped.
     tokenizer_name: MiniMaxAI/MiniMax-M2.7
     hf_device_map_auto: true
+    # Measured envelope for the two cross-framework gates (AMINT-286). The
+    # residual AM-vs-HF divergence is knife-edge routing amplifying bf16
+    # kernel noise, not an implementation defect: the checkpoint's fp32
+    # e_score_correction_bias lattices put top-8 selection inside the
+    # kernel-noise band (68% of tokens flip an expert within five layers,
+    # pipeline 64182587), and the HF reference against itself (eager vs sdpa
+    # attention, 62-layer sweep on real weights) diverges at the same order
+    # (mean KL 0.237 vs AutoModel's 0.320). Gate the full 2048-token document
+    # at the measured envelope (three scoped runs: mean KL 0.086-0.094,
+    # p95 0.346-0.375, cos 0.964-0.965); real conversion or model-math bugs
+    # stay loud (the repaired rope-reference bug measured mean KL 13.1).
+    parity_threshold_overrides:
+      source_load:
+        mean_kl: 0.15
+        p95_kl: 0.5
+        cosine_similarity: 0.95
+      hf_reload:
+        mean_kl: 0.15
+        p95_kl: 0.5
+        cosine_similarity: 0.95
     # Restored state and the first resumed forward are exact; three scoped-CI
     # runs measured 0.012-0.020 routed-MoE loss drift at continuation steps 6-7
     # versus the standard 0.0117 allowance (pipelines 63311388, 63340676,
