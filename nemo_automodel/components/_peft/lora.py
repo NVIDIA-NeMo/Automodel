@@ -318,18 +318,23 @@ class LinearLoRA(nn.Linear):
             if self.dropout_position == "pre":
                 x = F.dropout(x, p=self.dropout_p, training=self.training)
 
+            # F.linear requires the adapter and activation dtypes to match;
+            # compute in the adapter dtype, cast the addend to `res`'s.
+            lora_x = x.to(self.lora_A.weight.dtype)
             # Apply scale before lora_B to keep lora_res as a Partial tensor.
             # This allows both res and lora_res to remain Partial, so only one reduce-scatter is needed after addition.
             # Multiplying after lora_B would convert Partial to Replicate, causing an extra reduce-scatter operation.
-            use_memory_efficient_lora = self._should_use_memory_efficient_lora(x)
+            use_memory_efficient_lora = self._should_use_memory_efficient_lora(lora_x)
             if use_memory_efficient_lora:
                 if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
                     return apply_memory_efficient_lora(
-                        x, self.lora_A.weight, self.lora_B.weight, self.scale, False, res
-                    )
-                lora_res = apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, False)
+                        lora_x, self.lora_A.weight, self.lora_B.weight, self.scale, False, res
+                    ).to(res.dtype)
+                lora_res = apply_memory_efficient_lora(
+                    lora_x, self.lora_A.weight, self.lora_B.weight, self.scale, False
+                ).to(res.dtype)
             else:
-                lora_res = self.lora_B(self.lora_A(x) * self.scale)
+                lora_res = self.lora_B(self.lora_A(lora_x) * self.scale).to(res.dtype)
             if self.dropout_position == "post":
                 lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
             if use_memory_efficient_lora:
@@ -414,11 +419,22 @@ class TritonLinearLoRA(LinearLoRA):
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
         if self.use_memory_efficient_lora:
+            # Canonicalize to the base output dtype: the kernel requires one
+            # dtype across x, adapters, and output, and the addend must match
+            # `res` for the fused addition. The casts are outside the autograd
+            # Function, so gradients flow back in the original dtypes.
+            compute_dtype = res.dtype
+            x = x.to(compute_dtype)
+            lora_A_weight = self.lora_A.weight.to(compute_dtype)
+            lora_B_weight = self.lora_B.weight.to(compute_dtype)
             if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
-                return apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True, res)
-            lora_res = apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True)
+                return apply_memory_efficient_lora(x, lora_A_weight, lora_B_weight, self.scale, True, res)
+            lora_res = apply_memory_efficient_lora(x, lora_A_weight, lora_B_weight, self.scale, True)
         else:
-            lora_res = self.lora_B(self.lora_A(x) * self.scale)
+            # Module calls need the activation in the adapter dtype; cast the
+            # addend back to the base output dtype.
+            lora_x = x.to(self.lora_A.weight.dtype)
+            lora_res = self.lora_B(self.lora_A(lora_x) * self.scale).to(res.dtype)
         if self.dropout_position == "post":
             lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
         if self.use_memory_efficient_lora:
