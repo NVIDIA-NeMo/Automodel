@@ -22,15 +22,23 @@ keys the draft DDP group / sampler / checkpointer on. Real multi-rank TP is
 validated on the server.
 """
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 import nemo_automodel.recipes.llm.train_dflash as train_dflash
-from nemo_automodel.components.speculative.dflash.core import DFlashStepMetrics, DFlashTrainerModule, _to_full_tensor
+from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+from nemo_automodel.components.speculative.dflash.core import (
+    DFlashStepMetrics,
+    DFlashTrainerModule,
+    NoValidAnchorsError,
+    _to_full_tensor,
+)
 from nemo_automodel.components.speculative.dflash.domino_core import DominoStepMetrics, DominoTrainerModule
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
@@ -96,7 +104,160 @@ def _tp_target_modules():
     parallelize_module(
         embed, mesh, RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate(), use_local_output=False)
     )
+    lm_head.requires_grad_(False)
+    embed.requires_grad_(False)
     return lm_head, embed
+
+
+def _run_two_rank_materialized_head(rank: int, init_file: str) -> None:
+    """Exercise real TP weight gathering and fused draft-gradient parity."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard
+    from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=2)
+    try:
+        torch.manual_seed(23)
+        head = nn.Linear(HIDDEN, VOCAB, bias=False)
+        reference_weight = head.weight.detach().clone()
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("tp",))
+        parallelize_module(head, mesh, ColwiseParallel(output_layouts=Shard(-1), use_local_output=False))
+        head.requires_grad_(False)
+        embed = nn.Embedding(VOCAB, HIDDEN).requires_grad_(False)
+        trainer = DFlashTrainerModule(
+            draft_model=nn.Identity(),
+            target_lm_head=head,
+            target_embed_tokens=embed,
+            mask_token_id=MASK_ID,
+            block_size=BLOCK_SIZE,
+            attention_backend="sdpa",
+            num_anchors=2,
+            use_fused_linear_ce=True,
+            linear_ce_chunk_size=3,
+        )
+
+        gathered_weight, gathered_bias = trainer._materialize_frozen_lm_head(torch.device("cpu"))
+        torch.testing.assert_close(gathered_weight, reference_weight)
+        assert gathered_bias is None
+
+        B, N = 2, 2
+        T = N * (BLOCK_SIZE - 1)
+        hidden = torch.randn(B, T, HIDDEN, requires_grad=True)
+        hidden_ref = hidden.detach().clone().requires_grad_(True)
+        target_ids = torch.randint(0, VOCAB, (B, T))
+        block_mask = torch.ones(B, T)
+        loss_fn = DFlashDecayLoss(loss_gamma=4.0, chunk_size=3, normalize="mean")
+        actual, actual_correct = loss_fn.forward_fused_with_correct(
+            hidden,
+            gathered_weight,
+            target_ids,
+            block_mask,
+            block_size=BLOCK_SIZE,
+        )
+        expected_logits = torch.nn.functional.linear(hidden_ref, reference_weight)
+        expected = loss_fn(expected_logits, target_ids, block_mask, block_size=BLOCK_SIZE)
+
+        torch.testing.assert_close(actual.total_loss, expected.total_loss)
+        assert torch.equal(actual_correct, expected_logits.argmax(dim=-1) == target_ids)
+        actual.total_loss.backward()
+        expected.total_loss.backward()
+        torch.testing.assert_close(hidden.grad, hidden_ref.grad, atol=1e-6, rtol=1e-5)
+    finally:
+        dist.destroy_process_group()
+
+
+class _AncestorOwnedFrozenHead(nn.Module):
+    """Target root whose child head parameter is owned by root-level FSDP2."""
+
+    def __init__(self):
+        super().__init__()
+        self.lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
+
+
+def _run_two_rank_fsdp_ancestor_head_forward(rank: int, init_file: str) -> None:
+    """Exercise full DFlash forwards against an ancestor-owned FSDP2 head."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import FSDPModule, fully_shard
+    from torch.distributed.tensor import DTensor
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.manual_seed(31)
+        target_root = _AncestorOwnedFrozenHead().requires_grad_(False)
+        expected_head_weight = target_root.lm_head.weight.detach().clone()
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
+
+        # Only the ancestor is an FSDP unit. The child lm_head has no forward
+        # hook that may be called independently; its parameter is nevertheless
+        # a sharded DTensor owned by the ancestor's FSDP state.
+        fully_shard(target_root, mesh=mesh)
+        assert isinstance(target_root, FSDPModule)
+        assert isinstance(target_root.lm_head.weight, DTensor)
+        assert not isinstance(target_root.lm_head, FSDPModule)
+
+        embed = nn.Embedding(VOCAB, HIDDEN).requires_grad_(False)
+        trainer = DFlashTrainerModule(
+            draft_model=_draft_model(),
+            target_lm_head=target_root.lm_head,
+            target_embed_tokens=embed,
+            mask_token_id=MASK_ID,
+            block_size=BLOCK_SIZE,
+            attention_backend="sdpa",
+            num_anchors=4,
+            loss_decay_gamma=4.0,
+            use_fused_linear_ce=True,
+            linear_ce_chunk_size=2,
+        )
+
+        gathered_weight, gathered_bias = trainer._materialize_frozen_lm_head(torch.device("cpu"))
+        torch.testing.assert_close(gathered_weight, expected_head_weight)
+        assert gathered_bias is None
+
+        input_ids = torch.randint(0, VOCAB - 1, (1, 12))
+        hidden = torch.randn(1, 12, len(TARGET_LAYER_IDS) * HIDDEN)
+        loss_mask = torch.ones(1, 12) if rank == 0 else torch.zeros(1, 12)
+        # Rank 0 constructs four blocks (12 predicted positions, six CE
+        # chunks). Rank 1's only legal candidate is the final possible anchor,
+        # whose three continuation positions are supervised, so it constructs
+        # one block (three predicted positions, two chunks).
+        if rank == 1:
+            loss_mask[:, 8:] = 1
+
+        metrics = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+        assert torch.isfinite(metrics.loss)
+        assert metrics.valid_blocks.item() == (4 if rank == 0 else 1)
+        metrics.loss.backward()
+        draft_grads = [parameter.grad for parameter in trainer.draft_model.parameters() if parameter.grad is not None]
+        assert draft_grads
+        assert all(torch.isfinite(grad).all() for grad in draft_grads)
+        assert target_root.lm_head.weight.grad is None
+
+        block_counts = torch.tensor([metrics.valid_blocks.item()], dtype=torch.int64)
+        gathered_counts = [torch.empty_like(block_counts) for _ in range(2)]
+        dist.all_gather(gathered_counts, block_counts)
+        assert [int(count.item()) for count in gathered_counts] == [4, 1]
+
+        # A data-dependent empty-anchor rank must still participate in the
+        # ancestor-owned head's full_tensor collective before raising. Rank 0
+        # completes its unequal local work, then both ranks reach the barrier.
+        no_anchor_mask = torch.ones(1, 12) if rank == 0 else torch.zeros(1, 12)
+        if rank == 0:
+            result = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=no_anchor_mask)
+            assert torch.isfinite(result.loss)
+        else:
+            with pytest.raises(NoValidAnchorsError):
+                trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=no_anchor_mask)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
 
 
 # --------------------------------------------------------------------------- #
@@ -119,6 +280,40 @@ def test_to_full_tensor_gathers_vocab_sharded_dtensor(single_rank_pg):
     out = _to_full_tensor(sharded)
     assert not hasattr(out, "full_tensor")
     torch.testing.assert_close(out, full)
+
+
+def test_materialized_frozen_head_moves_to_compute_device():
+    head = nn.Linear(HIDDEN, VOCAB, bias=True).requires_grad_(False)
+    trainer = DFlashTrainerModule(
+        draft_model=nn.Identity(),
+        target_lm_head=head,
+        target_embed_tokens=nn.Embedding(VOCAB, HIDDEN).requires_grad_(False),
+        mask_token_id=MASK_ID,
+        block_size=BLOCK_SIZE,
+        use_fused_linear_ce=True,
+    )
+
+    weight, bias = trainer._materialize_frozen_lm_head(torch.device("meta"))
+
+    assert weight.device.type == "meta"
+    assert bias is not None and bias.device.type == "meta"
+
+
+def test_materialized_frozen_head_treats_empty_bias_placeholder_as_no_bias():
+    head = nn.Linear(HIDDEN, VOCAB, bias=False).requires_grad_(False)
+    head.bias = nn.Parameter(torch.empty(0), requires_grad=False)
+    trainer = DFlashTrainerModule(
+        draft_model=nn.Identity(),
+        target_lm_head=head,
+        target_embed_tokens=nn.Embedding(VOCAB, HIDDEN).requires_grad_(False),
+        mask_token_id=MASK_ID,
+        block_size=BLOCK_SIZE,
+        use_fused_linear_ce=True,
+    )
+
+    _, bias = trainer._materialize_frozen_lm_head(torch.device("cpu"))
+
+    assert bias is None
 
 
 # --------------------------------------------------------------------------- #
@@ -165,6 +360,21 @@ def test_trainer_runs_with_tensor_parallel_target(single_rank_pg, use_fused_line
     assert all(torch.isfinite(p.grad).all() for p in draft.parameters() if p.grad is not None)
     grad = sum(p.grad.abs().sum().item() for p in draft.parameters() if p.grad is not None)
     assert grad > 0
+
+
+def test_materialized_tp_head_two_rank_loss_and_gradient_parity(tmp_path):
+    """Two real ranks gather the frozen TP weight once and match the dense reference."""
+    mp.spawn(_run_two_rank_materialized_head, args=(str(tmp_path / "dflash_tp_head"),), nprocs=2, join=True)
+
+
+def test_fsdp2_ancestor_owned_head_full_forward_with_unequal_rank_work(tmp_path):
+    """Full forwards gather a root-FSDP2-owned head before rank-local chunking."""
+    mp.spawn(
+        _run_two_rank_fsdp_ancestor_head_forward,
+        args=(str(tmp_path / "dflash_fsdp_ancestor_head"),),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.parametrize("shift_label", [True, False])

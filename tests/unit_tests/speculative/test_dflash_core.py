@@ -64,6 +64,8 @@ def _build_trainer(
     draft = Qwen3DFlashDraftModel(cfg)
     lm_head = torch.nn.Linear(HIDDEN, VOCAB, bias=False)
     embed = torch.nn.Embedding(VOCAB, HIDDEN)
+    lm_head.requires_grad_(False)
+    embed.requires_grad_(False)
     return DFlashTrainerModule(
         draft_model=draft,
         target_lm_head=lm_head,
@@ -247,6 +249,37 @@ def test_fused_linear_ce_rejects_variable_prefix_objective():
             loss_type="variable_prefix",
             use_fused_linear_ce=True,
         )
+
+
+def test_constructor_preserves_historical_positional_prefix():
+    trainer = _build_trainer()
+
+    positional = DFlashTrainerModule(
+        trainer.draft_model,
+        trainer.lm_head,
+        trainer.embed_tokens,
+        MASK_ID,
+        BLOCK_SIZE,
+        "sdpa",
+        8,
+        4.0,
+        "dflash",
+        0.9,
+    )
+
+    assert positional.loss_decay_gamma == 4.0
+    assert positional.loss_type == "dflash"
+    assert positional.prefix_weight_base == 0.9
+    assert positional.max_total_anchors is None
+
+
+def test_fused_linear_ce_requires_frozen_target_head():
+    trainer = _build_trainer(use_fused_linear_ce=True)
+    trainer.lm_head.requires_grad_(True)
+    input_ids, hidden, loss_mask = _inputs()
+
+    with pytest.raises(ValueError, match="frozen target LM head"):
+        trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
 
 
 def test_fused_linear_ce_matches_dense_metrics_and_draft_gradients():

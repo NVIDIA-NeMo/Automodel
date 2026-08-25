@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from nemo_automodel.components.speculative.dflash import draft_qwen3
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
     _sliding_window_mask,
@@ -128,6 +129,38 @@ def test_draft_forward_output_shape():
     out = draft(position_ids=position_ids, attention_mask=None, noise_embedding=noise, target_hidden=target_hidden)
     assert out.shape == (B, Q, H)
     assert torch.isfinite(out).all()
+
+
+def test_flex_attention_forces_regular_kernel_for_short_dynamic_queries(monkeypatch):
+    cfg = _draft_cfg()
+    cfg._attn_implementation = "flex_attention"
+    captured_options = []
+
+    def fake_flex_attention(_module, query, _key, _value, _mask, **kwargs):
+        captured_options.append(kwargs["kernel_options"])
+        return query.transpose(1, 2), None
+
+    monkeypatch.setattr(
+        draft_qwen3,
+        "ALL_ATTENTION_FUNCTIONS",
+        {"flex_attention": fake_flex_attention},
+    )
+    draft = Qwen3DFlashDraftModel(cfg)
+    batch, context, query = 2, 10, 12
+    noise = torch.randn(batch, query, cfg.hidden_size)
+    target_hidden = torch.randn(batch, context, len(cfg.dflash_config["target_layer_ids"]) * cfg.hidden_size)
+    position_ids = torch.arange(context + query).unsqueeze(0).expand(batch, -1)
+
+    output = draft(
+        position_ids=position_ids,
+        attention_mask=None,
+        noise_embedding=noise,
+        target_hidden=target_hidden,
+    )
+
+    assert output.shape == noise.shape
+    assert len(captured_options) == cfg.num_hidden_layers
+    assert all(options["FORCE_USE_FLEX_ATTENTION"] for options in captured_options)
 
 
 class _ConstantTarget(torch.nn.Module):

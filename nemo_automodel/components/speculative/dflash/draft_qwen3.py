@@ -222,6 +222,15 @@ class Qwen3DFlashAttention(nn.Module):
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        if self.config._attn_implementation == "flex_attention":
+            # PyTorch's AUTO backend selects a separate flex-decoding lowering
+            # for rank-local query lengths below 128. Some dynamic speech
+            # batches have no valid decoding autotune choice, while other ranks
+            # select the regular FlexAttention kernel and proceed. Force the
+            # regular kernel so every rank supports the same dynamic shapes.
+            kernel_options = dict(kwargs.get("kernel_options") or {})
+            kernel_options.setdefault("FORCE_USE_FLEX_ATTENTION", True)
+            kwargs["kernel_options"] = kernel_options
         attn_output, attn_weights = attn_fn(
             self,
             q,
