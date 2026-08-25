@@ -147,4 +147,117 @@ LM head trainable — required to learn 48/49.
   <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_sft.png" alt="Gemma4-31B base SFT training loss curve on CoderForge" width="700">
 </p>
 
-## Phase 3 — SWE-bench Verified evaluation — *next*
+## Phase 3 — SWE-bench Verified evaluation
+
+### Goal
+
+Check whether CoderForge SFT gives the **raw base** `google/gemma-4-31B` (a
+pretrained model with *no* instruction/agent tuning) any **agentic** ability at
+all, versus the un-SFT'd base. The scripts referenced below live in the shared
+[`../eval/`](../eval) directory (model-agnostic; reused by the qwen3-32b eval too) —
+parameterize the `/path/to/...` placeholders and `<account>` for your cluster.
+
+### Scaffold
+
+The [OpenHands](https://github.com/All-Hands-AI/OpenHands) v0.52.1
+3-tool surface (`execute_bash` / `str_replace_editor` / `finish`) — the exact tools
+CoderForge trajectories were generated on — is presented to the served checkpoint
+(vLLM, with the built-in `gemma4` tool-call parser **disabled** — `NOPARSER=1`; see
+"Why NOPARSER=1" below) and executed against each SWE-bench instance's repo inside a
+**Docker-less enroot** container. Grading is local-in-enroot with the official
+`swebench` spec (gold patches → 5/5 resolved, so the grader is trusted).
+
+### Steps (from `../eval/`)
+
+```bash
+bash setup_eval_tooling.sh                    # py3.10 venv + agent + swebench harness
+SUBSET=verified sbatch prewarm_images.sub     # pre-import instance images once (CPU)
+
+# Serve each checkpoint + run the 3-tool agent -> preds.json (serve+agent on one 8-GPU node).
+# NOPARSER=1 is REQUIRED for these checkpoints (see "Why NOPARSER=1" below); serve both the base
+# and the SFT identically so the base-vs-SFT delta reflects the model, not the serving config.
+RUN_TAG=oh3_base NAME=gemma4base MODEL=<base google/gemma-4-31B consolidated> \
+  SLICE=0:500 SUBSET=verified NOPARSER=1 MAX_TOKENS=16384 TP=2 DP=4 WORKERS=16 \
+  sbatch --gpus-per-node=8 openhands3_run.sub
+RUN_TAG=oh3_sft  NAME=gemma4cf   MODEL=<CoderForge-SFT consolidated> \
+  SLICE=0:500 SUBSET=verified NOPARSER=1 MAX_TOKENS=16384 TP=2 DP=4 WORKERS=16 \
+  sbatch --gpus-per-node=8 openhands3_run.sub
+
+# Grade both locally (SUBSET must match the eval subset; always confirm enroot-errs=0
+# before trusting a 0.0 resolve)
+PREDS=<runs>/oh3_base/preds.json SUBSET=verified RUN_TAG=grade_base sbatch grade_enroot.sub
+PREDS=<runs>/oh3_sft/preds.json  SUBSET=verified RUN_TAG=grade_sft  sbatch grade_enroot.sub
+```
+
+### Note
+
+**1. Why `NOPARSER=1`:** A tool call is only usable if something parses the model's raw
+text into a structured `{name, arguments}` call. Both the raw base and the CoderForge
+SFT emit their arguments in the **base model's pretrained JSON prior** —
+`call:name{"command":"...","path":"..."}` (quoted JSON) — because 800 SFT steps don't
+overwrite that prior. vLLM's `--tool-call-parser gemma4` expects the *native* unquoted
+syntax that the **gemma4-`it` (instruction-tuned)** model emits (`{command:<value>}`),
+and **mangles** the JSON form: it folds the
+leading `{"` into the key (`{"command"`), so every argument comes out corrupted
+(measured: 727/727 `execute_bash` returned non-zero, 349/349 editor calls rejected —
+0% usable). `NOPARSER=1` disables that parser (and sets `tool_choice=none`, so vLLM
+still renders the tool schemas into the prompt but doesn't try to parse/force a call);
+the raw `call:name{...}` then reaches the response `content`, where `oh3_run.py`'s
+`json.loads`-first fallback recovers the JSON dict cleanly. Because base and SFT share
+the same JSON prior, **both** must run with `NOPARSER=1` — and serving them identically
+is what makes the base-vs-SFT comparison fair. (An `-it`/instruct checkpoint that emits
+Gemma-native args is the opposite case: leave the parser **on**, i.e. omit `NOPARSER`.)
+
+**2. Base serve note:** The raw base checkpoint is missing the `-it` model's serving
+fields, so two things must be set up before it can tool-call at all:
+
+- **`response_schema`** — a field in the `-it` `tokenizer_config.json` that declares the
+  tool-call *text format* (the `call:name{...}` envelope, regex
+  `call:(?P<name>\w+)(?P<arguments>\{.*\})`) so vLLM can recognize a tool call in the
+  output stream. The base config doesn't have it → **copy the `response_schema` block
+  from the `-it` config into the base's `tokenizer_config.json`**. (`oh3_run.py` mirrors
+  this same regex host-side, so the `NOPARSER=1` fallback recovers calls too.)
+- **`stop_token_ids=[1,106,50]`** — Gemma4's per-turn stop is `<end_of_turn>` = token
+  **106**, but the base's `generation_config` only lists `eos` = token **1**; without
+  forcing 106 the model runs past its turn boundary and never yields control back to the
+  agent. So `oh3_run.py` forces the stop set `[1, 106, 50]` (eos, turn-stop, and one more
+  Gemma stop marker) so each turn ends cleanly. Models with a correct `generation_config`
+  (e.g. Qwen3) instead set `OH3_STOP_TOKEN_IDS=""` to use their own `eos`.
+
+**`probe_indist.py`** is a one-call served smoke test: it hits the running vLLM **once**
+with the 3-tool schema and checks whether the checkpoint emits a real structured
+`call:name{...}` tool call versus just planning in prose — i.e. it confirms the serving
+config (`response_schema` + `stop_token_ids` + parser choice) is correct, and that the
+checkpoint has crossed over from text-only planning to structured tool calls, **before**
+you commit to a full 500-instance run.
+
+### Result — SFT installs agentic behavior; the raw base has none
+
+Base vs the **step-799** CoderForge SFT checkpoint, same OpenHands 3-tool scaffold,
+on all **500 SWE-bench Verified** tasks (7,972 assistant turns, 14,011 tool calls):
+
+| | Base `gemma-4-31B` (un-SFT'd) | CoderForge SFT (step 799) |
+|---|---|---|
+| Structured `tool_calls` | **0** (never emits one) | **7972 / 7972 turns = 100%** |
+| Tools used | none | `think` + `execute_bash` + `str_replace_editor` |
+| Turns per task | ~33 identical planning turns, then aborts | mean **15.9**, median **15** (range 2–56) |
+| Arg fidelity | — | **clean** (0% `\uXXXX` garbage, 0/500 trajectories) |
+| Terminates (`finish`) | never acts (`never_toolcalled`) | 0 / 500 (candidate patches produced, none applied) |
+| Resolved (official `swebench`) | — | **0 / 500 = 0.0%** (grading valid, enroot-errs 0) |
+
+**Base — never acts.** The raw base emits **zero** tool calls and repeats the same
+planning checklist verbatim every turn ("Phase 1. READING… 1.1 … 1.2 …") until the
+harness aborts (`never_toolcalled`) — a property of the raw pretrained model, not the
+checkpoint. It plans forever and never acts.
+
+**SFT — real agentic behavior.** After CoderForge SFT the step-799 model opens each
+task with a `think` that diagnoses the bug, then drives real exploration: across all
+500 Verified tasks **100% of turns (7972/7972) are structured OpenHands tool calls**
+(`execute_bash` ×9423, `str_replace_editor` ×4088, `think` ×500; mean 15.9 turns/task,
+args clean — 0/500 garbled). It does not yet emit `finish`, so runs end without a
+landed patch: candidate diffs are produced but do not apply cleanly, and the official
+`swebench` grader resolves **0/500** (grading valid, enroot-errs 0).
+
+**Takeaway.** CoderForge SFT **installs the agentic process** (tool-calling,
+think-first, correct targeting) into a base model that had none — the goal of this
+long-context CP-SFT validation.
