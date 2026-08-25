@@ -194,6 +194,39 @@ def test_memory_efficient_lora_matches_legacy_forward_and_backward(input_shape):
 
 
 @pytest.mark.parametrize("input_shape", [(5, 16), (2, 3, 16)])
+def test_memory_efficient_lora_mixed_dtype_matches_legacy_forward_and_backward(input_shape):
+    """Custom autograd LoRA should preserve mixed-precision output and gradient contracts."""
+    torch.manual_seed(1234)
+    scale = 1.3
+    lora_dim = 4
+    out_features = 12
+
+    x = torch.randn(*input_shape, dtype=torch.float32, requires_grad=True)
+    lora_A = torch.randn(lora_dim, input_shape[-1], dtype=torch.bfloat16, requires_grad=True)
+    lora_B = torch.randn(out_features, lora_dim, dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    lora_A_ref = lora_A.detach().clone().requires_grad_(True)
+    lora_B_ref = lora_B.detach().clone().requires_grad_(True)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        efficient = apply_memory_efficient_lora(x, lora_A, lora_B, scale, False).float()
+        legacy = F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref).float()
+
+    grad = torch.randn_like(legacy)
+    efficient.backward(grad)
+    legacy.backward(grad)
+
+    assert efficient.dtype == legacy.dtype == torch.float32
+    assert x.grad.dtype == x_ref.grad.dtype == torch.float32
+    assert lora_A.grad.dtype == lora_A_ref.grad.dtype == torch.bfloat16
+    assert lora_B.grad.dtype == lora_B_ref.grad.dtype == torch.bfloat16
+    torch.testing.assert_close(efficient, legacy)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(lora_A.grad, lora_A_ref.grad)
+    torch.testing.assert_close(lora_B.grad, lora_B_ref.grad)
+
+
+@pytest.mark.parametrize("input_shape", [(5, 16), (2, 3, 16)])
 def test_memory_efficient_lora_with_residual_matches_legacy_forward_and_backward(input_shape):
     """Custom autograd LoRA should fold residual addition without changing gradients."""
     torch.manual_seed(1234)
