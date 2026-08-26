@@ -388,10 +388,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
-        # Train metrics reach disk at least as often as the checkpoint they accompany,
-        # capped at the default so a long checkpoint interval cannot buffer unboundedly.
-        # flush because a buffered write only reaches the file object, whose own buffer is
-        # lost with the process. Validation is rare enough to write every point.
+        # buffer_size bounds how many records can be pending, so a hard kill that runs no
+        # cleanup loses at most one checkpoint interval of train metrics; it is NOT what keeps
+        # metrics in step with checkpoints, since it counts records rather than watching
+        # checkpoint boundaries. The explicit flush after each successful checkpoint is what
+        # provides that. flush=True because a buffered write only reaches the file object,
+        # whose own buffer dies with the process. Validation is rare enough to write every
+        # point.
         train_logger_kwargs = {"flush": True}
         if self.step_scheduler.ckpt_every_steps > 0:
             train_logger_kwargs["buffer_size"] = min(DEFAULT_BUFFER_SIZE, self.step_scheduler.ckpt_every_steps)
@@ -445,12 +448,24 @@ class TrainBiEncoderRecipe(BaseRecipe):
                             train_loss=train_log_data.metrics["loss"],
                             val_loss=val_loss,
                         )
+                        # Flush AFTER the checkpoint lands, so a checkpoint is never on disk
+                        # without the metrics describing the steps it covers. Buffer size alone
+                        # does not give this: it counts records, and the count only lines up
+                        # with checkpoint steps while training runs from step 0 with periodic
+                        # checkpoints. Resuming at a step that is not a multiple of
+                        # ckpt_every_steps, or a checkpoint taken at an epoch boundary or the
+                        # final step, leaves the two out of phase.
+                        if self.metric_logger_train is not None:
+                            self.metric_logger_train.flush()
+                        if self.metric_logger_valid is not None:
+                            self.metric_logger_valid.flush()
                     self._maybe_collect_garbage()
 
                     # Poll per step; the StepScheduler iterators stop on the flag.
                     if self.step_scheduler.sigterm_received:
-                        logger.info("Preemption signal received at step %d; stopping cleanly.",
-                                    self.step_scheduler.step)
+                        logger.info(
+                            "Preemption signal received at step %d; stopping cleanly.", self.step_scheduler.step
+                        )
         finally:
             if pbar is not None:
                 pbar.close()

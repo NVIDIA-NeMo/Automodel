@@ -137,10 +137,23 @@ class MetricLogger:
             self._fp.flush()
             os.fsync(self._fp.fileno())
 
+    def _drain(self) -> None:
+        """Write buffered records out. Caller must hold ``self._lock``."""
+        self._save(self._move_to_cpu(self.buffer))
+        self.buffer = []
+
+    def flush(self) -> None:
+        """Write buffered records to disk without closing the file.
+
+        Lets a caller align durability with an external event -- a checkpoint boundary, say --
+        instead of relying on the record count happening to reach ``buffer_size`` there.
+        """
+        with self._lock:
+            self._drain()
+
     def close(self) -> None:
         with self._lock:
-            self._save(self._move_to_cpu(self.buffer))
-            self.buffer = []
+            self._drain()
             try:
                 self._fp.flush()
             except Exception:
@@ -172,6 +185,11 @@ class MetricLoggerDist(MetricLogger):
         if self.rank != 0:
             return
         super().log(record)
+
+    def flush(self) -> None:
+        if self.rank != 0:
+            return
+        super().flush()
 
     def close(self) -> None:
         if self.rank != 0:
