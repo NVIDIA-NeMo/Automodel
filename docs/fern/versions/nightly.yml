@@ -78,6 +78,8 @@ navigation:
             path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
           - page: "Qwen3.8-2.4T-A95B"
             path: ../../model-coverage/llm/qwen/qwen3-8-2-4t-a95b.mdx
+          - page: "Qwen3.8-Flash-Next"
+            path: ../../model-coverage/llm/qwen/qwen3-8-flash-next.mdx
           - page: "Qwen3-Next"
             path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - page: "ERNIE 4.5"
