@@ -90,13 +90,24 @@ class TestNemotronV3StateDictAdapter:
         assert adapter.moe_config == moe_config
         assert adapter.backend == backend
         assert adapter.dtype == torch.bfloat16
-        assert adapter._uses_model_prefix is True
+        assert adapter._uses_model_prefix is False
 
     def test_hf_prefix_property(self, config, moe_config, backend):
-        """Test _hf_prefix property returns 'backbone.'"""
+        """The output prefix tracks the namespace detected from the source checkpoint."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
 
         assert adapter._hf_prefix == "backbone."
+        adapter._uses_model_prefix = True
+        assert adapter._hf_prefix == "model."
+
+    def test_peft_target_module_mapping_tracks_hf_prefix(self, config, moe_config, backend):
+        """PEFT target-module metadata uses the same public namespace as exported tensors."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        native_name = "model.layers.0.mixer.in_proj"
+
+        assert adapter.map_peft_target_module_to_hf(native_name) == "backbone.layers.0.mixer.in_proj"
+        adapter._uses_model_prefix = True
+        assert adapter.map_peft_target_module_to_hf(native_name) == native_name
 
     def test_expert_path_segment_property(self, config, moe_config, backend):
         """Test _expert_path_segment property returns 'mixer.experts'."""
@@ -161,6 +172,7 @@ class TestNemotronV3AdapterDense:
         assert "lm_head.weight" in native
         assert not any(k.startswith("backbone.") for k in native)
         assert not any(k.endswith("norm_f.weight") for k in native)
+        assert adapter._uses_model_prefix is False
 
     def test_round_trip_dense(self, adapter):
         hf_sd = {
@@ -172,6 +184,18 @@ class TestNemotronV3AdapterDense:
         back = adapter.to_hf(dict(native))
 
         assert set(back.keys()) == set(hf_sd.keys())
+
+    def test_peft_outer_prefix_round_trip(self, adapter):
+        hf_key = "base_model.model.backbone.layers.0.mixer.in_proj.lora_A.weight"
+        native_key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
+        tensor = torch.randn(8, 256)
+
+        exported = adapter.to_hf({native_key: tensor})
+        restored = adapter.from_hf(dict(exported))
+
+        assert list(exported) == [hf_key]
+        assert list(restored) == [native_key]
+        torch.testing.assert_close(restored[native_key], tensor)
 
 
 class TestNemotronV3AdapterMTP:
