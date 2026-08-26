@@ -164,8 +164,10 @@ wandb:
 ci:
   recipe_owner: athitten
   nodes: 8
-  # Allow the train/save, AutoModel reload, and resume matrix to finish.
-  time: "01:30:00"
+  # The robustness matrix (train/save, reload, resume) measured 1028s of
+  # phase time on the first scoped run (job 412098422, ~32 min including
+  # CI-side setup outside the Slurm window); 45 min covers it with headroom.
+  time: "00:45:00"
   checkpoint_robustness:
     # PP=4 with pp_microbatch_size=1 needs at least four pipeline microbatches;
     # dp = 64/4 = 16, so global = 4 * 16 with one grad-accum step.
