@@ -1,6 +1,6 @@
 ---
 title: "Model Coverage Overview"
-description: ""
+description: "Hugging Face Auto class support, release history, day-0 coverage, and custom architecture registration for NeMo AutoModel."
 position: 1
 ---
 NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that can be instantiated through `transformers` can also be used with NeMo AutoModel, subject to runtime, third-party software dependencies, and feature compatibility.
@@ -14,7 +14,7 @@ NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that 
 | Block-Diffusion LLMs | Text Generation (Diffusion LLM) | Supported | See [Diffusion LLM model list](/model-coverage/dllm/overview) |
 | `AutoModelForImageTextToText` | Image-Text-to-Text (VLM) | Supported | See [VLM model list](/model-coverage/vision-language-models/overview) |
 | Custom multimodal models | Unified multimodal training | Supported | See [Multimodal model list](/model-coverage/multimodal/overview) |
-| `AutoModelForSequenceClassification` | Sequence Classification | Work in Progress | Early support. Interfaces might change |
+| `AutoModelForSequenceClassification` | Sequence Classification | Work in Progress | Early support; interfaces might change |
 | Diffusers Pipelines | Diffusion Generation (T2I, T2V) | Supported | See [Diffusion model list](/model-coverage/diffusion/overview) |
 | `NeMoAutoModelBiEncoder` | Embedding Models | Supported | See [Embedding model list](/model-coverage/embedding-models/overview) |
 | `NeMoAutoModelCrossEncoder` | Reranking Models | Supported | See [Reranking model list](/model-coverage/reranking-models/overview) |
@@ -28,7 +28,10 @@ The table below tracks when model support and key features were added across NeM
 | **0.3.0** (upcoming) | Not announced | Kimi-VL, Kimi-K25-VL, Gemma 3n, Nemotron-Parse, Qwen3-VL-MoE, Qwen3-Omni, InternVL 3.5, Ministral3, Phi-4-multimodal, Devstral-Small-2, Step-3.5-Flash, Qwen3-Next, Nemotron-3-Nano-30B, FLUX.1-dev, Wan 2.1 T2V, HunyuanVideo 1.5 | MoE LoRA, expanded VLM coverage, diffusion model training (flow matching) |
 | **0.2.0** | Dec 2025 | GPT-OSS 20B/120B, Qwen3, Qwen3-MoE, GLM-4/4-MoE, Qwen2.5-VL, Qwen3-VL | Single- and multi-turn tool calling, streaming dataset, QAT for SFT, sequence classification, async DCP checkpointing, MLflow, CP and sequence packing for MoE |
 | **0.1.0** | Oct 2025 | DeepSeek V3/V3.2, more than 40 LLM architectures, Gemma 3 VLM | Pretraining, knowledge distillation, FP8 (torchao), pipeline parallelism, HSDP, auto pipelining, ColumnMapped dataset |
-| **0.1.0a0** | Sep 2025 | Initial LLM and VLM support (Llama, Mistral, Qwen2, Gemma, Phi, and more) | MegatronFSDP, packed sequences, Triton LoRA kernels |
+| **0.3.0** (upcoming) | Not announced | Kimi-VL, Kimi-K25-VL, Gemma 3n, Nemotron-Parse, Qwen3-VL-MoE, Qwen3-Omni, InternVL 3.5, Ministral3, Phi-4-multimodal, Devstral-Small-2, Step-3.5-Flash, Qwen3-Next, Nemotron-3-Nano-30B, FLUX.1-dev, Wan 2.1 T2V, HunyuanVideo 1.5 | Mixture-of-Experts (MoE) LoRA, expanded VLM coverage, diffusion model training (flow matching) |
+| **0.2.0** | December 2025 | GPT-OSS 20B/120B, Qwen3, Qwen3-MoE, GLM-4/4-MoE, Qwen2.5-VL, Qwen3-VL | Single- and multi-turn tool calling, streaming dataset, QAT for SFT, sequence classification, async DCP checkpointing, MLflow, CP and sequence packing for MoE |
+| **0.1.0** | October 2025 | DeepSeek V3/V3.2, more than 40 LLM architectures, Gemma 3 VLM | Pretraining, knowledge distillation, FP8 (torchao), pipeline parallelism, HSDP, auto pipelining, ColumnMapped dataset |
+| **0.1.0a0** | September 2025 | Initial LLM and VLM support (Llama, Mistral, Qwen2, Gemma, Phi, and more) | MegatronFSDP, packed sequences, Triton LoRA kernels |
 
 ## Day-0 Support
 
@@ -42,7 +45,7 @@ The table below tracks when model support and key features were added across NeM
 NeMo AutoModel includes a custom model registry that allows teams to:
 
 - Add custom implementations to extend support to models not yet covered upstream.
-- Provide optimized or faster implementations for specific models while retaining the same AutoModel interface.
+- Provide optimized or faster implementations for specific models while retaining the same NeMo AutoModel interface.
 
 ### Register an Architecture
 
@@ -86,18 +89,18 @@ with a built-in or another discovered architecture, NeMo AutoModel skips it and 
 <Note>
 Architecture registration selects a model implementation after the Hugging Face config is resolved. It does not
 register a new `model_type`, so the checkpoint config must already be loadable by the installed versions of
-Transformers or NeMo AutoModel.
+Hugging Face `transformers` or NeMo AutoModel.
 </Note>
 
 ### Ready-to-Run Architectures
 
 The following table lists architectures represented by the ready-to-run YAML recipes in this repository. It includes both NeMo-native implementations and models that use the standard Hugging Face implementation path.
 
-This is a practical starting set rather than an exhaustive compatibility list. NeMo AutoModel can also work with additional models supported by the installed version of the Hugging Face `transformers` library, although models without a checked-in recipe may require some configuration for a particular training setup.
+This is a practical starting set rather than an exhaustive compatibility list. NeMo AutoModel can also work with additional models supported by the installed version of the Hugging Face `transformers` library, although models without a checked-in recipe might require some configuration for a particular training setup.
 
 {/* BEGIN GENERATED MODEL ARCHITECTURES */}
 {/* END GENERATED MODEL ARCHITECTURES */}
 
 ## Having Issues?
 
-If a model from the Hub does not work as expected, see [Troubleshooting](/model-coverage/troubleshooting) for common issues and solutions.
+If a model from the Hugging Face Hub does not work as expected, see [Troubleshooting](/model-coverage/troubleshooting) for common issues and solutions.
