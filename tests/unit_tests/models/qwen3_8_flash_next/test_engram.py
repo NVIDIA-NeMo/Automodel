@@ -604,3 +604,50 @@ def test_owner_sharded_table_validates_send_segments_and_count_matrix(tmp_path: 
         nprocs=2,
         join=True,
     )
+
+
+def test_ple_casts_fp32_owner_table_to_bfloat16_compute() -> None:
+    fp32_table = nn.Embedding(36, 2, dtype=torch.float32)
+    ple = Qwen3_8_FlashNextPLELayer(
+        _tiny_ngram_embedding(fp32_table),
+        hidden_size=2,
+        hc_count=2,
+        ple_embed_dim=8,
+        backend=BackendConfig(linear="torch"),
+        dtype=torch.bfloat16,
+        conv_kernel_size=4,
+    )
+    reference_table = nn.Embedding(36, 2, dtype=torch.bfloat16)
+    reference = Qwen3_8_FlashNextPLELayer(
+        _tiny_ngram_embedding(reference_table),
+        hidden_size=2,
+        hc_count=2,
+        ple_embed_dim=8,
+        backend=BackendConfig(linear="torch"),
+        dtype=torch.bfloat16,
+        conv_kernel_size=4,
+    )
+    with torch.no_grad():
+        fp32_table.weight.copy_(fp32_table.weight.to(torch.bfloat16))
+        reference.load_state_dict(ple.state_dict())
+
+    input_ids = torch.tensor([[10, 11, 12]])
+    hidden_states = torch.randn(1, 3, 4, dtype=torch.bfloat16, requires_grad=True)
+    reference_hidden_states = hidden_states.detach().clone().requires_grad_(True)
+
+    actual = ple(hidden_states, input_ids)
+    expected = reference(reference_hidden_states, input_ids)
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(hidden_states.grad, reference_hidden_states.grad, rtol=0, atol=0)
+    assert fp32_table.weight.grad is not None
+    assert fp32_table.weight.grad.dtype == torch.float32
+    assert torch.isfinite(fp32_table.weight.grad).all()
+    assert ple.key_proj.weight.grad is not None
+    assert ple.key_proj.weight.grad.dtype == torch.bfloat16
+    assert torch.isfinite(ple.key_proj.weight.grad).all()
