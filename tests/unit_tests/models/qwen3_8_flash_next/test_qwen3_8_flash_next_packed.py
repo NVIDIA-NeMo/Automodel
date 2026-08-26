@@ -536,3 +536,33 @@ def test_packed_boundaries_from_seq_lens_matches_loader_contract() -> None:
 
     with pytest.raises(ValueError, match="positive document widths"):
         packed_boundaries_from_seq_lens(torch.tensor([-1000]), None)
+
+
+def test_model_advertises_packed_cp_for_tilelang_backend() -> None:
+    """The recipe capability gates must admit packed CP on the TileLang path."""
+    from types import SimpleNamespace
+
+    from nemo_automodel._transformers.capabilities import ModelSupports
+    from nemo_automodel.components.models.qwen3_8_flash_next.model import (
+        Qwen3_8_FlashNextForConditionalGeneration,
+    )
+
+    assert Qwen3_8_FlashNextForConditionalGeneration._packed_cp_attn_backends == ("tilelang",)
+
+    class _FakeModel:
+        __class__ = Qwen3_8_FlashNextForConditionalGeneration
+        backend = SimpleNamespace(attn="tilelang")
+        _owns_cp_attention = True
+        _packed_cp_attn_backends = ("tilelang",)
+
+        def forward(self, input_ids=None, **attn_kwargs):
+            pass
+
+    model = _FakeModel()
+    supports = ModelSupports(model, mesh=SimpleNamespace(cp_size=8, tp_size=1))
+    assert supports.supports_sequence_packing
+    assert supports.supports_cp_with_sequence_packing
+
+    model.backend = SimpleNamespace(attn="sdpa")
+    sdpa_supports = ModelSupports(model, mesh=SimpleNamespace(cp_size=8, tp_size=1))
+    assert not sdpa_supports.supports_cp_with_sequence_packing

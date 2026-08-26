@@ -477,6 +477,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["_fp32_params"]
     _owns_cp_attention = True
+    # Packed (THD) training and packed CP are owned by the model's fused
+    # TileLang QSA path; other attention backends have no packed routing.
+    _packed_cp_attn_backends = ("tilelang",)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
