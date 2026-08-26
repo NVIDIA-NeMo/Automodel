@@ -85,12 +85,22 @@ def _use_triton(*tensors) -> bool:
     return HAVE_TRITON and all(t.is_cuda and t.is_contiguous() for t in tensors)
 
 
-def _cast(dtype, *tensors):
-    """Cast tensors to ``dtype``. ``Tensor.to`` returns the tensor itself when it already matches."""
+def _cast(dtype: torch.dtype, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Cast tensors to ``dtype``, preserving shape.
+
+    Args:
+        dtype: Target dtype.
+        tensors: Tensors of arbitrary shape; each is returned with the same shape and device.
+
+    Returns:
+        The tensors cast to ``dtype``, in argument order. ``Tensor.to`` returns the tensor object
+        itself when it already has ``dtype``, so a matching cast allocates nothing and preserves
+        aliasing (callers may still mutate such a result in place).
+    """
     return tuple(t.to(dtype) for t in tensors)
 
 
-def _like_input(grad, inp):
+def _like_input(grad: torch.Tensor, inp: torch.Tensor) -> torch.Tensor:
     """Return ``grad`` on the device and in the dtype of the input it belongs to.
 
     Autograd rejects a gradient whose device or dtype differs from its input's.
@@ -102,6 +112,14 @@ def _like_input(grad, inp):
       come out in the lower forward compute dtype while the input they belong to is fp32.
 
     Both are no-ops in normal single-device, uniform-dtype training.
+
+    Args:
+        grad: Gradient tensor, already in ``inp``'s shape.
+        inp: The forward input this gradient belongs to; only its device and dtype are read.
+
+    Returns:
+        Tensor of ``grad``'s shape on ``inp``'s device and in ``inp``'s dtype. Returns ``grad``
+        itself when both already match.
     """
     return grad.to(device=inp.device, dtype=inp.dtype)
 
