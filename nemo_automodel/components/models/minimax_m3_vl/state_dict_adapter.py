@@ -233,9 +233,7 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         return native
 
     def _mtp_from_hf(self, mtp_keys: dict[str, Any], device_mesh: Optional["DeviceMesh"] = None) -> dict[str, Any]:
-        """Convert MTP tensors: the transformer_layer reuses the full text from_hf
-        (as a fake 1-layer model, so expert-merge / index / dequant all apply); the
-        enorm/hnorm/eh_proj/final_layernorm fusion tensors pass through (eh_proj is FP8)."""
+        """Convert MTP tensors through a temporary one-layer text namespace."""
         pattern = re.compile(r"(?P<pfx>.*?)mtp\.layers\.(?P<d>\d+)\.(?P<rest>.+)")
         tl_hf: dict[str, Any] = {}
         passthrough: dict[str, Any] = {}
@@ -249,9 +247,29 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
         self._dequantize(passthrough)  # eh_proj is MXFP8
         native = dict(passthrough)
-        for key, value in self.from_hf(tl_hf, device_mesh).items():
+        self._dequantize(tl_hf)
+        for key in list(tl_hf):
+            new_key = self._hf_key_to_native(key)
+            if new_key != key:
+                tl_hf[new_key] = tl_hf.pop(key)
+
+        # The backbone merge already reset the per-load record. Preserve it while
+        # processing MTP, then translate the temporary model.layers.* names back to
+        # the native model.mtp.layers.* namespace used by the checkpoint key diff.
+        prior_view_keys = set(self.view_loaded_native_keys)
+        tl_native = self._from_hf_w_merged_experts(tl_hf, device_mesh, reset_view_loaded_keys=False)
+        for key, value in tl_native.items():
             m = re.match(r"model\.layers\.(\d+)\.(.+)", key)
             native[f"model.mtp.layers.{m.group(1)}.transformer_layer.{m.group(2)}"] = value
+        new_view_keys = self.view_loaded_native_keys - prior_view_keys
+        self._view_loaded_native_keys = prior_view_keys | {
+            re.sub(
+                r"^model\.layers\.(\d+)\.",
+                r"model.mtp.layers.\1.transformer_layer.",
+                key,
+            )
+            for key in new_view_keys
+        }
         return native
 
     def to_hf(

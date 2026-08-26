@@ -99,6 +99,32 @@ def test_mtp_adapter_roundtrip_and_naming(mtp_model):
         assert torch.allclose(native[key].float(), back[key].float(), atol=1e-6), key
 
 
+def test_mtp_view_loaded_keys_keep_backbone_and_native_mtp_names(mtp_model):
+    adapter = mtp_model.state_dict_adapter
+    hf = adapter.to_hf(mtp_model.state_dict())
+
+    native_backbone = {
+        "model.layers.1.mlp.experts.gate_and_up_projs",
+        "model.layers.1.mlp.experts.down_projs",
+    }
+    temporary_mtp = {
+        "model.layers.0.mlp.experts.gate_and_up_projs",
+        "model.layers.0.mlp.experts.down_projs",
+    }
+    native_mtp = {
+        "model.mtp.layers.0.transformer_layer.mlp.experts.gate_and_up_projs",
+        "model.mtp.layers.0.transformer_layer.mlp.experts.down_projs",
+    }
+    adapter._inplace_loaded_native_keys = native_backbone | temporary_mtp
+
+    converted = adapter.from_hf(hf)
+
+    assert not native_backbone & converted.keys()
+    assert not native_mtp & converted.keys()
+    assert adapter.view_loaded_native_keys == native_backbone | native_mtp
+    assert adapter._inplace_loaded_native_keys == set()
+
+
 def test_from_hf_drops_mtp_when_disabled(model):
     """A model without MTP (num_mtp_modules=0) drops any MTP tensors on load."""
     adapter = model.state_dict_adapter
