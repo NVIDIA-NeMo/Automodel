@@ -10,6 +10,7 @@ use the stock HuggingFace model with ``is_causal=False``; this custom architectu
 remains available for ``ministral3_bidirec`` checkpoints.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -410,10 +411,10 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_name_or_path: str,
+        pretrained_model_name_or_path: str | os.PathLike | None,
         *model_args: Any,
         **kwargs: Any,
-    ) -> Any:
+    ) -> "Mistral3VLBidirectionalForSequenceClassification":
         """Load stock Mistral3 VLM weights into the reranker layout.
 
         Stock conditional-generation checkpoints nest the text backbone under

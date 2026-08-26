@@ -38,7 +38,7 @@ from transformers.models.ministral3.modeling_ministral3 import (
     Ministral3ForSequenceClassification,
     Ministral3Model,
 )
-from transformers.models.mistral3.modeling_mistral3 import Mistral3Model as HFMistral3Model
+from transformers.models.mistral3.modeling_mistral3 import Mistral3PreTrainedModel
 
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
@@ -199,6 +199,10 @@ def test_mistral_vlm_reranker_load_restores_all_backbone_weights(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "model_class",
+    [Mistral3BidirectionalModel, Mistral3VLBidirectionalForSequenceClassification],
+)
+@pytest.mark.parametrize(
     ("caller_mapping", "expected_required_mapping"),
     [
         ({r"^unused\.": "unused."}, "language_model."),
@@ -207,10 +211,11 @@ def test_mistral_vlm_reranker_load_restores_all_backbone_weights(tmp_path):
 )
 def test_mistral_vlm_load_preserves_caller_key_mapping(
     monkeypatch,
+    model_class,
     caller_mapping,
     expected_required_mapping,
 ):
-    """Model loading adds its remap as a default without overriding callers."""
+    """Model loaders add their remap as a default without overriding callers."""
     captured_kwargs = {}
     sentinel = object()
 
@@ -218,9 +223,9 @@ def test_mistral_vlm_load_preserves_caller_key_mapping(
         captured_kwargs.update(kwargs)
         return sentinel
 
-    monkeypatch.setattr(HFMistral3Model, "from_pretrained", classmethod(fake_from_pretrained))
+    monkeypatch.setattr(Mistral3PreTrainedModel, "from_pretrained", classmethod(fake_from_pretrained))
 
-    result = Mistral3BidirectionalModel.from_pretrained("checkpoint", key_mapping=caller_mapping)
+    result = model_class.from_pretrained("checkpoint", key_mapping=caller_mapping)
 
     assert result is sentinel
     assert captured_kwargs["key_mapping"][r"^language_model\.model\."] == expected_required_mapping
