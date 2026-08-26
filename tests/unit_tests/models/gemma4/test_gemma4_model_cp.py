@@ -724,6 +724,10 @@ def test_kv_share_holder_is_cache_free_passthrough():
     assert h.get_seq_length(0, foo=1) == 0
     assert h.get_mask_sizes(13) == (13, 0)
     assert h.get_mask_sizes(7, layer_idx=3) == (7, 0)
+    # transformers >=5.15 calls get_query_offset unguarded from
+    # _preprocess_mask_arguments; no cache -> queries start at 0.
+    assert h.get_query_offset() == 0
+    assert h.get_query_offset(layer_idx=3) == 0
     k = torch.randn(1, 2, 4, 8)
     v = torch.randn(1, 2, 4, 8)
     out_k, out_v = h.update(k, v, layer_idx=0)
