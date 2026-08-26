@@ -37,7 +37,7 @@
 #   }
 #
 # pos_doc[0] is the positive; the first seven neg_doc entries are the negatives, giving the
-# n_passages: 8 group below. Rows with fewer than seven negatives are dropped by the loader.
+# n_passages: 8 group below. Rows with fewer than seven negatives have their negatives
 #
 # reasoning and global_query are OPTIONAL per row. A missing, null, or whitespace-only value
 # is treated as absent rather than as an empty string: the field is left out of the prompt
