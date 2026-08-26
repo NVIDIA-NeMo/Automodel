@@ -5,7 +5,8 @@ slug: model-coverage/large-language-models/qwen/qwen3-8-flash-next
 ---
 
 Qwen3.8-Flash-Next is a hybrid-attention MoE model with four persistent HyperConnection
-streams and an Engram-derived product-level embedding (PLE). NeMo AutoModel
+streams and an Engram N-gram Embedding table (named `ple` in the checkpoint
+configuration). NeMo AutoModel
 supports the language-only `Qwen3_8_FlashNextForConditionalGeneration` path for
 supervised fine-tuning. All backbone parameters are trainable except the QSA
 indexers, whose reference path exposes discrete top-k IDs but no auxiliary
@@ -15,12 +16,13 @@ loss or straight-through gradient.
 
 | | |
 |---|---|
-| **Task** | Text generation (MoE, hybrid attention, Engram PLE) |
+| **Task** | Text generation (MoE, hybrid attention, Engram N-gram Embedding) |
 | **Architecture** | `Qwen3_8_FlashNextForConditionalGeneration` |
+| **Parameters** | 125B backbone with 6B activated per token, plus the 51.2B Engram table; the checkpoint's 4B MTP head is not loaded |
 | **Decoder** | 48 layers: 36 GatedDeltaNet and 12 QSA sparse-attention layers |
 | **Experts** | 512 routed experts, top-10 routing, plus one shared expert per layer |
-| **PLE** | One 51.2B-parameter table in decoder layer 2 |
-| **Validated sequence length** | 4,096 tokens |
+| **Engram** | One 51.2B-parameter N-gram Embedding table in decoder layer 2 |
+| **Sequence length** | 262,144 native; validated here at 4,096 tokens |
 
 </Info>
 
@@ -32,9 +34,9 @@ loss or straight-through gradient.
   and evaluates main GQA only on those selected token IDs. Every layer has
   separate learned HyperConnection reads and writes for attention and MoE.
 - The first decoder layer uses the normal Qwen3.8-Flash-Next GatedDeltaNet and MoE
-  skeleton without PLE. The second decoder layer first adds PLE values derived
+  skeleton without Engram. The second decoder layer first adds Engram values derived
   from eight raw-token bigram hashes and eight raw-token trigram hashes.
-- The PLE table has 320,001,536 padded rows of width 160. Its 51.2 billion
+- The Engram table has 320,001,536 padded rows of width 160. Its 51.2 billion
   parameters are stored as 128 physical checkpoint shards.
 - The final learned HyperConnection read collapses four 2,560-wide streams to
   one 2,560-wide state before the untied language-model head.
@@ -43,7 +45,7 @@ loss or straight-through gradient.
 
 | Area | Validated Configuration |
 |---|---|
-| FSDP2 | 47 decoder blocks use whole-layer activation checkpointing; the PLE owner-collective block remains eager; QSA indexers frozen |
+| FSDP2 | 47 decoder blocks use whole-layer activation checkpointing; the Engram owner-collective block remains eager; QSA indexers frozen |
 | Expert parallelism | EP64 baseline; EP128 for the CP1/CP8 comparison |
 | Engram ownership | Global `Shard(0)` DTensor over the world group; 64 or 128 contiguous local row shards |
 | Context parallelism | CP1 and CP8 at world size 128; CP was disabled in the EP64 baseline run below |
@@ -57,7 +59,7 @@ The 100-step run reduced training loss from 3.0734 at step 0 to 1.8195 at step
 collective errors and published model, optimizer, dataloader, scheduler, and
 RNG state in a distributed checkpoint.
 
-The PLE table is a globally shaped DTensor with placement `Shard(0)`. Request
+The Engram table is a globally shaped DTensor with placement `Shard(0)`. Request
 ranks group hashed row IDs by owner; an equal-capacity All-to-All sends IDs to
 owners and a second autograd-aware All-to-All returns values. Each rank directly
 looks up only its contiguous local DTensor shard, and backward reverses the
@@ -71,7 +73,7 @@ The released checkpoint was compared with its SGLang reference on two fixed
 raw-token sequences, including an EOS-reset case. Token embeddings, n-gram hash
 IDs, and table values matched exactly. The first four decoder-layer states had
 cosine similarity from 0.9998 to 1.0000, and the corresponding logit-lens top-1
-token matched at every layer. The PLE delta had relative L2 error below 0.0063
+token matched at every layer. The Engram delta had relative L2 error below 0.0063
 in both cases.
 
 The QSA routing path was also compared with SGLang on a fixed
@@ -80,15 +82,15 @@ exactly. Replaying the exact SGLang layer input through AutoModel produced the
 same selected-token sets at the first sparse row (2,051) and the last row
 (4,095), and relative L2 error 0.0041 for the projected sparse-attention
 output. Positional ordering after top-k is not compared because the reference
-CUDA kernel does not define a stable order. A full-model EP8 run executing the
-fused kernel in all 12 QSA layers produced final logits with cosine similarity
+CUDA kernel does not define a stable order. A full-model EP8 run executing sparse QSA in
+all 12 QSA layers produced final logits with cosine similarity
 0.99952, relative L2 error 0.03175, and the same top-1 and top-5 tokens as the
 SGLang reference. The eight EP ranks were bitwise identical for every captured
 layer state, routing probe, final hidden state, and final logits.
 
 Two-rank distributed tests compare model-owned CP with CP1 for exact QSA
-routing IDs, QSA and PLE outputs, per-token input gradients, globally summed
-parameter gradients, PLE hashes across an EOS/shard boundary, and the PLE
+routing IDs, QSA and Engram outputs, per-token input gradients, globally summed
+parameter gradients, Engram hashes across an EOS/shard boundary, and the Engram
 convolution's nine-token cross-rank halo. A full 128-GPU, EP128 comparison then
 trained CP1 and CP8 for the same 100 optimizer steps over the same padded
 4,096-token samples. Both runs completed with finite losses and wrote model,
@@ -104,13 +106,13 @@ path, so both runs consume byte-identical pack sequences). Loss-curve cosine
 similarity was 0.999999925, mean absolute difference 0.00024, and maximum
 absolute difference 0.00069; final losses were 0.56053 for CP1 and 0.56011
 for CP8. A world-64 single-forward probe additionally matched CP8 against CP1
-with exact per-row routing IDs and passing PLE/GDN/QSA activation gates.
+with exact per-row routing IDs and passing Engram/GDN/QSA activation gates.
 
 ## Example Recipe
 
 | Recipe | Description |
 |---|---|
-| [qwen3_8_flash_next_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml) | 100-step SFT on HellaSwag with FSDP2, EP64, and world-sized PLE ownership |
+| [qwen3_8_flash_next_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml) | 100-step SFT on HellaSwag with FSDP2, EP64, and world-sized Engram ownership |
 
 The recipe loads [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
 directly from the Hugging Face Hub. Allocate eight nodes with eight GPUs per
@@ -133,20 +135,20 @@ setup.
   backbone remain trainable.
 - Context parallelism uses contiguous rank-ordered sequence shards. QSA keeps
   queries local and gathers compressed index keys plus differentiable main
-  K/V; GatedDeltaNet uses FLA's contiguous CP recurrence; PLE hashes replicated
+  K/V; GatedDeltaNet uses FLA's contiguous CP recurrence; Engram hashes replicated
   global raw IDs, looks up only local table rows, and exchanges an exact
   autograd-aware nine-token convolution halo.
 - Activation checkpointing wraps 47 of the 48 decoder blocks. The block that
-  owns PLE remains eager because replaying its mutable owner-sharded
+  owns Engram remains eager because replaying its mutable owner-sharded
   All-to-All collectives during recomputation is not supported.
-- Native distributed checkpoints store the PLE parameter and optimizer tensors
+- Native distributed checkpoints store the Engram parameter and optimizer tensors
   under their global DTensor FQNs, so DCP can reshard them when the owner world
   size changes. Checkpoints from the earlier rank-local owner format are not
   supported; resume from a native DTensor checkpoint or restart the optimizer.
 - CP is limited to language-only inputs with TP=PP=1. Non-packed
   right-tail-padded batches and packed (THD) batches with ``cu_seqlens`` (or
-  loader ``seq_lens``) are both supported; the fused THD kernel serves packed
-  CUDA training and packing is performed topology-independently. Left/interior
+  loader ``seq_lens``) are both supported; the same FlexAttention path serves
+  packed CUDA training and packing is performed topology-independently. Left/interior
   padding, TP, PP, MTP, and vision/video training remain unsupported.
 
 ## References

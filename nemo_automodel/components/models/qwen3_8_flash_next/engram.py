@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3.8-Flash-Next raw-token Engram lookup and product-level embedding (PLE)."""
+"""Qwen3.8-Flash-Next raw-token Engram N-gram Embedding lookup (``ple`` in the checkpoint config)."""
 
 from __future__ import annotations
 

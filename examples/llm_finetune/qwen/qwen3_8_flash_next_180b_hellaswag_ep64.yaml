@@ -22,7 +22,7 @@
 #
 # From the AutoModel repository root:
 #   # Required on the validated pool0 image: its injected SPXC provider
-#   # corrupted cross-node PLE payloads, while NCCL's internal IB path passed
+#   # corrupted cross-node Engram payloads, while NCCL's internal IB path passed
 #   # the full forward/backward/optimizer smoke.
 #   export NCCL_NET_PLUGIN=none
 #   export NCCL_NET=IB
