@@ -282,7 +282,7 @@ def test_direct_thd_kernel_does_not_enable_packed_qwen_layer_cp() -> None:
     attention = object.__new__(Qwen3_8_FlashNextQSAAttention)
     nn.Module.__init__(attention)
     attention._cp_mesh = None
-    with pytest.raises(NotImplementedError, match="does not yet support CP"):
+    with pytest.raises(NotImplementedError, match="global document boundaries in the CP context"):
         attention(
             torch.zeros(1, 2, 8),
             freqs_cis=torch.zeros(1, 2, 4),
@@ -294,7 +294,7 @@ def test_direct_thd_kernel_does_not_enable_packed_qwen_layer_cp() -> None:
 def test_direct_thd_kernel_does_not_enable_packed_qwen_cp() -> None:
     from nemo_automodel.components.models.qwen3_8_flash_next.cp import shard_batch_for_qwen3_8_flash_next_cp
 
-    with pytest.raises(NotImplementedError, match="does not support packed/THD batches"):
+    with pytest.raises(NotImplementedError, match="supports only cu_seqlens document boundaries"):
         shard_batch_for_qwen3_8_flash_next_cp(object(), None, {"qkv_format": "thd"})
 
 

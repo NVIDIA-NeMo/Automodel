@@ -256,9 +256,9 @@ def test_selector_uses_absolute_query_positions_for_a_local_cp_shard() -> None:
 @pytest.mark.parametrize(
     ("extra", "match"),
     [
-        ({"qkv_format": "thd"}, "packed/THD"),
-        ({"cu_seqlens_padded": torch.tensor([0, 4])}, "packed/THD"),
-        ({"_packed_seq_ids": torch.ones(1, 4)}, "packed/THD"),
+        ({"qkv_format": "thd"}, "supports only cu_seqlens document boundaries"),
+        ({"cu_seqlens_padded": torch.tensor([0, 4])}, "supports only cu_seqlens document boundaries"),
+        ({"_packed_seq_ids": torch.ones(1, 4)}, "supports only cu_seqlens document boundaries"),
         ({"attention_mask": torch.ones(1, 1, 4, 4)}, "non-packed"),
         ({"attention_mask": torch.tensor([[1, 0, 1, 0]])}, "right-tail padding"),
         ({"padding_mask": torch.tensor([[0, 0, 2, 1]])}, "binary"),

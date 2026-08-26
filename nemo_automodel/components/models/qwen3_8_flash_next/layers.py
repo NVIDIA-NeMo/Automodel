@@ -109,12 +109,31 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
     def __init__(self, config: object, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
         output_gate_type = str(getattr(config, "output_gate_type", "sigmoid"))
+        self._packed_global_cu_seqlens: torch.Tensor | None = None
         self.norm = Qwen3_8_FlashNextRMSNormGated(
             self.head_v_dim,
             eps=float(getattr(config, "rms_norm_eps")),
             activation=output_gate_type,
             dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
         )
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        """Route packed boundaries around the inherited non-CP varlen path.
+
+        Without CP, ``cu_seqlens`` flows to the inherited FLA varlen forward
+        unchanged. With an active CP mesh the boundaries describe the global
+        packed row, so they are stashed for :meth:`_forward_with_cp` and the
+        inherited dispatcher sees no ``cu_seqlens``.
+        """
+        cu_seqlens = kwargs.pop("cu_seqlens", None)
+        cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
+        if not cp_active or cu_seqlens is None:
+            return super().forward(hidden_states, cu_seqlens=cu_seqlens, **kwargs)
+        self._packed_global_cu_seqlens = cu_seqlens
+        try:
+            return super().forward(hidden_states, **kwargs)
+        finally:
+            self._packed_global_cu_seqlens = None
 
     def _forward_with_cp(
         self,
@@ -136,7 +155,8 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
             seq_index: Optional local positions of shape ``[local_sequence]``
                 or ``[batch, local_sequence]``; ignored because Qwen3.8-Flash-Next's
                 model-owned layout is always contiguous.
-            blockdiag_state: Packed CP metadata. Qwen3.8-Flash-Next does not support it.
+            blockdiag_state: External packed CP metadata. Qwen3.8-Flash-Next builds its
+                own state and rejects an externally supplied one.
 
         Returns:
             Local GDN output of shape ``[batch, local_sequence, hidden]`` in
@@ -144,7 +164,10 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
         """
         del seq_index
         if blockdiag_state is not None:
-            raise NotImplementedError("Qwen3.8-Flash-Next GDN context parallelism does not support packed sequences")
+            raise NotImplementedError(
+                "Qwen3.8-Flash-Next GDN context parallelism builds its own packed state; "
+                "external blockdiag state is unsupported"
+            )
         if self._cp_mesh is None or self._cp_mesh.size() <= 1:
             raise RuntimeError("Qwen3.8-Flash-Next contiguous GDN CP requires an active CP mesh")
         if position_ids is None:
@@ -152,11 +175,17 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
 
         cp_group = self._cp_mesh.get_group()
         global_sequence_length = hidden_states.shape[1] * self._cp_mesh.size()
-        cu_seqlens_cpu = torch.tensor(
-            [0, global_sequence_length],
-            dtype=torch.long,
-            device="cpu",
-        )
+        packed_boundaries = getattr(self, "_packed_global_cu_seqlens", None)
+        if packed_boundaries is None:
+            # One contiguous document spanning the padded global sequence.
+            boundary_values = [0, global_sequence_length]
+        else:
+            boundary_values = [int(value) for value in packed_boundaries.reshape(-1).tolist()]
+            if boundary_values[-1] < global_sequence_length:
+                # The CP padding tail is its own segment so its recurrence
+                # cannot contaminate the final document.
+                boundary_values.append(global_sequence_length)
+        cu_seqlens_cpu = torch.tensor(boundary_values, dtype=torch.long, device="cpu")
         cu_seqlens = cu_seqlens_cpu.to(hidden_states.device)
         contiguous_state = BlockdiagCpModelState(
             group=cp_group,
@@ -440,9 +469,19 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             raise ValueError("Qwen3.8-Flash-Next QSA requires a non-empty sequence")
         packed_cu_seqlens = attn_kwargs.get("cu_seqlens")
         cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
+        context_boundaries = getattr(cp_context, "global_cu_seqlens", None) if cp_context is not None else None
+        if context_boundaries is not None:
+            if packed_cu_seqlens is not None:
+                raise ValueError(
+                    "Qwen3.8-Flash-Next packed CP takes document boundaries from its CP context; "
+                    "passing cu_seqlens directly is ambiguous"
+                )
+            packed_cu_seqlens = context_boundaries
+        elif packed_cu_seqlens is not None and (cp_active or cp_context is not None):
+            raise NotImplementedError(
+                "Qwen3.8-Flash-Next QSA packed CP requires global document boundaries in the CP context"
+            )
         if packed_cu_seqlens is not None:
-            if cp_active or cp_context is not None:
-                raise NotImplementedError("Qwen3.8-Flash-Next QSA packed THD attention does not yet support CP")
             if x.shape[0] != 1:
                 raise ValueError(
                     f"Qwen3.8-Flash-Next packed QSA requires a THD batch of one row, got batch={x.shape[0]}"
@@ -676,6 +715,8 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
         attn_input, attn_residual = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":
             packed_cu_seqlens = attn_kwargs.get("cu_seqlens")
+            if packed_cu_seqlens is None and cp_context is not None:
+                packed_cu_seqlens = getattr(cp_context, "global_cu_seqlens", None)
             if isinstance(packed_cu_seqlens, torch.Tensor):
                 packed_cu_seqlens = packed_cu_seqlens.to(torch.long)
             attn_output = self.linear_attn(

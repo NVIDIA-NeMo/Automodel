@@ -49,6 +49,10 @@ class Qwen3_8_FlashNextCPContext:
         local_sequence_start: Global position of local sequence position zero.
         local_sequence_length: Number of physical sequence positions on this
             rank, including CP padding.
+        global_cu_seqlens: Optional global packed-document boundaries
+            ``[num_docs + 1]`` for a THD batch of one row. The final boundary
+            may be smaller than the padded global length; the remaining tail
+            is CP padding that belongs to no document.
     """
 
     group: dist.ProcessGroup | None
@@ -58,6 +62,7 @@ class Qwen3_8_FlashNextCPContext:
     global_padding_mask: torch.Tensor
     local_sequence_start: int
     local_sequence_length: int
+    global_cu_seqlens: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         """Validate the replicated metadata and contiguous rank mapping."""
@@ -99,6 +104,23 @@ class Qwen3_8_FlashNextCPContext:
                 "Qwen3.8-Flash-Next CP local start must use contiguous rank order; "
                 f"got start={self.local_sequence_start}, expected={expected_start}"
             )
+        if self.global_cu_seqlens is not None:
+            boundaries = self.global_cu_seqlens
+            if boundaries.ndim != 1 or boundaries.numel() < 2:
+                raise ValueError(
+                    f"Qwen3.8-Flash-Next CP global_cu_seqlens must be a rank-1 boundary tensor, got {tuple(boundaries.shape)}"
+                )
+            if self.global_input_ids.shape[0] != 1:
+                raise ValueError("Qwen3.8-Flash-Next packed CP requires a THD batch of one row")
+            if (
+                int(boundaries[0]) != 0
+                or int(boundaries[-1]) > expected_global_length
+                or bool((boundaries.diff() <= 0).any())
+            ):
+                raise ValueError(
+                    "Qwen3.8-Flash-Next CP global_cu_seqlens must start at 0, be strictly increasing, and end at or "
+                    f"before the padded global length {expected_global_length}; got last={int(boundaries[-1])}"
+                )
 
     @property
     def global_sequence_length(self) -> int:
@@ -219,8 +241,14 @@ def shard_batch_for_qwen3_8_flash_next_cp(
         "max_seqlen_q",
         "max_seqlen_kv",
     )
-    if batch.get("qkv_format") == "thd" or any(batch.get(key) is not None for key in packed_keys):
-        raise NotImplementedError("Qwen3.8-Flash-Next context parallelism does not support packed/THD batches")
+    packed_cu_seqlens = batch.pop("cu_seqlens", None)
+    unsupported_packed_keys = [key for key in packed_keys if key != "cu_seqlens" and batch.get(key) is not None]
+    if unsupported_packed_keys or (batch.get("qkv_format") == "thd" and packed_cu_seqlens is None):
+        raise NotImplementedError(
+            "Qwen3.8-Flash-Next packed context parallelism supports only cu_seqlens document boundaries; "
+            f"got unsupported keys {unsupported_packed_keys}"
+        )
+    batch.pop("qkv_format", None)
     if "input_ids" not in batch or "inputs_embeds" in batch:
         raise NotImplementedError(
             "Qwen3.8-Flash-Next context parallelism requires raw input_ids as the sole primary stream for PLE hashing"
@@ -235,6 +263,28 @@ def shard_batch_for_qwen3_8_flash_next_cp(
         raise ValueError("Qwen3.8-Flash-Next context parallelism requires a non-empty sequence")
     if pad_multiple <= 1:
         raise ValueError(f"Qwen3.8-Flash-Next CP pad_multiple must exceed one, got {pad_multiple}")
+
+    if packed_cu_seqlens is not None:
+        if full_input_ids.shape[0] != 1:
+            raise ValueError(
+                f"Qwen3.8-Flash-Next packed CP requires a THD batch of one row, got batch={full_input_ids.shape[0]}"
+            )
+        boundaries = packed_cu_seqlens.reshape(-1).to(dtype=torch.long)
+        if (
+            boundaries.numel() < 2
+            or int(boundaries[0]) != 0
+            or int(boundaries[-1]) != full_input_ids.shape[1]
+            or bool((boundaries.diff() <= 0).any())
+        ):
+            raise ValueError(
+                "Qwen3.8-Flash-Next packed CP cu_seqlens must start at 0, be strictly increasing, and end at the "
+                f"packed token count {full_input_ids.shape[1]}"
+            )
+        if batch.get("attention_mask") is not None or batch.get("padding_mask") is not None:
+            raise ValueError(
+                "Qwen3.8-Flash-Next packed CP takes document boundaries from cu_seqlens; masks are unsupported"
+            )
+        packed_cu_seqlens = boundaries
 
     attention_mask = batch.get("attention_mask")
     padding_mask = batch.get("padding_mask")
@@ -289,6 +339,8 @@ def shard_batch_for_qwen3_8_flash_next_cp(
         raise RuntimeError(
             "Qwen3.8-Flash-Next CP sharder produced local raw IDs inconsistent with its global PLE context"
         )
+    if packed_cu_seqlens is not None:
+        packed_cu_seqlens = packed_cu_seqlens.to(device=global_input_ids.device)
     sharded_batch["_qwen3_8_flash_next_cp_context"] = Qwen3_8_FlashNextCPContext(
         group=cp_group,
         rank=cp_rank,
@@ -297,6 +349,7 @@ def shard_batch_for_qwen3_8_flash_next_cp(
         global_padding_mask=global_padding_mask,
         local_sequence_start=local_sequence_start,
         local_sequence_length=local_sequence_length,
+        global_cu_seqlens=packed_cu_seqlens,
     )
     return (
         ctx_factory,

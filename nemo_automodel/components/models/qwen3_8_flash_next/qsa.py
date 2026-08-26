@@ -519,11 +519,14 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.hidden_size:
             raise ValueError(f"QSA hidden_states must be [B, S, {self.hidden_size}], got {tuple(hidden_states.shape)}")
         if cu_seqlens is not None:
-            if cp_context is not None:
-                raise NotImplementedError("QSA packed routing under context parallelism is not yet supported")
             if attention_mask is not None:
                 raise ValueError("QSA packed routing takes document boundaries from cu_seqlens, not attention_mask")
-            return self._forward_packed(hidden_states, freqs_cis=freqs_cis, cu_seqlens=cu_seqlens)
+            return self._forward_packed(
+                hidden_states,
+                freqs_cis=freqs_cis,
+                cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
+            )
         batch_size, sequence_length, _ = hidden_states.shape
         if cp_context is None:
             sequence_lengths = right_padded_sequence_lengths(
@@ -590,6 +593,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
         *,
         freqs_cis: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        cp_context: Qwen3_8_FlashNextCPContext | None = None,
     ) -> torch.Tensor:
         """Select document-confined routes for one packed THD row.
 
@@ -616,10 +620,31 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
             raise ValueError(f"cu_seqlens must be a rank-1 boundary tensor, got shape {tuple(cu_seqlens.shape)}")
         boundaries = cu_seqlens.to(device=hidden_states.device, dtype=torch.long)
         document_lengths = boundaries.diff()
-        if int(boundaries[0]) != 0 or int(boundaries[-1]) != total_tokens or bool((document_lengths <= 0).any()):
+        if cp_context is not None:
+            if total_tokens != cp_context.local_sequence_length:
+                raise ValueError(
+                    "QSA packed CP local sequence length disagrees with its CP context; "
+                    f"got local={total_tokens}, context={cp_context.local_sequence_length}"
+                )
+            boundary_cap = cp_context.global_sequence_length
+        else:
+            boundary_cap = total_tokens
+        if (
+            int(boundaries[0]) != 0
+            or int(boundaries[-1]) > boundary_cap
+            or (cp_context is None and int(boundaries[-1]) != total_tokens)
+            or bool((document_lengths <= 0).any())
+        ):
             raise ValueError(
                 "cu_seqlens must start at 0, end at the packed token count, and be strictly increasing; "
-                f"got first={int(boundaries[0])}, last={int(boundaries[-1])}, T={total_tokens}"
+                f"got first={int(boundaries[0])}, last={int(boundaries[-1])}, T={boundary_cap}"
+            )
+        if cp_context is not None:
+            return self._forward_packed_cp(
+                hidden_states,
+                freqs_cis=freqs_cis,
+                boundaries=boundaries,
+                cp_context=cp_context,
             )
 
         projected = self.index_qk_proj(hidden_states)
@@ -660,6 +685,97 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
         )
         packed_routes = global_routes.new_full((1, total_tokens, global_routes.shape[-1]), -1)
         packed_routes[0, row_positions[row_valid]] = global_routes[row_valid]
+        return packed_routes
+
+    def _forward_packed_cp(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        boundaries: torch.Tensor,
+        cp_context: Qwen3_8_FlashNextCPContext,
+    ) -> torch.Tensor:
+        """Select document-confined routes for one rank's packed query shard.
+
+        The frozen indexer needs no gradients, so raw index keys and rotary
+        values are gathered globally with plain collectives and every document
+        is compressed identically on all ranks. Documents intersecting the
+        local shard are scored one at a time with the existing per-row
+        selection; queries in the CP padding tail (beyond the final document
+        boundary) keep all ``-1`` routes.
+
+        Args:
+            hidden_states: Local packed shard ``[1, S_local, hidden_size]``.
+            freqs_cis: Local document-relative rotary values ``[1, S_local, D_rope]``.
+            boundaries: Validated global boundaries ``[num_docs + 1]``.
+            cp_context: Contiguous CP metadata for the packed global row.
+
+        Returns:
+            int32 global flattened IDs ``[1, S_local, token_budget +
+            compress_ratio - 1]`` with ``-1`` padding.
+        """
+        projected = self.index_qk_proj(hidden_states)
+        query_width = self.num_query_heads * self.head_dim
+        raw_query = projected[..., :query_width].unflatten(-1, (self.num_query_heads, self.head_dim))
+        raw_key = projected[..., query_width:].unflatten(-1, (self.num_key_heads, self.head_dim))
+        index_query = apply_qsa_rope(self.q_layernorm(raw_query), freqs_cis)
+
+        global_raw_key = qwen3_8_flash_next_cp_all_gather(
+            raw_key.flatten(2, 3),
+            cp_context,
+            sequence_dim=1,
+            differentiable=False,
+        ).unflatten(-1, (self.num_key_heads, self.head_dim))
+        global_freqs = qwen3_8_flash_next_cp_all_gather(
+            freqs_cis,
+            cp_context,
+            sequence_dim=1,
+            differentiable=False,
+        )
+
+        local_start = cp_context.local_sequence_start
+        local_end = cp_context.local_sequence_end
+        route_width = self.token_budget + self.compress_ratio - 1
+        packed_routes = torch.full(
+            (1, hidden_states.shape[1], route_width),
+            -1,
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        for document_start, document_end in zip(boundaries.tolist(), boundaries[1:].tolist()):
+            overlap_start = max(document_start, local_start)
+            overlap_end = min(document_end, local_end)
+            if overlap_start >= overlap_end:
+                continue
+            document_length = document_end - document_start
+            query_slice = index_query[:, overlap_start - local_start : overlap_end - local_start]
+
+            document_key = global_raw_key[:, document_start:document_end]
+            document_freqs = global_freqs[:, document_start:document_end]
+            num_blocks = document_length // self.compress_ratio
+            grouped_key = document_key[:, : num_blocks * self.compress_ratio].unflatten(
+                1, (num_blocks, self.compress_ratio)
+            )
+            compressed_key = grouped_key.float().mean(dim=2).to(document_key.dtype)
+            compressed_freqs = document_freqs[:, : num_blocks * self.compress_ratio : self.compress_ratio]
+            compressed_key = apply_qsa_rope(self.k_layernorm(compressed_key), compressed_freqs)
+
+            document_routes = select_qsa_token_ids(
+                query_slice,
+                compressed_key,
+                boundaries.new_tensor([document_length], dtype=torch.long),
+                token_budget=self.token_budget,
+                compress_ratio=self.compress_ratio,
+                query_chunk_size=self.query_chunk_size,
+                query_position_offset=overlap_start - document_start,
+                global_sequence_length=document_length,
+            )
+            global_routes = torch.where(
+                document_routes >= 0,
+                document_routes + document_start,
+                document_routes.new_full((), -1),
+            )
+            packed_routes[:, overlap_start - local_start : overlap_end - local_start] = global_routes
         return packed_routes
 
     @torch.no_grad()
