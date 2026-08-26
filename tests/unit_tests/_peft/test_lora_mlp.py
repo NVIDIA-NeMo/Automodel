@@ -171,6 +171,32 @@ def test_fused_helper_declines_on_dropout_and_dora():
     assert fused_lora_swiglu_mlp(gate, up, down, x) is None
 
 
+def test_fused_helper_declines_on_biased_base():
+    """A biased base projection must decline fusion: the fused forward has no bias term.
+
+    ``F.linear(x, base_weight)`` in the fused path drops the bias, so fusing a biased MLP would
+    train on silently wrong math (models plumb this from ``config.mlp_bias``).
+    """
+    from nemo_automodel.components._peft.lora_mlp import _fusible, install_fused_lora_mlp
+    from nemo_automodel.components.moe.layers import MLP
+
+    torch.manual_seed(0)
+    H, I, R = 64, 96, 8
+    biased = MLP(dim=H, inter_dim=I, backend="torch", dtype=torch.float32, activation="swiglu", bias=True)
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        setattr(biased, proj, patch_linear_module(getattr(biased, proj), dim=R, alpha=R, use_triton=False))
+        nn.init.normal_(getattr(biased, proj).lora_B.weight, std=0.02)
+        with torch.no_grad():
+            getattr(biased, proj).bias.normal_(std=0.5)
+
+    assert not _fusible(biased.gate_proj)
+    assert install_fused_lora_mlp(biased) == 0
+    assert fused_lora_swiglu_mlp(biased.gate_proj, biased.up_proj, biased.down_proj, torch.randn(2, 16, H)) is None
+
+    # The unbiased counterpart still fuses, so the gate is not over-broad.
+    assert install_fused_lora_mlp(_lora_swiglu_mlp(H, I, R)) == 1
+
+
 def test_fused_helper_declines_on_quantized_base():
     """QLoRA/quantized base weights are packed buffers, not a 2D (out, in) matrix; the fused path
     must decline so the per-linear (dequantizing) path handles them.

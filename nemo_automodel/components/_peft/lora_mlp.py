@@ -94,8 +94,9 @@ def _cast(dtype: torch.dtype, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...
 
     Returns:
         The tensors cast to ``dtype``, in argument order. ``Tensor.to`` returns the tensor object
-        itself when it already has ``dtype``, so a matching cast allocates nothing and preserves
-        aliasing (callers may still mutate such a result in place).
+        itself when it already has ``dtype``, so a matching cast allocates nothing -- which also
+        means a result may alias its input (and, for a reshaped gradient, the caller's ``grad_out``).
+        Treat every result as read-only.
     """
     return tuple(t.to(dtype) for t in tensors)
 
@@ -222,7 +223,7 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         # untouched so the in-place SwiGLU backward keeps writing into the saved buffers.
         compute_dtype = e.dtype
         dY, xc = _cast(compute_dtype, dY, x)
-        gW, uW, dW = _cast(compute_dtype, gW, uW, dW)
+        (dW,) = _cast(compute_dtype, dW)
         gAc, gBc, uAc, uBc, dAc, dBc = _cast(compute_dtype, gA, gB, uA, uB, dA, dB)
 
         # Grad of the down-projection input h = silu(e)*g (does not need h itself):
@@ -252,7 +253,10 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
 
         d_x = None
         if needs_x:
-            # gate base+lora (d_e@gW + d_R@gA) plus up base+lora (d_g@uW + d_Q@uA)
+            # gate base+lora (d_e@gW + d_R@gA) plus up base+lora (d_g@uW + d_Q@uA). gW/uW are read
+            # only here, so cast them inside the branch -- they are (inter, hidden) each, and an
+            # eager cast would burn that memory on every backward that does not need d_x.
+            gW, uW = _cast(compute_dtype, gW, uW)
             d_x = torch.addmm(d_e @ gW, d_R, gAc)
             d_x = d_x.addmm_(d_g, uW).addmm_(d_Q, uAc).view(ctx.orig_shape)
 
@@ -278,6 +282,11 @@ def _fusible(module) -> bool:
     if getattr(module, "use_dora", False):
         return False
     if getattr(module, "dropout_p", 0.0) and module.training:
+        return False
+    # The fused forward calls ``F.linear(x, base_weight)`` with no bias term, so a biased base
+    # projection would train on silently wrong math. Models plumb this from the HF config
+    # (``nn.Linear(..., bias=config.mlp_bias)``), so decline and let the per-linear path add it.
+    if getattr(module, "bias", None) is not None:
         return False
     # QLoRA / quantized base weights are stored as packed buffers (e.g. bitsandbytes 4-bit
     # carries a ``quant_state`` and a flattened weight shaped like ``(1, out*in/2)`` rather than
@@ -370,7 +379,7 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         # gradient back in its input's dtype. All no-ops when the tensors already share a dtype.
         compute_dtype = e.dtype
         dY, xc = _cast(compute_dtype, dY, x)
-        uW, dW = _cast(compute_dtype, uW, dW)
+        (dW,) = _cast(compute_dtype, dW)
         uAc, uBc, dAc, dBc = _cast(compute_dtype, uA, uB, dA, dB)
 
         relu_e = torch.relu(e)
@@ -394,6 +403,7 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
 
         d_x = None
         if needs_x:
+            (uW,) = _cast(compute_dtype, uW)  # read only here; see LoRASwiGLUMLPFunction.backward
             d_x = torch.addmm(d_e @ uW, d_Q, uAc).view(ctx.orig_shape)
 
         # Hand every gradient back on its input's device and in its input's dtype (see _like_input).
