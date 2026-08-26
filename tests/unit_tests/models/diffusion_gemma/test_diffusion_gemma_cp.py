@@ -59,4 +59,5 @@ def test_mixed_stream_cp_layout_and_bias_padding():
     # Global bias is replicated. Pad query row 3 has a valid own-canvas key and
     # all newly padded non-diagonal locations remain masked.
     assert bias[0, 0, 1, 8].item() == 0
-    assert bias[0, 0, 1, 11].item() == torch.finfo(torch.float32).min
+    assert bias[0, 0, 1, 11].item() == -1.0e4
+    assert bias.isfinite().all()

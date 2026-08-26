@@ -41,9 +41,13 @@ def _pad_positions(position_ids: torch.Tensor, length: int) -> torch.Tensor:
 
 def _pad_decoder_bias(mask: torch.Tensor, query_len: int, key_len: int, encoder_len: int) -> torch.Tensor:
     """Pad a global additive decoder bias while keeping pad query rows finite."""
-    neg = torch.finfo(mask.dtype).min
+    # TE P2P CP evaluates K/V blocks incrementally. A partial block may be fully
+    # masked even though the complete attention row is not; dtype-min biases can
+    # make that partial softmax produce NaNs. -1e4 still underflows masked
+    # probabilities to zero in FP16/BF16 while keeping every partial block finite.
+    neg = -1.0e4
     padded = torch.full((*mask.shape[:-2], query_len, key_len), neg, dtype=mask.dtype, device=mask.device)
-    padded[..., : mask.shape[-2], : mask.shape[-1]] = mask
+    padded[..., : mask.shape[-2], : mask.shape[-1]] = mask.clamp_min(neg)
     rows = torch.arange(query_len, device=mask.device)
     padded[..., rows, encoder_len + rows] = 0
     return padded
