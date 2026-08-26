@@ -55,7 +55,10 @@ def _cast_latent_projection_input_to_weight_dtype(
     """
     hidden_states = inputs[0]
     device_type = hidden_states.device.type
-    if torch.amp.is_autocast_available(device_type) and torch.is_autocast_enabled(device_type):
+    # Meta tensors are used for shape inference but do not support autocast.
+    # Avoid is_autocast_available here because it is not traceable on older
+    # supported PyTorch releases and causes a graph break under torch.compile.
+    if device_type != "meta" and torch.is_autocast_enabled(device_type):
         return None
     weight = module.get_parameter("weight")
     if hidden_states.dtype == weight.dtype:

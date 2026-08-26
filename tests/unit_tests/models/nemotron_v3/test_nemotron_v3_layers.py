@@ -349,6 +349,36 @@ class TestNemotronV3Block:
         assert output.dtype == torch.bfloat16
         assert output.device.type == "meta"
 
+    @pytest.mark.parametrize("autocast_enabled", [False, True])
+    def test_latent_moe_output_projection_compiles(self, config, backend, moe_config, autocast_enabled: bool):
+        """Test the dtype hook remains traceable with and without autocast."""
+        config.layers_block_type = ["moe"]
+        latent_size = 128
+        latent_moe_config = replace(moe_config, moe_latent_size=latent_size, dtype=torch.float16)
+        block = NemotronV3Block(config, layer_idx=0, moe_config=latent_moe_config, backend=backend)
+        projection = block.mixer.fc2_latent_proj
+
+        assert projection is not None
+        reference = torch.nn.Linear(latent_size, config.hidden_size, bias=False, dtype=torch.float16)
+        reference.load_state_dict(projection.state_dict())
+        compiled_projection = torch.compile(projection, backend="eager", fullgraph=True)
+
+        expert_output = torch.randn(4, latent_size, dtype=torch.float32, requires_grad=True)
+        reference_input = expert_output.detach().clone().requires_grad_(True)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=autocast_enabled):
+            output = compiled_projection(expert_output)
+            if autocast_enabled:
+                reference_output = reference(reference_input)
+            else:
+                reference_output = reference(reference_input.to(dtype=reference.weight.dtype))
+
+        torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+
+        output.float().mean().backward()
+        reference_output.float().mean().backward()
+        torch.testing.assert_close(expert_output.grad, reference_input.grad, rtol=0, atol=0)
+        torch.testing.assert_close(projection.weight.grad, reference.weight.grad, rtol=0, atol=0)
+
     def test_block_init_invalid_type(self, config, backend):
         """Test block initialization with invalid layer type raises error."""
         config.layers_block_type = ["invalid"]
