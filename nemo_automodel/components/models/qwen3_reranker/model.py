@@ -211,6 +211,15 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         kwargs.pop("logits_to_keep", None)
         kwargs.pop("num_logits_to_keep", None)
 
+        # Resolve return_dict ONCE, before it is used. The signature defaults it to None, so a
+        # caller that omits it would otherwise fall through `if not return_dict` further down
+        # and get a bare tuple -- silently ignoring config.use_return_dict and denying callers
+        # the SequenceClassifierOutputWithPast they expect. Same normalisation the qwen2/qwen3
+        # models in this repo use.
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # The decoder call below pins return_dict=True regardless: last_hidden_state is only
+        # reachable on a ModelOutput. That is independent of what WE return, resolved above.
         # return_dict=True is required, not cosmetic: last_hidden_state is only reachable on a
         # ModelOutput, and this call does not forward the wrapper's return_dict. With
         # config.use_return_dict False the decoder hands back a plain tuple and the attribute
