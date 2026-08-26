@@ -669,6 +669,7 @@ def apply_fsdp(
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         )
+    experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
     fully_shard_impl = fully_shard
@@ -753,16 +754,17 @@ def apply_fsdp(
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
-            # Forward the same mp_policy used elsewhere so that when params are
-            # kept in fp32 (e.g. for fp32 master weights under FSDP2) the
-            # all-gathered expert weights are still cast to param_dtype for
-            # forward compute (required by GMM / TE kernels that expect bf16).
+            # Preserve the enclosing policy's parameter, reduction, and input-cast
+            # settings so FP32 master weights still compute in param_dtype (required
+            # by BF16 GMM / TE kernels). Experts are an internal FSDP boundary, so
+            # their policy does not override the activation dtype returned to the
+            # rest of the block.
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=experts_reshard_after_forward,
-                mp_policy=mp_policy,
+                mp_policy=experts_mp_policy,
                 offload_policy=offload_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already

@@ -341,6 +341,16 @@ def _install_torch_and_layers_stubs(monkeypatch):
     experts_stub.GroupedExpertsTE = GroupedExpertsTE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.experts", experts_stub)
 
+    # Stub MoK experts to keep this import-isolation test independent of the
+    # real DTensor stack, just like the TE and DeepEP expert implementations.
+    mok_experts_stub = types.ModuleType("nemo_automodel.components.moe.mok_experts")
+
+    class GroupedExpertsMoK:
+        pass
+
+    mok_experts_stub.GroupedExpertsMoK = GroupedExpertsMoK
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.mok_experts", mok_experts_stub)
+
 
 def _import_parallelizer_with_stubs(monkeypatch):
     import importlib
@@ -350,6 +360,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.moe.parallelizer",
         "nemo_automodel.components.moe.layers",
         "nemo_automodel.components.moe.experts",
+        "nemo_automodel.components.moe.mok_experts",
         "nemo_automodel.components.distributed.pipelining",
         "nemo_automodel.components.distributed.pipelining.config",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
@@ -423,6 +434,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         fully_shard_fn(module, **kwargs)
 
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
+    parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
 
     def reject_unsupported_mtp_cp(model):
@@ -463,8 +475,8 @@ def _import_parallelizer_with_stubs(monkeypatch):
     activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
     activation_checkpointing_stub.ensure_fsdp_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
-    activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = (
-        lambda context_fn=None: context_fn() if context_fn is not None else (nullcontext(), nullcontext())
+    activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: (
+        context_fn() if context_fn is not None else (nullcontext(), nullcontext())
     )
     monkeypatch.setitem(
         sys.modules,
@@ -848,6 +860,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert experts_kwargs["mesh"] is ep_shard_mesh
     assert experts_kwargs["reshard_after_forward"] is False
     assert experts_kwargs["offload_policy"] is offload_policy
+    assert experts_kwargs["mp_policy"] == ("INTERNAL_MP_POLICY", "MP_POLICY")
     assert callable(experts_kwargs["shard_placement_fn"])  # lambda _: Shard(1)
 
     # Block should be sharded with ignored_params when ep_enabled
