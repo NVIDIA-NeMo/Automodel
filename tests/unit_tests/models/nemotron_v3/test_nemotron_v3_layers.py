@@ -300,6 +300,55 @@ class TestNemotronV3Block:
         assert projection.weight.grad is not None
         assert torch.isfinite(projection.weight.grad).all()
 
+    def test_latent_moe_output_projection_defers_to_active_autocast(self, config, backend, moe_config):
+        """Test active autocast controls the projection compute dtype."""
+        config.layers_block_type = ["moe"]
+        latent_size = 128
+        latent_moe_config = replace(moe_config, moe_latent_size=latent_size, dtype=torch.float16)
+        block = NemotronV3Block(config, layer_idx=0, moe_config=latent_moe_config, backend=backend)
+        projection = block.mixer.fc2_latent_proj
+
+        assert projection is not None
+        assert projection.weight.dtype == torch.float16
+
+        with torch.no_grad():
+            projection.weight.fill_(1e-3)
+        reference = torch.nn.Linear(latent_size, config.hidden_size, bias=False, dtype=torch.float16)
+        reference.load_state_dict(projection.state_dict())
+
+        expert_output = torch.full((4, latent_size), 1e5, dtype=torch.float32, requires_grad=True)
+        reference_input = expert_output.detach().clone().requires_grad_(True)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            output = projection(expert_output)
+            reference_output = reference(reference_input)
+
+        torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+
+        output.float().mean().backward()
+        reference_output.float().mean().backward()
+        torch.testing.assert_close(expert_output.grad, reference_input.grad, rtol=0, atol=0)
+        torch.testing.assert_close(projection.weight.grad, reference.weight.grad, rtol=0, atol=0)
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(expert_output.grad).all()
+        assert torch.isfinite(projection.weight.grad).all()
+
+    def test_latent_moe_output_projection_supports_meta_shape_inference(self, config, backend, moe_config):
+        """Test the dtype hook preserves meta-device shape inference."""
+        config.layers_block_type = ["moe"]
+        latent_size = 128
+        latent_moe_config = replace(moe_config, moe_latent_size=latent_size)
+        with torch.device("meta"):
+            block = NemotronV3Block(config, layer_idx=0, moe_config=latent_moe_config, backend=backend)
+        projection = block.mixer.fc2_latent_proj
+
+        assert projection is not None
+        expert_output = torch.empty(4, latent_size, dtype=torch.float32, device="meta")
+        output = projection(expert_output)
+
+        assert output.shape == (4, config.hidden_size)
+        assert output.dtype == torch.bfloat16
+        assert output.device.type == "meta"
+
     def test_block_init_invalid_type(self, config, backend):
         """Test block initialization with invalid layer type raises error."""
         config.layers_block_type = ["invalid"]

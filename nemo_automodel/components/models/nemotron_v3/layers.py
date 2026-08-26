@@ -49,11 +49,14 @@ def _cast_latent_projection_input_to_weight_dtype(
         inputs: Positional inputs whose first tensor has shape ``[tokens, moe_latent]``.
 
     Returns:
-        ``None`` when the activation already matches the projection weight dtype;
-        otherwise, positional inputs with the first tensor cast to that dtype and
-        with the same shape and device.
+        ``None`` when autocast is active or the activation already matches the
+        projection weight dtype; otherwise, positional inputs with the first tensor
+        cast to that dtype and with the same shape and device.
     """
     hidden_states = inputs[0]
+    device_type = hidden_states.device.type
+    if torch.amp.is_autocast_available(device_type) and torch.is_autocast_enabled(device_type):
+        return None
     weight = module.get_parameter("weight")
     if hidden_states.dtype == weight.dtype:
         return None
