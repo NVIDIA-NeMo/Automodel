@@ -477,10 +477,11 @@ jobs:
           # as 13 separate entries the last three could not start until a wave-1 job
           # freed a runner. These are the three cheapest suites (3.6 + 5.2 + 6.0 =
           # 14.8 min median), well under the 16.6 min L2_HF_Transformer_Finetune that
-          # sets the stage floor. Timeout is the sum of the three originals.
+          # sets the stage floor. A 40-minute timeout leaves more than 2x headroom
+          # over the measured merged runtime while bounding timeout retries.
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer,hf_transformer_llm,data
-            timeout: 80
+            timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_Finetune
@@ -510,11 +511,11 @@ jobs:
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           # moe + parallelism merged (2.8 + 5.8 = 8.6 min median) to fit `max-parallel: 10`.
           # Each parity test in `parallelism` runs the proxy twice (1-rank baseline +
-          # 2-rank parallel), so the budget is roughly double a single smoke test;
-          # timeout is the sum of the two originals.
+          # 2-rank parallel), so the budget is roughly double a single smoke test.
+          # A 30-minute timeout leaves more than 2x measured-runtime headroom.
           - test-name: L2_Distributed
             test-folder: moe,parallelism
-            timeout: 60
+            timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
@@ -575,7 +576,7 @@ jobs:
           # floor). Leaves this matrix at 9 entries, one slot of headroom.
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer,hf_transformer_llm,data
-            timeout: 80
+            timeout: 40
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
             timeout: 40
@@ -592,7 +593,7 @@ jobs:
           # moe + parallelism merged (2.1 + 4.1 = 6.2 min median), mirroring cicd-e2e-tests.
           - test-name: L2_Distributed
             test-folder: moe,parallelism
-            timeout: 60
+            timeout: 30
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
     name: gb200_${{ matrix.test-name }}
