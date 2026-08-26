@@ -1175,6 +1175,8 @@ def _hf_source_load_kwargs(
     hf_model_cls: type,
     device: torch.device,
     hf_device_map_auto: bool,
+    hf_device_map_max_memory_gib: str | float | None = None,
+    hf_device_map_cpu_max_memory_gib: str | float | None = None,
 ) -> dict:
     """Build the HF-safe subset of recipe model kwargs for the source-load reference."""
     hf_allowed_keys = {
@@ -1211,6 +1213,13 @@ def _hf_source_load_kwargs(
         hf_kwargs["trust_remote_code"] = False
     if hf_device_map_auto:
         hf_kwargs["device_map"] = "auto"
+        # References too large for uncapped automatic placement (the 427B
+        # MiniMax-M3 fills every GPU and OOMs on the fused-expert concat
+        # transient) need the same GPU caps + CPU spill as the HF reload path.
+        max_memory = _hf_device_map_max_memory(hf_device_map_max_memory_gib, hf_device_map_cpu_max_memory_gib)
+        if max_memory is not None:
+            hf_kwargs["max_memory"] = max_memory
+            print(f"[Phase 0] Automatic device-map memory limits: {max_memory}")
     if (
         "device_map" not in hf_kwargs
         and not hf_kwargs["trust_remote_code"]
@@ -1592,6 +1601,8 @@ def _prepare_source_load_reference(
     trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
+    hf_device_map_max_memory_gib: str | float | None = None,
+    hf_device_map_cpu_max_memory_gib: str | float | None = None,
     hf_source_post_load_dequantize: bool,
     parity_tolerance_profile: str = "standard",
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
@@ -1619,6 +1630,8 @@ def _prepare_source_load_reference(
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
+            hf_device_map_max_memory_gib=hf_device_map_max_memory_gib,
+            hf_device_map_cpu_max_memory_gib=hf_device_map_cpu_max_memory_gib,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
             parity_tolerance_profile=parity_tolerance_profile,
         )
@@ -1640,6 +1653,8 @@ def _prepare_source_load_reference_rank0(
     trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
+    hf_device_map_max_memory_gib: str | float | None = None,
+    hf_device_map_cpu_max_memory_gib: str | float | None = None,
     hf_source_post_load_dequantize: bool,
     parity_tolerance_profile: str = "standard",
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
@@ -1672,6 +1687,8 @@ def _prepare_source_load_reference_rank0(
         hf_model_cls=hf_model_cls,
         device=device,
         hf_device_map_auto=hf_device_map_auto,
+        hf_device_map_max_memory_gib=hf_device_map_max_memory_gib,
+        hf_device_map_cpu_max_memory_gib=hf_device_map_cpu_max_memory_gib,
     )
     requested_attn_implementation = model_kwargs.get("attn_implementation")
     if hf_kwargs.get("attn_implementation") != requested_attn_implementation:
@@ -2507,6 +2524,8 @@ def _run_process_isolated_checkpoint_phase(
             trust_remote_code=custom_args.get("trust_remote_code"),
             experts_implementation=custom_args.get("experts_implementation", None),
             hf_device_map_auto=bool(custom_args.get("hf_device_map_auto", False)),
+            hf_device_map_max_memory_gib=custom_args.get("hf_device_map_max_memory_gib"),
+            hf_device_map_cpu_max_memory_gib=custom_args.get("hf_device_map_cpu_max_memory_gib"),
             hf_source_post_load_dequantize=bool(custom_args.get("hf_source_post_load_dequantize", False)),
             parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
         )
@@ -3068,6 +3087,8 @@ def run_checkpoint_robustness(
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
+            hf_device_map_max_memory_gib=custom_args.get("hf_device_map_max_memory_gib"),
+            hf_device_map_cpu_max_memory_gib=custom_args.get("hf_device_map_cpu_max_memory_gib"),
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
             parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
         )

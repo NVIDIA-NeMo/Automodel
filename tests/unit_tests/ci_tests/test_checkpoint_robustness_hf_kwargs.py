@@ -1087,6 +1087,8 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         trust_remote_code=True,
         experts_implementation=None,
         hf_device_map_auto=True,
+        hf_device_map_max_memory_gib=None,
+        hf_device_map_cpu_max_memory_gib=None,
         hf_source_post_load_dequantize=False,
         parity_tolerance_profile="standard",
     )
@@ -1897,6 +1899,33 @@ def test_hf_source_load_kwargs_drops_nemo_owned_recipe_config():
         )
 
     assert "config" not in hf_kwargs
+
+
+def test_hf_source_load_kwargs_applies_device_map_memory_caps():
+    """Phase 0 must honor the same GPU/CPU caps as the HF reload path: the 427B
+    MiniMax-M3 reference OOMs under uncapped device_map=auto placement."""
+    with (
+        patch(
+            "transformers.PretrainedConfig.get_config_dict",
+            return_value=({"model_type": "unknown_remote_model"}, {}),
+        ),
+        patch("torch.cuda.device_count", return_value=2),
+    ):
+        hf_kwargs = _hf_source_load_kwargs(
+            {"attn_implementation": "eager"},
+            pretrained_model_name_or_path="model-path",
+            source_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            experts_implementation=None,
+            hf_model_cls=AutoModelForCausalLM,
+            device=torch.device("cpu"),
+            hf_device_map_auto=True,
+            hf_device_map_max_memory_gib=55,
+            hf_device_map_cpu_max_memory_gib=512,
+        )
+
+    assert hf_kwargs["device_map"] == "auto"
+    assert hf_kwargs["max_memory"] == {0: "55GiB", 1: "55GiB", "cpu": "512GiB"}
 
 
 def test_hf_source_load_kwargs_keeps_hf_recipe_config():
