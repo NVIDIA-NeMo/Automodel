@@ -21,7 +21,7 @@
 # shards.
 #
 # From the AutoModel repository root:
-#   # Required on the validated pool0 image: its injected SPXC provider
+#   # Required on the validated cluster image: its injected NCCL network provider
 #   # corrupted cross-node Engram payloads, while NCCL's internal IB path passed
 #   # the full forward/backward/optimizer smoke.
 #   export NCCL_NET_PLUGIN=none
