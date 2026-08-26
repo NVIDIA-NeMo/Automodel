@@ -15,6 +15,7 @@
 import importlib.util
 import sys
 import types
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -440,7 +441,8 @@ class TestGlmMoeDsaClassmethods:
 
         assert isinstance(model, GlmMoeDsaForCausalLM)
         assert model.config == config
-        assert model.backend == backend_config
+        assert model.backend == replace(backend_config, gate_precision=torch.float32)
+        assert backend_config.gate_precision is None
 
     def test_from_pretrained_classmethod(self, config):
         with patch(

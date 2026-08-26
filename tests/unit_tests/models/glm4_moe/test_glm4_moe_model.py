@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -474,7 +475,8 @@ class TestGlm4MoeModelClassmethods:
 
         assert isinstance(model, Glm4MoeForCausalLM)
         assert model.config == glm_config
-        assert model.backend == backend_config
+        assert model.backend == replace(backend_config, gate_precision=torch.float32)
+        assert backend_config.gate_precision is None
 
     def test_from_pretrained_classmethod(self):
         """Ensure classmethod from_pretrained builds config then delegates to from_config."""
