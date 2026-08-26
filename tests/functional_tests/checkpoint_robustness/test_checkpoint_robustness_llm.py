@@ -377,6 +377,8 @@ def _repair_legacy_partial_rotary_config(config) -> bool:
         rope_parameters.partial_rotary_factor = rotary_dim / head_dim
         return True
     return False
+
+
 def _is_nemo_owned_config(config) -> bool:
     """Return True when a config object is an AutoModel component config."""
     return type(config).__module__.startswith("nemo_automodel")
@@ -402,6 +404,14 @@ def _replace_nemo_owned_reference_config(
     (AMINT-288). Resolve the checkpoint's own config class from its
     ``auto_map`` instead, preserving a load-time FP8 ``dequantize`` request.
 
+    The same registrations also shadow in-tree config classes: for built-in
+    references (``trust_remote_code=False``), AutoConfig pairs the
+    AutoModel-owned config with the in-tree model, which then crashes on
+    attribute contracts the local class does not carry (the in-tree
+    minimax_m3_vl vision tower reads ``vision_config.temporal_patch_size``).
+    Resolve the in-tree class from Transformers' own name table, which
+    registration cannot shadow.
+
     Args:
         config: Config resolved for the vanilla reference load.
         pretrained_model_name_or_path: Checkpoint the reference loads from.
@@ -412,14 +422,8 @@ def _replace_nemo_owned_reference_config(
     Returns:
         Tuple of the faithful config and whether a replacement happened.
     """
-    if not trust_remote_code or not _is_nemo_owned_config(config):
+    if not _is_nemo_owned_config(config):
         return config, False
-    auto_map = getattr(config, "auto_map", None) or {}
-    class_reference = auto_map.get("AutoConfig")
-    if not class_reference:
-        return config, False
-
-    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     load_kwargs: dict[str, str | bool] = {
         "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
@@ -428,7 +432,23 @@ def _replace_nemo_owned_reference_config(
         load_kwargs["revision"] = revision
     if token is not None:
         load_kwargs["token"] = token
-    config_cls = get_class_from_dynamic_module(class_reference, pretrained_model_name_or_path, **load_kwargs)
+
+    config_cls = None
+    auto_map = getattr(config, "auto_map", None) or {}
+    class_reference = auto_map.get("AutoConfig")
+    if trust_remote_code and class_reference:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        config_cls = get_class_from_dynamic_module(class_reference, pretrained_model_name_or_path, **load_kwargs)
+    else:
+        import transformers
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+        class_name = CONFIG_MAPPING_NAMES.get(getattr(config, "model_type", None) or "")
+        if class_name is not None:
+            config_cls = getattr(transformers, class_name, None)
+    if config_cls is None:
+        return config, False
     replacement = config_cls.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
 
     original_quantization = getattr(config, "quantization_config", None)

@@ -1788,6 +1788,7 @@ def test_repair_legacy_partial_rotary_is_noop_without_legacy_spec():
     assert _repair_legacy_partial_rotary_config(full_rotary) is False
     assert full_rotary.rope_parameters == rope_before
 
+
 class _FakeNemoOwnedConfig(PretrainedConfig):
     """Stands in for an AutoModel component config registered into AutoConfig."""
 
@@ -1838,6 +1839,32 @@ def test_replace_nemo_owned_reference_config_preserves_dequantize_request(tmp_pa
 
     assert did_replace is True
     assert replaced.quantization_config["dequantize"] is True
+
+
+class _FakeNemoOwnedLlamaConfig(PretrainedConfig):
+    """AutoModel-owned stand-in whose model_type shadows an in-tree class."""
+
+    model_type = "llama"
+
+
+_FakeNemoOwnedLlamaConfig.__module__ = "nemo_automodel.components.models.test_only.config"
+
+
+def test_replace_nemo_owned_reference_config_resolves_in_tree_class(tmp_path):
+    """Registered configs shadowing an in-tree model_type resolve to the in-tree
+    class for built-in references (the minimax_m3_vl vision-tower crash)."""
+    from transformers import LlamaConfig
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "llama", "vocab_size": 64, "hidden_size": 32, "num_hidden_layers": 1})
+    )
+    hijacked = _FakeNemoOwnedLlamaConfig()
+
+    replaced, did_replace = _replace_nemo_owned_reference_config(hijacked, tmp_path, trust_remote_code=False)
+
+    assert did_replace is True
+    assert type(replaced) is LlamaConfig
+    assert replaced.hidden_size == 32
 
 
 def test_replace_nemo_owned_reference_config_noop_cases(tmp_path):
