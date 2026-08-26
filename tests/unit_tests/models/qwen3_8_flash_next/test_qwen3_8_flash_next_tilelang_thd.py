@@ -276,15 +276,17 @@ def test_thd_public_api_rejects_invalid_softmax_scale(scale: object, error: type
         module.tilelang_sparse_gqa_thd_attention(query, key, value, token_ids, softmax_scale=scale)
 
 
-def test_direct_thd_kernel_does_not_enable_packed_qwen_layer() -> None:
+def test_direct_thd_kernel_does_not_enable_packed_qwen_layer_cp() -> None:
     from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
 
     attention = object.__new__(Qwen3_8_FlashNextQSAAttention)
     nn.Module.__init__(attention)
-    with pytest.raises(NotImplementedError, match="packed THD attention is not yet supported"):
+    attention._cp_mesh = None
+    with pytest.raises(NotImplementedError, match="does not yet support CP"):
         attention(
             torch.zeros(1, 2, 8),
             freqs_cis=torch.zeros(1, 2, 4),
+            cp_context=object(),
             cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
         )
 

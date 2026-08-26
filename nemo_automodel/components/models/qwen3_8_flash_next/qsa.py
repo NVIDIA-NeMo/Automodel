@@ -494,6 +494,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         cp_context: Qwen3_8_FlashNextCPContext | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return selected logical token IDs for every physical query row.
 
@@ -506,13 +507,23 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
                 ``hidden_states`` and ``freqs_cis`` contain the local query
                 shard while raw logical lengths and selected IDs use global
                 sequence coordinates.
+            cu_seqlens: Optional packed-document boundaries ``[num_docs + 1]``
+                for a THD batch of one row. Routes then stay confined to each
+                query's document and use global flattened token IDs.
 
         Returns:
             int32 logical IDs ``[B, S, token_budget + compress_ratio - 1]``.
-            Padding-query rows contain only ``-1``.
+            Padding-query rows contain only ``-1``. With ``cu_seqlens`` the
+            IDs are global flattened positions in ``[0, T)``.
         """
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.hidden_size:
             raise ValueError(f"QSA hidden_states must be [B, S, {self.hidden_size}], got {tuple(hidden_states.shape)}")
+        if cu_seqlens is not None:
+            if cp_context is not None:
+                raise NotImplementedError("QSA packed routing under context parallelism is not yet supported")
+            if attention_mask is not None:
+                raise ValueError("QSA packed routing takes document boundaries from cu_seqlens, not attention_mask")
+            return self._forward_packed(hidden_states, freqs_cis=freqs_cis, cu_seqlens=cu_seqlens)
         batch_size, sequence_length, _ = hidden_states.shape
         if cp_context is None:
             sequence_lengths = right_padded_sequence_lengths(
@@ -572,6 +583,84 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
             query_position_offset=query_position_offset,
             global_sequence_length=global_sequence_length,
         )
+
+    def _forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select document-confined routes for one packed THD row.
+
+        Each document is unpacked into its own right-padded pseudo-batch row so
+        the per-row selection runs unchanged: compression groups restart at
+        every document start and visibility is bounded by the document length.
+        Local per-document IDs are then offset by the document start and packed
+        back into the flattened layout.
+
+        Args:
+            hidden_states: Packed decoder block input ``[1, T, hidden_size]``.
+            freqs_cis: Document-relative rotary values ``[1, T, D_rope]``.
+            cu_seqlens: Strictly increasing boundaries ``[num_docs + 1]``
+                starting at zero and ending at ``T``.
+
+        Returns:
+            int32 global flattened IDs ``[1, T, token_budget +
+            compress_ratio - 1]`` with ``-1`` padding.
+        """
+        if hidden_states.shape[0] != 1:
+            raise ValueError(f"QSA packed routing requires a THD batch of one row, got batch={hidden_states.shape[0]}")
+        total_tokens = hidden_states.shape[1]
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+            raise ValueError(f"cu_seqlens must be a rank-1 boundary tensor, got shape {tuple(cu_seqlens.shape)}")
+        boundaries = cu_seqlens.to(device=hidden_states.device, dtype=torch.long)
+        document_lengths = boundaries.diff()
+        if int(boundaries[0]) != 0 or int(boundaries[-1]) != total_tokens or bool((document_lengths <= 0).any()):
+            raise ValueError(
+                "cu_seqlens must start at 0, end at the packed token count, and be strictly increasing; "
+                f"got first={int(boundaries[0])}, last={int(boundaries[-1])}, T={total_tokens}"
+            )
+
+        projected = self.index_qk_proj(hidden_states)
+        query_width = self.num_query_heads * self.head_dim
+        raw_query = projected[..., :query_width].unflatten(-1, (self.num_query_heads, self.head_dim))
+        raw_key = projected[..., query_width:].unflatten(-1, (self.num_key_heads, self.head_dim))
+
+        # Unpack the single packed row into right-padded per-document rows.
+        document_starts = boundaries[:-1]
+        max_length = int(document_lengths.max())
+        local_positions = torch.arange(max_length, device=hidden_states.device)
+        row_positions = document_starts[:, None] + local_positions[None, :]
+        row_valid = local_positions[None, :] < document_lengths[:, None]
+        safe_positions = row_positions.clamp(max=total_tokens - 1)
+        query_rows = raw_query[0, safe_positions]
+        key_rows = raw_key[0, safe_positions]
+        freqs_rows = freqs_cis[0, safe_positions]
+
+        index_query = apply_qsa_rope(self.q_layernorm(query_rows), freqs_rows)
+        num_blocks = max_length // self.compress_ratio
+        grouped_key = key_rows[:, : num_blocks * self.compress_ratio].unflatten(1, (num_blocks, self.compress_ratio))
+        compressed_key = grouped_key.float().mean(dim=2).to(key_rows.dtype)
+        compressed_freqs = freqs_rows[:, : num_blocks * self.compress_ratio : self.compress_ratio]
+        compressed_key = apply_qsa_rope(self.k_layernorm(compressed_key), compressed_freqs)
+
+        document_routes = select_qsa_token_ids(
+            index_query,
+            compressed_key,
+            document_lengths,
+            token_budget=self.token_budget,
+            compress_ratio=self.compress_ratio,
+            query_chunk_size=self.query_chunk_size,
+        )
+        global_routes = torch.where(
+            document_routes >= 0,
+            document_routes + document_starts[:, None, None].to(torch.int32),
+            document_routes.new_full((), -1),
+        )
+        packed_routes = global_routes.new_full((1, total_tokens, global_routes.shape[-1]), -1)
+        packed_routes[0, row_positions[row_valid]] = global_routes[row_valid]
+        return packed_routes
 
     @torch.no_grad()
     def init_weights(self, init_std: float = 0.02) -> None:

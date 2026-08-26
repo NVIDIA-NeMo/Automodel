@@ -38,7 +38,14 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
-from nemo_automodel.components.models.qwen3_8_flash_next.qsa import Qwen3_8_FlashNextQSAIndexer, qsa_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.kernels.sparse_attention_thd import (
+    tilelang_sparse_gqa_thd_attention,
+)
+from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
+    Qwen3_8_FlashNextQSAIndexer,
+    gathered_qsa_gqa_attention,
+    qsa_gqa_attention,
+)
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -431,9 +438,17 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             )
         if x.shape[1] == 0:
             raise ValueError("Qwen3.8-Flash-Next QSA requires a non-empty sequence")
-        if attn_kwargs.get("cu_seqlens") is not None:
-            raise NotImplementedError("Qwen3.8-Flash-Next QSA packed THD attention is not yet supported")
+        packed_cu_seqlens = attn_kwargs.get("cu_seqlens")
         cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
+        if packed_cu_seqlens is not None:
+            if cp_active or cp_context is not None:
+                raise NotImplementedError("Qwen3.8-Flash-Next QSA packed THD attention does not yet support CP")
+            if x.shape[0] != 1:
+                raise ValueError(
+                    f"Qwen3.8-Flash-Next packed QSA requires a THD batch of one row, got batch={x.shape[0]}"
+                )
+            if not isinstance(packed_cu_seqlens, torch.Tensor):
+                raise TypeError(f"cu_seqlens must be a tensor of document boundaries, got {type(packed_cu_seqlens)}")
         if cp_active and cp_context is None:
             raise RuntimeError(
                 "Qwen3.8-Flash-Next QSA has an active CP mesh but did not receive model-owned batch metadata"
@@ -450,16 +465,23 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
         selected_token_ids = self.indexer(
             x,
             freqs_cis=freqs_cis,
-            attention_mask=attention_mask,
+            attention_mask=None if packed_cu_seqlens is not None else attention_mask,
             cp_context=cp_context,
+            cu_seqlens=packed_cu_seqlens,
         )
 
         batch_size, sequence_length, _ = x.shape
         # Keep the indexer's fixed-width output hookable for parity while
         # avoiding 2,051 padded gathers on short sequences.  Valid IDs are
-        # contiguous and a causal row can never contain more than S tokens.
-        global_sequence_length = cp_context.global_sequence_length if cp_context is not None else sequence_length
-        attention_width = min(global_sequence_length, selected_token_ids.shape[-1])
+        # contiguous and a causal row can never contain more than S tokens
+        # (or, when packed, more than the longest document).
+        if packed_cu_seqlens is not None:
+            max_visible_tokens = int(packed_cu_seqlens.diff().max())
+        elif cp_context is not None:
+            max_visible_tokens = cp_context.global_sequence_length
+        else:
+            max_visible_tokens = sequence_length
+        attention_width = min(max_visible_tokens, selected_token_ids.shape[-1])
         selected_token_ids = selected_token_ids[..., :attention_width]
         query = self.q_proj(x).view(batch_size, sequence_length, -1, self.head_dim * 2)
         key = self.k_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
@@ -479,14 +501,36 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             key = qwen3_8_flash_next_cp_all_gather(key, cp_context, sequence_dim=1, differentiable=True)
             value = qwen3_8_flash_next_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
 
-        attn_output = qsa_gqa_attention(
-            query,
-            key,
-            value,
-            selected_token_ids,
-            backend=self.backend.attn,
-            softmax_scale=self.scaling,
-        )
+        if packed_cu_seqlens is not None and x.is_cuda:
+            # Direct THD dispatch: the routes are global flattened IDs already
+            # confined to each query's document, so the kernel needs no
+            # cu_seqlens. CPU parity uses the oracle on the single packed row.
+            if self.backend.attn != "tilelang":
+                raise RuntimeError("Qwen3.8-Flash-Next packed CUDA QSA requires backend.attn='tilelang'")
+            attn_output = tilelang_sparse_gqa_thd_attention(
+                query[0],
+                key[0],
+                value[0],
+                selected_token_ids[0],
+                softmax_scale=self.scaling,
+            ).unsqueeze(0)
+        elif packed_cu_seqlens is not None:
+            attn_output = gathered_qsa_gqa_attention(
+                query,
+                key,
+                value,
+                selected_token_ids,
+                softmax_scale=self.scaling,
+            )
+        else:
+            attn_output = qsa_gqa_attention(
+                query,
+                key,
+                value,
+                selected_token_ids,
+                backend=self.backend.attn,
+                softmax_scale=self.scaling,
+            )
         attn_output = attn_output.reshape(*x.shape[:-1], -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
@@ -631,10 +675,14 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
 
         attn_input, attn_residual = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":
+            packed_cu_seqlens = attn_kwargs.get("cu_seqlens")
+            if isinstance(packed_cu_seqlens, torch.Tensor):
+                packed_cu_seqlens = packed_cu_seqlens.to(torch.long)
             attn_output = self.linear_attn(
                 hidden_states=attn_input,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                cu_seqlens=packed_cu_seqlens,
             )
         else:
             qsa_mask = attention_mask
