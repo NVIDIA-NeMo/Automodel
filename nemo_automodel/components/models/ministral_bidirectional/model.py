@@ -311,14 +311,21 @@ class Mistral3BidirectionalModel(Mistral3Model):
             device=parameter.device,
             dtype=torch.long,
         )
-        dummy_outputs = self.get_image_features(
-            pixel_values=dummy_pixels,
+        image_outputs = self.vision_tower(
+            dummy_pixels,
             image_sizes=dummy_image_sizes,
+            output_hidden_states=True,
             return_dict=True,
         )
-        image_features = dummy_outputs.pooler_output
-        if isinstance(image_features, (list, tuple)):
-            return sum(feature.sum() for feature in image_features)
+        vision_feature_layer = self.config.vision_feature_layer
+        if isinstance(vision_feature_layer, int):
+            selected_image_features = image_outputs.hidden_states[vision_feature_layer]
+        else:
+            selected_image_features = torch.cat(
+                [image_outputs.hidden_states[layer_idx] for layer_idx in vision_feature_layer],
+                dim=-1,
+            )
+        image_features = self.multi_modal_projector(selected_image_features.squeeze(0), dummy_image_sizes)
         return image_features.sum()
 
     def forward(

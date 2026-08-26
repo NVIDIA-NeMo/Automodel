@@ -1359,18 +1359,53 @@ def test_mistral3_vlm_runs_dummy_vision_inside_model_forward(monkeypatch):
             super().__init__()
             self.weight = nn.Parameter(torch.ones(1))
 
+        def forward(
+            self,
+            pixel_values: torch.Tensor,
+            image_sizes: torch.Tensor,
+            output_hidden_states: bool,
+            return_dict: bool,
+        ) -> SimpleNamespace:
+            """Return a differentiable fake vision hidden state.
+
+            Args:
+                pixel_values: Tensor of shape [batch, channels, height, width].
+                image_sizes: Tensor of shape [batch, 2].
+                output_hidden_states: Whether hidden states are requested.
+                return_dict: Whether to return a structured output.
+
+            Returns:
+                Namespace containing a hidden-state tensor of shape [batch, tokens, hidden].
+            """
+            events.append("vision")
+            hidden_state = pixel_values.sum().reshape(1, 1, 1) * self.weight
+            return SimpleNamespace(hidden_states=(hidden_state,))
+
+    class FakeProjector(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def forward(self, image_features: torch.Tensor, image_sizes: torch.Tensor) -> torch.Tensor:
+            """Project fake image features while retaining a gradient path.
+
+            Args:
+                image_features: Tensor of shape [tokens, vision_hidden].
+                image_sizes: Tensor of shape [batch, 2].
+
+            Returns:
+                Tensor of shape [tokens, vision_hidden].
+            """
+            events.append("projector")
+            return image_features * self.weight
+
     model = Mistral3BidirectionalModel.__new__(Mistral3BidirectionalModel)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(spatial_merge_size=1)
+    model.config = SimpleNamespace(spatial_merge_size=1, vision_feature_layer=-1)
     model.vision_tower = FakeVisionTower()
+    model.multi_modal_projector = FakeProjector()
 
     monkeypatch.setattr(Mistral3BidirectionalModel, "get_input_embeddings", lambda self: embedding)
-
-    def get_image_features(self, pixel_values, image_sizes, return_dict):
-        events.append("vision")
-        return SimpleNamespace(pooler_output=(pixel_values.sum().reshape(1) * self.vision_tower.weight,))
-
-    monkeypatch.setattr(Mistral3BidirectionalModel, "get_image_features", get_image_features)
 
     def parent_forward(self, **kwargs):
         events.append("parent")
@@ -1384,11 +1419,12 @@ def test_mistral3_vlm_runs_dummy_vision_inside_model_forward(monkeypatch):
         run_dummy_vision=True,
     )
 
-    assert events == ["vision", "parent"]
+    assert events == ["vision", "projector", "parent"]
     assert outputs["input_ids"] is None
     assert outputs["inputs_embeds"].shape == (1, 2, 4)
     outputs["inputs_embeds"].sum().backward()
     assert model.vision_tower.weight.grad is not None
+    assert model.multi_modal_projector.weight.grad is not None
 
     events.clear()
     input_ids = torch.tensor([[3, 4]])
