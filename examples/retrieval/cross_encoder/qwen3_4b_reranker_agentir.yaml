@@ -38,6 +38,9 @@
 #
 # pos_doc[0] is the positive; the first seven neg_doc entries are the negatives, giving the
 # n_passages: 8 group below. Rows with fewer than seven negatives have their negatives
+# CYCLED to fill the group -- _retrieval_transform_func indexes them modulo the list
+# length -- so a short row trains on repeated negatives rather than being dropped. A row
+# with NO negatives raises instead.
 #
 # reasoning and global_query are OPTIONAL per row. A missing, null, or whitespace-only value
 # is treated as absent rather than as an empty string: the field is left out of the prompt
