@@ -228,6 +228,13 @@ class DiffusionGemmaAttention(nn.Module):
         value_states = self.v_norm(value_states)
 
         use_te = self.attn_module is not None
+        if use_te:
+            # FP32-resident parameters make RoPE's cos/sin FP32 even under BF16
+            # autocast, so the rotary multiply promotes Q/K while V remains BF16.
+            # TE requires one QKV dtype; restore the projected compute dtype at
+            # its boundary without changing the FP32 parameter/master storage.
+            query_states = query_states.to(value_states.dtype)
+            key_states = key_states.to(value_states.dtype)
         if not use_te:
             query_states = query_states.transpose(1, 2)
             key_states = key_states.transpose(1, 2)
