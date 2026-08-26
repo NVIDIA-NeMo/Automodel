@@ -54,7 +54,7 @@ wandb:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: google/diffusiongemma-26B-A4B-it
-  torch_dtype: float32        # fp32 master weights; compute is bf16 via mp_policy
+  torch_dtype: float32        # fp32 master weights; compute is bf16 via autocast
   canvas_length: 256
   self_conditioning: true
   freeze_router: true
@@ -86,8 +86,8 @@ distributed:
   ep_size: 8
   sequence_parallel: false
   activation_checkpointing: true
-  mp_policy:                  # mixed precision: fp32 master + bf16 compute
-    param_dtype: bfloat16
+  mp_policy:                  # mixed precision: fp32 master + bf16 autocast compute
+    param_dtype: float32
     reduce_dtype: float32
     output_dtype: float32
   autocast_dtype: bfloat16

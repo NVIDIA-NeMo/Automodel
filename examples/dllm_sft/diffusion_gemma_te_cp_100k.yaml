@@ -49,7 +49,7 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
   mp_policy:
-    param_dtype: bfloat16
+    param_dtype: float32
     reduce_dtype: float32
     output_dtype: float32
   autocast_dtype: bfloat16
