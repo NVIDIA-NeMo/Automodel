@@ -1,0 +1,154 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# CP8 half of the GLM-5.3-Flash packed MedPix parity pair. EP144 spans the
+# dp(18) x cp(8) mesh and therefore still stores two of the 288 experts per GPU;
+# PP remains disabled. Eight accumulation microsteps cover the same 144 packs
+# consumed by one CP1 optimizer step.
+
+recipe: FinetuneRecipeForVLM
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 144
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 5
+  num_epochs: 4
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+  deterministic: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: zai-org/GLM-5.3-Flash
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  text_config:
+    output_hidden_states: true
+    num_nextn_predict_layers: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: hybridep
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: nemo_automodel.components.models.glm5_next.processing.build_glm5_next_processor
+  pretrained_model_name_or_path: zai-org/GLM-5.3-Flash
+  trust_remote_code: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/glm5_3_flash_medpix_packed2k_ep144_cp8_100steps/
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 8
+  pp_size: 1
+  ep_size: 144
+  sequence_parallel: false
+  activation_checkpointing: true
+  # Avoid retaining a full accumulated gradient set across eight CP microsteps.
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+packed_sequence:
+  pretokenize: true
+  max_length: 2048
+  pack_size: 2048
+  collate_max_length: 2048
+  packing_ratio: 0.9
+  drop_long_samples: true
+  balance_media_tokens: true
+  packing_format: neat
+  attn_implementation: sdpa
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  persistent_workers: true
+  pin_memory: true
+  drop_last: true
+
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: constant
+
+clip_grad_norm:
+  max_norm: 1.0
+
+wandb:
+  enable: true
+  project: huiyingl_workspace
+  entity: Nemo-automodel
+  name: glm5_3_flash_medpix_packed2k_ep144_cp8_100steps
+  group: glm5_3_flash_medpix_packed2k_ep144_cp1_cp8_parity
+  tags: [glm5.3-flash, medpix, vlm, packed2k, ep144, cp8, parity]
+  dir: logs/glm5_3_flash_medpix_packed2k_ep144_cp8_100steps/wandb
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 18
+  time: "02:00:00"
+  max_steps: 5
