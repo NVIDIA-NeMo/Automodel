@@ -21,6 +21,10 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next import layers as qwen3_8_flash_next_layers
 from nemo_automodel.components.models.qwen3_8_flash_next import qsa as qwen3_8_flash_next_qsa
 from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import (
+    _routes_to_membership,
+    flex_sparse_gqa_attention,
+)
 from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     Qwen3_8_FlashNextQSAIndexer,
@@ -330,6 +334,56 @@ def test_gathered_qsa_oracle_handles_duplicate_and_padding_ids() -> None:
     for padding_input in padding_inputs:
         assert padding_input.grad is not None
         assert torch.count_nonzero(padding_input.grad) == 0
+
+
+def test_flex_membership_gives_empty_rows_a_kernel_safe_dummy_route() -> None:
+    selected = torch.tensor(
+        [[[-1, -1, -1], [0, 0, -1], [2, 1, 2], [4, -2, -1]]],
+        dtype=torch.int32,
+    )
+
+    membership, has_routes = _routes_to_membership(selected, kv_length=4)
+
+    torch.testing.assert_close(has_routes, torch.tensor([[False, True, True, False]]))
+    torch.testing.assert_close(
+        membership,
+        torch.tensor(
+            [
+                [
+                    [True, False, False, False],
+                    [True, False, False, False],
+                    [False, True, True, False],
+                    [True, False, False, False],
+                ]
+            ]
+        ),
+    )
+    assert bool(membership.any(dim=-1).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
+def test_flex_qsa_empty_route_rows_have_zero_output_and_gradients() -> None:
+    torch.manual_seed(43)
+    inputs = [
+        torch.randn(1, 3, 4, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True),
+        torch.randn(1, 3, 2, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True),
+        torch.randn(1, 3, 2, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True),
+    ]
+    selected = torch.tensor(
+        [[[-1, -1, -1], [0, 1, -1], [0, 1, 2]]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    output = flex_sparse_gqa_attention(*inputs, selected)
+
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output[:, 0]) == 0
+    output[:, 0].float().sum().backward()
+    for tensor in inputs:
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+        assert torch.count_nonzero(tensor.grad) == 0
 
 
 def test_qsa_flex_backend_bypasses_generic_parent_initializer() -> None:

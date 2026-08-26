@@ -18,9 +18,9 @@ One code path serves every training layout: dense right-padded batches,
 packed (THD) rows, and context parallelism (local queries against gathered
 global K/V) all reduce to "each query row attends exactly to its route IDs".
 The routes are scattered into a boolean membership table, FlexAttention's
-BlockMask skips fully-masked 128x128 tiles, and the flash-style kernel keeps
-memory at O(S) instead of materializing scores. Rows whose routes are all
-``-1`` (padding queries) produce exactly zero output and zero gradients.
+BlockMask skips fully-masked 128x128 tiles, and the kernel avoids materializing
+dense attention scores. Rows whose routes are all ``-1`` (padding queries)
+produce exactly zero output and zero gradients.
 """
 
 from __future__ import annotations
@@ -49,8 +49,10 @@ def _routes_to_membership(
         kv_length: Number of physical K/V rows.
 
     Returns:
-        Boolean membership ``[B, S_q, kv_length]`` and a boolean
-        ``[B, S_q]`` marking rows that selected at least one token.
+        Kernel-safe boolean membership ``[B, S_q, kv_length]`` and a boolean
+        ``[B, S_q]`` marking rows that selected at least one real token. Rows
+        without a real route select K/V row zero solely to keep the kernel's
+        softmax finite; the caller erases their output afterward.
     """
     batch_size, query_length, _ = selected_token_ids.shape
     valid = (selected_token_ids >= 0) & (selected_token_ids < kv_length)
@@ -60,7 +62,13 @@ def _routes_to_membership(
     hit_counts = torch.zeros(batch_size, query_length, kv_length, dtype=torch.int32, device=selected_token_ids.device)
     safe_ids = selected_token_ids.long().clamp(min=0, max=kv_length - 1)
     hit_counts.scatter_add_(-1, safe_ids, valid.to(torch.int32))
-    return hit_counts > 0, valid.any(dim=-1)
+    membership = hit_counts > 0
+    has_routes = valid.any(dim=-1)
+    # FlexAttention's behavior for a fully-masked softmax row is not a stable
+    # contract. Route empty query rows to one finite score so neither forward
+    # nor backward can form 0/0; their result is masked out below.
+    membership[..., 0] |= ~has_routes
+    return membership, has_routes
 
 
 def flex_sparse_gqa_attention(
@@ -128,9 +136,9 @@ def flex_sparse_gqa_attention(
         scale=scale,
         enable_gqa=True,
     ).permute(0, 2, 1, 3)
-    # Padding-query rows (no routes) must be exactly zero in both output and
-    # gradient, matching the oracle and the padded-gap training contract.
-    return output * has_routes[:, :, None, None].to(output.dtype)
+    # Padding-query rows (no real routes) must be exactly zero in both output
+    # and gradient, matching the oracle and the padded-gap training contract.
+    return output.masked_fill(~has_routes[:, :, None, None], 0)
 
 
 __all__ = ["flex_sparse_gqa_attention"]
