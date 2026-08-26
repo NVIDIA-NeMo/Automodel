@@ -292,3 +292,27 @@ def test_qsa_attention_has_no_public_query_chunk_or_rematerialization_config() -
 
     assert "qsa_attention_query_chunk_size" not in serialized
     assert "qsa_attention_activation_recompute" not in serialized
+
+
+def test_legacy_qwen4_exp_checkpoint_config_resolves_via_autoconfig(tmp_path) -> None:
+    """Immutable pre-rename checkpoint dumps must resolve to the renamed classes."""
+    import json
+
+    from transformers import AutoConfig
+
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+    from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextLegacyConfig
+
+    checkpoint_config = {
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "text_config": {"model_type": "qwen4_exp_text", "hidden_size": 8},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(checkpoint_config))
+
+    resolved = AutoConfig.from_pretrained(tmp_path)
+    assert isinstance(resolved, Qwen3_8_FlashNextLegacyConfig)
+    assert resolved.model_type == "qwen4_exp"
+    assert resolved.architectures == ["Qwen4ExpForConditionalGeneration"]
+    module_path, class_name = MODEL_ARCH_MAPPING["Qwen4ExpForConditionalGeneration"]
+    assert class_name == "Qwen3_8_FlashNextForConditionalGeneration"

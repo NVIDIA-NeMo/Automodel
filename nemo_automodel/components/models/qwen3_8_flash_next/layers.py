@@ -128,6 +128,16 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
         cu_seqlens = kwargs.pop("cu_seqlens", None)
         cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
         if not cp_active or cu_seqlens is None:
+            if cu_seqlens is not None and kwargs.get("attention_mask") is None:
+                # The inherited packed conv path reads per-token document IDs
+                # from ``attention_mask``. Synthesize them from the boundaries
+                # for cu_seqlens-only packed batches.
+                boundaries = cu_seqlens.reshape(-1).to(device=hidden_states.device, dtype=torch.long)
+                document_ids = torch.repeat_interleave(
+                    torch.arange(boundaries.numel() - 1, device=hidden_states.device),
+                    boundaries.diff(),
+                )
+                kwargs["attention_mask"] = document_ids.unsqueeze(0).to(torch.int32)
             return super().forward(hidden_states, cu_seqlens=cu_seqlens, **kwargs)
         self._packed_global_cu_seqlens = cu_seqlens
         try:

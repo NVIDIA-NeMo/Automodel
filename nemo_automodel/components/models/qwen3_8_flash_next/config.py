@@ -355,3 +355,20 @@ class Qwen3_8_FlashNextConfig(PretrainedConfig):
             architectures=architectures or ["Qwen3_8_FlashNextForConditionalGeneration"],
             **kwargs,
         )
+
+
+class Qwen3_8_FlashNextLegacyTextConfig(Qwen3_8_FlashNextTextConfig):
+    """Text config alias for checkpoint dumps that predate the model rename."""
+
+    model_type = "qwen4_exp_text"
+
+
+class Qwen3_8_FlashNextLegacyConfig(Qwen3_8_FlashNextConfig):
+    """Config alias for checkpoint dumps that predate the model rename.
+
+    Released checkpoints store ``model_type: qwen4_exp`` and architecture
+    ``Qwen4ExpForConditionalGeneration``. The dumps are immutable, so the
+    legacy identifiers resolve to the renamed classes here instead.
+    """
+
+    model_type = "qwen4_exp"

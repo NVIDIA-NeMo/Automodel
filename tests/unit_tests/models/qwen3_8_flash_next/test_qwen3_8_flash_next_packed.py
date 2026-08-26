@@ -487,3 +487,35 @@ def test_two_rank_packed_qsa_and_sharder_match_packed_cp1(tmp_path) -> None:
         nprocs=2,
         join=True,
     )
+
+
+def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """cu_seqlens-only packed batches get per-token document IDs for conv."""
+    from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
+
+    captured: dict[str, torch.Tensor | None] = {}
+
+    def _capture_forward(self, hidden_states, **kwargs):
+        captured.update(kwargs)
+        return hidden_states
+
+    monkeypatch.setattr(CPAwareGatedDeltaNet, "forward", _capture_forward)
+    gdn_config = _config()
+    gdn_config.layer_types = ["linear_attention"]
+    gdn_config.linear_conv_kernel_dim = 4
+    gdn_config.linear_key_head_dim = 4
+    gdn_config.linear_value_head_dim = 4
+    gdn_config.linear_num_key_heads = 1
+    gdn_config.linear_num_value_heads = 2
+    layer = Qwen3_8_FlashNextGatedDeltaNet(gdn_config, layer_idx=0)
+
+    layer(torch.randn(1, 10, gdn_config.hidden_size), cu_seqlens=torch.tensor([0, 3, 10]))
+    assert captured["cu_seqlens"].tolist() == [0, 3, 10]
+    assert captured["attention_mask"].tolist() == [[0, 0, 0, 1, 1, 1, 1, 1, 1, 1]]
+    assert captured["attention_mask"].dtype == torch.int32
+
+    # An explicit mask is preserved untouched.
+    explicit = torch.zeros(1, 10, dtype=torch.int32)
+    layer(torch.randn(1, 10, gdn_config.hidden_size), cu_seqlens=torch.tensor([0, 10]), attention_mask=explicit)
+    assert captured["attention_mask"] is explicit
