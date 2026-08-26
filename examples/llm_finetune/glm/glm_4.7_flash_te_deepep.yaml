@@ -120,3 +120,12 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
+  nodes: 1
+  time: "00:30:00"
+  checkpoint_robustness:
+    # Keep the currently mismatched HF comparisons blocking until the model or
+    # reference path is fixed; an observed mismatch alone is not a reason to skip.
+    tokenizer_name: zai-org/GLM-4.7-Flash
+    hf_device_map_auto: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
