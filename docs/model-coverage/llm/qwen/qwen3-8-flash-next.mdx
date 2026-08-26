@@ -103,8 +103,9 @@ was 0.00054, and the maximum absolute difference was 0.00267. Final losses were
 |---|---|
 | [qwen3_8_flash_next_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml) | 100-step SFT on HellaSwag with FSDP2, EP64, and world-sized PLE ownership |
 
-Set `QWEN3_8_FLASH_NEXT_MODEL_PATH` to the checkpoint directory, allocate eight nodes
-with eight GPUs per node, and launch the recipe through your cluster launcher.
+The recipe loads [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
+directly from the Hugging Face Hub. Allocate eight nodes with eight GPUs per
+node and launch the recipe through your cluster launcher.
 See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node
 setup.
 

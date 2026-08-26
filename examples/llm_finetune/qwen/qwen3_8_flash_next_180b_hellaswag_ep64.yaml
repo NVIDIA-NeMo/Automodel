@@ -21,14 +21,13 @@
 # shards.
 #
 # From the AutoModel repository root:
-#   export QWEN3_8_FLASH_NEXT_MODEL_PATH=../brightdelta-180b-bf16_vv1
 #   # Required on the validated pool0 image: its injected SPXC provider
 #   # corrupted cross-node PLE payloads, while NCCL's internal IB path passed
 #   # the full forward/backward/optimizer smoke.
 #   export NCCL_NET_PLUGIN=none
 #   export NCCL_NET=IB
 #   cp slurm.sub qwen3_8_flash_next_180b.sub
-#   # In qwen3_8_flash_next_180b.sub set CONFIG to this YAML, -N 8, and -t 04:00:00,
+#   # In qwen3_8_flash_next_180b.sub set CONFIG to this YAML, -N 8, and -t 01:00:00,
 #   # then configure the cluster account/container mounts and run:
 #   sbatch qwen3_8_flash_next_180b.sub
 
@@ -54,8 +53,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.qwen3_8_flash_next.config.Qwen3_8_FlashNextConfig.from_pretrained
-    pretrained_model_name_or_path: ${oc.env:QWEN3_8_FLASH_NEXT_MODEL_PATH,../brightdelta-180b-bf16_vv1}
-    name_or_path: ${oc.env:QWEN3_8_FLASH_NEXT_MODEL_PATH,../brightdelta-180b-bf16_vv1}
+    pretrained_model_name_or_path: Qwen/Qwen3.8-Flash-Next
+    name_or_path: Qwen/Qwen3.8-Flash-Next
     language_model_only: true
   trust_remote_code: false
   load_base_model: true
@@ -68,7 +67,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
-    dispatcher: torch
+    dispatcher: hybridep
     rope_fusion: false
     fake_balanced_gate: false
     gate_precision: float32
@@ -77,7 +76,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ${oc.env:QWEN3_8_FLASH_NEXT_OUTPUT_DIR,checkpoints/qwen3_8_flash_next_180b_hellaswag_ep64}
+  checkpoint_dir: checkpoints/qwen3_8_flash_next_180b_hellaswag_ep64
   model_save_format: safetensors
   save_consolidated: false
 
@@ -104,7 +103,7 @@ dataset:
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: ${oc.env:QWEN3_8_FLASH_NEXT_MODEL_PATH,../brightdelta-180b-bf16_vv1}
+    pretrained_model_name_or_path: Qwen/Qwen3.8-Flash-Next
     trust_remote_code: false
 
 packed_sequence:
@@ -126,7 +125,7 @@ validation_dataset:
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: ${oc.env:QWEN3_8_FLASH_NEXT_MODEL_PATH,../brightdelta-180b-bf16_vv1}
+    pretrained_model_name_or_path: Qwen/Qwen3.8-Flash-Next
     trust_remote_code: false
 
 validation_dataloader:
@@ -182,4 +181,4 @@ ci:
   recipe_owner: huiyingl
   # pp_size(1) * ep_size(64) = 64 GPUs => 8 nodes (8 GPUs/node).
   nodes: 8
-  time: "04:00:00"
+  time: "01:00:00"
