@@ -442,6 +442,14 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
     apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
 
 
+def _uses_hybridep_dispatch(model: nn.Module) -> bool:
+    """True when any expert module dispatches tokens through HybridEP."""
+    return any(
+        isinstance(m, (GroupedExpertsDeepEP, GroupedExpertsTE)) and m.dispatcher_backend == "hybridep"
+        for m in model.modules()
+    )
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -484,6 +492,21 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
+    if checkpoint_decoder and _uses_hybridep_dispatch(model):
+        logger.warning(
+            "Activation checkpointing is enabled with the HybridEP token dispatcher. "
+            "HybridEP's dispatch is not reproducible under checkpoint recompute: replaying it "
+            "with bit-identical routing can return a different number of tokens than the "
+            "forward pass produced, which surfaces as torch.utils.checkpoint.CheckpointError "
+            "('Recomputed values ... have different metadata', e.g. [2791, hidden] vs "
+            "[2701, hidden]). Verified on 8xH100 with DiffusionGemma-26B-A4B: the router's "
+            "top-k selection matched exactly on every rank across forward and recompute, so "
+            "the drift originates in the dispatch, not in routing -- ignore_router_for_ac "
+            "cannot prevent it. If this run dies with CheckpointError, either switch to "
+            "dispatcher='deepep' (reproducible under recompute) or disable activation "
+            "checkpointing (HybridEP is fastest in that mode)."
+        )
+
     if checkpoint_decoder and not selective and not ignore_router:
         logger.warning(
             "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
