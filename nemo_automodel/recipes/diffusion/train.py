@@ -928,9 +928,11 @@ class TrainDiffusionRecipe(BaseRecipe):
     def _run_validation_epoch(self, global_step: int) -> float:
         """Score the held-out set with the training flow-matching objective.
 
-        The fixed seed makes every evaluation draw the same timesteps, noise, and CFG dropout,
-        so ``val_loss`` tracks the model rather than the sampling; ``ScopedRNG`` restores the
-        training RNG state afterwards, leaving the training trajectory unchanged.
+        Seeding by data rank mirrors training: every evaluation draws the same timesteps, noise,
+        and CFG dropout, so ``val_loss`` tracks the model rather than the sampling, while
+        data-parallel ranks stay decorrelated and context-parallel peers of one rank draw
+        identical values for their shared batch. ``ScopedRNG`` restores the training RNG state
+        afterwards, leaving the training trajectory unchanged.
 
         The forward runs under the same compute-dtype autocast as training, so a single-rank
         split-dtype config evaluates the way it trains. FP8 autocast is left out: delayed-scaling
@@ -948,7 +950,11 @@ class TrainDiffusionRecipe(BaseRecipe):
         local_loss_sum = 0.0
         local_num_batches = 0
         try:
-            with ScopedRNG(seed=self.seed, ranked=False), torch.no_grad(), self._autocast_context():
+            with (
+                ScopedRNG(seed=self.seed + self._get_dp_rank(), ranked=False),
+                torch.no_grad(),
+                self._autocast_context(),
+            ):
                 for batch in self.val_dataloader:
                     _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
                         model=self.model,

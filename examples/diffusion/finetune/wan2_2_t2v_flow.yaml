@@ -30,8 +30,6 @@ step_scheduler:
   num_epochs: 100
   log_remote_every_steps: 2
   save_checkpoint_every_epoch: false
-  # Validation cadence; needs the data.validation_dataloader block below.
-  val_every_steps: 500
 
 data:
   dataloader:
@@ -42,16 +40,6 @@ data:
     base_resolution: [512, 512]
     dynamic_batch_size: false
     shuffle: true
-    drop_last: false
-    num_workers: 2
-  # Held-out cache for the validation loss. Shuffle off keeps the loss comparable across steps.
-  validation_dataloader:
-    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
-    cache_dir: PATH_TO_YOUR_WAN22_VAL_DATA
-    model_type: wan
-    base_resolution: [512, 512]
-    dynamic_batch_size: false
-    shuffle: false
     drop_last: false
     num_workers: 2
 

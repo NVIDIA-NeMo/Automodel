@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -21,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion import train as diffusion_train
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
@@ -218,6 +220,8 @@ def _minimal_diffusion_recipe_cfg(
     attention_backend="flash_varlen",
     optimize_hunyuan_flash_varlen_mask=True,
     fsdp=None,
+    checkpoint=None,
+    val_every_steps=None,
 ):
     cfg = {
         "model": {
@@ -237,6 +241,10 @@ def _minimal_diffusion_recipe_cfg(
     }
     if fsdp is not None:
         cfg["fsdp"] = fsdp
+    if checkpoint is not None:
+        cfg["checkpoint"] = checkpoint
+    if val_every_steps is not None:
+        cfg["step_scheduler"]["val_every_steps"] = val_every_steps
     return ConfigNode(cfg)
 
 
@@ -791,7 +799,7 @@ class _FakeValidationPipeline:
         return None, self.losses[(self.calls - 1) % len(self.losses)], None, {}
 
 
-def _make_validation_recipe(losses, num_batches=2):
+def _make_validation_recipe(losses, num_batches=2, dp_rank=0):
     recipe = object.__new__(TrainDiffusionRecipe)
     recipe.model = nn.Linear(1, 1)
     recipe.model.train()
@@ -799,9 +807,102 @@ def _make_validation_recipe(losses, num_batches=2):
     recipe.compute_dtype = torch.float32
     recipe._autocast_dtype = None
     recipe.seed = 1234
+    recipe._get_dp_rank = MagicMock(return_value=dp_rank)
     recipe.val_dataloader = [{"video_latents": torch.zeros(1, 1)} for _ in range(num_batches)]
     recipe.flow_matching_pipeline = _FakeValidationPipeline(losses)
     return recipe
+
+
+class _StopSetupAfterDataloaders(Exception):
+    """Ends ``setup()`` right after the dataloader section; the rest needs a real model."""
+
+
+def _patch_setup_dataloaders(monkeypatch, *, validation_batches=1, with_validation=True):
+    """Run ``setup()`` through the dataloader section with stub typed configs.
+
+    Returns the validation config stub so tests can assert how ``build`` was called.
+    """
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+    )
+
+    validation_config = None
+    if with_validation:
+        validation_config = SimpleNamespace(
+            build=MagicMock(
+                return_value=SimpleNamespace(dataloader=[object()] * validation_batches, sampler="val-sampler")
+            )
+        )
+
+    def _stop(self):
+        raise _StopSetupAfterDataloaders
+
+    monkeypatch.setattr(RecipeConfig, "checkpoint", property(lambda self: SimpleNamespace(build=MagicMock())))
+    monkeypatch.setattr(
+        RecipeConfig,
+        "diffusion_dataloader",
+        property(
+            lambda self: SimpleNamespace(
+                build=MagicMock(return_value=SimpleNamespace(dataloader=[object()], sampler="train-sampler"))
+            )
+        ),
+    )
+    monkeypatch.setattr(RecipeConfig, "diffusion_validation_dataloader", property(lambda self: validation_config))
+    monkeypatch.setattr(RecipeConfig, "step_scheduler", property(_stop))
+    return validation_config
+
+
+def _setup_cfg(**kwargs):
+    return _minimal_diffusion_recipe_cfg(
+        adapter_type="simple",
+        attention_backend=None,
+        optimize_hunyuan_flash_varlen_mask=False,
+        checkpoint={"enabled": False},
+        **kwargs,
+    )
+
+
+def test_setup_shards_the_validation_dataloader_like_the_training_one(monkeypatch):
+    validation_config = _patch_setup_dataloaders(monkeypatch)
+    recipe = TrainDiffusionRecipe(_setup_cfg(val_every_steps=5))
+
+    with pytest.raises(_StopSetupAfterDataloaders):
+        recipe.setup()
+
+    # dist is not initialized in the harness, so the data-parallel group is rank 0 of 1.
+    validation_config.build.assert_called_once_with(dp_rank=0, dp_world_size=1, batch_size=1)
+    assert recipe.val_sampler == "val-sampler"
+    assert len(recipe.val_dataloader) == 1
+
+
+def test_setup_rejects_an_empty_validation_dataloader(monkeypatch):
+    _patch_setup_dataloaders(monkeypatch, validation_batches=0)
+    recipe = TrainDiffusionRecipe(_setup_cfg(val_every_steps=5))
+
+    with pytest.raises(RuntimeError, match="Validation dataloader is empty"):
+        recipe.setup()
+
+
+@pytest.mark.parametrize(
+    ("with_validation", "val_every_steps", "expected_warning"),
+    [
+        (True, None, "without step_scheduler.val_every_steps"),
+        (False, 100, "no data.validation_dataloader is configured"),
+    ],
+)
+def test_setup_warns_when_the_loader_and_the_cadence_disagree(
+    monkeypatch, caplog, with_validation, val_every_steps, expected_warning
+):
+    _patch_setup_dataloaders(monkeypatch, with_validation=with_validation)
+    recipe = TrainDiffusionRecipe(_setup_cfg(val_every_steps=val_every_steps))
+
+    with caplog.at_level(logging.WARNING), pytest.raises(_StopSetupAfterDataloaders):
+        recipe.setup()
+
+    assert expected_warning in caplog.text
 
 
 def test_run_validation_epoch_averages_batch_losses_in_eval_mode(monkeypatch):
@@ -857,6 +958,28 @@ def test_run_validation_epoch_repeats_sampling_and_leaves_training_rng_untouched
     assert train_draw == pytest.approx(expected_train_draw)
 
 
+def test_run_validation_epoch_raises_when_the_loader_yields_no_batches(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(1.0)], num_batches=0)
+
+    with pytest.raises(RuntimeError, match="Validation produced no batches"):
+        recipe._run_validation_epoch(global_step=0)
+
+
+def test_run_validation_epoch_decorrelates_sampling_across_dp_ranks(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    losses = [torch.tensor(1.0), torch.tensor(3.0)]
+    # Ranks hold different shards, so drawing the same timesteps and noise everywhere would
+    # correlate the estimate; training offsets its seed by the data rank for the same reason.
+    rank0 = _make_validation_recipe(losses, dp_rank=0)
+    rank1 = _make_validation_recipe(losses, dp_rank=1)
+
+    rank0._run_validation_epoch(global_step=0)
+    rank1._run_validation_epoch(global_step=0)
+
+    assert rank0.flow_matching_pipeline.random_draws != rank1.flow_matching_pipeline.random_draws
+
+
 def test_run_validation_epoch_reduces_sum_and_count_over_dp_group(monkeypatch):
     recipe = _make_validation_recipe([torch.tensor(2.0), torch.tensor(4.0)])
     recipe._get_dp_group = MagicMock(return_value="dp-group")
@@ -888,7 +1011,9 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
     monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(diffusion_train.wandb, "run", None, raising=False)
+    wandb_log = MagicMock()
+    monkeypatch.setattr(diffusion_train.wandb, "run", MagicMock(), raising=False)
+    monkeypatch.setattr(diffusion_train.wandb, "log", wandb_log, raising=False)
 
     recipe = object.__new__(TrainDiffusionRecipe)
     recipe.dist_env = SimpleNamespace(is_main=True)
@@ -928,5 +1053,7 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
 
     if with_val_dataloader:
         recipe._run_validation_epoch.assert_called_once_with(1)
+        assert call({"val_loss": 1.25}, step=1) in wandb_log.call_args_list
     else:
         recipe._run_validation_epoch.assert_not_called()
+        assert all(call_args.args[0].keys() != {"val_loss"} for call_args in wandb_log.call_args_list)
