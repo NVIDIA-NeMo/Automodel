@@ -406,6 +406,7 @@ class _ConstantTarget(torch.nn.Module):
         super().__init__()
         self.model = torch.nn.Module()
         self.model.embed_tokens = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.model.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(cfg.num_target_layers)])
         self.lm_head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.num_layers = cfg.num_target_layers
         self.vocab_size = cfg.vocab_size
@@ -422,6 +423,8 @@ class _ConstantTarget(torch.nn.Module):
         output_hidden_states=False,
     ):
         hidden = self.model.embed_tokens(input_ids)
+        for layer in self.model.layers:
+            hidden = layer(hidden)
         keep = input_ids.shape[1] if logits_to_keep is None else logits_to_keep
         # A very peaked distribution so the sampled path is deterministic too.
         logits = torch.zeros(input_ids.shape[0], keep, self.vocab_size)
