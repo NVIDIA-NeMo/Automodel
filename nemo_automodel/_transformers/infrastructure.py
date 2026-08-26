@@ -27,7 +27,7 @@ import logging
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Union, cast
 
 import torch
 
@@ -77,6 +77,7 @@ from nemo_automodel.components.utils.model_utils import (
     init_empty_weights,
     print_trainable_parameters,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
@@ -624,6 +625,11 @@ def apply_model_infrastructure(
 
     # Apply freezing before sharding
     freeze_config = _kwargs.get("freeze_config")
+    has_peft_freeze_config = peft_config is not None and freeze_config is not None
+    if has_peft_freeze_config:
+        for name, param in model.named_parameters():
+            if "lora_" not in name and param.requires_grad:
+                param.requires_grad_(False)
     if freeze_config is not None:
         apply_parameter_freezing(model, freeze_config)
 
@@ -635,6 +641,16 @@ def apply_model_infrastructure(
 
     # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
     enable_radio_vit_fused_attn(model)
+
+    # Keep the snapshot sparse: only selectors that alter PEFT's normal
+    # LoRA-trainable/base-frozen policy need to survive parameter replacement.
+    pre_shard_trainability_overrides: dict[str, bool] = {}
+    if has_peft_freeze_config:
+        pre_shard_trainability_overrides = {
+            canonical_parameter_fqn(name).replace("_orig_mod.", ""): param.requires_grad
+            for name, param in model.named_parameters(remove_duplicate=False)
+            if param.requires_grad != ("lora_" in name)
+        }
 
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
@@ -724,13 +740,23 @@ def apply_model_infrastructure(
         checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
     )
 
-    # Freeze parameters after checkpoint loading and parallelization
-    # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)
+    # Sharding and checkpoint loading may replace Parameter objects. Restore the
+    # configured PEFT trainability policy by logical name, while keeping newly
+    # created non-LoRA parameters frozen.
     if peft_config is not None:
-        models_to_freeze = model.parts if hasattr(model, "parts") else [model]
-        for mp in models_to_freeze:
-            for name, param in mp.named_parameters():
-                if "lora_" not in name and param.requires_grad:
+        trainability_models: list[torch.nn.Module]
+        if hasattr(model, "parts"):
+            trainability_models = cast(list[torch.nn.Module], model.parts)
+        elif isinstance(model_wrapper, (DDPManager, MegatronFSDPManager)):
+            trainability_models = [getattr(model, "module", model)]
+        else:
+            trainability_models = [model]
+        for mp in trainability_models:
+            for name, param in mp.named_parameters(remove_duplicate=False):
+                name = canonical_parameter_fqn(name).replace("_orig_mod.", "")
+                if name in pre_shard_trainability_overrides:
+                    param.requires_grad_(pre_shard_trainability_overrides[name])
+                elif "lora_" not in name:
                     param.requires_grad_(False)
 
     if autopipeline is None:

@@ -14,11 +14,35 @@
 
 """Shared structural model traversal utilities."""
 
+import re
 from collections.abc import Iterator
+from functools import lru_cache
 
 from torch import nn
 
 _TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
+
+
+@lru_cache(maxsize=1000)
+def _compile_wildcard_pattern(pattern: str) -> re.Pattern[str]:
+    pattern = re.sub(r"(?<!\.)\*", r".*", pattern)
+    pattern = re.sub(r"\.\*", "(.*)", pattern)
+    return re.compile("^" + pattern + "$")
+
+
+def wildcard_match(pattern: str, key: str | None) -> bool:
+    """Return whether a wildcard pattern matches a fully qualified name.
+
+    Args:
+        pattern: Wildcard pattern such as ``*_proj`` or ``*.layers.0.*``.
+        key: Fully qualified module name to match.
+
+    Returns:
+        Whether the pattern matches the complete key.
+    """
+    if key is None:
+        return False
+    return _compile_wildcard_pattern(pattern).match(key) is not None
 
 
 def iter_transformer_and_mtp_blocks(model: nn.Module) -> Iterator[tuple[nn.Module, str, nn.Module]]:

@@ -12,48 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
+import logging
 from dataclasses import dataclass, field
 from typing import List
 
 import torch.nn as nn
 
 from nemo_automodel.shared.import_utils import safe_import_te
+from nemo_automodel.shared.model_utils import wildcard_match
 
 HAS_TE, transformer_engine = safe_import_te()
-import logging
 
 logger = logging.getLogger(__name__)
-from functools import lru_cache
 
 
 def _is_linear_module(module):
     return isinstance(module, nn.Linear) or (HAS_TE and isinstance(module, transformer_engine.pytorch.Linear))
-
-
-@lru_cache(maxsize=1000)
-def _compile_wildcard_pattern(pattern):
-    pattern = re.sub(r"(?<!\.)\*", r".*", pattern)  # replace [^\.]* with `.*` ie insert "." before "*"
-    pattern = re.sub(r"\.\*", "(.*)", pattern)  # replace .* -> (.*)
-    return re.compile("^" + pattern + "$")
-
-
-def wildcard_match(pattern, key):
-    """
-    Return whether the pattern (target module to add LoRA) matches the key (model weight name).
-
-    Example:
-    --------
-        >>> wildcard_match("*.layers.0.*.linear_qkv", "decoder.layers.0.self_attention.linear_qkv")
-        True
-        >>> wildcard_match("*.layers.0.*.linear_qkv", "decoder.layers.1.self_attention.linear_qkv")
-        False
-    """
-    if key is None:
-        return False
-    regex_pattern = _compile_wildcard_pattern(pattern)
-    match = regex_pattern.match(key)
-    return match is not None
 
 
 @dataclass

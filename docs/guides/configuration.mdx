@@ -63,6 +63,32 @@ Only load configuration files and `_target_` values from trusted sources. A YAML
 
 The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema. Use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`. You can also configure parallelism sizes, such as `dp_size`, `tp_size`, and `pp_size`, and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. For examples, see the [Pipeline Parallelism with AutoPipeline](/development/pipeline-parallelism) guide and the recipe configs.
 
+## Select Trainable Modules
+
+The LLM and VLM fine-tuning recipes accept a `freeze_config:` section. Use `freeze_modules` and `unfreeze_modules` to select modules with the same fully qualified name glob patterns accepted by PEFT's `target_modules`:
+
+```yaml
+freeze_config:
+  freeze_modules:
+  - "*encoder*"
+  unfreeze_modules:
+  - "*projector*"
+```
+
+Each matched module has all of its parameters updated recursively. Patterns match the complete module name, so use a leading wildcard when nesting can vary; for example, `*_proj` matches projection modules at any depth. A single string or a list of patterns is accepted.
+
+Freeze selectors are applied first, followed by unfreeze selectors, so an unfreeze selector takes precedence when both match. Selection happens before distributed wrapping and optimizer construction. Under PEFT, LoRA parameters in modules that do not match a freeze selector retain their existing trainability, selected non-LoRA modules can be unfrozen, and non-LoRA parameters created during parallelization remain frozen.
+
+The `freeze_vision_tower`, `freeze_audio_tower`, `freeze_language_model`, and `freeze_video_embedder` options are deprecated. Replace enabled options with the corresponding module name under `freeze_modules` and remove disabled options. For example:
+
+```yaml
+freeze_config:
+  freeze_modules:
+  - audio_encoder
+```
+
+Legacy-only configurations retain the existing implicit `freeze_vision_tower: true` default. A configuration containing `freeze_modules` or `unfreeze_modules` uses explicit-selector semantics and does not implicitly freeze vision modules; include a matching vision selector when migrating a configuration that relied on that default. Enabled legacy aliases retain their established attribute and substring matching before `unfreeze_modules` is applied.
+
 ## Prewarm One-Time CUDA Initialization
 
 {/* docs-review-start: mamba-ssd-prewarm */}

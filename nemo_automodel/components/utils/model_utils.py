@@ -15,11 +15,13 @@
 import inspect
 import logging
 import os
+import warnings
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Callable
 
 from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.model_utils import wildcard_match
 
 HAVE_TORCHAO, torch_ao = safe_import("torchao")
 HAVE_BNB, bnb = safe_import("bitsandbytes")
@@ -308,23 +310,13 @@ def print_trainable_parameters(model: nn.Module, name: str = "Model") -> tuple[i
 
 
 def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):
-    """Helper function to freeze parameters by attribute name and name patterns.
+    """Freeze a legacy model attribute and modules matching name substrings."""
+    if attribute_name is not None and hasattr(model, attribute_name):
+        getattr(model, attribute_name).requires_grad_(False)
 
-    Args:
-        model: The model to apply freezing to.
-        attribute_name: Name of the model attribute to freeze (e.g., 'vision_tower').
-        name_patterns: List of patterns to match in module names.
-    """
-    # Freeze by attribute name
-    if hasattr(model, attribute_name):
-        for param in getattr(model, attribute_name).parameters():
-            param.requires_grad = False
-
-    # Freeze by name patterns
     for name, module in model.named_modules():
         if any(pattern in name.lower() for pattern in name_patterns):
-            for param in module.parameters():
-                param.requires_grad = False
+            module.requires_grad_(False)
 
 
 def enable_radio_vit_fused_attn(model):
@@ -368,43 +360,48 @@ def apply_parameter_freezing(model, freeze_config):
         model: The model to apply freezing to.
         freeze_config: Configuration dict specifying what to freeze.
 
-    freeze_config can contain:
-        - freeze_vision_tower: bool (default True)
+    Deprecated compatibility aliases:
+        - freeze_vision_tower: bool (default True in legacy-only configurations)
         - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
         - freeze_video_embedder: bool (default False)
+
+    Generic selectors:
+        - freeze_modules: module-name glob pattern or list of patterns to freeze
+        - unfreeze_modules: module-name glob pattern or list of patterns to unfreeze
     """
-    freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
-    freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
-    freeze_language_model = freeze_config.get("freeze_language_model", False)
-    freeze_video_embedder = freeze_config.get("freeze_video_embedder", False)
+    freeze_modules = freeze_config.get("freeze_modules", ()) or ()
+    freeze_modules = [freeze_modules] if isinstance(freeze_modules, str) else list(freeze_modules)
+    has_generic_selectors = "freeze_modules" in freeze_config or "unfreeze_modules" in freeze_config
+    # Preserve the legacy attribute and substring matching independently of the
+    # glob semantics used by the generic selectors.
+    legacy_freeze_aliases = (
+        ("freeze_vision_tower", True, "vision_tower", ("vision", "visual", "image_encoder")),
+        ("freeze_audio_tower", False, "audio_tower", ("audio", "audio_encoder", "speech", "sound")),
+        ("freeze_language_model", False, "language_model", ("language", "text", "llm")),
+        ("freeze_video_embedder", False, None, ("patch_generator.video_embedder",)),
+    )
+    deprecated_options = [f"`{option}`" for option, _, _, _ in legacy_freeze_aliases if option in freeze_config]
+    if deprecated_options:
+        warnings.warn(
+            f"The freeze_config options {', '.join(deprecated_options)} are deprecated. Remove disabled options "
+            "and replace enabled options with `freeze_modules`; for example, replace `freeze_audio_tower: true` with "
+            '`freeze_modules: ["audio_encoder"]`. Generic selectors do not apply the legacy implicit vision freeze.',
+            category=FutureWarning,
+            stacklevel=2,
+        )
+    for option, default, attribute_name, name_patterns in legacy_freeze_aliases:
+        if option == "freeze_vision_tower" and has_generic_selectors:
+            default = False
+        if freeze_config.get(option, default):
+            _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns)
 
-    # Freeze vision tower
-    if freeze_vision_tower:
-        _freeze_module_by_attribute_and_patterns(model, "vision_tower", ["vision", "visual", "image_encoder"])
-
-    # Freeze audio tower
-    if freeze_audio_tower:
-        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech", "sound"])
-
-    # Freeze language model backbone
-    if freeze_language_model:
-        _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
-
-    # NemotronOmni RADIO: patch_generator.video_embedder is only exercised on
-    # video inputs; on image-only training it sits in the optimizer without
-    # state (no grad → no lazy init), so dcp.load on resume raises
-    # "Missing key in checkpoint state_dict: optim.state.<...>.video_embedder.weight.step".
-    # Independent of freeze_vision_tower so the image encoder can stay trainable
-    # while the video branch is frozen out.
-    if freeze_video_embedder:
-        frozen = 0
-        for name, param in model.named_parameters():
-            if "patch_generator.video_embedder" in name:
-                param.requires_grad_(False)
-                frozen += 1
-        if frozen:
-            logger.info("Froze %d patch_generator.video_embedder params", frozen)
+    unfreeze_modules = freeze_config.get("unfreeze_modules", ()) or ()
+    unfreeze_modules = [unfreeze_modules] if isinstance(unfreeze_modules, str) else list(unfreeze_modules)
+    for patterns, requires_grad in ((freeze_modules, False), (unfreeze_modules, True)):
+        for name, module in model.named_modules(remove_duplicate=False):
+            if any(wildcard_match(pattern, name) for pattern in patterns):
+                module.requires_grad_(requires_grad)
 
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache

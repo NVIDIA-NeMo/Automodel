@@ -44,10 +44,13 @@ peft:
   target_modules:
   - "*.query"
   - "*.value"
-  # Note: classifier head is fully trained (not LoRA), unfrozen automatically in train_seq_cls.py
   dim: 8
   alpha: 16
   dropout: 0.1
+
+freeze_config:
+  unfreeze_modules:
+  - "*classifier"
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC
@@ -71,4 +74,3 @@ optimizer:
   eps: 1e-8
   lr: 2.0e-5  # Standard learning rate for BERT/RoBERTa fine-tuning
   weight_decay: 0.01  # Crucial for stable training on small datasets
-

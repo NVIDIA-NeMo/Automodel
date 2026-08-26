@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from contextlib import nullcontext
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -148,6 +152,144 @@ class _DummyModel(torch.nn.Module):
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
         self.config = SimpleNamespace()
+
+
+class _TinyTrainabilityModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.base = torch.nn.Linear(1, 1, bias=False)
+        self.extension = torch.nn.Linear(1, 1, bias=False)
+        self.extension.requires_grad_(False)
+        self.config = SimpleNamespace()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Apply both projections.
+
+        Args:
+            inputs: Tensor of shape [batch, features].
+
+        Returns:
+            Tensor of shape [batch, features].
+        """
+        return self.base(inputs) + self.extension(inputs)
+
+
+_GENERIC_FREEZE_CONFIG = {
+    "freeze_modules": ["b*", "ext*"],
+    "unfreeze_modules": "ext*",
+}
+
+
+def _run_freeze_config_ddp(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+        from nemo_automodel.components.distributed.config import DDPConfig
+        from nemo_automodel.components.distributed.ddp import DDPManager
+
+        model = apply_model_infrastructure(
+            model=_TinyTrainabilityModel(),
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=DDPManager(DDPConfig()),
+            freeze_config=_GENERIC_FREEZE_CONFIG,
+        )
+
+        for _ in range(2):
+            model.zero_grad(set_to_none=True)
+            model(torch.tensor([[float(rank + 1)]])).sum().backward()
+
+        assert model.module.base.weight.grad is None
+        assert model.module.extension.weight.grad is not None
+        Path(result_dir, f"rank_{rank}.txt").write_text(
+            str(model.module.extension.weight.grad.item()),
+            encoding="utf-8",
+        )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_freeze_config_applies_before_ddp_reducer_construction(tmp_path: Path):
+    """Configured trainable parameters participate in DDP gradient synchronization."""
+    torch.multiprocessing.spawn(
+        _run_freeze_config_ddp,
+        args=(2, str(tmp_path / "gloo_init"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+    gradients = [float((tmp_path / f"rank_{rank}.txt").read_text(encoding="utf-8")) for rank in range(2)]
+    assert gradients == [1.5, 1.5]
+
+
+@pytest.mark.parametrize(
+    ("freeze_config", "extension_trainable", "vision_lora_trainable"),
+    [
+        pytest.param(None, False, True, id="no-freeze-config"),
+        pytest.param({"freeze_vision_tower": False}, False, True, id="disabled-legacy-alias"),
+        pytest.param({"freeze_vision_tower": True}, False, False, id="enabled-legacy-alias"),
+        pytest.param(_GENERIC_FREEZE_CONFIG, True, True, id="generic-freeze-config"),
+    ],
+)
+def test_peft_freeze_config_survives_parallel_parameter_replacement(
+    freeze_config: dict | None, extension_trainable: bool, vision_lora_trainable: bool
+):
+    """PEFT keeps selector overrides while freezing new non-LoRA parameters."""
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+    model = _TinyTrainabilityModel()
+    model.register_parameter("lora_weight", torch.nn.Parameter(torch.ones(1)))
+    model.vision_adapter = torch.nn.Module()
+    model.vision_adapter.register_parameter("lora_weight", torch.nn.Parameter(torch.ones(1)))
+    peft_config = SimpleNamespace(lora_A_init=None, use_triton=False)
+    freeze_kwargs = {"freeze_config": freeze_config} if freeze_config is not None else {}
+    warning_context = (
+        pytest.warns(FutureWarning, match="`freeze_vision_tower`")
+        if freeze_config is not None and "freeze_vision_tower" in freeze_config
+        else nullcontext()
+    )
+
+    def replace_and_add_parameters(model, *_args, **_kwargs):
+        for module in (model.base, model.extension):
+            module.weight = torch.nn.Parameter(module.weight.detach().clone())
+        model.lora_weight = torch.nn.Parameter(model.lora_weight.detach().clone())
+        model.vision_adapter.lora_weight = torch.nn.Parameter(model.vision_adapter.lora_weight.detach().clone())
+        model.register_parameter("parallel_parameter", torch.nn.Parameter(torch.ones(1)))
+        return model
+
+    with (
+        warning_context,
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._apply_peft_and_lower_precision", return_value=model),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", side_effect=replace_and_add_parameters),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
+        apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            peft_config=peft_config,
+            **freeze_kwargs,
+        )
+
+    assert not model.base.weight.requires_grad
+    assert model.extension.weight.requires_grad is extension_trainable
+    assert model.lora_weight.requires_grad
+    assert model.vision_adapter.lora_weight.requires_grad is vision_lora_trainable
+    assert not model.parallel_parameter.requires_grad
 
 
 def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():

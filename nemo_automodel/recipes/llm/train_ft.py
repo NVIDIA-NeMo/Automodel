@@ -54,6 +54,7 @@ from nemo_automodel._transformers.infrastructure import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
@@ -182,7 +183,7 @@ def build_model(
     cfg_quantization=None,
     distributed_setup: DistributedSetup | None = None,
     cfg_qat=None,
-    unfreeze_modules: list[str] | None = None,
+    cfg_freeze: ConfigNode | dict[str, Any] | None = None,
     sdpa_method: list[str] | None = None,
     device_mesh=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
@@ -198,7 +199,7 @@ def build_model(
         cfg_quantization: Configuration for BitsAndBytes quantization.
         distributed_setup: Resolved distributed topology and policy object.
         cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
-        unfreeze_modules: List of module names/substrings to unfreeze.
+        cfg_freeze: Configuration for freezing and unfreezing model parameters.
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
@@ -208,6 +209,7 @@ def build_model(
         kwargs = {
             "has_packed_sequence": has_packed_sequence,
             "peft_config": cfg_peft,
+            "freeze_config": cfg_freeze,
             "sdpa_method": sdpa_method,
         }
         if distributed_setup is not None:
@@ -289,17 +291,11 @@ def build_model(
                 fp8_config=kwargs.get("fp8_config"),
                 compile_config=kwargs.get("compile_config"),
                 quantization_config=kwargs.get("quantization_config"),
+                freeze_config=kwargs.get("freeze_config"),
                 pretrained_model_name_or_path=None,
                 load_base_model=False,
                 cache_dir=hf_constants.HF_HUB_CACHE,
             )
-
-    # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
-    if unfreeze_modules:
-        for name, param in model.named_parameters():
-            if any(module_name in name for module_name in unfreeze_modules):
-                param.requires_grad_(True)
-        logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
     return model
 
@@ -620,6 +616,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
             cfg_qat=self.cfg.get("qat", None),
+            cfg_freeze=self.cfg.get("freeze_config", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.embedding_row_repair_report = None

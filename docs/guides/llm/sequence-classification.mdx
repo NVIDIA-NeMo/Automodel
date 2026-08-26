@@ -76,6 +76,10 @@ peft:
   alpha: 16
   dropout: 0.1
 
+freeze_config:
+  unfreeze_modules:
+  - "*classifier"
+
 dataset:
   _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC
   split: train
@@ -110,6 +114,7 @@ optimizer:
 
 - `target_modules`: glob to select linear layers (e.g., `"*.proj"`).
 - `dim` (rank), `alpha`, `dropout`: tune per model/compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
+- `freeze_config.unfreeze_modules`: keeps the classification head fully trainable while PEFT freezes other non-LoRA parameters.
 - The recipe automatically applies the adapters; no additional code changes are required.
 
 ## Running on Multiple GPUs
