@@ -380,6 +380,75 @@ def _load_hf_fp8_dequantized_config(
     return config
 
 
+def _is_nemo_owned_config(config) -> bool:
+    """Return True when a config object is an AutoModel component config."""
+    return type(config).__module__.startswith("nemo_automodel")
+
+
+def _replace_nemo_owned_reference_config(
+    config,
+    pretrained_model_name_or_path: str | Path,
+    *,
+    trust_remote_code: bool,
+    revision: str | None = None,
+    token: str | bool | None = None,
+):
+    """Re-resolve a vanilla-reference config hijacked by AutoModel registrations.
+
+    nemo_automodel registers its component config classes into Transformers'
+    ``CONFIG_MAPPING`` (``_CUSTOM_CONFIG_REGISTRATIONS``), and a locally
+    registered ``model_type`` wins over checkpoint remote code even with
+    ``trust_remote_code=True``. Inside the harness process, AutoConfig then
+    resolves checkpoints such as Kimi-Linear to an AutoModel-owned class while
+    the model class still comes from the checkpoint's ``auto_map``, and
+    ``from_pretrained`` rejects the pair with a ``config_class`` mismatch
+    (AMINT-288). Resolve the checkpoint's own config class from its
+    ``auto_map`` instead, preserving a load-time FP8 ``dequantize`` request.
+
+    Args:
+        config: Config resolved for the vanilla reference load.
+        pretrained_model_name_or_path: Checkpoint the reference loads from.
+        trust_remote_code: Whether the reference load trusts remote code.
+        revision: Optional checkpoint revision.
+        token: Optional Hub token.
+
+    Returns:
+        Tuple of the faithful config and whether a replacement happened.
+    """
+    if not trust_remote_code or not _is_nemo_owned_config(config):
+        return config, False
+    auto_map = getattr(config, "auto_map", None) or {}
+    class_reference = auto_map.get("AutoConfig")
+    if not class_reference:
+        return config, False
+
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    load_kwargs: dict[str, str | bool] = {
+        "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    }
+    if revision is not None:
+        load_kwargs["revision"] = revision
+    if token is not None:
+        load_kwargs["token"] = token
+    config_cls = get_class_from_dynamic_module(class_reference, pretrained_model_name_or_path, **load_kwargs)
+    replacement = config_cls.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+
+    original_quantization = getattr(config, "quantization_config", None)
+    requested_dequantize = (
+        original_quantization.get("dequantize")
+        if isinstance(original_quantization, dict)
+        else getattr(original_quantization, "dequantize", None)
+    )
+    if requested_dequantize:
+        replacement_quantization = getattr(replacement, "quantization_config", None)
+        if isinstance(replacement_quantization, dict):
+            replacement.quantization_config = {**replacement_quantization, "dequantize": True}
+        elif replacement_quantization is not None:
+            replacement_quantization.dequantize = True
+    return replacement, True
+
+
 def _dequantize_hf_fp8_weights_in_place(model, output_dtype: torch.dtype) -> int:
     """Dequantize native per-tensor HF FP8 modules without their runtime kernel.
 
@@ -484,7 +553,7 @@ def _peft_adapter_load_kwargs(hf_kwargs: dict[str, object]) -> dict[str, object]
 
 
 def _patch_remote_masking_api_compatibility() -> None:
-    """Allow remote model code to pass masking kwargs removed by Transformers."""
+    """Adapt remote model code to masking kwargs removed or renamed by Transformers."""
     import transformers.masking_utils as masking_utils
 
     for function_name in ("create_causal_mask", "create_sliding_window_causal_mask"):
@@ -492,20 +561,98 @@ def _patch_remote_masking_api_compatibility() -> None:
         if getattr(mask_function, "_nemo_removed_kwargs_patched", False):
             continue
         parameters = inspect.signature(mask_function).parameters.values()
-        accepts_cache_position = any(
-            parameter.name == "cache_position" or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
+        parameter_names = {parameter.name for parameter in parameters}
+        accepts_var_keyword = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        drop_cache_position = "cache_position" not in parameter_names and not accepts_var_keyword
+        # Transformers v5.x renamed ``input_embeds`` to ``inputs_embeds``;
+        # pre-v5 remote code (e.g. Kimi-Linear) still passes the old keyword.
+        rename_input_embeds = (
+            "input_embeds" not in parameter_names and "inputs_embeds" in parameter_names and not accepts_var_keyword
         )
-        if accepts_cache_position:
+        if not drop_cache_position and not rename_input_embeds:
             continue
 
         @wraps(mask_function)
-        def compatible_mask_function(*args, _mask_function=mask_function, **kwargs):
-            kwargs.pop("cache_position", None)
+        def compatible_mask_function(
+            *args,
+            _mask_function=mask_function,
+            _drop_cache_position=drop_cache_position,
+            _rename_input_embeds=rename_input_embeds,
+            **kwargs,
+        ):
+            if _drop_cache_position:
+                kwargs.pop("cache_position", None)
+            if _rename_input_embeds and "input_embeds" in kwargs:
+                kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
             return _mask_function(*args, **kwargs)
 
         compatible_mask_function._nemo_removed_kwargs_patched = True  # type: ignore[attr-defined]
         setattr(masking_utils, function_name, compatible_mask_function)
+
+
+def _patch_remote_fla_api_compatibility() -> None:
+    """Adapt remote model code to the renamed fla-core KDA gate API.
+
+    Kimi-Linear's pre-0.4.2 remote code calls
+    ``fused_kda_gate(g, A_log, head_k_dim, g_bias=...)`` with a flat
+    ``g`` of shape ``[..., heads * head_k_dim]`` that the old kernel reshaped
+    internally. fla-core 0.4.2 renamed the API to
+    ``fused_kda_gate(g, A_log, dt_bias=None, lower_bound=None, ...)`` and
+    expects ``g`` pre-reshaped to ``[..., heads, head_k_dim]``. Translate
+    legacy calls when the installed function no longer accepts the old form;
+    an installed fla that still accepts ``g_bias`` is left untouched.
+    """
+    try:
+        import fla.ops.kda as kda_ops
+        import fla.ops.kda.gate as kda_gate
+    except ImportError:
+        return
+
+    gate_function = kda_gate.fused_kda_gate
+    if getattr(gate_function, "_nemo_legacy_kda_gate_patched", False):
+        return
+    parameter_names = set(inspect.signature(gate_function).parameters)
+    if "g_bias" in parameter_names or "dt_bias" not in parameter_names:
+        return
+
+    @wraps(gate_function)
+    def compatible_fused_kda_gate(g, A_log, *args, _gate_function=gate_function, **kwargs):
+        """Translate a legacy KDA gate call onto the renamed fla-core API.
+
+        Args:
+            g: Gate projection. Legacy callers pass a flat Tensor of shape
+                [..., heads * head_k_dim] together with a positional
+                ``head_k_dim``; new-style callers pass [..., heads, head_k_dim].
+            A_log: Per-head log-decay Tensor of shape [heads].
+            *args: A leading int is the legacy positional ``head_k_dim``; a
+                following tensor is the legacy positional ``g_bias``.
+            **kwargs: Legacy ``g_bias``/``beta``/``threshold`` keywords are
+                translated or rejected; everything else passes through.
+
+        Returns:
+            Gate Tensor of shape [..., heads, head_k_dim] from the new API.
+        """
+        if args and isinstance(args[0], int):
+            head_k_dim = args[0]
+            remaining = list(args[1:])
+            if remaining:
+                kwargs.setdefault("g_bias", remaining.pop(0))
+            if remaining:
+                raise TypeError("Unexpected extra positional arguments for legacy fused_kda_gate call")
+            g_bias = kwargs.pop("g_bias", None)
+            beta = kwargs.pop("beta", 1.0)
+            threshold = kwargs.pop("threshold", 20.0)
+            if beta != 1.0 or threshold != 20.0:
+                raise TypeError(
+                    "Legacy fused_kda_gate beta/threshold overrides are not supported by the installed fla API"
+                )
+            return _gate_function(g.view(*g.shape[:-1], -1, head_k_dim), A_log, dt_bias=g_bias, **kwargs)
+        return _gate_function(g, A_log, *args, **kwargs)
+
+    compatible_fused_kda_gate._nemo_legacy_kda_gate_patched = True  # type: ignore[attr-defined]
+    kda_gate.fused_kda_gate = compatible_fused_kda_gate
+    if getattr(kda_ops, "fused_kda_gate", None) is gate_function:
+        kda_ops.fused_kda_gate = compatible_fused_kda_gate
 
 
 def _rss_gb() -> float:
@@ -1067,6 +1214,13 @@ def _hf_source_load_kwargs(
         "trust_remote_code",
     }
     hf_kwargs = {k: v for k, v in model_kwargs.items() if k in hf_allowed_keys}
+    recipe_config = hf_kwargs.get("config")
+    if recipe_config is not None and _is_nemo_owned_config(recipe_config):
+        # AutoModel component configs are never valid for a vanilla-HF
+        # reference; remote and in-tree model classes both reject them with a
+        # config_class mismatch. Let the reference resolve the checkpoint's
+        # own config instead.
+        del hf_kwargs["config"]
     hf_kwargs["torch_dtype"] = source_dtype
     hf_kwargs["trust_remote_code"] = trust_remote_code
     hf_kwargs["local_files_only"] = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
@@ -1520,6 +1674,7 @@ def _prepare_source_load_reference_rank0(
 
     apply_cache_compatibility_patches()
     _patch_remote_masking_api_compatibility()
+    _patch_remote_fla_api_compatibility()
     artifact_dir = _robustness_artifact_dir(cfg)
     for router_path in _router_diagnostic_paths(artifact_dir):
         router_path.unlink(missing_ok=True)
@@ -1591,6 +1746,17 @@ def _prepare_source_load_reference_rank0(
             revision=hf_kwargs.get("revision"),
             token=hf_kwargs.get("token"),
         )
+    hf_config, replaced_reference_config = _replace_nemo_owned_reference_config(
+        hf_config,
+        original_pretrained_path,
+        trust_remote_code=hf_kwargs["trust_remote_code"],
+        revision=hf_kwargs.get("revision"),
+        token=hf_kwargs.get("token"),
+    )
+    if replaced_reference_config:
+        # Pass the faithful config explicitly so from_pretrained's internal
+        # AutoConfig resolution cannot re-select the AutoModel-owned class.
+        hf_kwargs["config"] = hf_config
 
     model_load_context = _hf_model_load_context(
         trust_remote_code=trust_remote_code,
@@ -2105,6 +2271,7 @@ def _run_vanilla_hf_reload(
         # still carry Transformers-v4 list-form ``_tied_weights_keys``.
         apply_cache_compatibility_patches()
         _patch_remote_masking_api_compatibility()
+        _patch_remote_fla_api_compatibility()
         _, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
         artifact_dir = _robustness_artifact_dir(cfg)
         _shape_diagnostic_report_path(artifact_dir, "phase_3").unlink(missing_ok=True)
@@ -2186,6 +2353,17 @@ def _run_vanilla_hf_reload(
                 revision=model_kwargs.get("revision"),
                 token=model_kwargs.get("token"),
             )
+        hf_config, replaced_reference_config = _replace_nemo_owned_reference_config(
+            hf_config,
+            config_path,
+            trust_remote_code=trust_remote_code,
+            revision=model_kwargs.get("revision"),
+            token=model_kwargs.get("token"),
+        )
+        if replaced_reference_config:
+            # Pass the faithful config explicitly so from_pretrained's internal
+            # AutoConfig resolution cannot re-select the AutoModel-owned class.
+            hf_kwargs["config"] = hf_config
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
         # rank-0-only stall trips the NCCL watchdog while the other ranks idle at

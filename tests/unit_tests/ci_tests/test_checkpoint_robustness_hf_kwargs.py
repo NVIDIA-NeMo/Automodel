@@ -19,7 +19,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, PretrainedConfig
 
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder import (
     _extract_custom_args as _extract_biencoder_custom_args,
@@ -49,6 +49,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _LogitParityPolicy,
     _model_pretrained_path,
     _normalize_peft_no_split_modules,
+    _patch_remote_fla_api_compatibility,
     _patch_remote_masking_api_compatibility,
     _peft_adapter_load_kwargs,
     _post_load_dequant_max_memory,
@@ -56,6 +57,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _raise_distributed_failure,
     _record_deferred_failure,
     _repeatability_policy,
+    _replace_nemo_owned_reference_config,
     _resolve_hf_attn_implementation,
     _resolve_hf_model_class,
     _run_hf_reload_standing_shape_diagnostic,
@@ -310,11 +312,13 @@ def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypat
     _patch_remote_masking_api_compatibility()
 
     for function_name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        # Pre-v5 remote code passes the removed ``cache_position`` and the
+        # renamed ``input_embeds`` keywords (e.g. Kimi-Linear).
         result = getattr(masking_utils, function_name)(
-            "config",
-            "inputs",
-            "attention",
-            "cache",
+            config="config",
+            input_embeds="inputs",
+            attention_mask="attention",
+            past_key_values="cache",
             position_ids="positions",
             cache_position="removed-argument",
         )
@@ -329,7 +333,7 @@ def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypat
 def test_remote_masking_api_compatibility_preserves_supported_api(monkeypatch):
     import transformers.masking_utils as masking_utils
 
-    def create_mask(config, inputs_embeds, attention_mask, past_key_values, cache_position=None):
+    def create_mask(config, input_embeds, attention_mask, past_key_values, cache_position=None):
         return cache_position
 
     monkeypatch.setattr(masking_utils, "create_causal_mask", create_mask)
@@ -1857,3 +1861,177 @@ def test_record_deferred_failure_preserves_all_comparison_failures():
     _record_deferred_failure(failures, "Phase 4 HF reload parity", "HF parity failed")
 
     assert failures == ["Phase 4 HF reload parity:\nHF parity failed"]
+
+
+class _FakeNemoOwnedConfig(PretrainedConfig):
+    """Stands in for an AutoModel component config registered into AutoConfig."""
+
+    model_type = "stub_reference"
+
+
+# The helper discriminates on the class's owning package, not its bases.
+_FakeNemoOwnedConfig.__module__ = "nemo_automodel.components.models.test_only.config"
+
+_STUB_AUTO_MAP = {"AutoConfig": "configuration_stub.StubReferenceConfig"}
+
+
+def _write_stub_remote_checkpoint(tmp_path, *, quantization_config=None):
+    """Write a minimal remote-code checkpoint dir exposing its own config class."""
+    (tmp_path / "configuration_stub.py").write_text(
+        "from transformers import PretrainedConfig\n"
+        "\n"
+        "\n"
+        "class StubReferenceConfig(PretrainedConfig):\n"
+        '    model_type = "stub_reference"\n'
+    )
+    config = {"model_type": "stub_reference", "auto_map": _STUB_AUTO_MAP, "hidden_size": 8}
+    if quantization_config is not None:
+        config["quantization_config"] = quantization_config
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    return tmp_path
+
+
+def test_replace_nemo_owned_reference_config_resolves_checkpoint_auto_map(tmp_path):
+    ckpt = _write_stub_remote_checkpoint(tmp_path)
+    hijacked = _FakeNemoOwnedConfig(auto_map=dict(_STUB_AUTO_MAP))
+
+    replaced, did_replace = _replace_nemo_owned_reference_config(hijacked, ckpt, trust_remote_code=True)
+
+    assert did_replace is True
+    assert type(replaced).__name__ == "StubReferenceConfig"
+    assert type(replaced).__module__.startswith("transformers_modules")
+
+
+def test_replace_nemo_owned_reference_config_preserves_dequantize_request(tmp_path):
+    ckpt = _write_stub_remote_checkpoint(tmp_path, quantization_config={"quant_method": "fp8"})
+    hijacked = _FakeNemoOwnedConfig(
+        auto_map=dict(_STUB_AUTO_MAP),
+        quantization_config={"quant_method": "fp8", "dequantize": True},
+    )
+
+    replaced, did_replace = _replace_nemo_owned_reference_config(hijacked, ckpt, trust_remote_code=True)
+
+    assert did_replace is True
+    assert replaced.quantization_config["dequantize"] is True
+
+
+def test_replace_nemo_owned_reference_config_noop_cases(tmp_path):
+    from transformers import AutoConfig
+
+    hf_config = AutoConfig.for_model("llama", vocab_size=64, hidden_size=32, num_hidden_layers=1)
+    assert _replace_nemo_owned_reference_config(hf_config, tmp_path, trust_remote_code=True) == (hf_config, False)
+
+    no_auto_map = _FakeNemoOwnedConfig()
+    assert _replace_nemo_owned_reference_config(no_auto_map, tmp_path, trust_remote_code=True) == (no_auto_map, False)
+
+    untrusted = _FakeNemoOwnedConfig(auto_map=dict(_STUB_AUTO_MAP))
+    assert _replace_nemo_owned_reference_config(untrusted, tmp_path, trust_remote_code=False) == (untrusted, False)
+
+
+def test_hf_source_load_kwargs_drops_nemo_owned_recipe_config():
+    with patch(
+        "transformers.PretrainedConfig.get_config_dict",
+        return_value=({"model_type": "unknown_remote_model"}, {}),
+    ):
+        hf_kwargs = _hf_source_load_kwargs(
+            {"config": _FakeNemoOwnedConfig(), "attn_implementation": "eager"},
+            pretrained_model_name_or_path="model-path",
+            source_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            experts_implementation=None,
+            hf_model_cls=AutoModelForCausalLM,
+            device=torch.device("cpu"),
+            hf_device_map_auto=False,
+        )
+
+    assert "config" not in hf_kwargs
+
+
+def test_hf_source_load_kwargs_keeps_hf_recipe_config():
+    from transformers import AutoConfig
+
+    hf_config = AutoConfig.for_model("llama", vocab_size=64, hidden_size=32, num_hidden_layers=1)
+    with patch(
+        "transformers.PretrainedConfig.get_config_dict",
+        return_value=({"model_type": "unknown_remote_model"}, {}),
+    ):
+        hf_kwargs = _hf_source_load_kwargs(
+            {"config": hf_config, "attn_implementation": "eager"},
+            pretrained_model_name_or_path="model-path",
+            source_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            experts_implementation=None,
+            hf_model_cls=AutoModelForCausalLM,
+            device=torch.device("cpu"),
+            hf_device_map_auto=False,
+        )
+
+    assert hf_kwargs["config"] is hf_config
+
+
+def _install_fake_fla(monkeypatch, gate_function):
+    """Register a minimal fake fla.ops.kda[.gate] module tree exposing gate_function."""
+    import sys
+    from types import ModuleType
+
+    fla = ModuleType("fla")
+    ops = ModuleType("fla.ops")
+    kda = ModuleType("fla.ops.kda")
+    gate = ModuleType("fla.ops.kda.gate")
+    gate.fused_kda_gate = gate_function
+    kda.fused_kda_gate = gate_function
+    kda.gate = gate
+    ops.kda = kda
+    fla.ops = ops
+    for name, module in (("fla", fla), ("fla.ops", ops), ("fla.ops.kda", kda), ("fla.ops.kda.gate", gate)):
+        monkeypatch.setitem(sys.modules, name, module)
+    return kda, gate
+
+
+def test_remote_fla_api_compatibility_translates_legacy_kda_gate(monkeypatch):
+    """Legacy fused_kda_gate(g, A, head_k_dim, g_bias=...) calls must reach the renamed API.
+
+    The fake installed API mirrors fla-core 0.4.2: g arrives pre-reshaped to
+    [..., heads, head_k_dim] and the bias keyword is dt_bias.
+    """
+    calls = {}
+
+    def fused_kda_gate(g, A_log, dt_bias=None, lower_bound=None, output_dtype=torch.float32):
+        calls["g_shape"] = tuple(g.shape)
+        calls["dt_bias"] = dt_bias
+        return g
+
+    kda, gate = _install_fake_fla(monkeypatch, fused_kda_gate)
+    _patch_remote_fla_api_compatibility()
+
+    # Legacy call: flat g of shape [batch, sequence, heads * head_k_dim].
+    g = torch.zeros(2, 3, 8)
+    bias = torch.ones(8)
+    gate.fused_kda_gate(g, torch.zeros(2), 4, g_bias=bias)
+    assert calls["g_shape"] == (2, 3, 2, 4)
+    assert calls["dt_bias"] is bias
+
+    # New-style calls pass through untouched.
+    gate.fused_kda_gate(torch.zeros(2, 3, 2, 4), torch.zeros(2), dt_bias=None)
+    assert calls["g_shape"] == (2, 3, 2, 4)
+    assert calls["dt_bias"] is None
+
+    # The package-level re-export is patched consistently, and re-patching no-ops.
+    assert kda.fused_kda_gate is gate.fused_kda_gate
+    patched = gate.fused_kda_gate
+    _patch_remote_fla_api_compatibility()
+    assert gate.fused_kda_gate is patched
+
+    with pytest.raises(TypeError, match="beta/threshold"):
+        gate.fused_kda_gate(g, torch.zeros(2), 4, g_bias=bias, beta=2.0)
+
+
+def test_remote_fla_api_compatibility_preserves_legacy_capable_api(monkeypatch):
+    def fused_kda_gate(g, A, head_k_dim, g_bias=None, beta=1.0, threshold=20.0):
+        return g
+
+    kda, gate = _install_fake_fla(monkeypatch, fused_kda_gate)
+    _patch_remote_fla_api_compatibility()
+
+    assert gate.fused_kda_gate is fused_kda_gate
+    assert kda.fused_kda_gate is fused_kda_gate
