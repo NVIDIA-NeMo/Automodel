@@ -296,6 +296,19 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     # Skip patch_hf_model_for_pp; our forward already handles PP routing.
     _pp_keep_self_forward: bool = True
 
+    def get_experts_implementation(self) -> dict[str, str | None]:
+        """Return the configured expert backend for Transformers generation hooks."""
+        return {"": getattr(self.config, "_experts_implementation", None)}
+
+    def set_experts_implementation(self, experts_implementation: str | dict[str, str | None]) -> None:
+        """Set the expert backend used by Transformers generation hooks."""
+        implementation = (
+            experts_implementation
+            if isinstance(experts_implementation, str)
+            else experts_implementation.get("", getattr(self.config, "_experts_implementation", None))
+        )
+        self.config._experts_implementation = implementation
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""

@@ -78,6 +78,7 @@ def get_gemma4_text_config(target_config):
 def build_gemma4_draft_config(target_config, model_args):
     """Build a Gemma4 DSpark draft config from a Gemma4 target's text sub-config."""
     draft_config = get_gemma4_text_config(target_config)
+    full_attention_config = draft_config.per_layer_config["full_attention"]
 
     num_target_layers = int(draft_config.num_hidden_layers)
     num_draft_layers = int(model_args.num_draft_layers)
@@ -103,7 +104,16 @@ def build_gemma4_draft_config(target_config, model_args):
     draft_config.num_hidden_layers = num_draft_layers
     draft_config.block_size = int(model_args.block_size)
     draft_config.tie_word_embeddings = False
+    draft_config.global_head_dim = full_attention_config.head_dim
+    draft_config.num_global_key_value_heads = full_attention_config.num_key_value_heads
     draft_config.layer_types = layer_types
+    draft_config.per_layer_config = {
+        layer_idx: {
+            "head_dim": full_attention_config.head_dim,
+            "num_key_value_heads": full_attention_config.num_key_value_heads,
+        }
+        for layer_idx in range(num_draft_layers)
+    }
     draft_config._attn_implementation = TRAIN_ATTN_IMPLEMENTATION
     draft_config.mask_token_id = int(model_args.mask_token_id)
     draft_config.target_layer_ids = target_layer_ids
@@ -259,6 +269,7 @@ def build_minimax_m3_draft_config(target_config, model_args):
     # The draft is always dense: no block-sparse indexer, no MoE, no MTP.
     draft_config.num_mtp_modules = 0
     draft_config.tie_word_embeddings = False
+    draft_config = type(draft_config).from_dict(draft_config.to_dict())
     draft_config._attn_implementation = TRAIN_ATTN_IMPLEMENTATION
     draft_config.block_size = int(model_args.block_size)
     draft_config.mask_token_id = int(model_args.mask_token_id)

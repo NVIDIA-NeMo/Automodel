@@ -761,6 +761,9 @@ class TestNemotronHForCausalLM:
         model = NemotronHForCausalLM(hf_config, backend=backend)
         model = model.to(torch.bfloat16)
         model.eval()
+        experts_implementation = model.get_experts_implementation()
+        assert experts_implementation == {"": hf_config._experts_implementation}
+        model.set_experts_implementation(experts_implementation)
 
         batch_size, prompt_len = 1, 4
         max_new_tokens = 3

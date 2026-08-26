@@ -116,8 +116,9 @@ class DiffusionGemmaAttention(nn.Module):
         self.is_sliding = self.layer_type == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
 
-        self.head_dim = config.head_dim if self.is_sliding else config.global_head_dim
-        num_key_value_heads = config.num_key_value_heads if self.is_sliding else config.num_global_key_value_heads
+        layer_config = config.per_layer_config[layer_idx]
+        self.head_dim = layer_config.head_dim
+        num_key_value_heads = layer_config.num_key_value_heads
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = config.num_attention_heads // num_key_value_heads

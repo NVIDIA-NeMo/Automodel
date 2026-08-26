@@ -452,7 +452,7 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
                 image_features = self.model.get_image_features(
                     pixel_values, image_position_ids=image_position_ids, return_dict=True
                 ).pooler_output
-                image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+                image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 
                 if mm_token_type_ids is not None:
                     special_image_mask = mm_token_type_ids == 1

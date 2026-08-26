@@ -284,10 +284,7 @@ class Gemma4DSparkModel(Gemma4PreTrainedModel):
             [Gemma4DSparkDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Gemma4TextRotaryEmbedding(
-            config,
-            layer_type="full_attention",
-        )
+        self.rotary_emb = Gemma4TextRotaryEmbedding(config)
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
             config.hidden_size,

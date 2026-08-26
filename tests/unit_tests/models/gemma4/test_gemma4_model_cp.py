@@ -434,8 +434,8 @@ def test_decoder_forward_flex_kernel_options_and_padding_branches():
     b, s = 1, 4
     x = torch.randn(b, s, tc.hidden_size, dtype=torch.bfloat16)
     pos = (
-        torch.randn(b, s, tc.head_dim // 2, dtype=torch.bfloat16),
-        torch.randn(b, s, tc.head_dim // 2, dtype=torch.bfloat16),
+        torch.randn(b, s, tc.per_layer_config[0].head_dim // 2, dtype=torch.bfloat16),
+        torch.randn(b, s, tc.per_layer_config[0].head_dim // 2, dtype=torch.bfloat16),
     )
     padding_mask = torch.tensor([[False, False, True, True]])
     captured = {}

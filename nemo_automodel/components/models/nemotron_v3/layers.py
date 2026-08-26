@@ -662,9 +662,14 @@ class NemotronV3Block(nn.Module):
             dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
         )
 
-        # Determine layer type from config
-        # 'M' → mamba, '*' → attention, '-' → mlp, other → moe
-        self.block_type = block_type if block_type is not None else config.layers_block_type[layer_idx]
+        # Transformers 5.15 canonicalized the hybrid discriminators. Keep the
+        # local implementation's names at the boundary so downstream routing and
+        # cache logic remain unchanged.
+        configured_block_type = block_type if block_type is not None else config.layers_block_type[layer_idx]
+        self.block_type = {
+            "linear_attention": "mamba",
+            "full_attention": "attention",
+        }.get(configured_block_type, configured_block_type)
 
         # Create mixer based on block type
         if self.block_type == "mamba":

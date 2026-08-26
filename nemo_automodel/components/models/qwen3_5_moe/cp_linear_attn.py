@@ -33,7 +33,13 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeGatedDeltaNet,
+    causal_conv1d_fn,
+    causal_conv1d_update,
+    torch_chunk_gated_delta_rule,
+    torch_recurrent_gated_delta_rule,
+)
 
 from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
 from nemo_automodel.shared.utils import dtype_from_str
@@ -114,6 +120,26 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     def __init__(self, config, layer_idx: int):
         super().__init__(config, layer_idx)
         self._cp_mesh = None
+        # Transformers 5.15 moved kernel callables from instance attributes to decorated
+        # module-level fallbacks. Prefer the installed kernels, matching the pre-5.15
+        # behavior and the FLA implementation used by the context-parallel path.
+        try:
+            from causal_conv1d import causal_conv1d_fn as fast_causal_conv1d_fn
+            from causal_conv1d import causal_conv1d_update as fast_causal_conv1d_update
+        except ImportError:
+            fast_causal_conv1d_fn = causal_conv1d_fn
+            fast_causal_conv1d_update = causal_conv1d_update
+
+        try:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+        except ImportError:
+            chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+            fused_recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
+
+        self.causal_conv1d_fn = fast_causal_conv1d_fn
+        self.causal_conv1d_update = fast_causal_conv1d_update
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule
+        self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
         # HF created bare ``A_log``/``dt_bias`` in ``_parameters``; move them into a
         # native fp32 ``SSMGate`` submodule (built directly, not relocated at runtime).
         install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config))
