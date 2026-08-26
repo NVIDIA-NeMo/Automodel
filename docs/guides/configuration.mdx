@@ -71,12 +71,13 @@ The LLM and VLM fine-tuning recipes accept a `freeze_config:` section. Use `free
 freeze_config:
   freeze_modules:
   - path: vision_tower        # exact canonical module path
-  - glob: "*.audio_encoder"   # case-sensitive shell-style glob on the full module path
+  - path: audio_tower         # repeat the key to select more exact module paths
+  - glob: "*.speech_encoder"  # case-sensitive shell-style glob on the full module path
   unfreeze_modules:
   - path: multi_modal_projector
 ```
 
-Each selector is a mapping with exactly one key: `path` matches one module by its exact fully qualified name, while `glob` matches module names with `fnmatch`-style wildcards (`*` crosses `.` separators, so `*_proj` matches projection modules at any depth). Matching is recursive: a selected module's entire subtree is frozen or unfrozen. Bare strings are rejected; unknown options and selectors that match no parameters raise an error before training starts.
+Each selector is a mapping with exactly one key — `path` matches one module by its exact fully qualified name, while `glob` matches module names with `fnmatch`-style wildcards (`*` crosses `.` separators, so `*_proj` matches projection modules at any depth). List entries are additive: repeat `path` or `glob` entries to select several modules, and a single entry combining both keys is rejected. Matching is recursive: a selected module's entire subtree is frozen or unfrozen. Bare strings are rejected; unknown options and selectors that match no parameters raise an error before training starts.
 
 Trainability is resolved in a fixed order. Full fine-tuning (everything trainable) or PEFT (LoRA trainable, base frozen) establishes the baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap — this makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is applied before distributed wrapping and re-resolved against the post-parallelization module hierarchy (parameter replacements during sharding cannot resurrect a frozen module), with the final trainable parameter set validated before optimizer construction.
 
