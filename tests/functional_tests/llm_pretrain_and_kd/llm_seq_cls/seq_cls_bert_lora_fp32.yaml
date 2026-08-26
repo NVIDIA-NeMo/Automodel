@@ -42,9 +42,8 @@ peft:
   alpha: 8
 
 freeze_config:
-  freeze_vision_tower: false
   unfreeze_modules:
-  - "*classifier"
+  - glob: "*classifier"
 
 dataset:
   _target_: nemo_automodel/components/datasets/llm/mock_seq_cls.py:MockSequenceClassificationDataset

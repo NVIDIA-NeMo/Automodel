@@ -27,7 +27,7 @@ import logging
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Union, cast
+from typing import TYPE_CHECKING, Union
 
 import torch
 
@@ -75,9 +75,9 @@ from nemo_automodel.components.utils.model_utils import (
     freeze_minimax_m3_indexer_params,
     freeze_unused_kv_sharing_params,
     init_empty_weights,
+    parse_freeze_config,
     print_trainable_parameters,
 )
-from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
@@ -623,15 +623,20 @@ def apply_model_infrastructure(
             _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
         )
 
-    # Apply freezing before sharding
-    freeze_config = _kwargs.get("freeze_config")
-    has_peft_freeze_config = peft_config is not None and freeze_config is not None
-    if has_peft_freeze_config:
+    # Apply freezing before sharding so DDP/FSDP capture the intended
+    # trainability at their lazy first-forward initialization.
+    freeze_config = parse_freeze_config(_kwargs.get("freeze_config"))
+    if peft_config is not None and freeze_config is not None:
+        # PEFT applies LoRA with skip_freeze=True (the global freeze happens after
+        # checkpoint loading). Establish the PEFT baseline -- LoRA trainable, base
+        # frozen -- so selector application and validation start from it.
         for name, param in model.named_parameters():
             if "lora_" not in name and param.requires_grad:
                 param.requires_grad_(False)
     if freeze_config is not None:
-        apply_parameter_freezing(model, freeze_config)
+        # Strict application: every selector must match parameters on the full,
+        # pre-parallelization model, so typos fail before sharding begins.
+        apply_parameter_freezing(model, freeze_config, strict=True)
 
     # Freeze dead K/V parameters in KV-shared layers (e.g. Gemma4 E2B/E4B)
     # so the optimizer never tracks them and checkpoint save/resume stay consistent.
@@ -641,16 +646,6 @@ def apply_model_infrastructure(
 
     # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
     enable_radio_vit_fused_attn(model)
-
-    # Keep the snapshot sparse: only selectors that alter PEFT's normal
-    # LoRA-trainable/base-frozen policy need to survive parameter replacement.
-    pre_shard_trainability_overrides: dict[str, bool] = {}
-    if has_peft_freeze_config:
-        pre_shard_trainability_overrides = {
-            canonical_parameter_fqn(name).replace("_orig_mod.", ""): param.requires_grad
-            for name, param in model.named_parameters(remove_duplicate=False)
-            if param.requires_grad != ("lora_" in name)
-        }
 
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
@@ -740,24 +735,37 @@ def apply_model_infrastructure(
         checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
     )
 
-    # Sharding and checkpoint loading may replace Parameter objects. Restore the
-    # configured PEFT trainability policy by logical name, while keeping newly
-    # created non-LoRA parameters frozen.
-    if peft_config is not None:
+    # Parallelization and checkpoint loading may replace Parameter objects (new
+    # Parameters default to requires_grad=True) and change parameter FQNs (e.g.
+    # grouped-expert regrouping, activation-checkpoint wrappers). Rebind the
+    # trainability policy by re-resolving it on the post-surgery module
+    # hierarchy -- PEFT baseline, then the configured selectors, then the
+    # framework-required freezes so they stay protected from unfreeze selectors.
+    # This runs before optimizer construction and before the first forward
+    # finalizes DDP/FSDP gradient handling.
+    if peft_config is not None or freeze_config is not None:
         trainability_models: list[torch.nn.Module]
         if hasattr(model, "parts"):
-            trainability_models = cast(list[torch.nn.Module], model.parts)
+            trainability_models = list(model.parts)
         elif isinstance(model_wrapper, (DDPManager, MegatronFSDPManager)):
             trainability_models = [getattr(model, "module", model)]
         else:
             trainability_models = [model]
         for mp in trainability_models:
-            for name, param in mp.named_parameters(remove_duplicate=False):
-                name = canonical_parameter_fqn(name).replace("_orig_mod.", "")
-                if name in pre_shard_trainability_overrides:
-                    param.requires_grad_(pre_shard_trainability_overrides[name])
-                elif "lora_" not in name:
-                    param.requires_grad_(False)
+            if peft_config is not None:
+                for name, param in mp.named_parameters(remove_duplicate=False):
+                    if "lora_" not in name:
+                        param.requires_grad_(False)
+            if freeze_config is not None:
+                apply_parameter_freezing(mp, freeze_config, strict=False)
+            freeze_unused_kv_sharing_params(mp)
+            freeze_deepseek_v4_indexer_params(mp)
+            freeze_minimax_m3_indexer_params(mp)
+        if not any(param.requires_grad for mp in trainability_models for param in mp.parameters()):
+            logger.warning(
+                "The configured trainability policy left no trainable parameters; "
+                "check freeze_config and the PEFT configuration."
+            )
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
@@ -834,21 +842,15 @@ def apply_model_infrastructure(
     # both cases FSDP mixed precision never casts their buffers, and an excluded frozen
     # module also keeps its storage-dtype params. Under fp32 master weights + bf16 compute
     # that leaves frozen fp32 tensors feeding bf16 trainable modules -> dtype-mismatch
-    # matmul at the seam. Generic PEFT selectors can create the inverse seam by unfreezing
-    # a plain fp32 parameter after its inputs have moved to bf16, so include those explicit
-    # trainability overrides as well. No-op for pure-fp32 / pure-bf16 runs and when no
-    # mp_policy is available (DDP/PP).
+    # matmul at the seam. Cast frozen params/buffers to the compute dtype so the whole
+    # forward runs uniformly. Freeze configuration only controls requires_grad; trainable
+    # parameters keep their storage dtype (compute dtype is owned by autocast or the
+    # distributed mixed-precision policy). No-op for pure-fp32 / pure-bf16 runs and when
+    # no mp_policy is available (DDP/PP).
     compute_dtype = getattr(getattr(model_wrapper, "mp_policy", None), "param_dtype", None)
     if compute_dtype is not None:
-        selected_trainable_param_names = {
-            name for name, requires_grad in pre_shard_trainability_overrides.items() if requires_grad
-        }
         for mp in model.parts if hasattr(model, "parts") else [model]:
-            cast_frozen_modules_to_compute_dtype(
-                mp,
-                compute_dtype,
-                trainable_param_names=selected_trainable_param_names,
-            )
+            cast_frozen_modules_to_compute_dtype(mp, compute_dtype)
 
     # Re-apply the Megatron-FSDP per-parameter state dropped by the lm-head re-tie and
     # post-wrap checkpoint reload, so the deferred optimizer registration and first

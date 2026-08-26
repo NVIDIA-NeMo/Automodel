@@ -50,7 +50,7 @@ peft:
 
 freeze_config:
   unfreeze_modules:
-  - "*classifier"
+  - glob: "*classifier"
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC

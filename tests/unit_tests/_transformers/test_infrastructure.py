@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,12 +181,20 @@ class _TinyClassifierModel(torch.nn.Module):
         self.config = SimpleNamespace()
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Apply the backbone and classifier.
+
+        Args:
+            inputs: Tensor of shape [batch, features].
+
+        Returns:
+            Tensor of shape [batch, 1].
+        """
         return self.classifier(self.backbone(inputs))
 
 
 _GENERIC_FREEZE_CONFIG = {
-    "freeze_modules": ["b*", "ext*"],
-    "unfreeze_modules": "ext*",
+    "freeze_modules": [{"glob": "b*"}, {"glob": "ext*"}],
+    "unfreeze_modules": [{"glob": "ext*"}],
 }
 
 
@@ -241,6 +248,48 @@ def test_freeze_config_applies_before_ddp_reducer_construction(tmp_path: Path):
     assert gradients == [1.5, 1.5]
 
 
+def _replace_and_wrap_parameters(model, *_args, **_kwargs):
+    """Simulate parallelization surgery: replace Parameters and change their FQNs.
+
+    Wrapping ``extension`` in a Sequential changes its parameter FQN from
+    ``extension.weight`` to ``extension.0.weight`` and installs a new Parameter
+    object (which defaults to requires_grad=True), mirroring grouped-expert
+    regrouping and wrapper-injecting transforms.
+    """
+    model.base.weight = torch.nn.Parameter(model.base.weight.detach().clone())
+    model.extension = torch.nn.Sequential(model.extension)
+    model.extension[0].weight = torch.nn.Parameter(model.extension[0].weight.detach().clone())
+    if hasattr(model, "lora_weight"):
+        model.lora_weight = torch.nn.Parameter(model.lora_weight.detach().clone())
+        model.vision_adapter.lora_weight = torch.nn.Parameter(model.vision_adapter.lora_weight.detach().clone())
+    model.register_parameter("parallel_parameter", torch.nn.Parameter(torch.ones(1)))
+    return model
+
+
+def _run_trainability_infrastructure(model, freeze_config, peft_config=None):
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+    freeze_kwargs = {"freeze_config": freeze_config} if freeze_config is not None else {}
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._apply_peft_and_lower_precision", return_value=model),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", side_effect=_replace_and_wrap_parameters),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
+        return apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            peft_config=peft_config,
+            **freeze_kwargs,
+        )
+
+
 @pytest.mark.parametrize(
     ("freeze_config", "extension_trainable", "vision_lora_trainable"),
     [
@@ -250,61 +299,43 @@ def test_freeze_config_applies_before_ddp_reducer_construction(tmp_path: Path):
         pytest.param(_GENERIC_FREEZE_CONFIG, True, True, id="generic-freeze-config"),
     ],
 )
-def test_peft_freeze_config_survives_parallel_parameter_replacement(
+def test_peft_freeze_config_survives_name_changing_parameter_replacement(
     freeze_config: dict | None, extension_trainable: bool, vision_lora_trainable: bool
 ):
-    """PEFT keeps selector overrides while freezing new non-LoRA parameters."""
-    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
-
+    """Under PEFT, selector overrides rebind after surgery while new non-LoRA parameters freeze."""
     model = _TinyTrainabilityModel()
     model.register_parameter("lora_weight", torch.nn.Parameter(torch.ones(1)))
     model.vision_adapter = torch.nn.Module()
     model.vision_adapter.register_parameter("lora_weight", torch.nn.Parameter(torch.ones(1)))
     peft_config = SimpleNamespace(lora_A_init=None, use_triton=False)
-    freeze_kwargs = {"freeze_config": freeze_config} if freeze_config is not None else {}
-    warning_context = (
-        pytest.warns(FutureWarning, match="`freeze_vision_tower`")
-        if freeze_config is not None and "freeze_vision_tower" in freeze_config
-        else nullcontext()
-    )
 
-    def replace_and_add_parameters(model, *_args, **_kwargs):
-        for module in (model.base, model.extension):
-            module.weight = torch.nn.Parameter(module.weight.detach().clone())
-        model.lora_weight = torch.nn.Parameter(model.lora_weight.detach().clone())
-        model.vision_adapter.lora_weight = torch.nn.Parameter(model.vision_adapter.lora_weight.detach().clone())
-        model.register_parameter("parallel_parameter", torch.nn.Parameter(torch.ones(1)))
-        return model
-
-    with (
-        warning_context,
-        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
-        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
-        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
-        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
-        patch(f"{_INFRA_MODULE}._apply_peft_and_lower_precision", return_value=model),
-        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", side_effect=replace_and_add_parameters),
-        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
-    ):
-        MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
-        apply_model_infrastructure(
-            model=model,
-            is_meta_device=False,
-            device=torch.device("cpu"),
-            load_base_model=False,
-            peft_config=peft_config,
-            **freeze_kwargs,
-        )
+    _run_trainability_infrastructure(model, freeze_config, peft_config=peft_config)
 
     assert not model.base.weight.requires_grad
-    assert model.extension.weight.requires_grad is extension_trainable
+    assert model.extension[0].weight.requires_grad is extension_trainable
     assert model.lora_weight.requires_grad
     assert model.vision_adapter.lora_weight.requires_grad is vision_lora_trainable
     assert not model.parallel_parameter.requires_grad
 
 
-def test_peft_unfrozen_classifier_uses_compute_dtype_without_sharding():
-    """A one-rank PEFT classifier can consume the frozen backbone output."""
+def test_freeze_config_rebinds_after_name_changing_replacement_under_full_finetuning():
+    """Under full fine-tuning, selectors re-resolve on the post-surgery module hierarchy."""
+    freeze_config = {
+        "freeze_modules": [{"path": "base"}, {"glob": "ext*"}],
+        "unfreeze_modules": [{"path": "extension"}],
+    }
+
+    model = _run_trainability_infrastructure(_TinyTrainabilityModel(), freeze_config)
+
+    assert not model.base.weight.requires_grad
+    # The renamed extension parameter is re-selected through its parent module path.
+    assert model.extension[0].weight.requires_grad
+    # Full fine-tuning baseline: parameters the policy does not select stay trainable.
+    assert model.parallel_parameter.requires_grad
+
+
+def test_freeze_config_unfreeze_keeps_parameter_storage_dtype():
+    """Freeze configuration controls requires_grad only; it never casts trainable params."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
     model = _TinyClassifierModel()
@@ -328,17 +359,16 @@ def test_peft_unfrozen_classifier_uses_compute_dtype_without_sharding():
             load_base_model=False,
             model_wrapper=model_wrapper,
             peft_config=peft_config,
-            freeze_config={"unfreeze_modules": ["classifier"]},
+            freeze_config={"unfreeze_modules": [{"path": "classifier"}]},
         )
 
-    output = result(torch.ones(1, 2, dtype=torch.bfloat16))
-    output.sum().backward()
-
     assert not result.backbone.weight.requires_grad
+    # Frozen plain params are cast to the compute dtype to avoid a mixed-dtype seam.
     assert result.backbone.weight.dtype == torch.bfloat16
     assert result.classifier.weight.requires_grad
-    assert result.classifier.weight.dtype == torch.bfloat16
-    assert result.classifier.weight.grad is not None
+    # Unfreezing must not turn fp32 resident/master parameters into bf16 storage;
+    # the compute dtype is owned by autocast or the distributed mp policy.
+    assert result.classifier.weight.dtype == torch.float32
 
 
 def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():

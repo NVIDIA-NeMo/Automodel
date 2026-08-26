@@ -91,6 +91,7 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
+    FreezeConfig,
     _supports_logits_to_keep,
     _supports_seq_lens,
     filter_forward_kwargs,
@@ -183,7 +184,7 @@ def build_model(
     cfg_quantization=None,
     distributed_setup: DistributedSetup | None = None,
     cfg_qat=None,
-    cfg_freeze: ConfigNode | dict[str, Any] | None = None,
+    cfg_freeze: ConfigNode | dict[str, Any] | FreezeConfig | None = None,
     sdpa_method: list[str] | None = None,
     device_mesh=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
@@ -199,7 +200,8 @@ def build_model(
         cfg_quantization: Configuration for BitsAndBytes quantization.
         distributed_setup: Resolved distributed topology and policy object.
         cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
-        cfg_freeze: Configuration for freezing and unfreezing model parameters.
+        cfg_freeze: Freeze configuration (``freeze_config`` YAML section as a
+            mapping, or a typed FreezeConfig) controlling parameter trainability.
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
@@ -209,7 +211,9 @@ def build_model(
         kwargs = {
             "has_packed_sequence": has_packed_sequence,
             "peft_config": cfg_peft,
-            "freeze_config": cfg_freeze,
+            # ConfigNode lives at the recipe boundary; downstream components take
+            # plain mappings or typed FreezeConfig objects.
+            "freeze_config": cfg_freeze.to_dict() if isinstance(cfg_freeze, ConfigNode) else cfg_freeze,
             "sdpa_method": sdpa_method,
         }
         if distributed_setup is not None:

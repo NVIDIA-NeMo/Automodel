@@ -65,29 +65,30 @@ The `distributed:` section is **not** instantiated using `_target_`. Recipes par
 
 ## Select Trainable Modules
 
-The LLM and VLM fine-tuning recipes accept a `freeze_config:` section. Use `freeze_modules` and `unfreeze_modules` to select modules with the same fully qualified name glob patterns accepted by PEFT's `target_modules`:
+The LLM and VLM fine-tuning recipes accept a `freeze_config:` section. Use `freeze_modules` and `unfreeze_modules` with typed selectors to control which modules are trainable:
 
 ```yaml
 freeze_config:
   freeze_modules:
-  - "*encoder*"
+  - path: vision_tower        # exact canonical module path
+  - glob: "*.audio_encoder"   # case-sensitive shell-style glob on the full module path
   unfreeze_modules:
-  - "*projector*"
+  - path: multi_modal_projector
 ```
 
-Each matched module has all of its parameters updated recursively. Patterns match the complete module name, so use a leading wildcard when nesting can vary; for example, `*_proj` matches projection modules at any depth. A single string or a list of patterns is accepted.
+Each selector is a mapping with exactly one key: `path` matches one module by its exact fully qualified name, while `glob` matches module names with `fnmatch`-style wildcards (`*` crosses `.` separators, so `*_proj` matches projection modules at any depth). Matching is recursive: a selected module's entire subtree is frozen or unfrozen. Bare strings are rejected; unknown options and selectors that match no parameters raise an error before training starts.
 
-Freeze selectors are applied first, followed by unfreeze selectors, so an unfreeze selector takes precedence when both match. Selection happens before distributed wrapping and optimizer construction. Under PEFT, LoRA parameters in modules that do not match a freeze selector retain their existing trainability, selected non-LoRA modules can be unfrozen, and non-LoRA parameters created during parallelization remain frozen.
+Trainability is resolved in a fixed order. Full fine-tuning (everything trainable) or PEFT (LoRA trainable, base frozen) establishes the baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap — this makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is applied before distributed wrapping and re-resolved against the post-parallelization module hierarchy (parameter replacements during sharding cannot resurrect a frozen module), with the final trainable parameter set validated before optimizer construction.
 
-The `freeze_vision_tower`, `freeze_audio_tower`, `freeze_language_model`, and `freeze_video_embedder` options are deprecated. Replace enabled options with the corresponding module name under `freeze_modules` and remove disabled options. For example:
+The modality-specific booleans `freeze_vision_tower`, `freeze_audio_tower`, `freeze_language_model`, and `freeze_video_embedder` remain supported and keep their established attribute and substring matching, applied before `unfreeze_modules`:
 
 ```yaml
 freeze_config:
-  freeze_modules:
-  - audio_encoder
+  freeze_vision_tower: true
+  freeze_audio_tower: true
 ```
 
-Legacy-only configurations retain the existing implicit `freeze_vision_tower: true` default. A configuration containing `freeze_modules` or `unfreeze_modules` uses explicit-selector semantics and does not implicitly freeze vision modules; include a matching vision selector when migrating a configuration that relied on that default. Enabled legacy aliases retain their established attribute and substring matching before `unfreeze_modules` is applied.
+Legacy-only configurations retain the implicit `freeze_vision_tower: true` default. A configuration that declares `freeze_modules` or `unfreeze_modules` uses explicit-selector semantics and does not implicitly freeze vision modules; add a vision selector (for example, `glob: "*vision*"`) when such a configuration should also freeze the vision tower.
 
 ## Prewarm One-Time CUDA Initialization
 

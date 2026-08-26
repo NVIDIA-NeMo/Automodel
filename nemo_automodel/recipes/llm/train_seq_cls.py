@@ -32,7 +32,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
-from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -109,7 +109,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if freeze_config is None and self.peft_config is not None:
             # Preserve the pre-freeze_config behavior for existing PEFT sequence
             # classification recipes; new configs declare this selector directly.
-            freeze_config = {"unfreeze_modules": ["*classifier"]}
+            freeze_config = FreezeConfig(unfreeze_modules=[ModuleSelector(glob="*classifier")])
         # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
         model = build_model(
             cfg_model=self.cfg.model,

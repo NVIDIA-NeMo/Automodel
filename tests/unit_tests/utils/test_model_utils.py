@@ -144,13 +144,7 @@ def test_apply_parameter_freezing(dummy_model, freeze_cfg: Dict, expect: Dict):
     for p in dummy_model.parameters():
         p.requires_grad = True
 
-    if "freeze_vision_tower" in freeze_cfg:
-        with pytest.warns(FutureWarning, match="freeze_config options"):
-            model_utils.apply_parameter_freezing(dummy_model, freeze_cfg)
-    else:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", FutureWarning)
-            model_utils.apply_parameter_freezing(dummy_model, freeze_cfg)
+    model_utils.apply_parameter_freezing(dummy_model, model_utils.parse_freeze_config(freeze_cfg))
 
     # vision tower(s)
     assert _all_requires_grad(dummy_model.vision_tower) is expect["vision"]
@@ -167,7 +161,7 @@ def test_apply_parameter_freezing(dummy_model, freeze_cfg: Dict, expect: Dict):
 
 
 def test_apply_parameter_freezing_supports_generic_module_selectors():
-    """Generic selectors apply PEFT-style globs to fully qualified module names."""
+    """Generic selectors match fully qualified module names and unfreeze wins on overlap."""
 
     class GenericModel(nn.Module):
         def __init__(self) -> None:
@@ -185,10 +179,12 @@ def test_apply_parameter_freezing_supports_generic_module_selectors():
 
     model_utils.apply_parameter_freezing(
         model,
-        {
-            "freeze_modules": "*_proj",
-            "unfreeze_modules": "*.k_proj",
-        },
+        model_utils.parse_freeze_config(
+            {
+                "freeze_modules": [{"glob": "*_proj"}],
+                "unfreeze_modules": [{"glob": "*.k_proj"}],
+            }
+        ),
     )
 
     assert not _any_requires_grad(model.backbone["q_proj"])
@@ -209,9 +205,7 @@ def test_generic_module_selector_matches_shared_module_alias():
     model = SharedModel()
     model_utils.apply_parameter_freezing(
         model,
-        {
-            "freeze_modules": "alias",
-        },
+        model_utils.FreezeConfig(freeze_modules=[model_utils.ModuleSelector(path="alias")]),
     )
 
     assert not _any_requires_grad(model.primary)
@@ -219,14 +213,15 @@ def test_generic_module_selector_matches_shared_module_alias():
 
 def test_generic_unfreeze_selector_overrides_legacy_freeze_alias(dummy_model):
     """Generic unfreeze selectors take precedence over legacy freeze aliases."""
-    with pytest.warns(FutureWarning, match="`freeze_vision_tower`"):
-        model_utils.apply_parameter_freezing(
-            dummy_model,
+    model_utils.apply_parameter_freezing(
+        dummy_model,
+        model_utils.parse_freeze_config(
             {
                 "freeze_vision_tower": True,
-                "unfreeze_modules": ["vision_tower"],
-            },
-        )
+                "unfreeze_modules": [{"path": "vision_tower"}],
+            }
+        ),
+    )
 
     assert _all_requires_grad(dummy_model.vision_tower)
     assert not _any_requires_grad(dummy_model.visual_extra)
@@ -236,33 +231,125 @@ def test_generic_unfreeze_selector_overrides_legacy_freeze_alias(dummy_model):
     "legacy_option",
     ["freeze_vision_tower", "freeze_audio_tower", "freeze_language_model", "freeze_video_embedder"],
 )
-def test_legacy_freeze_option_warns(dummy_model, legacy_option: str):
-    """Explicit legacy options identify the generic selector migration."""
-    with pytest.warns(
-        FutureWarning,
-        match=rf"`{legacy_option}`.*are deprecated\. Remove disabled options.*`freeze_modules`.*audio_encoder",
-    ):
-        model_utils.apply_parameter_freezing(dummy_model, {legacy_option: False})
+def test_legacy_freeze_options_remain_supported_without_deprecation(dummy_model, legacy_option: str):
+    """Legacy modality booleans are supported and do not emit deprecation warnings."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        model_utils.apply_parameter_freezing(
+            dummy_model, model_utils.parse_freeze_config({legacy_option: False, "freeze_vision_tower": False})
+        )
+
+    assert _all_requires_grad(dummy_model.other)
 
 
-def test_legacy_freeze_alias_does_not_use_glob_matching(dummy_model, monkeypatch):
-    """Legacy aliases retain their original substring matcher."""
-    monkeypatch.setattr(model_utils, "wildcard_match", lambda *_args: pytest.fail("unexpected glob match"))
-
-    with pytest.warns(FutureWarning, match="`freeze_vision_tower`"):
-        model_utils.apply_parameter_freezing(dummy_model, {"freeze_vision_tower": True})
+def test_legacy_freeze_alias_uses_substring_matching(dummy_model):
+    """Legacy aliases retain their original substring matcher ("visual" matches "visual_extra")."""
+    model_utils.apply_parameter_freezing(dummy_model, model_utils.FreezeConfig(freeze_vision_tower=True))
 
     assert not _any_requires_grad(dummy_model.vision_tower)
+    assert not _any_requires_grad(dummy_model.visual_extra)
 
 
 def test_generic_selectors_disable_implicit_legacy_vision_freeze(dummy_model):
-    """Generic selector configs need no deprecated opt-out for vision modules."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", FutureWarning)
-        model_utils.apply_parameter_freezing(dummy_model, {"unfreeze_modules": ["other"]})
+    """Explicit-selector configurations do not implicitly freeze vision modules."""
+    model_utils.apply_parameter_freezing(
+        dummy_model,
+        model_utils.FreezeConfig(unfreeze_modules=[model_utils.ModuleSelector(path="other")]),
+    )
 
     assert _all_requires_grad(dummy_model.vision_tower)
     assert _all_requires_grad(dummy_model.visual_extra)
+    assert _all_requires_grad(dummy_model.other)
+
+
+def test_glob_selector_treats_dot_as_literal():
+    """Glob matching is shell-style: `.` is literal, not a regex wildcard."""
+
+    class DotModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.axb = nn.Linear(4, 4)  # would match the regular expression r"^a.b$"
+            self.a = nn.ModuleDict({"b": nn.Linear(4, 4)})  # canonical module path "a.b"
+
+    model = DotModel()
+    model_utils.apply_parameter_freezing(
+        model,
+        model_utils.FreezeConfig(freeze_modules=[model_utils.ModuleSelector(glob="a.b")]),
+    )
+
+    assert not _any_requires_grad(model.a["b"])
+    assert _all_requires_grad(model.axb)
+
+
+def test_glob_selector_is_case_sensitive():
+    """Glob matching uses fnmatchcase and never folds case."""
+    assert model_utils.ModuleSelector(glob="*Encoder").matches("audio_encoder") is False
+    assert model_utils.ModuleSelector(glob="*Encoder").matches("audio_Encoder") is True
+    assert model_utils.ModuleSelector(path="audio_encoder").matches("model.audio_encoder") is False
+
+
+class TestParseFreezeConfig:
+    """Strict validation of the freeze_config schema."""
+
+    def test_none_and_typed_passthrough(self):
+        typed = model_utils.FreezeConfig()
+        assert model_utils.parse_freeze_config(None) is None
+        assert model_utils.parse_freeze_config(typed) is typed
+
+    def test_parses_typed_selectors(self):
+        config = model_utils.parse_freeze_config(
+            {
+                "freeze_modules": [{"path": "vision_tower"}, {"glob": "*.audio_encoder"}],
+                "unfreeze_modules": [{"path": "multi_modal_projector"}],
+            }
+        )
+        assert config.freeze_modules == [
+            model_utils.ModuleSelector(path="vision_tower"),
+            model_utils.ModuleSelector(glob="*.audio_encoder"),
+        ]
+        assert config.unfreeze_modules == [model_utils.ModuleSelector(path="multi_modal_projector")]
+
+    def test_unknown_option_rejected(self):
+        with pytest.raises(ValueError, match="unsupported option.*freeze_vision"):
+            model_utils.parse_freeze_config({"freeze_vision": True})
+
+    def test_bare_string_selector_rejected(self):
+        with pytest.raises(ValueError, match="must be mappings with exactly one of `path` or `glob`"):
+            model_utils.parse_freeze_config({"freeze_modules": ["vision_tower"]})
+
+    def test_selector_list_required(self):
+        with pytest.raises(ValueError, match="freeze_config.freeze_modules must be a list"):
+            model_utils.parse_freeze_config({"freeze_modules": {"path": "vision_tower"}})
+
+    def test_selector_with_both_path_and_glob_rejected(self):
+        with pytest.raises(ValueError, match="exactly one of `path` or `glob`"):
+            model_utils.parse_freeze_config({"freeze_modules": [{"path": "a", "glob": "b"}]})
+
+    def test_selector_with_neither_path_nor_glob_rejected(self):
+        with pytest.raises(ValueError, match="exactly one of `path` or `glob`"):
+            model_utils.parse_freeze_config({"unfreeze_modules": [{}]})
+
+    def test_selector_unknown_key_rejected(self):
+        with pytest.raises(ValueError, match="unsupported key.*regex"):
+            model_utils.parse_freeze_config({"freeze_modules": [{"regex": "vision"}]})
+
+    def test_non_boolean_legacy_option_rejected(self):
+        with pytest.raises(ValueError, match="freeze_config.freeze_audio_tower must be a boolean"):
+            model_utils.parse_freeze_config({"freeze_audio_tower": "yes"})
+
+    def test_non_mapping_rejected(self):
+        with pytest.raises(TypeError, match="freeze_config must be a mapping"):
+            model_utils.parse_freeze_config("vision_tower")
+
+    def test_unmatched_selector_raises_in_strict_mode(self, dummy_model):
+        config = model_utils.FreezeConfig(freeze_modules=[model_utils.ModuleSelector(path="nonexistent")])
+        with pytest.raises(ValueError, match=r"freeze_config\.freeze_modules selector `path: nonexistent` matched no parameters"):
+            model_utils.apply_parameter_freezing(dummy_model, config, strict=True)
+
+    def test_unmatched_selector_allowed_when_rebinding(self, dummy_model):
+        config = model_utils.FreezeConfig(freeze_modules=[model_utils.ModuleSelector(path="nonexistent")])
+        model_utils.apply_parameter_freezing(dummy_model, config, strict=False)
+        assert _all_requires_grad(dummy_model.other)
 
 
 def test_init_empty_weights_moves_params_to_meta_and_preserves_requires_grad():
@@ -439,8 +526,9 @@ def audio_model() -> nn.Module:
 
 def test_freeze_audio_tower_freezes_speech_pattern(audio_model):
     """freeze_audio_tower=True should freeze modules matching 'audio' and 'speech'."""
-    with pytest.warns(FutureWarning, match="`freeze_audio_tower`"):
-        model_utils.apply_parameter_freezing(audio_model, {"freeze_audio_tower": True, "freeze_vision_tower": False})
+    model_utils.apply_parameter_freezing(
+        audio_model, model_utils.FreezeConfig(freeze_audio_tower=True, freeze_vision_tower=False)
+    )
 
     assert not _any_requires_grad(audio_model.audio_encoder)
     assert not _any_requires_grad(audio_model.speech_adapter)
@@ -449,18 +537,20 @@ def test_freeze_audio_tower_freezes_speech_pattern(audio_model):
 
 def test_freeze_audio_tower_false_keeps_speech_trainable(audio_model):
     """freeze_audio_tower=False should keep speech modules trainable."""
-    with pytest.warns(FutureWarning, match="`freeze_audio_tower`"):
-        model_utils.apply_parameter_freezing(audio_model, {"freeze_audio_tower": False, "freeze_vision_tower": False})
+    model_utils.apply_parameter_freezing(
+        audio_model, model_utils.FreezeConfig(freeze_audio_tower=False, freeze_vision_tower=False)
+    )
 
     assert _all_requires_grad(audio_model.audio_encoder)
     assert _all_requires_grad(audio_model.speech_adapter)
 
 
 def test_freeze_audio_encoder_with_generic_selector(audio_model):
-    """The documented generic selector replaces the audio-specific option."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", FutureWarning)
-        model_utils.apply_parameter_freezing(audio_model, {"freeze_modules": ["audio_encoder"]})
+    """A glob selector freezes only the matched module, without the legacy substrings."""
+    model_utils.apply_parameter_freezing(
+        audio_model,
+        model_utils.FreezeConfig(freeze_modules=[model_utils.ModuleSelector(glob="*audio_encoder")]),
+    )
 
     assert not _any_requires_grad(audio_model.audio_encoder)
     assert _all_requires_grad(audio_model.speech_adapter)
@@ -485,8 +575,9 @@ def sound_model() -> nn.Module:
 
 def test_freeze_audio_tower_freezes_sound_pattern(sound_model):
     """``freeze_audio_tower=True`` must also freeze NemotronOmni's ``sound_*`` modules."""
-    with pytest.warns(FutureWarning, match="`freeze_audio_tower`"):
-        model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": True, "freeze_vision_tower": False})
+    model_utils.apply_parameter_freezing(
+        sound_model, model_utils.FreezeConfig(freeze_audio_tower=True, freeze_vision_tower=False)
+    )
 
     assert not _any_requires_grad(sound_model.sound_encoder)
     assert not _any_requires_grad(sound_model.sound_projection)
@@ -495,8 +586,9 @@ def test_freeze_audio_tower_freezes_sound_pattern(sound_model):
 
 def test_freeze_audio_tower_false_keeps_sound_trainable(sound_model):
     """Sound modules stay trainable when audio freeze is off."""
-    with pytest.warns(FutureWarning, match="`freeze_audio_tower`"):
-        model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": False, "freeze_vision_tower": False})
+    model_utils.apply_parameter_freezing(
+        sound_model, model_utils.FreezeConfig(freeze_audio_tower=False, freeze_vision_tower=False)
+    )
 
     assert _all_requires_grad(sound_model.sound_encoder)
     assert _all_requires_grad(sound_model.sound_projection)
@@ -540,7 +632,7 @@ def test_phi4mm_use_cache_disabled():
     m = nn.Linear(4, 4)
     m.config = types.SimpleNamespace(model_type="phi4mm", use_cache=True)
 
-    model_utils.apply_parameter_freezing(m, {})
+    model_utils.apply_parameter_freezing(m, model_utils.FreezeConfig())
     assert m.config.use_cache is False
 
 
@@ -551,7 +643,7 @@ def test_non_phi4mm_use_cache_unchanged():
     m = nn.Linear(4, 4)
     m.config = types.SimpleNamespace(model_type="gemma3", use_cache=True)
 
-    model_utils.apply_parameter_freezing(m, {})
+    model_utils.apply_parameter_freezing(m, model_utils.FreezeConfig())
     assert m.config.use_cache is True
 
 
@@ -865,11 +957,10 @@ def video_embedder_model() -> nn.Module:
 
 def test_freeze_video_embedder_true_freezes_only_video_embedder(video_embedder_model):
     """``freeze_video_embedder=True`` freezes ``patch_generator.video_embedder.*`` only."""
-    with pytest.warns(FutureWarning, match="`freeze_video_embedder`"):
-        model_utils.apply_parameter_freezing(
-            video_embedder_model,
-            {"freeze_vision_tower": False, "freeze_video_embedder": True},
-        )
+    model_utils.apply_parameter_freezing(
+        video_embedder_model,
+        model_utils.FreezeConfig(freeze_vision_tower=False, freeze_video_embedder=True),
+    )
 
     assert not _any_requires_grad(video_embedder_model.patch_generator.video_embedder)
     assert _all_requires_grad(video_embedder_model.patch_generator.image_embedder)
@@ -878,10 +969,9 @@ def test_freeze_video_embedder_true_freezes_only_video_embedder(video_embedder_m
 
 def test_freeze_video_embedder_false_keeps_video_embedder_trainable(video_embedder_model):
     """Default ``freeze_video_embedder=False`` leaves the video embedder trainable."""
-    with pytest.warns(FutureWarning, match="`freeze_video_embedder`"):
-        model_utils.apply_parameter_freezing(
-            video_embedder_model,
-            {"freeze_vision_tower": False, "freeze_video_embedder": False},
-        )
+    model_utils.apply_parameter_freezing(
+        video_embedder_model,
+        model_utils.FreezeConfig(freeze_vision_tower=False, freeze_video_embedder=False),
+    )
 
     assert _all_requires_grad(video_embedder_model.patch_generator.video_embedder)

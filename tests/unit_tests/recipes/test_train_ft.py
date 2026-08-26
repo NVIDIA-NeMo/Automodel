@@ -873,7 +873,7 @@ def test_build_model_passes_freeze_config(monkeypatch):
 
     freeze_config = ConfigNode(
         {
-            "unfreeze_modules": ["layer2"],
+            "unfreeze_modules": [{"path": "layer2"}],
         }
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
@@ -885,7 +885,8 @@ def test_build_model_passes_freeze_config(monkeypatch):
         seed=123,
     )
 
-    assert captured_kwargs["freeze_config"] is freeze_config
+    # ConfigNode is unwrapped at the recipe boundary; downstream receives a mapping.
+    assert captured_kwargs["freeze_config"] == {"unfreeze_modules": [{"path": "layer2"}]}
 
 
 @requires_cuda
@@ -1145,13 +1146,13 @@ def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
 
 def test_freeze_config_applies_before_optimizer_build(monkeypatch):
     """The optimizer sees the trainability selected through freeze_config."""
-    from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
+    from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, parse_freeze_config
 
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
     cfg.freeze_config = ConfigNode(
         {
-            "freeze_modules": ["layer*"],
-            "unfreeze_modules": ["*2"],
+            "freeze_modules": [{"glob": "layer*"}],
+            "unfreeze_modules": [{"glob": "*2"}],
         }
     )
     _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
@@ -1162,7 +1163,7 @@ def test_freeze_config_applies_before_optimizer_build(monkeypatch):
     def _build_model(*args, cfg_freeze=None, **kwargs):
         freeze_configs.append(cfg_freeze)
         if cfg_freeze is not None:
-            apply_parameter_freezing(model, cfg_freeze.to_dict())
+            apply_parameter_freezing(model, parse_freeze_config(cfg_freeze.to_dict()))
         return model
 
     trainable_at_optimizer_build = []
