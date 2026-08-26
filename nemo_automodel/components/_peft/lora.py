@@ -825,7 +825,28 @@ def apply_memory_efficient_lora(x, lora_A, lora_B, scale, use_triton_kernel, res
     autograd Function so the output is never a view). Reshape back to the input rank here; the result
     is an ordinary autograd view, which — unlike a custom-Function output view — a downstream consumer
     may mutate in place (e.g. transformers' gemma3n ``project_per_layer_inputs``).
+
+    Args:
+        x: Activation tensor of shape ``[tokens, in_features]`` or ``[batch, sequence, in_features]``.
+        lora_A: Tensor of shape ``[rank, in_features]``.
+        lora_B: Tensor of shape ``[out_features, rank]``.
+        scale: LoRA scaling factor (``alpha / rank``).
+        use_triton_kernel: Request the Triton kernels; declined when their dtype precondition
+            does not hold (see below).
+        res: Optional base-projection output to fold in, in ``x``'s leading shape with
+            ``out_features`` trailing.
+
+    Returns:
+        Tensor with ``x``'s leading dimensions and ``out_features`` trailing.
     """
+    if use_triton_kernel and not (x.dtype == lora_A.dtype == lora_B.dtype):
+        # The Triton kernels hand their operands straight to ``tl.dot``, which asserts a single dtype
+        # ("Both operands must be same dtype. Got fp32 and bf16"), and they run outside autocast, so
+        # nothing reconciles the two. Mixed precision reaches here whenever an FSDP2 unit's
+        # ``output_dtype=float32`` hands an fp32 activation to bf16 adapters — the layout in #3652,
+        # whose recipe does set ``use_triton: true``. Drop to the torch matmul path below, which
+        # follows the forward compute dtype and casts explicitly.
+        use_triton_kernel = False
     out = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, use_triton_kernel, res)
     if x.dim() == 3:
         out = out.reshape(*x.shape[:-1], -1)

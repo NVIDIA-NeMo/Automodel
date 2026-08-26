@@ -774,3 +774,32 @@ def test_linear_lora_negative_last_dim_shard_takes_async_shaping(single_rank_pg)
     bmm_spy.assert_not_called()
     assert isinstance(out, DTensor)
     assert torch.allclose(out.full_tensor(), ref, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("x_dtype", "lora_dtype", "expect_triton"),
+    [
+        (torch.float32, torch.float32, True),  # uniform: the Triton kernels are still used
+        (torch.bfloat16, torch.bfloat16, True),
+        (torch.float32, torch.bfloat16, False),  # issue #3652: fp32 activation, bf16 adapters
+        (torch.bfloat16, torch.float32, False),  # lora_dtype differing from the base weights
+    ],
+)
+def test_memory_efficient_lora_declines_triton_on_mixed_dtype(x_dtype, lora_dtype, expect_triton):
+    """The Triton kernels require one dtype for both matmul operands; mixed input must fall back.
+
+    ``tl.dot`` asserts "Both operands must be same dtype", and the kernels run outside autocast, so
+    nothing reconciles an FP32 activation with BF16 adapters (what FSDP2 ``output_dtype=float32``
+    produces). Declining here routes those to the torch matmul path instead of aborting compilation.
+    """
+    x = torch.randn(4, 8, dtype=x_dtype)
+    lora_A = torch.randn(2, 8, dtype=lora_dtype)
+    lora_B = torch.randn(6, 2, dtype=lora_dtype)
+
+    with patch("nemo_automodel.components._peft.lora.lora_forward_wrapper") as triton_forward:
+        triton_forward.return_value = torch.zeros(4, 6, dtype=x_dtype)
+        # The fallback is the torch matmul path, which relies on autocast to reconcile dtypes.
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            apply_memory_efficient_lora(x, lora_A, lora_B, 1.5, True)
+
+    assert triton_forward.called is expect_triton

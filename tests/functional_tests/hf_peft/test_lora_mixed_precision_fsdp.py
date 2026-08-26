@@ -57,7 +57,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components._peft import lora as lora_module
 from nemo_automodel.components._peft import lora_mlp as lora_mlp_module
-from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components._peft.lora import HAS_TE, PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.moe.layers import MLP
 
 _RESULT_PREFIX = "LORA_MIXED_PRECISION_FSDP_RESULT "
@@ -117,10 +117,19 @@ class _MLPBlock(nn.Module):
 
 
 _CASES = {
-    # (block factory, LoRA target modules, autograd function expected to run)
-    "per_linear": (lambda: _AttentionBlock(), ["*q_proj", "*o_proj"], "LoRATritonFunction"),
-    "fused_swiglu": (lambda: _MLPBlock("swiglu"), ["*gate_proj", "*up_proj", "*down_proj"], "LoRASwiGLUMLPFunction"),
-    "fused_relu2": (lambda: _MLPBlock("relu2"), ["*up_proj", "*down_proj"], "LoRAReLU2MLPFunction"),
+    # case -> (block factory, LoRA target modules, autograd function expected to run, peft.use_triton)
+    "per_linear": (lambda: _AttentionBlock(), ["*q_proj", "*o_proj"], "LoRATritonFunction", False),
+    "fused_swiglu": (
+        lambda: _MLPBlock("swiglu"),
+        ["*gate_proj", "*up_proj", "*down_proj"],
+        "LoRASwiGLUMLPFunction",
+        False,
+    ),
+    "fused_relu2": (lambda: _MLPBlock("relu2"), ["*up_proj", "*down_proj"], "LoRAReLU2MLPFunction", False),
+    # `use_triton: true` is what the recipe in #3652 actually sets, and 91 example recipes set it
+    # too. It only reaches the Triton kernels when TransformerEngine is absent -- patch_linear_module
+    # force-disables it otherwise -- which is why the issue's own run fell back to the torch path.
+    "per_linear_triton": (lambda: _AttentionBlock(), ["*q_proj", "*o_proj"], "LoRATritonFunction", True),
 }
 
 
@@ -174,7 +183,7 @@ def _observe_lora_dtypes():
 
 def _build_sharded_block(case: str, memory_efficient: bool, mesh, device, reference_state=None):
     """LoRA-patch a block through the production entry point, then shard it with the issue's policy."""
-    block_fn, target_modules, _ = _CASES[case]
+    block_fn, target_modules, _, use_triton = _CASES[case]
     torch.manual_seed(20260825)
     block = block_fn()
     apply_lora_to_linear_modules(
@@ -183,7 +192,7 @@ def _build_sharded_block(case: str, memory_efficient: bool, mesh, device, refere
             target_modules=target_modules,
             dim=RANK,
             alpha=RANK,
-            use_triton=False,
+            use_triton=use_triton,
             use_memory_efficient_lora=memory_efficient,
         ),
     )
@@ -239,7 +248,7 @@ def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
 def _assert_lora_mixed_precision(case: str, device: torch.device) -> None:
     """Run one LoRA path under the issue's FSDP2 policy and check it against plain autograd."""
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("dp",))
-    _, _, expected_fn = _CASES[case]
+    _, _, expected_fn, _ = _CASES[case]
 
     generator = torch.Generator(device=device).manual_seed(4242 + dist.get_rank())
     inputs = torch.randn(2, TOKENS, HIDDEN, device=device, dtype=torch.float32, generator=generator)
@@ -287,6 +296,12 @@ def _run_worker() -> None:
         device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 
         for case in _CASES:
+            if case.endswith("_triton") and HAS_TE:
+                # patch_linear_module force-disables Triton when TE is importable, so this case
+                # would silently duplicate "per_linear" instead of covering the Triton kernels.
+                if dist.get_rank() == 0:
+                    print(f"{_RESULT_PREFIX}SKIP {case} (TransformerEngine present)", flush=True)
+                continue
             _assert_lora_mixed_precision(case, device)
             dist.barrier()
 
