@@ -228,6 +228,18 @@ class TestNemotronV3AdapterDense:
 
         assert set(back.keys()) == set(hf_sd.keys())
 
+    def test_dense_mtp_keys_do_not_enter_moe_conversion(self, adapter):
+        hf_tensor = torch.randn(4, dtype=torch.bfloat16)
+        native = adapter.from_hf({"mtp.layers.0.mixer.A_log": hf_tensor})
+
+        assert set(native) == {"mtp.layers.0.mixer._fp32_params.A_log"}
+        assert native["mtp.layers.0.mixer._fp32_params.A_log"].dtype == torch.float32
+
+        exported = adapter.convert_single_tensor_to_hf(
+            "mtp.layers.0.mixer._fp32_params.A_log", native["mtp.layers.0.mixer._fp32_params.A_log"]
+        )
+        assert exported[0][0] == "mtp.layers.0.mixer.A_log"
+
     def test_peft_outer_prefix_round_trip(self, adapter):
         hf_key = "base_model.model.backbone.layers.0.mixer.in_proj.lora_A.weight"
         native_key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
@@ -286,6 +298,45 @@ class TestNemotronV3AdapterMTP:
             "mtp.layers.1.mixer.experts.gate_and_up_projs",
             "mtp.layers.1.mixer.experts.down_projs",
         }
+
+    def test_mtp_expert_conversion_forwards_checkpoint_kwargs(self):
+        moe_config = MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=1,
+            n_activated_experts=1,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            dim=256,
+            inter_dim=512,
+            moe_inter_dim=128,
+            norm_topk_prob=False,
+            expert_bias=False,
+            expert_activation="relu2",
+            dtype=torch.bfloat16,
+        )
+        adapter = NemotronV3StateDictAdapter(MockNemotronV3Config(), moe_config, BackendConfig())
+        tensor = torch.randn(moe_config.n_routed_experts, 256, 128)
+
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None) as convert:
+            adapter.convert_single_tensor_to_hf(
+                "mtp.layers.1.mixer.experts.gate_and_up_projs",
+                tensor,
+                for_checkpoint_load=True,
+                v4_compatible=True,
+            )
+
+        convert.assert_called_once_with(
+            "mtp.layers.1.mixer.experts.gate_and_up_projs",
+            tensor,
+            prefix_override="mtp.",
+            for_checkpoint_load=True,
+            v4_compatible=True,
+        )
 
 
 class TestNemotronV3AdapterToHf:

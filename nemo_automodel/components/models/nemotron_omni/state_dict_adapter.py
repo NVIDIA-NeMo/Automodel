@@ -110,6 +110,11 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         """Whether the embedded language adapter supports a low-memory DCP load."""
         return self._llm_adapter.supports_low_memory_dcp_load
 
+    @property
+    def view_loaded_native_keys(self) -> set[str]:
+        """Language-model keys loaded through model-backed checkpoint views."""
+        return {f"language_model.{key}" for key in self._llm_adapter.view_loaded_native_keys}
+
     def __init__(
         self,
         config,

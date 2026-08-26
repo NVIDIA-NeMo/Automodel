@@ -122,6 +122,18 @@ def test_from_hf_routes_llm_through_v3_adapter_with_prefix(adapter):
     assert not any(k.startswith("language_model.") for k in delegated)
 
 
+def test_view_loaded_llm_keys_restore_outer_prefix(adapter):
+    adapter._llm_adapter.view_loaded_native_keys = {
+        "model.layers.0.mixer.experts.gate_and_up_projs",
+        "model.layers.0.mixer.experts.down_projs",
+    }
+
+    assert adapter.view_loaded_native_keys == {
+        "language_model.model.layers.0.mixer.experts.gate_and_up_projs",
+        "language_model.model.layers.0.mixer.experts.down_projs",
+    }
+
+
 # ---------------------------------------------------------------------------
 # to_hf — Automodel layout -> HF layout (round-trip)
 # ---------------------------------------------------------------------------

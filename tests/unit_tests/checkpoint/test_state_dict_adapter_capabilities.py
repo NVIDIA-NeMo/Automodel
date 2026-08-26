@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -59,7 +60,16 @@ class _AllocatingKeysAdapter(StateDictAdapter):
 
     def to_hf(self, state_dict, **kwargs):
         self.converted_devices = [value.device for value in state_dict.values() if isinstance(value, torch.Tensor)]
-        return {"fused.weight": torch.cat((state_dict.pop("q.weight"), state_dict.pop("k.weight")), dim=0)}
+        converted = {"fused.weight": torch.cat((state_dict.pop("q.weight"), state_dict.pop("k.weight")), dim=0)}
+        exclude_key_regex = kwargs.get("exclude_key_regex")
+        converted.update(
+            {
+                key: value
+                for key, value in state_dict.items()
+                if exclude_key_regex is None or not re.match(exclude_key_regex, key)
+            }
+        )
+        return converted
 
     def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
         return hf_state_dict
@@ -73,13 +83,15 @@ def test_get_hf_state_dict_keys_uses_shape_only_tensors() -> None:
     state_dict = {
         "q.weight": torch.ones(4, 8),
         "k.weight": torch.ones(2, 8),
+        "buffer": torch.ones(1),
+        "layer._extra_state": {"recipe": "metadata"},
     }
 
     keys = adapter.get_hf_state_dict_keys(state_dict)
 
-    assert keys == ["fused.weight"]
-    assert adapter.converted_devices == [torch.device("meta"), torch.device("meta")]
-    assert list(state_dict) == ["q.weight", "k.weight"]
+    assert keys == ["fused.weight", "buffer"]
+    assert adapter.converted_devices == [torch.device("meta"), torch.device("meta"), torch.device("meta")]
+    assert list(state_dict) == ["q.weight", "k.weight", "buffer", "layer._extra_state"]
 
 
 def _assert_destinations_write_through(
@@ -159,7 +171,7 @@ def test_write_through_adapters_expose_aliasing_destinations(
 def test_low_memory_dcp_grouped_adapters_preserve_non_expert_storage_and_require_model_backed_experts(
     adapter_type: type[StateDictAdapter],
 ) -> None:
-    moe_config = SimpleNamespace(n_routed_experts=2, moe_inter_dim=2, expert_activation="silu")
+    moe_config = SimpleNamespace(n_routed_experts=2, moe_inter_dim=2, expert_activation="silu", expert_bias=False)
     adapter = adapter_type(
         SimpleNamespace(num_hidden_layers=1),
         moe_config,

@@ -64,8 +64,9 @@ class MoESplitExpertsStateDictMixin:
     @property
     def supports_low_memory_dcp_load(self) -> bool:
         """Whether DCP needs at most small temporary tensors for this MoE checkpoint."""
-        experts_use_model_storage = self.moe_config is None or self._expert_checkpoint_tensors_use_model_storage
-        return self._supports_low_memory_dcp_load and experts_use_model_storage
+        if not self._supports_low_memory_dcp_load or self.moe_config is None:
+            return self._supports_low_memory_dcp_load
+        return self._expert_checkpoint_tensors_use_model_storage and not self.moe_config.expert_bias
 
     @property
     def _expert_checkpoint_tensors_use_model_storage(self) -> bool:
@@ -80,17 +81,17 @@ class MoESplitExpertsStateDictMixin:
     def _grouped_expert_storage_is_model_weight(self) -> bool:
         """Whether the runtime grouped expert tensors use the model's parameter storage.
 
-        TE normally exposes virtual grouped tensors backed by ``torch.stack`` copies. The MoE layer instead constructs
-        ordinary ``GroupedExperts`` when an EP dispatcher runs with world size one, so the same TE configuration uses
-        real model parameters in that runtime. Non-EP dispatchers also construct ordinary grouped experts.
+        This mirrors the expert implementation selected by ``MoE.__init__``. EP dispatchers use ordinary
+        ``GroupedExperts`` at world size one, ``GroupedExpertsDeepEP`` for the grouped backends at larger world sizes,
+        and ``GroupedExpertsTE`` otherwise. Non-EP dispatchers construct ordinary grouped experts.
         """
-        if self.backend.experts != "te":
-            return True
         if self.backend.dispatcher == "mok":
-            return False
+            return self.backend.experts != "te"
         if self.backend.dispatcher not in {"deepep", "hybridep", "uccl_ep"}:
             return True
-        return get_world_size_safe() == 1
+        if get_world_size_safe() == 1:
+            return True
+        return self.backend.experts in {"gmm", "torch_mm", "torch_mm_mxfp8"}
 
     @property
     def _is_gated_moe(self) -> bool:
@@ -597,6 +598,12 @@ class MoESplitExpertsStateDictMixin:
         ``_convert_single_merged_expert_to_hf_split_experts`` for adapter
         compatibility (e.g. ``exclude_key_regex``).
         """
+        if self.moe_config is not None and self.moe_config.expert_bias:
+            raise NotImplementedError(
+                "Checkpoint conversion for grouped experts with expert_bias=True is not implemented; "
+                "refusing to pass expert bias tensors through under incorrect keys."
+            )
+
         hf_state_dict: dict[str, Any] = {}
 
         for fqn, tensor in state_dict.items():
@@ -643,6 +650,12 @@ class MoESplitExpertsStateDictMixin:
             [local_experts, hidden, expert_hidden], and down projections have shape
             [local_experts, expert_hidden, hidden].
         """
+        if self.moe_config is not None and self.moe_config.expert_bias:
+            raise NotImplementedError(
+                "Checkpoint conversion for grouped experts with expert_bias=True is not implemented; "
+                "refusing to pass expert bias tensors through under incorrect keys."
+            )
+
         if reset_view_loaded_keys:
             self._view_loaded_native_keys = set()
 
@@ -884,6 +897,12 @@ class MoESplitExpertsStateDictMixin:
         prefix = prefix_override if prefix_override is not None else self._hf_prefix
         expert_segment = self._expert_path_segment
 
+        if self.moe_config.expert_bias and f".{expert_segment}." in fqn:
+            raise NotImplementedError(
+                "Checkpoint conversion for grouped experts with expert_bias=True is not implemented; "
+                "refusing to pass expert bias tensors through under incorrect keys."
+            )
+
         # MoE expert LoRA keys do not depend on the runtime backend or its checkpoint storage aliases.
         # When v4_compatible=True, emit per-expert split keys. Otherwise, adapters that explicitly opt in emit the
         # fused ParamWrapper format; unvalidated adapters retain the legacy per-expert format.
@@ -942,7 +961,7 @@ class MoESplitExpertsStateDictMixin:
                 and not quantization
                 and gate_up_storage_is_model_weight
             )
-            if inplace_ok:
+            if inplace_ok and for_checkpoint_load:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 
             result = []
@@ -995,7 +1014,7 @@ class MoESplitExpertsStateDictMixin:
                 and not quantization
                 and down_storage_is_model_weight
             )
-            if inplace_ok:
+            if inplace_ok and for_checkpoint_load:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 
             result = []

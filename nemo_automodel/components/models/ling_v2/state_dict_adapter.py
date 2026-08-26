@@ -87,6 +87,8 @@ def _rename_native_to_hf(key: str) -> str:
 class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """State-dict adapter for BailingMoeV2 / Ling 2.0 checkpoints."""
 
+    _supports_low_memory_dcp_load = True
+
     def __init__(
         self,
         config: BailingMoeV2Config,
@@ -103,7 +105,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
     @property
     def supports_low_memory_dcp_load(self) -> bool:
         """Whether Ling's DCP load needs only small fused-QKV temporary tensors."""
-        return self._expert_checkpoint_tensors_use_model_storage and not self.moe_config.expert_bias
+        return self.moe_config is not None and super().supports_low_memory_dcp_load
 
     # ---- HF -> native ----------------------------------------------------
 
