@@ -252,6 +252,32 @@ def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     assert out.item() == pytest.approx(2.0)
 
 
+def test_fused_cross_entropy_uses_autocast_compute_dtype_with_fp32_parameters(monkeypatch):
+    """FP32 resident parameters reach CCE as BF16 under BF16 autocast."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    seen_dtypes = None
+
+    def _fake_linear_ce(hidden, weight, **_kwargs):
+        nonlocal seen_dtypes
+        seen_dtypes = (hidden.dtype, weight.dtype)
+        return hidden.sum() + weight.sum()
+
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
+    hidden = torch.randn(2, 3, 4, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(5, 4, dtype=torch.float32, requires_grad=True)
+    labels = torch.zeros(2, 3, dtype=torch.long)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss = FusedLinearCrossEntropy()(hidden, labels, weight)
+    loss.backward()
+
+    assert seen_dtypes == (torch.bfloat16, torch.bfloat16)
+    assert hidden.grad is not None and hidden.grad.dtype == torch.float32
+    assert weight.grad is not None and weight.grad.dtype == torch.float32
+
+
 def test_fused_cross_entropy_cp_example_mean_matches_reference_gradient(monkeypatch):
     """Summed CP token shards match full-sequence unequal-length example means."""
     from nemo_automodel.components.loss import linear_ce as linear_ce_mod

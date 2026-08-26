@@ -252,6 +252,15 @@ class FusedLinearCrossEntropy(nn.Module):
             lm_weight,
             grad_reduce_group=grad_reduce_group,
         )
+        device_type = hidden_states.device.type
+        if torch.is_autocast_enabled(device_type):
+            compute_dtype = torch.get_autocast_dtype(device_type)
+            if compute_dtype in (torch.bfloat16, torch.float16):
+                # CCE backward requires both operands in a 16-bit compute dtype.
+                # Keep FP32 resident/master parameters and route gradients back
+                # through these differentiable casts.
+                hidden_states = hidden_states.to(compute_dtype)
+                lm_weight = lm_weight.to(compute_dtype)
 
         if (label_token_counts is None) != (num_label_examples is None):
             raise ValueError("label_token_counts and num_label_examples must be provided together")
