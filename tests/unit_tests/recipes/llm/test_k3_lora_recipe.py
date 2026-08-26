@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration contract for the Kimi K3 expert-LoRA example."""
+"""Configuration contracts for the Kimi K3 SFT examples."""
 
 from pathlib import Path
 
@@ -25,6 +25,21 @@ from nemo_automodel.recipes._dist_utils import parse_distributed_section
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CONFIG_PATH = REPO_ROOT / "examples/llm_finetune/kimi/k3_hellaswag_lora.yaml"
+SFT_CONFIG_PATH = REPO_ROOT / "examples/llm_finetune/kimi/k3_hellaswag.yaml"
+
+
+def test_k3_full_sft_recipe_uses_hybridep_with_resharding() -> None:
+    """The full-SFT recipe keeps HybridEP dispatch and reshard-after-forward enabled."""
+    raw_config = yaml.safe_load(SFT_CONFIG_PATH.read_text(encoding="utf-8"))
+    config = load_yaml_config(SFT_CONFIG_PATH)
+    distributed = parse_distributed_section(raw_config["distributed"])
+
+    backend = config.model.backend.instantiate()
+
+    assert isinstance(backend, BackendConfig)
+    assert backend.experts == "torch_mm"
+    assert backend.dispatcher == "hybridep"
+    assert distributed["moe_parallel_config"].reshard_after_forward is True
 
 
 def test_k3_lora_recipe_declares_expert_lora_scaling_contract() -> None:

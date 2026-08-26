@@ -52,7 +52,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
-    dispatcher: torch
+    dispatcher: hybridep
     rope_fusion: false
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -80,7 +80,7 @@ distributed:
     patch_inner_model: false
     patch_causal_lm_model: false
   moe:
-    reshard_after_forward: false
+    reshard_after_forward: true
     wrap_outer_model: false
 
 loss_fn:
