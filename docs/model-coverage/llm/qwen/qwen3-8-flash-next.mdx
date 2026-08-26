@@ -48,7 +48,7 @@ loss or straight-through gradient.
 | Engram ownership | Global `Shard(0)` DTensor over the world group; 64 or 128 contiguous local row shards |
 | Context parallelism | CP1 and CP8 at world size 128; CP was disabled in the EP64 baseline run below |
 | Tensor / pipeline parallelism | Disabled |
-| Workload | Non-packed, right-tail-padded HellaSwag next-token prediction |
+| Workload | Non-packed right-tail-padded HellaSwag; packed (THD) Tulu-3 full-token SFT |
 | Scale | 8 nodes / 64 H100 baseline; 16 nodes / 128 H100 CP comparison |
 | Duration | 100 optimizer steps |
 
@@ -97,6 +97,15 @@ steps, loss-curve cosine similarity was 0.9999992, mean absolute loss difference
 was 0.00054, and the maximum absolute difference was 0.00267. Final losses were
 0.60801 for CP1 and 0.60800 for CP8.
 
+Packed (THD) context parallelism was validated the same way at world size 64
+with EP64: CP1 (DP64/GA2) and CP8 (DP8/GA16) trained 100 optimizer steps over
+identical THD packs (packing is topology-independent for the model-owned CP
+path, so both runs consume byte-identical pack sequences). Loss-curve cosine
+similarity was 0.999999925, mean absolute difference 0.00024, and maximum
+absolute difference 0.00069; final losses were 0.56053 for CP1 and 0.56011
+for CP8. A world-64 single-forward probe additionally matched CP8 against CP1
+with exact per-row routing IDs and passing PLE/GDN/QSA activation gates.
+
 ## Example Recipe
 
 | Recipe | Description |
@@ -132,9 +141,11 @@ setup.
   under their global DTensor FQNs, so DCP can reshard them when the owner world
   size changes. Checkpoints from the earlier rank-local owner format are not
   supported; resume from a native DTensor checkpoint or restart the optimizer.
-- CP is limited to language-only, non-packed, right-tail-padded inputs with
-  TP=PP=1. Packed sequences, left/interior padding, TP, PP, MTP, and
-  vision/video training remain unsupported.
+- CP is limited to language-only inputs with TP=PP=1. Non-packed
+  right-tail-padded batches and packed (THD) batches with ``cu_seqlens`` (or
+  loader ``seq_lens``) are both supported; the fused THD kernel serves packed
+  CUDA training and packing is performed topology-independently. Left/interior
+  padding, TP, PP, MTP, and vision/video training remain unsupported.
 
 ## References
 
