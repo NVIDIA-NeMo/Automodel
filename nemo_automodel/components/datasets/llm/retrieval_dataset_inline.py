@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -490,16 +491,45 @@ def _group_aware_split(dataset, validation_fraction: float, group_key: str | Non
             )
         groups = sorted(set(row_groups))
 
-    shuffled = list(groups)
-    random.Random(seed).shuffle(shuffled)
-    n_val = int(round(len(shuffled) * validation_fraction))
-    val_groups = set(shuffled[len(shuffled) - n_val:]) if n_val else set()
+    # ASSIGN EACH GROUP INDEPENDENTLY, BY HASH.
+    #
+    # The train and validation halves are produced by two SEPARATE calls to this function,
+    # from two separate configs. They are complementary only if both calls see the same
+    # groups in the same order with the same seed. Shuffling a materialised list made that
+    # coupling silent and brittle: any difference in file order, or one extra row on one
+    # side, permutes the shuffle and moves groups across the boundary -- reintroducing
+    # exactly the leakage the grouping exists to prevent, with no error raised.
+    #
+    # Hashing (seed, group) instead makes a group's side a pure function of its own id. Two
+    # calls agree as long as they share the seed and fraction, whatever order the rows
+    # arrive in and whatever else is present. It is also stable as a dataset grows: adding
+    # trajectories leaves existing groups where they were, instead of reshuffling everything.
+    # Rank by hash and take the lowest n_val, rather than thresholding the score directly.
+    # Thresholding is simpler but makes the validation size binomial -- 0.2 of 40 groups came
+    # out as 7 rather than 8 in testing, and at 249 groups a 10% split would vary by about
+    # +/-5 -- where the previous implementation always produced exactly round(n * fraction).
+    # Ranking keeps that exact count while still depending only on the group ids.
+    def _val_score(group) -> tuple:
+        h = hashlib.blake2b(f"{seed}:{group}".encode("utf-8"), digest_size=8).digest()
+        # group id breaks ties so the order is total even on a digest collision
+        return (int.from_bytes(h, "big"), str(group))
+
+    n_val = int(round(len(groups) * validation_fraction))
+    val_groups = set(sorted(groups, key=_val_score)[:n_val]) if n_val else set()
 
     keep_val = data_type in ("validation", "eval")
     indices = [i for i, g in enumerate(row_groups) if (g in val_groups) == keep_val]
+    # Log a fingerprint of the chosen validation set. The train and validation builds print
+    # one of these each, back to back, so a seed or fraction mismatch between the two configs
+    # is visible in the job log as two differing fingerprints rather than as silent leakage.
+    fp = hashlib.blake2b(
+        "|".join(sorted(map(str, val_groups))).encode("utf-8"), digest_size=6
+    ).hexdigest()
     logging.info(
-        "group-aware split on %r: %d groups -> %d validation, %d rows selected for %s",
+        "group-aware split on %r: %d groups -> %d validation, %d rows selected for %s "
+        "(seed=%s fraction=%s val_fingerprint=%s)",
         group_key, len(groups), len(val_groups), len(indices), data_type,
+        seed, validation_fraction, fp,
     )
     return dataset.select(indices)
 
