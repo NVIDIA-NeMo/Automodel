@@ -362,6 +362,15 @@ class Qwen3_8_FlashNextLegacyTextConfig(Qwen3_8_FlashNextTextConfig):
 
     model_type = "qwen4_exp_text"
 
+    def __init__(self, **kwargs: Any) -> None:
+        """Pass through so transformers keeps the parent's field handling.
+
+        ``PreTrainedConfig.__init_subclass__`` dataclass-wraps subclasses and
+        replaces a missing ``__init__`` with a generated one that skips the
+        parent's sub-config materialization.
+        """
+        super().__init__(**kwargs)
+
 
 class Qwen3_8_FlashNextLegacyConfig(Qwen3_8_FlashNextConfig):
     """Config alias for checkpoint dumps that predate the model rename.
@@ -372,3 +381,7 @@ class Qwen3_8_FlashNextLegacyConfig(Qwen3_8_FlashNextConfig):
     """
 
     model_type = "qwen4_exp"
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Pass through so transformers keeps the parent's sub-config conversion."""
+        super().__init__(**kwargs)

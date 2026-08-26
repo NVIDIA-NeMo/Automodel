@@ -242,7 +242,14 @@ def shard_batch_for_qwen3_8_flash_next_cp(
         "max_seqlen_kv",
     )
     packed_cu_seqlens = batch.pop("cu_seqlens", None)
-    unsupported_packed_keys = [key for key in packed_keys if key != "cu_seqlens" and batch.get(key) is not None]
+    loader_seq_lens = batch.pop("seq_lens", None)
+    loader_seq_lens_padded = batch.pop("seq_lens_padded", None)
+    if packed_cu_seqlens is None and loader_seq_lens is not None:
+        packed_cu_seqlens = packed_boundaries_from_seq_lens(loader_seq_lens, loader_seq_lens_padded)
+    supported_packed_keys = {"cu_seqlens", "seq_lens", "seq_lens_padded"}
+    unsupported_packed_keys = [
+        key for key in packed_keys if key not in supported_packed_keys and batch.get(key) is not None
+    ]
     if unsupported_packed_keys or (batch.get("qkv_format") == "thd" and packed_cu_seqlens is None):
         raise NotImplementedError(
             "Qwen3.8-Flash-Next packed context parallelism supports only cu_seqlens document boundaries; "
@@ -453,8 +460,41 @@ def qwen3_8_flash_next_cp_left_halo(
     return preceding + collective_anchor
 
 
+def packed_boundaries_from_seq_lens(
+    seq_lens: torch.Tensor,
+    seq_lens_padded: torch.Tensor | None,
+    *,
+    sentinel: int = -1000,
+) -> torch.Tensor:
+    """Convert loader ``seq_lens`` metadata to physical document boundaries.
+
+    The packed-sequence loader emits per-document real lengths (``seq_lens``)
+    and slot widths (``seq_lens_padded``), padded with a sentinel. Boundaries
+    follow the physical slot layout, so intra-document padding introduced by
+    the packer stays inside its document: both CP1 and CP-sharded runs treat
+    those pad tokens identically and their labels are already masked.
+
+    Args:
+        seq_lens: Real lengths ``[num_docs]`` or ``[1, num_docs]``.
+        seq_lens_padded: Optional slot widths in the same shape.
+        sentinel: Filler value marking unused length slots.
+
+    Returns:
+        int64 boundaries ``[num_docs + 1]`` starting at zero.
+    """
+    widths = seq_lens if seq_lens_padded is None else seq_lens_padded
+    widths = widths.reshape(-1).to(dtype=torch.long)
+    widths = widths[widths != sentinel]
+    if widths.numel() == 0 or bool((widths <= 0).any()):
+        raise ValueError(f"packed seq_lens must contain positive document widths, got {widths.tolist()}")
+    boundaries = torch.zeros(widths.numel() + 1, dtype=torch.long, device=widths.device)
+    boundaries[1:] = torch.cumsum(widths, dim=0)
+    return boundaries
+
+
 __all__ = [
     "Qwen3_8_FlashNextCPContext",
+    "packed_boundaries_from_seq_lens",
     "qwen3_8_flash_next_cp_all_gather",
     "qwen3_8_flash_next_cp_left_halo",
     "shard_batch_for_qwen3_8_flash_next_cp",

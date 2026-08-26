@@ -519,3 +519,20 @@ def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytes
     explicit = torch.zeros(1, 10, dtype=torch.int32)
     layer(torch.randn(1, 10, gdn_config.hidden_size), cu_seqlens=torch.tensor([0, 10]), attention_mask=explicit)
     assert captured["attention_mask"] is explicit
+
+
+def test_packed_boundaries_from_seq_lens_matches_loader_contract() -> None:
+    """Loader seq_lens metadata converts to physical slot boundaries."""
+    from nemo_automodel.components.models.qwen3_8_flash_next.cp import packed_boundaries_from_seq_lens
+
+    boundaries = packed_boundaries_from_seq_lens(
+        torch.tensor([[3, 2, 6, -1000]]),
+        torch.tensor([[4, 2, 6, -1000]]),
+    )
+    assert boundaries.tolist() == [0, 4, 6, 12]
+
+    boundaries = packed_boundaries_from_seq_lens(torch.tensor([5, 7]), None)
+    assert boundaries.tolist() == [0, 5, 12]
+
+    with pytest.raises(ValueError, match="positive document widths"):
+        packed_boundaries_from_seq_lens(torch.tensor([-1000]), None)

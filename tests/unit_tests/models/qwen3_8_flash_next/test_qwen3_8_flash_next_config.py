@@ -310,8 +310,12 @@ def test_legacy_qwen4_exp_checkpoint_config_resolves_via_autoconfig(tmp_path) ->
     }
     (tmp_path / "config.json").write_text(json.dumps(checkpoint_config))
 
+    from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+
     resolved = AutoConfig.from_pretrained(tmp_path)
     assert isinstance(resolved, Qwen3_8_FlashNextLegacyConfig)
+    assert isinstance(resolved.text_config, Qwen3_8_FlashNextTextConfig)
+    assert resolved.text_config.hidden_size == 8
     assert resolved.model_type == "qwen4_exp"
     assert resolved.architectures == ["Qwen4ExpForConditionalGeneration"]
     module_path, class_name = MODEL_ARCH_MAPPING["Qwen4ExpForConditionalGeneration"]
