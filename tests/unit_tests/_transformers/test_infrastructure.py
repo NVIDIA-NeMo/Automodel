@@ -174,6 +174,17 @@ class _TinyTrainabilityModel(torch.nn.Module):
         return self.base(inputs) + self.extension(inputs)
 
 
+class _TinyClassifierModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = torch.nn.Linear(2, 2)
+        self.classifier = torch.nn.Linear(2, 1)
+        self.config = SimpleNamespace()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.backbone(inputs))
+
+
 _GENERIC_FREEZE_CONFIG = {
     "freeze_modules": ["b*", "ext*"],
     "unfreeze_modules": "ext*",
@@ -290,6 +301,44 @@ def test_peft_freeze_config_survives_parallel_parameter_replacement(
     assert model.lora_weight.requires_grad
     assert model.vision_adapter.lora_weight.requires_grad is vision_lora_trainable
     assert not model.parallel_parameter.requires_grad
+
+
+def test_peft_unfrozen_classifier_uses_compute_dtype_without_sharding():
+    """A one-rank PEFT classifier can consume the frozen backbone output."""
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+    model = _TinyClassifierModel()
+    peft_config = SimpleNamespace(lora_A_init=None, use_triton=False)
+    model_wrapper = SimpleNamespace(mp_policy=SimpleNamespace(param_dtype=torch.bfloat16))
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._apply_peft_and_lower_precision", return_value=model),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", return_value=model),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
+        result = apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=model_wrapper,
+            peft_config=peft_config,
+            freeze_config={"unfreeze_modules": ["classifier"]},
+        )
+
+    output = result(torch.ones(1, 2, dtype=torch.bfloat16))
+    output.sum().backward()
+
+    assert not result.backbone.weight.requires_grad
+    assert result.backbone.weight.dtype == torch.bfloat16
+    assert result.classifier.weight.requires_grad
+    assert result.classifier.weight.dtype == torch.bfloat16
+    assert result.classifier.weight.grad is not None
 
 
 def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():

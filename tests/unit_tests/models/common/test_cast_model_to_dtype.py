@@ -580,6 +580,37 @@ class TestCastFrozenModulesToComputeDtype:
         assert model.bias.dtype == torch.bfloat16
         assert model.adapter.weight.dtype == torch.bfloat16
 
+    def test_selected_trainable_plain_param_cast(self):
+        model = _VLMLike()
+
+        cast_frozen_modules_to_compute_dtype(
+            model,
+            torch.bfloat16,
+            trainable_param_names={"language.weight", "language.bias"},
+        )
+
+        assert model.language.weight.dtype == torch.bfloat16
+        assert model.language.bias.dtype == torch.bfloat16
+
+    def test_selected_trainable_dtensor_is_left_to_fsdp(self, monkeypatch):
+        import torch.distributed.tensor as dt_mod
+
+        class _FakeDTensor(nn.Parameter):
+            pass
+
+        monkeypatch.setattr(dt_mod, "DTensor", _FakeDTensor, raising=False)
+
+        model = _VLMLike()
+        model.language.weight = _FakeDTensor(model.language.weight.data)
+
+        cast_frozen_modules_to_compute_dtype(
+            model,
+            torch.bfloat16,
+            trainable_param_names={"language.weight"},
+        )
+
+        assert model.language.weight.dtype == torch.float32
+
     def test_sharded_frozen_param_skipped_but_buffer_cast(self, monkeypatch):
         """A sharded (DTensor) frozen param is left to FSDP, but its fp32 buffers are still cast.
 

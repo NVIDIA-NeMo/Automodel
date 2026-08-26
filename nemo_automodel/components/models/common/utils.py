@@ -1037,7 +1037,12 @@ def compute_lm_head_logits(
     return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
 
 
-def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
+def cast_frozen_modules_to_compute_dtype(
+    model: nn.Module,
+    compute_dtype: torch.dtype | None,
+    *,
+    trainable_param_names: set[str] | None = None,
+) -> None:
     """Cast frozen floating-point tensors to ``compute_dtype``.
 
     When parameters are stored in fp32 (the fp32-master-weights pattern) while compute runs
@@ -1059,12 +1064,16 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     Tensors whose qualified name matches ``_keep_in_fp32_modules`` or
     ``_keep_in_fp32_modules_strict`` are left in fp32. The function is a no-op when
     ``compute_dtype`` is None and for tensors already in ``compute_dtype``. Frozen parameters
-    are never updated during training. Trainable plain tensors are cast only in mixed subtrees,
-    where unsharded execution must match the requested compute dtype.
+    are never updated during training. Trainable plain tensors are cast only in mixed subtrees
+    or when named by ``trainable_param_names``, where unsharded execution must match the
+    requested compute dtype.
 
     Args:
-        model: The model, already materialized, checkpoint-loaded, and sharded.
+        model: The model, already materialized, checkpoint-loaded, and sharded, before
+            optimizer construction.
         compute_dtype: The compute dtype (``mp_policy.param_dtype``); None disables the cast.
+        trainable_param_names: Logical names of trainable parameters that must use the compute
+            dtype when they remain unsharded. DTensor parameters are still left to FSDP.
     """
     if compute_dtype is None:
         return
@@ -1075,6 +1084,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
         DTensor = ()
 
     fp32_keywords = _get_fp32_module_keywords(model)
+    trainable_param_names = trainable_param_names or set()
 
     def _is_fp32_pinned(name: str) -> bool:
         return any(kw in name for kw in fp32_keywords)
@@ -1116,14 +1126,20 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
                 return False
             subtree, _, _ = subtree.rpartition(".")
 
-    # Parameters: cast frozen plain floats and plain floats in mixed adapter subtrees; leave
-    # all other trainable params and every sharded (DTensor) param to FSDP mixed precision.
+    # Parameters: cast frozen plain floats, mixed adapter subtrees, and explicitly selected
+    # trainable params; leave other trainable params and every DTensor to FSDP mixed precision.
     for name, param in named_params:
-        if (param.requires_grad and not _is_in_subtrees(name, mixed_subtrees)) or _is_fp32_pinned(name):
+        logical_name = canonical_parameter_fqn(name).replace("_orig_mod.", "")
+        selected_trainable = logical_name in trainable_param_names
+        if (
+            param.requires_grad and not selected_trainable and not _is_in_subtrees(name, mixed_subtrees)
+        ) or _is_fp32_pinned(name):
             continue
         if DTensor and isinstance(param, DTensor):
             continue
         if param.is_floating_point() and param.dtype != compute_dtype:
+            # Infrastructure invokes this before optimizer construction or backward. Preserve
+            # Parameter identity (and tied aliases) while replacing only its unsharded storage.
             param.data = param.data.to(compute_dtype)
 
     # Preserve the existing buffer scope: fully frozen parameter subtrees plus the newly

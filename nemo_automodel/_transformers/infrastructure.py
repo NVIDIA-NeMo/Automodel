@@ -834,13 +834,21 @@ def apply_model_infrastructure(
     # both cases FSDP mixed precision never casts their buffers, and an excluded frozen
     # module also keeps its storage-dtype params. Under fp32 master weights + bf16 compute
     # that leaves frozen fp32 tensors feeding bf16 trainable modules -> dtype-mismatch
-    # matmul at the seam. Cast frozen params/buffers to the compute dtype so the whole
-    # forward runs uniformly. No-op for pure-fp32 / pure-bf16 runs and when no mp_policy
-    # is available (DDP/PP).
+    # matmul at the seam. Generic PEFT selectors can create the inverse seam by unfreezing
+    # a plain fp32 parameter after its inputs have moved to bf16, so include those explicit
+    # trainability overrides as well. No-op for pure-fp32 / pure-bf16 runs and when no
+    # mp_policy is available (DDP/PP).
     compute_dtype = getattr(getattr(model_wrapper, "mp_policy", None), "param_dtype", None)
     if compute_dtype is not None:
+        selected_trainable_param_names = {
+            name for name, requires_grad in pre_shard_trainability_overrides.items() if requires_grad
+        }
         for mp in model.parts if hasattr(model, "parts") else [model]:
-            cast_frozen_modules_to_compute_dtype(mp, compute_dtype)
+            cast_frozen_modules_to_compute_dtype(
+                mp,
+                compute_dtype,
+                trainable_param_names=selected_trainable_param_names,
+            )
 
     # Re-apply the Megatron-FSDP per-parameter state dropped by the lm-head re-tie and
     # post-wrap checkpoint reload, so the deferred optimizer registration and first
