@@ -913,6 +913,7 @@ class TestConvertSingleMergedExpertToHfSplitExperts:
     def test_allocating_cuda_conversions_use_generation_zero_collection(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         gate_up_tensor = Mock(spec=torch.Tensor, is_meta=False, is_cuda=True)
         down_tensor = Mock(spec=torch.Tensor, ndim=3, shape=(2, 3, 4), is_meta=False, is_cuda=True)
         gate_up_splits = [
@@ -921,6 +922,7 @@ class TestConvertSingleMergedExpertToHfSplitExperts:
         down_splits = [torch.arange(12, dtype=torch.float32).reshape(3, 4) + 12 * expert_id for expert_id in range(2)]
 
         with (
+            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=2),
             patch.object(mixin, "_split_experts_weights", side_effect=[gate_up_splits, down_splits]),
             patch("torch.cuda.is_available", return_value=True),
             patch("nemo_automodel.components.moe.state_dict_mixin.gc.collect") as collect,
