@@ -34,8 +34,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
-from nemo_automodel.components.models.qwen3_8_flash_next.kernels._tilelang import HAS_TILELANG
-from nemo_automodel.components.models.qwen3_8_flash_next.kernels.sparse_attention import tilelang_sparse_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -331,8 +330,8 @@ def gathered_qsa_gqa_attention(
     """Run the differentiable PyTorch QSA oracle without expanding K/V heads.
 
     This implementation is retained for CPU execution and numerical parity.
-    CUDA training with ``backend.attn='tilelang'`` dispatches to the fused
-    kernel instead. The oracle uses a private fixed query chunk solely to bound
+    CUDA training with ``backend.attn='flex'`` dispatches to FlexAttention
+    instead. The oracle uses a private fixed query chunk solely to bound
     temporary gathered K/V storage; it has no public model configuration.
 
     Args:
@@ -398,13 +397,12 @@ def qsa_gqa_attention(
     backend: str,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Dispatch QSA to fused TileLang on CUDA or the PyTorch oracle elsewhere.
+    """Dispatch QSA to FlexAttention on CUDA or the PyTorch oracle elsewhere.
 
     CPU execution always uses the oracle so model construction, checkpoint
-    inspection, and distributed CPU parity tests do not require TileLang.
-    CUDA execution is strict: Qwen3.8-Flash-Next sparse GQA requires TileLang, and
-    missing dependencies or unsupported backends/dtypes are reported rather
-    than silently falling back to the much larger gathered implementation.
+    inspection, and distributed CPU parity tests need no compiled kernels.
+    CUDA execution is strict: unsupported backends or dtypes are reported
+    rather than silently falling back to the gathered implementation.
     """
     if not query.is_cuda:
         return gathered_qsa_gqa_attention(
@@ -414,20 +412,14 @@ def qsa_gqa_attention(
             selected_token_ids,
             softmax_scale=softmax_scale,
         )
-    if backend != "tilelang":
+    if backend != "flex":
         raise RuntimeError(
-            "Qwen3.8-Flash-Next CUDA QSA requires backend.attn='tilelang'; "
+            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex', got {backend!r}; "
             "call gathered_qsa_gqa_attention directly for a numerical oracle"
         )
-    if not HAS_TILELANG:
-        raise RuntimeError(
-            "Qwen3.8-Flash-Next TileLang QSA was requested on CUDA, but tilelang is not installed. "
-            "Install tilelang; the PyTorch oracle is available only through "
-            "gathered_qsa_gqa_attention for explicit numerical tests."
-        )
     if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
-        raise RuntimeError("Qwen3.8-Flash-Next TileLang QSA requires CUDA BF16 query, key, and value tensors")
-    return tilelang_sparse_gqa_attention(
+        raise RuntimeError("Qwen3.8-Flash-Next flex QSA requires CUDA BF16 query, key, and value tensors")
+    return flex_sparse_gqa_attention(
         query,
         key,
         value,

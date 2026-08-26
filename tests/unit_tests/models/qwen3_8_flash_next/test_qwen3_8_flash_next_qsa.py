@@ -332,19 +332,19 @@ def test_gathered_qsa_oracle_handles_duplicate_and_padding_ids() -> None:
         assert torch.count_nonzero(padding_input.grad) == 0
 
 
-def test_qsa_tilelang_backend_bypasses_generic_parent_initializer() -> None:
+def test_qsa_flex_backend_bypasses_generic_parent_initializer() -> None:
     backend = _backend()
-    backend.attn = "tilelang"
+    backend.attn = "flex"
 
     attention = Qwen3_8_FlashNextQSAAttention(_config(), layer_idx=0, backend=backend)
 
     assert attention.backend is backend
-    assert attention.backend.attn == "tilelang"
+    assert attention.backend.attn == "flex"
     assert attention.attn_module is None
     assert attention.attn_func is None
 
 
-def test_qsa_tilelang_backend_uses_cpu_oracle(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qsa_flex_backend_uses_cpu_oracle(monkeypatch: pytest.MonkeyPatch) -> None:
     query = torch.randn(1, 3, 4, 3)
     key = torch.randn(1, 3, 2, 3)
     value = torch.randn(1, 3, 2, 3)
@@ -352,9 +352,9 @@ def test_qsa_tilelang_backend_uses_cpu_oracle(monkeypatch: pytest.MonkeyPatch) -
     expected = gathered_qsa_gqa_attention(query, key, value, selected)
 
     def fail_if_called(*_args, **_kwargs):
-        pytest.fail("CPU QSA must not call the TileLang kernel")
+        pytest.fail("CPU QSA must not call the FlexAttention kernel")
 
-    monkeypatch.setattr(qwen3_8_flash_next_qsa, "tilelang_sparse_gqa_attention", fail_if_called)
-    actual = qwen3_8_flash_next_qsa.qsa_gqa_attention(query, key, value, selected, backend="tilelang")
+    monkeypatch.setattr(qwen3_8_flash_next_qsa, "flex_sparse_gqa_attention", fail_if_called)
+    actual = qwen3_8_flash_next_qsa.qsa_gqa_attention(query, key, value, selected, backend="flex")
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

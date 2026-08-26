@@ -15,10 +15,10 @@
 """Trainable Qwen3.8-Flash-Next conditional-generation model.
 
 This implementation uses the checkpoint's compressed-block QSA router and a
-fused TileLang sparse-GQA path for CUDA BF16 long-sequence SFT, with a PyTorch
-oracle for CPU and numerical parity. Pipeline, tensor, and packed-sequence
-parallelism remain unsupported. Context parallelism uses a model-owned
-contiguous sequence shard for QSA, GDN, and PLE.
+FlexAttention sparse-GQA path for CUDA BF16 long-sequence SFT, with a PyTorch
+oracle for CPU and numerical parity. Pipeline and tensor parallelism remain
+unsupported. Context parallelism uses a model-owned contiguous sequence shard
+for QSA, GDN, and PLE, and composes with sequence packing.
 """
 
 from __future__ import annotations
@@ -483,9 +483,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["_fp32_params"]
     _owns_cp_attention = True
-    # Packed (THD) training and packed CP are owned by the model's fused
-    # TileLang QSA path; other attention backends have no packed routing.
-    _packed_cp_attn_backends = ("tilelang",)
+    # Packed (THD) training and packed CP are owned by the model's
+    # FlexAttention QSA path; other attention backends have no packed routing.
+    _packed_cp_attn_backends = ("flex",)
 
     @dataclass(frozen=True)
     class ModelCapabilities:

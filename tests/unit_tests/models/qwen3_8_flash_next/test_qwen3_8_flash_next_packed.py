@@ -33,16 +33,16 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import Qwen3_8_Flas
 _CU_SEQLENS = (0, 5, 12, 20)
 
 
-def _can_run_h100_tilelang() -> bool:
-    """Return whether this process has TileLang and an exact H100/SM90 target."""
-    if importlib.util.find_spec("tilelang") is None or not torch.cuda.is_available():
+def _can_run_h100() -> bool:
+    """Return whether this process has an exact H100/SM90 CUDA target."""
+    if not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability() == (9, 0) and "H100" in torch.cuda.get_device_name()
 
 
-requires_h100_tilelang = pytest.mark.skipif(
-    not _can_run_h100_tilelang(),
-    reason="requires TileLang on an H100/SM90 CUDA device",
+requires_h100 = pytest.mark.skipif(
+    not _can_run_h100(),
+    reason="requires an H100/SM90 CUDA device",
 )
 
 
@@ -225,14 +225,14 @@ def _full_size_config() -> Qwen3_8_FlashNextTextConfig:
     return config
 
 
-@requires_h100_tilelang
-def test_packed_qsa_layer_cuda_matches_per_document_dense_kernel() -> None:
-    """The fused THD dispatch must match per-document dense-kernel runs."""
+@requires_h100
+def test_packed_qsa_layer_cuda_matches_per_document_runs() -> None:
+    """The flex packed dispatch must match per-document runs."""
     torch.manual_seed(55)
     config = _full_size_config()
     backend = BackendConfig(
         linear="torch",
-        attn="tilelang",
+        attn="flex",
         rms_norm="torch",
         experts="torch",
         dispatcher="torch",
@@ -542,8 +542,8 @@ def test_packed_boundaries_from_seq_lens_matches_loader_contract() -> None:
         packed_boundaries_from_seq_lens(torch.tensor([5, 7]), total_tokens=10)
 
 
-def test_model_advertises_packed_cp_for_tilelang_backend() -> None:
-    """The recipe capability gates must admit packed CP on the TileLang path."""
+def test_model_advertises_packed_cp_for_flex_backend() -> None:
+    """The recipe capability gates must admit packed CP on the flex path."""
     from types import SimpleNamespace
 
     from nemo_automodel._transformers.capabilities import ModelSupports
@@ -551,13 +551,13 @@ def test_model_advertises_packed_cp_for_tilelang_backend() -> None:
         Qwen3_8_FlashNextForConditionalGeneration,
     )
 
-    assert Qwen3_8_FlashNextForConditionalGeneration._packed_cp_attn_backends == ("tilelang",)
+    assert Qwen3_8_FlashNextForConditionalGeneration._packed_cp_attn_backends == ("flex",)
 
     class _FakeModel:
         __class__ = Qwen3_8_FlashNextForConditionalGeneration
-        backend = SimpleNamespace(attn="tilelang")
+        backend = SimpleNamespace(attn="flex")
         _owns_cp_attention = True
-        _packed_cp_attn_backends = ("tilelang",)
+        _packed_cp_attn_backends = ("flex",)
 
         def forward(self, input_ids=None, **attn_kwargs):
             pass

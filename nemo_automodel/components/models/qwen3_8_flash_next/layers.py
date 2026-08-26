@@ -38,17 +38,51 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
-from nemo_automodel.components.models.qwen3_8_flash_next.kernels.sparse_attention_thd import (
-    tilelang_sparse_gqa_thd_attention,
-)
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     Qwen3_8_FlashNextQSAIndexer,
-    gathered_qsa_gqa_attention,
     qsa_gqa_attention,
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+def _rms_norm_gated_fp32(
+    hidden_states: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    use_sigmoid: bool,
+) -> torch.Tensor:
+    """FP32 RMSNorm + output gate as one fusable elementwise chain."""
+    input_dtype = hidden_states.dtype
+    normalized = hidden_states.float()
+    variance = normalized.square().mean(dim=-1, keepdim=True)
+    normalized = normalized * torch.rsqrt(variance + eps)
+    normalized = weight.float() * normalized
+    gate_fp32 = gate.float()
+    activated_gate = torch.sigmoid(gate_fp32) if use_sigmoid else F.silu(gate_fp32)
+    return (normalized * activated_gate).to(input_dtype)
+
+
+def _grouped_rms_norm_fp32(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float,
+) -> torch.Tensor:
+    """FP32 grouped RMSNorm as one fusable elementwise chain."""
+    input_dtype = hidden_states.dtype
+    grouped = hidden_states.float().unflatten(-1, (-1, group_size))
+    variance = grouped.square().mean(dim=-1, keepdim=True)
+    normalized = (grouped * torch.rsqrt(variance + eps)).flatten(-2)
+    return (normalized * (1.0 + weight.float())).to(input_dtype)
+
+
+# Compiled variants are used on CUDA only; CPU tests and the numerical oracle
+# keep the eager chain so they run without inductor warm-up.
+_rms_norm_gated_fp32_compiled = torch.compile(_rms_norm_gated_fp32, dynamic=True)
+_grouped_rms_norm_fp32_compiled = torch.compile(_grouped_rms_norm_fp32, dynamic=True)
 
 
 class Qwen3_8_FlashNextRMSNormGated(nn.Module):
@@ -86,16 +120,10 @@ class Qwen3_8_FlashNextRMSNormGated(nn.Module):
         Returns:
             Tensor of shape ``[..., hidden_size]`` in the input dtype.
         """
-        input_dtype = hidden_states.dtype
-        normalized = hidden_states.float()
-        variance = normalized.square().mean(dim=-1, keepdim=True)
-        normalized = normalized * torch.rsqrt(variance + self.variance_epsilon)
         # SGLang's layernorm_gated kernel keeps xhat*weight and gate multiply
         # in fp32 and casts only at the output store.
-        normalized = self.weight.float() * normalized
-        gate_fp32 = gate.float()
-        activated_gate = torch.sigmoid(gate_fp32) if self.activation == "sigmoid" else F.silu(gate_fp32)
-        return (normalized * activated_gate).to(input_dtype)
+        norm_fn = _rms_norm_gated_fp32_compiled if hidden_states.is_cuda else _rms_norm_gated_fp32
+        return norm_fn(hidden_states, gate, self.weight, self.variance_epsilon, self.activation == "sigmoid")
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
@@ -249,11 +277,8 @@ class Qwen3_8_FlashNextGroupedRMSNorm(nn.Module):
         """
         if hidden_states.shape[-1] != self.hidden_size:
             raise ValueError(f"Expected hidden width {self.hidden_size}, got {hidden_states.shape[-1]}")
-        input_dtype = hidden_states.dtype
-        grouped = hidden_states.float().unflatten(-1, (-1, self.group_size))
-        variance = grouped.square().mean(dim=-1, keepdim=True)
-        normalized = (grouped * torch.rsqrt(variance + self.eps)).flatten(-2)
-        return (normalized * (1.0 + self.weight.float())).to(input_dtype)
+        norm_fn = _grouped_rms_norm_fp32_compiled if hidden_states.is_cuda else _grouped_rms_norm_fp32
+        return norm_fn(hidden_states, self.weight, self.group_size, self.eps)
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
@@ -424,14 +449,15 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     The main query/key/value, output gate, and output projection retain the
     Qwen3-Next equations.  A separate frozen indexer returns logical token IDs,
     then the model-owned QSA dispatcher evaluates only those IDs. CUDA BF16
-    training uses fused TileLang sparse GQA; CPU and explicit reference
-    backends use the PyTorch oracle. Main Q/K/V remain differentiable.
+    training uses FlexAttention over a route-membership BlockMask; CPU and
+    explicit reference backends use the PyTorch oracle. Main Q/K/V remain
+    differentiable.
     """
 
     def __init__(self, config: object, layer_idx: int, backend: BackendConfig) -> None:
         # QSA owns its sparse-attention dispatch. The inherited constructor is
         # reused only for projections/norms, but its generic attention factory
-        # does not implement ``tilelang``. Give that factory an isolated SDPA
+        # does not implement ``flex``. Give that factory an isolated SDPA
         # copy, then discard the unused callable and retain the real backend.
         parent_backend = replace(backend, attn="sdpa")
         super().__init__(config, layer_idx, parent_backend)
@@ -550,36 +576,17 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             key = qwen3_8_flash_next_cp_all_gather(key, cp_context, sequence_dim=1, differentiable=True)
             value = qwen3_8_flash_next_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
 
-        if packed_cu_seqlens is not None and x.is_cuda:
-            # Direct THD dispatch: the routes are global flattened IDs already
-            # confined to each query's document, so the kernel needs no
-            # cu_seqlens. CPU parity uses the oracle on the single packed row.
-            if self.backend.attn != "tilelang":
-                raise RuntimeError("Qwen3.8-Flash-Next packed CUDA QSA requires backend.attn='tilelang'")
-            attn_output = tilelang_sparse_gqa_thd_attention(
-                query[0],
-                key[0],
-                value[0],
-                selected_token_ids[0],
-                softmax_scale=self.scaling,
-            ).unsqueeze(0)
-        elif packed_cu_seqlens is not None:
-            attn_output = gathered_qsa_gqa_attention(
-                query,
-                key,
-                value,
-                selected_token_ids,
-                softmax_scale=self.scaling,
-            )
-        else:
-            attn_output = qsa_gqa_attention(
-                query,
-                key,
-                value,
-                selected_token_ids,
-                backend=self.backend.attn,
-                softmax_scale=self.scaling,
-            )
+        # One dispatcher serves dense, packed, and CP layouts: routes are
+        # global K/V coordinates and FlexAttention accepts S_q != S_kv, so
+        # packed rows need no dedicated kernel path. CPU keeps the oracle.
+        attn_output = qsa_gqa_attention(
+            query,
+            key,
+            value,
+            selected_token_ids,
+            backend=self.backend.attn,
+            softmax_scale=self.scaling,
+        )
         attn_output = attn_output.reshape(*x.shape[:-1], -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)

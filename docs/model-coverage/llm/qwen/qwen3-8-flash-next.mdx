@@ -74,7 +74,7 @@ cosine similarity from 0.9998 to 1.0000, and the corresponding logit-lens top-1
 token matched at every layer. The PLE delta had relative L2 error below 0.0063
 in both cases.
 
-The fused TileLang QSA path was also compared with SGLang on a fixed
+The QSA routing path was also compared with SGLang on a fixed
 4,096-token input. Rows through position 2,050 matched the reference routing
 exactly. Replaying the exact SGLang layer input through AutoModel produced the
 same selected-token sets at the first sparse row (2,051) and the last row
@@ -120,11 +120,13 @@ setup.
 
 ## Current Scope
 
-- QSA uses fused TileLang sparse GQA for CUDA BF16 training when
-  `model.backend.attn=tilelang`. It streams the selected K/V rows without
-  materializing a query-by-selected-token gather. CPU execution retains a
-  bounded-workspace PyTorch numerical oracle; tests can also call that oracle
-  directly. CUDA execution requires TileLang and never silently falls back. The
+- QSA uses FlexAttention sparse GQA for CUDA BF16 training when
+  `model.backend.attn=flex`. Route IDs are scattered into a boolean membership
+  table and executed through a `BlockMask`, keeping memory at O(S) without
+  materializing dense scores; the same code path serves dense, packed, and
+  context-parallel layouts. CPU execution retains a bounded-workspace PyTorch
+  numerical oracle; tests can also call that oracle directly. CUDA execution
+  requires the `flex` backend and never silently falls back. The
   discrete QSA indexers are frozen because the supplied inference reference
   and checkpoint define neither an indexer auxiliary loss nor a
   straight-through estimator; main attention Q/K/V and the rest of the
