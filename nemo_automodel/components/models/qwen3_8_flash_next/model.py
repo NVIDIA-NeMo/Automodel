@@ -316,7 +316,10 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
                 "max_seqlen_kv",
             )
             if attn_kwargs.get("qkv_format") == "thd" or any(attn_kwargs.get(key) is not None for key in packed_keys):
-                raise NotImplementedError("Qwen3.8-Flash-Next context parallelism does not support packed/THD inputs")
+                raise NotImplementedError(
+                    "Qwen3.8-Flash-Next packed context parallelism requires document boundaries to be normalized "
+                    "into the model-owned CP context by its batch sharder"
+                )
             if attention_mask is not None and attention_mask.ndim != 2:
                 raise NotImplementedError(
                     "Qwen3.8-Flash-Next context parallelism requires a non-packed [batch, local_sequence] attention mask"

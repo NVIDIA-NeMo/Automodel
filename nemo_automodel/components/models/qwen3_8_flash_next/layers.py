@@ -491,15 +491,17 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             cp_context: Optional contiguous CP metadata. When present, ``x``
                 contains local queries while compressed/main K/V are gathered
                 to global rank order.
-            **attn_kwargs: Backend attention metadata. Packed layouts are
-                rejected.
+            **attn_kwargs: Backend attention metadata. Packed layouts provide
+                global document boundaries through ``cu_seqlens`` or
+                ``cp_context``.
 
         Returns:
             Attention output with the same shape as ``x``.
         """
         if x.ndim != 3:
             raise NotImplementedError(
-                f"Qwen3.8-Flash-Next QSA currently requires non-packed [batch, sequence, hidden] inputs; got {tuple(x.shape)}"
+                "Qwen3.8-Flash-Next QSA requires rank-3 [batch, sequence, hidden] inputs, including a "
+                f"batch-one packed THD row; got {tuple(x.shape)}"
             )
         if x.shape[1] == 0:
             raise ValueError("Qwen3.8-Flash-Next QSA requires a non-empty sequence")

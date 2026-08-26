@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3.8-Flash-Next QSA routing, fused sparse GQA, and its PyTorch oracle.
+"""Qwen3.8-Flash-Next QSA routing, FlexAttention sparse GQA, and its PyTorch oracle.
 
 The supplied Qwen3.8-Flash-Next reference is an inference implementation: its indexer
 returns integer top-k IDs and defines neither an auxiliary indexer loss nor a

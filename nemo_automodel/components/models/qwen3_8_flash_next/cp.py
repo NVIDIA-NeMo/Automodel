@@ -213,7 +213,9 @@ def shard_batch_for_qwen3_8_flash_next_cp(
         batch: Mutable full-sequence batch. ``input_ids``, ``labels``, and
             optional ``attention_mask``/``padding_mask`` have shape ``[batch,
             global_sequence]``; ``position_ids`` has shape ``[batch,
-            global_sequence]``. Packed/THD metadata is unsupported.
+            global_sequence]``. A packed THD row uses batch size one plus
+            ``cu_seqlens`` or loader ``seq_lens`` document boundaries; packed
+            attention and padding masks remain unsupported.
         loss_mask: Optional tensor of shape ``[batch, global_sequence]`` used
             by the shared sharder when labels are absent.
         padding_token_id: Raw token ID appended for CP divisibility.

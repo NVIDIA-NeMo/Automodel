@@ -124,11 +124,12 @@ setup.
 
 - QSA uses FlexAttention sparse GQA for CUDA BF16 training when
   `model.backend.attn=flex`. Route IDs are scattered into a boolean membership
-  table and executed through a `BlockMask`, keeping memory at O(S) without
-  materializing dense scores; the same code path serves dense, packed, and
-  context-parallel layouts. CPU execution retains a bounded-workspace PyTorch
-  numerical oracle; tests can also call that oracle directly. CUDA execution
-  requires the `flex` backend and never silently falls back. The
+  table of shape `[batch, queries, key/value tokens]` and executed through a
+  `BlockMask`, avoiding materialized dense per-head attention scores; the same
+  code path serves dense, packed, and context-parallel layouts. CPU execution
+  retains a bounded-workspace PyTorch numerical oracle; tests can also call
+  that oracle directly. CUDA execution requires the `flex` backend and never
+  silently falls back. The
   discrete QSA indexers are frozen because the supplied inference reference
   and checkpoint define neither an indexer auxiliary loss nor a
   straight-through estimator; main attention Q/K/V and the rest of the
@@ -148,8 +149,9 @@ setup.
 - CP is limited to language-only inputs with TP=PP=1. Non-packed
   right-tail-padded batches and packed (THD) batches with ``cu_seqlens`` (or
   loader ``seq_lens``) are both supported; the same FlexAttention path serves
-  packed CUDA training and packing is performed topology-independently. Left/interior
-  padding, TP, PP, MTP, and vision/video training remain unsupported.
+  packed CUDA training and packing is performed topology-independently.
+  Left/interior padding, TP, PP, MTP, and vision/video training remain
+  unsupported.
 
 ## References
 

@@ -20,8 +20,6 @@ start offsets, and layer outputs and input gradients must match the
 concatenated per-document results.
 """
 
-import importlib.util
-
 import pytest
 import torch
 
