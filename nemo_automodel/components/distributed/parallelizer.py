@@ -1513,6 +1513,10 @@ def translate_to_torch_parallel_style(style: str):
         return RowwiseParallel()
     elif style == "colwise_rep":
         return ColwiseParallel(output_layouts=Replicate())
+    elif style == "colwise_gather_output":
+        # HF maps this to ColwiseParallel(gather_output=True); gathering the output
+        # is the same as replicating it, so this matches "colwise_rep" above.
+        return ColwiseParallel(output_layouts=Replicate())
     elif style == "rowwise_rep":
         return RowwiseParallel(input_layouts=Replicate())
     elif style == "sequence_parallel":
