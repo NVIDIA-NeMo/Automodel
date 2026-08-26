@@ -29,6 +29,7 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _compare_training_reproducibility,
     _configure_resumed_run,
     _configure_uninterrupted_run,
+    _disable_checkpoint_saves_after_restore,
     _report_resume_comparison,
     _report_training_reproducibility,
     _resolve_resume_loss_tolerance,
@@ -44,7 +45,12 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
 
 def _config(max_steps: int = 5) -> SimpleNamespace:
     return SimpleNamespace(
-        step_scheduler=SimpleNamespace(max_steps=max_steps, ckpt_every_steps=max_steps),
+        step_scheduler=SimpleNamespace(
+            max_steps=max_steps,
+            num_epochs=1,
+            ckpt_every_steps=max_steps,
+            save_checkpoint_every_epoch=True,
+        ),
         lr_scheduler=SimpleNamespace(lr_decay_steps=None),
         checkpoint=SimpleNamespace(
             checkpoint_dir="/tmp/checkpoint-robustness",
@@ -100,7 +106,9 @@ def test_shared_resume_plan_extends_phase_one_from_the_checkpoint_boundary(tmp_p
     assert plan.boundary_step == 5
     assert plan.comparison_steps == (5, 6, 7)
     assert cfg.step_scheduler.max_steps == 8
+    assert cfg.step_scheduler.num_epochs == 8
     assert cfg.step_scheduler.ckpt_every_steps == 5
+    assert cfg.step_scheduler.save_checkpoint_every_epoch is False
     assert cfg.lr_scheduler.lr_decay_steps == 5
     assert cfg.checkpoint.save_consolidated == "final"
 
@@ -109,6 +117,16 @@ def test_shared_resume_plan_extends_phase_one_from_the_checkpoint_boundary(tmp_p
     assert cfg.checkpoint.restore_from == str(checkpoint_path)
     assert cfg.checkpoint.checkpoint_dir == str(plan.resume_checkpoint_dir)
     assert cfg.checkpoint.save_consolidated is False
+    assert cfg.step_scheduler.num_epochs == 8
+    assert cfg.step_scheduler.save_checkpoint_every_epoch is False
+
+
+def test_resume_continuation_disables_checkpoint_writes_after_restore():
+    trainer = SimpleNamespace(checkpointer=SimpleNamespace(config=SimpleNamespace(enabled=True)))
+
+    _disable_checkpoint_saves_after_restore(trainer)
+
+    assert trainer.checkpointer.config.enabled is False
 
 
 def test_resume_state_check_detects_omitted_rng_state():
@@ -202,11 +220,13 @@ def test_stateful_sampler_restore_uses_next_batch_instead_of_raw_state_digest():
 
 
 def test_shared_trajectory_harness_runs_checkpoint_and_resume_locally(tmp_path):
-    plan = _ResumePlan(checkpoint_dir=tmp_path, boundary_step=2, continuation_steps=2)
+    # Three optimizer steps fit in each epoch, so the step-five checkpoint and
+    # its continuation exercise dataloader restoration across epoch boundaries.
+    plan = _ResumePlan(checkpoint_dir=tmp_path, boundary_step=5, continuation_steps=3)
     checkpoints: dict[int, dict[str, object]] = {}
 
     def make_trainer() -> SimpleNamespace:
-        dataset = TensorDataset(torch.arange(16, dtype=torch.float32))
+        dataset = TensorDataset(torch.arange(6, dtype=torch.float32))
         sampler = StatefulDistributedSampler(
             dataset,
             seed=42,
