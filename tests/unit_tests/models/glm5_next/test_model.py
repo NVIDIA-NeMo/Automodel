@@ -3,6 +3,8 @@
 import torch
 
 from nemo_automodel._transformers.capabilities import ModelSupports
+from nemo_automodel.components.models.glm5_next import layers as glm5_next_layers
+from nemo_automodel.components.models.glm5_next.cp import Glm5NextPackedContext
 from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextLinearAttention,
     Glm5NextSparseAttention,
@@ -70,6 +72,48 @@ def test_sparse_indexer_prepares_document_pools_once_across_query_chunks():
 
     assert output.shape == (1, 6, 16)
     assert calls == 1
+
+
+def test_sparse_attention_empty_cp_shard_keeps_gather_backward_live(monkeypatch):
+    sparse = tiny_glm5_next_model().model.language_model.layers["3"].self_attn
+    backward_calls = 0
+
+    class FakeGather(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, local_hidden):
+            ctx.local_length = local_hidden.shape[1]
+            return torch.cat((local_hidden, local_hidden), dim=1)
+
+        @staticmethod
+        def backward(ctx, full_grad):
+            nonlocal backward_calls
+            backward_calls += 1
+            return full_grad[:, : ctx.local_length] + full_grad[:, ctx.local_length :]
+
+    class FakeCPMesh:
+        @staticmethod
+        def get_group():
+            return None
+
+    monkeypatch.setattr(
+        glm5_next_layers,
+        "all_gather_sequence",
+        lambda local_hidden, _group, dim=1: FakeGather.apply(local_hidden),
+    )
+    sparse.setup_cp_attention(FakeCPMesh())
+    local_hidden = torch.randn(1, 2, 16, requires_grad=True)
+    context = Glm5NextPackedContext(
+        doc_ids=torch.tensor([[1, 1, 0, 0]], dtype=torch.int32),
+        seq_start=2,
+        cp_size=2,
+    )
+
+    output = sparse(local_hidden, packed_context=context)
+    output.sum().backward()
+
+    assert output.requires_grad
+    assert backward_calls == 1
+    torch.testing.assert_close(local_hidden.grad, torch.zeros_like(local_hidden))
 
 
 def test_image_features_replace_exactly_the_placeholder_tokens():

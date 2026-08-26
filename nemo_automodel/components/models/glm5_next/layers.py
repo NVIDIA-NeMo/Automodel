@@ -23,6 +23,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
+    all_gather_backward_anchor,
     all_gather_sequence,
     build_fla_cp_context,
 )
@@ -640,6 +641,11 @@ class Glm5NextSparseAttention(nn.Module):
                 doc_output = self._forward_document(doc, local_query_start, local_query_end)
                 out_start = query_start - local_start
                 output[row : row + 1, out_start : out_start + doc_output.shape[1]] = doc_output
+        if packed_context.cp_enabled:
+            # A short packed sample can leave this contiguous CP interval with
+            # no valid queries. Keep the differentiable all-gather connected to
+            # the local output so every CP rank launches its backward AllReduce.
+            output = output + all_gather_backward_anchor(full_hidden)
         if padding_mask is not None:
             output = output.masked_fill(padding_mask.unsqueeze(-1), 0)
         return output

@@ -170,9 +170,27 @@ class _AllGatherSequence(torch.autograd.Function):
         return grad_output.narrow(ctx.dim, start, ctx.local_size).contiguous(), None, None
 
 
+class _AllGatherBackwardAnchor(torch.autograd.Function):
+    """Return zero while retaining a backward edge to a gathered tensor."""
+
+    @staticmethod
+    def forward(ctx, gathered: torch.Tensor) -> torch.Tensor:
+        ctx.input_shape = gathered.shape
+        return gathered.new_zeros((gathered.shape[0], 1, 1))
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        return grad_output.new_zeros(ctx.input_shape)
+
+
 def all_gather_sequence(tensor: torch.Tensor, cp_group: Any, *, dim: int = 1) -> torch.Tensor:
     """Gather a sequence-sharded tensor while preserving K/V gradient flow."""
     return _AllGatherSequence.apply(tensor, cp_group, dim)
+
+
+def all_gather_backward_anchor(gathered: torch.Tensor) -> torch.Tensor:
+    """Create a zero-valued dependency that keeps gather backward collective-safe."""
+    return _AllGatherBackwardAnchor.apply(gathered)
 
 
 def _pad_sequence_dim(tensor: torch.Tensor, pad_len: int, value: float | int | bool) -> torch.Tensor:
