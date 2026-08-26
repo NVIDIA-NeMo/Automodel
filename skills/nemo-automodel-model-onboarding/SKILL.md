@@ -179,6 +179,14 @@ Implement files in dependency order:
    alias model storage, bound allocating conversions, and report
    `supports_low_memory_dcp_load=False` for unsafe variants; a model-sized device
    temporary can otherwise cause an out-of-memory failure.
+
+   For adapters using `MoESplitExpertsStateDictMixin`, treat the capability as
+   runtime-dependent. With the maintained EP dispatchers (`deepep`, `hybridep`,
+   and `uccl_ep`), TE expert storage is model-backed only at world size one;
+   `gmm`, `torch_mm`, and `torch_mm_mxfp8` expert storage is model-backed at any
+   world size. Non-EP dispatchers use ordinary grouped storage. The shared mixin
+   disables low-memory DCP for `expert_bias=True`, MoK, and any variant whose
+   checkpoint expert tensors require rebuilding.
 6. **__init__.py** -- Re-export the main model class
 
 See the pattern files for detailed implementation guidance:

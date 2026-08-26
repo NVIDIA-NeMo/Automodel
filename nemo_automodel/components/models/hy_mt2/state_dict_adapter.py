@@ -92,7 +92,7 @@ class HyMT2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         **kwargs,
     ) -> dict[str, Any]:
         """Native -> on-disk Hy-MT2 HF: per-expert split + name renames."""
-        hf_split: dict[str, Any] = self._to_hf_w_split_experts(state_dict)
+        hf_split: dict[str, Any] = self._to_hf_w_split_experts(state_dict, **kwargs)
 
         out: dict[str, Any] = {}
         for k, v in hf_split.items():

@@ -598,12 +598,6 @@ class MoESplitExpertsStateDictMixin:
         ``_convert_single_merged_expert_to_hf_split_experts`` for adapter
         compatibility (e.g. ``exclude_key_regex``).
         """
-        if self.moe_config is not None and self.moe_config.expert_bias:
-            raise NotImplementedError(
-                "Checkpoint conversion for grouped experts with expert_bias=True is not implemented; "
-                "refusing to pass expert bias tensors through under incorrect keys."
-            )
-
         hf_state_dict: dict[str, Any] = {}
 
         for fqn, tensor in state_dict.items():
@@ -650,18 +644,23 @@ class MoESplitExpertsStateDictMixin:
             [local_experts, hidden, expert_hidden], and down projections have shape
             [local_experts, expert_hidden, hidden].
         """
+        expert_segment = self._expert_path_segment
         if self.moe_config is not None and self.moe_config.expert_bias:
-            raise NotImplementedError(
-                "Checkpoint conversion for grouped experts with expert_bias=True is not implemented; "
-                "refusing to pass expert bias tensors through under incorrect keys."
+            split_bias_pattern = re.compile(
+                rf"(?:^|\.){re.escape(expert_segment)}\.\d+\.(?:gate_proj|up_proj|down_proj)\.bias$"
             )
+            unsupported_bias_key = next((key for key in hf_state_dict if split_bias_pattern.search(key)), None)
+            if unsupported_bias_key is not None:
+                raise NotImplementedError(
+                    "Loading Hugging Face per-expert bias tensors with expert_bias=True is not implemented; "
+                    f"refusing key {unsupported_bias_key!r}."
+                )
 
         if reset_view_loaded_keys:
             self._view_loaded_native_keys = set()
 
         n_experts = self.moe_config.n_routed_experts
         is_gated = self._is_gated_moe
-        expert_segment = self._expert_path_segment
 
         self._validate_expert_availability(hf_state_dict, n_experts, device_mesh)
 
@@ -896,12 +895,6 @@ class MoESplitExpertsStateDictMixin:
         inter_dim = self.moe_config.moe_inter_dim
         prefix = prefix_override if prefix_override is not None else self._hf_prefix
         expert_segment = self._expert_path_segment
-
-        if self.moe_config.expert_bias and f".{expert_segment}." in fqn:
-            raise NotImplementedError(
-                "Checkpoint conversion for grouped experts with expert_bias=True is not implemented; "
-                "refusing to pass expert bias tensors through under incorrect keys."
-            )
 
         # MoE expert LoRA keys do not depend on the runtime backend or its checkpoint storage aliases.
         # When v4_compatible=True, emit per-expert split keys. Otherwise, adapters that explicitly opt in emit the

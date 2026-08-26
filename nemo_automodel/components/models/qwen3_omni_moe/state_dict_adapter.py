@@ -48,7 +48,7 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
-        hf_state_dict = self._to_hf_w_split_experts(state_dict)
+        hf_state_dict = self._to_hf_w_split_experts(state_dict, quantization=quantization, **kwargs)
 
         if self._uses_thinker_prefix:
             hf_state_dict_with_prefix = {}

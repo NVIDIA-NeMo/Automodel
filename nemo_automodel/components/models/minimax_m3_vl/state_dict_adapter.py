@@ -332,6 +332,11 @@ class MiniMaxM3VLStateDictAdapter(StateDictAdapter):
         self.config = config
         self.text_adapter = MiniMaxM3StateDictAdapter(config.text_config, moe_config, backend, dtype=dtype)
 
+    @property
+    def view_loaded_native_keys(self) -> set[str]:
+        """Native text keys loaded through the inner adapter's checkpoint views."""
+        return set(self.text_adapter.view_loaded_native_keys)
+
     @staticmethod
     def _map_non_text_from_hf(key: str) -> str | None:
         if ".mtp." in key:

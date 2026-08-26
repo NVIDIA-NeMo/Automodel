@@ -52,6 +52,19 @@ from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Q
 from nemo_automodel.components.models.qwen3_vl_moe.state_dict_adapter import Qwen3VLMoeStateDictAdapter
 
 
+_LOW_MEMORY_GROUPED_ADAPTERS = (
+    Ernie4_5_MoeStateDictAdapter,
+    Glm4MoeStateDictAdapter,
+    HYV3StateDictAdapter,
+    HyMT2StateDictAdapter,
+    LagunaStateDictAdapter,
+    NemotronV3StateDictAdapter,
+    Qwen3MoeStateDictAdapter,
+    Qwen3NextStateDictAdapter,
+    Qwen3OmniMoeStateDictAdapter,
+)
+
+
 class _AllocatingKeysAdapter(StateDictAdapter):
     """Test adapter whose normal conversion joins two tensors."""
 
@@ -156,17 +169,7 @@ def test_write_through_adapters_expose_aliasing_destinations(
 
 @pytest.mark.parametrize(
     "adapter_type",
-    [
-        Ernie4_5_MoeStateDictAdapter,
-        Glm4MoeStateDictAdapter,
-        HYV3StateDictAdapter,
-        HyMT2StateDictAdapter,
-        LagunaStateDictAdapter,
-        NemotronV3StateDictAdapter,
-        Qwen3MoeStateDictAdapter,
-        Qwen3NextStateDictAdapter,
-        Qwen3OmniMoeStateDictAdapter,
-    ],
+    _LOW_MEMORY_GROUPED_ADAPTERS,
 )
 def test_low_memory_dcp_grouped_adapters_preserve_non_expert_storage_and_require_model_backed_experts(
     adapter_type: type[StateDictAdapter],
@@ -199,6 +202,23 @@ def test_low_memory_dcp_grouped_adapters_preserve_non_expert_storage_and_require
 
     adapter.backend = SimpleNamespace(experts="torch", dispatcher="mok")
     assert adapter.supports_low_memory_dcp_load is False
+
+
+@pytest.mark.parametrize("adapter_type", _LOW_MEMORY_GROUPED_ADAPTERS)
+def test_low_memory_grouped_adapters_forward_checkpoint_load_flag(adapter_type: type[StateDictAdapter]) -> None:
+    adapter = adapter_type(
+        SimpleNamespace(num_hidden_layers=1),
+        SimpleNamespace(n_routed_experts=2, moe_inter_dim=2, expert_activation="silu", expert_bias=False),
+        SimpleNamespace(experts="torch", dispatcher="torch"),
+    )
+    with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None) as convert:
+        adapter.to_hf(
+            {"model.layers.0.input_layernorm.weight": torch.zeros(2, dtype=torch.bfloat16)},
+            for_checkpoint_load=True,
+        )
+
+    convert.assert_called_once()
+    assert convert.call_args.kwargs.get("for_checkpoint_load") is True
 
 
 @pytest.mark.parametrize(

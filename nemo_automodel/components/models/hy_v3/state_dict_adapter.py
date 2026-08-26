@@ -111,7 +111,7 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
              gate.weight -> router.gate.weight, shared_experts. -> shared_mlp.).
         """
         # Step 1: per-expert split via the mixin. Pass-through for non-expert keys.
-        hf_split: dict[str, Any] = self._to_hf_w_split_experts(state_dict)
+        hf_split: dict[str, Any] = self._to_hf_w_split_experts(state_dict, **kwargs)
 
         # Step 2: rename native -> on-disk Tencent.
         out: dict[str, Any] = {}

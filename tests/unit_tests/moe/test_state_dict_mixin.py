@@ -1096,17 +1096,37 @@ class TestInplaceLoadViews:
         assert mixin._grouped_expert_storage_is_model_weight is False
         assert mixin._expert_checkpoint_tensors_use_model_storage is False
 
-    def test_grouped_expert_bias_is_rejected_instead_of_passed_through(self):
+    def test_grouped_expert_bias_native_roundtrip_preserves_grouped_keys(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        mixin.moe_config.expert_bias = True
+        native = {
+            "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(2, 4, 6),
+            "model.layers.0.mlp.experts.down_projs": torch.randn(2, 3, 4),
+            "model.layers.0.mlp.experts.gate_up_proj_bias": torch.randn(2, 6),
+            "model.layers.0.mlp.experts.down_proj_bias": torch.randn(2, 4),
+        }
+
+        assert mixin.supports_low_memory_dcp_load is False
+        hf_state = mixin._to_hf_w_split_experts(dict(native))
+        assert hf_state["model.layers.0.mlp.experts.gate_up_proj_bias"] is native[
+            "model.layers.0.mlp.experts.gate_up_proj_bias"
+        ]
+        assert hf_state["model.layers.0.mlp.experts.down_proj_bias"] is native[
+            "model.layers.0.mlp.experts.down_proj_bias"
+        ]
+
+        restored = mixin._from_hf_w_merged_experts(dict(hf_state))
+        assert set(restored) == set(native)
+        for key in native:
+            torch.testing.assert_close(restored[key], native[key])
+
+    def test_hf_per_expert_bias_load_is_rejected(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
         mixin.moe_config.expert_bias = True
 
-        assert mixin.supports_low_memory_dcp_load is False
-        with pytest.raises(NotImplementedError, match="expert_bias=True"):
-            mixin._from_hf_w_merged_experts({"model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(3, 4)})
-        with pytest.raises(NotImplementedError, match="expert_bias=True"):
-            mixin._convert_single_merged_expert_to_hf_split_experts(
-                "model.layers.0.mlp.experts.gate_and_up_projs",
-                torch.randn(2, 4, 6),
+        with pytest.raises(NotImplementedError, match="per-expert bias"):
+            mixin._from_hf_w_merged_experts(
+                {"model.layers.0.mlp.experts.0.gate_proj.bias": torch.randn(3)}
             )
 
     def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits, *, for_checkpoint_load=False):

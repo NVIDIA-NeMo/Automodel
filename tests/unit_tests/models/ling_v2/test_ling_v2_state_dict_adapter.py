@@ -270,6 +270,12 @@ class TestLowMemoryDcpLoad:
         dcp.load(destinations, storage_reader=_HuggingFaceStorageReader(path=tmp_path))
 
         converted = adapter.from_hf(destinations)
+        grouped_keys = {
+            "model.layers.1.mlp.experts.gate_and_up_projs",
+            "model.layers.1.mlp.experts.down_projs",
+        }
+        assert grouped_keys.isdisjoint(converted)
+        assert grouped_keys <= adapter.view_loaded_native_keys
         for key, value in converted.items():
             native[key].copy_(value)
 
