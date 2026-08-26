@@ -131,6 +131,11 @@ class _Gemma4KVShareHolder:
         # (kv_length, kv_offset): no cache -> kv spans the current query, zero offset.
         return query_length, 0
 
+    def get_query_offset(self, layer_idx=None) -> int:
+        # No cache -> queries start at position 0. transformers >=5.15 calls this
+        # unguarded from _preprocess_mask_arguments (is_sliding stays hasattr-guarded).
+        return 0
+
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         return key_states, value_states
 
