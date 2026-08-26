@@ -57,12 +57,15 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components._peft import lora as lora_module
 from nemo_automodel.components._peft import lora_mlp as lora_mlp_module
-from nemo_automodel.components._peft.lora import HAS_TE, PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.moe.layers import MLP
 
 _RESULT_PREFIX = "LORA_MIXED_PRECISION_FSDP_RESULT "
 
 HIDDEN, INTER, RANK, TOKENS = 64, 96, 8, 16
+# alpha != dim on purpose: PeftConfig.scale is alpha/dim, and scale==1.0 would hide every
+# dropped-scale bug in the backward.
+ALPHA = 3 * RANK
 
 # The policy from issue #3652: parameters compute in BF16, gradients reduce in FP32, and each
 # FSDP unit casts its output back to FP32 -- which is what puts an FP32 activation in front of
@@ -126,10 +129,11 @@ _CASES = {
         False,
     ),
     "fused_relu2": (lambda: _MLPBlock("relu2"), ["*up_proj", "*down_proj"], "LoRAReLU2MLPFunction", False),
-    # `use_triton: true` is what the recipe in #3652 actually sets, and 91 example recipes set it
-    # too. It only reaches the Triton kernels when TransformerEngine is absent -- patch_linear_module
-    # force-disables it otherwise -- which is why the issue's own run fell back to the torch path.
-    "per_linear_triton": (lambda: _AttentionBlock(), ["*q_proj", "*o_proj"], "LoRATritonFunction", True),
+    # No `use_triton: true` case here on purpose: patch_linear_module force-disables Triton whenever
+    # TransformerEngine is importable, and the CI image builds it (docker/Dockerfile TE_COMMIT), so
+    # such a case would silently duplicate "per_linear". The Triton fallback is covered instead by
+    # test_lora_kernel.py::test_memory_efficient_lora_declines_triton_on_mixed_dtype, which calls
+    # apply_memory_efficient_lora directly and therefore runs regardless of TE.
 }
 
 
@@ -191,7 +195,7 @@ def _build_sharded_block(case: str, memory_efficient: bool, mesh, device, refere
         PeftConfig(
             target_modules=target_modules,
             dim=RANK,
-            alpha=RANK,
+            alpha=ALPHA,
             use_triton=use_triton,
             use_memory_efficient_lora=memory_efficient,
         ),
@@ -232,6 +236,14 @@ def _lora_grads(block: nn.Module) -> dict[str, torch.Tensor]:
     return grads
 
 
+# Fused vs per-linear differ only by op ordering, so the floor here is bf16 GEMM rounding: measured
+# at <=8.8e-3 (worst over cases and seeds, sm_89). CI also runs A100/H100/GB200, whose bf16 split-k
+# differs, so allow ~3.4x headroom rather than risk a permanent red. Detection is unaffected -- the
+# bugs this guards against are far larger: a dropped LoRA scale, a swapped base weight, or a missing
+# gate term all land at >=1.3e-1, and a uniform 5% gradient error at 5.0e-2.
+_TOLERANCE = 3e-2
+
+
 def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     """Max elementwise deviation normalized by ``expected``'s magnitude.
 
@@ -268,23 +280,35 @@ def _assert_lora_mixed_precision(case: str, device: torch.device) -> None:
         f"(observed: {sorted((str(a), str(b)) for a, b in observed[expected_fn])})"
     )
 
-    baseline, _ = _build_sharded_block(case, memory_efficient=False, mesh=mesh, device=device, reference_state=state)
-    x_baseline = inputs.clone().requires_grad_(True)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        out_baseline = baseline(x_baseline)
-    (out_baseline.float() * grad_out).sum().backward()
+    # Guard the comparison itself: observe the baseline too and require that it did NOT enter any
+    # memory-efficient autograd function. Without this, a refactor that made fusion unconditional
+    # (or retired `use_memory_efficient_lora`) would turn every check below into self-vs-self, and
+    # they would keep passing while the path under test was silently broken.
+    with _observe_lora_dtypes() as baseline_observed:
+        baseline, _ = _build_sharded_block(
+            case, memory_efficient=False, mesh=mesh, device=device, reference_state=state
+        )
+        x_baseline = inputs.clone().requires_grad_(True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out_baseline = baseline(x_baseline)
+        (out_baseline.float() * grad_out).sum().backward()
+    assert not baseline_observed, (
+        f"{case}: baseline entered {sorted(baseline_observed)}; it must run on plain autograd or "
+        "the parity check compares an implementation against itself"
+    )
 
-    # Gradients must come back in the dtype of the input they belong to.
-    assert x_efficient.grad.dtype == x_baseline.grad.dtype == torch.float32, case
+    # NB: do not assert gradient dtypes here. torch's autograd engine coerces a Function's returned
+    # gradient to its input's dtype (verified on 2.10), so such an assertion can never fail and would
+    # give false confidence. The compute-dtype half of the fix is what the parity checks below catch.
     efficient_grads, baseline_grads = _lora_grads(efficient), _lora_grads(baseline)
     assert efficient_grads.keys() == baseline_grads.keys()
     for name, grad in efficient_grads.items():
         assert torch.isfinite(grad).all(), f"{case}: non-finite gradient for {name}"
 
-    assert _relative_error(out_efficient.float(), out_baseline.float()) < 2e-2, case
-    assert _relative_error(x_efficient.grad, x_baseline.grad) < 2e-2, case
+    assert _relative_error(out_efficient.float(), out_baseline.float()) < _TOLERANCE, case
+    assert _relative_error(x_efficient.grad, x_baseline.grad) < _TOLERANCE, case
     for name, grad in efficient_grads.items():
-        assert _relative_error(grad, baseline_grads[name]) < 2e-2, f"{case}: gradient mismatch for {name}"
+        assert _relative_error(grad, baseline_grads[name]) < _TOLERANCE, f"{case}: gradient mismatch for {name}"
 
 
 def _run_worker() -> None:
@@ -296,12 +320,6 @@ def _run_worker() -> None:
         device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 
         for case in _CASES:
-            if case.endswith("_triton") and HAS_TE:
-                # patch_linear_module force-disables Triton when TE is importable, so this case
-                # would silently duplicate "per_linear" instead of covering the Triton kernels.
-                if dist.get_rank() == 0:
-                    print(f"{_RESULT_PREFIX}SKIP {case} (TransformerEngine present)", flush=True)
-                continue
             _assert_lora_mixed_precision(case, device)
             dist.barrier()
 
@@ -323,8 +341,9 @@ def test_lora_mixed_precision_fsdp_two_rank() -> None:
         str(Path(__file__).resolve()),
         "--worker",
     ]
+    # Inherit CUDA_VISIBLE_DEVICES: the skipif gate counts the parent's visible devices, so
+    # hardcoding "0,1" here could push the workers onto GPUs this job was not assigned.
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0,1"
     repo_root = str(Path(__file__).resolve().parents[3])
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
     completed = subprocess.run(

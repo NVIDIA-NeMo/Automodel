@@ -352,7 +352,8 @@ def _mixed_precision_mlp(activation, memory_efficient, lora_dtype=None):
     config = PeftConfig(
         target_modules=list(_PROJS),
         dim=4,
-        alpha=4,
+        # alpha != dim: PeftConfig.scale is alpha/dim, and scale==1.0 would hide a dropped scale.
+        alpha=12,
         use_triton=False,
         use_memory_efficient_lora=memory_efficient,
         lora_dtype=lora_dtype,
