@@ -55,7 +55,7 @@ wandb:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: inclusionAI/LLaDA2.1-mini
-  torch_dtype: bfloat16
+  torch_dtype: float32
   trust_remote_code: true
 
 checkpoint:

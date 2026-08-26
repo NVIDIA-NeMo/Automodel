@@ -29,6 +29,8 @@ def test_diffusion_recipes_keep_fp32_master_parameters() -> None:
 
     assert diffusion_configs, "No diffusion recipes found"
     for path, config in diffusion_configs:
+        model_dtype = config["model"].get("torch_dtype", config["model"].get("dtype"))
+        assert model_dtype == "float32", f"{path.name} must load FP32 resident parameters"
         mixed_precision = config["distributed"]["mp_policy"]
         assert mixed_precision["param_dtype"] == "float32", f"{path.name} must retain FP32 master parameters"
         assert config["distributed"]["autocast_dtype"] == "bfloat16", f"{path.name} must keep BF16 autocast compute"
