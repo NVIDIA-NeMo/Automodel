@@ -172,11 +172,13 @@ Implement files in dependency order:
 3. **layers.py** (if needed) -- Attention, MLP, decoder block classes
 4. **model.py** -- The main `ForCausalLM` (or `ForConditionalGeneration`) class
 5. **state_dict_adapter.py** -- HF weight conversion. Leave
-   `supports_write_through_checkpoint_load` disabled unless every load
-   destination returned by `to_hf` writes through to final model storage for
-   every supported backend and configuration. Any opt-in needs a focused
-   write-through storage test; allocating conversions can otherwise create a
-   model-sized device temporary and cause an out-of-memory failure.
+   `_supports_low_memory_dcp_load` disabled unless most checkpoint tensors load
+   directly into final model storage and every remaining allocating conversion
+   has a small, bounded temporary footprint for every supported backend and
+   configuration. Any opt-in needs focused tests that prove direct destinations
+   alias model storage, bound allocating conversions, and report
+   `supports_low_memory_dcp_load=False` for unsafe variants; a model-sized device
+   temporary can otherwise cause an out-of-memory failure.
 6. **__init__.py** -- Re-export the main model class
 
 See the pattern files for detailed implementation guidance:
@@ -419,8 +421,8 @@ that only surface in a full parity comparison.
 - [ ] Implemented layers.py (if custom layers needed)
 - [ ] Implemented rope_utils.py (if custom RoPE needed)
 - [ ] Implemented model.py with `HFCheckpointingMixin`
-- [ ] Implemented state_dict_adapter.py; any write-through opt-in proves writes reach model storage and reports
-  `False` for allocating variants
+- [ ] Implemented state_dict_adapter.py; any low-memory DCP opt-in proves direct destinations reach model storage,
+  bounds allocating conversions, and reports `False` for unsafe variants
 - [ ] Implemented __init__.py with re-export
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
 - [ ] Registered custom config in `_CUSTOM_CONFIG_REGISTRATIONS` (if applicable)
