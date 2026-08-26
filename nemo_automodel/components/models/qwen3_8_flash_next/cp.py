@@ -243,9 +243,12 @@ def shard_batch_for_qwen3_8_flash_next_cp(
     )
     packed_cu_seqlens = batch.pop("cu_seqlens", None)
     loader_seq_lens = batch.pop("seq_lens", None)
-    loader_seq_lens_padded = batch.pop("seq_lens_padded", None)
+    batch.pop("seq_lens_padded", None)
     if packed_cu_seqlens is None and loader_seq_lens is not None:
-        packed_cu_seqlens = packed_boundaries_from_seq_lens(loader_seq_lens, loader_seq_lens_padded)
+        packed_cu_seqlens = packed_boundaries_from_seq_lens(
+            loader_seq_lens,
+            total_tokens=batch["input_ids"].shape[1],
+        )
     supported_packed_keys = {"cu_seqlens", "seq_lens", "seq_lens_padded"}
     unsupported_packed_keys = [
         key for key in packed_keys if key not in supported_packed_keys and batch.get(key) is not None
@@ -462,33 +465,39 @@ def qwen3_8_flash_next_cp_left_halo(
 
 def packed_boundaries_from_seq_lens(
     seq_lens: torch.Tensor,
-    seq_lens_padded: torch.Tensor | None,
     *,
+    total_tokens: int | None = None,
     sentinel: int = -1000,
 ) -> torch.Tensor:
     """Convert loader ``seq_lens`` metadata to physical document boundaries.
 
-    The packed-sequence loader emits per-document real lengths (``seq_lens``)
-    and slot widths (``seq_lens_padded``), padded with a sentinel. Boundaries
-    follow the physical slot layout, so intra-document padding introduced by
-    the packer stays inside its document: both CP1 and CP-sharded runs treat
-    those pad tokens identically and their labels are already masked.
+    The THD packer concatenates documents contiguously and pads only the pack
+    tail, so physical boundaries follow the REAL lengths (``seq_lens``); the
+    loader's ``seq_lens_padded`` is TE-specific virtual-layout metadata and
+    must not be used for physical offsets. When ``total_tokens`` exceeds the
+    packed length, the trailing pack padding becomes its own segment so pad
+    tokens never join a real document.
 
     Args:
-        seq_lens: Real lengths ``[num_docs]`` or ``[1, num_docs]``.
-        seq_lens_padded: Optional slot widths in the same shape.
+        seq_lens: Real per-document lengths ``[num_docs]`` or ``[1, num_docs]``.
+        total_tokens: Physical row length including trailing pack padding.
         sentinel: Filler value marking unused length slots.
 
     Returns:
-        int64 boundaries ``[num_docs + 1]`` starting at zero.
+        int64 boundaries ``[num_docs (+1 pad segment) + 1]`` starting at zero.
     """
-    widths = seq_lens if seq_lens_padded is None else seq_lens_padded
-    widths = widths.reshape(-1).to(dtype=torch.long)
+    widths = seq_lens.reshape(-1).to(dtype=torch.long)
     widths = widths[widths != sentinel]
     if widths.numel() == 0 or bool((widths <= 0).any()):
         raise ValueError(f"packed seq_lens must contain positive document widths, got {widths.tolist()}")
     boundaries = torch.zeros(widths.numel() + 1, dtype=torch.long, device=widths.device)
     boundaries[1:] = torch.cumsum(widths, dim=0)
+    if total_tokens is not None:
+        packed_length = int(boundaries[-1])
+        if packed_length > total_tokens:
+            raise ValueError(f"packed seq_lens sum {packed_length} exceeds the physical row length {total_tokens}")
+        if packed_length < total_tokens:
+            boundaries = torch.cat([boundaries, boundaries.new_tensor([total_tokens])])
     return boundaries
 
 

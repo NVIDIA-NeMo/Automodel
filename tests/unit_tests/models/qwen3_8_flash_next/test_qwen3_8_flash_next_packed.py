@@ -525,17 +525,21 @@ def test_packed_boundaries_from_seq_lens_matches_loader_contract() -> None:
     """Loader seq_lens metadata converts to physical slot boundaries."""
     from nemo_automodel.components.models.qwen3_8_flash_next.cp import packed_boundaries_from_seq_lens
 
+    # Physical layout is contiguous real lengths; trailing pack padding
+    # becomes its own segment so it never joins a real document.
     boundaries = packed_boundaries_from_seq_lens(
         torch.tensor([[3, 2, 6, -1000]]),
-        torch.tensor([[4, 2, 6, -1000]]),
+        total_tokens=16,
     )
-    assert boundaries.tolist() == [0, 4, 6, 12]
+    assert boundaries.tolist() == [0, 3, 5, 11, 16]
 
-    boundaries = packed_boundaries_from_seq_lens(torch.tensor([5, 7]), None)
+    boundaries = packed_boundaries_from_seq_lens(torch.tensor([5, 7]), total_tokens=12)
     assert boundaries.tolist() == [0, 5, 12]
 
     with pytest.raises(ValueError, match="positive document widths"):
-        packed_boundaries_from_seq_lens(torch.tensor([-1000]), None)
+        packed_boundaries_from_seq_lens(torch.tensor([-1000]))
+    with pytest.raises(ValueError, match="exceeds the physical row length"):
+        packed_boundaries_from_seq_lens(torch.tensor([5, 7]), total_tokens=10)
 
 
 def test_model_advertises_packed_cp_for_tilelang_backend() -> None:

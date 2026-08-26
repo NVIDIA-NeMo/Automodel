@@ -285,11 +285,17 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         if past_key_values is not None or use_cache:
             raise NotImplementedError("Qwen3.8-Flash-Next training does not support recurrent or KV caches")
         loader_seq_lens = attn_kwargs.pop("seq_lens", None)
-        loader_seq_lens_padded = attn_kwargs.pop("seq_lens_padded", None)
+        attn_kwargs.pop("seq_lens_padded", None)
         if attn_kwargs.get("qkv_format") in (None, "thd"):
             attn_kwargs.pop("qkv_format", None)
         if loader_seq_lens is not None and attn_kwargs.get("cu_seqlens") is None:
-            attn_kwargs["cu_seqlens"] = packed_boundaries_from_seq_lens(loader_seq_lens, loader_seq_lens_padded)
+            packed_reference = input_ids if input_ids is not None else inputs_embeds
+            if packed_reference is None:
+                raise ValueError("packed seq_lens require input_ids or inputs_embeds for the physical row length")
+            attn_kwargs["cu_seqlens"] = packed_boundaries_from_seq_lens(
+                loader_seq_lens,
+                total_tokens=packed_reference.shape[1],
+            )
         if getattr(self, "_cp_enabled", False) and _qwen3_8_flash_next_cp_context is None:
             raise RuntimeError(
                 "Qwen3.8-Flash-Next context parallelism is enabled, but the model-owned contiguous batch context is missing"
