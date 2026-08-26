@@ -407,6 +407,29 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
         supports_pp: bool = False
         supports_ep: bool = False
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Load stock Mistral3 VLM weights into the reranker layout.
+
+        Stock conditional-generation checkpoints nest the text backbone under
+        ``model.language_model.model``. This reranker owns that backbone directly
+        under ``model.language_model``, so checkpoint loading must remove the
+        extra ``model`` segment.
+        """
+        key_mapping = dict(kwargs.pop("key_mapping", None) or {})
+        key_mapping.setdefault(r"^language_model\.model\.", "language_model.")
+        return super().from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            key_mapping=key_mapping,
+            **kwargs,
+        )
+
     def __init__(self, config: Mistral3BidirectionalConfig) -> None:
         """Initialize the full vision-language cross-encoder.
 
