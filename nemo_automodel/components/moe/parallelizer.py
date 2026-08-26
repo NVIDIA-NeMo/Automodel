@@ -482,9 +482,16 @@ def _replay_deepep_dispatch_on_recompute(
 
 def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     """True when any expert module dispatches tokens through HybridEP."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        # Duck-typed models (tests, custom wrappers) need not expose
+        # nn.Module.modules(); this check only gates a warning, so skip it
+        # rather than making apply_ac require more of the model than the
+        # checkpointing itself does.
+        return False
     return any(
         isinstance(m, (GroupedExpertsDeepEP, GroupedExpertsTE)) and m.dispatcher_backend == "hybridep"
-        for m in model.modules()
+        for m in modules()
     )
 
 
