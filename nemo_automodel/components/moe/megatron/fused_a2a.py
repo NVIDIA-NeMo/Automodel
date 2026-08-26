@@ -18,6 +18,8 @@
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
 import os
+import threading
+from contextlib import contextmanager
 
 try:
     from deep_ep import Buffer
@@ -26,6 +28,87 @@ try:
     HAVE_DEEP_EP = True
 except ImportError:
     HAVE_DEEP_EP = False
+
+
+# ── DeepEP dispatch replay across activation-checkpoint recompute ────────────
+#
+# Activation checkpointing replays a block's forward during backward, which
+# re-runs its MoE dispatch from scratch: DeepEP recomputes the routing layout
+# (`get_dispatch_layout` -> `notify_dispatch`) and then moves the tokens. The
+# layout is pure a function of the routing, and the routing is identical on the
+# replay (checkpointing restores the same inputs and the AC policy pins the
+# router's top-k), so that recomputation is redundant.
+#
+# DeepEP already exposes the cheap path: passing the `handle` returned by a
+# previous dispatch skips the layout exchange entirely -- that is what
+# `FusedDispatch.backward` does, and it is why the backward dispatch costs
+# ~4 ms against ~4.4 s for the layout-computing forward dispatches.
+#
+# Recording is scoped to one checkpoint frame: the AC wrapper builds a recorder
+# per checkpointed call, the forward appends each dispatch's handle and routing
+# metadata in call order, and the recompute consumes them in the same order.
+# Only the handle and the (small) per-token routing metadata are retained --
+# the dispatched activations themselves are still re-communicated, so the
+# memory that activation checkpointing saves is preserved.
+class DispatchReplayRecorder:
+    """Per-checkpoint-frame log of DeepEP dispatch results, replayed on recompute."""
+
+    def __init__(self) -> None:
+        self._records: list = []
+        self._cursor = 0
+        self.replay_misses = 0
+
+    def record(self, entry) -> None:
+        self._records.append(entry)
+
+    def take(self):
+        """Next recorded dispatch, or None when the replay outruns the log."""
+        if self._cursor >= len(self._records):
+            # Recompute issued more dispatches than the forward did. Fall back to
+            # a full dispatch rather than replaying a mismatched layout.
+            self.replay_misses += 1
+            return None
+        entry = self._records[self._cursor]
+        self._cursor += 1
+        return entry
+
+    def rewind(self) -> None:
+        self._cursor = 0
+
+
+class _DispatchReplayState(threading.local):
+    """Thread-local replay binding. ``threading.local`` runs ``__init__`` once per
+    thread, so both attributes always exist on every thread that touches it."""
+
+    def __init__(self) -> None:
+        self.recorder: DispatchReplayRecorder | None = None
+        self.mode: str | None = None
+
+
+_dispatch_replay_state = _DispatchReplayState()
+
+
+def _replay_mode() -> str | None:
+    return _dispatch_replay_state.mode
+
+
+def _active_recorder() -> "DispatchReplayRecorder | None":
+    return _dispatch_replay_state.recorder
+
+
+@contextmanager
+def dispatch_replay_scope(recorder: "DispatchReplayRecorder | None", mode: str):
+    """Bind ``recorder`` for the enclosed region. ``mode`` is 'record' or 'replay'."""
+    prev_recorder = _dispatch_replay_state.recorder
+    prev_mode = _dispatch_replay_state.mode
+    _dispatch_replay_state.recorder = recorder
+    _dispatch_replay_state.mode = mode if recorder is not None else None
+    try:
+        yield
+    finally:
+        _dispatch_replay_state.recorder = prev_recorder
+        _dispatch_replay_state.mode = prev_mode
+
 
 try:
     import importlib.util
@@ -154,8 +237,32 @@ class FusedDispatch(torch.autograd.Function):
         previous_event = None
         if async_finish:
             previous_event = EventOverlap(EventHandle())
-        # Calculate layout before actual dispatch
         buffer = get_buffer(group, get_hidden_bytes(x))
+
+        # Activation-checkpoint replay: reuse the layout this dispatch computed
+        # on the original forward instead of recomputing it. Cached-mode dispatch
+        # returns only recv_x, so the routing metadata comes from the record.
+        recorder = _active_recorder()
+        if recorder is not None and _replay_mode() == "replay":
+            replayed = recorder.take()
+            if replayed is not None:
+                cached_handle, recv_token_indices, recv_token_probs, tokens_per_expert = replayed
+                recv_x, _, _, _, _, after_event_overlap = buffer.dispatch(
+                    x,
+                    handle=cached_handle,
+                    previous_event=previous_event,
+                    async_finish=async_finish,
+                    allocate_on_comm_stream=allocate_on_comm_stream,
+                )
+                if async_finish:
+                    after_event_overlap.current_stream_wait()
+                ctx.group = group
+                ctx.handle = cached_handle
+                ctx.async_finish = async_finish
+                ctx.allocate_on_comm_stream = allocate_on_comm_stream
+                return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, cached_handle)
+
+        # Calculate layout before actual dispatch
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -203,6 +310,11 @@ class FusedDispatch(torch.autograd.Function):
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+
+        if recorder is not None and _replay_mode() == "record":
+            # Keep the handle and routing metadata (small) so the recompute can
+            # skip the layout exchange; recv_x is deliberately not retained.
+            recorder.record((handle, recv_token_indices, recv_token_probs, tokens_per_expert))
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
 

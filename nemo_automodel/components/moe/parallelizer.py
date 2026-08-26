@@ -442,6 +442,44 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
     apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
 
 
+def _replay_deepep_dispatch_on_recompute(
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]],
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]]:
+    """Let a checkpointed block's recompute reuse the DeepEP layout it already computed.
+
+    Activation checkpointing replays the block during backward, and the replayed
+    MoE dispatch recomputes its routing layout from scratch even though the
+    routing is identical to the forward's. DeepEP skips that exchange when handed
+    the previous dispatch's handle -- the same shortcut its backward already
+    takes, which is why the backward dispatch is ~1000x cheaper than a
+    layout-computing forward one.
+
+    The recorder is built inside ``checkpoint_context_fn``, so each checkpointed
+    call gets its own: a block called once per forward pass keeps its passes'
+    dispatches separate, and the recompute consumes them in the order the
+    matching forward produced them.
+    """
+    from nemo_automodel.components.moe.megatron.fused_a2a import (
+        DispatchReplayRecorder,
+        dispatch_replay_scope,
+    )
+
+    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+        forward_context, recompute_context = context_fn()
+        recorder = DispatchReplayRecorder()
+
+        @contextmanager
+        def scoped(mode, inner):
+            if mode == "replay":
+                recorder.rewind()
+            with dispatch_replay_scope(recorder, mode), inner:
+                yield
+
+        return scoped("record", forward_context), scoped("replay", recompute_context)
+
+    return checkpoint_context_fn
+
+
 def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     """True when any expert module dispatches tokens through HybridEP."""
     return any(
@@ -637,14 +675,20 @@ def apply_ac(
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
         if ignore_router:
+            # Only this branch pins routing across recompute (the policy saves the
+            # router projection and top-k), which is what makes replaying the
+            # DeepEP layout sound. Do not extend the replay to the else-branch:
+            # there the router is recomputed and may route differently, so a
+            # replayed layout would silently mis-route instead of failing loudly.
+            block_context_fn = _preserve_gate_load_during_recompute(
+                block,
+                _with_attention_backend_snapshot(selective_checkpointing_context_fn),
+            )
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
                 determinism_check=_register_moe_checkpoint_determinism_check(),
-                context_fn=_preserve_gate_load_during_recompute(
-                    block,
-                    _with_attention_backend_snapshot(selective_checkpointing_context_fn),
-                ),
+                context_fn=_replay_deepep_dispatch_on_recompute(block_context_fn),
             )
         else:
             block = ptd_checkpoint_wrapper(
