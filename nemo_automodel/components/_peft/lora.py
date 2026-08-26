@@ -748,11 +748,21 @@ class LoRATritonFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, d_y):
-        """
-        Backward method for memory-efficient LoRA.
+        """Compute gradients for memory-efficient LoRA.
 
         Reshapes 3D tensors into 2D and then updates d_lora_a, d_lora_b, and dx. The PyTorch matmul
         path recomputes ``x @ lora_A.T`` here instead of saving it from forward.
+
+        Args:
+            ctx: Autograd context containing the saved input and LoRA weights.
+            d_y: Tensor of shape ``[tokens, out_features]`` containing the output gradient in the forward compute
+                dtype.
+
+        Returns:
+            Gradients for the custom autograd inputs. The input gradient has shape ``[tokens, in_features]`` or
+            ``[batch, sequence, in_features]`` and matches the original input dtype. LoRA weight gradients have
+            shapes ``[rank, in_features]`` and ``[out_features, rank]`` and match their weight dtypes. When a
+            residual input is present, its gradient matches the original residual shape.
         """
         x, lora_A, lora_B = ctx.saved_tensors
         scale = ctx.scale
@@ -776,17 +786,23 @@ class LoRATritonFunction(torch.autograd.Function):
         else:
             d_x = d_lora_A = d_lora_B = None
             needs_x, needs_lora_A, needs_lora_B = ctx.needs_input_grad[:3]
+            # Custom backward executes outside autocast. Reuse d_y's forward compute dtype for the recomputed
+            # matmuls, then cast each returned gradient to the dtype of its corresponding input.
+            x_compute = x.to(d_y.dtype) if needs_lora_A or needs_lora_B else x
+            lora_A_compute = lora_A.to(d_y.dtype) if needs_x or needs_lora_B else lora_A
+            lora_B_compute = lora_B.to(d_y.dtype) if needs_x or needs_lora_A else lora_B
             if needs_x or needs_lora_A:
-                d_y_lora_B = torch.matmul(d_y, lora_B)
+                d_y_lora_B = torch.matmul(d_y, lora_B_compute)
+                d_y_lora_B.mul_(scale)
                 if needs_x:
-                    d_x = torch.empty_like(x)
-                    d_x.addmm_(d_y_lora_B, lora_A, beta=0, alpha=scale)
+                    d_x = torch.matmul(d_y_lora_B, lora_A_compute).to(x.dtype)
                 if needs_lora_A:
-                    d_lora_A = torch.matmul(d_y_lora_B.t(), x) * scale
+                    d_lora_A = torch.matmul(d_y_lora_B.t(), x_compute).to(lora_A.dtype)
 
             if needs_lora_B:
-                d_lora_B = torch.empty_like(lora_B)
-                d_lora_B.addmm_(d_y.t(), F.linear(x, lora_A), beta=0, alpha=scale)
+                x_lora_A = F.linear(x_compute, lora_A_compute)
+                x_lora_A.mul_(scale)
+                d_lora_B = torch.matmul(d_y.t(), x_lora_A).to(lora_B.dtype)
 
         if reshape and d_x is not None:
             d_x = d_x.view(bs, seq_len, d)
@@ -806,7 +822,28 @@ def apply_memory_efficient_lora(x, lora_A, lora_B, scale, use_triton_kernel, res
     autograd Function so the output is never a view). Reshape back to the input rank here; the result
     is an ordinary autograd view, which — unlike a custom-Function output view — a downstream consumer
     may mutate in place (e.g. transformers' gemma3n ``project_per_layer_inputs``).
+
+    Args:
+        x: Activation tensor of shape ``[tokens, in_features]`` or ``[batch, sequence, in_features]``.
+        lora_A: Tensor of shape ``[rank, in_features]``.
+        lora_B: Tensor of shape ``[out_features, rank]``.
+        scale: LoRA scaling factor (``alpha / rank``).
+        use_triton_kernel: Request the Triton kernels; declined when their dtype precondition
+            does not hold (see below).
+        res: Optional base-projection output to fold in, in ``x``'s leading shape with
+            ``out_features`` trailing.
+
+    Returns:
+        Tensor with ``x``'s leading dimensions and ``out_features`` trailing.
     """
+    if use_triton_kernel and not (x.dtype == lora_A.dtype == lora_B.dtype):
+        # The Triton kernels hand their operands straight to ``tl.dot``, which asserts a single dtype
+        # ("Both operands must be same dtype. Got fp32 and bf16"), and they run outside autocast, so
+        # nothing reconciles the two. Mixed precision reaches here whenever an FSDP2 unit's
+        # ``output_dtype=float32`` hands an fp32 activation to bf16 adapters — the layout in #3652,
+        # whose recipe does set ``use_triton: true``. Drop to the torch matmul path below, which
+        # follows the forward compute dtype and casts explicitly.
+        use_triton_kernel = False
     out = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, use_triton_kernel, res)
     if x.dim() == 3:
         out = out.reshape(*x.shape[:-1], -1)
