@@ -107,6 +107,10 @@ ci:
   nodes: 32
   time: "01:00:00"
   checkpoint_robustness:
+    # Keep the known-good PP batch geometry. The shared robustness defaults
+    # (GBS=32/LBS=2) are invalid for DP=64 and provide fewer microbatches than PP=4.
+    step_scheduler.global_batch_size: 512
+    step_scheduler.local_batch_size: 4
     # AutoModel-side phases only (train -> consolidated save -> reload ->
     # same-implementation logit parity). The cross-framework phases load the
     # 1.5TB checkpoint in vanilla HF as a single rank-0 process (~50 minutes

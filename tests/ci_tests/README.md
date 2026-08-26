@@ -168,7 +168,8 @@ experts systematically follow correction bias. Flip counts never gate because a 
 The full report also groups final-token KL by flipped-layer count, separating the zero-flipped-layer empirical floor
 from the routed tail. Raw captures and JSON evidence live under `.checkpoint_robustness/router_diagnostics/` and are
 embedded in the schema-v3 Phase 0 parity record. The option is model-specific and off by default because it retains
-router tensors until the forward finishes; unsupported model families fail explicitly when it is enabled.
+router tensors until the forward finishes; unsupported model families and pipeline-parallel runs fail explicitly
+when it is enabled because global rank 0 can observe only its local pipeline stage.
 
 When `cross_framework_gate_sequence_length` is shorter than `parity_sequence_length`, the harness automatically runs
 the vanilla-HF reference at the gate length and reports `KL(HF_full[:gate_length] || HF_gate_length)` beside both the
@@ -183,8 +184,10 @@ schema-v3 parity record. Calibration sweeps add one vanilla-HF forward per uniqu
 
 Every comparison reports mean, p95, and max per-token `KL(reference || candidate)`; mean, p95, and max per-token
 Jensen-Shannon divergence (natural log, bounded by `ln(2)`); whole-tensor cosine similarity; and mean/max absolute
-logit difference. The full record is printed as `CHECKPOINT_PARITY_METRICS <json>` and saved under
-`<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`. Named profiles gate mean KL, p95 KL, and cosine similarity.
+logit difference. The full record is saved under `<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`, while a
+one-line `CHECKPOINT_PARITY_METRICS <json>` summary is printed for CI log consumers. When full shape or router evidence
+is embedded, the summary omits that bulky evidence and includes the complete artifact path instead. Named profiles
+gate mean KL, p95 KL, and cosine similarity.
 JSD, max KL, and absolute logit differences remain diagnostics, allowing their usefulness to be evaluated without
 changing pass/fail policy. Record schema version 3 keeps `metrics` as the full-sequence record and adds `gate_metrics`,
 `gate_sequence_length`, and explicit full-sequence failure diagnostics. Schema version 2 introduced `mean_jsd`,

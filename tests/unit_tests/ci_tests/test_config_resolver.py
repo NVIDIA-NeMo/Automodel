@@ -332,6 +332,21 @@ def test_glm_4_7_flash_uses_hf_aligned_router_precision(tmp_path):
     }
 
 
+def test_glm_5_2_checkpoint_robustness_preserves_pipeline_batch_geometry(tmp_path):
+    """GLM 5.2 robustness keeps batch sizes valid for its DP64/PP4 topology."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    _run_resolver(["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)], env=env)
+
+    resolved = yaml.load(out.open())
+    assert resolved["step_scheduler"]["global_batch_size"] == 512
+    assert resolved["step_scheduler"]["local_batch_size"] == 4
+    pp_size = resolved["distributed"]["pp_size"]
+    pp_microbatch_size = resolved["distributed"]["pipeline"]["pp_microbatch_size"]
+    assert resolved["step_scheduler"]["local_batch_size"] // pp_microbatch_size >= pp_size
+
+
 @pytest.mark.parametrize(
     "recipe_path",
     [

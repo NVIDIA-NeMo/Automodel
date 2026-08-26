@@ -81,7 +81,20 @@ def _build_shape_diagnostic_report(
     sweep_lengths: tuple[int, ...] = (),
     router_diagnostics: Mapping[int, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
-    """Build HF-full-prefix versus HF-standalone shape-sensitivity evidence."""
+    """Build HF-full-prefix versus HF-standalone shape-sensitivity evidence.
+
+    Args:
+        base_logits: Full-forward vanilla-HF logits of shape [batch, sequence, vocab].
+        standalone_logits: Mapping from sequence length to standalone logits of shape [batch, sequence, vocab].
+        parity_document_sha256: Digest of the parity prompt document.
+        phase: Checkpoint phase that owns the report.
+        gate_sequence_length: Optional standing cross-framework gate length.
+        sweep_lengths: Optional standalone lengths requested for calibration.
+        router_diagnostics: Optional router summaries keyed by standalone sequence length.
+
+    Returns:
+        Machine-readable non-gating shape-sensitivity report.
+    """
     base_sequence_length = base_logits.shape[-2]
     points: dict[int, dict[str, object]] = {}
     for sequence_length, candidate_logits in sorted(standalone_logits.items()):

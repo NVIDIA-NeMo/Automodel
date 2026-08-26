@@ -779,7 +779,11 @@ def _compare_logits(
     temporary_report_path = report_path.with_suffix(".tmp")
     temporary_report_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary_report_path.replace(report_path)
-    print(f"CHECKPOINT_PARITY_METRICS {json.dumps(payload, sort_keys=True)}")
+    logged_payload = {key: value for key, value in payload.items() if diagnostics is None or key not in diagnostics}
+    if diagnostics:
+        logged_payload["embedded_diagnostics"] = sorted(diagnostics)
+    logged_payload["report_path"] = str(report_path)
+    print(f"CHECKPOINT_PARITY_METRICS {json.dumps(logged_payload, sort_keys=True)}")
 
     if not policy.enforce:
         print(
@@ -1851,28 +1855,36 @@ def _compare_source_load_parity(
                 f"{candidate_logits.shape}"
             )
             diagnostics: dict[str, object] = {}
-            shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_0")
-            if shape_report_path.exists():
-                diagnostics["shape_diagnostic"] = json.loads(shape_report_path.read_text())
-            hf_router_capture, automodel_router_capture, router_report = _router_diagnostic_paths(artifact_dir)
-            if hf_router_capture.exists() or automodel_router_capture.exists():
-                if not hf_router_capture.exists() or not automodel_router_capture.exists():
-                    raise AssertionError(
-                        "Incomplete Phase 0 router diagnostics: expected both HF and AutoModel captures, got "
-                        f"hf={hf_router_capture.exists()} automodel={automodel_router_capture.exists()}"
+            diagnostic_failure = None
+            try:
+                shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_0")
+                if shape_report_path.exists():
+                    diagnostics["shape_diagnostic"] = json.loads(shape_report_path.read_text())
+                hf_router_capture, automodel_router_capture, router_report = _router_diagnostic_paths(artifact_dir)
+                if hf_router_capture.exists() or automodel_router_capture.exists():
+                    if not hf_router_capture.exists() or not automodel_router_capture.exists():
+                        raise AssertionError(
+                            "Incomplete Phase 0 router diagnostics: expected both HF and AutoModel captures, got "
+                            f"hf={hf_router_capture.exists()} automodel={automodel_router_capture.exists()}"
+                        )
+                    from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
+                        compare_glm_router_captures,
                     )
-                from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
-                    compare_glm_router_captures,
-                )
 
-                router_diagnostics = compare_glm_router_captures(
-                    hf_router_capture,
-                    automodel_router_capture,
-                    router_report,
-                    reference_logits=hf_logits,
-                    candidate_logits=candidate_logits,
-                )
-                diagnostics["router_diagnostics"] = router_diagnostics
+                    router_diagnostics = compare_glm_router_captures(
+                        hf_router_capture,
+                        automodel_router_capture,
+                        router_report,
+                        reference_logits=hf_logits,
+                        candidate_logits=candidate_logits,
+                    )
+                    diagnostics["router_diagnostics"] = router_diagnostics
+            except Exception as exc:
+                diagnostic_failure = traceback.format_exc()
+                diagnostics["diagnostic_failure"] = {
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
             parity_failure = _compare_logits(
                 artifact_dir,
                 hf_logits,
@@ -1880,8 +1892,13 @@ def _compare_source_load_parity(
                 policy,
                 diagnostics=diagnostics,
             )
+            comparison_failures = []
             if parity_failure is not None:
-                raise AssertionError(parity_failure)
+                comparison_failures.append(parity_failure)
+            if diagnostic_failure is not None:
+                comparison_failures.append(f"Phase 0 diagnostics failed:\n{diagnostic_failure}")
+            if comparison_failures:
+                raise AssertionError("\n".join(comparison_failures))
             print(
                 f"[Phase 0] Source-load aliases: hf_aliased={hf_aliased}; "
                 f"trainer_aliased={candidate_aliased}; tie_word_embeddings={explicit_tie_word_embeddings}"
@@ -2225,7 +2242,16 @@ def _run_hf_reload_standing_shape_diagnostic(
     artifact_dir: Path,
     custom_args: dict[str, object],
 ) -> None:
-    """Automatically contextualize a shortened Phase 3 cross-framework gate."""
+    """Automatically contextualize a shortened Phase 3 cross-framework gate.
+
+    Args:
+        hf_model: Loaded vanilla-HF model used for standalone forwards.
+        input_ids: Token IDs for the full parity prompt.
+        device: Device holding ``hf_model`` and its inputs.
+        hf_logits: Full-forward logits of shape [batch, sequence, vocab].
+        artifact_dir: Directory that owns checkpoint-robustness artifacts.
+        custom_args: Validated checkpoint-robustness fixture settings.
+    """
     if "cross_framework_gate_sequence_length" not in custom_args:
         return
     gate_sequence_length = int(custom_args["cross_framework_gate_sequence_length"])
@@ -2559,6 +2585,18 @@ def _router_diagnostic_capture_context(
     return capture_glm_automodel_routers(model, automodel_path)
 
 
+def _validate_router_diagnostic_config(cfg, custom_args: dict[str, object]) -> None:
+    """Reject router capture for unsupported pipeline-parallel execution."""
+    if not custom_args.get("capture_router_diagnostics", False):
+        return
+    pp_size = int(getattr(cfg.distributed, "pp_size", 1))
+    if pp_size > 1:
+        raise ValueError(
+            "capture_router_diagnostics does not support pipeline parallelism because global rank 0 owns only "
+            f"one local pipeline stage; set distributed.pp_size=1 or disable capture (got pp_size={pp_size})"
+        )
+
+
 def _run_hf_shape_diagnostic(
     hf_model: torch.nn.Module,
     input_ids: list[int],
@@ -2571,7 +2609,19 @@ def _run_hf_shape_diagnostic(
     capture_router_diagnostics: bool,
     phase: Literal["phase_0", "phase_3"],
 ) -> None:
-    """Run informational HF-full-prefix versus HF-standalone forwards."""
+    """Run informational HF-full-prefix versus HF-standalone forwards.
+
+    Args:
+        hf_model: Loaded vanilla-HF model used for standalone forwards.
+        input_ids: Token IDs for the full parity prompt.
+        device: Device holding ``hf_model`` and its inputs.
+        base_logits: Full-forward logits of shape [batch, sequence, vocab].
+        artifact_dir: Directory that owns checkpoint-robustness artifacts.
+        config: Validated standalone-forward lengths.
+        gate_sequence_length: Optional standing cross-framework gate length.
+        capture_router_diagnostics: Whether to capture router selections for each standalone forward.
+        phase: Checkpoint phase that owns the diagnostic report.
+    """
     diagnostic_lengths = config.lengths(
         parity_sequence_length=len(input_ids),
         gate_sequence_length=gate_sequence_length,
@@ -2697,6 +2747,7 @@ def _run_process_isolated_checkpoint_phase(
 
     _disable_distributed_atexit_teardown()
     cfg = parse_args_and_load_config()
+    _validate_router_diagnostic_config(cfg, custom_args)
     tokenizer_name = custom_args.get("tokenizer_name", None)
     parity_sequence_length = int(custom_args.get("parity_sequence_length", "2048"))
 
@@ -3284,6 +3335,7 @@ def run_checkpoint_robustness(
     deferred_failures: list[str] = []
 
     cfg = parse_args_and_load_config()
+    _validate_router_diagnostic_config(cfg, custom_args)
     resume_plan = _resume_plan_from_config(cfg) if resume_enabled else None
     if resume_plan is not None:
         _configure_uninterrupted_run(cfg, resume_plan)

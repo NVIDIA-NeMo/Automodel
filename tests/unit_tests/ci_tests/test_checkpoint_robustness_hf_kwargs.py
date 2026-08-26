@@ -66,6 +66,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _set_model_pretrained_path,
     _source_load_parity_policy,
     _trainable_parameter_digests,
+    _validate_router_diagnostic_config,
     _wait_for_hf_reload_rank0,
     _wait_for_source_load_artifacts,
 )
@@ -1456,7 +1457,49 @@ def test_source_load_parity_emits_complete_schema_v3_metrics_once(tmp_path, caps
         line for line in capsys.readouterr().out.splitlines() if line.startswith("CHECKPOINT_PARITY_METRICS ")
     ]
     assert len(metric_lines) == 1
-    assert json.loads(metric_lines[0].removeprefix("CHECKPOINT_PARITY_METRICS ")) == payload
+    logged_payload = json.loads(metric_lines[0].removeprefix("CHECKPOINT_PARITY_METRICS "))
+    assert "shape_diagnostic" not in logged_payload
+    assert "router_diagnostics" not in logged_payload
+    assert logged_payload["embedded_diagnostics"] == ["router_diagnostics", "shape_diagnostic"]
+    assert logged_payload["report_path"] == str(tmp_path / "parity_metrics" / "phase_0_source_load.json")
+
+
+def test_source_load_diagnostic_failure_still_persists_parity_metrics(tmp_path):
+    logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
+    router_dir = tmp_path / "router_diagnostics"
+    router_dir.mkdir()
+    (router_dir / "phase_0_hf.pt").touch()
+    (router_dir / "phase_0_automodel.pt").touch()
+
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.router_diagnostics.compare_glm_router_captures",
+        side_effect=ValueError("malformed capture"),
+    ):
+        failure = _compare_source_load_parity(
+            (logits, None, None),
+            logits.clone(),
+            None,
+            artifact_dir=tmp_path,
+            policy=_source_load_parity_policy({"parity_tolerance_profile": "strict"}),
+        )
+
+    assert failure is not None
+    assert "Phase 0 diagnostics failed" in failure
+    payload = json.loads((tmp_path / "parity_metrics" / "phase_0_source_load.json").read_text())
+    assert payload["passed"] is True
+    assert payload["diagnostic_failure"] == {
+        "error_type": "ValueError",
+        "message": "malformed capture",
+    }
+
+
+def test_router_diagnostics_reject_pipeline_parallel_capture():
+    cfg = SimpleNamespace(distributed=SimpleNamespace(pp_size=2))
+
+    with pytest.raises(ValueError, match="does not support pipeline parallelism"):
+        _validate_router_diagnostic_config(cfg, {"capture_router_diagnostics": True})
+
+    _validate_router_diagnostic_config(cfg, {"capture_router_diagnostics": False})
 
 
 def test_source_load_logit_skip_keeps_metrics_informational():

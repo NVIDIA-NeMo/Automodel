@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
+    _token_kl,
     compare_glm_router_captures,
     summarize_glm_router_shape_captures,
 )
@@ -105,3 +106,75 @@ def test_router_shape_report_attributes_kl_to_sustained_self_flips(tmp_path):
     assert report["tokens_with_sustained_flips_count"] == 1
     assert report["sustained_flip_final_token_kl"]["token_count"] == 1
     assert report["sustained_flip_final_token_kl"]["mean_kl"] > 1.0
+
+
+def test_router_report_handles_all_zero_logit_cosine(tmp_path):
+    hf_path = tmp_path / "hf.pt"
+    automodel_path = tmp_path / "automodel.pt"
+    report_path = tmp_path / "report.json"
+    capture = _capture([[0.0, 0.0, 0.0]], [[0]])
+    torch.save(capture, hf_path)
+    torch.save(capture, automodel_path)
+    final_logits = torch.tensor([[[0.0, 0.0]]])
+
+    report = compare_glm_router_captures(
+        hf_path,
+        automodel_path,
+        report_path,
+        reference_logits=final_logits,
+        candidate_logits=final_logits.clone(),
+    )
+
+    assert report["router_logit_cosine"] == 1.0
+    assert report["layer_metrics"][1]["router_logit_cosine"] == 1.0
+
+
+def test_router_report_handles_one_zero_logit_cosine(tmp_path):
+    hf_path = tmp_path / "hf.pt"
+    automodel_path = tmp_path / "automodel.pt"
+    report_path = tmp_path / "report.json"
+    torch.save(_capture([[0.0, 0.0, 0.0]], [[0]]), hf_path)
+    torch.save(_capture([[1.0, 0.0, 0.0]], [[0]]), automodel_path)
+    final_logits = torch.tensor([[[0.0, 0.0]]])
+
+    report = compare_glm_router_captures(
+        hf_path,
+        automodel_path,
+        report_path,
+        reference_logits=final_logits,
+        candidate_logits=final_logits.clone(),
+    )
+
+    assert report["router_logit_cosine"] == 0.0
+    assert report["layer_metrics"][1]["router_logit_cosine"] == 0.0
+
+
+def test_router_report_rejects_equal_numel_shape_mismatch(tmp_path):
+    hf_path = tmp_path / "hf.pt"
+    automodel_path = tmp_path / "automodel.pt"
+    report_path = tmp_path / "report.json"
+    hf_capture = _capture([[4.0, 1.0, 0.0], [1.0, 0.99, 0.0]], [[0], [0]])
+    automodel_capture = _capture([[4.0, 1.0, 0.0], [1.0, 0.99, 0.0]], [[0], [0]])
+    automodel_capture["layers"][1]["router_logits"] = automodel_capture["layers"][1]["router_logits"].reshape(1, 2, 3)
+    automodel_capture["layers"][1]["indices"] = automodel_capture["layers"][1]["indices"].reshape(1, 2, 1)
+    torch.save(hf_capture, hf_path)
+    torch.save(automodel_capture, automodel_path)
+    final_logits = torch.zeros(1, 2, 2)
+
+    with pytest.raises(ValueError, match="Router capture shape mismatch"):
+        compare_glm_router_captures(
+            hf_path,
+            automodel_path,
+            report_path,
+            reference_logits=final_logits,
+            candidate_logits=final_logits.clone(),
+        )
+
+
+@pytest.mark.parametrize("nonfinite", [float("inf"), float("nan")])
+def test_token_kl_rejects_nonfinite_logits(nonfinite):
+    reference_logits = torch.tensor([[[0.0, nonfinite]]])
+    candidate_logits = torch.zeros_like(reference_logits)
+
+    with pytest.raises(ValueError, match="non-finite"):
+        _token_kl(reference_logits, candidate_logits)
