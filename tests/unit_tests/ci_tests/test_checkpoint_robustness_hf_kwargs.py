@@ -2027,7 +2027,15 @@ def test_hf_fp32_module_names_cover_vanilla_layout_differences():
     """
 
     class TinyAutoModel:
-        _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "router.weight", "norm.bias"]
+        _keep_in_fp32_modules_strict = [
+            "mlp.gate.e_score_correction_bias",
+            "router.weight",
+            "norm.bias",
+            # Gemma4-style entries: their leaves are unanchored-substring traps
+            # ("proj" matches q_proj/down_proj/...) and must not become aliases.
+            "router.proj",
+            "router.scale",
+        ]
 
     hf_config = SimpleNamespace(architectures=["TinyForCausalLM"])
     with patch(
@@ -2038,6 +2046,9 @@ def test_hf_fp32_module_names_cover_vanilla_layout_differences():
 
     assert "mlp.gate.e_score_correction_bias" in names
     assert "e_score_correction_bias" in names
-    # Generic leaves would pin every weight/bias fp32 and must not be added.
-    assert "weight" not in names
-    assert "bias" not in names
+    # The full AutoModel paths always pass through unchanged.
+    assert "router.proj" in names and "router.scale" in names
+    # Generic leaves would pin unrelated modules fp32 (Transformers matches
+    # these names as unanchored substrings) and must not be added.
+    for generic_leaf in ("weight", "bias", "proj", "scale"):
+        assert generic_leaf not in names

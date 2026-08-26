@@ -1314,6 +1314,15 @@ def _release_model_memory() -> None:
         torch.cuda.empty_cache()
 
 
+# Leaf names distinctive enough to register as layout-independent fp32
+# aliases. Transformers matches _keep_in_fp32_modules_strict entries as
+# unanchored substrings, so only leaves that cannot collide with unrelated
+# modules qualify — a generic leaf such as ``proj`` or ``scale`` (from
+# Gemma4's ``router.proj``/``router.scale``) would pin ``q_proj``,
+# ``down_proj``, and friends fp32 across the whole bf16 reference.
+_HF_FP32_LEAF_ALIASES = ("e_score_correction_bias",)
+
+
 def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
     """Infer vanilla-HF fp32 names from AutoModel's model-owned checkpoint contract."""
     from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
@@ -1333,10 +1342,9 @@ def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
         # ``mlp.gate``), so the AutoModel-path entry silently fails to match
         # and the reference's router bias was cast to bf16 — scrambling 30-73%
         # of knife-edge top-k selections per layer (AMINT-286). Also register
-        # the distinctive leaf so any layout keeps the tensor in fp32; generic
-        # ``weight``/``bias`` leaves are excluded to avoid pinning everything.
+        # the distinctive leaf so any layout keeps the tensor in fp32.
         leaf = name.rsplit(".", 1)[-1]
-        if leaf not in ("weight", "bias") and leaf not in module_names:
+        if leaf in _HF_FP32_LEAF_ALIASES and leaf not in module_names:
             module_names.append(leaf)
     return tuple(module_names)
 
