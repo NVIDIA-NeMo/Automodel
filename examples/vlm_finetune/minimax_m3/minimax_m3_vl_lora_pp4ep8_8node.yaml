@@ -164,8 +164,9 @@ wandb:
 ci:
   recipe_owner: athitten
   nodes: 8
-  # Allow the complete source, reload, and resume calibration matrix to finish.
-  time: "01:30:00"
+  # Allow the complete source, reload, and resume calibration matrix to finish;
+  # the 427B vanilla reference CPU-offloads ~half its weights on rank 0's node.
+  time: "04:00:00"
   checkpoint_robustness:
     # PP=4 with pp_microbatch_size=1 needs at least four pipeline microbatches;
     # dp = 64/4 = 16, so global = 4 * 16 with one grad-accum step.
@@ -177,6 +178,13 @@ ci:
     trust_remote_code: false
     tokenizer_name: MiniMaxAI/MiniMax-M3
     hf_device_map_auto: true
+    # The 427B (854 GiB bf16) reference exceeds rank 0's eight GPUs: cap each
+    # GPU below the fused-expert concat transient (first run OOMed at 72 GiB
+    # resident + 9 GiB concat) and spill the remainder to host RAM, following
+    # the Step-3.7 precedent at roughly double its scale.
+    hf_device_map_max_memory_gib: 55
+    hf_device_map_cpu_max_memory_gib: 512
+    hf_reload_timeout_seconds: 7200
     # MiniMax-M3 shares MiniMax-M2.7's knife-edge router: the released
     # checkpoint's fp32 e_score_correction_bias tensors are 1e-3-quantized
     # lattices at magnitudes 4.7-7.9 (bf16 ulp 0.016-0.031), so top-k
