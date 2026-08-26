@@ -180,13 +180,34 @@ Implement files in dependency order:
    `supports_low_memory_dcp_load=False` for unsafe variants; a model-sized device
    temporary can otherwise cause an out-of-memory failure.
 
-   For adapters using `MoESplitExpertsStateDictMixin`, treat the capability as
-   runtime-dependent. With the maintained EP dispatchers (`deepep`, `hybridep`,
-   and `uccl_ep`), TE expert storage is model-backed only at world size one;
-   `gmm`, `torch_mm`, and `torch_mm_mxfp8` expert storage is model-backed at any
-   world size. Non-EP dispatchers use ordinary grouped storage. The shared mixin
-   disables low-memory DCP for `expert_bias=True`, MoK, and any variant whose
-   checkpoint expert tensors require rebuilding.
+   The checkpoint router currently uses this capability to let one-process
+   custom-model safetensors initialization avoid a full host checkpoint load.
+   Multi-process loads already use DCP, but they share the same adapter conversion
+   and expert-storage rules.
+
+   For adapters using `MoESplitExpertsStateDictMixin`, decide this capability
+   from the runtime expert storage, not only from the configured backend name:
+
+   - Non-EP dispatchers use ordinary grouped experts whose checkpoint tensors
+     alias the final model parameters.
+   - At world size one, the maintained EP dispatchers (`deepep`, `hybridep`, and
+     `uccl_ep`) fall back to ordinary grouped experts and can use the low-memory
+     path.
+   - At larger world sizes, the `gmm`, `torch_mm`, and `torch_mm_mxfp8` expert
+     backends use model-backed grouped storage. TE and other expert backends use
+     virtual grouped tensors assembled from per-expert parameters, so they must
+     not advertise low-memory DCP.
+   - The mixin reports the capability as false for `expert_bias=True` and MoK.
+     The loader must also bypass the low-memory route for quantized expert
+     conversion and any other variant that must rebuild model-sized checkpoint
+     tensors after reading them.
+
+   A false capability value does not mean checkpoint loading is unsupported; it
+   selects an allocating or rebuilding load path. A false positive is dangerous:
+   if an adapter marks a temporary tensor as loaded in-place, `from_hf` can skip
+   rebuilding the real parameter and silently leave its previous value. Test each
+   optimized destination by writing a sentinel value through it and asserting
+   that the final model parameter storage changes.
 6. **__init__.py** -- Re-export the main model class
 
 See the pattern files for detailed implementation guidance:
