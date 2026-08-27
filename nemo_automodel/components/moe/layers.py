@@ -266,6 +266,13 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
+        # Score arithmetic always has a concrete dtype: an explicit
+        # gate_precision wins, otherwise fp32 (the shared default of both
+        # score branches). gate_precision itself stays tri-state because
+        # None means "project in the input's runtime dtype", which several
+        # reference routers require (AM-821: Qwen3-MoE, GPT-OSS, DSV4,
+        # Laguna project in bf16 while scoring in fp32).
+        self.score_dtype = gate_precision if gate_precision is not None else torch.float32
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -406,7 +413,7 @@ class Gate(nn.Module):
 
         if self.score_func == "softmax":
             if self.softmax_before_topk:
-                scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+                scores = scores.softmax(dim=-1, dtype=self.score_dtype)
                 original_scores = scores
                 indices = torch.topk(scores, k=self.topk, dim=-1)[1]
                 indices = replay_selection(self.router_replay, indices)
@@ -419,14 +426,14 @@ class Gate(nn.Module):
                     # replayed experts. Skipped (zero overhead) on the default path.
                     values = scores.gather(1, replayed)
                     indices = replayed
-                weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
+                weights = values.softmax(dim=1, dtype=self.score_dtype)
                 # Use full softmax for aux_loss so P_i represents proper probabilities.
                 # Raw logits can be negative, causing aux_loss to diverge negative.
-                original_scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+                original_scores = scores.softmax(dim=-1, dtype=self.score_dtype)
         elif self.score_func == "softmax_with_bias":
             # softmax first, then add bias for expert selection,
             # group routing on biased scores, final weights from unbiased softmax scores.
-            scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+            scores = scores.softmax(dim=-1, dtype=self.score_dtype)
             original_scores = scores
 
             # Add correction bias for expert SELECTION only
@@ -463,7 +470,7 @@ class Gate(nn.Module):
             # compute sigmoid(logits.float()), and bf16 sigmoid quantizes scores
             # at ~2e-3 — enough to flip knife-edge e_score_correction_bias
             # selections (AMINT-286).
-            scores = torch.sigmoid(scores.to(dtype=self.gate_precision or torch.float32))
+            scores = torch.sigmoid(scores.to(dtype=self.score_dtype))
             original_scores = scores
             scores_for_choice = scores
 
@@ -485,7 +492,7 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
         else:
             # Score in fp32 like the softmax path (see sigmoid_with_bias above).
-            scores = torch.sigmoid(scores.to(dtype=self.gate_precision or torch.float32))
+            scores = torch.sigmoid(scores.to(dtype=self.score_dtype))
             original_scores = scores
 
             # Add correction bias to balance tokens across gates.
