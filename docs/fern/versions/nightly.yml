@@ -78,6 +78,8 @@ navigation:
             path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
           - page: "Qwen3.8-2.4T-A95B"
             path: ../../model-coverage/llm/qwen/qwen3-8-2-4t-a95b.mdx
+          - page: "Qwen3.8-Flash-Next"
+            path: ../../model-coverage/llm/qwen/qwen3-8-flash-next.mdx
           - page: "Qwen3-Next"
             path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - page: "ERNIE 4.5"
@@ -437,6 +439,9 @@ navigation:
       - page: "Train an EAGLE Drafter for Speculative Decoding"
         path: ../../guides/speculative/eagle.mdx
         slug: eagle-speculative-decoding
+      - page: "Train a DFlash Drafter for Speculative Decoding"
+        path: ../../guides/speculative/dflash.mdx
+        slug: dflash-speculative-decoding
       - page: "Train a DSpark Drafter for Speculative Decoding"
         path: ../../guides/speculative/dspark.mdx
         slug: dspark-speculative-decoding

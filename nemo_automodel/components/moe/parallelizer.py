@@ -535,6 +535,9 @@ def apply_ac(
             for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
                 if id(block) in repeated_mtp_moe_block_ids:
                     continue
+                if bool(getattr(block, "_nemo_disable_activation_checkpointing", False)):
+                    logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
+                    continue
                 block = ptd_checkpoint_wrapper(
                     block,
                     preserve_rng_state=True,
@@ -624,6 +627,9 @@ def apply_ac(
         # dense/attention/Mamba blocks have no such expert group and keep AC.
         if id(block) in repeated_mtp_moe_block_ids:
             continue
+        if bool(getattr(block, "_nemo_disable_activation_checkpointing", False)):
+            logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
+            continue
         if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block,
@@ -680,6 +686,7 @@ def apply_fsdp(
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         )
+    experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
     fully_shard_impl = fully_shard
@@ -702,6 +709,35 @@ def apply_fsdp(
         _model = model
     # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
+
+    # Models may construct a rank-local shell first (so meta initialization is
+    # cheap) and turn it into a globally shaped DTensor only after the runtime
+    # mesh exists. Run that private capability before collecting ignored
+    # parameters so every FSDP unit records the final Parameter identity.
+    prepare_model_owned_dtensors = getattr(model, "_nemo_prepare_model_owned_dtensors", None)
+    prepared_model_owned_dtensors: set[nn.Parameter] = set()
+    if prepare_model_owned_dtensors is not None:
+        prepared_model_owned_dtensors = set(prepare_model_owned_dtensors(fsdp_mesh))
+
+    # Some trainable parameters are already physically sharded by model-owned
+    # communication. Letting FSDP shard those local owner partitions again
+    # would invalidate the model's lookup and autograd routing. The explicit
+    # parameter marker keeps this exception narrow and fail-visible.
+    # Some unit-test and integration wrappers intentionally expose the nested
+    # model without subclassing nn.Module.  They cannot own parameters
+    # themselves, so treat a missing ``parameters`` method as an empty outer
+    # parameter set while preserving the normal nn.Module path.
+    outer_parameters = model.parameters() if hasattr(model, "parameters") else ()
+    externally_sharded_params = prepared_model_owned_dtensors | {
+        parameter
+        for parameter in outer_parameters
+        if getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
+    }
+    if externally_sharded_params:
+        logger.info(
+            "Excluding %d model-owned sharded parameters from FSDP ownership",
+            len(externally_sharded_params),
+        )
 
     multimodal_modules: list[tuple[str, nn.Module, set[nn.Parameter], bool]] = []
     for module_name, module in iter_multimodal_modules(model):
@@ -764,16 +800,17 @@ def apply_fsdp(
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
-            # Forward the same mp_policy used elsewhere so that when params are
-            # kept in fp32 (e.g. for fp32 master weights under FSDP2) the
-            # all-gathered expert weights are still cast to param_dtype for
-            # forward compute (required by GMM / TE kernels that expect bf16).
+            # Preserve the enclosing policy's parameter, reduction, and input-cast
+            # settings so FP32 master weights still compute in param_dtype (required
+            # by BF16 GMM / TE kernels). Experts are an internal FSDP boundary, so
+            # their policy does not override the activation dtype returned to the
+            # rest of the block.
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=experts_reshard_after_forward,
-                mp_policy=mp_policy,
+                mp_policy=experts_mp_policy,
                 offload_policy=offload_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
@@ -782,9 +819,11 @@ def apply_fsdp(
         # If FSDP is enabled for grouped experts, the parameters are automatically
         # removed from the FSDP for the transformer block due to the rules of the
         # PyTorch FSDP implementation.
-        ignored_params = None
+        ignored_params: set[nn.Parameter] = set()
         if isinstance(moe_module, MoE) and ep_enabled:
-            ignored_params = set(moe_module.experts.parameters())
+            ignored_params.update(moe_module.experts.parameters())
+        if externally_sharded_params:
+            ignored_params.update(externally_sharded_params.intersection(block.parameters()))
 
         # Reuse the dense dtype-aware path for model-owned fp32 contracts while
         # leaving EP-owned experts out of the block's dtype and FSDP ownership.
@@ -795,7 +834,7 @@ def apply_fsdp(
             offload_policy=offload_policy,
             fp32_compute_module_names=fp32_compute_module_names,
             reshard_after_forward=reshard_after_forward,
-            ignored_params=ignored_params,
+            ignored_params=ignored_params or None,
             fully_shard_fn=fully_shard_impl,
         )
 
@@ -895,11 +934,13 @@ def apply_fsdp(
                 "wrap_outer_model=False cannot preserve that parameter in one FSDP root. "
                 "Use wrap_outer_model=True or untie the embeddings explicitly."
             )
-        fully_shard_default(_model, ignored_params=ignored_params_for_root(_model, ignored_multimodal_params))
+        inner_ignored_params = ignored_multimodal_params | externally_sharded_params
+        fully_shard_default(_model, ignored_params=ignored_params_for_root(_model, inner_ignored_params))
 
     # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested.
     if wrap_outer_model and model is not _model:
-        fully_shard_default(model, ignored_params=ignored_params_for_root(model, ignored_multimodal_params))
+        outer_ignored_params = ignored_multimodal_params | externally_sharded_params
+        fully_shard_default(model, ignored_params=ignored_params_for_root(model, outer_ignored_params))
 
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):

@@ -32,7 +32,7 @@ import pathlib
 import time
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import mlflow
 import torch
@@ -150,7 +150,8 @@ def _should_pack_validation(
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
     """Return whether the recipe should attach PP causal-mask precomputation."""
-    return getattr(model_config, "model_type", None) != "deepseek_v4"
+    # TODO: Replace model-type exceptions with a shared mask-ownership capability.
+    return getattr(model_config, "model_type", None) not in ("deepseek_v4", "glm_moe_dsa")
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
@@ -352,7 +353,7 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
     """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``.
 
     ``None`` when PP is disabled, the model config can't be loaded, or the model
-    computes masks internally (e.g. ``deepseek_v4``).  Passed to
+    computes masks internally (e.g. ``deepseek_v4`` or ``glm_moe_dsa``).  Passed to
     :meth:`DataloaderConfig.build` as ``collate_wrapper``.
     """
     if not pp_enabled:
@@ -718,7 +719,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     dp_world_size=self._get_dp_group_size(),
                     pp_enabled=self.pp_enabled,
                     supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
-                    cp_size=self.cfg.get("distributed.cp_size", 1),
+                    # Models that own their CP shard the packed row contiguously;
+                    # per-document CP padding is a TE blockdiag concern and would
+                    # make pack composition depend on the topology.
+                    cp_size=(
+                        1
+                        if getattr(self.model_parts[0], "_owns_cp_attention", False)
+                        else self.cfg.get("distributed.cp_size", 1)
+                    ),
                     attn_implementation=attn_implementation,
                     collate_wrapper=collate_wrapper,
                 )
@@ -1191,7 +1199,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
         Args:

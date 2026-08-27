@@ -114,8 +114,8 @@ wandb:
 
 # ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
 # Regression gate, one-sided: passes iff CI IFEval prompt_level_strict_acc >
-# baseline - k * stderr. A higher score always passes. baseline/stderr
-# measured (see README.md). `tokenizer: checkpoint` -> eval uses the trained checkpoint's
+# baseline - k * stderr. A higher score always passes. baseline measured (see
+# README.md). `tokenizer: checkpoint` -> eval uses the trained checkpoint's
 # tokenizer (it carries the chat_template.jinja).
 # google/gemma-4-31B (base) ships no chat template; it is supplied via dataset.chat_template
 # (applied to the processor by the VLM loader), so no manual staging onto the model dir is needed.
@@ -133,5 +133,11 @@ ci:
     extra_model_args: "max_model_len=8192"
     metric: prompt_level_strict_acc
     baseline: 0.5287
-    stderr: 0.0215
-    k: 3                                 # gemma4 has larger variance
+    # Between-run sigma of the train->eval pipeline, NOT lm-eval's within-eval
+    # bootstrap stderr (0.0215) -- that is ~2x smaller and only covers scoring 541
+    # prompts. Nine runs span 0.4492-0.5619 (stdev 0.0455), so the old 3*0.0215 floor
+    # (0.4642) tripped roughly 1 healthy run in 9: Aug-24 scored 0.4492 and failed, but
+    # re-running that same commit scored 0.5046. Floor 0.4378 clears all nine, while a
+    # real training failure lands near the untuned base (~0.25).
+    stderr: 0.0455
+    k: 2

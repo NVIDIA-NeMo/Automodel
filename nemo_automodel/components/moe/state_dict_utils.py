@@ -232,7 +232,7 @@ def validate_dtensor_expert_sharding(tensor: torch.Tensor, expected_experts: int
 
 
 def create_dtensor_from_local(
-    local_tensor: torch.Tensor, device_mesh: Optional["DeviceMesh"], rank: Optional[int] = None
+    local_tensor: torch.Tensor, device_mesh: Optional["DeviceMesh"], rank: int | None = None
 ) -> torch.Tensor:
     """
     Create a DTensor from a local tensor for expert parallelism.
