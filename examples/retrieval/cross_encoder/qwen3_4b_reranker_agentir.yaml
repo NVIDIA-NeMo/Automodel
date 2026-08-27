@@ -109,7 +109,7 @@ dataset:
 
 dataloader:
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.ContextAwareRerankerCollator
+    _target_: nemo_automodel.components.models.qwen3_reranker.Qwen3ContextAwareRerankerCollator
     rerank_max_length: 5120
     global_query_max_length: 2048
     sub_query_max_length: 256
@@ -137,7 +137,7 @@ validation_dataset:
 
 validation_dataloader:
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.ContextAwareRerankerCollator
+    _target_: nemo_automodel.components.models.qwen3_reranker.Qwen3ContextAwareRerankerCollator
     rerank_max_length: 5120
     global_query_max_length: 2048
     sub_query_max_length: 256
