@@ -109,8 +109,7 @@ class Qwen3RerankerConfig(Qwen3Config):
             # checkpoint reloads in HF or vLLM with different position encoding than it was
             # trained with. Everything except rope_theta and the type discriminator is the
             # scaling payload.
-            scaling = {k: v for k, v in rope_params.items()
-                       if k not in ("rope_theta", "rope_type", "type")}
+            scaling = {k: v for k, v in rope_params.items() if k not in ("rope_theta", "rope_type", "type")}
             rope_type = rope_params.get("rope_type") or rope_params.get("type")
             if scaling:
                 if rope_type:
@@ -149,6 +148,34 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
     sigmoid to recover ``p(yes)`` (the official ``compute_logits`` output);
     ``TrainCrossEncoderRecipe`` consumes the raw score directly. Attention remains
     causal and the pretrained ``lm_head`` is reused (no new parameters).
+
+    Why this subclasses ``Qwen3ForCausalLM`` rather than ``Qwen3PreTrainedModel``
+    ------------------------------------------------------------------------
+    Qwen3-Reranker is a causal LM, not a sequence-classification model. Its
+    published ``config.json`` declares ``architectures: ["Qwen3ForCausalLM"]``, the
+    model card loads it with ``AutoModelForCausalLM``, and the official
+    ``compute_logits`` scores by reading full-vocabulary next-token logits at the
+    final position (``model(**inputs).logits[:, -1, :]``) and indexing the "yes" /
+    "no" ids. Reranking here IS next-token prediction; there is no classification
+    head. Subclassing the causal LM keeps that identity, reuses upstream's
+    ``model`` + ``lm_head`` construction and weight tying instead of duplicating
+    it, and keeps the state-dict keys (``model.*``, ``lm_head.*``) byte-identical
+    to the backbone.
+
+    Checkpoints saved from this class deserialize as plain ``Qwen3ForCausalLM``
+    (see :meth:`Qwen3RerankerConfig.to_dict`), so a finetuned model loads and
+    scores through the stock HuggingFace and vLLM paths exactly like the backbone,
+    with no custom code and no ``trust_remote_code``.
+
+    Training-time forward contract
+    ------------------------------
+    :meth:`forward` is overridden for training and returns pooled scores of shape
+    ``[batch, 1]`` rather than ``[batch, sequence, vocab]``, and ``labels`` are
+    binary relevance targets rather than next-token ids. Generation APIs are
+    therefore not usable on an instance of this class -- ``logits_to_keep`` is
+    rejected rather than silently ignored so that a mistaken ``generate()`` call
+    fails with a clear message. This affects the in-process training object only;
+    the saved checkpoint is a standard causal LM with full generation behavior.
     """
 
     config_class = Qwen3RerankerConfig
@@ -206,10 +233,22 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
                 "from_pretrained (which resolves them) or set them explicitly."
             )
 
-        # kwargs may carry logits_to_keep / use_cache etc.; drop the ones that
-        # do not apply to the bare decoder forward.
-        kwargs.pop("logits_to_keep", None)
-        kwargs.pop("num_logits_to_keep", None)
+        # kwargs may carry logits_to_keep / use_cache etc.; drop the ones that do not apply
+        # to the bare decoder forward. A non-zero logits_to_keep is a generation caller
+        # asking for per-position vocabulary logits, which this forward does not produce --
+        # it returns one pooled score per row. Silently dropping it would hand that caller a
+        # [batch, 1] tensor where it expects [batch, kept, vocab], so reject it by name
+        # instead. 0 / None are upstream's own defaults and are accepted.
+        for name in ("logits_to_keep", "num_logits_to_keep"):
+            requested = kwargs.pop(name, None)
+            if requested:
+                raise ValueError(
+                    f"{type(self).__name__}.forward() does not support {name}={requested!r}: it "
+                    "returns one pooled yes/no score per row, not per-position vocabulary "
+                    "logits, so generation APIs cannot run on this class. Save the checkpoint "
+                    "and reload it as a standard Qwen3ForCausalLM to generate or to score with "
+                    "the official compute_logits."
+                )
 
         # Resolve return_dict ONCE, before it is used. The signature defaults it to None, so a
         # caller that omits it would otherwise fall through `if not return_dict` further down
