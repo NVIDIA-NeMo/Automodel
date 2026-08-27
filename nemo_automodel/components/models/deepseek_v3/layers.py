@@ -51,8 +51,8 @@ class MLA(nn.Module):
         Args:
             config: Model configuration that defines the MLA dimensions.
             backend: Kernel backend selections for attention, linear layers, and normalization.
-            latent_norm_eps: Epsilon for the internal query and key/value latent RMSNorms. Defaults to the
-                model-wide ``rms_norm_eps`` when omitted.
+            latent_norm_eps: Epsilon for the internal query and key/value latent RMSNorms. Defaults to the upstream
+                MLA contract of ``1e-6`` when omitted.
         """
         super().__init__()
 
@@ -71,7 +71,7 @@ class MLA(nn.Module):
         attn_impl = backend.attn
         linear_impl = backend.linear
         rms_norm_impl = backend.rms_norm
-        latent_norm_eps = config.rms_norm_eps if latent_norm_eps is None else latent_norm_eps
+        latent_norm_eps = 1e-6 if latent_norm_eps is None else latent_norm_eps
 
         hidden_size = config.hidden_size
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)

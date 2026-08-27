@@ -28,6 +28,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _PARITY_DOCUMENT_SHA256,
     _assert_peft_adapter_matches_checkpoint,
     _automodel_reload_parity_policy,
+    _collect_hf_reload_shape_diagnostics,
     _compare_logits,
     _compare_source_load_parity,
     _cross_tp_parity_policy,
@@ -825,6 +826,15 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert remaining == ["--config", str(config_path)]
 
 
+def test_extract_custom_args_parses_quoted_false_router_capture(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text('ci:\n  checkpoint_robustness:\n    capture_router_diagnostics: "false"\n')
+
+    custom, _remaining = _extract_custom_args(["--config", str(config_path)])
+
+    assert custom["capture_router_diagnostics"] is False
+
+
 def test_extract_custom_args_reads_shape_diagnostic_mapping(tmp_path):
     config_path = tmp_path / "recipe.yaml"
     config_path.write_text(
@@ -1027,6 +1037,29 @@ def test_hf_reload_standing_shape_diagnostic_skips_full_length_gate(tmp_path):
         )
 
     run_shape_diagnostic.assert_not_called()
+
+
+def test_hf_reload_shape_diagnostic_failure_is_returned_as_evidence(tmp_path):
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+        "_run_hf_reload_standing_shape_diagnostic",
+        side_effect=ValueError("malformed shape probe"),
+    ):
+        diagnostics, failure = _collect_hf_reload_shape_diagnostics(
+            Mock(),
+            [1, 2],
+            torch.device("cpu"),
+            torch.zeros(1, 2, 3),
+            artifact_dir=tmp_path,
+            custom_args={"cross_framework_gate_sequence_length": "1"},
+        )
+
+    assert diagnostics["diagnostic_failure"] == {
+        "error_type": "ValueError",
+        "message": "malformed shape probe",
+    }
+    assert failure is not None
+    assert "malformed shape probe" in failure
 
 
 def test_process_isolated_cross_tp_reload_uses_exported_weights_and_reports_parity(tmp_path):
@@ -1502,6 +1535,39 @@ def test_router_diagnostics_reject_pipeline_parallel_capture():
     _validate_router_diagnostic_config(cfg, {"capture_router_diagnostics": False})
 
 
+def test_router_diagnostics_accept_missing_distributed_section_for_supported_family():
+    cfg = SimpleNamespace(model=SimpleNamespace(pretrained_model_name_or_path="org/model"))
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._model_kwargs_from_config",
+            return_value={},
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_hf_config",
+            return_value=SimpleNamespace(model_type="glm4_moe_lite"),
+        ),
+    ):
+        _validate_router_diagnostic_config(cfg, {"capture_router_diagnostics": True})
+
+
+def test_router_diagnostics_reject_unsupported_family_before_model_load():
+    cfg = SimpleNamespace(model=SimpleNamespace(pretrained_model_name_or_path="org/model"))
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._model_kwargs_from_config",
+            return_value={},
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_hf_config",
+            return_value=SimpleNamespace(model_type="qwen3_moe"),
+        ),
+        pytest.raises(ValueError, match="supports only model_type='glm4_moe_lite'"),
+    ):
+        _validate_router_diagnostic_config(cfg, {"capture_router_diagnostics": True})
+
+
 def test_source_load_logit_skip_keeps_metrics_informational():
     policy = _source_load_parity_policy({"skip_source_load_logit_parity": True})
 
@@ -1588,6 +1654,19 @@ def test_compare_logits_persists_machine_readable_metrics(tmp_path):
     assert payload["metrics"]["mean_jsd"] == pytest.approx(0.0, abs=5e-8)
     assert payload["metrics"]["p95_jsd"] == pytest.approx(0.0, abs=5e-8)
     assert payload["metrics"]["max_jsd"] == pytest.approx(0.0, abs=5e-8)
+
+
+def test_compare_logits_rejects_diagnostic_key_collision(tmp_path):
+    logits = torch.tensor([[[2.0, -2.0]]])
+    policy = _LogitParityPolicy(
+        phase="phase_0",
+        comparison="source_load",
+        comparison_kind="cross_framework",
+        profile="standard",
+    )
+
+    with pytest.raises(ValueError, match="collide with parity record fields"):
+        _compare_logits(tmp_path, logits, logits.clone(), policy, diagnostics={"metrics": {}})
 
 
 def test_compare_logits_gates_cross_framework_prefix_and_reports_full_sequence(tmp_path):

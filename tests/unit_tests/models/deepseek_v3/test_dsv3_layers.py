@@ -29,6 +29,7 @@ from nemo_automodel.components.models.deepseek_v3.layers import (
 TE_AVAILABLE = False
 try:
     import transformer_engine  # noqa: F401
+
     TE_AVAILABLE = True
 except ImportError:
     pass
@@ -89,8 +90,10 @@ class TestPreprocessArgsAndKwargsForAttn:
         k = torch.randn(2, 8, 16, 64)
         v = torch.randn(2, 8, 16, 64)
         # First sequence: all valid (1s), second sequence: some padding (0s)
-        attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-                                       [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]], dtype=torch.float32)
+        attention_mask = torch.tensor(
+            [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]],
+            dtype=torch.float32,
+        )
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
         q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
@@ -152,11 +155,10 @@ class TestPreprocessArgsAndKwargsForAttn:
         attention_mask = torch.ones(2, 16, dtype=torch.long)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        _, _, _, attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q, k, v, attention_mask, attn_impl=backend.attn
-        )
+        _, _, _, attn_kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, attention_mask, attn_impl=backend.attn)
 
         assert attn_kwargs == {"is_causal": True}
+
 
 class TestPostprocessOutputForAttn:
     def test_te_backend_no_change(self):
@@ -237,18 +239,18 @@ class TestMLAInitialization:
         assert mla.softmax_scale == 128**-0.5
 
         # Check that q_proj was initialized (not q_a_proj/q_b_proj)
-        assert hasattr(mla, 'q_proj')
-        assert not hasattr(mla, 'q_a_proj')
-        assert not hasattr(mla, 'q_b_proj')
-        assert not hasattr(mla, 'q_a_layernorm')
+        assert hasattr(mla, "q_proj")
+        assert not hasattr(mla, "q_a_proj")
+        assert not hasattr(mla, "q_b_proj")
+        assert not hasattr(mla, "q_a_layernorm")
 
         # Check other components exist
-        assert hasattr(mla, 'kv_a_proj_with_mqa')
-        assert hasattr(mla, 'kv_a_layernorm')
-        assert hasattr(mla, 'kv_b_proj')
-        assert hasattr(mla, 'o_proj')
-        assert hasattr(mla, 'attn_module')
-        assert hasattr(mla, 'attn_func')
+        assert hasattr(mla, "kv_a_proj_with_mqa")
+        assert hasattr(mla, "kv_a_layernorm")
+        assert hasattr(mla, "kv_b_proj")
+        assert hasattr(mla, "o_proj")
+        assert hasattr(mla, "attn_module")
+        assert hasattr(mla, "attn_func")
 
     @skip_te
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
@@ -265,10 +267,10 @@ class TestMLAInitialization:
         mla = MLA(config, backend)
 
         # Check that q_a_proj/q_b_proj were initialized (not q_proj)
-        assert not hasattr(mla, 'q_proj')
-        assert hasattr(mla, 'q_a_proj')
-        assert hasattr(mla, 'q_b_proj')
-        assert hasattr(mla, 'q_a_layernorm')
+        assert not hasattr(mla, "q_proj")
+        assert hasattr(mla, "q_a_proj")
+        assert hasattr(mla, "q_b_proj")
+        assert hasattr(mla, "q_a_layernorm")
 
         assert mla.q_lora_rank == 1024
 
@@ -285,7 +287,7 @@ class TestMLAInitialization:
     ):
         config = self.create_mock_config(q_lora_rank=1024, rms_norm_eps=1e-5)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
-        expected_epsilon = config.rms_norm_eps if latent_norm_eps is None else latent_norm_eps
+        expected_epsilon = 1e-6 if latent_norm_eps is None else latent_norm_eps
 
         mock_init_linear.return_value = Mock()
         mock_init_rms.return_value = Mock()
@@ -313,25 +315,21 @@ class TestMLAInitialization:
 
         # Test that initialization works with SDPA backend
         assert mla.backend.attn == "sdpa"
-        assert hasattr(mla, 'q_proj')
-        assert hasattr(mla, 'kv_a_proj_with_mqa')
-        assert hasattr(mla, 'kv_a_layernorm')
-        assert hasattr(mla, 'kv_b_proj')
-        assert hasattr(mla, 'o_proj')
+        assert hasattr(mla, "q_proj")
+        assert hasattr(mla, "kv_a_proj_with_mqa")
+        assert hasattr(mla, "kv_a_layernorm")
+        assert hasattr(mla, "kv_b_proj")
+        assert hasattr(mla, "o_proj")
 
     @patch("nemo_automodel.components.models.deepseek_v3.layers.yarn_get_mscale")
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
     def test_mla_init_with_rope_scaling(self, mock_init_attn, mock_init_rms, mock_init_linear, mock_yarn_get_mscale):
-        rope_scaling = {
-            "factor": 2.0,
-            "mscale": 1.0,
-            "original_max_position_embeddings": 4096
-        }
+        rope_scaling = {"factor": 2.0, "mscale": 1.0, "original_max_position_embeddings": 4096}
         config = self.create_mock_config(
             rope_scaling=rope_scaling,
-            max_position_embeddings=8192  # Greater than original
+            max_position_embeddings=8192,  # Greater than original
         )
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
@@ -352,14 +350,10 @@ class TestMLAInitialization:
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
     def test_mla_init_rope_scaling_no_adjustment(self, mock_init_attn, mock_init_rms, mock_init_linear):
-        rope_scaling = {
-            "factor": 2.0,
-            "mscale": 1.5,
-            "original_max_position_embeddings": 8192
-        }
+        rope_scaling = {"factor": 2.0, "mscale": 1.5, "original_max_position_embeddings": 8192}
         config = self.create_mock_config(
             rope_scaling=rope_scaling,
-            max_position_embeddings=4096  # Less than or equal to original
+            max_position_embeddings=4096,  # Less than or equal to original
         )
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
@@ -402,16 +396,21 @@ class TestMLAForward:
         config = self.create_mock_config(q_lora_rank=None)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
-
+        with (
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear,
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms,
+            patch(
+                "nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func"
+            ) as mock_init_attn,
+        ):
             # Create mock components that return correctly shaped tensors
             def create_mock_linear(in_features, out_features, *args, **kwargs):
                 mock = Mock()
                 mock.weight = torch.randn(out_features, in_features)
+
                 def forward_func(x):
                     return torch.randn(*x.shape[:-1], out_features)
+
                 mock.side_effect = forward_func
                 return mock
 
@@ -439,10 +438,13 @@ class TestMLAForward:
         config = self.create_mock_config(q_lora_rank=512)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
-
+        with (
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear,
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms,
+            patch(
+                "nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func"
+            ) as mock_init_attn,
+        ):
             mock_init_linear.return_value = Mock()
             mock_init_rms.return_value = Mock()
             mock_init_attn.return_value = (Mock(), Mock())
@@ -451,21 +453,26 @@ class TestMLAForward:
 
             # Verify q_lora configuration was set up correctly
             assert mla.q_lora_rank == 512
-            assert hasattr(mla, 'q_a_proj')
-            assert hasattr(mla, 'q_b_proj')
-            assert hasattr(mla, 'q_a_layernorm')
-            assert not hasattr(mla, 'q_proj')
+            assert hasattr(mla, "q_a_proj")
+            assert hasattr(mla, "q_b_proj")
+            assert hasattr(mla, "q_a_layernorm")
+            assert not hasattr(mla, "q_proj")
 
     def test_mla_preprocess_integration(self):
         # Test that MLA correctly integrates with preprocess function
         config = self.create_mock_config(q_lora_rank=None)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.preprocess_args_and_kwargs_for_attn") as mock_preprocess:
-
+        with (
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear,
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms,
+            patch(
+                "nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func"
+            ) as mock_init_attn,
+            patch(
+                "nemo_automodel.components.models.deepseek_v3.layers.preprocess_args_and_kwargs_for_attn"
+            ) as mock_preprocess,
+        ):
             # Setup all the initialize mocks
             mock_init_linear.return_value = Mock()
             mock_init_rms.return_value = Mock()
@@ -476,7 +483,7 @@ class TestMLAForward:
                 torch.randn(2, 16, 8, 64),  # q (SDPA format)
                 torch.randn(2, 16, 8, 64),  # k
                 torch.randn(2, 16, 8, 64),  # v
-                {"is_causal": True}
+                {"is_causal": True},
             )
 
             mla = MLA(config, backend)
@@ -527,10 +534,13 @@ class TestMLAInitWeights:
         config = self.create_mock_config(q_lora_rank=None)
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
-
+        with (
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear,
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms,
+            patch(
+                "nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func"
+            ) as mock_init_attn,
+        ):
             mock_linear = Mock()
             mock_linear.weight = torch.randn(64, 1024)
             mock_linear.reset_parameters = Mock()
@@ -561,10 +571,13 @@ class TestMLAInitWeights:
         config = self.create_mock_config(q_lora_rank=512)
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
-
+        with (
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear,
+            patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms,
+            patch(
+                "nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func"
+            ) as mock_init_attn,
+        ):
             mock_linear = Mock()
             mock_linear.weight = torch.randn(64, 1024)
             mock_linear.reset_parameters = Mock()

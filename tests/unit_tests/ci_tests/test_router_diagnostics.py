@@ -13,15 +13,76 @@
 # limitations under the License.
 
 import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
+from torch import nn
 
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import Gate
 from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
-    _token_kl,
+    _flip_pair_bias_directions,
+    capture_glm_automodel_routers,
+    capture_glm_hf_routers,
     compare_glm_router_captures,
     summarize_glm_router_shape_captures,
 )
+
+
+class Glm4MoeLiteMoE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(n_group=1)
+        self.gate = SimpleNamespace(e_score_correction_bias=torch.zeros(3))
+
+    def route_tokens_to_experts(self, router_logits):
+        return router_logits.topk(1, dim=-1).indices, torch.ones_like(router_logits[..., :1])
+
+
+class _HfRouterModel(nn.Module):
+    def __init__(self, *, include_invalid_name: bool = False):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="glm4_moe_lite")
+        self.layers = nn.ModuleDict({"0": Glm4MoeLiteMoE()})
+        if include_invalid_name:
+            self.orphan_router = Glm4MoeLiteMoE()
+
+
+class _GateBlock(nn.Module):
+    def __init__(self, gate: Gate):
+        super().__init__()
+        self.gate = gate
+
+
+class _AutoModelRouterModel(nn.Module):
+    def __init__(self, gate: Gate):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="glm4_moe_lite")
+        self.layers = nn.ModuleDict({"0": _GateBlock(gate)})
+
+
+def _gate() -> Gate:
+    config = MoEConfig(
+        n_routed_experts=3,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=False,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="sigmoid",
+        route_scale=1.0,
+        dim=4,
+        inter_dim=8,
+        moe_inter_dim=8,
+        norm_topk_prob=False,
+        force_e_score_correction_bias=True,
+        dtype=torch.float32,
+    )
+    return Gate(config, gate_precision=torch.float32)
 
 
 def _capture(router_logits, indices):
@@ -41,6 +102,70 @@ def _capture(router_logits, indices):
     }
 
 
+def test_hf_capture_validates_all_modules_before_patching(tmp_path):
+    model = _HfRouterModel(include_invalid_name=True)
+    router = model.layers["0"]
+
+    with pytest.raises(ValueError, match="transformer layer index"):
+        with capture_glm_hf_routers(model, tmp_path / "capture.pt"):
+            pass
+
+    assert "route_tokens_to_experts" not in router.__dict__
+
+
+def test_hf_capture_rejects_missing_router_on_nonzero_rank_path(tmp_path):
+    model = nn.Module()
+    model.config = SimpleNamespace(model_type="glm4_moe_lite")
+
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.router_diagnostics._rank0",
+        return_value=False,
+    ):
+        with pytest.raises(ValueError, match="No vanilla-HF"):
+            with capture_glm_hf_routers(model, tmp_path / "capture.pt"):
+                pass
+
+
+@pytest.mark.parametrize("nonfinite", [float("inf"), float("nan")])
+def test_hf_capture_rejects_nonfinite_router_values_and_restores_patch(tmp_path, nonfinite):
+    model = _HfRouterModel()
+    router = model.layers["0"]
+
+    with pytest.raises(ValueError, match="non-finite router_logits"):
+        with capture_glm_hf_routers(model, tmp_path / "capture.pt"):
+            router.route_tokens_to_experts(torch.tensor([[nonfinite, 0.0, 1.0]]))
+
+    assert "route_tokens_to_experts" not in router.__dict__
+
+
+def test_automodel_capture_wraps_cuda_graph_routing_core(tmp_path):
+    gate = _gate()
+    gate.use_routing_core = True
+    model = _AutoModelRouterModel(gate)
+    capture_path = tmp_path / "capture.pt"
+
+    with capture_glm_automodel_routers(model, capture_path):
+        gate(torch.randn(2, 4), torch.ones(2, dtype=torch.bool), None)
+
+    capture = torch.load(capture_path, map_location="cpu", weights_only=True)
+    assert capture["model_family"] == "glm4_moe_lite"
+    assert capture["layers"][0]["indices"].shape == (2, 1)
+    assert "forward" not in gate.routing_core.__dict__
+
+
+def test_flip_bias_direction_vectorization_counts_added_dropped_pairs():
+    summary = _flip_pair_bias_directions(
+        torch.tensor([[0, 1], [1, 2]]),
+        torch.tensor([[0, 2], [0, 2]]),
+        torch.tensor([0.5, 0.2, 0.8]),
+        torch.tensor([True, True]),
+    )
+
+    assert summary["added_bias_greater_count"] == 2
+    assert summary["added_bias_equal_count"] == 0
+    assert summary["added_bias_less_count"] == 0
+
+
 def test_router_report_separates_natural_floor_from_routed_tail(tmp_path, capsys):
     hf_path = tmp_path / "hf.pt"
     automodel_path = tmp_path / "automodel.pt"
@@ -52,9 +177,9 @@ def test_router_report_separates_natural_floor_from_routed_tail(tmp_path, capsys
     candidate_logits[:, 1, :] = -candidate_logits[:, 1, :]
 
     report = compare_glm_router_captures(
-        hf_path,
-        automodel_path,
-        report_path,
+        hf_path=hf_path,
+        automodel_path=automodel_path,
+        report_path=report_path,
         reference_logits=reference_logits,
         candidate_logits=candidate_logits,
     )
@@ -96,8 +221,8 @@ def test_router_shape_report_attributes_kl_to_sustained_self_flips(tmp_path):
     candidate_logits[:, 1, :] = -candidate_logits[:, 1, :]
 
     report = summarize_glm_router_shape_captures(
-        base_path,
-        standalone_path,
+        base_path=base_path,
+        standalone_path=standalone_path,
         reference_logits=reference_logits,
         candidate_logits=candidate_logits,
     )
@@ -118,9 +243,9 @@ def test_router_report_handles_all_zero_logit_cosine(tmp_path):
     final_logits = torch.tensor([[[0.0, 0.0]]])
 
     report = compare_glm_router_captures(
-        hf_path,
-        automodel_path,
-        report_path,
+        hf_path=hf_path,
+        automodel_path=automodel_path,
+        report_path=report_path,
         reference_logits=final_logits,
         candidate_logits=final_logits.clone(),
     )
@@ -138,9 +263,9 @@ def test_router_report_handles_one_zero_logit_cosine(tmp_path):
     final_logits = torch.tensor([[[0.0, 0.0]]])
 
     report = compare_glm_router_captures(
-        hf_path,
-        automodel_path,
-        report_path,
+        hf_path=hf_path,
+        automodel_path=automodel_path,
+        report_path=report_path,
         reference_logits=final_logits,
         candidate_logits=final_logits.clone(),
     )
@@ -163,18 +288,9 @@ def test_router_report_rejects_equal_numel_shape_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="Router capture shape mismatch"):
         compare_glm_router_captures(
-            hf_path,
-            automodel_path,
-            report_path,
+            hf_path=hf_path,
+            automodel_path=automodel_path,
+            report_path=report_path,
             reference_logits=final_logits,
             candidate_logits=final_logits.clone(),
         )
-
-
-@pytest.mark.parametrize("nonfinite", [float("inf"), float("nan")])
-def test_token_kl_rejects_nonfinite_logits(nonfinite):
-    reference_logits = torch.tensor([[[0.0, nonfinite]]])
-    candidate_logits = torch.zeros_like(reference_logits)
-
-    with pytest.raises(ValueError, match="non-finite"):
-        _token_kl(reference_logits, candidate_logits)

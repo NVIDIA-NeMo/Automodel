@@ -108,13 +108,13 @@ def _validate_logits(logits: torch.Tensor, *, chunk_tokens: int = 16) -> tuple[i
     return token_count, vocab_size
 
 
-def _compute_parity_metrics(
+def _compute_parity_metrics_with_token_kl(
     reference_logits: torch.Tensor,
     candidate_logits: torch.Tensor,
     *,
     chunk_tokens: int = 16,
-) -> _ParityMetrics:
-    """Compute bounded-memory statistics over two complete logit tensors.
+) -> tuple[_ParityMetrics, torch.Tensor]:
+    """Compute bounded-memory statistics and per-token KL over two logit tensors.
 
     Args:
         reference_logits: Reference tensor of shape [..., vocab], with arbitrary leading token dimensions.
@@ -122,7 +122,8 @@ def _compute_parity_metrics(
         chunk_tokens: Number of flattened tokens processed together. This bounds temporary softmax memory.
 
     Returns:
-        Scalar statistics over every token and vocabulary element. Returned values do not alias the inputs.
+        Scalar statistics over every token and vocabulary element plus a CPU tensor of shape ``[tokens]`` containing
+        per-token KL. Returned values do not alias the inputs.
     """
     if reference_logits.shape != candidate_logits.shape:
         raise ValueError(
@@ -195,19 +196,37 @@ def _compute_parity_metrics(
     else:
         cosine_similarity = dot_product / norm_product
 
-    return _ParityMetrics(
-        token_count=token_count,
-        vocab_size=vocab_size,
-        mean_kl=per_token_kl.mean().item(),
-        p95_kl=torch.quantile(per_token_kl, 0.95).item(),
-        max_kl=per_token_kl.max().item(),
-        mean_jsd=per_token_jsd.mean().item(),
-        p95_jsd=torch.quantile(per_token_jsd, 0.95).item(),
-        max_jsd=per_token_jsd.max().item(),
-        cosine_similarity=cosine_similarity,
-        mean_absolute_logit_difference=absolute_difference_sum / reference_logits.numel(),
-        max_absolute_logit_difference=max_absolute_difference,
+    return (
+        _ParityMetrics(
+            token_count=token_count,
+            vocab_size=vocab_size,
+            mean_kl=per_token_kl.mean().item(),
+            p95_kl=torch.quantile(per_token_kl, 0.95).item(),
+            max_kl=per_token_kl.max().item(),
+            mean_jsd=per_token_jsd.mean().item(),
+            p95_jsd=torch.quantile(per_token_jsd, 0.95).item(),
+            max_jsd=per_token_jsd.max().item(),
+            cosine_similarity=cosine_similarity,
+            mean_absolute_logit_difference=absolute_difference_sum / reference_logits.numel(),
+            max_absolute_logit_difference=max_absolute_difference,
+        ),
+        per_token_kl,
     )
+
+
+def _compute_parity_metrics(
+    reference_logits: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    *,
+    chunk_tokens: int = 16,
+) -> _ParityMetrics:
+    """Compute bounded-memory scalar statistics over two complete logit tensors."""
+    metrics, _per_token_kl = _compute_parity_metrics_with_token_kl(
+        reference_logits,
+        candidate_logits,
+        chunk_tokens=chunk_tokens,
+    )
+    return metrics
 
 
 def _resolve_parity_thresholds(profile: str, comparison_kind: _ComparisonKind) -> _ParityThresholds:

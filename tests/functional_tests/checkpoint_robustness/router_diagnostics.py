@@ -24,8 +24,11 @@ from typing import Iterator
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
+
+from tests.functional_tests.checkpoint_robustness.parity_metrics import _compute_parity_metrics_with_token_kl
+
+_SUPPORTED_MODEL_FAMILY = "glm4_moe_lite"
 
 
 def _rank0() -> bool:
@@ -54,22 +57,46 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _persist_capture(path: Path, framework: str, captures: dict[int, dict[str, object]]) -> None:
+def _model_family(model: torch.nn.Module) -> str:
+    """Return and validate the model family supported by router diagnostics."""
+    model_family = getattr(getattr(model, "config", None), "model_type", None)
+    if model_family != _SUPPORTED_MODEL_FAMILY:
+        raise ValueError(
+            "capture_router_diagnostics currently supports only model_type="
+            f"{_SUPPORTED_MODEL_FAMILY!r}, got {model_family!r}"
+        )
+    return model_family
+
+
+def _persist_capture(
+    path: Path,
+    framework: str,
+    model_family: str,
+    captures: dict[int, dict[str, object]],
+) -> None:
     """Persist router tensors captured for each transformer layer.
 
     Args:
         path: Destination path for the serialized capture.
         framework: Framework label stored in the capture metadata.
+        model_family: Validated checkpoint model-family label.
         captures: Per-layer mappings containing router logits of shape [tokens, experts], correction bias of shape
             [experts], and selected indices of shape [tokens, top_k]. Arbitrary leading token dimensions are retained
             until comparison.
     """
     if not captures:
         raise RuntimeError(f"No {framework} GLM router calls were captured")
+    for layer_index, layer in captures.items():
+        for field in ("router_logits", "correction_bias"):
+            tensor = _local_tensor(layer[field])
+            if not bool(torch.isfinite(tensor).all()):
+                raise ValueError(
+                    f"{framework} router capture contains non-finite {field} values in layer {layer_index}"
+                )
     payload = {
         "schema_version": 1,
         "framework": framework,
-        "model_family": "glm4_moe_lite",
+        "model_family": model_family,
         "layers": {
             layer_index: {
                 "router_logits": _local_tensor(layer["router_logits"]).to(device="cpu", dtype=torch.float32),
@@ -98,56 +125,44 @@ def capture_glm_hf_routers(model: torch.nn.Module, output_path: Path) -> Iterato
     Yields:
         Control to exactly one model forward.
     """
+    model_family = _model_family(model)
+    matched_modules = [
+        (module, _layer_index(module_name))
+        for module_name, module in model.named_modules()
+        if module.__class__.__name__ == "Glm4MoeLiteMoE"
+    ]
+    if not matched_modules:
+        raise ValueError("No vanilla-HF Glm4MoeLiteMoE router modules were found")
     if not _rank0():
         yield
         return
 
     captures: dict[int, dict[str, object]] = {}
     patched_modules: list[tuple[torch.nn.Module, bool, object | None]] = []
-    for module_name, module in model.named_modules():
-        if module.__class__.__name__ != "Glm4MoeLiteMoE":
-            continue
-        layer_index = _layer_index(module_name)
-        original_route = module.route_tokens_to_experts
-        had_instance_override = "route_tokens_to_experts" in module.__dict__
-        original_instance_value = module.__dict__.get("route_tokens_to_experts")
-
-        def capture_route(self, router_logits, *args, _original=original_route, _layer=layer_index, **kwargs):
-            """Capture one vanilla-HF router invocation.
-
-            Args:
-                self: Vanilla-HF MoE module owning the router.
-                router_logits: Router logits of shape [..., experts], with arbitrary leading token dimensions.
-                *args: Additional arguments forwarded unchanged to the original router.
-                _original: Bound original routing method.
-                _layer: Transformer layer index associated with this router.
-                **kwargs: Additional keyword arguments forwarded unchanged to the original router.
-
-            Returns:
-                Original router result containing expert indices and weights of shape [..., top_k].
-            """
-            result = _original(router_logits, *args, **kwargs)
-            indices, _weights = result
-            correction_bias = self.gate.e_score_correction_bias
-            if correction_bias is None:
-                correction_bias = torch.zeros(router_logits.shape[-1], device=router_logits.device)
-            captures[_layer] = {
-                "router_logits": router_logits.detach(),
-                "correction_bias": correction_bias.detach(),
-                "indices": indices.detach(),
-                "score_func": "sigmoid",
-                "n_groups": int(getattr(self.config, "n_group", 1)),
-            }
-            return result
-
-        module.route_tokens_to_experts = MethodType(capture_route, module)
-        patched_modules.append((module, had_instance_override, original_instance_value))
-
-    if not patched_modules:
-        raise ValueError("capture_router_diagnostics currently supports only vanilla-HF Glm4MoeLiteMoE models")
-
     completed = False
     try:
+        for module, layer_index in matched_modules:
+            original_route = module.route_tokens_to_experts
+            had_instance_override = "route_tokens_to_experts" in module.__dict__
+            original_instance_value = module.__dict__.get("route_tokens_to_experts")
+
+            def capture_route(self, router_logits, *args, _original=original_route, _layer=layer_index, **kwargs):
+                result = _original(router_logits, *args, **kwargs)
+                indices, _weights = result
+                correction_bias = self.gate.e_score_correction_bias
+                if correction_bias is None:
+                    correction_bias = torch.zeros(router_logits.shape[-1], device=router_logits.device)
+                captures[_layer] = {
+                    "router_logits": router_logits.detach(),
+                    "correction_bias": correction_bias.detach(),
+                    "indices": indices.detach(),
+                    "score_func": "sigmoid",
+                    "n_groups": int(getattr(self.config, "n_group", 1)),
+                }
+                return result
+
+            module.route_tokens_to_experts = MethodType(capture_route, module)
+            patched_modules.append((module, had_instance_override, original_instance_value))
         yield
         completed = True
     finally:
@@ -157,7 +172,7 @@ def capture_glm_hf_routers(model: torch.nn.Module, output_path: Path) -> Iterato
             else:
                 delattr(module, "route_tokens_to_experts")
         if completed:
-            _persist_capture(output_path, "hf", captures)
+            _persist_capture(output_path, "hf", model_family, captures)
 
 
 @contextmanager
@@ -171,67 +186,64 @@ def capture_glm_automodel_routers(model: torch.nn.Module, output_path: Path) -> 
     Yields:
         Control to exactly one model forward.
     """
+    from nemo_automodel.components.moe.layers import Gate
+
+    model_family = _model_family(model)
+    matched_gates = [
+        (module, _layer_index(module_name)) for module_name, module in model.named_modules() if isinstance(module, Gate)
+    ]
+    if not matched_gates:
+        raise ValueError("No learned AutoModel Gate router modules were found")
     if not _rank0():
         yield
         return
 
-    from nemo_automodel.components.moe.layers import Gate
-
     captures: dict[int, dict[str, object]] = {}
-    patched_gates: list[tuple[Gate, bool, object | None]] = []
-    for module_name, module in model.named_modules():
-        if not isinstance(module, Gate):
-            continue
-        layer_index = _layer_index(module_name)
-        original_route = module._route_scores
-        had_instance_override = "_route_scores" in module.__dict__
-        original_instance_value = module.__dict__.get("_route_scores")
-
-        def capture_route(self, router_logits, _original=original_route, _layer=layer_index):
-            """Capture one AutoModel router invocation.
-
-            Args:
-                self: AutoModel Gate module owning the router.
-                router_logits: Router logits of shape [..., experts], with arbitrary leading token dimensions.
-                _original: Bound original routing method.
-                _layer: Transformer layer index associated with this router.
-
-            Returns:
-                Original routing result containing scores of shape [..., experts] and selected indices of shape
-                [..., top_k].
-            """
-            result = _original(router_logits)
-            _weights, indices, _original_scores = result
-            correction_bias = self._local_score_correction_bias()
-            if correction_bias is None:
-                correction_bias = torch.zeros(router_logits.shape[-1], device=router_logits.device)
-            captures[_layer] = {
-                "router_logits": router_logits.detach(),
-                "correction_bias": correction_bias.detach(),
-                "indices": indices.detach(),
-                "score_func": self.score_func,
-                "n_groups": self.n_groups,
-            }
-            return result
-
-        module._route_scores = MethodType(capture_route, module)
-        patched_gates.append((module, had_instance_override, original_instance_value))
-
-    if not patched_gates:
-        raise ValueError("capture_router_diagnostics requires an AutoModel with learned MoE Gate modules")
-
+    patched_methods: list[tuple[torch.nn.Module, str, bool, object | None]] = []
     completed = False
     try:
+        for gate, layer_index in matched_gates:
+            target = gate.routing_core if gate.use_routing_core else gate
+            method_name = "forward" if gate.use_routing_core else "_route_scores"
+            original_route = getattr(target, method_name)
+            had_instance_override = method_name in target.__dict__
+            original_instance_value = target.__dict__.get(method_name)
+
+            def capture_route(
+                self,
+                router_logits,
+                *args,
+                _original=original_route,
+                _gate=gate,
+                _layer=layer_index,
+                **kwargs,
+            ):
+                result = _original(router_logits, *args, **kwargs)
+                _weights, indices, _original_scores = result
+                correction_bias = _gate._local_score_correction_bias()
+                if correction_bias is None:
+                    correction_bias = torch.zeros(router_logits.shape[-1], device=router_logits.device)
+                captures[_layer] = {
+                    "router_logits": router_logits.detach(),
+                    "correction_bias": correction_bias.detach(),
+                    "indices": indices.detach(),
+                    "score_func": _gate.score_func,
+                    "n_groups": _gate.n_groups,
+                }
+                return result
+
+            setattr(target, method_name, MethodType(capture_route, target))
+            patched_methods.append((target, method_name, had_instance_override, original_instance_value))
         yield
         completed = True
     finally:
-        for module, had_instance_override, original_instance_value in patched_gates:
+        for target, method_name, had_instance_override, original_instance_value in patched_methods:
             if had_instance_override:
-                module._route_scores = original_instance_value
+                setattr(target, method_name, original_instance_value)
             else:
-                delattr(module, "_route_scores")
+                delattr(target, method_name)
         if completed:
-            _persist_capture(output_path, "automodel", captures)
+            _persist_capture(output_path, "automodel", model_family, captures)
 
 
 def _quantiles(values: torch.Tensor) -> dict[str, float] | None:
@@ -254,40 +266,6 @@ def _quantiles(values: torch.Tensor) -> dict[str, float] | None:
         "p95": quantiles[3].item(),
         "max": quantiles[4].item(),
     }
-
-
-def _token_kl(reference_logits: torch.Tensor, candidate_logits: torch.Tensor) -> torch.Tensor:
-    """Compute per-token KL divergence for matching final logits.
-
-    Args:
-        reference_logits: Reference tensor of shape [..., vocab], with arbitrary leading token dimensions.
-        candidate_logits: Candidate tensor of shape [..., vocab], matching ``reference_logits`` exactly.
-
-    Returns:
-        Tensor of shape [tokens], with the leading token dimensions flattened in row-major order.
-    """
-    if reference_logits.shape != candidate_logits.shape:
-        raise ValueError(
-            f"Final-logit shape mismatch: {tuple(reference_logits.shape)} != {tuple(candidate_logits.shape)}"
-        )
-    vocab_size = reference_logits.shape[-1]
-    reference_tokens = reference_logits.detach().reshape(-1, vocab_size)
-    candidate_tokens = candidate_logits.detach().reshape(-1, vocab_size)
-    token_kl_chunks = []
-    for start in range(0, reference_tokens.shape[0], 16):
-        reference_chunk = reference_tokens[start : start + 16].float()
-        candidate_chunk = candidate_tokens[start : start + 16].float()
-        if not torch.isfinite(reference_chunk).all():
-            raise ValueError("Reference final logits contain non-finite values")
-        if not torch.isfinite(candidate_chunk).all():
-            raise ValueError("Candidate final logits contain non-finite values")
-        reference_log_probs = F.log_softmax(reference_chunk, dim=-1)
-        candidate_log_probs = F.log_softmax(candidate_chunk, dim=-1)
-        token_kl = (reference_log_probs.exp() * (reference_log_probs - candidate_log_probs)).sum(dim=-1)
-        if not torch.isfinite(token_kl).all():
-            raise ValueError("Per-token KL computation produced non-finite values")
-        token_kl_chunks.append(token_kl.cpu())
-    return torch.cat(token_kl_chunks)
 
 
 def _kl_summary(values: torch.Tensor) -> dict[str, int | float] | None:
@@ -343,24 +321,20 @@ def _flip_pair_bias_directions(
     Returns:
         Correction-bias pair counts and the fraction favoring experts added by AutoModel.
     """
-    greater_count = 0
-    equal_count = 0
-    less_count = 0
-    for token_index in route_flip_mask.nonzero(as_tuple=False).flatten().tolist():
-        hf_experts = set(hf_indices[token_index].tolist())
-        automodel_experts = set(automodel_indices[token_index].tolist())
-        dropped_experts = hf_experts - automodel_experts
-        added_experts = automodel_experts - hf_experts
-        for dropped_expert in dropped_experts:
-            for added_expert in added_experts:
-                added_bias = correction_bias[added_expert].item()
-                dropped_bias = correction_bias[dropped_expert].item()
-                if added_bias > dropped_bias:
-                    greater_count += 1
-                elif added_bias < dropped_bias:
-                    less_count += 1
-                else:
-                    equal_count += 1
+    flipped_hf_indices = hf_indices[route_flip_mask]
+    flipped_automodel_indices = automodel_indices[route_flip_mask]
+    if flipped_hf_indices.numel() == 0:
+        return _bias_direction_summary(0, 0, 0)
+
+    dropped_mask = ~(flipped_hf_indices.unsqueeze(-1) == flipped_automodel_indices.unsqueeze(-2)).any(dim=-1)
+    added_mask = ~(flipped_automodel_indices.unsqueeze(-1) == flipped_hf_indices.unsqueeze(-2)).any(dim=-1)
+    pair_mask = dropped_mask.unsqueeze(-1) & added_mask.unsqueeze(-2)
+    dropped_bias = correction_bias[flipped_hf_indices].unsqueeze(-1)
+    added_bias = correction_bias[flipped_automodel_indices].unsqueeze(-2)
+    bias_delta = added_bias - dropped_bias
+    greater_count = int(((bias_delta > 0) & pair_mask).sum().item())
+    equal_count = int(((bias_delta == 0) & pair_mask).sum().item())
+    less_count = int(((bias_delta < 0) & pair_mask).sum().item())
     return _bias_direction_summary(greater_count, equal_count, less_count)
 
 
@@ -391,10 +365,10 @@ def _combine_bias_direction_counts(counts: list[dict[str, int | float | None]]) 
 
 
 def compare_glm_router_captures(
+    *,
     hf_path: Path,
     automodel_path: Path,
     report_path: Path,
-    *,
     reference_logits: torch.Tensor,
     candidate_logits: torch.Tensor,
 ) -> dict[str, object]:
@@ -412,6 +386,14 @@ def compare_glm_router_captures(
     """
     hf_capture = torch.load(hf_path, map_location="cpu", weights_only=True)
     automodel_capture = torch.load(automodel_path, map_location="cpu", weights_only=True)
+    model_family = hf_capture.get("model_family")
+    if model_family != automodel_capture.get("model_family"):
+        raise ValueError(
+            "HF and AutoModel router capture families differ: "
+            f"{model_family!r} != {automodel_capture.get('model_family')!r}"
+        )
+    if model_family != _SUPPORTED_MODEL_FAMILY:
+        raise ValueError(f"Unsupported router capture model family {model_family!r}")
     hf_layers = hf_capture["layers"]
     automodel_layers = automodel_capture["layers"]
     if set(hf_layers) != set(automodel_layers):
@@ -469,6 +451,14 @@ def compare_glm_router_captures(
 
         hf_bias = hf_layer["correction_bias"].float()
         automodel_bias = automodel_layer["correction_bias"].float()
+        for framework, field, tensor in (
+            ("HF", "router_logits", hf_logits),
+            ("AutoModel", "router_logits", automodel_logits),
+            ("HF", "correction_bias", hf_bias),
+            ("AutoModel", "correction_bias", automodel_bias),
+        ):
+            if not bool(torch.isfinite(tensor).all()):
+                raise ValueError(f"{framework} router capture has non-finite {field} values in layer {layer_index}")
         hf_scores = hf_logits.sigmoid() + hf_bias
         automodel_scores = automodel_logits.sigmoid() + automodel_bias
         topk = hf_indices.shape[-1]
@@ -570,7 +560,7 @@ def compare_glm_router_captures(
         (1.0 if logit_abs_max == 0.0 else 0.0) if cosine_denominator == 0.0 else logit_dot / cosine_denominator
     )
     assert flipped_layer_counts is not None
-    per_token_kl = _token_kl(reference_logits, candidate_logits)
+    _metrics, per_token_kl = _compute_parity_metrics_with_token_kl(reference_logits, candidate_logits)
     if per_token_kl.shape != flipped_layer_counts.shape:
         raise ValueError(
             f"Router capture has {flipped_layer_counts.numel()} tokens, but final logits have {per_token_kl.numel()}"
@@ -583,7 +573,7 @@ def compare_glm_router_captures(
     }
     report: dict[str, object] = {
         "schema_version": 2,
-        "model_family": "glm4_moe_lite",
+        "model_family": model_family,
         "comparison": "hf_source_vs_automodel_source",
         "layer_count": len(layer_metrics),
         "layer_token_count": total_layer_tokens,
@@ -653,9 +643,9 @@ def compare_glm_router_captures(
 
 
 def summarize_glm_router_shape_captures(
+    *,
     base_path: Path,
     standalone_path: Path,
-    *,
     reference_logits: torch.Tensor,
     candidate_logits: torch.Tensor,
     sustained_flip_layer_count: int = 11,
@@ -674,6 +664,14 @@ def summarize_glm_router_shape_captures(
     """
     base_capture = torch.load(base_path, map_location="cpu", weights_only=True)
     standalone_capture = torch.load(standalone_path, map_location="cpu", weights_only=True)
+    model_family = base_capture.get("model_family")
+    if model_family != standalone_capture.get("model_family"):
+        raise ValueError(
+            "Base and standalone HF router capture families differ: "
+            f"{model_family!r} != {standalone_capture.get('model_family')!r}"
+        )
+    if model_family != _SUPPORTED_MODEL_FAMILY:
+        raise ValueError(f"Unsupported router capture model family {model_family!r}")
     base_layers = base_capture["layers"]
     standalone_layers = standalone_capture["layers"]
     if set(base_layers) != set(standalone_layers):
@@ -718,7 +716,7 @@ def summarize_glm_router_shape_captures(
             early_route_flips += flip_count
 
     assert flipped_layer_counts is not None
-    per_token_kl = _token_kl(reference_logits, candidate_logits)
+    _metrics, per_token_kl = _compute_parity_metrics_with_token_kl(reference_logits, candidate_logits)
     if per_token_kl.shape != flipped_layer_counts.shape:
         raise ValueError(
             f"HF shape router capture has {flipped_layer_counts.numel()} tokens, "

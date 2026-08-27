@@ -97,6 +97,7 @@ datasets.disable_caching()
 
 _PARITY_DOCUMENT_PATH = Path(__file__).with_name("parity_document.mdx")
 _PARITY_DOCUMENT_SHA256 = "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"  # pragma: allowlist secret
+_ROUTER_DIAGNOSTIC_MODEL_TYPE = "glm4_moe_lite"
 _REMOVED_CHECKPOINT_ROBUSTNESS_FIELDS = {
     "automodel_reload_cosine_threshold",
     "automodel_reload_mean_kl_threshold",
@@ -131,6 +132,17 @@ class _LogitParityPolicy:
     p95_kl_threshold_override: float | None = None
     cosine_threshold_override: float | None = None
     gate_sequence_length: int | None = None
+
+
+def _parse_boolean_fixture_value(value: object, *, key: str) -> bool:
+    """Normalize a YAML boolean fixture value without string-truthiness surprises."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "false"}:
+            return normalized == "true"
+    raise ValueError(f"ci.checkpoint_robustness.{key} must be true or false, got {value!r}")
 
 
 def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]:
@@ -170,6 +182,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         "--skip_automodel_reload_logit_parity",
         "--skip_hf_reload_logit_parity",
     }
+    boolean_config_keys = {key.lstrip("-") for key in boolean_keys}
     custom: dict[str, object] = {}
     remaining = []
     i = 0
@@ -218,10 +231,8 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
                     # Dotted keys are config overrides (e.g. distributed.tp_size),
                     # route them to the config parser instead of the custom dict.
                     remaining.extend([f"--{k}", str(v)])
-                elif isinstance(v, bool) and (v or k == "trust_remote_code"):
-                    # ``false`` is meaningful for trust_remote_code: it must be
-                    # able to override a recipe model that normally uses remote code.
-                    custom[k] = v
+                elif k in boolean_config_keys:
+                    custom[k] = _parse_boolean_fixture_value(v, key=k)
                 elif not isinstance(v, bool):
                     custom[k] = str(v)
 
@@ -248,7 +259,9 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
     if "skip_source_load_parity" in cli_custom_keys:
         source_load_parity_enabled = False
     elif "skip_source_load_parity" in ci_robustness:
-        source_load_parity_enabled = not bool(ci_robustness["skip_source_load_parity"])
+        source_load_parity_enabled = not _parse_boolean_fixture_value(
+            ci_robustness["skip_source_load_parity"], key="skip_source_load_parity"
+        )
     else:
         source_load_parity_enabled = True
     custom["source_load_parity_enabled"] = source_load_parity_enabled
@@ -258,7 +271,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
     if "skip_resume" in cli_custom_keys:
         resume_enabled = False
     elif "skip_resume" in ci_robustness:
-        resume_enabled = not bool(ci_robustness["skip_resume"])
+        resume_enabled = not _parse_boolean_fixture_value(ci_robustness["skip_resume"], key="skip_resume")
     else:
         resume_enabled = True
     custom["resume_enabled"] = resume_enabled
@@ -771,6 +784,10 @@ def _compare_logits(
         "metrics": metrics.to_dict(),
         "gate_metrics": gate_metrics.to_dict(),
     }
+    diagnostic_keys = set(diagnostics or ())
+    diagnostic_collisions = diagnostic_keys & payload.keys()
+    if diagnostic_collisions:
+        raise ValueError(f"Diagnostic keys collide with parity record fields: {sorted(diagnostic_collisions)}")
     if diagnostics:
         payload.update(diagnostics)
     report_dir = artifact_dir / "parity_metrics"
@@ -779,7 +796,7 @@ def _compare_logits(
     temporary_report_path = report_path.with_suffix(".tmp")
     temporary_report_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary_report_path.replace(report_path)
-    logged_payload = {key: value for key, value in payload.items() if diagnostics is None or key not in diagnostics}
+    logged_payload = {key: value for key, value in payload.items() if key not in diagnostic_keys}
     if diagnostics:
         logged_payload["embedded_diagnostics"] = sorted(diagnostics)
     logged_payload["report_path"] = str(report_path)
@@ -1872,9 +1889,9 @@ def _compare_source_load_parity(
                     )
 
                     router_diagnostics = compare_glm_router_captures(
-                        hf_router_capture,
-                        automodel_router_capture,
-                        router_report,
+                        hf_path=hf_router_capture,
+                        automodel_path=automodel_router_capture,
+                        report_path=router_report,
                         reference_logits=hf_logits,
                         candidate_logits=candidate_logits,
                     )
@@ -2270,6 +2287,38 @@ def _run_hf_reload_standing_shape_diagnostic(
     )
 
 
+def _collect_hf_reload_shape_diagnostics(
+    hf_model: torch.nn.Module,
+    input_ids: list[int],
+    device: torch.device,
+    hf_logits: torch.Tensor,
+    *,
+    artifact_dir: Path,
+    custom_args: dict[str, object],
+) -> tuple[dict[str, object], str | None]:
+    """Collect optional Phase 3 shape evidence without suppressing parity output."""
+    diagnostics: dict[str, object] = {}
+    try:
+        _run_hf_reload_standing_shape_diagnostic(
+            hf_model,
+            input_ids,
+            device,
+            hf_logits,
+            artifact_dir=artifact_dir,
+            custom_args=custom_args,
+        )
+        shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_3")
+        if shape_report_path.exists():
+            diagnostics["shape_diagnostic"] = json.loads(shape_report_path.read_text())
+    except Exception as exc:
+        diagnostics["diagnostic_failure"] = {
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+        return diagnostics, traceback.format_exc()
+    return diagnostics, None
+
+
 def _run_vanilla_hf_reload(
     cfg,
     input_ids: list[int],
@@ -2402,6 +2451,7 @@ def _run_vanilla_hf_reload(
             has_device_map="device_map" in hf_kwargs,
         )
 
+        diagnostic_failure = None
         if is_peft:
             from peft import PeftModel
 
@@ -2458,7 +2508,7 @@ def _run_vanilla_hf_reload(
                 ),
             )
             del repeated_hf_logits
-            _run_hf_reload_standing_shape_diagnostic(
+            diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
                 peft_model,
                 input_ids,
                 device,
@@ -2511,7 +2561,7 @@ def _run_vanilla_hf_reload(
                 ),
             )
             del repeated_hf_logits
-            _run_hf_reload_standing_shape_diagnostic(
+            diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
                 hf_model,
                 input_ids,
                 device,
@@ -2521,10 +2571,6 @@ def _run_vanilla_hf_reload(
             )
             del hf_model
 
-        diagnostics: dict[str, object] = {}
-        shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_3")
-        if shape_report_path.exists():
-            diagnostics["shape_diagnostic"] = json.loads(shape_report_path.read_text())
         hf_reload_error = _compare_logits(
             artifact_dir,
             reference_logits,
@@ -2534,7 +2580,12 @@ def _run_vanilla_hf_reload(
         )
         del hf_logits
         _release_model_memory()
-        return hf_reload_error
+        failures = []
+        if hf_reload_error is not None:
+            failures.append(hf_reload_error)
+        if diagnostic_failure is not None:
+            failures.append(f"Phase 3 diagnostics failed:\n{diagnostic_failure}")
+        return "\n".join(failures) if failures else None
     except Exception as exc:
         _release_model_memory()
         return f"Vanilla HF reload failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
@@ -2586,14 +2637,35 @@ def _router_diagnostic_capture_context(
 
 
 def _validate_router_diagnostic_config(cfg, custom_args: dict[str, object]) -> None:
-    """Reject router capture for unsupported pipeline-parallel execution."""
+    """Reject router capture for unsupported model families and pipeline execution."""
     if not custom_args.get("capture_router_diagnostics", False):
         return
-    pp_size = int(getattr(cfg.distributed, "pp_size", 1))
+    distributed_config = getattr(cfg, "distributed", None)
+    pp_size = int(getattr(distributed_config, "pp_size", 1))
     if pp_size > 1:
         raise ValueError(
             "capture_router_diagnostics does not support pipeline parallelism because global rank 0 owns only "
             f"one local pipeline stage; set distributed.pp_size=1 or disable capture (got pp_size={pp_size})"
+        )
+    model_kwargs = _model_kwargs_from_config(cfg.model)
+    pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
+    configured_trust_remote_code = custom_args.get("trust_remote_code")
+    trust_remote_code = (
+        bool(model_kwargs.get("trust_remote_code", False))
+        if configured_trust_remote_code is None
+        else bool(configured_trust_remote_code)
+    )
+    model_config = _load_hf_config(
+        pretrained_path,
+        trust_remote_code=trust_remote_code,
+        revision=model_kwargs.get("revision"),
+        token=model_kwargs.get("token"),
+    )
+    model_type = getattr(model_config, "model_type", None)
+    if model_type != _ROUTER_DIAGNOSTIC_MODEL_TYPE:
+        raise ValueError(
+            "capture_router_diagnostics currently supports only model_type="
+            f"{_ROUTER_DIAGNOSTIC_MODEL_TYPE!r}, got {model_type!r}"
         )
 
 
@@ -2649,8 +2721,8 @@ def _run_hf_shape_diagnostic(
             )
 
             router_summaries[sequence_length] = summarize_glm_router_shape_captures(
-                hf_router_capture,
-                router_capture_path,
+                base_path=hf_router_capture,
+                standalone_path=router_capture_path,
                 reference_logits=base_logits[..., :sequence_length, :],
                 candidate_logits=candidate_logits,
             )

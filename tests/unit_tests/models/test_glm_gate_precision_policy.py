@@ -84,3 +84,8 @@ def test_glm_gate_precision_respects_explicit_override(model_cls, inner_model_pa
     assert model.backend is backend
     assert model.backend.gate_precision is torch.bfloat16
     assert inner_model_cls.call_args.kwargs["backend"] is backend
+
+
+@pytest.mark.parametrize("model_cls", [Glm4MoeForCausalLM, Glm4MoeLiteForCausalLM, GlmMoeDsaForCausalLM])
+def test_glm_preserves_score_correction_bias_in_fp32(model_cls):
+    assert "e_score_correction_bias" in model_cls._keep_in_fp32_modules_strict
