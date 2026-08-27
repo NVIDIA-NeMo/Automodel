@@ -118,14 +118,12 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
-  time: "00:15:00"
+  time: "00:30:00"
   node_multiplier: true
   vllm_deploy: true
   vllm_smoke_test: true
   checkpoint_robustness:
-    hf_kl_threshold: 1e-1
     tokenizer_name: openai/gpt-oss-20b
     check_phantom_keys: true
-    no_check_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500

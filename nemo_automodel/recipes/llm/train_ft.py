@@ -719,7 +719,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     dp_world_size=self._get_dp_group_size(),
                     pp_enabled=self.pp_enabled,
                     supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
-                    cp_size=self.cfg.get("distributed.cp_size", 1),
+                    # Models that own their CP shard the packed row contiguously;
+                    # per-document CP padding is a TE blockdiag concern and would
+                    # make pack composition depend on the topology.
+                    cp_size=(
+                        1
+                        if getattr(self.model_parts[0], "_owns_cp_attention", False)
+                        else self.cfg.get("distributed.cp_size", 1)
+                    ),
                     attn_implementation=attn_implementation,
                     collate_wrapper=collate_wrapper,
                 )

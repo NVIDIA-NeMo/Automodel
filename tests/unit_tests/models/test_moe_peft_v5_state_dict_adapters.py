@@ -108,6 +108,9 @@ def _make_adapter_and_state(family: str, rank: int):
         adapter = NemotronV3StateDictAdapter(
             SimpleNamespace(num_hidden_layers=1), moe_config, backend, dtype=torch.float32
         )
+        # This fixture uses Transformers v5's native ``model.*`` hierarchy;
+        # remote-code Nemotron-H checkpoints instead select ``backbone.*``.
+        adapter._uses_model_prefix = True
         expert_path = "mixer.experts"
 
     base = f"base_model.model.model.layers.0.{expert_path}"

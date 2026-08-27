@@ -83,6 +83,9 @@ _DOC_ARCH_ALIASES = {
     # Qwen3.5-VL page.
     "Qwen3_5ForCausalLM": "Qwen3.5",
     "Qwen3_5ForConditionalGeneration": "Qwen3.5",
+    # Legacy checkpoint architecture name for the renamed Qwen3.8-Flash-Next
+    # implementation, documented under its current architecture name.
+    "Qwen4ExpForConditionalGeneration": "Qwen3_8_FlashNextForConditionalGeneration",
     # HF split Seed-OSS into its own arch; the Seed page (``seed.mdx``) covers
     # both Seed-Coder and Seed-OSS under the "Seed-OSS" name.
     "SeedOssForCausalLM": "Seed-OSS",

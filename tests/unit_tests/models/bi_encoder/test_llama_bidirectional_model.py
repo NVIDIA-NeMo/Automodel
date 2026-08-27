@@ -17,6 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -32,6 +33,7 @@ from nemo_automodel.retrieval.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
+    _register_with_hf_auto_classes,
 )
 
 
@@ -89,6 +91,44 @@ def test_llama_bidirectional_config_fields():
     assert cfg.pooling == "cls"
     # Some downstream configs may overwrite; just ensure attribute exists and is float-like
     assert isinstance(cfg.temperature, float)
+
+
+def test_llama_bidirectional_sequence_classification_auto_class_registration():
+    config = LlamaBidirectionalConfig(
+        vocab_size=64,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        intermediate_size=32,
+        num_labels=2,
+    )
+
+    model = AutoModelForSequenceClassification.from_config(config)
+
+    assert isinstance(model, LlamaBidirectionalForSequenceClassification)
+
+
+def test_llama_bidirectional_auto_class_registration_ignores_duplicate_errors(monkeypatch):
+    calls = []
+
+    def duplicate_register(name):
+        def register(*args, **kwargs):
+            calls.append(name)
+            raise ValueError("already registered")
+
+        return register
+
+    monkeypatch.setattr(AutoConfig, "register", duplicate_register("config"))
+    monkeypatch.setattr(AutoModel, "register", duplicate_register("model"))
+    monkeypatch.setattr(
+        AutoModelForSequenceClassification,
+        "register",
+        duplicate_register("sequence_classification"),
+    )
+
+    _register_with_hf_auto_classes()
+
+    assert calls == ["config", "model", "sequence_classification"]
 
 
 def test_llama_bidirectional_model_init_and_mask():
