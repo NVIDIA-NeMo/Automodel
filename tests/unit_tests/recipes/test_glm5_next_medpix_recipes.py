@@ -19,6 +19,7 @@ def test_glm5_next_medpix_ep72_cp2_recipe_contract():
 
     assert recipe["recipe"] == "FinetuneRecipeForVLM"
     assert recipe["model"]["pretrained_model_name_or_path"] == "zai-org/GLM-5.3-Flash"
+    assert recipe["model"]["backend"]["attn"] == "cudnn"
     assert recipe["processor"]["_target_"].endswith("build_glm5_next_processor")
     assert recipe["dataset"] == {
         "_target_": "nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset",
@@ -39,7 +40,7 @@ def test_glm5_next_medpix_ep72_cp2_recipe_contract():
     assert recipe["packed_sequence"]["max_length"] == 2048
     assert recipe["packed_sequence"]["pack_size"] == 2048
     assert recipe["packed_sequence"]["collate_max_length"] == 2048
-    assert recipe["wandb"]["enable"] is True
+    assert recipe["wandb"]["enable"] is False
     assert recipe["wandb"]["name"] == "glm5_3_flash_medpix_packed2k_ep72_cp2_100steps"
     assert "ep72" in recipe["wandb"]["tags"]
     assert "cp2" in recipe["wandb"]["tags"]

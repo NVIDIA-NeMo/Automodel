@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import pytest
 import torch
 
 from nemo_automodel._transformers.capabilities import ModelSupports
@@ -10,7 +11,40 @@ from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextSparseAttention,
 )
 from nemo_automodel.components.models.glm5_next.model import build_glm5_next_moe_config
-from tests.unit_tests.models.glm5_next.conftest import tiny_glm5_next_config, tiny_glm5_next_model
+from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config, tiny_glm5_next_model
+
+
+def _torch_sparse_latent_attention(
+    query: torch.Tensor,
+    latent_kv: torch.Tensor,
+    indices: torch.Tensor,
+    softmax_scale: float,
+    *,
+    all_rows_nonempty: bool,
+) -> torch.Tensor:
+    """Reference absorbed sparse attention used by the GLM-5.3 dispatch test.
+
+    Args:
+        query: Absorbed query tensor with shape ``[queries, heads, latent_dim]``.
+        latent_kv: Shared latent K/V tensor with shape ``[keys, 1, latent_dim]``.
+        indices: Document-local sparse indices with shape
+            ``[queries, 1, sparse_width]``.
+        softmax_scale: Scale applied to query-key scores.
+        all_rows_nonempty: Whether every query has at least one selected key.
+
+    Returns:
+        Latent attention output with shape ``[queries, heads, latent_dim]``.
+    """
+    assert all_rows_nonempty
+    rows = []
+    for row in range(query.shape[0]):
+        selected = indices[row, 0]
+        selected = selected[(selected >= 0) & (selected < latent_kv.shape[0])].unique(sorted=True)
+        assert selected.numel() > 0
+        keys = latent_kv.index_select(0, selected.long()).squeeze(1)
+        scores = torch.matmul(query[row].float(), keys.float().transpose(0, 1)) * softmax_scale
+        rows.append(torch.matmul(scores.softmax(dim=-1), keys.float()).to(query.dtype))
+    return torch.stack(rows)
 
 
 def test_tiny_hybrid_packed_forward_backward_is_finite():
@@ -73,6 +107,49 @@ def test_sparse_indexer_prepares_document_pools_once_across_query_chunks():
 
     assert output.shape == (1, 6, 16)
     assert calls == 1
+
+
+def test_cudnn_sparse_attention_matches_sdpa_absorbed_math(monkeypatch):
+    """The cuDNN dispatch preserves GLM-5.3 forward and gradient math."""
+    torch.manual_seed(19)
+    config = tiny_glm5_next_config().text_config
+    config.kv_lora_rank = 512
+    sdpa_backend = tiny_backend()
+    cudnn_backend = tiny_backend()
+    cudnn_backend.attn = "cudnn"
+    sdpa = Glm5NextSparseAttention(config, layer_idx=3, backend=sdpa_backend)
+    cudnn = Glm5NextSparseAttention(config, layer_idx=3, backend=cudnn_backend)
+    sdpa.init_weights(torch.device("cpu"), init_std=0.02)
+    cudnn.load_state_dict(sdpa.state_dict())
+
+    monkeypatch.setattr(glm5_next_layers, "is_cudnn_sparse_attention_available", lambda: True)
+    monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", _torch_sparse_latent_attention)
+
+    sdpa_input = torch.randn(1, 6, config.hidden_size, requires_grad=True)
+    cudnn_input = sdpa_input.detach().clone().requires_grad_(True)
+    sdpa_output = sdpa._forward_document(sdpa_input, 0, 6)
+    cudnn_output = cudnn._forward_document(cudnn_input, 0, 6)
+    upstream = torch.randn_like(sdpa_output)
+    (sdpa_output * upstream).sum().backward()
+    (cudnn_output * upstream).sum().backward()
+
+    torch.testing.assert_close(cudnn_output, sdpa_output, rtol=2e-4, atol=2e-6)
+    torch.testing.assert_close(cudnn_input.grad, sdpa_input.grad, rtol=5e-4, atol=2e-6)
+    for name in ("q_b_proj.weight", "kv_a_proj_with_mqa.weight", "kv_b_proj.weight"):
+        sdpa_grad = dict(sdpa.named_parameters())[name].grad
+        cudnn_grad = dict(cudnn.named_parameters())[name].grad
+        torch.testing.assert_close(cudnn_grad, sdpa_grad, rtol=5e-4, atol=2e-6)
+
+
+def test_cudnn_sparse_attention_rejects_dropout():
+    config = tiny_glm5_next_config().text_config
+    config.kv_lora_rank = 512
+    config.attention_dropout = 0.1
+    backend = tiny_backend()
+    backend.attn = "cudnn"
+
+    with pytest.raises(ValueError, match="does not support attention dropout"):
+        Glm5NextSparseAttention(config, layer_idx=3, backend=backend)
 
 
 def test_sparse_attention_empty_cp_shard_keeps_gather_backward_live(monkeypatch):
@@ -150,6 +227,7 @@ def test_hybrid_layer_pattern_and_parallel_capabilities():
     assert supports.supports_cp
     assert supports.supports_sequence_packing
     assert supports.supports_cp_with_sequence_packing
+    assert "cudnn" in model._packed_cp_attn_backends
 
 
 def test_hyperconnection_fp32_parameters_have_a_dedicated_fsdp_holder():

@@ -212,7 +212,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     _skip_init_weights_on_load = True
     _owns_cp_attention = True
     _owns_packed_attention = True
-    _packed_cp_attn_backends = ("sdpa",)
+    _packed_cp_attn_backends = ("sdpa", "cudnn")
     _keep_in_fp32_modules_strict = [
         "_fp32_params",
         "e_score_correction_bias",

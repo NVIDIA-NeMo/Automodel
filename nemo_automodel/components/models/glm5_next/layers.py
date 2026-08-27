@@ -20,6 +20,10 @@ from torch import nn
 
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.cudnn_sparse_attention import (
+    cudnn_sparse_attention,
+    is_cudnn_sparse_attention_available,
+)
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
@@ -573,16 +577,24 @@ class Glm5NextSparseAttention(nn.Module):
 
     query_chunk_size = 32
 
-    def __init__(self, config: Glm5NextTextConfig, layer_idx: int) -> None:
+    def __init__(self, config: Glm5NextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.backend = backend
         self.num_heads = config.num_attention_heads
         self.q_lora_rank = config.q_lora_rank
         self.qk_head_dim = config.qk_nope_head_dim
         self.v_head_dim = config.v_head_dim
         self.kv_lora_rank = config.kv_lora_rank
         self.scaling = self.qk_head_dim**-0.5
+        if backend.attn == "cudnn" and self.kv_lora_rank != 512:
+            raise ValueError(f"GLM-5.3 cuDNN sparse attention requires kv_lora_rank=512, got {self.kv_lora_rank}.")
+        if backend.attn == "cudnn" and config.attention_dropout != 0.0:
+            raise ValueError(
+                "GLM-5.3 cuDNN sparse attention does not support attention dropout; "
+                f"got attention_dropout={config.attention_dropout}."
+            )
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.q_a_proj = nn.Linear(config.hidden_size, self.q_lora_rank, bias=config.attention_bias, dtype=dtype)
         self.q_a_layernorm = Glm5NextRMSNorm(self.q_lora_rank, config.rms_norm_eps, dtype)
@@ -651,13 +663,33 @@ class Glm5NextSparseAttention(nn.Module):
         return output
 
     def _forward_document(self, full_hidden: torch.Tensor, query_start: int, query_end: int) -> torch.Tensor:
-        """Execute one unpadded document, returning only ``[query_start:query_end]``."""
+        """Execute sparse attention for a local query interval of one full document.
+
+        Args:
+            full_hidden: Unpadded document states with shape ``[1, key_tokens, hidden]``.
+            query_start: Inclusive document-local index of the first local query.
+            query_end: Exclusive document-local index of the final local query.
+
+        Returns:
+            Projected attention output with shape
+            ``[1, query_end - query_start, hidden]``.
+        """
         length = full_hidden.shape[1]
         latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(full_hidden))
+        pool_keys, pool_indices = self.indexer.prepare_pools(full_hidden)
+        if self.backend.attn == "cudnn":
+            return self._forward_document_cudnn(
+                full_hidden,
+                latent,
+                pool_keys,
+                pool_indices,
+                query_start,
+                query_end,
+            )
+
         expanded = self.kv_b_proj(latent).view(1, length, self.num_heads, self.qk_head_dim + self.v_head_dim)
         key, value = expanded.split([self.qk_head_dim, self.v_head_dim], dim=-1)
         key, value = key.transpose(1, 2), value.transpose(1, 2)
-        pool_keys, pool_indices = self.indexer.prepare_pools(full_hidden)
         chunks = []
         for start in range(query_start, query_end, self.query_chunk_size):
             end = min(start + self.query_chunk_size, query_end)
@@ -689,6 +721,74 @@ class Glm5NextSparseAttention(nn.Module):
             chunks.append(attn.transpose(1, 2).reshape(1, end - start, -1))
         return self.o_proj(torch.cat(chunks, dim=1))
 
+    def _forward_document_cudnn(
+        self,
+        full_hidden: torch.Tensor,
+        latent: torch.Tensor,
+        pool_keys: torch.Tensor,
+        pool_indices: torch.Tensor,
+        query_start: int,
+        query_end: int,
+    ) -> torch.Tensor:
+        """Run absorbed latent attention through FlashMLA/cuDNN for one document.
+
+        Args:
+            full_hidden: Unpadded document states with shape ``[1, key_tokens, hidden]``.
+            latent: Normalized shared latent K/V with shape
+                ``[1, key_tokens, 512]``.
+            pool_keys: KPool-compressed index keys with shape
+                ``[complete_pools, index_head_dim]``.
+            pool_indices: Document-local token indices with shape
+                ``[complete_pools, index_kpool]``.
+            query_start: Inclusive document-local index of the first local query.
+            query_end: Exclusive document-local index of the final local query.
+
+        Returns:
+            Projected attention output with shape
+            ``[1, query_end - query_start, hidden]``.
+        """
+        if not is_cudnn_sparse_attention_available():
+            raise RuntimeError(
+                "backend.attn='cudnn' requires the optional cuDNN sparse-attention "
+                "and FlashMLA runtimes, but they are unavailable in this environment."
+            )
+
+        weight = self.kv_b_proj.weight.view(
+            self.num_heads,
+            self.qk_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        w_kc, w_vc = weight.split([self.qk_head_dim, self.v_head_dim], dim=1)
+        absorbed_queries = []
+        selected_indices = []
+        length = full_hidden.shape[1]
+        for start in range(query_start, query_end, self.query_chunk_size):
+            end = min(start + self.query_chunk_size, query_end)
+            query_hidden = full_hidden[:, start:end]
+            q_resid = self.q_a_layernorm(self.q_a_proj(query_hidden))
+            query = self.q_b_proj(q_resid).view(1, end - start, self.num_heads, self.qk_head_dim)
+            absorbed_queries.append(torch.einsum("bqhd,hdc->bqhc", query, w_kc.to(query.dtype)).squeeze(0))
+            positions = torch.arange(start, end, device=full_hidden.device)
+            indices = self.indexer.select(
+                query_hidden,
+                q_resid,
+                positions,
+                pool_keys,
+                pool_indices,
+                length,
+            )
+            selected_indices.append(indices.squeeze(0).unsqueeze(1))
+
+        latent_output = cudnn_sparse_attention(
+            torch.cat(absorbed_queries, dim=0).contiguous(),
+            latent.squeeze(0).unsqueeze(1).contiguous(),
+            torch.cat(selected_indices, dim=0).contiguous(),
+            self.scaling,
+            all_rows_nonempty=self.indexer.always_select_tail,
+        )
+        attention_output = torch.einsum("qhc,hvc->qhv", latent_output, w_vc.to(latent_output.dtype))
+        return self.o_proj(attention_output.reshape(1, query_end - query_start, -1))
+
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
         """Initialize MLA and indexer parameters."""
@@ -718,7 +818,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.self_attn = (
             Glm5NextLinearAttention(config, layer_idx)
             if self.is_linear_attn
-            else Glm5NextSparseAttention(config, layer_idx)
+            else Glm5NextSparseAttention(config, layer_idx, backend)
         )
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.mlp = (
