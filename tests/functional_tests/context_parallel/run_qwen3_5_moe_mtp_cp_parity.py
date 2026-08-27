@@ -28,11 +28,11 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig
 
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
 from nemo_automodel.components.moe.parallelizer import apply_cp
 
 

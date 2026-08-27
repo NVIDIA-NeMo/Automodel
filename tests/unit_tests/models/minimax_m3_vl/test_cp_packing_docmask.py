@@ -24,7 +24,7 @@ group.
 
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import cp_document_ids
+from nemo_automodel._transformers.models.minimax_m3_vl.cp_sparse_attn import cp_document_ids
 
 
 def test_single_sequence_is_all_zero_docid():
@@ -108,7 +108,7 @@ class TestPackedCpCapability:
         return ModelSupports(model, types.SimpleNamespace(cp_size=8, tp_size=1, pp_size=4, ep_size=32))
 
     def test_declares_packed_and_cp_attention_ownership(self):
-        from nemo_automodel.components.models.minimax_m3_vl.model import (
+        from nemo_automodel._transformers.models.minimax_m3_vl.model import (
             MiniMaxM3SparseForConditionalGeneration,
         )
 

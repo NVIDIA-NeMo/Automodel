@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
+from nemo_automodel._transformers.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule
 from nemo_automodel.components.speculative.dflash.draft_kimi_k3 import (
     KimiK3DFlashDraftModel,

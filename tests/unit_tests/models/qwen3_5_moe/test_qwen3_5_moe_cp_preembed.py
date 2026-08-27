@@ -20,7 +20,7 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
-from nemo_automodel.components.models.qwen3_5_moe.model import (
+from nemo_automodel._transformers.models.qwen3_5_moe.model import (
     Qwen3_5MoeForConditionalGeneration,
     Qwen3_5MoeModel,
     _Qwen3_5MoeAttention,
@@ -235,7 +235,7 @@ class TestEmbedAndSpliceForCP:
         assert torch.allclose(emb[0, 0], torch.full((4,), 5.0))  # text token untouched
 
     def test_image_features_use_frame_sharding_when_active(self, monkeypatch):
-        from nemo_automodel.components.models.qwen3_5_moe import model as model_module
+        from nemo_automodel._transformers.models.qwen3_5_moe import model as model_module
 
         model = _build_model(image_token_id=99)
         model.model.visual = types.SimpleNamespace(dtype=torch.bfloat16)
@@ -261,8 +261,8 @@ class TestEmbedAndSpliceForCP:
 
 class TestPackedCPDispatch:
     def test_full_attention_routes_through_blockdiag_sdpa(self, monkeypatch):
+        from nemo_automodel._transformers.models.qwen3_next import layers as qwen3_next_layers
         from nemo_automodel.components.distributed import blockdiag_cp
-        from nemo_automodel.components.models.qwen3_next import layers as qwen3_next_layers
 
         attention = _Qwen3_5MoeAttention.__new__(_Qwen3_5MoeAttention)
         nn.Module.__init__(attention)
@@ -296,8 +296,8 @@ class TestPackedCPDispatch:
         assert calls[0][3]["is_causal"] is True
 
     def test_gdn_forward_receives_active_blockdiag_state(self, monkeypatch):
+        from nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
         from nemo_automodel.components.distributed import blockdiag_cp
-        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 
         module = CPAwareGatedDeltaNet.__new__(CPAwareGatedDeltaNet)
         nn.Module.__init__(module)

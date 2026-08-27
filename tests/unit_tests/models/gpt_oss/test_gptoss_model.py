@@ -19,8 +19,8 @@ import pytest
 import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 
@@ -581,7 +581,7 @@ class TestGptOssAttentionTHD:
 
     def test_3d_input_with_cu_seqlens_detected_as_thd(self, gpt_config, backend_config, device):
         """PP schedule produces [1, T, H] with cu_seqlens — attention must squeeze and not crash."""
-        from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
+        from nemo_automodel._transformers.models.gpt_oss.layers import GptOssAttention
 
         attn = GptOssAttention(gpt_config, backend=backend_config).to(device)
         total_tokens = 16
@@ -610,7 +610,7 @@ class TestGptOssAttentionTHD:
 
     def test_2d_input_detected_as_thd(self, gpt_config, backend_config, device):
         """Native THD format: 2D [T, H] input should be detected without cu_seqlens."""
-        from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
+        from nemo_automodel._transformers.models.gpt_oss.layers import GptOssAttention
 
         attn = GptOssAttention(gpt_config, backend=backend_config).to(device)
         total_tokens = 16
@@ -635,8 +635,8 @@ class TestGptOssAttentionTHD:
 
     def test_thd_metadata_clears_attention_mask_before_backend(self, gpt_config, backend_config, device):
         """THD cu_seqlens must take precedence over padding-mask style TE preprocessing."""
-        import nemo_automodel.components.models.gpt_oss.layers as gpt_oss_layers
-        from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
+        import nemo_automodel._transformers.models.gpt_oss.layers as gpt_oss_layers
+        from nemo_automodel._transformers.models.gpt_oss.layers import GptOssAttention
 
         attn = GptOssAttention(gpt_config, backend=backend_config).to(device)
         attn.backend.attn = "te"
@@ -683,8 +683,8 @@ class TestRopeUtilsTHD:
 
     @staticmethod
     def _make_rotary_emb(gpt_config, device):
-        from nemo_automodel.components.models.common import get_rope_config
-        from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding
+        from nemo_automodel._transformers.models.common import get_rope_config
+        from nemo_automodel._transformers.models.gpt_oss.rope_utils import RotaryEmbedding
 
         rope_theta, rope_scaling, _ = get_rope_config(gpt_config)
         return RotaryEmbedding(
@@ -700,7 +700,7 @@ class TestRopeUtilsTHD:
 
     def test_thd_1d_position_ids_fused_rope(self, gpt_config, backend_config, device):
         """1D position_ids [T] with fused_rope should use shape[0] for seq_len."""
-        from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
+        from nemo_automodel._transformers.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
         rotary_emb = self._make_rotary_emb(gpt_config, device)
         seq_len = 16
@@ -718,7 +718,7 @@ class TestRopeUtilsTHD:
 
     def test_thd_2d_position_ids_fused_rope(self, gpt_config, backend_config, device):
         """2D position_ids [1, T] from PP schedule should use shape[-1] for seq_len."""
-        from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
+        from nemo_automodel._transformers.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
         rotary_emb = self._make_rotary_emb(gpt_config, device)
         seq_len = 16
@@ -735,7 +735,7 @@ class TestRopeUtilsTHD:
 
     def test_thd_1d_position_ids_no_fused_rope(self, gpt_config, backend_config, device):
         """1D position_ids [T] without fused_rope should unsqueeze to [1, T]."""
-        from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
+        from nemo_automodel._transformers.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
         rotary_emb = self._make_rotary_emb(gpt_config, device)
         seq_len = 16
@@ -752,7 +752,7 @@ class TestRopeUtilsTHD:
 
     def test_thd_2d_position_ids_no_fused_rope_no_double_unsqueeze(self, gpt_config, backend_config, device):
         """2D position_ids [1, T] without fused_rope should NOT be double-unsqueezed."""
-        from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
+        from nemo_automodel._transformers.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
         rotary_emb = self._make_rotary_emb(gpt_config, device)
         seq_len = 16

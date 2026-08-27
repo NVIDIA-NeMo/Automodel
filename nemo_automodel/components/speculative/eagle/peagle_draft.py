@@ -35,7 +35,7 @@ import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.utils.checkpoint import checkpoint
 
-from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb
+from nemo_automodel._transformers.models.llama.rope_utils import apply_rotary_pos_emb
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
 
 logger = logging.getLogger(__name__)

@@ -28,16 +28,16 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
-from nemo_automodel.components.checkpoint.config import CheckpointingConfig
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel._transformers.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.engram import (
     Qwen3_8_FlashNextEngramTableConfig,
     Qwen3_8_FlashNextOwnerShardedEmbedding,
 )
-from nemo_automodel.components.models.qwen3_8_flash_next.state_dict_adapter import Qwen3_8_FlashNextStateDictAdapter
+from nemo_automodel._transformers.models.qwen3_8_flash_next.state_dict_adapter import Qwen3_8_FlashNextStateDictAdapter
+from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.moe.layers import MoEConfig
 
 _TABLE_KEY = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
@@ -372,9 +372,9 @@ def table() -> Qwen3_8_FlashNextOwnerShardedEmbedding:
     """Build a real rank-1-of-2 table without starting a process group."""
     owner_group = Mock()
     with (
-        patch("nemo_automodel.components.models.qwen3_8_flash_next.engram.dist.is_initialized", return_value=True),
-        patch("nemo_automodel.components.models.qwen3_8_flash_next.engram.dist.get_world_size", return_value=2),
-        patch("nemo_automodel.components.models.qwen3_8_flash_next.engram.dist.get_rank", return_value=1),
+        patch("nemo_automodel._transformers.models.qwen3_8_flash_next.engram.dist.is_initialized", return_value=True),
+        patch("nemo_automodel._transformers.models.qwen3_8_flash_next.engram.dist.get_world_size", return_value=2),
+        patch("nemo_automodel._transformers.models.qwen3_8_flash_next.engram.dist.get_rank", return_value=1),
     ):
         return Qwen3_8_FlashNextEngramTableConfig(num_embeddings=16, embedding_dim=3).build(
             process_group=owner_group,

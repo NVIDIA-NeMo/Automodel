@@ -17,8 +17,8 @@ import pytest
 import torch
 from transformers.cache_utils import DynamicCache
 
-from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
-from nemo_automodel.components.models.baichuan.model import (
+from nemo_automodel._transformers.models.baichuan.configuration import BaichuanConfig
+from nemo_automodel._transformers.models.baichuan.model import (
     MLP,
     Attention,
     BaichuanForCausalLM,
@@ -443,7 +443,7 @@ class TestBaichuanForCausalLM:
     def test_is_hf_checkpointing_mixin(self):
         cfg = _tiny_config()
         model = BaichuanForCausalLM(cfg)
-        from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+        from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
         assert isinstance(model, HFCheckpointingMixin)
 

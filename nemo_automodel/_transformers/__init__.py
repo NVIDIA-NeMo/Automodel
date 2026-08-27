@@ -31,16 +31,16 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "NeMoAutoModelForTokenClassification",
     ),
     "NeMoAutoModelForTextToWaveform": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForTextToWaveform"),
-    "NeMoAutoModelBiEncoder": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelBiEncoder"),
-    "NeMoAutoModelCrossEncoder": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelCrossEncoder"),
+    "NeMoAutoModelBiEncoder": ("nemo_automodel.retrieval.auto_model", "NeMoAutoModelBiEncoder"),
+    "NeMoAutoModelCrossEncoder": ("nemo_automodel.retrieval.auto_model", "NeMoAutoModelCrossEncoder"),
     "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
     "AutoMFU": ("nemo_automodel._transformers.mfu", "AutoMFU"),
     "RetrieverStudentWithProjection": (
-        "nemo_automodel._transformers.retrieval",
+        "nemo_automodel.retrieval.modeling",
         "RetrieverStudentWithProjection",
     ),
     "RetrieverTeacherEmbeddingEncoder": (
-        "nemo_automodel._transformers.retrieval",
+        "nemo_automodel.retrieval.modeling",
         "RetrieverTeacherEmbeddingEncoder",
     ),
 }

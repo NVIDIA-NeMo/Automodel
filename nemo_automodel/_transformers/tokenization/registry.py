@@ -116,7 +116,7 @@ def _register_default_tokenizers():
     TokenizerRegistry.register("ministral3", mistral_common)
     TokenizerRegistry.register(
         "kimi_k3",
-        "nemo_automodel.components.models.kimi_k3.tokenization:TikTokenTokenizer",
+        "nemo_automodel._transformers.models.kimi_k3.tokenization:TikTokenTokenizer",
     )
 
 

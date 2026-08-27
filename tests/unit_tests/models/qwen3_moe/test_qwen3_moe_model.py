@@ -18,8 +18,8 @@ import pytest
 import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_moe.model import Block, Qwen3MoeForCausalLM, Qwen3MoeModel
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_moe.model import Block, Qwen3MoeForCausalLM, Qwen3MoeModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
 
@@ -321,7 +321,7 @@ class TestQwen3MoeModelFromPretrainedAndExport:
 
     def test_modelclass_export_exists(self):
         """Ensure ModelClass pointer is defined and points to class."""
-        from nemo_automodel.components.models.qwen3_moe import model as qwen_mod
+        from nemo_automodel._transformers.models.qwen3_moe import model as qwen_mod
 
         assert hasattr(qwen_mod, "ModelClass")
         assert qwen_mod.ModelClass is Qwen3MoeForCausalLM

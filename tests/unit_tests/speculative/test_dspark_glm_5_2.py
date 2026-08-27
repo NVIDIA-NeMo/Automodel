@@ -331,7 +331,7 @@ def test_softmax_scale_applies_yarn_mscale_like_the_target():
     Without this the draft trains at a different attention temperature than the target
     whose hidden states supervise it, which only shows up as lost acceptance.
     """
-    from nemo_automodel.components.models.deepseek_v3.rope_utils import yarn_get_mscale
+    from nemo_automodel._transformers.models.deepseek_v3.rope_utils import yarn_get_mscale
 
     target_config = _tiny_target_config()
     target_config.rope_parameters = _yarn_rope_parameters()
@@ -356,7 +356,7 @@ def test_softmax_scale_skips_mscale_within_original_context():
 
 def test_rope_table_honors_rope_scaling():
     """The frequency table must be the YaRN-corrected one the target builds."""
-    from nemo_automodel.components.models.deepseek_v3.rope_utils import precompute_freqs_cis
+    from nemo_automodel._transformers.models.deepseek_v3.rope_utils import precompute_freqs_cis
 
     target_config = _tiny_target_config()
     target_config.rope_parameters = _yarn_rope_parameters()
@@ -385,7 +385,7 @@ def test_rope_theta_comes_from_the_config_not_a_default():
     draft_config = build_glm_5_2_draft_config(target_config, _tiny_model_args())
     model = Glm5_2DSparkModel(draft_config)
 
-    from nemo_automodel.components.models.deepseek_v3.rope_utils import precompute_freqs_cis
+    from nemo_automodel._transformers.models.deepseek_v3.rope_utils import precompute_freqs_cis
 
     expected = precompute_freqs_cis(
         qk_rope_head_dim=draft_config.qk_rope_head_dim,

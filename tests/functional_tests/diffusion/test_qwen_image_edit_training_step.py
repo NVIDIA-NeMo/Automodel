@@ -34,7 +34,7 @@ def test_qwen_image_edit_flow_matching_updates_model() -> None:
     from diffusers import QwenImageTransformer2DModel
 
     from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline
-    from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
+    from nemo_automodel._diffusers.models.qwen_image_edit.adapter import QwenImageEditAdapter
 
     torch.manual_seed(123)
     device = torch.device("cuda")

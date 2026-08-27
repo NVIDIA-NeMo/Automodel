@@ -520,16 +520,17 @@ def _extract_target_modules(
                                 final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
                         break
 
-    # Strip "model." prefix for encoder adapters so adapter_config.json
-    # is compatible with HF PEFT / merge_lora.
+    # Let state-dict adapters declare a wrapper prefix that must be removed so
+    # adapter_config.json remains compatible with HF PEFT / merge_lora. This is
+    # capability-based to keep generic checkpoint components independent of
+    # concrete model and task packages.
     adapter = getattr(model_parts[0], "state_dict_adapter", None)
-    if adapter is not None:
-        from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
-
-        if isinstance(adapter, EncoderStateDictAdapter):
-            final_target_modules = {
-                name[len("model.") :] if name.startswith("model.") else name for name in final_target_modules
-            }
+    target_module_prefix = getattr(adapter, "peft_target_module_prefix", None)
+    if target_module_prefix:
+        final_target_modules = {
+            name[len(target_module_prefix) :] if name.startswith(target_module_prefix) else name
+            for name in final_target_modules
+        }
 
     # Adapters whose HF checkpoint layout renames modules (e.g. Kimi K3's
     # mlp.experts.{E}.gate_proj -> block_sparse_moe.experts.{E}.w1) convert the

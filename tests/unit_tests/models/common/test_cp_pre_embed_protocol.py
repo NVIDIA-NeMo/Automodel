@@ -26,14 +26,14 @@ import inspect
 import pytest
 
 PRE_EMBED_MODELS = [
-    ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
-    ("nemo_automodel.components.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
-    ("nemo_automodel.components.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
-    ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
-    ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
-    ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
-    ("nemo_automodel.components.models.minimax_m3_vl.model", "MiniMaxM3SparseForConditionalGeneration"),
-    ("nemo_automodel.components.models.nemotron_omni.model", "NemotronOmniForConditionalGeneration"),
+    ("nemo_automodel._transformers.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
+    ("nemo_automodel._transformers.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
+    ("nemo_automodel._transformers.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
+    ("nemo_automodel._transformers.models.step3p7.model", "Step3p7ForConditionalGeneration"),
+    ("nemo_automodel._transformers.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
+    ("nemo_automodel._transformers.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
+    ("nemo_automodel._transformers.models.minimax_m3_vl.model", "MiniMaxM3SparseForConditionalGeneration"),
+    ("nemo_automodel._transformers.models.nemotron_omni.model", "NemotronOmniForConditionalGeneration"),
 ]
 
 

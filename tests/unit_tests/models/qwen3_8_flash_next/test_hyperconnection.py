@@ -17,8 +17,8 @@
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.layers import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.layers import (
     Qwen3_8_FlashNextGroupedRMSNorm,
     Qwen3_8_FlashNextHyperConnection,
 )

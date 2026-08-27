@@ -21,10 +21,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.step3p7 import model as step3p7_model
-from nemo_automodel.components.models.step3p7.configuration_step3p7 import Step3p7Config
-from nemo_automodel.components.models.step3p7.model import Step3p7ForConditionalGeneration, Step3p7Model
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.step3p7 import model as step3p7_model
+from nemo_automodel._transformers.models.step3p7.configuration_step3p7 import Step3p7Config
+from nemo_automodel._transformers.models.step3p7.model import Step3p7ForConditionalGeneration, Step3p7Model
 
 
 def small_config(**kwargs):

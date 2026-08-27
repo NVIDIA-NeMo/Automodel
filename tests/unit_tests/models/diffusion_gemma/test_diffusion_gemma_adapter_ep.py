@@ -21,8 +21,8 @@ with the EP expert slicing/gathering contract used during checkpoint load/save.
 
 import torch
 
-from nemo_automodel.components.models.diffusion_gemma import state_dict_adapter as adapter_mod
-from nemo_automodel.components.models.diffusion_gemma.state_dict_adapter import (
+from nemo_automodel._transformers.models.diffusion_gemma import state_dict_adapter as adapter_mod
+from nemo_automodel._transformers.models.diffusion_gemma.state_dict_adapter import (
     DiffusionGemmaStateDictAdapter,
 )
 

@@ -23,8 +23,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLVisionConfig
-from nemo_automodel.components.models.minimax_m3_vl.vision_encoder import MiniMaxM3VisionModel
+from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLVisionConfig
+from nemo_automodel._transformers.models.minimax_m3_vl.vision_encoder import MiniMaxM3VisionModel
 
 from .conftest import IMAGE_TOKEN_INDEX, VISION_CONFIG
 

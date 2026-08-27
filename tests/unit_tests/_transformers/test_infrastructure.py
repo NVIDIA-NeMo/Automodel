@@ -674,7 +674,7 @@ def test_load_before_shard_populates_unloaded_model_from_checkpoint(tmp_path):
     from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
-    from nemo_automodel.components.models.llama.model import LlamaForCausalLM
+    from nemo_automodel._transformers.models.llama.model import LlamaForCausalLM
 
     config = LlamaConfig(
         hidden_size=64,

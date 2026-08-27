@@ -29,6 +29,8 @@ from unittest import mock
 import pytest
 import torch
 
+from nemo_automodel._transformers.models.gemma4_moe import cp_batch as _cm
+
 # Import module under test
 from nemo_automodel.components.distributed.context_parallel import utils as _cu
 from nemo_automodel.components.distributed.context_parallel.sharder import (
@@ -38,7 +40,6 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_aux_only,
     shard_batch_contiguous,
 )
-from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
 
 
 # ContextParallelSharder used by the model-owned dispatch tests below (passed as an explicit

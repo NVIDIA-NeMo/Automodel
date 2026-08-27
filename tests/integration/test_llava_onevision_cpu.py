@@ -43,7 +43,7 @@ def test_model_config():
     logger.info("Test 1: Model Config & Architecture")
     logger.info("=" * 80)
 
-    from nemo_automodel.components.models.llava_onevision.model import (
+    from nemo_automodel._transformers.models.llava_onevision.model import (
         LLaVAOneVision1_5_ForConditionalGeneration,
         Llavaonevision1_5Config,
         RiceConfig,

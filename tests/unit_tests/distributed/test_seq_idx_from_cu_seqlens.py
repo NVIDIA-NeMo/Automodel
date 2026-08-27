@@ -18,7 +18,7 @@ Two production sites derive ``seq_idx`` via searchsorted on ``cu_seqlens[1:]``:
 
   * ``nemo_automodel/components/loss/mtp.py:calculate_mtp_loss`` — cross-seq
     mask in the MTP loss.
-  * ``nemo_automodel/components/models/nemotron_v3/layers.py`` — mamba SSD
+  * ``nemo_automodel/_transformers/models/nemotron_v3/layers.py`` — mamba SSD
     scan state-reset.
 
 Both must use ``side="right"`` (i.e. ``right=True``) so a position equal to a
@@ -181,7 +181,7 @@ def test_production_site_loss_mtp_matches_brute_force():
 
 def test_production_site_layers_mamba_matches_brute_force():
     """Re-runs the exact derivation in
-    ``nemo_automodel.components.models.nemotron_v3.layers`` (line ~330)
+    ``nemo_automodel._transformers.models.nemotron_v3.layers`` (line ~330)
     against the brute-force reference, ensuring the production site uses
     ``right=True``.
     """
@@ -201,8 +201,8 @@ def test_searchsorted_call_sites_use_right_true():
     """
     import inspect
 
+    from nemo_automodel._transformers.models.nemotron_v3 import layers as _layers_mod
     from nemo_automodel.components.loss import mtp as _mtp_mod
-    from nemo_automodel.components.models.nemotron_v3 import layers as _layers_mod
 
     for mod in (_mtp_mod, _layers_mod):
         src = inspect.getsource(mod)

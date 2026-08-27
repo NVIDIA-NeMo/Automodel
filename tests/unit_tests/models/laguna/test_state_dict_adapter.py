@@ -14,9 +14,9 @@
 
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.laguna.config import LagunaConfig
-from nemo_automodel.components.models.laguna.state_dict_adapter import LagunaStateDictAdapter
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.laguna.config import LagunaConfig
+from nemo_automodel._transformers.models.laguna.state_dict_adapter import LagunaStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 
 

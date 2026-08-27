@@ -17,9 +17,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
-from nemo_automodel.components.models.mistral4.model import Mistral4MLA, _get_llama_4_attn_scale
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.mistral4.configuration import Mistral4Config
+from nemo_automodel._transformers.models.mistral4.model import Mistral4MLA, _get_llama_4_attn_scale
 
 
 def _tiny_long_context_config() -> Mistral4Config:

@@ -106,7 +106,6 @@ recipes/             -- main training / eval entry points
     |
     v
 components/          -- modular building blocks
-  models/            -- 27+ model families (LLM, VLM, MoE, ...)
   datasets/          -- LLM, VLM, diffusion data pipelines
   distributed/       -- FSDP2, HSDP, DDP utilities
   checkpoint/        -- async DCP, SafeTensors
@@ -115,15 +114,25 @@ components/          -- modular building blocks
   launcher/          -- Slurm, SkyPilot job submission
     |
     v
-_transformers/       -- HuggingFace bridge
+_transformers/       -- HuggingFace transformers bridge
+  models/            -- 50+ model families built on transformers (LLM, VLM, MoE, ...)
   auto_model.py      -- NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText, ...
   registry.py        -- MODEL_ARCH_MAPPING (model registration)
   capabilities.py    -- per-model feature detection flags
   infrastructure.py  -- device mesh setup for distributed training
 
-_diffusers/          -- diffusion pipeline wrapper
+_diffusers/          -- HuggingFace diffusers bridge
+  models/            -- flux, flux2, hunyuan, ltx2, qwen_image,
+                        qwen_image_edit, wan -- each a <arch>/adapter.py
   NeMoAutoDiffusionPipeline
 ```
+
+Diffusion architectures come from upstream `diffusers` pipelines; what Automodel
+owns per family is a `ModelAdapter` in `_diffusers/models/<arch>/adapter.py`.
+The adapter *contract* (`ModelAdapter`, `FlowMatchingContext`) stays with the
+algorithm, in `components/flow_matching/adapters/base.py`. Recipes select one by
+`adapter_type` (`"simple"` maps to `wan`), never by module path -- go through
+`create_adapter()` in `components/flow_matching/pipeline.py`.
 
 ### Entry Point
 
@@ -170,7 +179,30 @@ distributed training interface used by LLM/VLM recipes.
 
 ### Directory Layout
 
-Each model lives under `components/models/<name>/` and contains:
+Models are split by **which bridge trains them**, not by which upstream package
+their source imports:
+
+- `_transformers/models/<name>/` -- trained through the HuggingFace
+  `transformers` bridge. These subclass `PreTrainedModel`.
+- `_diffusers/models/<name>/` -- trained through the flow-matching / diffusion
+  bridge. These are `ModelAdapter` implementations. Most do **not** import
+  `diffusers` themselves; `NeMoAutoDiffusionPipeline` builds the pipeline and
+  hands them tensors. Only `qwen_image_edit` imports `diffusers` directly.
+
+When adding to the diffusers side, also add the name to `DIFFUSERS_MODELS` in
+`nemo_automodel/_model_locations.py` -- `tests/unit_tests/test_model_locations.py`
+fails if the table and the directories drift apart, and asserts the invariant
+that actually holds: diffusers-side packages expose a `ModelAdapter`,
+transformers-side packages do not.
+
+The legacy `nemo_automodel.components.models.*` import path still resolves (with
+a `DeprecationWarning`) via the alias finder in `nemo_automodel/__init__.py`.
+It routes off a deliberately narrower table -- only `qwen_image_edit` was ever
+reachable there -- so `components.models.flux` still raises "unknown model"
+rather than inventing a path that never existed.
+`nemo_automodel.models.*` remains supported and routes to both sides.
+
+Each model directory contains:
 
 | File                    | Purpose                                           |
 |-------------------------|---------------------------------------------------|
@@ -224,7 +256,7 @@ to instantiate. This is the same pattern used by Hydra/OmegaConf:
 
 ```yaml
 model:
-  _target_: nemo_automodel.components.models.llama.model.LlamaForCausalLM
+  _target_: nemo_automodel._transformers.models.llama.model.LlamaForCausalLM
   config:
     hidden_size: 4096
     num_attention_heads: 32

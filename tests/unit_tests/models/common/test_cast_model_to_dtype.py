@@ -17,7 +17,7 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common.utils import (
+from nemo_automodel._transformers.models.common.utils import (
     _get_fp32_module_keywords,
     _get_strict_fp32_module_keywords,
     _has_dtensor_params,
@@ -458,7 +458,7 @@ class TestDTensorAwareCasting:
         """When model has DTensor params, only buffers of matching modules are restored to fp32."""
         model = ModelWithFp32Modules()
 
-        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=True):
+        with patch("nemo_automodel._transformers.models.common.utils._has_dtensor_params", return_value=True):
             cast_model_to_dtype(model, torch.bfloat16)
 
         # Parameters should be bf16 — FSDP2 requires uniform dtype
@@ -469,7 +469,7 @@ class TestDTensorAwareCasting:
         """Strict fp32 modules are already isolated as their own FSDP units, so they can be restored."""
         model = ModelWithStrictFp32()
 
-        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=True):
+        with patch("nemo_automodel._transformers.models.common.utils._has_dtensor_params", return_value=True):
             cast_model_to_dtype(model, torch.bfloat16)
 
         assert model.head.weight.dtype == torch.float32
@@ -489,7 +489,7 @@ class TestDTensorAwareCasting:
 
         model = ModelWithNormBuffer()
 
-        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=True):
+        with patch("nemo_automodel._transformers.models.common.utils._has_dtensor_params", return_value=True):
             cast_model_to_dtype(model, torch.bfloat16)
 
         # Parameters stay bf16
@@ -502,7 +502,7 @@ class TestDTensorAwareCasting:
         """When model has plain tensor params, fp32 restore works normally."""
         model = ModelWithFp32Modules()
 
-        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=False):
+        with patch("nemo_automodel._transformers.models.common.utils._has_dtensor_params", return_value=False):
             cast_model_to_dtype(model, torch.bfloat16)
 
         assert model.norm.weight.dtype == torch.float32

@@ -27,6 +27,7 @@ Features:
 - Detailed training logging
 """
 
+import importlib
 import logging
 import math
 import os
@@ -36,17 +37,10 @@ from typing import Any, Dict, Tuple
 import torch
 import torch.nn as nn
 
-# Import adapters from the adapters module
-from .adapters import (
-    FlowMatchingContext,
-    Flux2Adapter,
-    FluxAdapter,
-    HunyuanAdapter,
-    LTX2Adapter,
-    ModelAdapter,
-    QwenImageAdapter,
-    SimpleAdapter,
-)
+# Only the adapter contract is needed at module scope; the per-model adapters
+# live in their model packages and are imported lazily in create_adapter so
+# that a recipe does not load every model's code.
+from .adapters.base import FlowMatchingContext, ModelAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -637,24 +631,24 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
     Returns:
         ModelAdapter instance
     """
-    # Imported lazily: the adapter is owned by the model package, and importing
-    # it here at module scope would load the Qwen model code for every recipe.
-    from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
-
+    # Each adapter is owned by its model package under nemo_automodel._diffusers.
+    # Only the selected one is imported, so a recipe does not pay for the rest.
     adapters = {
-        "hunyuan": HunyuanAdapter,
-        "simple": SimpleAdapter,
-        "flux": FluxAdapter,
-        "flux2": Flux2Adapter,
-        "qwen_image": QwenImageAdapter,
-        "qwen_image_edit": QwenImageEditAdapter,
-        "ltx2": LTX2Adapter,
+        "hunyuan": ("hunyuan", "HunyuanAdapter"),
+        "simple": ("wan", "SimpleAdapter"),
+        "flux": ("flux", "FluxAdapter"),
+        "flux2": ("flux2", "Flux2Adapter"),
+        "qwen_image": ("qwen_image", "QwenImageAdapter"),
+        "qwen_image_edit": ("qwen_image_edit", "QwenImageEditAdapter"),
+        "ltx2": ("ltx2", "LTX2Adapter"),
     }
 
     if adapter_type not in adapters:
         raise ValueError(f"Unknown adapter type: {adapter_type}. Available: {list(adapters.keys())}")
 
-    return adapters[adapter_type](**kwargs)
+    package, class_name = adapters[adapter_type]
+    module = importlib.import_module(f"nemo_automodel._diffusers.models.{package}.adapter")
+    return getattr(module, class_name)(**kwargs)
 
 
 def create_pipeline(

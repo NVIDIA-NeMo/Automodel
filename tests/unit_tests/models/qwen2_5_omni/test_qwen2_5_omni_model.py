@@ -26,7 +26,7 @@ torch = pytest.importorskip("torch")
 
 
 def test_imports():
-    from nemo_automodel.components.models.qwen2_5_omni.model import (
+    from nemo_automodel._transformers.models.qwen2_5_omni.model import (
         ModelClass,
         Qwen2_5OmniThinkerForConditionalGeneration,
     )
@@ -35,8 +35,8 @@ def test_imports():
 
 
 def test_mro_includes_hf_checkpointing_mixin():
-    from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-    from nemo_automodel.components.models.qwen2_5_omni.model import (
+    from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+    from nemo_automodel._transformers.models.qwen2_5_omni.model import (
         Qwen2_5OmniThinkerForConditionalGeneration,
     )
 
@@ -51,10 +51,10 @@ def test_mro_includes_hf_checkpointing_mixin():
 
 
 def test_registry_resolves_to_thinker_class():
-    from nemo_automodel._transformers.registry import ModelRegistry
-    from nemo_automodel.components.models.qwen2_5_omni.model import (
+    from nemo_automodel._transformers.models.qwen2_5_omni.model import (
         Qwen2_5OmniThinkerForConditionalGeneration,
     )
+    from nemo_automodel._transformers.registry import ModelRegistry
 
     for arch in (
         "Qwen2_5OmniModel",
@@ -69,7 +69,7 @@ def test_registry_resolves_to_thinker_class():
 
 def test_resolve_thinker_config_unwraps_full_omni_config():
     """``_resolve_thinker_config`` returns the thinker sub-config when given the full Omni config."""
-    from nemo_automodel.components.models.qwen2_5_omni.model import _resolve_thinker_config
+    from nemo_automodel._transformers.models.qwen2_5_omni.model import _resolve_thinker_config
 
     class FakeThinker:
         torch_dtype = None

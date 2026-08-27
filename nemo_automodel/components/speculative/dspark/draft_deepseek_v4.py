@@ -25,9 +25,8 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 
-from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
-from nemo_automodel.components.models.common import initialize_rms_norm_module
-from nemo_automodel.components.models.deepseek_v4.layers import (
+from nemo_automodel._transformers.models.common import initialize_rms_norm_module
+from nemo_automodel._transformers.models.deepseek_v4.layers import (
     DeepseekV4FP32Parameter,
     DeepseekV4GroupedLinear,
     DeepseekV4RotaryEmbedding,
@@ -35,6 +34,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _rms_norm_last_dim,
     eager_attention_with_sink,
 )
+from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
 from nemo_automodel.components.speculative.dspark._sampling import sample_tokens
 from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,

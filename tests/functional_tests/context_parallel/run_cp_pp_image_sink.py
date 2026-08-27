@@ -41,9 +41,9 @@ IMG = 100
 
 
 def build_minimax(device):
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
-    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLConfig
+    from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
 
     tiny = dict(
         hidden_size=64,

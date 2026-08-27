@@ -26,7 +26,7 @@ from unittest import mock
 import pytest
 import torch
 
-from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
+from nemo_automodel._transformers.models.gemma4_moe import cp_attention as cpa
 
 
 # ---------------------------------------------------------------------------

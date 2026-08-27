@@ -30,7 +30,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel._transformers.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 
 HAVE_UCCL_EP = importlib.util.find_spec("uccl") is not None or importlib.util.find_spec("ep") is not None
@@ -356,7 +356,7 @@ class TestUtilsHaveUcclEp:
     """Test HAVE_UCCL_EP flag in models/common/utils.py."""
 
     def test_have_uccl_ep_is_bool(self):
-        from nemo_automodel.components.models.common.utils import HAVE_UCCL_EP
+        from nemo_automodel._transformers.models.common.utils import HAVE_UCCL_EP
 
         assert isinstance(HAVE_UCCL_EP, bool)
 

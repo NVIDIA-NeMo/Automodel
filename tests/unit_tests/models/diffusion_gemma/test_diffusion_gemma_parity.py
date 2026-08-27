@@ -110,8 +110,8 @@ def _build_hf_model(text_cfg: dict):
 def _build_native_model(text_cfg: dict):
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
 
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.diffusion_gemma.model import DiffusionGemmaForBlockDiffusion
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.diffusion_gemma.model import DiffusionGemmaForBlockDiffusion
 
     # The native model reuses the HF config; self_conditioning/freeze_router are
     # model-construction flags (not strict config fields), so pass them to the model.

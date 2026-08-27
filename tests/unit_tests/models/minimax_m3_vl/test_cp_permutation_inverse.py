@@ -26,7 +26,7 @@ process group required.
 import pytest
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import (
+from nemo_automodel._transformers.models.minimax_m3_vl.cp_sparse_attn import (
     cp_load_balanced_global_slots,
     order_by_positions,
     restore_by_positions,

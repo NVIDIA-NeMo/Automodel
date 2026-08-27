@@ -107,7 +107,7 @@ def _fsdp2_worker(rank: int, world_size: int, port: int, result_path: str):
             Gemma4AssistantForCausalLM,
         )
 
-        from nemo_automodel.components.models.gemma4_drafter.composite import (
+        from nemo_automodel._transformers.models.gemma4_drafter.composite import (
             Gemma4JointOutput,
             Gemma4WithDrafter,
         )

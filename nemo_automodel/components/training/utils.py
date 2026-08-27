@@ -21,7 +21,7 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
-from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
+from nemo_automodel._transformers.models.common.utils import set_is_first_microbatch, set_is_optim_step
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:

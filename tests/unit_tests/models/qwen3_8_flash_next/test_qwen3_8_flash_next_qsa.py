@@ -17,16 +17,16 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_8_flash_next import layers as qwen3_8_flash_next_layers
-from nemo_automodel.components.models.qwen3_8_flash_next import qsa as qwen3_8_flash_next_qsa
-from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next import layers as qwen3_8_flash_next_layers
+from nemo_automodel._transformers.models.qwen3_8_flash_next import qsa as qwen3_8_flash_next_qsa
+from nemo_automodel._transformers.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.flex_qsa import (
     _routes_to_membership,
     flex_sparse_gqa_attention,
 )
-from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
-from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
+from nemo_automodel._transformers.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
+from nemo_automodel._transformers.models.qwen3_8_flash_next.qsa import (
     Qwen3_8_FlashNextQSAIndexer,
     gathered_qsa_gqa_attention,
     select_qsa_token_ids,

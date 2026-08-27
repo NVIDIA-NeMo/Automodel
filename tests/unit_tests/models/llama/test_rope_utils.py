@@ -27,8 +27,8 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.llama.rope_utils import LlamaRotaryEmbedding
 
 
 def _build_rope(
@@ -250,7 +250,7 @@ def test_rope_yarn_matches_transformers_not_llama3_fallback():
     YaRN target's ``rope_scaling``)."""
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-    from nemo_automodel.components.models.llama.rope_utils import _compute_llama3_inv_freq
+    from nemo_automodel._transformers.models.llama.rope_utils import _compute_llama3_inv_freq
 
     config = _config_with_rope_scaling({"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 2048})
     rope = LlamaRotaryEmbedding(config)

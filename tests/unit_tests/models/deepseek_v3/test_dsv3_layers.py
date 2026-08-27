@@ -18,8 +18,8 @@ import pytest
 import torch
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v3.layers import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.deepseek_v3.layers import (
     MLA,
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
@@ -213,9 +213,9 @@ class TestMLAInitialization:
         return config
 
     @skip_te
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func")
     def test_mla_init_without_q_lora(self, mock_init_attn, mock_init_rms, mock_init_linear):
         config = self.create_mock_config(q_lora_rank=None)
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
@@ -251,9 +251,9 @@ class TestMLAInitialization:
         assert hasattr(mla, 'attn_func')
 
     @skip_te
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func")
     def test_mla_init_with_q_lora(self, mock_init_attn, mock_init_rms, mock_init_linear):
         config = self.create_mock_config(q_lora_rank=1024)
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
@@ -272,9 +272,9 @@ class TestMLAInitialization:
 
         assert mla.q_lora_rank == 1024
 
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func")
     def test_mla_init_with_sdpa_backend(self, mock_init_attn, mock_init_rms, mock_init_linear):
         config = self.create_mock_config(q_lora_rank=None)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
@@ -293,10 +293,10 @@ class TestMLAInitialization:
         assert hasattr(mla, 'kv_b_proj')
         assert hasattr(mla, 'o_proj')
 
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.yarn_get_mscale")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.yarn_get_mscale")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func")
     def test_mla_init_with_rope_scaling(self, mock_init_attn, mock_init_rms, mock_init_linear, mock_yarn_get_mscale):
         rope_scaling = {
             "factor": 2.0,
@@ -322,9 +322,9 @@ class TestMLAInitialization:
         expected_scale = base_scale * 1.5 * 1.5
         assert abs(mla.softmax_scale - expected_scale) < 1e-6
 
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func")
     def test_mla_init_rope_scaling_no_adjustment(self, mock_init_attn, mock_init_rms, mock_init_linear):
         rope_scaling = {
             "factor": 2.0,
@@ -376,9 +376,9 @@ class TestMLAForward:
         config = self.create_mock_config(q_lora_rank=None)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
+        with patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
 
             # Create mock components that return correctly shaped tensors
             def create_mock_linear(in_features, out_features, *args, **kwargs):
@@ -413,9 +413,9 @@ class TestMLAForward:
         config = self.create_mock_config(q_lora_rank=512)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
+        with patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
 
             mock_init_linear.return_value = Mock()
             mock_init_rms.return_value = Mock()
@@ -435,10 +435,10 @@ class TestMLAForward:
         config = self.create_mock_config(q_lora_rank=None)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.preprocess_args_and_kwargs_for_attn") as mock_preprocess:
+        with patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.preprocess_args_and_kwargs_for_attn") as mock_preprocess:
 
             # Setup all the initialize mocks
             mock_init_linear.return_value = Mock()
@@ -501,9 +501,9 @@ class TestMLAInitWeights:
         config = self.create_mock_config(q_lora_rank=None)
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
+        with patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
 
             mock_linear = Mock()
             mock_linear.weight = torch.randn(64, 1024)
@@ -535,9 +535,9 @@ class TestMLAInitWeights:
         config = self.create_mock_config(q_lora_rank=512)
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
+        with patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_linear_module") as mock_init_linear, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_rms_norm_module") as mock_init_rms, \
+             patch("nemo_automodel._transformers.models.deepseek_v3.layers.initialize_attn_module_and_func") as mock_init_attn:
 
             mock_linear = Mock()
             mock_linear.weight = torch.randn(64, 1024)

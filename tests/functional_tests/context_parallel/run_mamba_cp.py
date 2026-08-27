@@ -93,7 +93,7 @@ class MockNemotronV3Config:
 
 def _create_mixer_pair(config, device):
     """Create a pair of identical mixers (baseline and CP) with synced weights."""
-    from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+    from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
     mixer_baseline = NemotronV3Mamba2Mixer(config, layer_idx=0).to(device).to(torch.bfloat16)
     mixer_cp = NemotronV3Mamba2Mixer(config, layer_idx=0).to(device).to(torch.bfloat16)

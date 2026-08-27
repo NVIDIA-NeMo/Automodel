@@ -15,9 +15,9 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
-from nemo_automodel.components.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.ling_v2.config import BailingMoeV2Config
+from nemo_automodel._transformers.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 
 

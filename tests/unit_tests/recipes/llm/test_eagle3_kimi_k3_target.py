@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
+from nemo_automodel._transformers.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.recipes.llm.train_eagle3 import (
     KIMI_K3_MODEL_TYPE,
     TrainEagle3Recipe,

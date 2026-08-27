@@ -1326,7 +1326,7 @@ _HF_FP32_LEAF_ALIASES = ("e_score_correction_bias",)
 def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
     """Infer vanilla-HF fp32 names from AutoModel's model-owned checkpoint contract."""
     from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
-    from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+    from nemo_automodel._transformers.models.common.gated_delta_net_fp32 import (
         FP32_GDN_PARAM_NAMES,
         has_gated_delta_net_fp32_checkpoint_contract,
     )

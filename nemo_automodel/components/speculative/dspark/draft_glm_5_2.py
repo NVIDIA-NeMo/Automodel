@@ -33,14 +33,14 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 
-from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
-from nemo_automodel.components.models.common import initialize_rms_norm_module
-from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+from nemo_automodel._transformers.models.common import initialize_rms_norm_module
+from nemo_automodel._transformers.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.glm_moe_dsa.rope_utils import mla_softmax_scale
+from nemo_automodel._transformers.models.glm_moe_dsa.rope_utils import mla_softmax_scale
+from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
 from nemo_automodel.components.speculative.dspark._sampling import sample_tokens
 from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,

@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel._transformers.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,

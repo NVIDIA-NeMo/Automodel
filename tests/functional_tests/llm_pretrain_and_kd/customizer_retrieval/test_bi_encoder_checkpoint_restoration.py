@@ -76,15 +76,19 @@ PEFT_RECIPE_YAML = os.environ.get(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _run_training(recipe_yaml: str, checkpoint_dir: str) -> Path:
     """Launch bi-encoder training as a subprocess and return the checkpoint dir."""
     cmd = [
         sys.executable,
-        "-m", "coverage", "run",
+        "-m",
+        "coverage",
+        "run",
         "--data-file=/workspace/.coverage",
         "--source=/workspace/",
         "--parallel-mode",
-        "-m", "nemo_automodel.recipes.retrieval.train_bi_encoder",
+        "-m",
+        "nemo_automodel.recipes.retrieval.train_bi_encoder",
         "--config",
         recipe_yaml,
     ]
@@ -133,16 +137,11 @@ def _compare_state_dicts(
         keys_a = {k for k in keys_a if key_filter(k)}
         keys_b = {k for k in keys_b if key_filter(k)}
 
-    assert keys_a == keys_b, (
-        f"Key mismatch: {prefix_a} extra = {keys_a - keys_b}, "
-        f"{prefix_b} extra = {keys_b - keys_a}"
-    )
+    assert keys_a == keys_b, f"Key mismatch: {prefix_a} extra = {keys_a - keys_b}, {prefix_b} extra = {keys_b - keys_a}"
     for key in sorted(keys_a):
         ta = sd_a[key].float().cpu()
         tb = sd_b[key].float().cpu()
-        assert ta.shape == tb.shape, (
-            f"Shape mismatch at {key}: {ta.shape} vs {tb.shape}"
-        )
+        assert ta.shape == tb.shape, f"Shape mismatch at {key}: {ta.shape} vs {tb.shape}"
         assert torch.allclose(ta, tb, atol=atol), (
             f"Value mismatch at {key}: max diff = {(ta - tb).abs().max().item():.6e}"
         )
@@ -151,6 +150,7 @@ def _compare_state_dicts(
 # ---------------------------------------------------------------------------
 # Test class
 # ---------------------------------------------------------------------------
+
 
 class TestBiEncoderCheckpointRestoration:
     """Verify that bi-encoder checkpoints produced by NeMo Automodel training
@@ -173,8 +173,8 @@ class TestBiEncoderCheckpointRestoration:
         """Train bi-encoder -> load trained model back in NeMo -> save ->
         restore with transformers -> verify state dicts match."""
 
-        from nemo_automodel._transformers.retrieval import BiEncoderModel
-        from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
+        from nemo_automodel.retrieval.modeling import BiEncoderModel
+        from nemo_automodel.retrieval.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train ------------------------------------------------
         checkpoint_dir = _run_training(RECIPE_YAML, CHECKPOINT_DIR)
@@ -184,16 +184,13 @@ class TestBiEncoderCheckpointRestoration:
         # containing config.json, consolidated safetensors, and the index.
         consolidated_dir = checkpoint_dir / "model" / "consolidated"
         assert os.path.isfile(consolidated_dir / "config.json"), (
-            "config.json not found in consolidated checkpoint "
-            f"(looked in {consolidated_dir})"
+            f"config.json not found in consolidated checkpoint (looked in {consolidated_dir})"
         )
 
         # ---- Step 2: Load trained model back in NeMo ----------------------
         # The consolidated checkpoint is a standard HF checkpoint that
         # ``from_pretrained`` can load directly.
-        lm_q = LlamaBidirectionalModel.from_pretrained(
-            str(consolidated_dir), torch_dtype=torch.bfloat16
-        )
+        lm_q = LlamaBidirectionalModel.from_pretrained(str(consolidated_dir), torch_dtype=torch.bfloat16)
         nemo_model = BiEncoderModel(
             model=lm_q,
             pooling="avg",
@@ -204,16 +201,12 @@ class TestBiEncoderCheckpointRestoration:
         with tempfile.TemporaryDirectory() as save_dir:
             nemo_model.save_pretrained(save_dir)
 
-            assert os.path.isfile(os.path.join(save_dir, "config.json")), (
-                "config.json not found after save_pretrained"
-            )
+            assert os.path.isfile(os.path.join(save_dir, "config.json")), "config.json not found after save_pretrained"
             sf_files = _glob.glob(os.path.join(save_dir, "*.safetensors"))
             assert sf_files, "No .safetensors after save_pretrained"
 
             # ---- Step 4: Restore with transformers ------------------------
-            hf_model = LlamaBidirectionalModel.from_pretrained(
-                save_dir, torch_dtype=torch.bfloat16
-            )
+            hf_model = LlamaBidirectionalModel.from_pretrained(save_dir, torch_dtype=torch.bfloat16)
 
             # ---- Step 5: Compare state dicts ------------------------------
             _compare_state_dicts(
@@ -233,9 +226,9 @@ class TestBiEncoderCheckpointRestoration:
         """Train bi-encoder with LoRA -> load in NeMo -> save -> verify base
         weights restored by transformers + LoRA weights by safetensors."""
 
-        from nemo_automodel._transformers.retrieval import BiEncoderModel
         from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-        from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
+        from nemo_automodel.retrieval.modeling import BiEncoderModel
+        from nemo_automodel.retrieval.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train with PEFT -------------------------------------
         checkpoint_dir = _run_training(PEFT_RECIPE_YAML, PEFT_CHECKPOINT_DIR)
@@ -244,17 +237,14 @@ class TestBiEncoderCheckpointRestoration:
         # adapter_config.json under the ``model/`` subdirectory.
         model_dir = checkpoint_dir / "model"
         assert os.path.isfile(model_dir / "adapter_config.json"), (
-            "adapter_config.json not found in training checkpoint "
-            f"(looked in {model_dir})"
+            f"adapter_config.json not found in training checkpoint (looked in {model_dir})"
         )
 
         # ---- Step 2: Load trained PEFT model in NeMo ----------------------
         # The PEFT training checkpoint contains only adapter (LoRA) weights
         # saved by the checkpointer.  We rebuild the model exactly as the
         # recipe does: base model + apply LoRA + load adapter weights.
-        lm_q = LlamaBidirectionalModel.from_pretrained(
-            BASE_MODEL_PATH, torch_dtype=torch.bfloat16
-        )
+        lm_q = LlamaBidirectionalModel.from_pretrained(BASE_MODEL_PATH, torch_dtype=torch.bfloat16)
         nemo_model = BiEncoderModel(
             model=lm_q,
             pooling="avg",
@@ -273,8 +263,7 @@ class TestBiEncoderCheckpointRestoration:
         raw_ckpt_sd = _load_safetensors_from_dir(str(model_dir))
         _PREFIX_TO_STRIP = "base_model.model.model."
         ckpt_sd = {
-            k[len(_PREFIX_TO_STRIP):] if k.startswith(_PREFIX_TO_STRIP) else k: v
-            for k, v in raw_ckpt_sd.items()
+            k[len(_PREFIX_TO_STRIP) :] if k.startswith(_PREFIX_TO_STRIP) else k: v for k, v in raw_ckpt_sd.items()
         }
         missing, unexpected = nemo_model.model.load_state_dict(ckpt_sd, strict=False)
         # lora_dropout has no parameters so it won't appear in the safetensors;
@@ -286,9 +275,7 @@ class TestBiEncoderCheckpointRestoration:
         with tempfile.TemporaryDirectory() as save_dir:
             nemo_model.save_pretrained(save_dir)
 
-            assert os.path.isfile(os.path.join(save_dir, "config.json")), (
-                "config.json not found after save_pretrained"
-            )
+            assert os.path.isfile(os.path.join(save_dir, "config.json")), "config.json not found after save_pretrained"
             sf_files = _glob.glob(os.path.join(save_dir, "*.safetensors"))
             assert sf_files, "No .safetensors after save_pretrained"
 
@@ -297,9 +284,7 @@ class TestBiEncoderCheckpointRestoration:
 
             # ---- Step 5: Verify LoRA weights are present ------------------
             lora_keys = sorted(k for k in saved_sd if "lora_" in k)
-            assert len(lora_keys) > 0, (
-                "No LoRA adapter weights found in saved checkpoint"
-            )
+            assert len(lora_keys) > 0, "No LoRA adapter weights found in saved checkpoint"
             print(f"Found {len(lora_keys)} LoRA weight tensors in checkpoint")
 
             # ---- Step 6: Restore with transformers + LoRA ------------------
@@ -308,9 +293,7 @@ class TestBiEncoderCheckpointRestoration:
             # the base checkpoint (no LoRA keys → no UNEXPECTED noise),
             # apply LoRA, then load the complete saved state dict so
             # every weight (base + adapter) is populated in one shot.
-            hf_model = LlamaBidirectionalModel.from_pretrained(
-                BASE_MODEL_PATH, torch_dtype=torch.bfloat16
-            )
+            hf_model = LlamaBidirectionalModel.from_pretrained(BASE_MODEL_PATH, torch_dtype=torch.bfloat16)
             hf_peft_config = PeftConfig(match_all_linear=True, dim=8, alpha=32, use_triton=False)
             apply_lora_to_linear_modules(hf_model, hf_peft_config, quantization_config=None)
             hf_full_sd = _load_safetensors_from_dir(save_dir)

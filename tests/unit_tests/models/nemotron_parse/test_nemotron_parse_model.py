@@ -17,7 +17,7 @@ import pytest
 import torch
 from transformers.models.donut.modeling_donut_swin import DonutSwinModelOutput
 
-from nemo_automodel.components.models.nemotron_parse import model as np_model
+from nemo_automodel._transformers.models.nemotron_parse import model as np_model
 
 
 class _DummyRadioEncoder(torch.nn.Module):
@@ -175,7 +175,7 @@ def test_nemotron_parse_external_loss(monkeypatch):
     Simulates the recipe's external loss flow: model returns 4D logits,
     loss function receives them separately with labels.
     """
-    from nemo_automodel.components.models.nemotron_parse.nemotron_parse_loss import NemotronParseLoss
+    from nemo_automodel._transformers.models.nemotron_parse.nemotron_parse_loss import NemotronParseLoss
 
     decoder_dim = 32
     vocab_size = 50

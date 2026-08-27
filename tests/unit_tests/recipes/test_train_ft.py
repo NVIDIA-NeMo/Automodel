@@ -32,13 +32,13 @@ from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.mfu import MFUConfig
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel._transformers.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
 )
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
-from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
@@ -2604,7 +2604,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
 
 def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch):
     """The recipe consumes raw packed lengths, shifts globally, then reuses the CP layout."""
-    from nemo_automodel.components.models.common.mtp import (
+    from nemo_automodel._transformers.models.common.mtp import (
         MTPConfig,
         prepare_mtp_context_parallel_inputs,
     )

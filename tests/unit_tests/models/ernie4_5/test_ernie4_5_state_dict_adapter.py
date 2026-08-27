@@ -18,8 +18,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.ernie4_5.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.ernie4_5.state_dict_adapter import (
     Ernie4_5_MoeStateDictAdapter,
     Ernie4_5StateDictAdapter,
 )

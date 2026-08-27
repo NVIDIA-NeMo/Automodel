@@ -49,9 +49,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
-from nemo_automodel.components.models.kimi_k3.model import KimiK3MLP, KimiMLAAttention, KimiRMSNorm
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.kimi_k3.config import KimiK3TextConfig
+from nemo_automodel._transformers.models.kimi_k3.model import KimiK3MLP, KimiMLAAttention, KimiRMSNorm
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 
 

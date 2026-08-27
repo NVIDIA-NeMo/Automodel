@@ -26,7 +26,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
-from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
+from nemo_automodel._transformers.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
 
 N_EXPERTS = 4
 HIDDEN = 64

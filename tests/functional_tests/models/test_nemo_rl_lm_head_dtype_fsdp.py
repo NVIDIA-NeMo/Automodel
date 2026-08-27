@@ -44,7 +44,7 @@ def _free_port() -> int:
 
 
 def _backend():
-    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common import BackendConfig
 
     return BackendConfig(
         linear="torch",
@@ -60,7 +60,7 @@ def _backend():
 def _build_gemma4():
     from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
-    from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
+    from nemo_automodel._transformers.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 
     text_config = Gemma4TextConfig(
         vocab_size=128,
@@ -117,11 +117,11 @@ class _NemotronConfig:
 
 
 def _build_nemotron_omni():
-    from nemo_automodel.components.models.nemotron_omni.model import (
+    from nemo_automodel._transformers.models.nemotron_omni.model import (
         NemotronOmniForConditionalGeneration,
         _ModelProxy,
     )
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    from nemo_automodel._transformers.models.nemotron_v3.model import NemotronHForCausalLM
 
     llm_config = _NemotronConfig()
     language_model = NemotronHForCausalLM(llm_config, backend=_backend())

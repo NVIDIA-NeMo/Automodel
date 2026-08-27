@@ -27,10 +27,10 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.ernie4_5.model import Ernie4_5_MoeForCausalLM
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.ernie4_5.model import Ernie4_5_MoeForCausalLM
 from nemo_automodel.components.moe.parallelizer import parallelize_model
 
 _WORLD_SIZE = 2

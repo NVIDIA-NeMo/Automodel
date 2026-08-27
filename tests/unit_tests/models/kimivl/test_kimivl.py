@@ -20,7 +20,7 @@ import pytest
 import torch
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.models.kimivl.model import (
+from nemo_automodel._transformers.models.kimivl.model import (
     KimiVLConfig,
     KimiVLForConditionalGeneration,
     MoonViTConfig,
@@ -161,7 +161,7 @@ class TestKimiVLForConditionalGeneration:
 
     def test_modelclass_export_exists(self):
         """Test ModelClass is exported and points to correct class."""
-        from nemo_automodel.components.models.kimivl import model as kimivl_mod
+        from nemo_automodel._transformers.models.kimivl import model as kimivl_mod
 
         assert hasattr(kimivl_mod, "ModelClass")
         assert kimivl_mod.ModelClass is KimiVLForConditionalGeneration
@@ -191,7 +191,7 @@ class TestVisionTowerComponents:
 
     def test_apply_rope_vision_output_shape(self):
         """Test _apply_rope_vision produces correct output shapes."""
-        from nemo_automodel.components.models.kimivl.model import _apply_rope_vision
+        from nemo_automodel._transformers.models.kimivl.model import _apply_rope_vision
 
         batch_seq = 16
         num_heads = 4
@@ -209,7 +209,7 @@ class TestVisionTowerComponents:
 
     def test_learnable_2d_interp_pos_emb_same_size(self):
         """Test Learnable2DInterpPosEmb with same size (no interpolation)."""
-        from nemo_automodel.components.models.kimivl.model import Learnable2DInterpPosEmb
+        from nemo_automodel._transformers.models.kimivl.model import Learnable2DInterpPosEmb
 
         height, width, dim = 8, 8, 64
         pos_emb = Learnable2DInterpPosEmb(height, width, dim)
@@ -223,7 +223,7 @@ class TestVisionTowerComponents:
 
     def test_learnable_2d_interp_pos_emb_interpolation(self):
         """Test Learnable2DInterpPosEmb with different size (requires interpolation)."""
-        from nemo_automodel.components.models.kimivl.model import Learnable2DInterpPosEmb
+        from nemo_automodel._transformers.models.kimivl.model import Learnable2DInterpPosEmb
 
         height, width, dim = 8, 8, 64
         pos_emb = Learnable2DInterpPosEmb(height, width, dim)
@@ -239,7 +239,7 @@ class TestVisionTowerComponents:
 
     def test_rope_2d_pos_emb_freqs_cis_shape(self):
         """Test Rope2DPosEmb generates correct freqs_cis shape."""
-        from nemo_automodel.components.models.kimivl.model import Rope2DPosEmb
+        from nemo_automodel._transformers.models.kimivl.model import Rope2DPosEmb
 
         dim = 64
         max_height, max_width = 16, 16
@@ -256,7 +256,7 @@ class TestVisionTowerComponents:
         """Test MoonVitMLP forward pass."""
         import torch.nn.functional as F
 
-        from nemo_automodel.components.models.kimivl.model import MoonVitMLP
+        from nemo_automodel._transformers.models.kimivl.model import MoonVitMLP
 
         dims = [64, 128, 64]
         mlp = MoonVitMLP(dims, activation=F.gelu)
@@ -268,7 +268,7 @@ class TestVisionTowerComponents:
 
     def test_patch_merger_output_structure(self):
         """Test patch_merger produces correct output structure."""
-        from nemo_automodel.components.models.kimivl.model import patch_merger
+        from nemo_automodel._transformers.models.kimivl.model import patch_merger
 
         hidden_dim = 64
         h1, w1 = 8, 8
@@ -307,7 +307,7 @@ class TestMoonVitPretrainedModel:
 
     def test_moonvit_initialization(self, small_vit_config):
         """Test MoonVitPretrainedModel initializes correctly."""
-        from nemo_automodel.components.models.kimivl.model import MoonVitPretrainedModel
+        from nemo_automodel._transformers.models.kimivl.model import MoonVitPretrainedModel
 
         model = MoonVitPretrainedModel(small_vit_config)
 
@@ -318,7 +318,7 @@ class TestMoonVitPretrainedModel:
 
     def test_moonvit_dtype_property(self, small_vit_config):
         """Test MoonVitPretrainedModel dtype property."""
-        from nemo_automodel.components.models.kimivl.model import MoonVitPretrainedModel
+        from nemo_automodel._transformers.models.kimivl.model import MoonVitPretrainedModel
 
         model = MoonVitPretrainedModel(small_vit_config)
         assert model.dtype == torch.float32
@@ -339,7 +339,7 @@ class TestKimiVLMultiModalProjector:
 
     def test_projector_initialization(self, projector_config):
         """Test KimiVLMultiModalProjector initializes correctly."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLMultiModalProjector
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLMultiModalProjector
 
         projector = KimiVLMultiModalProjector(projector_config)
 
@@ -352,7 +352,7 @@ class TestKimiVLMultiModalProjector:
 
     def test_projector_forward(self, projector_config):
         """Test KimiVLMultiModalProjector forward pass."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLMultiModalProjector
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLMultiModalProjector
 
         projector = KimiVLMultiModalProjector(projector_config)
 
@@ -416,7 +416,7 @@ class TestKimiVLModel:
         """Test KimiVLModel.forward has expected signature."""
         import inspect
 
-        from nemo_automodel.components.models.kimivl.model import KimiVLModel
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLModel
 
         sig = inspect.signature(KimiVLModel.forward)
         params = list(sig.parameters.keys())
@@ -490,8 +490,8 @@ class TestKimiVLStateDictAdapter:
     @pytest.fixture
     def adapter_setup(self):
         """Create adapter setup for testing."""
-        from nemo_automodel.components.models.common import BackendConfig
-        from nemo_automodel.components.models.kimivl.model import KimiVLStateDictAdapter
+        from nemo_automodel._transformers.models.common import BackendConfig
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLStateDictAdapter
         from nemo_automodel.components.moe.config import MoEConfig
 
         config = KimiVLConfig(
@@ -778,7 +778,7 @@ class TestVisionAttentionFunctions:
 
     def test_vision_attention_sdpa_single_sequence(self):
         """Test vision_attention_sdpa with a single sequence."""
-        from nemo_automodel.components.models.kimivl.model import vision_attention_sdpa
+        from nemo_automodel._transformers.models.kimivl.model import vision_attention_sdpa
 
         seq_len = 16
         num_heads = 4
@@ -796,7 +796,7 @@ class TestVisionAttentionFunctions:
 
     def test_vision_attention_sdpa_multiple_sequences(self):
         """Test vision_attention_sdpa with multiple sequences in a batch."""
-        from nemo_automodel.components.models.kimivl.model import vision_attention_sdpa
+        from nemo_automodel._transformers.models.kimivl.model import vision_attention_sdpa
 
         seq1_len = 8
         seq2_len = 12
@@ -815,7 +815,7 @@ class TestVisionAttentionFunctions:
 
     def test_vision_attention_sdpa_creates_block_diagonal_mask(self):
         """Test that SDPA creates proper block-diagonal attention mask."""
-        from nemo_automodel.components.models.kimivl.model import vision_attention_sdpa
+        from nemo_automodel._transformers.models.kimivl.model import vision_attention_sdpa
 
         # Use small sizes for verification
         seq1 = 4
@@ -842,7 +842,7 @@ class TestMoonVitEncoderLayer:
         """Create a small encoder layer for testing."""
         import torch.nn.functional as F
 
-        from nemo_automodel.components.models.kimivl.model import MoonVitEncoderLayer
+        from nemo_automodel._transformers.models.kimivl.model import MoonVitEncoderLayer
 
         return MoonVitEncoderLayer(
             num_heads=4,
@@ -872,7 +872,7 @@ class TestMoonVitEncoderLayer:
 
     def test_encoder_layer_forward_shape(self, encoder_layer):
         """Test encoder layer forward produces correct output shape."""
-        from nemo_automodel.components.models.kimivl.model import Rope2DPosEmb
+        from nemo_automodel._transformers.models.kimivl.model import Rope2DPosEmb
 
         seq_len = 16
         hidden_dim = 64
@@ -891,7 +891,7 @@ class TestMoonVitEncoderLayer:
 
     def test_encoder_layer_residual_connection(self, encoder_layer):
         """Test encoder layer uses residual connections."""
-        from nemo_automodel.components.models.kimivl.model import Rope2DPosEmb
+        from nemo_automodel._transformers.models.kimivl.model import Rope2DPosEmb
 
         seq_len = 16
         hidden_dim = 64
@@ -915,7 +915,7 @@ class TestMoonVitEncoder:
     @pytest.fixture
     def encoder(self):
         """Create a small encoder for testing."""
-        from nemo_automodel.components.models.kimivl.model import MoonVitEncoder
+        from nemo_automodel._transformers.models.kimivl.model import MoonVitEncoder
 
         block_cfg = {
             "num_heads": 4,
@@ -986,7 +986,7 @@ class TestMoonVisionPatchEmbed:
     @pytest.fixture
     def patch_embed(self):
         """Create patch embed module for testing."""
-        from nemo_automodel.components.models.kimivl.model import MoonVisionPatchEmbed
+        from nemo_automodel._transformers.models.kimivl.model import MoonVisionPatchEmbed
 
         return MoonVisionPatchEmbed(
             out_dim=64,
@@ -1057,7 +1057,7 @@ class TestKimiVLLanguageModelBackend:
 
     def test_backend_has_expected_attributes(self):
         """Test KimiVLLanguageModelBackend has expected attributes."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLLanguageModelBackend
 
         assert hasattr(KimiVLLanguageModelBackend, "forward")
         assert hasattr(KimiVLLanguageModelBackend, "get_input_embeddings")
@@ -1068,7 +1068,7 @@ class TestKimiVLLanguageModelBackend:
         """Test forward signature has expected parameters."""
         import inspect
 
-        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLLanguageModelBackend
 
         sig = inspect.signature(KimiVLLanguageModelBackend.forward)
         params = list(sig.parameters.keys())
@@ -1081,19 +1081,19 @@ class TestKimiVLLanguageModelBackend:
 
     def test_backend_embed_tokens_property(self):
         """Test embed_tokens property exists."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLLanguageModelBackend
 
         assert hasattr(KimiVLLanguageModelBackend, "embed_tokens")
 
     def test_backend_layers_property(self):
         """Test layers property exists."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLLanguageModelBackend
 
         assert hasattr(KimiVLLanguageModelBackend, "layers")
 
     def test_backend_norm_property(self):
         """Test norm property exists."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLLanguageModelBackend
 
         assert hasattr(KimiVLLanguageModelBackend, "norm")
 
@@ -1239,7 +1239,7 @@ class TestKimiVLForConditionalGenerationInit:
         # Check __init__ signature mentions model
         import inspect
 
-        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLForConditionalGeneration
         source = inspect.getsource(KimiVLForConditionalGeneration.__init__)
         assert "self.model" in source
 
@@ -1247,7 +1247,7 @@ class TestKimiVLForConditionalGenerationInit:
         """Test vocab_size is set from config."""
         import inspect
 
-        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLForConditionalGeneration
 
         source = inspect.getsource(KimiVLForConditionalGeneration.__init__)
         assert "self.vocab_size" in source
@@ -1256,7 +1256,7 @@ class TestKimiVLForConditionalGenerationInit:
         """Test state_dict_adapter is created conditionally."""
         import inspect
 
-        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLForConditionalGeneration
 
         source = inspect.getsource(KimiVLForConditionalGeneration.__init__)
         assert "enable_hf_state_dict_adapter" in source
@@ -1264,7 +1264,7 @@ class TestKimiVLForConditionalGenerationInit:
 
     def test_lm_head_property_exists(self):
         """Test lm_head property is defined."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
+        from nemo_automodel._transformers.models.kimivl.model import KimiVLForConditionalGeneration
 
         assert hasattr(KimiVLForConditionalGeneration, "lm_head")
 
@@ -1359,7 +1359,7 @@ class TestDeepSeekV3RotaryEmbeddingAdapter:
 
     def test_adapter_stores_parent_reference(self):
         """Test adapter stores reference to parent module."""
-        from nemo_automodel.components.models.kimivl.model import DeepSeekV3RotaryEmbeddingAdapter
+        from nemo_automodel._transformers.models.kimivl.model import DeepSeekV3RotaryEmbeddingAdapter
 
         class MockParent:
             freqs_cis = torch.randn(100, 64)
@@ -1372,7 +1372,7 @@ class TestDeepSeekV3RotaryEmbeddingAdapter:
 
     def test_adapter_freqs_cis_property(self):
         """Test freqs_cis property accesses parent's buffer."""
-        from nemo_automodel.components.models.kimivl.model import DeepSeekV3RotaryEmbeddingAdapter
+        from nemo_automodel._transformers.models.kimivl.model import DeepSeekV3RotaryEmbeddingAdapter
 
         class MockParent:
             freqs_cis = torch.randn(100, 64)
@@ -1384,7 +1384,7 @@ class TestDeepSeekV3RotaryEmbeddingAdapter:
 
     def test_adapter_raises_when_freqs_cis_none(self):
         """Test adapter raises error when freqs_cis is None."""
-        from nemo_automodel.components.models.kimivl.model import DeepSeekV3RotaryEmbeddingAdapter
+        from nemo_automodel._transformers.models.kimivl.model import DeepSeekV3RotaryEmbeddingAdapter
 
         class MockParent:
             freqs_cis = None

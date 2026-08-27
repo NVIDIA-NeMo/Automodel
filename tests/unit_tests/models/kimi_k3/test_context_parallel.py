@@ -15,13 +15,13 @@
 import torch
 from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
 
-from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
-from nemo_automodel.components.models.kimi_k3.cp import shard_batch_for_kimi_cp
-from nemo_automodel.components.models.kimi_k3.model import (
+from nemo_automodel._transformers.models.kimi_k3.cp import shard_batch_for_kimi_cp
+from nemo_automodel._transformers.models.kimi_k3.model import (
     KimiDeltaAttention,
     KimiK3ForCausalLM,
     KimiMLAAttention,
 )
+from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 
 
 class _FakeCPMesh:

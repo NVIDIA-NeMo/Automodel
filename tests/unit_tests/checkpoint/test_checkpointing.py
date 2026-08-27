@@ -73,7 +73,7 @@ from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
 )
-from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
+from nemo_automodel._transformers.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
@@ -1223,21 +1223,27 @@ class TestIsCustomModel:
         assert _is_custom_model(model) is False
 
     def test_module_from_custom_namespace_is_custom(self):
-        """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
+        """A class whose __module__ starts with nemo_automodel._transformers.models. is custom."""
         # Simulate a custom model by patching __module__ on the class's MRO
         FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
-        FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
+        FakeCustom.__module__ = "nemo_automodel._transformers.models.deepseek_v3.model"
         instance = FakeCustom()
         assert _is_custom_model(instance) is True
 
     def test_subclass_of_custom_model_is_custom(self):
         """A subclass of a custom model class is also detected as custom."""
         Base = type("Base", (torch.nn.Module,), {})
-        Base.__module__ = "nemo_automodel.components.models.kimivl.model"
+        Base.__module__ = "nemo_automodel._transformers.models.kimivl.model"
         Child = type("Child", (Base,), {})
         Child.__module__ = "some_other_module"
         instance = Child()
         assert _is_custom_model(instance) is True
+
+    def test_retrieval_model_namespace_is_custom(self):
+        """Task-owned retrieval implementations remain custom checkpoint models."""
+        FakeRetrievalModel = type("FakeRetrievalModel", (torch.nn.Module,), {})
+        FakeRetrievalModel.__module__ = "nemo_automodel.retrieval.models.llama_bidirectional.model"
+        assert _is_custom_model(FakeRetrievalModel()) is True
 
     def test_none_module_attr_does_not_crash(self):
         """Classes where __module__ is None don't cause an error."""
@@ -1325,7 +1331,7 @@ def test_load_hf_bin_checkpoint_rejects_pickled_module(tmp_path):
 
 def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
     """A DDP-wrapped encoder restores HF-format checkpoint keys through its adapter."""
-    from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+    from nemo_automodel.retrieval.state_dict_adapter import EncoderStateDictAdapter
 
     class Encoder(torch.nn.Module):
         def __init__(self):
@@ -1401,7 +1407,7 @@ def test_single_device_gemma4_loads_into_model_weights_without_full_copy(tmp_pat
                 dtype=torch.float32,
             )
 
-    Gemma4Model.__module__ = "nemo_automodel.components.models.gemma4_moe.model"
+    Gemma4Model.__module__ = "nemo_automodel._transformers.models.gemma4_moe.model"
     model = Gemma4Model()
     checkpoint_gate = torch.arange(48, dtype=torch.float32).reshape(2, 8, 3)
     checkpoint_down = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
@@ -1618,7 +1624,7 @@ class TestLoadModelCustomModelGuard:
 
         # Create a model class in the custom namespace
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
-        CustomModel.__module__ = "nemo_automodel.components.models.kimivl.model"
+        CustomModel.__module__ = "nemo_automodel._transformers.models.kimivl.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
 
@@ -1669,7 +1675,7 @@ class TestLoadModelCustomModelGuard:
         checkpointer = self._make_checkpointer()
 
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
-        CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
+        CustomModel.__module__ = "nemo_automodel._transformers.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
         assert _is_custom_model(model) is True
@@ -1709,7 +1715,7 @@ class TestLoadModelCustomModelGuard:
     ):
         """Quantized conversion keeps the full CPU fallback for both direct-load capabilities."""
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
-        CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
+        CustomModel.__module__ = "nemo_automodel._transformers.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)

@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 from nemo_automodel.components.speculative.dspark.config import build_minimax_m3_draft_config
 from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
 

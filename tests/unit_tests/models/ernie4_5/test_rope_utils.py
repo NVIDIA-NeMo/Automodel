@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
-from nemo_automodel.components.models.ernie4_5.rope_utils import (
+from nemo_automodel._transformers.models.ernie4_5.rope_utils import (
     Ernie4_5RotaryEmbedding,
     apply_rotary_pos_emb,
     rotate_every_two,

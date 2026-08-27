@@ -28,8 +28,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.hy_v3.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.hy_v3.state_dict_adapter import (
     _HF_TO_NATIVE_RENAMES,
     _NATIVE_TO_HF_RENAMES,
     HYV3StateDictAdapter,

@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
+from nemo_automodel._transformers.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
 from nemo_automodel.components.speculative.dspark.config import build_kimi_k3_draft_config
 from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss

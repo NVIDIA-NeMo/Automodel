@@ -17,8 +17,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_automodel.components.models.step3p7.configuration_step3p7 import StepRoboticsVisionEncoderConfig
-from nemo_automodel.components.models.step3p7.vision_encoder import (
+from nemo_automodel._transformers.models.step3p7.configuration_step3p7 import StepRoboticsVisionEncoderConfig
+from nemo_automodel._transformers.models.step3p7.vision_encoder import (
     EncoderLayerScale,
     EncoderMLP,
     EncoderRope2D,

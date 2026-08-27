@@ -25,8 +25,8 @@ itself needs a real checkpoint dir for DCP). Runs on CPU.
 import torch
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.kimi_k25_vl.model import (
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype
+from nemo_automodel._transformers.models.kimi_k25_vl.model import (
     KimiK25VLConfig,
     KimiK25VLForConditionalGeneration,
     MoonViT3dConfig,

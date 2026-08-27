@@ -17,7 +17,7 @@
 At depth ``k`` the MTP module embeds the token originally at position
 ``t + k + 1`` for slot ``t``. This is implemented by cumulatively rolling
 ``cur_input_ids`` (and ``cur_position_ids``) left by one at each depth in
-``MTPModule.forward`` (see ``components/models/common/mtp/mtp.py``).
+``MTPModule.forward`` (see ``_transformers/models/common/mtp/mtp.py``).
 
 These tests intercept what reaches each sublayer and verify the rolled
 inputs match a hand-rolled reference. The label-rolling on the loss side is
@@ -30,7 +30,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common.mtp.mtp import (
+from nemo_automodel._transformers.models.common.mtp.mtp import (
     MTPConfig,
     MTPModule,
     prepare_mtp_context_parallel_inputs,

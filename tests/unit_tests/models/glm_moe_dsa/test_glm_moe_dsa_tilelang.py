@@ -21,13 +21,13 @@ import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.glm_moe_dsa import cp as cp_mod
+from nemo_automodel._transformers.models.glm_moe_dsa import layers as layer_mod
+from nemo_automodel._transformers.models.glm_moe_dsa import optimized_kernels as ok
+from nemo_automodel._transformers.models.glm_moe_dsa.layers import GlmMoeDsaIndexer, GlmMoeDsaMLA
+from nemo_automodel._transformers.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM
 from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.glm_moe_dsa import cp as cp_mod
-from nemo_automodel.components.models.glm_moe_dsa import layers as layer_mod
-from nemo_automodel.components.models.glm_moe_dsa import optimized_kernels as ok
-from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaIndexer, GlmMoeDsaMLA
-from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM
 from nemo_automodel.shared.import_utils import UnavailableError
 
 # GLM-5.2 DSA kernel dims (kv_lora_rank + qk_rope_head_dim == 576 is hard-coded in the kernel).
@@ -257,7 +257,7 @@ def _patch_fake_tilelang(monkeypatch, module):
 
 
 def test_tilelang_shim_handles_missing_and_delegates(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import _tilelang
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import _tilelang
 
     assert _tilelang.tilelang.math.next_power_of_2(7) == 8
     assert _tilelang.tilelang.cdiv(5, 2) == 3
@@ -287,7 +287,7 @@ def test_tilelang_shim_handles_missing_and_delegates(monkeypatch):
 
 
 def test_tilelang_shim_loads_real_modules(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import _tilelang
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import _tilelang
 
     tilelang_module = ModuleType("tilelang")
     language_module = ModuleType("tilelang.language")
@@ -299,7 +299,7 @@ def test_tilelang_shim_loads_real_modules(monkeypatch):
 
 
 def test_tilelang_shim_lazy_jit_resolves_pass_configs_and_caches(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import _tilelang
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import _tilelang
 
     compiled_calls = []
     load_calls = []
@@ -443,7 +443,7 @@ def test_generate_padded_varlen_mask_params_excludes_cp_padding():
 
 
 def test_tilelang_topk_chunks_rows_without_changing_results(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import indexer as indexer_mod
 
     logits = torch.randn(7, 11)
     expected_scores, expected_indices = torch.topk(logits, 4, dim=-1)
@@ -465,7 +465,7 @@ def test_tilelang_topk_chunks_rows_without_changing_results(monkeypatch):
 
 
 def test_tilelang_topk_keeps_small_inputs_in_one_call(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import indexer as indexer_mod
 
     logits = torch.randn(3, 5)
     original_topk = torch.topk
@@ -487,7 +487,7 @@ def test_tilelang_topk_keeps_small_inputs_in_one_call(monkeypatch):
 
 
 def test_indexer_generates_topk_and_varlen_mask_params(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import indexer as indexer_mod
 
     captured = {}
 
@@ -550,7 +550,7 @@ def test_tilelang_sparse_attention_dispatches_and_projects_value(monkeypatch):
 
 
 def test_indexer_autograd_backward_dispatches_kernel(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import indexer as indexer_mod
 
     captured = {}
 
@@ -592,7 +592,7 @@ def test_indexer_autograd_backward_dispatches_kernel(monkeypatch):
 
 
 def test_sparse_mla_autograd_backward_dispatches_kernel(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import sparse_mla as sparse_mla_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import sparse_mla as sparse_mla_mod
 
     captured = {}
 
@@ -637,7 +637,7 @@ def test_sparse_mla_autograd_backward_dispatches_kernel(monkeypatch):
 
 
 def test_tilelang_indexer_backward_interface_launches_kernel(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_indexer_bwd as indexer_bwd_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import tilelang_indexer_bwd as indexer_bwd_mod
 
     captured = {}
 
@@ -688,7 +688,7 @@ def test_tilelang_indexer_backward_interface_launches_kernel(monkeypatch):
 
 
 def test_tilelang_sparse_mla_forward_interface_launches_kernel(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_fwd as sparse_fwd_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import tilelang_sparse_mla_fwd as sparse_fwd_mod
 
     captured = {}
 
@@ -749,7 +749,7 @@ def test_tilelang_sparse_mla_forward_interface_launches_kernel(monkeypatch):
 
 
 def test_tilelang_sparse_mla_backward_wrapper_launches_kernels(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_bwd as sparse_bwd_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import tilelang_sparse_mla_bwd as sparse_bwd_mod
 
     captured = {}
 
@@ -805,9 +805,9 @@ def test_tilelang_sparse_mla_backward_wrapper_launches_kernels(monkeypatch):
 
 
 def test_raw_tilelang_kernel_builders_with_fake_language(monkeypatch):
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_indexer_bwd as indexer_bwd_mod
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_bwd as sparse_bwd_mod
-    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_fwd as sparse_fwd_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import tilelang_indexer_bwd as indexer_bwd_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import tilelang_sparse_mla_bwd as sparse_bwd_mod
+    from nemo_automodel._transformers.models.glm_moe_dsa.kernels import tilelang_sparse_mla_fwd as sparse_fwd_mod
 
     for module in (indexer_bwd_mod, sparse_bwd_mod, sparse_fwd_mod):
         _patch_fake_tilelang(monkeypatch, module)

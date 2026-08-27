@@ -1798,7 +1798,7 @@ class _FakeNemoOwnedConfig(PretrainedConfig):
 
 
 # The helper discriminates on the class's owning package, not its bases.
-_FakeNemoOwnedConfig.__module__ = "nemo_automodel.components.models.test_only.config"
+_FakeNemoOwnedConfig.__module__ = "nemo_automodel._transformers.models.test_only.config"
 
 _STUB_AUTO_MAP = {"AutoConfig": "configuration_stub.StubReferenceConfig"}
 
@@ -1849,7 +1849,7 @@ class _FakeNemoOwnedLlamaConfig(PretrainedConfig):
     model_type = "llama"
 
 
-_FakeNemoOwnedLlamaConfig.__module__ = "nemo_automodel.components.models.test_only.config"
+_FakeNemoOwnedLlamaConfig.__module__ = "nemo_automodel._transformers.models.test_only.config"
 
 
 def test_replace_nemo_owned_reference_config_resolves_in_tree_class(tmp_path):

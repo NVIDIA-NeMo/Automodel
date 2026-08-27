@@ -37,7 +37,7 @@ from nemo_automodel._transformers.model_init import (
     _try_get_remote_code_model_cls,
     get_hf_config,
 )
-from nemo_automodel.components.models.common.utils import BackendConfig
+from nemo_automodel._transformers.models.common.utils import BackendConfig
 
 
 class TestBackendModuleOverrides:
@@ -128,7 +128,7 @@ class TestBackendModuleOverrides:
         )
 
         with patch(
-            "nemo_automodel.components.models.common.utils.safe_import_from",
+            "nemo_automodel._transformers.models.common.utils.safe_import_from",
             side_effect=fake_safe_import,
         ):
             is_custom, model = _init_model(
@@ -152,7 +152,7 @@ class TestBackendModuleOverrides:
         assert torch.isfinite(output.logits).all()
 
     def test_registered_legacy_model_uses_quack_without_backend_constructor_parameter(self):
-        from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
+        from nemo_automodel._transformers.models.baichuan.configuration import BaichuanConfig
 
         class FakeQuackLinear(nn.Linear):
             pass
@@ -174,7 +174,7 @@ class TestBackendModuleOverrides:
         )
 
         with patch(
-            "nemo_automodel.components.models.common.utils.safe_import_from",
+            "nemo_automodel._transformers.models.common.utils.safe_import_from",
             return_value=(True, FakeQuackLinear),
         ):
             is_custom, model = _init_model(
@@ -230,7 +230,7 @@ class TestBackendModuleOverrides:
         )
 
         with patch(
-            "nemo_automodel.components.models.common.utils.safe_import_from",
+            "nemo_automodel._transformers.models.common.utils.safe_import_from",
             side_effect=fake_safe_import,
         ):
             is_custom, model = _init_model(
@@ -365,7 +365,7 @@ class TestBackendDictCoercion:
             captured_kwargs.update(kwargs)
             return MagicMock()
 
-        fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        fake_model_cls.__module__ = "nemo_automodel._transformers.models.fake"
         if backend_config_resolver is not None:
             fake_model_cls.backend_config_resolver = backend_config_resolver
         mock_resolve_cls.return_value = fake_model_cls
@@ -643,7 +643,7 @@ class TestDictConfigOverrideKeepsCustomPath:
             captured_kwargs.update(kwargs)
             return MagicMock()
 
-        fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        fake_model_cls.__module__ = "nemo_automodel._transformers.models.fake"
         mock_resolve_cls.return_value = fake_model_cls
 
         is_custom, _ = _init_model(
@@ -890,7 +890,7 @@ class TestStreamingBnbSupported:
 
     def test_custom_automodel_class_is_unsupported(self):
         """Classes that carry HFCheckpointingMixin rely on state_dict_adapter; skip streaming."""
-        from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+        from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
         class FakeCustomModel(HFCheckpointingMixin, nn.Module):
             pass
@@ -1127,7 +1127,7 @@ class TestTieWeightsNemoConfigGate:
     def test_untied_only_policy_overrides_misleading_tied_config(self):
         """A fixed untied policy prevents re-tying despite an outer True flag."""
         from nemo_automodel._transformers.model_init import _tie_weights_nemo
-        from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+        from nemo_automodel._transformers.models.common.tie_word_embeddings import TieSupport
 
         model = self._make_model(tie=True)
         model.tie_word_embeddings_support = TieSupport.UNTIED_ONLY

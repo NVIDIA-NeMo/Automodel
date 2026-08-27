@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
+from nemo_automodel._transformers.models.mimo_v2_flash.config import MiMoV2FlashConfig
 
 
 class TestMiMoV2FlashConfig:

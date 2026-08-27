@@ -16,7 +16,7 @@
 
 Covers the branch exercised when ``target_force_hf=False`` and the loaded
 target model is the AutoModel custom implementation (e.g. the custom
-``Qwen3MoeForCausalLM`` under ``components/models/qwen3_moe``) rather than
+``Qwen3MoeForCausalLM`` under ``_transformers/models/qwen3_moe``) rather than
 the stock HuggingFace class. Verifies:
 
 1. ``_get_transformer_layers`` normalizes both ``nn.ModuleDict`` (custom

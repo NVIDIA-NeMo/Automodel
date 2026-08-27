@@ -18,13 +18,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
-from nemo_automodel.components.models.minimax_m3_vl.layers import (
+from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+from nemo_automodel._transformers.models.minimax_m3_vl.layers import (
     MiniMaxM3Indexer,
     _padding_mask_to_keep_mask,
     build_block_sparse_attn_mask,
 )
-from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
 from .conftest import SPARSE_ATTENTION_CONFIG, TINY_CFG
 from .test_minimax_m3_parity import _gemma_rmsnorm, _partial_neox_rope, _swiglu_oai
@@ -287,7 +287,7 @@ def test_eager_sparse_attn_bf16_matches_fp32(backend):
     ~1e-2, max ~0.27), which silently made cp1 (eager) diverge from cp2 (CP/FlexAttention).
     Boolean masking keeps bf16 within ~1e-4 of fp32; this guard fails if it ever regresses.
     """
-    from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import MiniMaxM3CPSparseAttention
+    from nemo_automodel._transformers.models.minimax_m3_vl.cp_sparse_attn import MiniMaxM3CPSparseAttention
 
     dev = torch.device("cuda")
     torch.manual_seed(0)

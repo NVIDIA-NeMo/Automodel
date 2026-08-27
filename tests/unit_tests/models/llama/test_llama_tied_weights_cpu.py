@@ -14,7 +14,7 @@
 
 from transformers import LlamaConfig
 
-from nemo_automodel.components.models.llama.model import LlamaForCausalLM
+from nemo_automodel._transformers.models.llama.model import LlamaForCausalLM
 
 
 def _tiny_llama_config(tie_word_embeddings: bool) -> LlamaConfig:

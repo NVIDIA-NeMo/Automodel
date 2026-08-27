@@ -7,9 +7,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.minimax_m2.model import Block, MiniMaxM2ForCausalLM, MiniMaxM2Model
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype
+from nemo_automodel._transformers.models.minimax_m2.model import Block, MiniMaxM2ForCausalLM, MiniMaxM2Model
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 
 

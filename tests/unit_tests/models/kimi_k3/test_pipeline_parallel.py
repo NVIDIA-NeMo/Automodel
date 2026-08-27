@@ -20,10 +20,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import nemo_automodel.components.models.kimi_k3.model as kimi_k3_model
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
-from nemo_automodel.components.models.kimi_k3.model import (
+import nemo_automodel._transformers.models.kimi_k3.model as kimi_k3_model
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
+from nemo_automodel._transformers.models.kimi_k3.model import (
     KimiK3ForCausalLM,
     KimiK3MoE,
     KimiMLAAttention,

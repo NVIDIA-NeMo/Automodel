@@ -23,8 +23,8 @@ projection, fp32 scoring, fp32 selected weights (AMINT-286).
 import torch
 from transformers import AutoConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m2.model import MiniMaxM2ForCausalLM
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.minimax_m2.model import MiniMaxM2ForCausalLM
 
 TINY = dict(
     vocab_size=128,

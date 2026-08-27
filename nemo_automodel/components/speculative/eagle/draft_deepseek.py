@@ -31,7 +31,7 @@ and the ``d2t`` / ``t2d`` buffers). Only the attention block is replaced with ML
 
 To guarantee the draft's rotary math matches the target's exactly, the MLA
 projection layout and the interleaved RoPE are taken from the onboarded DeepSeek
-target (``components/models/deepseek_v3``: the ``MLA`` projection structure and
+target (``_transformers/models/deepseek_v3``: the ``MLA`` projection structure and
 ``rope_utils``), not reimplemented.
 
 Scope: EAGLE-3 single fused draft layer, eager attention. Sequence packing is
@@ -47,13 +47,13 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
 
-from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
-from nemo_automodel.components.models.common import initialize_rms_norm_module
-from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+from nemo_automodel._transformers.models.common import initialize_rms_norm_module
+from nemo_automodel._transformers.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
 
 
 def _resolve_rope_theta(config: PretrainedConfig) -> float:

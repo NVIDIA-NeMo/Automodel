@@ -19,8 +19,8 @@ import json
 import pytest
 from transformers import AutoConfig
 
+from nemo_automodel._transformers.models.glm_moe_dsa.config import GlmMoeDsaConfig
 from nemo_automodel._transformers.registry import resolve_custom_config_cls
-from nemo_automodel.components.models.glm_moe_dsa.config import GlmMoeDsaConfig
 
 # The released GLM-5.2 config.json carries both keys; transformers aliases
 # head_dim onto qk_rope_head_dim, so loading it through the built-in config

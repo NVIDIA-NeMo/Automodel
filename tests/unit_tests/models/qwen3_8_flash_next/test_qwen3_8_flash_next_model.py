@@ -17,13 +17,13 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.config import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.config import (
     Qwen3_8_FlashNextConfig,
     Qwen3_8_FlashNextTextConfig,
 )
-from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.model import (
+from nemo_automodel._transformers.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.model import (
     ModelClass,
     Qwen3_8_FlashNextForConditionalGeneration,
 )

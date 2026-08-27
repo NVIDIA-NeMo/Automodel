@@ -20,8 +20,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.mistral4.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.mistral4.model import (
     _HF_MISTRAL3_AVAILABLE,
     Mistral4Block,
     Mistral4ForCausalLM,
@@ -166,7 +166,7 @@ class TestMistral4MLA:
         B, S = 2, 8
         x = torch.randn(B, S, 64, dtype=torch.bfloat16, device=device)
         # Build freqs_cis
-        from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+        from nemo_automodel._transformers.models.deepseek_v3.rope_utils import (
             freqs_cis_from_position_ids,
             precompute_freqs_cis,
         )
@@ -196,7 +196,7 @@ class TestMistral4MLA:
         assert mla.llama_4_scaling_beta is None
         B, S = 1, 4
         x = torch.randn(B, S, 64, dtype=torch.bfloat16, device=device)
-        from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+        from nemo_automodel._transformers.models.deepseek_v3.rope_utils import (
             freqs_cis_from_position_ids,
             precompute_freqs_cis,
         )
@@ -378,7 +378,7 @@ class TestMistral4ForCausalLM:
 
 class TestMistral4Config:
     def test_defaults(self):
-        from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
+        from nemo_automodel._transformers.models.mistral4.configuration import Mistral4Config
 
         cfg = Mistral4Config()
         assert cfg.model_type == "mistral4"
@@ -388,7 +388,7 @@ class TestMistral4Config:
         assert cfg.head_dim == 128  # v_head_dim
 
     def test_custom_values(self):
-        from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
+        from nemo_automodel._transformers.models.mistral4.configuration import Mistral4Config
 
         cfg = Mistral4Config(vocab_size=256, hidden_size=64, num_hidden_layers=2)
         assert cfg.vocab_size == 256
@@ -396,7 +396,7 @@ class TestMistral4Config:
         assert cfg.num_hidden_layers == 2
 
     def test_rope_parameters_default(self):
-        from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
+        from nemo_automodel._transformers.models.mistral4.configuration import Mistral4Config
 
         cfg = Mistral4Config()
         assert cfg.rope_parameters is not None
@@ -404,7 +404,7 @@ class TestMistral4Config:
         assert cfg.rope_parameters["llama_4_scaling_beta"] == 0.1
 
     def test_custom_rope_parameters(self):
-        from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
+        from nemo_automodel._transformers.models.mistral4.configuration import Mistral4Config
 
         custom_rope = {
             "type": "yarn",
@@ -422,7 +422,7 @@ class TestMistral4Config:
         assert cfg.rope_parameters["llama_4_scaling_beta"] == 0.2
 
     def test_num_key_value_heads_default(self):
-        from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
+        from nemo_automodel._transformers.models.mistral4.configuration import Mistral4Config
 
         cfg = Mistral4Config(num_key_value_heads=None, num_attention_heads=16)
         assert cfg.num_key_value_heads == 16
@@ -452,7 +452,7 @@ def multimodal_config():
     from transformers import AutoConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
+    from nemo_automodel._transformers.models.mistral4.configuration import Mistral4Config
 
     # Ensure Mistral4Config is registered before Mistral3Config tries to resolve it
     if "mistral4" not in CONFIG_MAPPING:
@@ -524,14 +524,14 @@ def _make_fake_vision_tower(hidden_size=32, patch_size=4):
 @_skip_no_hf_mistral3
 class TestMistral4TextModelBackend:
     def test_init(self, text_config, backend):
-        from nemo_automodel.components.models.mistral4.model import Mistral4TextModelBackend
+        from nemo_automodel._transformers.models.mistral4.model import Mistral4TextModelBackend
 
         tm = Mistral4TextModelBackend(text_config, backend)
         assert tm.lm_head is not None
         assert tm.moe_config is not None
 
     def test_properties(self, text_config, backend):
-        from nemo_automodel.components.models.mistral4.model import Mistral4TextModelBackend
+        from nemo_automodel._transformers.models.mistral4.model import Mistral4TextModelBackend
 
         tm = Mistral4TextModelBackend(text_config, backend)
         assert tm.embed_tokens is tm.model.embed_tokens
@@ -539,7 +539,7 @@ class TestMistral4TextModelBackend:
         assert tm.norm is tm.model.norm
 
     def test_get_set_input_embeddings(self, text_config, backend):
-        from nemo_automodel.components.models.mistral4.model import Mistral4TextModelBackend
+        from nemo_automodel._transformers.models.mistral4.model import Mistral4TextModelBackend
 
         tm = Mistral4TextModelBackend(text_config, backend)
         embed = tm.get_input_embeddings()
@@ -551,7 +551,7 @@ class TestMistral4TextModelBackend:
     def test_forward_returns_base_model_output(self, text_config, backend, device):
         from transformers.modeling_outputs import BaseModelOutputWithPast
 
-        from nemo_automodel.components.models.mistral4.model import Mistral4TextModelBackend
+        from nemo_automodel._transformers.models.mistral4.model import Mistral4TextModelBackend
 
         tm = Mistral4TextModelBackend(text_config, backend).to(device).to(torch.bfloat16)
         input_ids = torch.randint(0, 256, (1, 8), device=device)
@@ -561,7 +561,7 @@ class TestMistral4TextModelBackend:
         assert out.past_key_values is None
 
     def test_forward_with_inputs_embeds(self, text_config, backend, device):
-        from nemo_automodel.components.models.mistral4.model import Mistral4TextModelBackend
+        from nemo_automodel._transformers.models.mistral4.model import Mistral4TextModelBackend
 
         tm = Mistral4TextModelBackend(text_config, backend).to(device).to(torch.bfloat16)
         embeds = torch.randn(1, 8, 64, dtype=torch.bfloat16, device=device)
@@ -569,7 +569,7 @@ class TestMistral4TextModelBackend:
         assert out.last_hidden_state.shape == (1, 8, 64)
 
     def test_init_weights(self, text_config, backend, device):
-        from nemo_automodel.components.models.mistral4.model import Mistral4TextModelBackend
+        from nemo_automodel._transformers.models.mistral4.model import Mistral4TextModelBackend
 
         tm = Mistral4TextModelBackend(text_config, backend).to(device).to(torch.bfloat16)
         tm.init_weights(buffer_device=device)
@@ -578,10 +578,10 @@ class TestMistral4TextModelBackend:
 @_skip_no_hf_mistral3
 class TestMistral3Model:
     def test_init(self, text_config, backend):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
         )
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -595,10 +595,10 @@ class TestMistral3Model:
         assert model.language_model is language_model
 
     def test_properties_delegate_to_language_model(self, text_config, backend):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
         )
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -610,10 +610,10 @@ class TestMistral3Model:
         assert model.get_input_embeddings() is language_model.get_input_embeddings()
 
     def test_forward_text_only(self, text_config, backend, device):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
         )
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -624,10 +624,10 @@ class TestMistral3Model:
         assert out.last_hidden_state.shape == (1, 8, 64)
 
     def test_forward_raises_on_both_inputs(self, text_config, backend, device):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
         )
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -640,10 +640,10 @@ class TestMistral3Model:
 
     def test_forward_float_input_ids_as_embeds(self, text_config, backend, device):
         """When embed_tokens is None and input_ids is float, treat as embeds."""
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
         )
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -659,10 +659,10 @@ class TestMistral3Model:
 @_skip_no_hf_mistral3
 class TestMistral3ForConditionalGeneration:
     def test_checkpoint_tie_policy_ignores_outer_wrapper_default(self, multimodal_config, backend):
-        from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
+        from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
         model = OurMistral3ForCG(multimodal_config, backend=backend)
 
@@ -671,7 +671,7 @@ class TestMistral3ForConditionalGeneration:
         assert is_tied_word_embeddings(model) is False
 
     def test_init(self, multimodal_config, backend):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -682,7 +682,7 @@ class TestMistral3ForConditionalGeneration:
         assert model.image_token_index == 10
 
     def test_get_set_input_embeddings(self, multimodal_config, backend):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -694,7 +694,7 @@ class TestMistral3ForConditionalGeneration:
         assert model.get_input_embeddings() is new_embed
 
     def test_get_set_output_embeddings(self, multimodal_config, backend):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -706,7 +706,7 @@ class TestMistral3ForConditionalGeneration:
         assert model.get_output_embeddings() is new_head
 
     def test_lm_head_property(self, multimodal_config, backend):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -714,7 +714,7 @@ class TestMistral3ForConditionalGeneration:
         assert model.lm_head is model.model.language_model.lm_head
 
     def test_forward_text_only(self, multimodal_config, backend, device):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -724,7 +724,7 @@ class TestMistral3ForConditionalGeneration:
         assert logits.shape == (1, 8, 256)
 
     def test_from_config(self, multimodal_config, backend):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -732,7 +732,7 @@ class TestMistral3ForConditionalGeneration:
         assert model.config is multimodal_config
 
     def test_num_hidden_layers_override(self, multimodal_config, backend):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -740,7 +740,7 @@ class TestMistral3ForConditionalGeneration:
         assert len(model.model.language_model.layers) == 1
 
     def test_update_moe_gate_bias(self, multimodal_config, backend, device):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -751,7 +751,7 @@ class TestMistral3ForConditionalGeneration:
         model.update_moe_gate_bias()
 
     def test_initialize_weights(self, multimodal_config, backend, device):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -759,7 +759,7 @@ class TestMistral3ForConditionalGeneration:
         model.initialize_weights(buffer_device=device)
 
     def test_state_dict_adapter_created(self, multimodal_config):
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -775,7 +775,7 @@ class TestMistral3ForConditionalGeneration:
 
     def test_lm_head_none_on_pruned_model(self, multimodal_config, backend):
         """lm_head property gracefully returns None when language_model is pruned (PP)."""
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -787,7 +787,7 @@ class TestMistral3ForConditionalGeneration:
 
     def test_forward_without_lm_head(self, multimodal_config, backend, device):
         """Forward returns hidden_states when lm_head is None (PP stage without head)."""
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -800,7 +800,7 @@ class TestMistral3ForConditionalGeneration:
 
     def test_pp_vlm_chunk_retrieval(self, multimodal_config, backend):
         """PP VLM chunk attributes are stored and chunk_idx increments correctly."""
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -825,10 +825,10 @@ class TestMistral3ModelVision:
 
     def test_get_image_features(self, text_config, backend, device):
         """Test _get_image_features with a mocked vision tower."""
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
         )
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -875,7 +875,7 @@ class TestMistral3ModelVision:
         """
         from transformers.modeling_outputs import BaseModelOutputWithPast
 
-        from nemo_automodel.components.models.mistral4.model import Mistral3Model as OurMistral3Model
+        from nemo_automodel._transformers.models.mistral4.model import Mistral3Model as OurMistral3Model
 
         hidden_size = text_config.hidden_size
         n_vision_tokens = 4
@@ -928,7 +928,7 @@ class TestMistral3ModelVision:
 
     def test_forward_raises_on_pp_stage_without_embeds(self, text_config, backend, device):
         """PP stage with no embed_tokens and integer input_ids raises ValueError."""
-        from nemo_automodel.components.models.mistral4.model import Mistral3Model as OurMistral3Model
+        from nemo_automodel._transformers.models.mistral4.model import Mistral3Model as OurMistral3Model
 
         # Mock language_model with no embed_tokens
         language_model = Mock()
@@ -957,8 +957,8 @@ class TestRegistry:
         from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
 
         mapping = dict(MODEL_ARCH_MAPPING)
-        assert mapping["Mistral4ForCausalLM"][0] == "nemo_automodel.components.models.mistral4.model"
-        assert mapping["Mistral3ForConditionalGeneration"][0] == "nemo_automodel.components.models.mistral4.model"
+        assert mapping["Mistral4ForCausalLM"][0] == "nemo_automodel._transformers.models.mistral4.model"
+        assert mapping["Mistral3ForConditionalGeneration"][0] == "nemo_automodel._transformers.models.mistral4.model"
 
 
 # ---------------------------------------------------------------------------
@@ -970,7 +970,7 @@ class TestRegistry:
 class TestSupportsConfig:
     def test_supports_mistral4_text_config(self, multimodal_config):
         """supports_config returns True for Mistral3Config wrapping a Mistral4 text backbone."""
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -978,7 +978,7 @@ class TestSupportsConfig:
 
     def test_rejects_non_mistral4_text_config(self):
         """supports_config returns False when text_config.model_type is not 'mistral4'."""
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -989,7 +989,7 @@ class TestSupportsConfig:
 
     def test_rejects_config_without_text_config(self):
         """supports_config returns False when config has no text_config attribute."""
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 
@@ -998,7 +998,7 @@ class TestSupportsConfig:
 
     def test_rejects_text_config_without_model_type(self):
         """supports_config returns False when text_config has no model_type."""
-        from nemo_automodel.components.models.mistral4.model import (
+        from nemo_automodel._transformers.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,
         )
 

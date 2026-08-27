@@ -24,10 +24,10 @@ restored to fp32. Runs on CPU.
 
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
-from nemo_automodel.components.models.minimax_m3_vl.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype
+from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
+from nemo_automodel._transformers.models.minimax_m3_vl.model import (
     MiniMaxM3SparseForCausalLM,
     MiniMaxM3SparseForConditionalGeneration,
 )

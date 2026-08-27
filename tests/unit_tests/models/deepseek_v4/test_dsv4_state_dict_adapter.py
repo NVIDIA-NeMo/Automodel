@@ -16,9 +16,9 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
-from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel._transformers.models.deepseek_v4.state_dict_adapter import (
     DeepSeekV4StateDictAdapter,
     _rename_hf_key,
 )
@@ -180,7 +180,7 @@ class TestDeepSeekV4StateDictAdapterFromHF:
         sentinel = torch.empty(4, 4)
 
         with patch(
-            "nemo_automodel.components.models.deepseek_v4.state_dict_adapter.dequantize_from_fp8",
+            "nemo_automodel._transformers.models.deepseek_v4.state_dict_adapter.dequantize_from_fp8",
             return_value=sentinel,
         ) as mock_dequantize:
             out = adapter._dequantize_expert_weight("layers.0.ffn.experts.0.w1.weight", weight, scale)

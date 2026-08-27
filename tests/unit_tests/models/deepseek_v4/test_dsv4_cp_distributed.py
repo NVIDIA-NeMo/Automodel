@@ -24,13 +24,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
-from nemo_automodel.components.models.deepseek_v4.cp import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel._transformers.models.deepseek_v4.cp import (
     build_dsv4_cp_causal_padding_mask,
     dsv4_cp_all_gather,
 )
-from nemo_automodel.components.models.deepseek_v4.layers import (
+from nemo_automodel._transformers.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4RotaryEmbedding,
     build_causal_padding_mask,

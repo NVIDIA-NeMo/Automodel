@@ -26,8 +26,8 @@ import torch
 def _tiny_model(self_conditioning=True, freeze_router=True):
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
 
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.diffusion_gemma.model import DiffusionGemmaForBlockDiffusion
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.diffusion_gemma.model import DiffusionGemmaForBlockDiffusion
 
     text_cfg = dict(
         vocab_size=64,
@@ -67,7 +67,7 @@ def _tiny_model(self_conditioning=True, freeze_router=True):
 
 
 def _masks(model, batch_size, seq_len, block_size, device, dtype=torch.float32):
-    from nemo_automodel.components.models.diffusion_gemma.attention_mask import (
+    from nemo_automodel._transformers.models.diffusion_gemma.attention_mask import (
         build_block_diffusion_training_mask,
     )
 

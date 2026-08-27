@@ -42,6 +42,7 @@ from nemo_automodel._transformers.model_init import (
     _patched_get_init_context,
     no_hf_meta_device,
 )
+from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.checkpoint.utils import _get_checkpoint_tensor_dtypes
 from nemo_automodel.components.distributed.config import (
     DistributedSetup,
@@ -50,7 +51,6 @@ from nemo_automodel.components.distributed.config import (
     MultimodalDistributedConfig,
 )
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 
 class _FakeMesh:

@@ -35,292 +35,298 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "BagelForUnifiedMultimodal",
             (
-                "nemo_automodel.components.models.bagel.model",
+                "nemo_automodel._transformers.models.bagel.model",
                 "BagelForUnifiedMultimodal",
             ),
         ),
         (
             "BagelForConditionalGeneration",
             (
-                "nemo_automodel.components.models.bagel.model",
+                "nemo_automodel._transformers.models.bagel.model",
                 "BagelForUnifiedMultimodal",
             ),
         ),
         (
             "BaichuanForCausalLM",
-            ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
+            ("nemo_automodel._transformers.models.baichuan.model", "BaichuanForCausalLM"),
         ),
         (
             "BailingMoeV2ForCausalLM",
-            ("nemo_automodel.components.models.ling_v2.model", "BailingMoeV2ForCausalLM"),
+            ("nemo_automodel._transformers.models.ling_v2.model", "BailingMoeV2ForCausalLM"),
         ),
         (
             "DeepseekV3ForCausalLM",
-            ("nemo_automodel.components.models.deepseek_v3.model", "DeepseekV3ForCausalLM"),
+            ("nemo_automodel._transformers.models.deepseek_v3.model", "DeepseekV3ForCausalLM"),
         ),
         (
             "DeepseekV32ForCausalLM",
-            ("nemo_automodel.components.models.deepseek_v32.model", "DeepseekV32ForCausalLM"),
+            ("nemo_automodel._transformers.models.deepseek_v32.model", "DeepseekV32ForCausalLM"),
         ),
         (
             "DeepseekV4ForCausalLM",
-            ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
+            ("nemo_automodel._transformers.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
         ),
         (
             "DiffusionGemmaForBlockDiffusion",
-            ("nemo_automodel.components.models.diffusion_gemma.model", "DiffusionGemmaForBlockDiffusion"),
+            ("nemo_automodel._transformers.models.diffusion_gemma.model", "DiffusionGemmaForBlockDiffusion"),
         ),
         (
             "Ernie4_5_MoeForCausalLM",
-            ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
+            ("nemo_automodel._transformers.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
         ),
         (
             "Glm4MoeForCausalLM",
-            ("nemo_automodel.components.models.glm4_moe.model", "Glm4MoeForCausalLM"),
+            ("nemo_automodel._transformers.models.glm4_moe.model", "Glm4MoeForCausalLM"),
         ),
         (
             "Glm4MoeLiteForCausalLM",
-            ("nemo_automodel.components.models.glm4_moe_lite.model", "Glm4MoeLiteForCausalLM"),
+            ("nemo_automodel._transformers.models.glm4_moe_lite.model", "Glm4MoeLiteForCausalLM"),
         ),
         (
             "GlmMoeDsaForCausalLM",
-            ("nemo_automodel.components.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
+            ("nemo_automodel._transformers.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
         ),
         (
             "Gemma4ForConditionalGeneration",
-            ("nemo_automodel.components.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
         ),
         (
             "Gemma4UnifiedForConditionalGeneration",
             (
-                "nemo_automodel.components.models.gemma4_unified.model",
+                "nemo_automodel._transformers.models.gemma4_unified.model",
                 "Gemma4UnifiedForConditionalGeneration",
             ),
         ),
         (
             "Gemma4AssistantForCausalLM",
-            ("nemo_automodel.components.models.gemma4_drafter.model", "Gemma4DrafterForCausalLM"),
+            ("nemo_automodel._transformers.models.gemma4_drafter.model", "Gemma4DrafterForCausalLM"),
         ),
         (
             "GptOssForCausalLM",
-            ("nemo_automodel.components.models.gpt_oss.model", "GptOssForCausalLM"),
+            ("nemo_automodel._transformers.models.gpt_oss.model", "GptOssForCausalLM"),
         ),
         (
             "KimiK25ForConditionalGeneration",
-            ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.kimi_k25_vl.model", "KimiK25VLForConditionalGeneration"),
         ),
         (
             "KimiK25VLForConditionalGeneration",
-            ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.kimi_k25_vl.model", "KimiK25VLForConditionalGeneration"),
         ),
         (
             "KimiK3ForConditionalGeneration",
-            ("nemo_automodel.components.models.kimi_k3.multimodal", "KimiK3ForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.kimi_k3.multimodal", "KimiK3ForConditionalGeneration"),
         ),
         (
             "KimiK3ForCausalLM",
-            ("nemo_automodel.components.models.kimi_k3.model", "KimiK3ForCausalLM"),
+            ("nemo_automodel._transformers.models.kimi_k3.model", "KimiK3ForCausalLM"),
         ),
         (
             "KimiVLForConditionalGeneration",
-            ("nemo_automodel.components.models.kimivl.model", "KimiVLForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.kimivl.model", "KimiVLForConditionalGeneration"),
         ),
         (
             "KimiLinear48BForCausalLM",
-            ("nemo_automodel.components.models.kimi_linear.model", "KimiLinear48BForCausalLM"),
+            ("nemo_automodel._transformers.models.kimi_linear.model", "KimiLinear48BForCausalLM"),
         ),
         (
             "LlamaBidirectionalForSequenceClassification",
             (
-                "nemo_automodel.components.models.llama_bidirectional.model",
+                "nemo_automodel.retrieval.models.llama_bidirectional.model",
                 "LlamaBidirectionalForSequenceClassification",
                 {"retrieval"},
             ),
         ),
         (
             "LlamaBidirectionalModel",
-            ("nemo_automodel.components.models.llama_bidirectional.model", "LlamaBidirectionalModel", {"retrieval"}),
+            ("nemo_automodel.retrieval.models.llama_bidirectional.model", "LlamaBidirectionalModel", {"retrieval"}),
         ),
         (
             "LlamaNemotronVLModel",
-            ("nemo_automodel.components.models.llama_nemotron_vl.model", "LlamaNemotronVLModel", {"retrieval"}),
+            ("nemo_automodel.retrieval.models.llama_nemotron_vl.model", "LlamaNemotronVLModel", {"retrieval"}),
         ),
         (
             "LlamaForCausalLM",
-            ("nemo_automodel.components.models.llama.model", "LlamaForCausalLM"),
+            ("nemo_automodel._transformers.models.llama.model", "LlamaForCausalLM"),
         ),
         (
             "MiniMaxM2ForCausalLM",
-            ("nemo_automodel.components.models.minimax_m2.model", "MiniMaxM2ForCausalLM"),
+            ("nemo_automodel._transformers.models.minimax_m2.model", "MiniMaxM2ForCausalLM"),
         ),
         (
             "MiniMaxM3SparseForConditionalGeneration",
             (
-                "nemo_automodel.components.models.minimax_m3_vl.model",
+                "nemo_automodel._transformers.models.minimax_m3_vl.model",
                 "MiniMaxM3SparseForConditionalGeneration",
             ),
         ),
         (
             "MiMoV2FlashForCausalLM",
-            ("nemo_automodel.components.models.mimo_v2_flash.model", "MiMoV2FlashForCausalLM"),
+            ("nemo_automodel._transformers.models.mimo_v2_flash.model", "MiMoV2FlashForCausalLM"),
         ),
         (
             "LagunaForCausalLM",
-            ("nemo_automodel.components.models.laguna.model", "LagunaForCausalLM"),
+            ("nemo_automodel._transformers.models.laguna.model", "LagunaForCausalLM"),
         ),
         (
             "Ministral3ForCausalLM",
-            ("nemo_automodel.components.models.mistral3.model", "Ministral3ForCausalLM"),
+            ("nemo_automodel._transformers.models.mistral3.model", "Ministral3ForCausalLM"),
         ),
         (
             "Ministral3BidirectionalModel",
             (
-                "nemo_automodel.components.models.ministral_bidirectional.model",
+                "nemo_automodel.retrieval.models.ministral_bidirectional.model",
                 "Ministral3BidirectionalModel",
                 {"retrieval"},
             ),
         ),
         (
             "Mistral4ForCausalLM",
-            ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
+            ("nemo_automodel._transformers.models.mistral4.model", "Mistral4ForCausalLM"),
         ),
         (
             "Mistral3ForConditionalGeneration",
-            ("nemo_automodel.components.models.mistral4.model", "Mistral3ForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.mistral4.model", "Mistral3ForConditionalGeneration"),
         ),
         (
             "Mistral3FP8VLMForConditionalGeneration",
             (
-                "nemo_automodel.components.models.mistral3_vlm.model",
+                "nemo_automodel._transformers.models.mistral3_vlm.model",
                 "Mistral3FP8VLMForConditionalGeneration",
             ),
         ),
         (
             "NemotronHForCausalLM",
-            ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
+            ("nemo_automodel._transformers.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),
         (
             "NemotronH_Nano_Omni_Reasoning_V3",
             (
-                "nemo_automodel.components.models.nemotron_omni.model",
+                "nemo_automodel._transformers.models.nemotron_omni.model",
                 "NemotronOmniForConditionalGeneration",
             ),
         ),
         (
             "NemotronParseForConditionalGeneration",
-            ("nemo_automodel.components.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
         ),
         (
             "MuseGlimmerForConditionalGeneration",
-            ("nemo_automodel.components.models.muse_glimmer.model", "MuseGlimmerForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.muse_glimmer.model", "MuseGlimmerForConditionalGeneration"),
         ),
         (
             "LLaVAOneVision1_5_ForConditionalGeneration",
             (
-                "nemo_automodel.components.models.llava_onevision.model",
+                "nemo_automodel._transformers.models.llava_onevision.model",
                 "LLaVAOneVision1_5_ForConditionalGeneration",
             ),
         ),
         (
             "HYV3ForCausalLM",
-            ("nemo_automodel.components.models.hy_v3.model", "HYV3ForCausalLM"),
+            ("nemo_automodel._transformers.models.hy_v3.model", "HYV3ForCausalLM"),
         ),
         (
             "HyMT2ForCausalLM",
-            ("nemo_automodel.components.models.hy_mt2.model", "HyMT2ForCausalLM"),
+            ("nemo_automodel._transformers.models.hy_mt2.model", "HyMT2ForCausalLM"),
         ),
         (
             "Qwen2ForCausalLM",
-            ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
+            ("nemo_automodel._transformers.models.qwen2.model", "Qwen2ForCausalLM"),
         ),
         (
             "Qwen3ForCausalLM",
-            ("nemo_automodel.components.models.qwen3.model", "Qwen3ForCausalLM"),
+            ("nemo_automodel._transformers.models.qwen3.model", "Qwen3ForCausalLM"),
         ),
         (
             "Qwen2_5OmniModel",
             (
-                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "nemo_automodel._transformers.models.qwen2_5_omni.model",
                 "Qwen2_5OmniThinkerForConditionalGeneration",
             ),
         ),
         (
             "Qwen2_5OmniForConditionalGeneration",
             (
-                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "nemo_automodel._transformers.models.qwen2_5_omni.model",
                 "Qwen2_5OmniThinkerForConditionalGeneration",
             ),
         ),
         (
             "Qwen2_5OmniThinkerForConditionalGeneration",
             (
-                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "nemo_automodel._transformers.models.qwen2_5_omni.model",
                 "Qwen2_5OmniThinkerForConditionalGeneration",
             ),
         ),
         (
             "Qwen3MoeForCausalLM",
-            ("nemo_automodel.components.models.qwen3_moe.model", "Qwen3MoeForCausalLM"),
+            ("nemo_automodel._transformers.models.qwen3_moe.model", "Qwen3MoeForCausalLM"),
         ),
         (
             "Qwen3NextForCausalLM",
-            ("nemo_automodel.components.models.qwen3_next.model", "Qwen3NextForCausalLM"),
+            ("nemo_automodel._transformers.models.qwen3_next.model", "Qwen3NextForCausalLM"),
         ),
         (
             "Qwen3_5ForCausalLM",
-            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM"),
+            ("nemo_automodel._transformers.models.qwen3_5.model", "Qwen3_5ForCausalLM"),
         ),
         (
             "Qwen3_5ForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
         ),
         (
             "Qwen3OmniMoeForConditionalGeneration",
             (
-                "nemo_automodel.components.models.qwen3_omni_moe.model",
+                "nemo_automodel._transformers.models.qwen3_omni_moe.model",
                 "Qwen3OmniMoeThinkerForConditionalGeneration",
             ),
         ),
         (
             "Qwen3VLMoeForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen3_vl_moe.model", "Qwen3VLMoeForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.qwen3_vl_moe.model", "Qwen3VLMoeForConditionalGeneration"),
         ),
         (
             "Qwen3VLForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen3_vl.model", "Qwen3VLForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.qwen3_vl.model", "Qwen3VLForConditionalGeneration"),
         ),
         (
             "Qwen3_5MoeForCausalLM",
-            ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForCausalLM"),
+            ("nemo_automodel._transformers.models.qwen3_5_moe.model", "Qwen3_5MoeForCausalLM"),
         ),
         (
             "Qwen3_5MoeForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
         ),
         (
             "Qwen3_8_FlashNextForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen3_8_flash_next.model", "Qwen3_8_FlashNextForConditionalGeneration"),
+            (
+                "nemo_automodel._transformers.models.qwen3_8_flash_next.model",
+                "Qwen3_8_FlashNextForConditionalGeneration",
+            ),
         ),
         (
             # Immutable checkpoint dumps predate the Qwen3.8-Flash-Next rename.
             "Qwen4ExpForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen3_8_flash_next.model", "Qwen3_8_FlashNextForConditionalGeneration"),
+            (
+                "nemo_automodel._transformers.models.qwen3_8_flash_next.model",
+                "Qwen3_8_FlashNextForConditionalGeneration",
+            ),
         ),
         (
             "Step3p6ForConditionalGeneration",
-            ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
         (
             "Step3p5ForCausalLM",
-            ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
+            ("nemo_automodel._transformers.models.step3p5.model", "Step3p5ForCausalLM"),
         ),
         (
             "InklingForConditionalGeneration",
-            ("nemo_automodel.components.models.inkling.model", "InklingForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.inkling.model", "InklingForConditionalGeneration"),
         ),
         (
             "Step3p7ForConditionalGeneration",
-            ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
+            ("nemo_automodel._transformers.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
     ]
 )
@@ -330,45 +336,48 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
-    "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
-    "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
-    "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
-    "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
-    "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
-    "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
-    "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
-    "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
-    "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
-    "kimi_k3": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3Config"),
-    "kimi_linear": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3TextConfig"),
-    "kimi_linear_48b_a3b": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinear48BConfig"),
-    "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
-    "laguna": ("nemo_automodel.components.models.laguna.config", "LagunaConfig"),
-    "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
-    "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
-    "minimax_m3_vl": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
+    "bagel": ("nemo_automodel._transformers.models.bagel.configuration", "BagelConfig"),
+    "baichuan": ("nemo_automodel._transformers.models.baichuan.configuration", "BaichuanConfig"),
+    "bailing_moe": ("nemo_automodel._transformers.models.ling_v2.config", "BailingMoeV2Config"),
+    "deepseek_v4": ("nemo_automodel._transformers.models.deepseek_v4.config", "DeepseekV4Config"),
+    "glm_moe_dsa": ("nemo_automodel._transformers.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
+    "hy_v3": ("nemo_automodel._transformers.models.hy_v3.config", "HYV3Config"),
+    "inkling_mm_model": ("nemo_automodel._transformers.models.inkling.configuration", "InklingConfig"),
+    "kimi_k2": ("nemo_automodel._transformers.models.kimi_k2.config", "KimiK2Config"),
+    "kimi_k25": ("nemo_automodel._transformers.models.kimi_k25_vl.model", "KimiK25VLConfig"),
+    "kimi_k3": ("nemo_automodel._transformers.models.kimi_k3.config", "KimiK3Config"),
+    "kimi_linear": ("nemo_automodel._transformers.models.kimi_k3.config", "KimiK3TextConfig"),
+    "kimi_linear_48b_a3b": ("nemo_automodel._transformers.models.kimi_linear.config", "KimiLinear48BConfig"),
+    "kimi_vl": ("nemo_automodel._transformers.models.kimivl.model", "KimiVLConfig"),
+    "laguna": ("nemo_automodel._transformers.models.laguna.config", "LagunaConfig"),
+    "llavaonevision1_5": ("nemo_automodel._transformers.models.llava_onevision.model", "Llavaonevision1_5Config"),
+    "mimo_v2_flash": ("nemo_automodel._transformers.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
+    "minimax_m3_vl": ("nemo_automodel._transformers.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
     "ministral3_bidirec": (
-        "nemo_automodel.components.models.ministral_bidirectional.model",
+        "nemo_automodel.retrieval.models.ministral_bidirectional.model",
         "Ministral3BidirectionalConfig",
     ),
-    "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
-    "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),
-    "qwen3_8_flash_next": ("nemo_automodel.components.models.qwen3_8_flash_next.config", "Qwen3_8_FlashNextConfig"),
+    "mistral4": ("nemo_automodel._transformers.models.mistral4.configuration", "Mistral4Config"),
+    "muse_glimmer": ("nemo_automodel._transformers.models.muse_glimmer.config", "MuseGlimmerConfig"),
+    "qwen3_8_flash_next": (
+        "nemo_automodel._transformers.models.qwen3_8_flash_next.config",
+        "Qwen3_8_FlashNextConfig",
+    ),
     "qwen3_8_flash_next_text": (
-        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "nemo_automodel._transformers.models.qwen3_8_flash_next.config",
         "Qwen3_8_FlashNextTextConfig",
     ),
     # Immutable checkpoint dumps predate the Qwen3.8-Flash-Next rename.
     "qwen4_exp": (
-        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "nemo_automodel._transformers.models.qwen3_8_flash_next.config",
         "Qwen3_8_FlashNextLegacyConfig",
     ),
     "qwen4_exp_text": (
-        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "nemo_automodel._transformers.models.qwen3_8_flash_next.config",
         "Qwen3_8_FlashNextLegacyTextConfig",
     ),
-    "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
-    "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
+    "step3p5v": ("nemo_automodel._transformers.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
+    "step3p7": ("nemo_automodel._transformers.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
 
 # model_types whose custom model implementation should win over a transformers
@@ -559,6 +568,11 @@ class _ModelRegistry:
 
 @lru_cache
 def get_registry():
+    """Return the process-wide model registry, creating it on first call.
+
+    Returns:
+        The cached :class:`_ModelRegistry` singleton.
+    """
     return _ModelRegistry()
 
 

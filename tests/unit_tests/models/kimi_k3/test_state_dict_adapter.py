@@ -16,8 +16,8 @@ from types import SimpleNamespace
 
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.kimi_k3.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.kimi_k3.state_dict_adapter import (
     KimiK3StateDictAdapter,
     _route_kda_fp32_holder,
     _strip_kda_fp32_holder,

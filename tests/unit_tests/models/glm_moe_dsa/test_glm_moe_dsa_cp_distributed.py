@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather
+from nemo_automodel._transformers.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather
 
 pytestmark = pytest.mark.run_only_on("GPU")
 

@@ -18,9 +18,9 @@ from pathlib import Path
 
 import yaml
 
+from nemo_automodel._transformers.models.common import BackendConfig
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.config.loader import load_yaml_config
-from nemo_automodel.components.models.common import BackendConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CONFIG_PATH = REPO_ROOT / "examples" / "llm_finetune" / "nemotron" / "nemotron_nano_v3_5_lightning_singlegpu_lora.yaml"

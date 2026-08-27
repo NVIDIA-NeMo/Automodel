@@ -32,8 +32,8 @@ bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
 To lint a single file or directory:
 
 ```bash
-ruff format nemo_automodel/components/models/llama/model.py
-ruff check --fix nemo_automodel/components/models/llama/
+ruff format nemo_automodel/_transformers/models/llama/model.py
+ruff check --fix nemo_automodel/_transformers/models/llama/
 ```
 
 ### What linting enforces (from `pyproject.toml`)

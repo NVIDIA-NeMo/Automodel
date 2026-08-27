@@ -25,31 +25,31 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+from nemo_automodel._transformers.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.cp import (
+    Qwen3_8_FlashNextCPContext,
+    shard_batch_for_qwen3_8_flash_next_cp,
+)
+from nemo_automodel._transformers.models.qwen3_8_flash_next.engram import (
+    Qwen3_8_FlashNextNGramEmbedding,
+    Qwen3_8_FlashNextPLELayer,
+)
+from nemo_automodel._transformers.models.qwen3_8_flash_next.layers import (
+    Qwen3_8_FlashNextGatedDeltaNet,
+    Qwen3_8_FlashNextQSAAttention,
+)
+from nemo_automodel._transformers.models.qwen3_8_flash_next.model import (
+    Qwen3_8_FlashNextForConditionalGeneration,
+    Qwen3_8_FlashNextTextModelBackend,
+)
+from nemo_automodel._transformers.models.qwen3_8_flash_next.qsa import select_qsa_token_ids
 from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelState
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
-from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
-    Qwen3_8_FlashNextCPContext,
-    shard_batch_for_qwen3_8_flash_next_cp,
-)
-from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
-    Qwen3_8_FlashNextNGramEmbedding,
-    Qwen3_8_FlashNextPLELayer,
-)
-from nemo_automodel.components.models.qwen3_8_flash_next.layers import (
-    Qwen3_8_FlashNextGatedDeltaNet,
-    Qwen3_8_FlashNextQSAAttention,
-)
-from nemo_automodel.components.models.qwen3_8_flash_next.model import (
-    Qwen3_8_FlashNextForConditionalGeneration,
-    Qwen3_8_FlashNextTextModelBackend,
-)
-from nemo_automodel.components.models.qwen3_8_flash_next.qsa import select_qsa_token_ids
 
 
 class _FakeMesh:

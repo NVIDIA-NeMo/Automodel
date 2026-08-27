@@ -20,12 +20,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
-from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
 from nemo_automodel.components.datasets.llm import BiEncoderCollator
+from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
+from nemo_automodel.retrieval.auto_model import NeMoAutoModelBiEncoder
 
 
 def _resolve_latest_checkpoint_dir(ckpt_root: Path) -> Path:
@@ -60,6 +61,7 @@ def _iter_batches(ds, batch_size: int, max_samples: int):
     if batch:
         yield batch
 
+
 @torch.no_grad()
 def _compute_pos_neg_diffs(
     *,
@@ -75,7 +77,9 @@ def _compute_pos_neg_diffs(
     diffs: list[np.ndarray] = []
 
     autocast_ctx = (
-        torch.amp.autocast("cuda", dtype=torch.bfloat16) if (use_bf16_autocast and device.type == "cuda") else nullcontext()
+        torch.amp.autocast("cuda", dtype=torch.bfloat16)
+        if (use_bf16_autocast and device.type == "cuda")
+        else nullcontext()
     )
 
     for batch_examples in _iter_batches(ds, batch_size=batch_size, max_samples=max_samples):
@@ -212,18 +216,24 @@ def main() -> int:
     model_dtype = torch.bfloat16
 
     # Build a single model instance, compute baseline diffs, then load finetuned weights and recompute.
-    model = NeMoAutoModelBiEncoder.from_pretrained(
-        pretrained_model_name_or_path=base_model_path,
-        pooling="avg",
-        l2_normalize=True,
-        use_liger_kernel=False,
-        use_sdpa_patching=False,
-        torch_dtype=model_dtype,
-        trust_remote_code=trust_remote_code,
-    ).to(device).eval()
+    model = (
+        NeMoAutoModelBiEncoder.from_pretrained(
+            pretrained_model_name_or_path=base_model_path,
+            pooling="avg",
+            l2_normalize=True,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            torch_dtype=model_dtype,
+            trust_remote_code=trust_remote_code,
+        )
+        .to(device)
+        .eval()
+    )
 
-    print(f"Config: max_length={max_length}, max_samples={max_samples}, batch_size={batch_size}, "
-          f"dtype={model_dtype}, bf16_autocast={use_bf16}")
+    print(
+        f"Config: max_length={max_length}, max_samples={max_samples}, batch_size={batch_size}, "
+        f"dtype={model_dtype}, bf16_autocast={use_bf16}"
+    )
 
     base_diffs = _compute_pos_neg_diffs(
         model=model,

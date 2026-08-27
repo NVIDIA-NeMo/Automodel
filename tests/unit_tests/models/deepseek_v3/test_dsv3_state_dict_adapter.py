@@ -12,26 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, MagicMock, patch
 from transformers import DeepseekV3Config
 
-from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter import (
+    _TRITON_AVAILABLE,
+    BLOCK_SIZE,
+    NON_QUANTIZED_KEY_PATTERNS,
     DeepSeekV3StateDictAdapter,
-    calculate_scale_shape,
-    dequantize_from_fp8,
     _dequantize_with_torch,
     _dequantize_with_triton,
     _slice_scale_for_dtensor,
-    should_quantize_key,
+    calculate_scale_shape,
     create_scale_inv_for_weight,
-    NON_QUANTIZED_KEY_PATTERNS,
-    _TRITON_AVAILABLE,
-    BLOCK_SIZE,
+    dequantize_from_fp8,
+    should_quantize_key,
 )
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
@@ -140,7 +141,7 @@ class TestDeepSeekV3StateDictAdapter:
             "layer2.weight": torch.randn(64, 32),
         }
 
-        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter.dequantize_from_fp8') as mock_dequant:
+        with patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter.dequantize_from_fp8') as mock_dequant:
             mock_dequant.return_value = torch.randn(256, 128, dtype=torch.float32)
 
             result = adapter._dequantize(state_dict)
@@ -435,7 +436,7 @@ class TestCreateScaleInvForWeight:
         mock_weight.to_local.return_value = local_weight
         mock_weight.shape = torch.Size([256, 128])  # Global shape (2x local in rows)
 
-        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter.is_dtensor') as mock_is_dtensor:
+        with patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter.is_dtensor') as mock_is_dtensor:
             mock_is_dtensor.return_value = True
 
             scale_inv = create_scale_inv_for_weight(mock_weight)
@@ -542,7 +543,7 @@ class TestDequantizeFromFp8:
         weight = torch.randn(256, 128, dtype=torch.float32).to(torch.float8_e4m3fn)
         scale_inv = torch.ones((2, 1), dtype=torch.float32)  # Correct shape for 256x128 tensor
 
-        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter.logger') as mock_logger:
+        with patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter.logger') as mock_logger:
             result = dequantize_from_fp8(weight, scale_inv, dtype=torch.float32)
 
             # No warning should be called for correct shape
@@ -554,7 +555,7 @@ class TestDequantizeFromFp8:
         weight = torch.randn(128, 64, dtype=torch.float32).to(torch.float8_e4m3fn)  # Should be (1, 1) scale shape
         scale_inv = torch.ones((2, 1), dtype=torch.float32)  # Wrong shape - too many scale values
 
-        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter.logger') as mock_logger:
+        with patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter.logger') as mock_logger:
             # For non-DTensor, mismatched scale shape logs debug (not warning)
             result = dequantize_from_fp8(weight, scale_inv, dtype=torch.float32)
 
@@ -634,9 +635,9 @@ class TestDequantizeFromFp8:
         weight = torch.randn(256, 128, dtype=torch.float32, device="cuda").to(torch.float8_e4m3fn)
         scale_inv = torch.ones((2, 1), dtype=torch.float32, device="cuda")
 
-        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_triton') as mock_triton, \
-             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_torch, \
-             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter.logger') as mock_logger:
+        with patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter._dequantize_with_triton') as mock_triton, \
+             patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_torch, \
+             patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter.logger') as mock_logger:
 
             mock_triton.side_effect = RuntimeError("Triton kernel failed")
             mock_torch.return_value = torch.randn(256, 128, dtype=torch.float32, device="cuda")
@@ -653,8 +654,8 @@ class TestDequantizeFromFp8:
         weight = torch.randn(256, 128, dtype=torch.float32).to(torch.float8_e4m3fn)
         scale_inv = torch.ones((2, 1), dtype=torch.float32)
 
-        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_torch, \
-             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_triton') as mock_triton:
+        with patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_torch, \
+             patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter._dequantize_with_triton') as mock_triton:
 
             mock_torch.return_value = torch.randn(256, 128, dtype=torch.float32)
 
@@ -681,8 +682,8 @@ class TestDequantizeFromFp8:
         # Mock DTensor.from_local
         mock_dtensor_result = Mock()
 
-        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter.is_dtensor') as mock_is_dtensor, \
-             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_dequant, \
+        with patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter.is_dtensor') as mock_is_dtensor, \
+             patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_dequant, \
              patch('torch.distributed._tensor.DTensor.from_local') as mock_from_local:
 
             # Configure mocks
@@ -724,9 +725,9 @@ class TestDequantizeFromFp8:
 
         mock_dtensor_result = Mock()
 
-        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter.is_dtensor') as mock_is_dtensor, \
-             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_dequant, \
-             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._slice_scale_for_dtensor') as mock_slice, \
+        with patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter.is_dtensor') as mock_is_dtensor, \
+             patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_dequant, \
+             patch('nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter._slice_scale_for_dtensor') as mock_slice, \
              patch('torch.distributed._tensor.DTensor.from_local') as mock_from_local:
 
             # weight is DTensor, scale is not

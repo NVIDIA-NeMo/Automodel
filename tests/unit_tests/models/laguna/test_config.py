@@ -14,7 +14,7 @@
 
 import pytest
 
-from nemo_automodel.components.models.laguna.config import LagunaConfig
+from nemo_automodel._transformers.models.laguna.config import LagunaConfig
 
 
 def test_laguna_config_clips_full_checkpoint_layer_lists_for_proxy_models():

@@ -19,9 +19,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.hy_v3.config import HYV3Config
-from nemo_automodel.components.models.hy_v3.layers import HYV3Attention
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.hy_v3.config import HYV3Config
+from nemo_automodel._transformers.models.hy_v3.layers import HYV3Attention
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

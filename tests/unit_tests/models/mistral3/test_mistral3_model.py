@@ -20,13 +20,13 @@ from transformers import AutoConfig, AutoModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
-from nemo_automodel.components.models.mistral3 import model as mistral_mod
-from nemo_automodel.components.models.mistral3.model import (
+from nemo_automodel._transformers.models.mistral3 import model as mistral_mod
+from nemo_automodel._transformers.models.mistral3.model import (
     Ministral3Config,
     Ministral3ForCausalLM,
     Ministral3Model,
 )
-from nemo_automodel.components.models.mistral3.state_dict_adapter import Mistral3FP8StateDictAdapter
+from nemo_automodel._transformers.models.mistral3.state_dict_adapter import Mistral3FP8StateDictAdapter
 
 
 def tiny_config(**overrides) -> Ministral3Config:

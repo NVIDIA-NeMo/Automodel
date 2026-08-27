@@ -1,0 +1,258 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific governing permissions and
+# limitations under the License.
+
+import logging
+from typing import Any
+
+import torch
+from torch import nn
+from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+logger = logging.getLogger(__name__)
+
+from nemo_automodel._transformers.models.common import (
+    BackendConfig,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
+from nemo_automodel._transformers.models.deepseek_v3.rope_utils import (
+    apply_rotary_emb_qk,
+    yarn_get_mscale,
+)
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+class MLA(nn.Module):
+    def __init__(self, config: DeepseekV3Config, backend: BackendConfig):
+        super().__init__()
+
+        self.n_heads = config.num_attention_heads
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_head_dim = (
+            config.qk_head_dim if hasattr(config, "qk_head_dim") else (self.qk_nope_head_dim + self.qk_rope_head_dim)
+        )
+        self.v_head_dim = config.v_head_dim
+
+        self.backend = backend
+        self.rope_fusion = backend.rope_fusion
+        attn_impl = backend.attn
+        linear_impl = backend.linear
+        rms_norm_impl = backend.rms_norm
+
+        hidden_size = config.hidden_size
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
+        if self.q_lora_rank is None:
+            self.q_proj = initialize_linear_module(
+                linear_impl=linear_impl,
+                in_features=hidden_size,
+                out_features=self.n_heads * self.qk_head_dim,
+                bias=False,
+                dtype=dtype,
+            )
+        else:
+            self.q_a_proj = initialize_linear_module(
+                linear_impl=linear_impl,
+                in_features=hidden_size,
+                out_features=self.q_lora_rank,
+                bias=False,
+                dtype=dtype,
+            )
+            self.q_a_layernorm = initialize_rms_norm_module(
+                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=config.rms_norm_eps, dtype=dtype
+            )
+            self.q_b_proj = initialize_linear_module(
+                linear_impl=linear_impl,
+                in_features=self.q_lora_rank,
+                out_features=self.n_heads * self.qk_head_dim,
+                bias=False,
+                dtype=dtype,
+            )
+
+        self.kv_a_proj_with_mqa = initialize_linear_module(
+            linear_impl=linear_impl,
+            in_features=hidden_size,
+            out_features=self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            dtype=dtype,
+        )
+        self.kv_a_layernorm = initialize_rms_norm_module(
+            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=config.rms_norm_eps, dtype=dtype
+        )
+        self.kv_b_proj = initialize_linear_module(
+            linear_impl=linear_impl,
+            in_features=self.kv_lora_rank,
+            out_features=self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            dtype=dtype,
+        )
+        self.o_proj = initialize_linear_module(
+            linear_impl=linear_impl,
+            in_features=self.n_heads * self.v_head_dim,
+            out_features=hidden_size,
+            bias=False,
+            dtype=dtype,
+        )
+        self.softmax_scale = self.qk_head_dim**-0.5
+
+        rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
+        if rope_parameters and all(
+            map(lambda x: x in rope_parameters, ["factor", "mscale", "original_max_position_embeddings"])
+        ):
+            factor = rope_parameters["factor"]
+            mscale = rope_parameters["mscale"]
+            original_seq_len = rope_parameters["original_max_position_embeddings"]
+            if config.max_position_embeddings > original_seq_len:
+                mscale = yarn_get_mscale(factor, mscale)
+            self.softmax_scale = self.softmax_scale * mscale * mscale
+
+        self.attn_module, self.attn_func = initialize_attn_module_and_func(
+            attn_impl=attn_impl,
+            num_attention_heads=self.n_heads,
+            num_qk_channels=self.qk_head_dim,
+            num_v_channels=self.v_head_dim,
+            softmax_scale=self.softmax_scale,
+        )
+
+        # Optionally fuse the MLA forward's many small ops (lora down/up projections,
+        # RoPE, latent reshapes, SDPA) with torch.compile(fullgraph=True). Only valid
+        # with a compilable attention backend — TE's fused attention is a custom-autograd
+        # black box that fullgraph can't trace. seq_len is fixed here so dynamic=False.
+        # Driven by the generic backend.compile_attn flag (the MLA is one attention module).
+        self._compiled_forward = None
+        if backend.compile_attn:
+            if attn_impl != "sdpa":
+                logger.warning(
+                    "backend.compile_attn ignored: requires attn='sdpa' (got attn='%s'); "
+                    "TE fused attention is not fullgraph-compilable.",
+                    attn_impl,
+                )
+            else:  # pragma: no cover - torch.compile path exercised on GPU benchmark runs only
+                logger.warning("compile MLA forward: torch.compile(fullgraph=True) the MLA forward (attn=sdpa).")
+                self._compiled_forward = torch.compile(self._forward_impl, fullgraph=True, dynamic=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ):
+        if self._compiled_forward is not None:  # pragma: no cover - compiled path only on GPU benchmark runs
+            return self._compiled_forward(x, freqs_cis, attention_mask, **attn_kwargs)
+        return self._forward_impl(x, freqs_cis, attention_mask, **attn_kwargs)
+
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ):
+        if len(x.shape) == 2:
+            qkv_format = "thd"
+            num_tokens = x.shape[0]
+        else:
+            qkv_format = "bshd"
+            bsz, local_seq_len, _ = x.size()
+
+        if self.q_lora_rank is None:
+            q = self.q_proj(x)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+
+        if qkv_format == "thd":
+            q = q.view(num_tokens, self.n_heads, self.qk_head_dim)
+        else:
+            q = q.view(bsz, local_seq_len, self.n_heads, self.qk_head_dim)
+
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        kv = self.kv_a_proj_with_mqa(x)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv = self.kv_a_layernorm(kv)
+
+        # For MLA, k_pe needs an extra head dimension for apply_rotary_emb_qk
+        # k_pe shape: (B, S, rope_dim) -> (B, S, 1, rope_dim) for bshd
+        # k_pe shape: (T, rope_dim) -> (T, 1, rope_dim) for thd
+        head_unsqueeze_dim = 2 if qkv_format == "bshd" else 1
+        k_pe = k_pe.unsqueeze(head_unsqueeze_dim)
+
+        # Apply rotary embeddings to q_pe and k_pe
+        cu_seqlens = attn_kwargs.get("cu_seqlens", None)
+        q_pe, k_pe = apply_rotary_emb_qk(
+            q_pe,
+            k_pe,
+            freqs_cis,
+            format=qkv_format,
+            rope_fusion=self.rope_fusion,
+            cu_seqlens=cu_seqlens,
+            cp_size=attn_kwargs.get("cp_size", 1),
+            cp_rank=attn_kwargs.get("cp_rank", 0),
+        )
+
+        # Remove the head dimension we added to k_pe
+        k_pe = k_pe.squeeze(head_unsqueeze_dim)
+
+        q = torch.cat([q_nope, q_pe], dim=-1)
+
+        kv = self.kv_b_proj(kv)
+        if qkv_format == "thd":
+            kv = kv.view(num_tokens, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_pe = k_pe.unsqueeze(1).expand([num_tokens, self.n_heads, self.qk_rope_head_dim])
+        else:
+            kv = kv.view(bsz, local_seq_len, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_pe = k_pe.unsqueeze(2).expand([bsz, local_seq_len, self.n_heads, self.qk_rope_head_dim])
+
+        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k = torch.cat([k_nope, k_pe], dim=-1)
+
+        q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask, self.backend.attn, **attn_kwargs
+        )
+
+        x = self.attn_func(q, k, v, **_attn_kwargs)
+        x = postprocess_output_for_attn(x, self.backend.attn)
+
+        flatten_dim = 2 if qkv_format == "bshd" else 1
+        x = self.o_proj(x.flatten(flatten_dim))
+        return x
+
+    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
+        linear_list = [
+            self.kv_a_proj_with_mqa,
+            self.kv_b_proj,
+            self.o_proj,
+        ]
+        if self.q_lora_rank is None:
+            linear_list.append(self.q_proj)
+        else:
+            linear_list.extend([self.q_a_proj, self.q_b_proj])
+
+        for linear in linear_list:
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+
+        norms = [self.kv_a_layernorm]
+        if self.q_lora_rank is not None:
+            norms.append(self.q_a_layernorm)
+        for norm in norms:
+            norm.reset_parameters()

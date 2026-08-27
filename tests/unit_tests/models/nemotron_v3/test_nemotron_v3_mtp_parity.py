@@ -37,8 +37,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.mtp import roll_tensor
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.mtp import roll_tensor
 from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_mtp import MockNemotronV3Config
 
 
@@ -55,7 +55,7 @@ def backend():
 
 
 def _build_model(backend, *, mtp_layers, mtp_pattern, dtype=torch.float32, **cfg_overrides):
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    from nemo_automodel._transformers.models.nemotron_v3.model import NemotronHForCausalLM
 
     config = MockNemotronV3Config(
         num_nextn_predict_layers=mtp_layers,

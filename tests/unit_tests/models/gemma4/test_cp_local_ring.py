@@ -29,8 +29,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
-from nemo_automodel.components.models.gemma4_moe import cp_local_ring as clr
+from nemo_automodel._transformers.models.gemma4_moe import cp_attention as cpa
+from nemo_automodel._transformers.models.gemma4_moe import cp_local_ring as clr
 
 
 def _sliding_module(sliding_window, use_bidirectional_attention=None):

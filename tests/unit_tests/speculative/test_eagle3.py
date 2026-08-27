@@ -670,7 +670,7 @@ def test_draft_attention_einsum_matches_loop_reference():
     near-identical outputs guards against any algebraic regression a
     future refactor might introduce.
     """
-    from nemo_automodel.components.models.llama.rope_utils import (
+    from nemo_automodel._transformers.models.llama.rope_utils import (
         apply_rotary_pos_emb as _rope,
     )
     from nemo_automodel.components.speculative.eagle.draft_llama import _build_causal_mask

@@ -3,8 +3,8 @@
 This document describes the standard patterns for adding a dense (non-MoE) causal language model to NeMo AutoModel.
 
 Reference implementations:
-- `components/models/llama/model.py` -- canonical dense LLM (inherits PreTrainedModel)
-- `components/models/qwen2/model.py` -- dense LLM with attention/QKV bias
+- `_transformers/models/llama/model.py` -- canonical dense LLM (inherits PreTrainedModel)
+- `_transformers/models/qwen2/model.py` -- dense LLM with attention/QKV bias
 
 ---
 
@@ -13,7 +13,7 @@ Reference implementations:
 A dense LLM typically needs these files:
 
 ```
-components/models/<name>/
+_transformers/models/<name>/
   __init__.py
   model.py
   state_dict_adapter.py
@@ -28,13 +28,13 @@ However, before reusing a standard template module, make sure they are numerical
 ## Common Imports
 
 ```python
-from nemo_automodel.components.models.common import (
+from nemo_automodel._transformers.models.common import (
     BackendConfig,
     CombinedGateUpMLP,
     CombinedQKVAttentionMixin,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 ```
 
 ---
@@ -117,7 +117,7 @@ Where each group has `(group_size * head_dim)` Q rows, `head_dim` K rows, `head_
 For standard SwiGLU models, use `CombinedGateUpMLP` directly:
 
 ```python
-from nemo_automodel.components.models.common import CombinedGateUpMLP
+from nemo_automodel._transformers.models.common import CombinedGateUpMLP
 
 class NewModelDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config, layer_idx, backend):
@@ -317,7 +317,7 @@ Key backend fields:
 
 Usage:
 ```python
-from nemo_automodel.components.models.common import (
+from nemo_automodel._transformers.models.common import (
     initialize_rms_norm_module,
     initialize_linear_module,
 )
@@ -345,7 +345,7 @@ For standard dense LLMs with combined QKV + combined gate_up, inherit `CombinedP
 
 ```python
 # state_dict_adapter.py
-from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
+from nemo_automodel._transformers.models.common.combined_projection.state_dict_adapter import (
     CombinedProjectionStateDictAdapter,
 )
 
@@ -383,7 +383,7 @@ qkv_bias = self._restore_1d_bias(self._interleave_qkv(q_bias, k_bias, v_bias), o
 Keep the init file simple -- just re-export the main class:
 
 ```python
-from nemo_automodel.components.models.<name>.model import NewModelForCausalLM
+from nemo_automodel._transformers.models.<name>.model import NewModelForCausalLM
 
 __all__ = ["NewModelForCausalLM"]
 ```
@@ -397,7 +397,7 @@ Add to the `MODEL_ARCH_MAPPING` ordered dict in `_transformers/registry.py`:
 ```python
 (
     "NewModelForCausalLM",
-    ("nemo_automodel.components.models.new_model.model", "NewModelForCausalLM"),
+    ("nemo_automodel._transformers.models.new_model.model", "NewModelForCausalLM"),
 ),
 ```
 
@@ -406,7 +406,7 @@ The tuple format is `(module_path, class_name)`. An optional third element is a 
 ```python
 (
     "NewModelForSequenceClassification",
-    ("nemo_automodel.components.models.new_model.model", "NewModelForSequenceClassification", {"retrieval"}),
+    ("nemo_automodel._transformers.models.new_model.model", "NewModelForSequenceClassification", {"retrieval"}),
 ),
 ```
 

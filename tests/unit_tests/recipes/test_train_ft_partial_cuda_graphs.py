@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 from torch import nn
 
 import nemo_automodel.components.cuda_graphs.partial as partial_graphs
-from nemo_automodel.components.models.common import BackendConfig, CudaGraphConfig
+from nemo_automodel._transformers.models.common import BackendConfig, CudaGraphConfig
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_partial_cuda_graph_manager,

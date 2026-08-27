@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.kimi_k25_vl.model import KimiK25VLConfig
-from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.kimi_k25_vl.model import KimiK25VLConfig
+from nemo_automodel._transformers.models.kimi_k25_vl.state_dict_adapter import (
     KimiK25VLStateDictAdapter,
     dequantize_int4,
     quantize_to_int4,

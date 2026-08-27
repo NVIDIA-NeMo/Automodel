@@ -21,13 +21,13 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-import nemo_automodel.components.models.qwen3_5_moe.model as qwen3_5_moe_model
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import (
+import nemo_automodel._transformers.models.qwen3_5_moe.model as qwen3_5_moe_model
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_5_moe.state_dict_adapter import (
     Qwen3_5MoeStateDictAdapter,
     _infer_base_expert_hf_layout,
 )
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.moe.layers import MoEConfig
 
 
@@ -1295,7 +1295,7 @@ class TestFp32ParamRouting:
     """Routing/stripping of SSM-gating params into/out of the fp32 holder."""
 
     def test_strip_fp32_params_removes_holder_segment(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
+        from nemo_automodel._transformers.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
 
         assert (
             _strip_fp32_params("model.language_model.layers.0.linear_attn._fp32_params.A_log")
@@ -1307,7 +1307,7 @@ class TestFp32ParamRouting:
         )
 
     def test_strip_fp32_params_passthrough(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
+        from nemo_automodel._transformers.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
 
         for key in (
             "model.language_model.layers.0.self_attn.q_proj.weight",
@@ -1316,7 +1316,7 @@ class TestFp32ParamRouting:
             assert _strip_fp32_params(key) == key
 
     def test_route_fp32_params_routes_gating_keys(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
+        from nemo_automodel._transformers.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
 
         assert (
             _route_fp32_params("model.language_model.layers.0.linear_attn.A_log")
@@ -1328,7 +1328,7 @@ class TestFp32ParamRouting:
         )
 
     def test_route_fp32_params_passthrough(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
+        from nemo_automodel._transformers.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
 
         # Already routed, non-gating param, and a non-linear_attn A_log all pass through.
         for key in (
@@ -1339,7 +1339,7 @@ class TestFp32ParamRouting:
             assert _route_fp32_params(key) == key
 
     def test_route_strip_round_trip(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import (
+        from nemo_automodel._transformers.models.qwen3_5_moe.state_dict_adapter import (
             _route_fp32_params,
             _strip_fp32_params,
         )

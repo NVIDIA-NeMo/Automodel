@@ -22,13 +22,13 @@ monkeypatched ``fully_shard`` so no process group / GPU is required.
 
 import torch.nn as nn
 
+from nemo_automodel._transformers.models.diffusion_gemma import fsdp as dg4_fsdp
 from nemo_automodel.components.distributed import parallelizer as p
 from nemo_automodel.components.distributed.parallelizer import (
     DefaultParallelizationStrategy,
     ParallelizationStrategy,
     get_parallelization_strategy,
 )
-from nemo_automodel.components.models.diffusion_gemma import fsdp as dg4_fsdp
 
 
 def test_register_strategy_is_idempotent_and_keyed_on_model_name():

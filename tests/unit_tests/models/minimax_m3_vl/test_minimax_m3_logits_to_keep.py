@@ -24,8 +24,8 @@ materialises the ``[tokens, vocab_size]`` logits tensor.
 import pytest
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
-from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
+from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLConfig
+from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
 from .conftest import (

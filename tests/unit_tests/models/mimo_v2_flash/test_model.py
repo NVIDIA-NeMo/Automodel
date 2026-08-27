@@ -19,16 +19,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
-from nemo_automodel.components.models.mimo_v2_flash.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.mimo_v2_flash.config import MiMoV2FlashConfig
+from nemo_automodel._transformers.models.mimo_v2_flash.model import (
     MiMoV2FlashAttention,
     MiMoV2FlashBlock,
     MiMoV2FlashForCausalLM,
     MiMoV2FlashModel,
     ModelClass,
 )
-from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import (
+from nemo_automodel._transformers.models.mimo_v2_flash.state_dict_adapter import (
     MiMoV2FlashStateDictAdapter,
 )
 from nemo_automodel.components.moe.layers import MLP, MoE
@@ -259,7 +259,7 @@ class TestMiMoV2FlashForCausalLM:
 
     def test_from_pretrained_uses_classmethod(self, tiny_config, backend_config):
         with patch(
-            "nemo_automodel.components.models.mimo_v2_flash.model.MiMoV2FlashConfig.from_pretrained",
+            "nemo_automodel._transformers.models.mimo_v2_flash.model.MiMoV2FlashConfig.from_pretrained",
             return_value=tiny_config,
         ) as mock_from_pretrained:
             model = MiMoV2FlashForCausalLM.from_pretrained("XiaomiMiMo/MiMo-V2-Flash", backend=backend_config)

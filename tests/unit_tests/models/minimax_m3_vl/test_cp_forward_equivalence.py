@@ -85,9 +85,9 @@ def test_cp_forward_cp1_matches_eager(backend):
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
-    from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import MiniMaxM3CPSparseAttention
-    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+    from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+    from nemo_automodel._transformers.models.minimax_m3_vl.cp_sparse_attn import MiniMaxM3CPSparseAttention
+    from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29577")

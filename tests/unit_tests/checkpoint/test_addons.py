@@ -388,7 +388,7 @@ class TestExtractTargetModules:
 
     def test_encoder_target_modules_remapped(self):
         """Encoder model.* target modules have model. prefix stripped."""
-        from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+        from nemo_automodel.retrieval.state_dict_adapter import EncoderStateDictAdapter
 
         model = _make_model_with_named_modules(
             [

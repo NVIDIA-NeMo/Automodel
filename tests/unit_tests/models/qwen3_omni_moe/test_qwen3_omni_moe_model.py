@@ -25,8 +25,8 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinkerForConditionalGeneration,
 )
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_omni_moe.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_omni_moe.model import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextModel,
 )
@@ -116,7 +116,7 @@ class IdentityLayer(torch.nn.Module):
         return x
 
 
-@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+@patch("nemo_automodel._transformers.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
 def test_text_model_forward_expands_position_ids(rotary_cls, text_config, backend_config, moe_config, device):
     calls = {}
 
@@ -150,7 +150,7 @@ def test_text_model_forward_expands_position_ids(rotary_cls, text_config, backen
 
 def test_deepstack_process_adds_visual_embeddings(text_config, backend_config, moe_config, device):
     with patch(
-        "nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding",
+        "nemo_automodel._transformers.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding",
         return_value=MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x))),
     ):
         model = Qwen3OmniMoeThinkerTextModel(text_config, backend=backend_config, moe_config=moe_config).to(device)
@@ -166,7 +166,7 @@ def test_deepstack_process_adds_visual_embeddings(text_config, backend_config, m
     assert torch.all(updated[0, 1] == 0)
 
 
-@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+@patch("nemo_automodel._transformers.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
 def test_text_model_init_weights_calls_layers(rotary_cls, text_config, backend_config, moe_config):
     rotary_cls.return_value = MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x)))
     model = Qwen3OmniMoeThinkerTextModel(text_config, backend=backend_config, moe_config=moe_config)
@@ -197,7 +197,7 @@ def _stub_hf_init(self, *args, **kwargs):
 
 
 @patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
-@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+@patch("nemo_automodel._transformers.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
 def test_thinker_forward_returns_logits(rotary_cls, thinker_config, backend_config, moe_config, device):
     rotary_cls.return_value = MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x)))
     model = Qwen3OmniMoeThinkerForConditionalGeneration(thinker_config, moe_config=moe_config, backend=backend_config).to(device)
@@ -223,7 +223,7 @@ def test_thinker_forward_returns_logits(rotary_cls, thinker_config, backend_conf
 
 
 @patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
-@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+@patch("nemo_automodel._transformers.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
 def test_thinker_forward_with_labels_returns_loss_dict(rotary_cls, thinker_config, backend_config, moe_config, device):
     rotary_cls.return_value = MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x)))
     model = Qwen3OmniMoeThinkerForConditionalGeneration(thinker_config, moe_config=moe_config, backend=backend_config).to(device)
@@ -254,14 +254,14 @@ def test_thinker_forward_with_labels_returns_loss_dict(rotary_cls, thinker_confi
 
 
 def test_modelclass_export_exists():
-    from nemo_automodel.components.models.qwen3_omni_moe import model as omni_module
+    from nemo_automodel._transformers.models.qwen3_omni_moe import model as omni_module
 
     assert hasattr(omni_module, "ModelClass")
     assert omni_module.ModelClass is Qwen3OmniMoeThinkerForConditionalGeneration
 
 
 @patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
-@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+@patch("nemo_automodel._transformers.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
 def test_forward_unpacks_vision_features_from_named_output(rotary_cls, thinker_config, backend_config, moe_config, device):
     """get_image_features / get_video_features return a named output object;
     forward() must use .pooler_output and .deepstack_features, not tuple unpacking."""
@@ -305,7 +305,7 @@ def test_forward_unpacks_vision_features_from_named_output(rotary_cls, thinker_c
 
 
 @patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
-@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+@patch("nemo_automodel._transformers.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
 def test_forward_unpacks_audio_features_from_named_output(
     rotary_cls, thinker_config, backend_config, moe_config, device
 ):
@@ -375,7 +375,7 @@ def test_forward_unpacks_audio_features_from_named_output(
 
 
 @patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
-@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+@patch("nemo_automodel._transformers.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
 def test_forward_audio_features_tensor_fallback(
     rotary_cls, thinker_config, backend_config, moe_config, device
 ):

@@ -21,15 +21,15 @@ import json
 import pytest
 from transformers import AutoConfig
 
+from nemo_automodel._transformers.models.qwen3_8_flash_next.config import (
+    Qwen3_8_FlashNextConfig,
+    Qwen3_8_FlashNextTextConfig,
+    Qwen3_8_FlashNextVisionConfig,
+)
 from nemo_automodel._transformers.registry import (
     _CUSTOM_CONFIG_REGISTRATIONS,
     MODEL_ARCH_MAPPING,
     resolve_custom_config_cls,
-)
-from nemo_automodel.components.models.qwen3_8_flash_next.config import (
-    Qwen3_8_FlashNextConfig,
-    Qwen3_8_FlashNextTextConfig,
-    Qwen3_8_FlashNextVisionConfig,
 )
 
 _LAYER_TYPES = ["full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention" for layer_idx in range(48)]
@@ -180,18 +180,18 @@ def test_custom_config_registry_covers_outer_and_text_model_types() -> None:
     assert resolve_custom_config_cls("qwen3_8_flash_next") is Qwen3_8_FlashNextConfig
     assert resolve_custom_config_cls("qwen3_8_flash_next_text") is Qwen3_8_FlashNextTextConfig
     assert _CUSTOM_CONFIG_REGISTRATIONS["qwen3_8_flash_next"] == (
-        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "nemo_automodel._transformers.models.qwen3_8_flash_next.config",
         "Qwen3_8_FlashNextConfig",
     )
     assert _CUSTOM_CONFIG_REGISTRATIONS["qwen3_8_flash_next_text"] == (
-        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "nemo_automodel._transformers.models.qwen3_8_flash_next.config",
         "Qwen3_8_FlashNextTextConfig",
     )
 
 
 def test_architecture_registry_points_to_qwen3_8_flash_next_model() -> None:
     assert MODEL_ARCH_MAPPING["Qwen3_8_FlashNextForConditionalGeneration"] == (
-        "nemo_automodel.components.models.qwen3_8_flash_next.model",
+        "nemo_automodel._transformers.models.qwen3_8_flash_next.model",
         "Qwen3_8_FlashNextForConditionalGeneration",
     )
 
@@ -300,8 +300,8 @@ def test_legacy_qwen4_exp_checkpoint_config_resolves_via_autoconfig(tmp_path) ->
 
     from transformers import AutoConfig
 
+    from nemo_automodel._transformers.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextLegacyConfig
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
-    from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextLegacyConfig
 
     checkpoint_config = {
         "model_type": "qwen4_exp",
@@ -310,7 +310,7 @@ def test_legacy_qwen4_exp_checkpoint_config_resolves_via_autoconfig(tmp_path) ->
     }
     (tmp_path / "config.json").write_text(json.dumps(checkpoint_config))
 
-    from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+    from nemo_automodel._transformers.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 
     resolved = AutoConfig.from_pretrained(tmp_path)
     assert isinstance(resolved, Qwen3_8_FlashNextLegacyConfig)

@@ -2,7 +2,7 @@
 
 import torch
 
-from nemo_automodel.components.models.bagel.state_dict_adapter import BagelStateDictAdapter
+from nemo_automodel._transformers.models.bagel.state_dict_adapter import BagelStateDictAdapter
 
 
 def test_bagel_adapter_roots_upstream_keys_for_am_model():

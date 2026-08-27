@@ -17,7 +17,7 @@ import math
 import pytest
 import torch
 
-from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+from nemo_automodel._transformers.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     apply_rotary_emb_qk,
     freqs_cis_from_position_ids,

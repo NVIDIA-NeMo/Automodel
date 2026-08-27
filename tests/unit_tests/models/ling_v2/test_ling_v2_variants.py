@@ -20,9 +20,9 @@ config) that would otherwise be invisible to a single-variant test."""
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
-from nemo_automodel.components.models.ling_v2.model import BailingMoeV2ForCausalLM
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.ling_v2.config import BailingMoeV2Config
+from nemo_automodel._transformers.models.ling_v2.model import BailingMoeV2ForCausalLM
 from nemo_automodel.components.moe.config import MoEConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required for forward smoke")

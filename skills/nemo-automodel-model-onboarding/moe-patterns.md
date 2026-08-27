@@ -3,9 +3,9 @@
 This document describes the patterns for adding a Mixture-of-Experts model to NeMo AutoModel.
 
 Reference implementations:
-- `components/models/deepseek_v3/model.py` -- canonical MoE LLM with MLA + grouped experts
-- `components/models/mistral4/model.py` -- MoE with Mistral4-specific MLA and VLM wrapping
-- `components/models/qwen3_moe/model.py` -- Qwen3 MoE variant
+- `_transformers/models/deepseek_v3/model.py` -- canonical MoE LLM with MLA + grouped experts
+- `_transformers/models/mistral4/model.py` -- MoE with Mistral4-specific MLA and VLM wrapping
+- `_transformers/models/qwen3_moe/model.py` -- Qwen3 MoE variant
 
 ---
 
@@ -416,13 +416,13 @@ from nemo_automodel.components.moe.layers import MoE, MLP
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 
 # Common model components
-from nemo_automodel.components.models.common import (
+from nemo_automodel._transformers.models.common import (
     BackendConfig,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 # Utilities
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd

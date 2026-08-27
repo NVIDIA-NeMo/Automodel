@@ -27,8 +27,8 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
 )
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_vl_moe.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_vl_moe.model import (
     Fp32SafeQwen3VLMoeTextRotaryEmbedding,
     Fp32SafeQwen3VLMoeVisionRotaryEmbedding,
     ModelClass,
@@ -516,7 +516,7 @@ class TestQwen3VLMoeForConditionalGeneration:
 
         with (
             patch(
-                "nemo_automodel.components.models.qwen3_vl_moe.model.squeeze_input_for_thd",
+                "nemo_automodel._transformers.models.qwen3_vl_moe.model.squeeze_input_for_thd",
                 return_value=(squeezed_ids, squeezed_position_ids, squeezed_padding_mask, squeezed_kwargs),
             ) as mock_squeeze,
             patch.object(model.model, "forward") as mock_model_forward,

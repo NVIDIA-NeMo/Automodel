@@ -20,14 +20,14 @@ import torch
 import yaml
 from torch import nn
 
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.minimax_m2.model import MiniMaxM2ForCausalLM as NeMoMiniMaxM2ForCausalLM
+from nemo_automodel._transformers.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
+from nemo_automodel._transformers.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
 from nemo_automodel.components.checkpoint.addons import _get_hf_peft_config
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m2.model import MiniMaxM2ForCausalLM as NeMoMiniMaxM2ForCausalLM
-from nemo_automodel.components.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
-from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]

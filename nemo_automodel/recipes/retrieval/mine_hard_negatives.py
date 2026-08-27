@@ -24,10 +24,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
 from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
+from nemo_automodel.retrieval.auto_model import NeMoAutoModelBiEncoder
 
 logger = logging.getLogger(__name__)
 

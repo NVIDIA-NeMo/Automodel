@@ -26,9 +26,9 @@ pytest.importorskip("transformers.models.ernie4_5_moe")
 from transformers.models.ernie4_5.configuration_ernie4_5 import Ernie4_5Config
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.ernie4_5.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype
+from nemo_automodel._transformers.models.ernie4_5.model import (
     Ernie4_5_MoeForCausalLM,
     Ernie4_5_MoeModel,
     Ernie4_5Attention,
@@ -38,7 +38,7 @@ from nemo_automodel.components.models.ernie4_5.model import (
     Ernie4_5MoeBlock,
     ModelClass,
 )
-from nemo_automodel.components.models.ernie4_5.state_dict_adapter import (
+from nemo_automodel._transformers.models.ernie4_5.state_dict_adapter import (
     Ernie4_5_MoeStateDictAdapter,
     Ernie4_5StateDictAdapter,
 )
@@ -608,10 +608,10 @@ class TestLayerEquivalence:
             apply_rotary_pos_emb as hf_apply_rope,
         )
 
-        from nemo_automodel.components.models.ernie4_5.rope_utils import (
+        from nemo_automodel._transformers.models.ernie4_5.rope_utils import (
             Ernie4_5RotaryEmbedding as NeMoRotary,
         )
-        from nemo_automodel.components.models.ernie4_5.rope_utils import (
+        from nemo_automodel._transformers.models.ernie4_5.rope_utils import (
             apply_rotary_pos_emb as nemo_apply_rope,
         )
 
@@ -645,7 +645,7 @@ class TestLayerEquivalence:
             Ernie4_5RotaryEmbedding as HFRotary,
         )
 
-        from nemo_automodel.components.models.ernie4_5.rope_utils import (
+        from nemo_automodel._transformers.models.ernie4_5.rope_utils import (
             Ernie4_5RotaryEmbedding as NeMoRotary,
         )
 

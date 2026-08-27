@@ -27,8 +27,8 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.engram import (
     QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS,
     QWEN3_8_FLASH_NEXT_NGRAM_HEAD_OFFSETS,
     QWEN3_8_FLASH_NEXT_NGRAM_HEAD_VOCAB_SIZES,

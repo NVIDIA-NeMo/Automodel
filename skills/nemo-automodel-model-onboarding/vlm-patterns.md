@@ -3,9 +3,9 @@
 This document describes the patterns for adding a VLM (ForConditionalGeneration) to NeMo AutoModel.
 
 Reference implementations:
-- `components/models/mistral4/model.py` -- `Mistral3ForConditionalGeneration` (Pixtral vision + MoE text)
-- `components/models/kimivl/model.py` -- `KimiVLForConditionalGeneration` (MoonVit + DeepSeek-V3 text)
-- `components/models/kimi_k25_vl/model.py` -- `KimiK25VLForConditionalGeneration`
+- `_transformers/models/mistral4/model.py` -- `Mistral3ForConditionalGeneration` (Pixtral vision + MoE text)
+- `_transformers/models/kimivl/model.py` -- `KimiVLForConditionalGeneration` (MoonVit + DeepSeek-V3 text)
+- `_transformers/models/kimi_k25_vl/model.py` -- `KimiK25VLForConditionalGeneration`
 
 ---
 
@@ -458,7 +458,7 @@ VLMs are registered in `MODEL_ARCH_MAPPING` just like LLMs:
 ```python
 (
     "NewVLMForConditionalGeneration",
-    ("nemo_automodel.components.models.new_vlm.model", "NewVLMForConditionalGeneration"),
+    ("nemo_automodel._transformers.models.new_vlm.model", "NewVLMForConditionalGeneration"),
 ),
 ```
 
@@ -466,7 +466,7 @@ If the model has a custom config class (not natively supported by HF's `AutoConf
 
 ```python
 _CUSTOM_CONFIG_REGISTRATIONS = {
-    "new_vlm": ("nemo_automodel.components.models.new_vlm.model", "NewVLMConfig"),
+    "new_vlm": ("nemo_automodel._transformers.models.new_vlm.model", "NewVLMConfig"),
 }
 ```
 

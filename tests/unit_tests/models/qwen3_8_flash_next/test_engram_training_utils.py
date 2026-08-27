@@ -23,7 +23,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
 

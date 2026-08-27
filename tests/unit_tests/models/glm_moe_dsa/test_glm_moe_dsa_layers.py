@@ -18,8 +18,8 @@ import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.glm_moe_dsa.layers import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.glm_moe_dsa.layers import (
     GlmMoeDsaIndexer,
     GlmMoeDsaMLA,
     _apply_index_rope_half_split,

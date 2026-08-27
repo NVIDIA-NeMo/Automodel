@@ -23,10 +23,10 @@ concatenated per-document results.
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
-from nemo_automodel.components.models.qwen3_8_flash_next.qsa import Qwen3_8_FlashNextQSAIndexer
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel._transformers.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
+from nemo_automodel._transformers.models.qwen3_8_flash_next.qsa import Qwen3_8_FlashNextQSAIndexer
 
 _CU_SEQLENS = (0, 5, 12, 20)
 
@@ -295,9 +295,9 @@ class _FakeMesh:
 
 def test_gdn_wrapper_builds_packed_segments_with_padding_tail(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stashed global boundaries reach the blockdiag core with a pad segment."""
+    from nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+    from nemo_automodel._transformers.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
     from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelState
-    from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
-    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
 
     captured: list[BlockdiagCpModelState] = []
 
@@ -338,7 +338,7 @@ def test_gdn_wrapper_builds_packed_segments_with_padding_tail(monkeypatch: pytes
 def _packed_cp_parity_worker(rank: int, world_size: int, store_path: str) -> None:
     import torch.distributed as dist
 
-    from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
+    from nemo_automodel._transformers.models.qwen3_8_flash_next.cp import (
         Qwen3_8_FlashNextCPContext,
         shard_batch_for_qwen3_8_flash_next_cp,
     )
@@ -489,8 +489,8 @@ def test_two_rank_packed_qsa_and_sharder_match_packed_cp1(tmp_path) -> None:
 
 def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytest.MonkeyPatch) -> None:
     """cu_seqlens-only packed batches get per-token document IDs for conv."""
-    from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
-    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
+    from nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+    from nemo_automodel._transformers.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
 
     captured: dict[str, torch.Tensor | None] = {}
 
@@ -521,7 +521,7 @@ def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytes
 
 def test_packed_boundaries_from_seq_lens_matches_loader_contract() -> None:
     """Loader seq_lens metadata converts to physical slot boundaries."""
-    from nemo_automodel.components.models.qwen3_8_flash_next.cp import packed_boundaries_from_seq_lens
+    from nemo_automodel._transformers.models.qwen3_8_flash_next.cp import packed_boundaries_from_seq_lens
 
     # Physical layout is contiguous real lengths; trailing pack padding
     # becomes its own segment so it never joins a real document.
@@ -545,7 +545,7 @@ def test_model_advertises_packed_cp_for_flex_backend() -> None:
     from types import SimpleNamespace
 
     from nemo_automodel._transformers.capabilities import ModelSupports
-    from nemo_automodel.components.models.qwen3_8_flash_next.model import (
+    from nemo_automodel._transformers.models.qwen3_8_flash_next.model import (
         Qwen3_8_FlashNextForConditionalGeneration,
     )
 

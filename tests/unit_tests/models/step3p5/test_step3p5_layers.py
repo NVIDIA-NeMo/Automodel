@@ -18,8 +18,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.step3p5.layers import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.step3p5.layers import (
     Step3p5Attention,
     Step3p5MLP,
     Step3p5RMSNorm,
@@ -278,7 +278,7 @@ class TestStep3p5Attention:
         attention.attn_func = MagicMock(return_value=fake_attn.to(torch.bfloat16))
 
         with patch(
-            "nemo_automodel.components.models.step3p5.layers.apply_rotary_emb_qk",
+            "nemo_automodel._transformers.models.step3p5.layers.apply_rotary_emb_qk",
             side_effect=lambda q, k, *_, **__: (q, k),
         ):
             out = attention(x, freqs_cis=freqs_cis)

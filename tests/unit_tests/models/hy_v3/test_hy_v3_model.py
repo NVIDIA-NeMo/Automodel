@@ -20,9 +20,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.hy_v3.config import HYV3Config
-from nemo_automodel.components.models.hy_v3.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.hy_v3.config import HYV3Config
+from nemo_automodel._transformers.models.hy_v3.model import (
     Block,
     HYV3ForCausalLM,
     HYV3Model,
@@ -292,7 +292,7 @@ class TestHYV3ForCausalLM:
     def test_state_dict_adapter_attached_when_enabled(self, config, backend_config):
         backend_config.enable_hf_state_dict_adapter = True
         model = HYV3ForCausalLM(config, backend=backend_config)
-        from nemo_automodel.components.models.hy_v3.state_dict_adapter import HYV3StateDictAdapter
+        from nemo_automodel._transformers.models.hy_v3.state_dict_adapter import HYV3StateDictAdapter
 
         assert hasattr(model, "state_dict_adapter")
         assert isinstance(model.state_dict_adapter, HYV3StateDictAdapter)
@@ -418,11 +418,11 @@ class TestHYV3ForCausalLM:
 
 class TestModuleExports:
     def test_init_exports_hyv3_for_causal_lm(self):
-        from nemo_automodel.components.models.hy_v3 import HYV3ForCausalLM as exported
+        from nemo_automodel._transformers.models.hy_v3 import HYV3ForCausalLM as exported
 
         assert exported is HYV3ForCausalLM
 
     def test_module_class_pointer(self):
-        from nemo_automodel.components.models.hy_v3 import model as mod
+        from nemo_automodel._transformers.models.hy_v3 import model as mod
 
         assert mod.ModelClass is HYV3ForCausalLM

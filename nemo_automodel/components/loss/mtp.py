@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from nemo_automodel._transformers.models.common.mtp import get_mtp_loss_scaling_factor, roll_tensor
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.utils import (
     _get_final_hidden_states,
@@ -27,7 +28,6 @@ from nemo_automodel.components.loss.utils import (
     _get_lm_head_weight,
     calculate_loss,
 )
-from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor, roll_tensor
 
 
 @dataclass(frozen=True)

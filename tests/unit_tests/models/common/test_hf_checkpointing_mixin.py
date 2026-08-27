@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch.nn as nn
 
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 
 class SimpleModelWithMixin(HFCheckpointingMixin, nn.Module):

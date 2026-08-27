@@ -17,8 +17,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -192,16 +192,16 @@ class TestFromHf:
         per_expert_scale = hf_sd["model.language_model.layers.0.router.per_expert_scale"]
 
         monkeypatch.setattr(
-            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils."
+            "nemo_automodel._transformers.models.gemma4_moe.state_dict_adapter.state_dict_utils."
             "get_expert_range_for_rank_from_mesh",
             lambda device_mesh, n_experts: (0, n_experts),
         )
         monkeypatch.setattr(
-            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils.get_submesh",
+            "nemo_automodel._transformers.models.gemma4_moe.state_dict_adapter.state_dict_utils.get_submesh",
             lambda device_mesh, dims: FakeShardMesh(),
         )
         monkeypatch.setattr(
-            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils.create_dtensor_from_local",
+            "nemo_automodel._transformers.models.gemma4_moe.state_dict_adapter.state_dict_utils.create_dtensor_from_local",
             lambda local_tensor, device_mesh, rank: local_tensor,
         )
 
@@ -344,11 +344,11 @@ class TestToHf:
         ]
 
         monkeypatch.setattr(
-            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils.is_dtensor",
+            "nemo_automodel._transformers.models.gemma4_moe.state_dict_adapter.state_dict_utils.is_dtensor",
             lambda tensor: isinstance(tensor, FakeDTensor),
         )
         monkeypatch.setattr(
-            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils."
+            "nemo_automodel._transformers.models.gemma4_moe.state_dict_adapter.state_dict_utils."
             "split_experts_weights_dtensor_aware",
             lambda tensor, n_experts: (split_weights, [0, 1]),
         )

@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.nemotron_omni.model import (
+from nemo_automodel._transformers.models.nemotron_omni.model import (
     NemotronOmniForConditionalGeneration,
 )
 

@@ -17,7 +17,7 @@
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextRMSNormGated
+from nemo_automodel._transformers.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextRMSNormGated
 
 
 def test_qwen3_8_flash_next_gdn_norm_uses_sigmoid_gate() -> None:

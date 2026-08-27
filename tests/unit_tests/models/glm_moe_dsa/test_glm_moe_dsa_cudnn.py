@@ -21,11 +21,11 @@ import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.glm_moe_dsa import layers as layer_mod
-from nemo_automodel.components.models.glm_moe_dsa.kernels import cudnn_dsa
-from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaIndexer, GlmMoeDsaMLA
-from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM, GlmMoeDsaModel
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.glm_moe_dsa import layers as layer_mod
+from nemo_automodel._transformers.models.glm_moe_dsa.kernels import cudnn_dsa
+from nemo_automodel._transformers.models.glm_moe_dsa.layers import GlmMoeDsaIndexer, GlmMoeDsaMLA
+from nemo_automodel._transformers.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM, GlmMoeDsaModel
 
 TOKENS = 5
 INDEX_HEADS = 64

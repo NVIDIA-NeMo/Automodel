@@ -32,6 +32,8 @@ from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
@@ -54,8 +56,6 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner, resolve_decode_eval_config
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
