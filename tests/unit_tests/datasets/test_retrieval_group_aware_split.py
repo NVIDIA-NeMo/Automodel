@@ -130,3 +130,38 @@ def test_missing_group_column_is_rejected():
     dataset = _FakeDataset(["q0", "q1"])
     with pytest.raises(ValueError, match="not a column of the dataset"):
         _group_aware_split(dataset, 0.25, "no_such_column", "train", SEED)
+
+
+def test_empty_validation_side_raises():
+    """Few groups + a small fraction can hash to zero validation groups."""
+    # one group, fraction 0.25 -> the single group almost certainly lands in train
+    with pytest.raises(ValueError, match="every group on one side"):
+        _split(["only_group"], "train", fraction=0.25)
+
+
+def test_empty_train_side_raises():
+    with pytest.raises(ValueError, match="every group on one side"):
+        _split(["only_group"], "train", fraction=0.999)
+
+
+def test_error_names_the_knobs_that_produced_it():
+    try:
+        _split(["only_group"], "validation", fraction=0.25)
+    except ValueError as e:
+        msg = str(e)
+    else:
+        raise AssertionError("expected ValueError")
+    assert "validation_fraction=0.25" in msg
+    assert f"seed={SEED}" in msg
+    assert GROUP_KEY in msg
+
+
+def test_healthy_split_does_not_raise():
+    groups = [f"q{i}" for i in range(40)]
+    assert _split(groups, "train")
+    assert _split(groups, "validation")
+
+
+def test_zero_fraction_never_raises_even_with_one_group():
+    """validation_fraction=0 means 'no held-out slice', which is a valid request."""
+    assert _split(["only_group"], "train", fraction=0.0) == {"only_group"}
