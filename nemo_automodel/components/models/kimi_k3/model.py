@@ -1062,6 +1062,25 @@ def _situ_bwd_core(
     return d_g, d_u, red
 
 
+_SITU_CORES_COMPILED = False
+
+
+def _compile_situ_cores() -> None:
+    """Wrap the SiTU chunk cores with ``torch.compile``, once per process.
+
+    The compiled functions replace the module-level eager cores, so every
+    ``KimiK3MoE`` layer shares one pair of compiled kernels and repeated model
+    construction does not recompile. Compilation itself is lazy (at first
+    call). Compiled numerics are allclose to eager, not bitwise-identical.
+    """
+    global _situ_fwd_core, _situ_bwd_core, _SITU_CORES_COMPILED
+    if _SITU_CORES_COMPILED:
+        return
+    _situ_fwd_core = torch.compile(_situ_fwd_core, dynamic=True)
+    _situ_bwd_core = torch.compile(_situ_bwd_core, dynamic=True)
+    _SITU_CORES_COMPILED = True
+
+
 def _situ_rw_is_row_aligned(gate_up: torch.Tensor, routing_weights: torch.Tensor) -> bool:
     """Return True when ``routing_weights`` carries one entry per ``gate_up`` row.
 
@@ -1283,6 +1302,8 @@ class KimiK3MoE(MoE):
             self.gate = FakeBalancedGate(moe_config, noise=backend.fake_gate_noise)
         else:
             self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        if backend.compile_situ:
+            _compile_situ_cores()
         expert_activation = partial(
             _weighted_situ,
             beta=config.activation_situ_beta or 1.0,
