@@ -9,7 +9,8 @@ from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextLinearAttention,
     Glm5NextSparseAttention,
 )
-from tests.unit_tests.models.glm5_next.conftest import tiny_glm5_next_model
+from nemo_automodel.components.models.glm5_next.model import build_glm5_next_moe_config
+from tests.unit_tests.models.glm5_next.conftest import tiny_glm5_next_config, tiny_glm5_next_model
 
 
 def test_tiny_hybrid_packed_forward_backward_is_finite():
@@ -157,3 +158,10 @@ def test_hyperconnection_fp32_parameters_have_a_dedicated_fsdp_holder():
     assert set(dict(hyperconnection.named_parameters(recurse=False))) == {"fn"}
     assert set(dict(hyperconnection._fp32_params.named_parameters())) == {"base", "scale"}
     assert all(parameter.dtype is torch.float32 for parameter in hyperconnection._fp32_params.parameters())
+
+
+def test_moe_router_correction_bias_only_controls_expert_selection():
+    config = build_glm5_next_moe_config(tiny_glm5_next_config().text_config, torch.float32)
+
+    assert config.score_func == "sigmoid_with_bias"
+    assert not config.router_weight_uses_score_correction_bias

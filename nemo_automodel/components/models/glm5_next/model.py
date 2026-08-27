@@ -58,7 +58,9 @@ def build_glm5_next_moe_config(
         n_limited_groups=config.topk_group,
         train_gate=True,
         gate_bias_update_factor=1e-3,
-        score_func="sigmoid",
+        # HF uses the correction bias only to select experts; routing weights
+        # are gathered from the unbiased sigmoid scores.
+        score_func="sigmoid_with_bias",
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0.0,
         norm_topk_prob=config.norm_topk_prob,
@@ -69,7 +71,7 @@ def build_glm5_next_moe_config(
         swiglu_limit=config.swiglu_limit,
         softmax_before_topk=False,
         router_weights_fp32=True,
-        router_weight_uses_score_correction_bias=True,
+        router_weight_uses_score_correction_bias=False,
         shared_expert_gate=False,
         shared_expert_inter_dim=config.moe_intermediate_size,
         force_e_score_correction_bias=True,

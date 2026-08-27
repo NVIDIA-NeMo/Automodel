@@ -872,13 +872,12 @@ class Checkpointer:
                 state_dict_from_disk = {}
             t_adapt = time.monotonic()
 
-            # Apply key_mapping (e.g. _checkpoint_conversion_mapping) so that
-            # HF checkpoint keys are renamed to match the model's parameter FQNs.
-            # Without this, VLM models like Gemma3ForConditionalGeneration whose
-            # checkpoint keys differ from their module hierarchy (e.g.
-            # "language_model.model.X" vs "model.language_model.X") would silently
-            # fail to load base weights when using strict=False.
-            if key_mapping and state_dict_from_disk:
+            # Apply key_mapping (e.g. _checkpoint_conversion_mapping) when no
+            # model-owned adapter has already converted the HF state dict to native
+            # FQNs. Applying both transformations can remap valid native keys a
+            # second time. This mirrors the DCP path below, which also disables the
+            # storage-reader key mapping whenever a state-dict adapter is present.
+            if key_mapping and state_dict_from_disk and not has_state_dict_adapter:
                 state_dict_from_disk = _apply_key_mapping(state_dict_from_disk, key_mapping)
 
             materialized_tied_lm_head = materialize_missing_tied_lm_head(
