@@ -56,6 +56,11 @@ class MoEConfig:
     router_weights_fp32: bool = False
     router_weight_uses_score_correction_bias: bool = False
     dtype: str | torch.dtype = torch.bfloat16
+    # Storage dtype for the router gate parameters. None inherits ``dtype``.
+    # Models whose checkpoints store the gate in fp32 (e.g. MiniMax-M2) set
+    # this so the gate is fp32 from allocation on every construction path,
+    # keeping FSDP dtype groups uniform with the fp32 correction-bias buffer.
+    gate_dtype: str | torch.dtype | None = None
     shared_expert_gate: bool = False
     shared_expert_inter_dim: int | None = None
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
@@ -74,6 +79,8 @@ class MoEConfig:
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
+        if isinstance(self.gate_dtype, str):
+            self.gate_dtype = dtype_from_str(self.gate_dtype, default=torch.bfloat16)
 
 
 @dataclass
