@@ -112,11 +112,32 @@ def _configure_fsdp_module(
 
 
 def _run_post_backward_hooks(fsdp_module: FSDPModule) -> Callable:
+    """Run post-backward for every FSDP state and return the root final callback.
+
+    Both the per-state ``post_backward()`` calls and the returned callback
+    tolerate FSDP modules that never ran forward in this step. With
+    ``FusedLinearCrossEntropy`` under pipeline parallelism the ``lm_head``
+    weight is consumed inside the loss function, so its FSDP module never
+    runs forward and its ``FSDPCommContext`` is never lazily initialized;
+    ``post_backward()`` then raises ``AttributeError`` (``'FSDPCommContext'
+    object has no attribute 'post_forward_order'``). A never-forwarded group
+    has no gradients to reduce, so it is safe to skip.
+    """
     fsdp_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
     for state in fsdp_state._state_ctx.all_states:
         if state._fsdp_param_group:
-            state._fsdp_param_group.post_backward()
-    return fsdp_state._root_post_backward_final_callback
+            try:
+                state._fsdp_param_group.post_backward()
+            except AttributeError:
+                continue
+
+    def _final_callback() -> None:
+        try:
+            fsdp_state._root_post_backward_final_callback()
+        except AttributeError:
+            pass
+
+    return _final_callback
 
 
 class MoEFSDPSyncMixin:
