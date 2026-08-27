@@ -143,6 +143,9 @@ over `max_steps=800` (~0.5B tokens) and `clip_grad_norm=1.0` (the base has
 volatile early grads). `freeze_language_model: false` keeps the embeddings + tied
 LM head trainable — required to learn 48/49.
 
+_Training / validation loss curve (wandb):
+<https://wandb.ai/Nemo-automodel/long_context_validation_gemma4_31b/workspace?nw=nwuserathittenaman>._
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_sft.png" alt="Gemma4-31B base SFT training loss curve on CoderForge" width="700">
 </p>
