@@ -262,6 +262,18 @@ def test_generic_selectors_disable_implicit_legacy_vision_freeze(dummy_model):
     assert _all_requires_grad(dummy_model.other)
 
 
+def test_empty_generic_selector_list_disables_implicit_legacy_vision_freeze(dummy_model):
+    """An explicitly empty selector field opts out of legacy implicit freezing."""
+    config = model_utils.parse_freeze_config({"freeze_modules": []})
+
+    assert config.freeze_modules == []
+    assert config.unfreeze_modules is None
+    model_utils.apply_parameter_freezing(dummy_model, config)
+
+    assert _all_requires_grad(dummy_model.vision_tower)
+    assert _all_requires_grad(dummy_model.visual_extra)
+
+
 def test_glob_selector_treats_dot_as_literal():
     """Glob matching is shell-style: `.` is literal, not a regex wildcard."""
 
@@ -296,6 +308,13 @@ class TestParseFreezeConfig:
         assert model_utils.parse_freeze_config(None) is None
         assert model_utils.parse_freeze_config(typed) is typed
 
+    def test_empty_mapping_retains_legacy_selector_absence(self):
+        config = model_utils.parse_freeze_config({})
+
+        assert config.freeze_modules is None
+        assert config.unfreeze_modules is None
+        assert not config.has_generic_selectors()
+
     def test_parses_typed_selectors(self):
         config = model_utils.parse_freeze_config(
             {
@@ -326,6 +345,12 @@ class TestParseFreezeConfig:
             model_utils.parse_freeze_config({"freeze_modules": {"path": "vision_tower"}})
         with pytest.raises(ValueError, match="freeze_config.freeze_modules must be a list"):
             model_utils.parse_freeze_config({"freeze_modules": ({"path": "vision_tower"},)})
+
+    @pytest.mark.parametrize("field_name", ["freeze_modules", "unfreeze_modules"])
+    @pytest.mark.parametrize("invalid", [None, False, 0])
+    def test_empty_like_selector_values_rejected(self, field_name, invalid):
+        with pytest.raises(ValueError, match=rf"freeze_config\.{field_name} must be a list"):
+            model_utils.parse_freeze_config({field_name: invalid})
 
     def test_selector_with_both_path_and_glob_rejected(self):
         with pytest.raises(ValueError, match="exactly one of `path` or `glob`"):

@@ -172,6 +172,7 @@ class _TinyTrainabilityModel(torch.nn.Module):
         self.base = torch.nn.Linear(1, 1, bias=False)
         self.extension = torch.nn.Linear(1, 1, bias=False)
         self.extension.requires_grad_(False)
+        self.model_constant = torch.nn.Parameter(torch.ones(1), requires_grad=False)
         self.config = SimpleNamespace()
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -358,10 +359,12 @@ def test_freeze_config_rebinds_after_name_changing_replacement_under_full_finetu
     assert not model.base.weight.requires_grad
     # The renamed extension parameter is re-selected through its parent module path.
     assert model.extension[0].weight.requires_grad
-    # Full fine-tuning baseline: parameters the policy does not select stay trainable.
+    # Parameters the policy does not select retain their model-owned trainability.
+    assert not model.model_constant.requires_grad
     assert model.parallel_parameter.requires_grad
     assert not model.trainability_at_wrapper_construction["base.weight"]
     assert model.trainability_at_wrapper_construction["extension.0.weight"]
+    assert not model.trainability_at_wrapper_construction["model_constant"]
     assert model.trainability_at_wrapper_construction["parallel_parameter"]
 
 

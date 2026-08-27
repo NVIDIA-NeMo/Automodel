@@ -18,7 +18,7 @@ import logging
 import os
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -357,6 +357,7 @@ class ModuleSelector:
         """
         if self.path is not None:
             return module_path == self.path
+        assert self.glob is not None
         return fnmatch.fnmatchcase(module_path, self.glob)
 
     def describe(self) -> str:
@@ -371,8 +372,8 @@ class FreezeConfig:
 
     Trainability semantics, in application order:
 
-    1. Full fine-tuning (all parameters trainable) or PEFT (LoRA trainable,
-       base frozen) establishes the baseline.
+    1. Full fine-tuning preserves the model's existing trainability state;
+       PEFT establishes a LoRA-trainable, base-frozen baseline.
     2. ``freeze_modules`` recursively freezes the selected modules.
     3. ``unfreeze_modules`` recursively unfreezes the selected modules and wins
        on overlap.
@@ -387,8 +388,8 @@ class FreezeConfig:
     explicit-selector semantics and does not implicitly freeze vision modules.
     """
 
-    freeze_modules: list[ModuleSelector] = field(default_factory=list)
-    unfreeze_modules: list[ModuleSelector] = field(default_factory=list)
+    freeze_modules: list[ModuleSelector] | None = None
+    unfreeze_modules: list[ModuleSelector] | None = None
     freeze_vision_tower: bool | None = None
     freeze_audio_tower: bool = False
     freeze_language_model: bool = False
@@ -398,6 +399,8 @@ class FreezeConfig:
         """Validate selectors and legacy compatibility options."""
         for field_name in ("freeze_modules", "unfreeze_modules"):
             selectors = getattr(self, field_name)
+            if selectors is None:
+                continue
             if not isinstance(selectors, list):
                 raise TypeError(f"FreezeConfig.{field_name} must be a list; got {type(selectors).__name__}.")
             invalid = [selector for selector in selectors if not isinstance(selector, ModuleSelector)]
@@ -414,8 +417,8 @@ class FreezeConfig:
                 raise TypeError(f"FreezeConfig.{field_name} must be a boolean; got {value!r}.")
 
     def has_generic_selectors(self) -> bool:
-        """Return whether any ``freeze_modules``/``unfreeze_modules`` selector is declared."""
-        return bool(self.freeze_modules or self.unfreeze_modules)
+        """Return whether either generic selector field was explicitly declared."""
+        return self.freeze_modules is not None or self.unfreeze_modules is not None
 
 
 _FREEZE_CONFIG_OPTIONS = {
@@ -487,8 +490,10 @@ def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> Free
             f"valid options are {sorted(_FREEZE_CONFIG_OPTIONS)}."
         )
 
-    def _selectors(field_name: str) -> list[ModuleSelector]:
-        entries = config.get(field_name) or []
+    def _selectors(field_name: str) -> list[ModuleSelector] | None:
+        if field_name not in config:
+            return None
+        entries = config[field_name]
         if not isinstance(entries, list):
             raise ValueError(
                 f"freeze_config.{field_name} must be a list of `path`/`glob` selector mappings; got {entries!r}."
@@ -618,9 +623,10 @@ def apply_parameter_freezing(
         - freeze_language_model: bool (default False)
         - freeze_video_embedder: bool (default False)
     """
-    freeze_config = parse_freeze_config(freeze_config)
-    if freeze_config is None:
+    parsed_freeze_config = parse_freeze_config(freeze_config)
+    if parsed_freeze_config is None:
         return
+    freeze_config = parsed_freeze_config
 
     # Preserve the legacy attribute and substring matching independently of the
     # fnmatch semantics used by the generic selectors.
@@ -646,10 +652,10 @@ def apply_parameter_freezing(
             _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns)
 
     _apply_module_selectors(
-        model, freeze_config.freeze_modules, requires_grad=False, strict=strict, field_name="freeze_modules"
+        model, freeze_config.freeze_modules or [], requires_grad=False, strict=strict, field_name="freeze_modules"
     )
     _apply_module_selectors(
-        model, freeze_config.unfreeze_modules, requires_grad=True, strict=strict, field_name="unfreeze_modules"
+        model, freeze_config.unfreeze_modules or [], requires_grad=True, strict=strict, field_name="unfreeze_modules"
     )
 
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,

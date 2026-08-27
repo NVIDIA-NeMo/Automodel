@@ -495,9 +495,6 @@ def _apply_trainability_policy(
     if peft_enabled:
         for name, param in model.named_parameters(remove_duplicate=False):
             param.requires_grad_("lora_" in name)
-    elif freeze_config is not None and freeze_config.has_generic_selectors():
-        for param in model.parameters():
-            param.requires_grad_(True)
     if freeze_config is not None:
         apply_parameter_freezing(model, freeze_config, strict=strict)
 

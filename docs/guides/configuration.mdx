@@ -79,7 +79,7 @@ freeze_config:
 
 Each selector is a mapping with exactly one key — `path` matches one module by its exact fully qualified name, while `glob` matches module names with `fnmatch`-style wildcards (`*` crosses `.` separators, so `*_proj` matches projection modules at any depth). List entries are additive: repeat `path` or `glob` entries to select several modules, and a single entry combining both keys is rejected. Matching is recursive: a selected module's entire subtree is frozen or unfrozen. Bare strings are rejected; unknown options and selectors that match no parameters raise an error before training starts.
 
-Trainability is resolved in a fixed order. Full fine-tuning (everything trainable) or PEFT (LoRA trainable, base frozen) establishes the baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap — this makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is validated on the complete model, re-resolved after tensor/expert parallel and activation-checkpointing surgery immediately before DDP/FSDP construction, and resolved once more after checkpoint loading before optimizer construction.
+Trainability is resolved in a fixed order. Full fine-tuning preserves the model's existing `requires_grad` state, including intentionally frozen model-owned parameters; PEFT establishes a LoRA-trainable, base-frozen baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap — this makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is validated on the complete model, re-resolved after tensor/expert parallel and activation-checkpointing surgery immediately before DDP/FSDP construction, and resolved once more after checkpoint loading before optimizer construction.
 
 The modality-specific booleans `freeze_vision_tower`, `freeze_audio_tower`, `freeze_language_model`, and `freeze_video_embedder` remain supported and keep their established attribute and substring matching, applied before `unfreeze_modules`:
 
@@ -89,7 +89,7 @@ freeze_config:
   freeze_audio_tower: true
 ```
 
-Legacy-only configurations retain the implicit `freeze_vision_tower: true` default. A configuration that declares `freeze_modules` or `unfreeze_modules` uses explicit-selector semantics and does not implicitly freeze vision modules; add a vision selector (for example, `glob: "*vision*"`) when such a configuration should also freeze the vision tower.
+Legacy-only configurations retain the implicit `freeze_vision_tower: true` default. A configuration that declares `freeze_modules` or `unfreeze_modules`, even as an empty list, uses explicit-selector semantics and does not implicitly freeze vision modules; add a vision selector (for example, `glob: "*vision*"`) when such a configuration should also freeze the vision tower. Omit both selector fields to retain legacy behavior; `null`, `false`, and numeric values are rejected.
 
 ## Prewarm One-Time CUDA Initialization
 
