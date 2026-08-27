@@ -235,9 +235,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits, labels.view(-1))
+            with self._autocast_context():
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                loss = self.loss_fn(logits, labels.view(-1))
             losses.append(loss.detach().clone())
 
             # Collect predictions for accuracy calculation
@@ -344,9 +345,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits, labels.view(-1))
+            with self._autocast_context():
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                loss = self.loss_fn(logits, labels.view(-1))
             total_loss += loss.detach()
 
             # Collect predictions for accuracy

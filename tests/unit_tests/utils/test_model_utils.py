@@ -313,6 +313,10 @@ class TestParseFreezeConfig:
         with pytest.raises(ValueError, match="unsupported option.*freeze_vision"):
             model_utils.parse_freeze_config({"freeze_vision": True})
 
+    def test_hydra_meta_option_rejected(self):
+        with pytest.raises(ValueError, match="unsupported option.*_target_"):
+            model_utils.parse_freeze_config({"_target_": "example.FreezeConfig"})
+
     def test_bare_string_selector_rejected(self):
         with pytest.raises(ValueError, match="must be mappings with exactly one of `path` or `glob`"):
             model_utils.parse_freeze_config({"freeze_modules": ["vision_tower"]})
@@ -320,6 +324,8 @@ class TestParseFreezeConfig:
     def test_selector_list_required(self):
         with pytest.raises(ValueError, match="freeze_config.freeze_modules must be a list"):
             model_utils.parse_freeze_config({"freeze_modules": {"path": "vision_tower"}})
+        with pytest.raises(ValueError, match="freeze_config.freeze_modules must be a list"):
+            model_utils.parse_freeze_config({"freeze_modules": ({"path": "vision_tower"},)})
 
     def test_selector_with_both_path_and_glob_rejected(self):
         with pytest.raises(ValueError, match="exactly one of `path` or `glob`"):
@@ -341,9 +347,21 @@ class TestParseFreezeConfig:
         with pytest.raises(TypeError, match="freeze_config must be a mapping"):
             model_utils.parse_freeze_config("vision_tower")
 
+    def test_direct_typed_config_rejects_untyped_values(self):
+        with pytest.raises(TypeError, match="entries must be ModuleSelector"):
+            model_utils.FreezeConfig(freeze_modules=[{"path": "vision_tower"}])
+        with pytest.raises(TypeError, match="freeze_audio_tower must be a boolean"):
+            model_utils.FreezeConfig(freeze_audio_tower="yes")
+
+    def test_apply_parameter_freezing_accepts_raw_mapping_for_compatibility(self, dummy_model):
+        model_utils.apply_parameter_freezing(dummy_model, {"freeze_modules": [{"path": "other"}]})
+        assert not _any_requires_grad(dummy_model.other)
+
     def test_unmatched_selector_raises_in_strict_mode(self, dummy_model):
         config = model_utils.FreezeConfig(freeze_modules=[model_utils.ModuleSelector(path="nonexistent")])
-        with pytest.raises(ValueError, match=r"freeze_config\.freeze_modules selector `path: nonexistent` matched no parameters"):
+        with pytest.raises(
+            ValueError, match=r"freeze_config\.freeze_modules selector `path: nonexistent` matched no parameters"
+        ):
             model_utils.apply_parameter_freezing(dummy_model, config, strict=True)
 
     def test_unmatched_selector_allowed_when_rebinding(self, dummy_model):

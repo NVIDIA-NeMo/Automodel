@@ -394,6 +394,25 @@ class FreezeConfig:
     freeze_language_model: bool = False
     freeze_video_embedder: bool = False
 
+    def __post_init__(self) -> None:
+        """Validate selectors and legacy compatibility options."""
+        for field_name in ("freeze_modules", "unfreeze_modules"):
+            selectors = getattr(self, field_name)
+            if not isinstance(selectors, list):
+                raise TypeError(f"FreezeConfig.{field_name} must be a list; got {type(selectors).__name__}.")
+            invalid = [selector for selector in selectors if not isinstance(selector, ModuleSelector)]
+            if invalid:
+                raise TypeError(f"FreezeConfig.{field_name} entries must be ModuleSelector instances; got {invalid!r}.")
+
+        if self.freeze_vision_tower is not None and not isinstance(self.freeze_vision_tower, bool):
+            raise TypeError(
+                f"FreezeConfig.freeze_vision_tower must be a boolean or None; got {self.freeze_vision_tower!r}."
+            )
+        for field_name in ("freeze_audio_tower", "freeze_language_model", "freeze_video_embedder"):
+            value = getattr(self, field_name)
+            if not isinstance(value, bool):
+                raise TypeError(f"FreezeConfig.{field_name} must be a boolean; got {value!r}.")
+
     def has_generic_selectors(self) -> bool:
         """Return whether any ``freeze_modules``/``unfreeze_modules`` selector is declared."""
         return bool(self.freeze_modules or self.unfreeze_modules)
@@ -407,10 +426,6 @@ _FREEZE_CONFIG_OPTIONS = {
     "freeze_language_model",
     "freeze_video_embedder",
 }
-
-# Hydra / OmegaConf meta keys that may leak from YAML configs; they carry no
-# meaning for FreezeConfig and must not trigger strict unknown-key validation.
-_HYDRA_META_KEYS = {"_target_", "_recursive_", "_convert_"}
 
 
 def _parse_module_selector(entry: Any, *, field_name: str) -> ModuleSelector:
@@ -465,7 +480,7 @@ def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> Free
     if not isinstance(config, Mapping):
         raise TypeError(f"freeze_config must be a mapping of freeze options; got {type(config).__name__}: {config!r}.")
 
-    unknown = set(config) - _FREEZE_CONFIG_OPTIONS - _HYDRA_META_KEYS
+    unknown = set(config) - _FREEZE_CONFIG_OPTIONS
     if unknown:
         raise ValueError(
             f"freeze_config has unsupported option(s) {sorted(unknown)}; "
@@ -474,7 +489,7 @@ def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> Free
 
     def _selectors(field_name: str) -> list[ModuleSelector]:
         entries = config.get(field_name) or []
-        if isinstance(entries, (str, bytes)) or not isinstance(entries, (list, tuple)):
+        if not isinstance(entries, list):
             raise ValueError(
                 f"freeze_config.{field_name} must be a list of `path`/`glob` selector mappings; got {entries!r}."
             )
@@ -575,7 +590,12 @@ def _apply_module_selectors(
             )
 
 
-def apply_parameter_freezing(model: nn.Module, freeze_config: FreezeConfig, *, strict: bool = True) -> None:
+def apply_parameter_freezing(
+    model: nn.Module,
+    freeze_config: FreezeConfig | Mapping[str, Any],
+    *,
+    strict: bool = True,
+) -> None:
     """Apply parameter freezing based on a typed FreezeConfig.
 
     Application order: legacy modality booleans and ``freeze_modules`` freeze,
@@ -585,7 +605,9 @@ def apply_parameter_freezing(model: nn.Module, freeze_config: FreezeConfig, *, s
 
     Args:
         model: The model to apply freezing to.
-        freeze_config: Typed freeze configuration; see FreezeConfig.
+        freeze_config: Typed freeze configuration or a raw mapping retained for
+            compatibility with direct callers. Raw mappings are validated and
+            converted to FreezeConfig before use.
         strict: When True, raise if a ``freeze_modules``/``unfreeze_modules``
             selector matches no parameters. Set False when rebinding the policy
             onto a post-parallelization model part.
@@ -596,6 +618,10 @@ def apply_parameter_freezing(model: nn.Module, freeze_config: FreezeConfig, *, s
         - freeze_language_model: bool (default False)
         - freeze_video_embedder: bool (default False)
     """
+    freeze_config = parse_freeze_config(freeze_config)
+    if freeze_config is None:
+        return
+
     # Preserve the legacy attribute and substring matching independently of the
     # fnmatch semantics used by the generic selectors.
     freeze_vision_tower = freeze_config.freeze_vision_tower

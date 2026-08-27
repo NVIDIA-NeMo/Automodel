@@ -32,6 +32,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
+  autocast_dtype: bfloat16
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig

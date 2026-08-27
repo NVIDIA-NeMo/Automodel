@@ -141,6 +141,19 @@ def test_moe_infrastructure_forwards_fsdp2_tp_sequence_and_offload_settings():
     assert parallelize_fn.keywords["frozen_multimodal_sharding"] == "replicate"
 
 
+def test_pipeline_parallelizer_forwards_trainability_rebind():
+    """Each PP stage receives the same pre-wrapper trainability policy."""
+    from nemo_automodel._transformers.infrastructure import parallelize_for_pp
+
+    model = torch.nn.Linear(2, 2)
+    callback = MagicMock()
+    manager = MagicMock()
+    manager.parallelize.return_value = model
+
+    assert parallelize_for_pp(model, model_wrapper=manager, reapply_trainability=callback) is model
+    manager.parallelize.assert_called_once_with(model, reapply_trainability=callback)
+
+
 # =============================================================================
 # Tests for apply_model_infrastructure: post-shard initialize_model_weights
 # =============================================================================
@@ -269,6 +282,18 @@ def _replace_and_wrap_parameters(model, *_args, **_kwargs):
 def _run_trainability_infrastructure(model, freeze_config, peft_config=None):
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
+    class _ReplacingWrapper:
+        mp_policy = None
+
+        def parallelize(self, model, reapply_trainability=None):
+            model = _replace_and_wrap_parameters(model)
+            assert reapply_trainability is not None
+            reapply_trainability(model)
+            model.trainability_at_wrapper_construction = {
+                name: param.requires_grad for name, param in model.named_parameters(remove_duplicate=False)
+            }
+            return model
+
     freeze_kwargs = {"freeze_config": freeze_config} if freeze_config is not None else {}
     with (
         patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
@@ -276,7 +301,6 @@ def _run_trainability_infrastructure(model, freeze_config, peft_config=None):
         patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
         patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
         patch(f"{_INFRA_MODULE}._apply_peft_and_lower_precision", return_value=model),
-        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", side_effect=_replace_and_wrap_parameters),
         patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
     ):
         MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
@@ -285,6 +309,7 @@ def _run_trainability_infrastructure(model, freeze_config, peft_config=None):
             is_meta_device=False,
             device=torch.device("cpu"),
             load_base_model=False,
+            model_wrapper=_ReplacingWrapper(),
             peft_config=peft_config,
             **freeze_kwargs,
         )
@@ -316,6 +341,9 @@ def test_peft_freeze_config_survives_name_changing_parameter_replacement(
     assert model.lora_weight.requires_grad
     assert model.vision_adapter.lora_weight.requires_grad is vision_lora_trainable
     assert not model.parallel_parameter.requires_grad
+    assert model.trainability_at_wrapper_construction["extension.0.weight"] is extension_trainable
+    assert model.trainability_at_wrapper_construction["vision_adapter.lora_weight"] is vision_lora_trainable
+    assert not model.trainability_at_wrapper_construction["parallel_parameter"]
 
 
 def test_freeze_config_rebinds_after_name_changing_replacement_under_full_finetuning():
@@ -332,6 +360,9 @@ def test_freeze_config_rebinds_after_name_changing_replacement_under_full_finetu
     assert model.extension[0].weight.requires_grad
     # Full fine-tuning baseline: parameters the policy does not select stay trainable.
     assert model.parallel_parameter.requires_grad
+    assert not model.trainability_at_wrapper_construction["base.weight"]
+    assert model.trainability_at_wrapper_construction["extension.0.weight"]
+    assert model.trainability_at_wrapper_construction["parallel_parameter"]
 
 
 def test_freeze_config_unfreeze_keeps_parameter_storage_dtype():
