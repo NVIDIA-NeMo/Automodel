@@ -18,9 +18,91 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch import nn
+from torch.distributed.checkpoint import FileSystemReader
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
+
+
+class _ModelOwnedDTensorOptimizerModel(nn.Module):
+    """Tiny globally shaped row DTensor consumed through its local shard."""
+
+    def __init__(self, process_group: torch.distributed.ProcessGroup, *, global_rows: int = 8) -> None:
+        super().__init__()
+        world_size = torch.distributed.get_world_size(process_group)
+        rank = torch.distributed.get_rank(process_group)
+        if global_rows % world_size:
+            raise ValueError("global_rows must divide evenly over the test process group")
+        local_rows = global_rows // world_size
+        local_weight = torch.arange(rank * local_rows, (rank + 1) * local_rows, dtype=torch.float32).unsqueeze(1)
+        local_weight = local_weight.expand(-1, 2).contiguous()
+        mesh = DeviceMesh.from_group(
+            process_group,
+            device_type="cpu",
+            mesh_dim_names=("ple_owner",),
+        )
+        weight = DTensor.from_local(
+            local_weight,
+            device_mesh=mesh,
+            placements=(Shard(0),),
+            run_check=False,
+            shape=(global_rows, 2),
+            stride=(2, 1),
+        )
+        self.weight = nn.Parameter(weight)
+        self.weight._nemo_model_owned_grad_divisor = float(world_size)
+
+
+def _make_distributed_checkpointer(rank: int, checkpoint_dir: str) -> Checkpointer:
+    """Build the ordinary full-training DCP wrapper for one test rank."""
+    return Checkpointer(
+        CheckpointingConfig(
+            checkpoint_dir=checkpoint_dir,
+            model_save_format="safetensors",
+            save_consolidated=False,
+            is_peft=False,
+        ),
+        dp_rank=rank,
+        tp_rank=0,
+        pp_rank=0,
+        process_group=torch.distributed.group.WORLD,
+    )
+
+
+def _state_local(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a writable optimizer-state shard."""
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _fill_row_coded_adam_state(model: nn.Module, optimizer: torch.optim.AdamW, rank: int) -> None:
+    """Materialize Adam state and overwrite it with deterministic owner rows."""
+    parameter = model.weight
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    state = optimizer.state[parameter]
+    local_rows = _state_local(state["exp_avg"]).shape[0]
+    row_start = rank * local_rows
+    rows = torch.arange(row_start, row_start + local_rows, dtype=torch.float32).unsqueeze(1)
+    columns = torch.arange(2, dtype=torch.float32).unsqueeze(0)
+    _state_local(state["exp_avg"]).copy_(rows * 10 + columns + 0.25)
+    _state_local(state["exp_avg_sq"]).copy_(rows * 10 + columns + 0.75)
+    state["step"].fill_(5)
+
+
+def _assert_row_coded_adam_state(model: nn.Module, optimizer: torch.optim.AdamW, rank: int) -> None:
+    """Check the deterministic state expected for this rank's row interval."""
+    state = optimizer.state[model.weight]
+    exp_avg = _state_local(state["exp_avg"])
+    exp_avg_sq = _state_local(state["exp_avg_sq"])
+    local_rows = exp_avg.shape[0]
+    rows = torch.arange(rank * local_rows, (rank + 1) * local_rows, dtype=torch.float32).unsqueeze(1)
+    columns = torch.arange(2, dtype=torch.float32).unsqueeze(0)
+    torch.testing.assert_close(exp_avg, rows * 10 + columns + 0.25, rtol=0, atol=0)
+    torch.testing.assert_close(exp_avg_sq, rows * 10 + columns + 0.75, rtol=0, atol=0)
+    torch.testing.assert_close(state["step"], torch.tensor(5.0), rtol=0, atol=0)
 
 
 def _make_stepped_adam_parts(
@@ -38,6 +120,66 @@ def _make_stepped_adam_parts(
         model_parts.append(model_part)
         optimizers.append(optimizer)
     return model_parts, optimizers
+
+
+def _run_native_dtensor_optimizer_save(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    checkpoint_dir: str,
+) -> None:
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        model = _ModelOwnedDTensorOptimizerModel(torch.distributed.group.WORLD)
+        optimizer = torch.optim.AdamW([model.weight], lr=0.031, foreach=False)
+        _fill_row_coded_adam_state(model, optimizer, rank)
+        checkpointer = _make_distributed_checkpointer(rank, checkpoint_dir)
+        checkpointer.save_optimizer(optimizer, model, checkpoint_dir)
+        torch.distributed.barrier()
+        metadata = FileSystemReader(os.path.join(checkpoint_dir, "optim")).read_metadata().state_dict_metadata
+        exp_avg_metadata = metadata["optim.state.weight.exp_avg"]
+        assert tuple(exp_avg_metadata.size) == (8, 2)
+        assert len(exp_avg_metadata.chunks) == world_size
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _run_native_dtensor_optimizer_load(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    checkpoint_dir: str,
+    resaved_checkpoint_dir: str,
+) -> None:
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        model = _ModelOwnedDTensorOptimizerModel(torch.distributed.group.WORLD)
+        optimizer = torch.optim.AdamW([model.weight], lr=0.9, foreach=False)
+        checkpointer = _make_distributed_checkpointer(rank, checkpoint_dir)
+        checkpointer.load_optimizer(optimizer, model, checkpoint_dir)
+        _assert_row_coded_adam_state(model, optimizer, rank)
+        assert optimizer.param_groups[0]["lr"] == 0.031
+
+        resave_checkpointer = _make_distributed_checkpointer(rank, resaved_checkpoint_dir)
+        resave_checkpointer.save_optimizer(optimizer, model, resaved_checkpoint_dir)
+        torch.distributed.barrier()
+        metadata = FileSystemReader(os.path.join(resaved_checkpoint_dir, "optim")).read_metadata().state_dict_metadata
+        assert tuple(metadata["optim.state.weight.exp_avg"].size) == (8, 2)
+        assert len(metadata["optim.state.weight.exp_avg"].chunks) == world_size
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def _assert_adam_states_equal(
@@ -149,6 +291,25 @@ def test_native_single_optimizer_state_preserves_existing_checkpoint_schema():
     assert state_dict["optim"].keys() == {"state", "param_groups"}
 
 
+def test_flattened_untagged_optimizer_state_preserves_existing_checkpoint_schema():
+    model = nn.Linear(2, 1, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters())
+    expected_state = {
+        "state.weight.exp_avg": torch.ones_like(model.weight),
+        "param_groups.weight.lr": 0.01,
+    }
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_optimizer_state_dict",
+        return_value=expected_state,
+    ):
+        actual_state = OptimizerState(model, optimizer).state_dict()["optim"]
+
+    assert actual_state.keys() == expected_state.keys()
+    assert actual_state["state.weight.exp_avg"] is expected_state["state.weight.exp_avg"]
+    assert actual_state["param_groups.weight.lr"] == expected_state["param_groups.weight.lr"]
+
+
 def test_native_multi_optimizer_state_dcp_round_trip(tmp_path):
     source_models, source_optimizers = _make_stepped_adam_parts()
     checkpointer = _make_peft_ep_checkpointer(tmp_path)
@@ -207,5 +368,26 @@ def test_native_pipeline_optimizer_state_dcp_round_trip_across_ranks(tmp_path):
         _run_native_pp_optimizer_dcp_round_trip,
         args=(world_size, str(tmp_path / "dist_init"), str(tmp_path / "checkpoint")),
         nprocs=world_size,
+        join=True,
+    )
+
+
+def test_model_owned_dtensor_optimizer_state_reshards_world_two_to_four(tmp_path):
+    checkpoint_dir = str(tmp_path / "native-dtensor-checkpoint")
+    torch.multiprocessing.spawn(
+        _run_native_dtensor_optimizer_save,
+        args=(2, str(tmp_path / "native-save-init"), checkpoint_dir),
+        nprocs=2,
+        join=True,
+    )
+    torch.multiprocessing.spawn(
+        _run_native_dtensor_optimizer_load,
+        args=(
+            4,
+            str(tmp_path / "native-load-init"),
+            checkpoint_dir,
+            str(tmp_path / "native-dtensor-resaved"),
+        ),
+        nprocs=4,
         join=True,
     )

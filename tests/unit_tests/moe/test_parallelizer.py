@@ -707,6 +707,21 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     assert len(model.layers.registered) == 2
 
 
+def test_apply_ac_skips_model_owned_eager_block(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    eager_block = DummyBlock()
+    eager_block._nemo_disable_activation_checkpointing = True
+    wrapped_block = object()
+    wrapper_mock = MagicMock(return_value=wrapped_block)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
+
+    model = DummyModel([DummyBlock(), eager_block])
+    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
+
+    wrapper_mock.assert_called_once()
+    assert model.layers.registered == {"0": wrapped_block}
+
+
 def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kw: block))
@@ -1029,6 +1044,90 @@ def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
     _, block_kwargs = block_call
     assert block_kwargs["mesh"] is fsdp_mesh
     assert block_kwargs.get("ignored_params") is None
+
+
+def test_apply_fsdp_excludes_model_owned_shard_from_block_and_root(monkeypatch):
+    """A model-owned parameter shard must not be sharded again by FSDP."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    owner_weight = DummyParam()
+    owner_weight._nemo_model_owned_grad_divisor = 1.0
+
+    class OwnerShardedBlock(DummyBlock):
+        def parameters(self):
+            yield owner_weight
+
+    class OwnerShardedModel(DummyModel):
+        def parameters(self):
+            yield owner_weight
+
+    block = OwnerShardedBlock(mlp=DummyMoE())
+    model = OwnerShardedModel([block])
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+    )
+
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    assert block_call[1]["ignored_params"] == {owner_weight}
+    root_call = _find_call_by_first_arg(fully_shard_mock, model)
+    assert root_call is not None
+    assert root_call[1]["ignored_params"] == {owner_weight}
+
+
+def test_apply_fsdp_prepares_and_excludes_final_model_owned_dtensor_identity(monkeypatch):
+    """The model hook runs before every FSDP unit snapshots ignored params."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    # ``_import_parallelizer_with_stubs`` gives the module its own minimal
+    # ``torch.nn.Parameter`` class.  Use that exact runtime class so this test
+    # exercises the production type guard instead of mixing the real and
+    # stubbed torch modules.
+    distributed_weight = P.nn.Parameter()
+    distributed_weight._nemo_model_owned_grad_divisor = 2.0
+
+    class ModelOwnedDTensorBlock(DummyBlock):
+        def parameters(self):
+            yield distributed_weight
+
+    class ModelOwnedDTensorModel(DummyModel):
+        def parameters(self):
+            yield distributed_weight
+
+        def _nemo_prepare_model_owned_dtensors(self, mesh):
+            assert mesh is fsdp_mesh
+            return {distributed_weight}
+
+    block = ModelOwnedDTensorBlock(mlp=DummyMoE())
+    model = ModelOwnedDTensorModel([block])
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+    )
+
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    assert block_call[1]["ignored_params"] == {distributed_weight}
+    root_call = _find_call_by_first_arg(fully_shard_mock, model)
+    assert root_call is not None
+    assert root_call[1]["ignored_params"] == {distributed_weight}
 
 
 @pytest.mark.parametrize(
