@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# CP8 half of the GLM-5.3-Flash packed MedPix parity pair. EP144 spans the
-# dp(18) x cp(8) mesh and therefore still stores two of the 288 experts per GPU;
-# PP remains disabled. Eight accumulation microsteps cover the same 144 packs
-# consumed by one CP1 optimizer step.
+# Validated 9-node/72-GPU packed MedPix run for GLM-5.3-Flash. CP2 gives DP36;
+# EP72 spans the dp(36) x cp(2) mesh and stores four of 288 routed experts per
+# GPU. Four accumulation microsteps form each 144-pack optimizer step. TP and PP
+# remain disabled.
 
 recipe: FinetuneRecipeForVLM
 seed: 1234
@@ -70,7 +70,7 @@ processor:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/glm5_3_flash_medpix_packed2k_ep144_cp8_100steps/
+  checkpoint_dir: checkpoints/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps/
   model_save_format: safetensors
   save_consolidated: false
   dequantize_base_checkpoint: true
@@ -78,12 +78,12 @@ checkpoint:
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 8
+  cp_size: 2
   pp_size: 1
-  ep_size: 144
+  ep_size: 72
   sequence_parallel: false
   activation_checkpointing: true
-  # Avoid retaining a full accumulated gradient set across eight CP microsteps.
+  # Avoid retaining a full accumulated gradient set across four microsteps.
   defer_fsdp_grad_sync: false
   moe:
     reshard_after_forward: false
@@ -142,13 +142,13 @@ wandb:
   enable: true
   project: huiyingl_workspace
   entity: Nemo-automodel
-  name: glm5_3_flash_medpix_packed2k_ep144_cp8_100steps
-  group: glm5_3_flash_medpix_packed2k_ep144_cp1_cp8_parity
-  tags: [glm5.3-flash, medpix, vlm, packed2k, ep144, cp8, parity]
-  dir: logs/glm5_3_flash_medpix_packed2k_ep144_cp8_100steps/wandb
+  name: glm5_3_flash_medpix_packed2k_ep72_cp2_100steps
+  group: glm5_3_flash_medpix_packed2k_cp_parity_100steps
+  tags: [glm5.3-flash, medpix, vlm, packed2k, ep72, cp2, parity]
+  dir: logs/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps/wandb
 
 ci:
   recipe_owner: HuiyingLi
-  nodes: 18
-  time: "02:00:00"
+  nodes: 9
+  time: "01:00:00"
   max_steps: 5
