@@ -139,7 +139,7 @@ clip_grad_norm:
   max_norm: 1.0
 
 wandb:
-  enable: true
+  enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: glm5_3_flash_medpix_packed2k_ep72_cp2_100steps
