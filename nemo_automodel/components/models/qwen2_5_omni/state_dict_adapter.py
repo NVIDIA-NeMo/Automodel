@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 _THINKER_PREFIX = "thinker."
+_PEFT_PREFIX = "base_model.model."
 _DROP_PREFIXES = ("talker.", "token2wav.")
 
 # Keys the NeMo Thinker class deletes at __init__ time (so the HF base
@@ -71,7 +72,13 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
         **kwargs,
     ) -> dict[str, Any]:
         if self._uses_thinker_prefix:
-            hf_state_dict = {_THINKER_PREFIX + k: v for k, v in state_dict.items()}
+            hf_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith(_PEFT_PREFIX):
+                    new_k = f"{_PEFT_PREFIX}{_THINKER_PREFIX}{k[len(_PEFT_PREFIX) :]}"
+                else:
+                    new_k = _THINKER_PREFIX + k
+                hf_state_dict[new_k] = v
         else:
             hf_state_dict = dict(state_dict)
 
@@ -91,20 +98,38 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
         for key, value in hf_state_dict.items():
             if key.startswith(_DROP_PREFIXES):
                 continue
-            stripped = key[len(_THINKER_PREFIX) :] if key.startswith(_THINKER_PREFIX) else key
+            if key.startswith(_PEFT_PREFIX):
+                after_peft = key[len(_PEFT_PREFIX) :]
+                if after_peft.startswith(_THINKER_PREFIX):
+                    stripped = f"{_PEFT_PREFIX}{after_peft[len(_THINKER_PREFIX) :]}"
+                    saw_thinker = True
+                else:
+                    stripped = key
+            elif key.startswith(_THINKER_PREFIX):
+                stripped = key[len(_THINKER_PREFIX) :]
+                saw_thinker = True
+            else:
+                stripped = key
+
             # Drop keys for parameters the NeMo Thinker deletes at __init__.
             if any(sub in stripped for sub in _DROP_THINKER_KEY_SUBSTRINGS):
                 continue
-            if key.startswith(_THINKER_PREFIX):
-                saw_thinker = True
             out[stripped] = value
         self._uses_thinker_prefix = saw_thinker or self._uses_thinker_prefix
         return out
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
-        key = _THINKER_PREFIX + fqn if self._uses_thinker_prefix else fqn
+        if self._uses_thinker_prefix:
+            if fqn.startswith(_PEFT_PREFIX):
+                key = f"{_PEFT_PREFIX}{_THINKER_PREFIX}{fqn[len(_PEFT_PREFIX) :]}"
+            else:
+                key = _THINKER_PREFIX + fqn
+        else:
+            key = fqn
+
         if exclude_key_regex:
             if re.match(exclude_key_regex, key):
                 return []
         return [(key, tensor)]
+
