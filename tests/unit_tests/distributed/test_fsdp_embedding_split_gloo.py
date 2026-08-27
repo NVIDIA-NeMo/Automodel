@@ -91,7 +91,7 @@ def _run_case(mesh: DeviceMesh, *, tied: bool) -> None:
         mesh=mesh,
         mp_policy=mp_policy,
         offload_policy=None,
-        reshard_after_forward=True,
+        input_reshard_after_forward=True,
         fully_shard_fn=fully_shard,
     )
     fully_shard(model, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=False)

@@ -276,7 +276,7 @@ def _fully_shard_untied_input_output_embeddings(
     mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy,
     offload_policy: OffloadPolicy | None,
-    reshard_after_forward: bool,
+    input_reshard_after_forward: bool,
     fully_shard_fn: Callable[..., nn.Module],
 ) -> None:
     """Give large trainable untied embedding tables independent FSDP buffers.
@@ -295,11 +295,11 @@ def _fully_shard_untied_input_output_embeddings(
         mp_policy: Mixed-precision policy used by the surrounding FSDP units.
         offload_policy: Optional offload policy used by the surrounding FSDP
             units.
-        reshard_after_forward: Whether each embedding unit reshards its
-            parameters after forward.
+        input_reshard_after_forward: Whether the input embedding unit reshards
+            its parameters after forward.
         fully_shard_fn: FSDP sharding callable, injectable for unit tests.
     """
-    ensure_tied_lm_head(model)
+    weights_are_tied = ensure_tied_lm_head(model)
 
     def _resolve(getter_name: str) -> nn.Module | None:
         getter = getattr(model, getter_name, None)
@@ -315,17 +315,21 @@ def _fully_shard_untied_input_output_embeddings(
     output_embeddings = _resolve("get_output_embeddings")
     input_weight = getattr(input_embeddings, "weight", None)
     output_weight = getattr(output_embeddings, "weight", None)
-    weights_are_tied = input_embeddings is not None and (
+    weights_are_physically_tied = input_embeddings is not None and (
         input_embeddings is output_embeddings or (input_weight is not None and input_weight is output_weight)
     )
-    if weights_are_tied:
+    if weights_are_tied or weights_are_physically_tied:
         logger.info("Keeping tied input/output embeddings in the root FSDP unit")
         return
 
     seen: set[int] = set()
-    for role, module in (
-        ("input embedding", input_embeddings),
-        ("output embedding", output_embeddings),
+    for role, module, module_reshard_after_forward in (
+        ("input embedding", input_embeddings, input_reshard_after_forward),
+        # The output projection is the last compute unit. Keep it gathered until
+        # backward, matching the old root-owned behavior and allowing
+        # FusedLinearCrossEntropy to consume its mixed-precision compute weight
+        # outside the module's forward.
+        ("output embedding", output_embeddings, False),
     ):
         if module is None or id(module) in seen:
             continue
@@ -336,7 +340,7 @@ def _fully_shard_untied_input_output_embeddings(
             module,
             mesh=mesh,
             mp_policy=mp_policy,
-            reshard_after_forward=reshard_after_forward,
+            reshard_after_forward=module_reshard_after_forward,
             offload_policy=offload_policy,
         )
         logger.info("Sharded %s as an independent FSDP unit", role)
@@ -522,7 +526,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             ignored_multimodal_params=ignored_multimodal_params,
         )
 
-        standalone_reshard_after_forward = (
+        input_embedding_reshard_after_forward = (
             reshard_after_forward if reshard_after_forward is not None else not pp_enabled
         )
         _fully_shard_untied_input_output_embeddings(
@@ -530,7 +534,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             mesh=dp_mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
-            reshard_after_forward=standalone_reshard_after_forward,
+            input_reshard_after_forward=input_embedding_reshard_after_forward,
             fully_shard_fn=fully_shard_fn,
         )
 
