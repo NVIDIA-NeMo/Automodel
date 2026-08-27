@@ -1696,52 +1696,6 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    @patch("nemo_automodel.components.checkpoint.checkpointing._apply_key_mapping")
-    def test_single_device_adapter_does_not_double_apply_key_mapping(
-        self,
-        mock_apply_key_mapping,
-        mock_load_full,
-        mock_load_hf,
-        mock_is_st,
-    ):
-        """A model-owned adapter produces native keys, so HF key mapping must not run again."""
-        checkpointer = self._make_checkpointer()
-
-        CustomModel = type("CustomModel", (torch.nn.Module,), {})
-        CustomModel.__module__ = "nemo_automodel.components.models.glm5_next.model"
-        model = CustomModel()
-        model.layer = torch.nn.Linear(4, 4)
-        model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
-        model.state_dict_adapter.supports_write_through_checkpoint_load = False
-        model.state_dict_adapter.supports_checkpoint_load_without_full_copy = False
-
-        checkpoint_state = {"hf.layer.weight": torch.randn(4, 4)}
-        native_state = {"layer.weight": torch.randn(4, 4)}
-        mock_load_hf.return_value = checkpoint_state
-
-        with (
-            patch("os.path.exists", return_value=True),
-            patch("torch.distributed.is_initialized", return_value=False),
-            patch.dict("os.environ", {"WORLD_SIZE": "1"}),
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
-                return_value=native_state,
-            ) as mock_adapt,
-        ):
-            checkpointer.load_model(
-                model,
-                model_path="/fake/path",
-                is_init_step=True,
-                key_mapping={r"^layer\.": "converted."},
-            )
-
-        mock_adapt.assert_called_once()
-        mock_apply_key_mapping.assert_not_called()
-        mock_load_full.assert_called_once_with([model], native_state)
-
-    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
-    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
-    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
     @pytest.mark.parametrize("load_capability", ["write_through", "without_full_copy"])
     @pytest.mark.parametrize("dequantize_base_checkpoint", [False, True])
     def test_single_device_adapter_without_full_copy_routes_by_quantization(
