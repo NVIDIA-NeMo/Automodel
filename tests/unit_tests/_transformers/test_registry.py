@@ -92,6 +92,29 @@ def test_duplicate_register_exist_ok():
     assert inst.model_arch_name_to_cls["MyArch"] is ReplacementClass
 
 
+def test_builtin_register_requires_explicit_override():
+    """Built-in architecture names are preserved unless the caller opts into replacement."""
+    from nemo_automodel._transformers.registry import _LazyArchMapping
+
+    class BuiltInClass:
+        pass
+
+    class ReplacementClass:
+        pass
+
+    mapping = _LazyArchMapping({"BuiltInArch": ("built.in", "BuiltInClass")})
+    mapping._modules["built.in"] = types.SimpleNamespace(BuiltInClass=BuiltInClass)
+
+    with pytest.raises(ValueError, match="Duplicated model implementation for BuiltInArch"):
+        mapping.register("BuiltInArch", ReplacementClass)
+    assert mapping["BuiltInArch"] is BuiltInClass
+
+    mapping.register("BuiltInArch", ReplacementClass, exist_ok=True)
+    assert mapping["BuiltInArch"] is ReplacementClass
+    assert "BuiltInArch" not in mapping._auto_map
+    assert "BuiltInArch" not in mapping._loaded
+
+
 def test_supported_models_and_getter():
     from nemo_automodel._transformers import registry as reg
 
@@ -609,8 +632,14 @@ def test_public_register_architecture(monkeypatch):
     class PublicModel:
         pass
 
+    class ReplacementModel:
+        pass
+
     register_architecture("PublicArch", PublicModel)
     assert inst.get_model_cls_from_model_arch("PublicArch") is PublicModel
+
+    register_architecture("PublicArch", ReplacementModel, exist_ok=True)
+    assert inst.get_model_cls_from_model_arch("PublicArch") is ReplacementModel
 
 
 def test_entry_point_discovery_adds_lazy_entry(monkeypatch):
@@ -635,3 +664,38 @@ def test_entry_point_discovery_adds_lazy_entry(monkeypatch):
     # First resolution triggers import.
     inst.model_arch_name_to_cls._modules["fake.module"] = types.SimpleNamespace(EntryModel=EntryModel)
     assert inst.get_model_cls_from_model_arch("EntryArch") is EntryModel
+
+
+def test_entry_point_discovery_skips_registered_architecture(monkeypatch, caplog):
+    """Entry points cannot silently replace an architecture already in the registry."""
+    import importlib.metadata
+
+    from nemo_automodel._transformers import registry as reg
+
+    fake_ep = types.SimpleNamespace(name="ExistingArch", value="plugin.module:PluginModel")
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda **kwargs: [fake_ep])
+
+    mapping = reg._LazyArchMapping({"ExistingArch": ("built.in", "BuiltInModel")})
+    reg._ModelRegistry(model_arch_name_to_cls=mapping)
+
+    assert mapping._auto_map["ExistingArch"] == ("built.in", "BuiltInModel")
+    assert (
+        "Architecture ExistingArch is already registered; skipping entry point plugin.module:PluginModel" in caplog.text
+    )
+
+
+@pytest.mark.parametrize("entry_point_value", [":EntryModel", "fake.module:"])
+def test_entry_point_discovery_rejects_invalid_value(monkeypatch, entry_point_value):
+    """Architecture entry points require both a module path and class name."""
+    import importlib.metadata
+
+    from nemo_automodel._transformers import registry as reg
+
+    fake_ep = types.SimpleNamespace(name="BrokenArch", value=entry_point_value)
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda **kwargs: [fake_ep])
+
+    with pytest.raises(
+        ValueError,
+        match=r"Entry point 'BrokenArch' value must be module\.path:ClassName",
+    ):
+        _new_registry_instance(reg)
