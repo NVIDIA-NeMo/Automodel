@@ -128,12 +128,12 @@ ci:
     tokenizer_name: zai-org/GLM-5.2
     # HybridEP/PP runs in a fresh process for consolidated reload. Two exact-head runs were self-repeat exact but
     # measured bounded process-level drift (mean KL 0.00737-0.00889, p95 KL 0.0298-0.0376, cosine 0.9899-0.9914).
-    # Native DCP resume remains the exact state-correctness gate; keep rounded limits with margin here instead of
-    # relaxing every same-implementation test or tuning the gate to one observed run.
+    # Scope the shared relaxed same-implementation profile to this comparison. Its KL limits cover the measured
+    # envelope; only cosine needs a model-specific override. Native DCP resume remains the exact state-correctness gate.
+    parity_tolerance_profile_overrides:
+      automodel_reload: relaxed
     parity_threshold_overrides:
       automodel_reload:
-        mean_kl: 0.012
-        p95_kl: 0.05
         cosine_similarity: 0.985
     dataset.num_samples_limit: 512
     validation_dataset.num_samples_limit: 512

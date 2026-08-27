@@ -14,6 +14,7 @@
 
 import json
 from contextlib import nullcontext
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -57,6 +58,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _prepare_consolidated_hf_cache_once,
     _raise_distributed_failure,
     _record_deferred_failure,
+    _repair_legacy_partial_rotary_config,
     _repeatability_policy,
     _replace_nemo_owned_reference_config,
     _resolve_hf_attn_implementation,
@@ -1192,6 +1194,8 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         trust_remote_code=True,
         experts_implementation=None,
         hf_device_map_auto=True,
+        hf_device_map_max_memory_gib=None,
+        hf_device_map_cpu_max_memory_gib=None,
         hf_source_post_load_dequantize=False,
         parity_tolerance_profile="standard",
         capture_router_diagnostics=False,
@@ -1404,7 +1408,13 @@ def test_hf_fp32_module_names_includes_generic_model_strict_contract():
         "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
         return_value=TinyAutoModel,
     ):
-        assert _hf_fp32_module_names(hf_config) == ("rotary_emb", "router.e_score_correction_bias")
+        # Dotted strict names also register their distinctive leaf so vanilla
+        # layouts with a different parent path stay covered.
+        assert _hf_fp32_module_names(hf_config) == (
+            "rotary_emb",
+            "router.e_score_correction_bias",
+            "e_score_correction_bias",
+        )
 
 
 def test_hf_fp32_module_names_combines_gdn_and_generic_contracts_without_duplicates():
@@ -1985,6 +1995,71 @@ def test_record_deferred_failure_preserves_all_comparison_failures():
     assert failures == ["Phase 4 HF reload parity:\nHF parity failed"]
 
 
+def _legacy_partial_rotary_minimax_config(**overrides):
+    """Tiny in-tree MiniMax-M2 config built from checkpoint-style legacy fields."""
+    from transformers import AutoConfig
+
+    kwargs = dict(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        rotary_dim=16,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        max_position_embeddings=128,
+    )
+    kwargs.update(overrides)
+    return AutoConfig.for_model("minimax_m2", **kwargs)
+
+
+def test_repair_legacy_partial_rotary_derives_factor_from_rotary_dim():
+    config = _legacy_partial_rotary_minimax_config()
+
+    factor_missing_before = not config.rope_parameters.get("partial_rotary_factor")
+    assert _repair_legacy_partial_rotary_config(config) is factor_missing_before
+    assert config.rope_parameters["partial_rotary_factor"] == pytest.approx(0.5)
+    # A second pass finds the factor present and must not report a repair.
+    assert _repair_legacy_partial_rotary_config(config) is False
+
+
+def test_repaired_minimax_m2_config_rotates_only_rotary_dim():
+    from transformers import AutoModelForCausalLM as HFAutoModelForCausalLM
+
+    config = _legacy_partial_rotary_minimax_config()
+    _repair_legacy_partial_rotary_config(config)
+
+    model = HFAutoModelForCausalLM.from_config(config)
+    # inv_freq carries one frequency per rotated dim pair: rotary_dim // 2,
+    # not head_dim // 2 (the full-rotation failure mode from AMINT-286).
+    assert model.model.rotary_emb.inv_freq.shape[0] == config.rotary_dim // 2
+
+
+def test_repair_legacy_partial_rotary_is_noop_without_legacy_spec():
+    from transformers import AutoConfig
+
+    llama = AutoConfig.for_model(
+        "llama",
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+    )
+    rope_before = deepcopy(getattr(llama, "rope_parameters", None))
+    assert _repair_legacy_partial_rotary_config(llama) is False
+    assert getattr(llama, "rope_parameters", None) == rope_before
+
+    full_rotary = _legacy_partial_rotary_minimax_config(rotary_dim=32)
+    rope_before = deepcopy(full_rotary.rope_parameters)
+    assert _repair_legacy_partial_rotary_config(full_rotary) is False
+    assert full_rotary.rope_parameters == rope_before
+
+
 class _FakeNemoOwnedConfig(PretrainedConfig):
     """Stands in for an AutoModel component config registered into AutoConfig."""
 
@@ -2037,6 +2112,32 @@ def test_replace_nemo_owned_reference_config_preserves_dequantize_request(tmp_pa
     assert replaced.quantization_config["dequantize"] is True
 
 
+class _FakeNemoOwnedLlamaConfig(PretrainedConfig):
+    """AutoModel-owned stand-in whose model_type shadows an in-tree class."""
+
+    model_type = "llama"
+
+
+_FakeNemoOwnedLlamaConfig.__module__ = "nemo_automodel.components.models.test_only.config"
+
+
+def test_replace_nemo_owned_reference_config_resolves_in_tree_class(tmp_path):
+    """Registered configs shadowing an in-tree model_type resolve to the in-tree
+    class for built-in references (the minimax_m3_vl vision-tower crash)."""
+    from transformers import LlamaConfig
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "llama", "vocab_size": 64, "hidden_size": 32, "num_hidden_layers": 1})
+    )
+    hijacked = _FakeNemoOwnedLlamaConfig()
+
+    replaced, did_replace = _replace_nemo_owned_reference_config(hijacked, tmp_path, trust_remote_code=False)
+
+    assert did_replace is True
+    assert type(replaced) is LlamaConfig
+    assert replaced.hidden_size == 32
+
+
 def test_replace_nemo_owned_reference_config_noop_cases(tmp_path):
     from transformers import AutoConfig
 
@@ -2067,6 +2168,33 @@ def test_hf_source_load_kwargs_drops_nemo_owned_recipe_config():
         )
 
     assert "config" not in hf_kwargs
+
+
+def test_hf_source_load_kwargs_applies_device_map_memory_caps():
+    """Phase 0 must honor the same GPU/CPU caps as the HF reload path: the 427B
+    MiniMax-M3 reference OOMs under uncapped device_map=auto placement."""
+    with (
+        patch(
+            "transformers.PretrainedConfig.get_config_dict",
+            return_value=({"model_type": "unknown_remote_model"}, {}),
+        ),
+        patch("torch.cuda.device_count", return_value=2),
+    ):
+        hf_kwargs = _hf_source_load_kwargs(
+            {"attn_implementation": "eager"},
+            pretrained_model_name_or_path="model-path",
+            source_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            experts_implementation=None,
+            hf_model_cls=AutoModelForCausalLM,
+            device=torch.device("cpu"),
+            hf_device_map_auto=True,
+            hf_device_map_max_memory_gib=55,
+            hf_device_map_cpu_max_memory_gib=512,
+        )
+
+    assert hf_kwargs["device_map"] == "auto"
+    assert hf_kwargs["max_memory"] == {0: "55GiB", 1: "55GiB", "cpu": "512GiB"}
 
 
 def test_hf_source_load_kwargs_keeps_hf_recipe_config():
@@ -2157,3 +2285,39 @@ def test_remote_fla_api_compatibility_preserves_legacy_capable_api(monkeypatch):
 
     assert gate.fused_kda_gate is fused_kda_gate
     assert kda.fused_kda_gate is fused_kda_gate
+
+
+def test_hf_fp32_module_names_cover_vanilla_layout_differences():
+    """The fp32 contract must reach tensors whose vanilla-HF parent path differs.
+
+    AutoModel's strict name is ``mlp.gate.e_score_correction_bias``, but in-tree
+    MiniMax-M2 keeps the buffer at ``mlp.e_score_correction_bias``; without the
+    leaf entry the HF reference silently casts the router bias to bf16.
+    """
+
+    class TinyAutoModel:
+        _keep_in_fp32_modules_strict = [
+            "mlp.gate.e_score_correction_bias",
+            "router.weight",
+            "norm.bias",
+            # Gemma4-style entries: their leaves are unanchored-substring traps
+            # ("proj" matches q_proj/down_proj/...) and must not become aliases.
+            "router.proj",
+            "router.scale",
+        ]
+
+    hf_config = SimpleNamespace(architectures=["TinyForCausalLM"])
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=TinyAutoModel,
+    ):
+        names = _hf_fp32_module_names(hf_config)
+
+    assert "mlp.gate.e_score_correction_bias" in names
+    assert "e_score_correction_bias" in names
+    # The full AutoModel paths always pass through unchanged.
+    assert "router.proj" in names and "router.scale" in names
+    # Generic leaves would pin unrelated modules fp32 (Transformers matches
+    # these names as unanchored substrings) and must not be added.
+    for generic_leaf in ("weight", "bias", "proj", "scale"):
+        assert generic_leaf not in names

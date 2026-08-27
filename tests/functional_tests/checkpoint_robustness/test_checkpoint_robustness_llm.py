@@ -393,6 +393,42 @@ def _load_hf_fp8_dequantized_config(
     return config
 
 
+def _repair_legacy_partial_rotary_config(config) -> bool:
+    """Restore a legacy partial-rotary spec dropped by newer Transformers configs.
+
+    Checkpoints such as MiniMax-M2.* express partial RoPE only through the
+    legacy ``rotary_dim`` config field. Transformers 5.x in-tree configs keep
+    ``rotary_dim`` as a plain attribute while their models read only
+    ``rope_parameters["partial_rotary_factor"]``, so the vanilla reference
+    silently rotates the full head dimension with the wrong frequency ladder
+    and becomes a deterministic but invalid reference (AMINT-286). Derive the
+    missing factor as ``rotary_dim / head_dim``.
+
+    Args:
+        config: Loaded HF config for the vanilla reference model.
+
+    Returns:
+        True when the config's rope parameters were repaired; False when the
+        config has no legacy spec or already carries a partial factor.
+    """
+    rotary_dim = getattr(config, "rotary_dim", None)
+    head_dim = getattr(config, "head_dim", None)
+    if not rotary_dim or not head_dim or rotary_dim == head_dim:
+        return False
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        if rope_parameters.get("partial_rotary_factor"):
+            return False
+        rope_parameters["partial_rotary_factor"] = rotary_dim / head_dim
+        return True
+    if rope_parameters is not None and hasattr(rope_parameters, "partial_rotary_factor"):
+        if rope_parameters.partial_rotary_factor:
+            return False
+        rope_parameters.partial_rotary_factor = rotary_dim / head_dim
+        return True
+    return False
+
+
 def _is_nemo_owned_config(config) -> bool:
     """Return True when a config object is an AutoModel component config."""
     return type(config).__module__.startswith("nemo_automodel")
@@ -418,6 +454,14 @@ def _replace_nemo_owned_reference_config(
     (AMINT-288). Resolve the checkpoint's own config class from its
     ``auto_map`` instead, preserving a load-time FP8 ``dequantize`` request.
 
+    The same registrations also shadow in-tree config classes: for built-in
+    references (``trust_remote_code=False``), AutoConfig pairs the
+    AutoModel-owned config with the in-tree model, which then crashes on
+    attribute contracts the local class does not carry (the in-tree
+    minimax_m3_vl vision tower reads ``vision_config.temporal_patch_size``).
+    Resolve the in-tree class from Transformers' own name table, which
+    registration cannot shadow.
+
     Args:
         config: Config resolved for the vanilla reference load.
         pretrained_model_name_or_path: Checkpoint the reference loads from.
@@ -428,14 +472,8 @@ def _replace_nemo_owned_reference_config(
     Returns:
         Tuple of the faithful config and whether a replacement happened.
     """
-    if not trust_remote_code or not _is_nemo_owned_config(config):
+    if not _is_nemo_owned_config(config):
         return config, False
-    auto_map = getattr(config, "auto_map", None) or {}
-    class_reference = auto_map.get("AutoConfig")
-    if not class_reference:
-        return config, False
-
-    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     load_kwargs: dict[str, str | bool] = {
         "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
@@ -444,7 +482,23 @@ def _replace_nemo_owned_reference_config(
         load_kwargs["revision"] = revision
     if token is not None:
         load_kwargs["token"] = token
-    config_cls = get_class_from_dynamic_module(class_reference, pretrained_model_name_or_path, **load_kwargs)
+
+    config_cls = None
+    auto_map = getattr(config, "auto_map", None) or {}
+    class_reference = auto_map.get("AutoConfig")
+    if trust_remote_code and class_reference:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        config_cls = get_class_from_dynamic_module(class_reference, pretrained_model_name_or_path, **load_kwargs)
+    else:
+        import transformers
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+        class_name = CONFIG_MAPPING_NAMES.get(getattr(config, "model_type", None) or "")
+        if class_name is not None:
+            config_cls = getattr(transformers, class_name, None)
+    if config_cls is None:
+        return config, False
     replacement = config_cls.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
 
     original_quantization = getattr(config, "quantization_config", None)
@@ -1224,6 +1278,8 @@ def _hf_source_load_kwargs(
     hf_model_cls: type,
     device: torch.device,
     hf_device_map_auto: bool,
+    hf_device_map_max_memory_gib: str | float | None = None,
+    hf_device_map_cpu_max_memory_gib: str | float | None = None,
 ) -> dict:
     """Build the HF-safe subset of recipe model kwargs for the source-load reference."""
     hf_allowed_keys = {
@@ -1260,6 +1316,13 @@ def _hf_source_load_kwargs(
         hf_kwargs["trust_remote_code"] = False
     if hf_device_map_auto:
         hf_kwargs["device_map"] = "auto"
+        # References too large for uncapped automatic placement (the 427B
+        # MiniMax-M3 fills every GPU and OOMs on the fused-expert concat
+        # transient) need the same GPU caps + CPU spill as the HF reload path.
+        max_memory = _hf_device_map_max_memory(hf_device_map_max_memory_gib, hf_device_map_cpu_max_memory_gib)
+        if max_memory is not None:
+            hf_kwargs["max_memory"] = max_memory
+            print(f"[Phase 0] Automatic device-map memory limits: {max_memory}")
     if (
         "device_map" not in hf_kwargs
         and not hf_kwargs["trust_remote_code"]
@@ -1354,6 +1417,15 @@ def _release_model_memory() -> None:
         torch.cuda.empty_cache()
 
 
+# Leaf names distinctive enough to register as layout-independent fp32
+# aliases. Transformers matches _keep_in_fp32_modules_strict entries as
+# unanchored substrings, so only leaves that cannot collide with unrelated
+# modules qualify — a generic leaf such as ``proj`` or ``scale`` (from
+# Gemma4's ``router.proj``/``router.scale``) would pin ``q_proj``,
+# ``down_proj``, and friends fp32 across the whole bf16 reference.
+_HF_FP32_LEAF_ALIASES = ("e_score_correction_bias",)
+
+
 def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
     """Infer vanilla-HF fp32 names from AutoModel's model-owned checkpoint contract."""
     from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
@@ -1367,6 +1439,16 @@ def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
     for name in getattr(model_cls, "_keep_in_fp32_modules_strict", None) or ():
         if name not in module_names:
             module_names.append(name)
+        # AutoModel strict names use AutoModel module paths, but vanilla HF
+        # layouts can hang the same tensor off a different parent (in-tree
+        # MiniMax-M2 keeps e_score_correction_bias on ``mlp``, not
+        # ``mlp.gate``), so the AutoModel-path entry silently fails to match
+        # and the reference's router bias was cast to bf16 — scrambling 30-73%
+        # of knife-edge top-k selections per layer (AMINT-286). Also register
+        # the distinctive leaf so any layout keeps the tensor in fp32.
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf in _HF_FP32_LEAF_ALIASES and leaf not in module_names:
+            module_names.append(leaf)
     return tuple(module_names)
 
 
@@ -1630,6 +1712,8 @@ def _prepare_source_load_reference(
     trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
+    hf_device_map_max_memory_gib: str | float | None = None,
+    hf_device_map_cpu_max_memory_gib: str | float | None = None,
     hf_source_post_load_dequantize: bool,
     parity_tolerance_profile: str = "standard",
     capture_router_diagnostics: bool = False,
@@ -1660,6 +1744,8 @@ def _prepare_source_load_reference(
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
+            hf_device_map_max_memory_gib=hf_device_map_max_memory_gib,
+            hf_device_map_cpu_max_memory_gib=hf_device_map_cpu_max_memory_gib,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
             parity_tolerance_profile=parity_tolerance_profile,
             capture_router_diagnostics=capture_router_diagnostics,
@@ -1684,6 +1770,8 @@ def _prepare_source_load_reference_rank0(
     trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
+    hf_device_map_max_memory_gib: str | float | None = None,
+    hf_device_map_cpu_max_memory_gib: str | float | None = None,
     hf_source_post_load_dequantize: bool,
     parity_tolerance_profile: str = "standard",
     capture_router_diagnostics: bool = False,
@@ -1730,6 +1818,8 @@ def _prepare_source_load_reference_rank0(
         hf_model_cls=hf_model_cls,
         device=device,
         hf_device_map_auto=hf_device_map_auto,
+        hf_device_map_max_memory_gib=hf_device_map_max_memory_gib,
+        hf_device_map_cpu_max_memory_gib=hf_device_map_cpu_max_memory_gib,
     )
     requested_attn_implementation = model_kwargs.get("attn_implementation")
     if hf_kwargs.get("attn_implementation") != requested_attn_implementation:
@@ -1777,6 +1867,10 @@ def _prepare_source_load_reference_rank0(
     if replaced_reference_config:
         # Pass the faithful config explicitly so from_pretrained's internal
         # AutoConfig resolution cannot re-select the AutoModel-owned class.
+        hf_kwargs["config"] = hf_config
+    if _repair_legacy_partial_rotary_config(hf_config):
+        # The repaired spec only reaches the model when the config object is
+        # passed explicitly; from_pretrained otherwise re-reads config.json.
         hf_kwargs["config"] = hf_config
 
     model_load_context = _hf_model_load_context(
@@ -2439,6 +2533,12 @@ def _run_vanilla_hf_reload(
             # Pass the faithful config explicitly so from_pretrained's internal
             # AutoConfig resolution cannot re-select the AutoModel-owned class.
             hf_kwargs["config"] = hf_config
+        if _repair_legacy_partial_rotary_config(hf_config):
+            # The repaired spec only reaches the model when the config object
+            # is passed explicitly; from_pretrained otherwise re-reads
+            # config.json (the consolidated export copies the source config,
+            # so it carries the same legacy rotary_dim field).
+            hf_kwargs["config"] = hf_config
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
         # rank-0-only stall trips the NCCL watchdog while the other ranks idle at
@@ -2853,6 +2953,8 @@ def _run_process_isolated_checkpoint_phase(
             trust_remote_code=custom_args.get("trust_remote_code"),
             experts_implementation=custom_args.get("experts_implementation", None),
             hf_device_map_auto=bool(custom_args.get("hf_device_map_auto", False)),
+            hf_device_map_max_memory_gib=custom_args.get("hf_device_map_max_memory_gib"),
+            hf_device_map_cpu_max_memory_gib=custom_args.get("hf_device_map_cpu_max_memory_gib"),
             hf_source_post_load_dequantize=bool(custom_args.get("hf_source_post_load_dequantize", False)),
             parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
             capture_router_diagnostics=bool(custom_args.get("capture_router_diagnostics", False)),
@@ -3428,6 +3530,8 @@ def run_checkpoint_robustness(
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
+            hf_device_map_max_memory_gib=custom_args.get("hf_device_map_max_memory_gib"),
+            hf_device_map_cpu_max_memory_gib=custom_args.get("hf_device_map_cpu_max_memory_gib"),
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
             parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
             capture_router_diagnostics=bool(custom_args.get("capture_router_diagnostics", False)),
