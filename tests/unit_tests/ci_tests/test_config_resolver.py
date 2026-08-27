@@ -345,6 +345,11 @@ def test_glm_5_2_checkpoint_robustness_preserves_pipeline_batch_geometry(tmp_pat
     pp_size = resolved["distributed"]["pp_size"]
     pp_microbatch_size = resolved["distributed"]["pipeline"]["pp_microbatch_size"]
     assert resolved["step_scheduler"]["local_batch_size"] // pp_microbatch_size >= pp_size
+    assert resolved["ci"]["checkpoint_robustness"]["parity_threshold_overrides"]["automodel_reload"] == {
+        "mean_kl": 0.012,
+        "p95_kl": 0.05,
+        "cosine_similarity": 0.985,
+    }
 
 
 @pytest.mark.parametrize(
