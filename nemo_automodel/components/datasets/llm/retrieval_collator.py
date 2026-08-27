@@ -407,7 +407,7 @@ class ContextAwareRerankerCollator(CrossEncoderCollator):
     drop REMOVES the field -- no placeholder is substituted, so the prompt shape changes
     with it and the instruction follows. The draw is a hash of
     (drop_seed, epoch, field, query): identical across runs, workers and ranks, and
-    redrawn per epoch once the recipe calls ``set_epoch_source``. Set both to 0.0 at
+    redrawn per epoch once ``set_epoch`` is called. Set both to 0.0 at
     eval time to force full mode.
     """
 
@@ -429,9 +429,7 @@ class ContextAwareRerankerCollator(CrossEncoderCollator):
     # The base instruction is Qwen3-Reranker's own, verbatim, so a row with no context is
     # byte-identical to the out-of-the-box prompt.
     DEFAULT_INSTRUCTIONS: Dict[frozenset, str] = {
-        frozenset(): (
-            "Given a web search query, retrieve relevant passages that answer the query"
-        ),
+        frozenset(): ("Given a web search query, retrieve relevant passages that answer the query"),
         frozenset({"reasoning"}): (
             "Given a user generated web search query and the user's reasoning trace that "
             "motivated the query (when available), retrieve relevant passages that answer "
@@ -474,9 +472,7 @@ class ContextAwareRerankerCollator(CrossEncoderCollator):
                 fields = frozenset(f.strip() for f in key.split(",") if f.strip())
                 result[fields] = val
             else:
-                raise TypeError(
-                    f"instructions keys must be str, tuple, or frozenset; got {type(key)}"
-                )
+                raise TypeError(f"instructions keys must be str, tuple, or frozenset; got {type(key)}")
         return result
 
     def __init__(
@@ -563,9 +559,15 @@ class ContextAwareRerankerCollator(CrossEncoderCollator):
         self.reasoning_drop_prob = reasoning_drop_prob
         self.global_query_drop_prob = global_query_drop_prob
         self.drop_seed = drop_seed
-        # Supplied by the recipe so drops differ per epoch. Left unset the epoch reads 0,
-        # which is what the validation collator wants: the same fixed mix every time.
-        self._epoch_fn = None
+        # Shared memory rather than a plain int because collate_fn runs inside the
+        # DataLoader worker processes. Under persistent_workers=True those workers outlive
+        # the epoch boundary, so an attribute assigned in the parent would never reach the
+        # already-forked children and every epoch would replay epoch 0's drops. A shared
+        # tensor is visible to the workers as the parent mutates it in place.
+        #
+        # Left untouched the epoch stays 0, which is what the validation collator wants:
+        # the same fixed mix every time.
+        self._epoch = torch.zeros(1, dtype=torch.int64).share_memory_()
         system_message = system_message if system_message is not None else self.DEFAULT_SYSTEM
         # Defaults are ChatML plus Qwen3's empty think block, which is what makes the final
         # tokens a yes/no next-token prediction. Override both for a backbone with different
@@ -576,15 +578,19 @@ class ContextAwareRerankerCollator(CrossEncoderCollator):
         self.prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
         self.suffix_ids = self.tokenizer.encode(suffix, add_special_tokens=False)
 
-    def set_epoch_source(self, fn) -> None:
-        """Register a zero-arg callable returning the current epoch.
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch used for deterministic context dropout.
 
-        Drops are then redrawn each epoch. Without it the epoch is 0 forever, so the mix
-        is fixed -- correct for validation, where a val_loss that moves because the
-        prompt mix changed would be indistinguishable from one that moved because the
-        model did.
+        Called by ``StepScheduler.set_epoch`` on the training dataloader's collate
+        function, so drops are redrawn each epoch. A validation collator is never given an
+        epoch and stays at 0, keeping its prompt mix fixed -- otherwise a val_loss that
+        moved because the sampled modes changed would be indistinguishable from one that
+        moved because the model did.
+
+        Args:
+            epoch: Zero-based index of the epoch about to run.
         """
-        self._epoch_fn = fn
+        self._epoch[0] = epoch
 
     def _keep_field(self, kind: str, query: str, prob: float) -> bool:
         """Whether to KEEP a context field for this query, deterministically.
@@ -604,7 +610,7 @@ class ContextAwareRerankerCollator(CrossEncoderCollator):
             return True
         if prob >= 1.0:
             return False
-        epoch = self._epoch_fn() if self._epoch_fn is not None else 0
+        epoch = int(self._epoch[0].item())
         key = f"{self.drop_seed}|{epoch}|{kind}|{query}".encode()
         u = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big") / 2.0**64
         return u >= prob
