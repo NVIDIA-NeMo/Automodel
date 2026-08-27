@@ -525,6 +525,23 @@ def _group_aware_split(dataset, validation_fraction: float, group_key: str | Non
 
     val_groups = {g for g in groups if _in_validation(g)} if validation_fraction > 0 else set()
 
+    # A thresholded split has a binomial size, so with few groups a run that asked for a
+    # held-out slice can legitimately draw every group onto one side. Neither outcome is
+    # usable and both fail far from here: an empty validation side yields a zero-length
+    # eval dataset, and an empty training side yields a run with nothing to train on.
+    # Fail here instead, where the seed and fraction that produced it are in scope.
+    if validation_fraction > 0 and len(groups) > 0 and (not val_groups or len(val_groups) == len(groups)):
+        empty_side = "validation" if not val_groups else "train"
+        raise ValueError(
+            f"group-aware split put every group on one side: {len(groups)} group(s), "
+            f"{len(val_groups)} selected for validation, so the {empty_side} side is empty "
+            f"(validation_fraction={validation_fraction}, seed={seed}, "
+            f"validation_group_key={group_key!r}). The split assigns each group independently "
+            f"by hash, so with this few groups the drawn size can miss the requested fraction "
+            f"entirely. Use more groups, change the seed, adjust validation_fraction, or set "
+            f"validation_fraction=0 and supply an explicit validation dataset."
+        )
+
     keep_val = data_type in ("validation", "eval")
     indices = [i for i, g in enumerate(row_groups) if (g in val_groups) == keep_val]
     # Log a fingerprint of the chosen validation set. The train and validation builds print
