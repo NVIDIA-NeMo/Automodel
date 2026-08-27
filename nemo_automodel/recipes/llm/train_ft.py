@@ -101,6 +101,7 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
     from torch.optim import Optimizer
 
 
@@ -110,6 +111,41 @@ logger = logging.getLogger(__name__)
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
+def _warmup_mesh_collectives(*meshes: "DeviceMesh | None") -> None:
+    """Eagerly initialize the communicator of every mesh process group.
+
+    NCCL communicators are created lazily at the first collective issued on
+    each process group. The gradient-norm all-reduce therefore first fires at
+    the end of step 0 -- the peak-memory point of the whole run -- where
+    NCCL's internal buffer allocation can fail with
+    ``cuda failure 2 (out of memory)`` even though the torch allocator still
+    reports free device memory. Issuing one tiny all-reduce per unique
+    mesh-dimension group (plus the default world group) at training-loop
+    entry moves communicator setup to a point where device memory is empty.
+
+    Args:
+        *meshes: Device meshes whose per-dimension process groups should be
+            warmed up. ``None`` entries are skipped.
+    """
+    if not torch.distributed.is_initialized():
+        return
+    device = torch.device(torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    seen: set[int] = set()
+    for mesh in meshes:
+        if mesh is None:
+            continue
+        for name in mesh.mesh_dim_names or ():
+            group = mesh.get_group(mesh_dim=name)
+            if id(group) in seen:
+                continue
+            seen.add(id(group))
+            torch.distributed.all_reduce(torch.zeros(1, device=device), group=group)
+    torch.distributed.all_reduce(torch.zeros(1, device=device))
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    logger.debug("Warmed up %d mesh process groups plus the world group", len(seen))
+
+
 def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
@@ -948,6 +984,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         for mp in self.model_parts:
             mp.train()
+        _warmup_mesh_collectives(getattr(self, "device_mesh", None), getattr(self, "moe_mesh", None))
         self.timestamp = time.perf_counter()
 
         pbar = self._make_progress_bar()
