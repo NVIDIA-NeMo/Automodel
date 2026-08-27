@@ -34,8 +34,16 @@ _MODEL_OK, Qwen3RerankerForCausalReranking = safe_import_from(
     "Qwen3RerankerForCausalReranking",
     msg=_MSG,
 )
+# The collator depends only on tokenizers and DataCollatorWithPadding, not on the Qwen3
+# modelling stack, so it stays importable for data-only use even when the model does not.
+_COLLATOR_OK, Qwen3ContextAwareRerankerCollator = safe_import_from(
+    "nemo_automodel.components.models.qwen3_reranker.collator",
+    "Qwen3ContextAwareRerankerCollator",
+    msg="Qwen3ContextAwareRerankerCollator requires transformers' DataCollatorWithPadding.",
+)
 
 __all__ = [
+    "Qwen3ContextAwareRerankerCollator",
     "Qwen3RerankerForCausalReranking",
     "Qwen3RerankerConfig",
 ]

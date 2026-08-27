@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-epoch context dropout in ContextAwareRerankerCollator."""
+"""Per-epoch context dropout in Qwen3ContextAwareRerankerCollator."""
 
 from typing import Any, Dict, List
 
 import torch
 
-from nemo_automodel.components.datasets.llm.retrieval_collator import ContextAwareRerankerCollator
+from nemo_automodel.components.models.qwen3_reranker.collator import Qwen3ContextAwareRerankerCollator
 
 
 class _FakeTokenizer:
@@ -43,11 +43,11 @@ class _FakeTokenizer:
         return list(range(len(text.split())))
 
 
-def _collator(**kwargs) -> ContextAwareRerankerCollator:
-    return ContextAwareRerankerCollator(rerank_max_length=512, tokenizer=_FakeTokenizer(), **kwargs)
+def _collator(**kwargs) -> Qwen3ContextAwareRerankerCollator:
+    return Qwen3ContextAwareRerankerCollator(rerank_max_length=512, tokenizer=_FakeTokenizer(), **kwargs)
 
 
-def _kept(collator: ContextAwareRerankerCollator, queries: List[str]) -> List[bool]:
+def _kept(collator: Qwen3ContextAwareRerankerCollator, queries: List[str]) -> List[bool]:
     """Keep/drop decision for the reasoning field across a fixed set of queries."""
     return [collator._keep_field("reasoning", q, 0.5) for q in queries]
 
