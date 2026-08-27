@@ -183,10 +183,10 @@ class _StubTokenizerChatWithReasoning(_StubTokenizerPlain):  # noqa: D401
 class _RecordingPaddingTokenizer(_StubTokenizerPlain):
     """Stub tokenizer that records ``padding_side`` during ``__call__``.
 
-    Used to assert that ``format_prompt_completion`` flips the side to
-    ``"right"`` for the duration of the tokenize call and restores the
-    original value after — including when the original is ``"left"`` (the
-    transformers v5.8 ``LlamaTokenizer`` class default).
+    Used to assert that ``format_prompt_completion`` leaves the caller's
+    ``padding_side`` completely alone. Data prep reads the resulting layout
+    back from the tokenizer's own attention mask instead of dictating it, so
+    a shared tokenizer cannot be perturbed for the caller's other uses.
     """
 
     padding_side = "right"
@@ -203,13 +203,13 @@ class _RecordingPaddingTokenizer(_StubTokenizerPlain):
 
 
 @pytest.mark.parametrize("initial_side", ["left", "right"])
-def test_format_prompt_completion_forces_right_padding_and_restores(initial_side):
-    """Covers the padding_side save/restore wrapper for both initial sides.
+def test_format_prompt_completion_never_touches_padding_side(initial_side):
+    """The caller's padding_side must survive data prep untouched.
 
-    Each call goes through every line of the wrapper (save, set, try, finally,
-    restore), so the parametrize ensures the inner ``if _saved_padding_side
-    is not None`` branches are exercised regardless of which session codecov
-    looks at.
+    Tokenizers are routinely shared with generation/eval code, so mutating
+    ``padding_side`` -- even with a restore -- is observable to anything
+    holding the same object concurrently. The correct layout is recovered
+    from the tokenizer's attention mask instead.
     """
     tok = _RecordingPaddingTokenizer()
     tok.padding_side = initial_side
@@ -221,18 +221,16 @@ def test_format_prompt_completion_forces_right_padding_and_restores(initial_side
         pad_token_id=tok.eos_token_id,
         answer_only_loss_mask=True,
     )
-    assert tok.padding_side_during_call == "right"
+    assert tok.padding_side_during_call == initial_side
     assert tok.padding_side == initial_side
     assert "input_ids" in out and "labels" in out
 
 
-def test_format_prompt_completion_without_padding_side_attr_is_a_noop_for_the_wrapper():
-    """Covers the False branches of the padding_side wrapper.
+def test_format_prompt_completion_without_padding_side_attr():
+    """A tokenizer with no ``padding_side`` attribute must still work.
 
-    When the tokenizer has no ``padding_side`` attribute (e.g.
-    ``_StubTokenizerPlain``), ``getattr`` returns ``None`` and the
-    ``if _saved_padding_side is not None`` set/restore branches must
-    short-circuit without touching the tokenizer.
+    Nothing reads or writes the attribute any more, so its absence is simply
+    a non-event.
     """
     tok = _StubTokenizerPlain()
     assert not hasattr(tok, "padding_side")

@@ -176,14 +176,26 @@ def test_no_supervision_on_unattended_positions(shape, chat, side):
             assert targets[i] == ignore, f"supervised target at unattended position {i}"
 
 
+@pytest.mark.parametrize("shape", sorted(TOKENIZER_SHAPES))
 @pytest.mark.parametrize("chat", [False, True], ids=["prompt_completion", "chat_template"])
-def test_tokenizer_is_pinned_to_right_padding(chat):
-    """Both formatters must tokenize under right padding, and restore after."""
-    tok = _make("pad_ne_eos", "left", chat)
+@pytest.mark.parametrize("side", ["right", "left"])
+def test_caller_tokenizer_is_never_mutated(shape, chat, side):
+    """Data prep must not touch the tokenizer the caller owns.
+
+    The padding layout is read back from the tokenizer's own attention mask,
+    so there is never a reason to overwrite padding_side -- and doing so would
+    leak into the caller's generation/eval code sharing the same object.
+    """
+    tok = _make(shape, side, chat)
+    before = dict(tok.__dict__)
     _format(tok, chat)
-    assert tok.observed_padding_sides, "tokenizer was never invoked"
-    assert set(tok.observed_padding_sides) == {"right"}
-    assert tok.padding_side == "left", "caller's padding_side must be restored"
+    after = dict(tok.__dict__)
+    after.pop("observed_padding_sides", None)
+    before.pop("observed_padding_sides", None)
+    assert after == before
+    assert tok.padding_side == side
+    # the tokenizer really did pad on the side it was configured for
+    assert tok.observed_padding_sides == [side]
 
 
 def test_left_padded_input_is_normalized_at_the_chokepoint():
@@ -224,3 +236,59 @@ def test_all_formatter_call_sites_covered():
         f"_package_tokenized_example called outside formatting_utils.py: {sorted(callers)}. "
         "New callers must pin padding_side or pass the tokenizer's attention_mask."
     )
+
+
+# --- adversarial cases -----------------------------------------------------
+# These hit _package_tokenized_example directly with hand-built layouts that
+# the formatter-level tests above cannot reach.
+
+
+def _pack(ids, assistant, pad, eos, attn, **kw):
+    return formatting_utils._package_tokenized_example(
+        tokenizer=_make("pad_ne_eos", "right", False),
+        input_ids=list(ids),
+        assistant_masks=list(assistant),
+        eos_token_id=eos,
+        pad_token_id=pad,
+        seq_length=None,
+        attention_mask=None if attn is None else list(attn),
+        **kw,
+    )
+
+
+def test_padding_on_both_sides_is_never_attended():
+    out = _pack([7, 7, 100, 101, 102, 7, 7, 7], [0, 0, 0, 0, 1, 0, 0, 0], 7, 9, [0, 0, 1, 1, 1, 0, 0, 0])
+    assert sum(out["attention_mask"]) <= 3
+
+
+def test_entirely_padded_example_has_no_content():
+    out = _pack([7, 7, 7, 7], [0, 0, 0, 0], 7, 9, [0, 0, 0, 0])
+    assert sum(out["attention_mask"]) == 0
+
+
+def test_interior_masked_token_is_not_mistaken_for_the_pad_id():
+    """The pad id is read from the trailing unattended run, not the first zero.
+
+    A processor may mask a placeholder mid-sequence; picking that token as the
+    pad id would strip nothing and report the padding as content.
+    """
+    out = _pack([100, 55, 101, 102, 7, 7], [0, 0, 0, 1, 0, 0], 7, 9, [1, 0, 1, 1, 0, 0])
+    assert out["attention_mask"] == [1, 1, 1, 0, 0]
+
+
+def test_attention_mask_length_mismatch_falls_back_to_the_pad_id_scan():
+    out = _pack([100, 101, 7, 7], [0, 1, 0, 0], 7, 9, [1, 1, 0])
+    assert sum(out["attention_mask"]) == 1
+
+
+def test_wrong_pad_id_is_self_corrected_from_the_mask():
+    """gemma shape: real pad id is 0, but callers pass eos because `0 or eos`."""
+    out = _pack([0, 0, 0, 100, 101, 102], [0, 0, 0, 0, 0, 1], 9, 9, [0, 0, 0, 1, 1, 1])
+    assert sum(out["attention_mask"]) <= 3
+
+
+def test_unshifted_branch_under_left_padding():
+    out = _pack([7, 7, 100, 101, 102], [0, 0, 0, 1, 1], 7, 9, [0, 0, 1, 1, 1], unshifted=True)
+    mask, loss = out["attention_mask"], out["loss_mask"]
+    assert sum(mask) == 3
+    assert all(loss[i] == 0 for i, a in enumerate(mask) if not a)
