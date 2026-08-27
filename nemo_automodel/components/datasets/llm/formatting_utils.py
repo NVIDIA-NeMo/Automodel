@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import json
 import logging
 import re
@@ -107,16 +108,102 @@ def _maybe_shift_mask_for_left_padding(
     ``input_ids``, so the mask must be shifted right by the padding offset to
     keep positions aligned.
 
-    For right-padding tokenizers (the majority) this is a no-op.
+    The offset is derived from the *leading* zero run of ``attention_mask``
+    rather than from ``tokenizer.padding_side``: data prep pins the tokenizer
+    to right padding (:func:`_pin_padding_side_right`), so the attribute can
+    disagree with how these ids were actually laid out. It is also the total
+    pad count that ``padding_side`` would imply, which is wrong whenever a
+    sequence is padded on both sides. For right-padded input the leading run
+    is empty and this is a no-op.
     """
-    if getattr(tokenizer, "padding_side", "right") != "left":
-        return mask
+    del tokenizer  # layout is read from attention_mask, not the attribute
     if attention_mask is None:
         return mask
-    pad_len = len(mask) - sum(attention_mask)
-    if pad_len <= 0:
+    lead = 0
+    while lead < len(attention_mask) and not attention_mask[lead]:
+        lead += 1
+    if lead <= 0:
         return mask
-    return [0] * pad_len + mask[: len(mask) - pad_len]
+    if lead >= len(mask):
+        # Nothing is attended: the example is entirely padding, so no position
+        # may stay supervised.
+        return [0] * len(mask)
+    return [0] * lead + mask[: len(mask) - lead]
+
+
+_warned_left_padding = set()
+
+
+@contextlib.contextmanager
+def _pin_padding_side_right(tokenizer):
+    """Force right padding for the duration of a tokenizer call.
+
+    Every downstream computation in this module -- the next-token shift, the
+    label masking and the attention mask built by
+    :func:`_package_tokenized_example` -- assumes pad positions are trailing.
+    A left-padding tokenizer silently violates that: the mask builder strips
+    *trailing* pads, finds none, and emits an all-ones mask, so real tokens
+    attend to the leading pad run.
+
+    transformers 5.5.0 still honored ``padding_side: "right"`` baked into the
+    tokenizer's saved ``tokenizer_config.json``, but 5.8.1 ignores that field
+    and uses the tokenizer class default. Pin it explicitly rather than trust
+    either the saved config or the class default.
+    """
+    saved = getattr(tokenizer, "padding_side", None)
+    if saved == "left" and "pinned" not in _warned_left_padding:
+        _warned_left_padding.add("pinned")
+        logger.warning(
+            "Tokenizer '%s' uses padding_side='left'; forcing 'right' for training data prep. "
+            "Left padding is a generation-time concern -- the SFT label shift, attention mask "
+            "and position ids all assume trailing pads.",
+            getattr(tokenizer, "name_or_path", "unknown"),
+        )
+    if saved is not None:
+        tokenizer.padding_side = "right"
+    try:
+        yield
+    finally:
+        if saved is not None:
+            tokenizer.padding_side = saved
+
+
+def _normalize_left_padding(input_ids, assistant_masks, attention_mask, pad_token_id):
+    """Rotate a left-padded example so its pad run is trailing.
+
+    Defense in depth for callers that hand pre-tokenized, left-padded ids to
+    :func:`_package_tokenized_example` without going through the pinned
+    tokenizer calls above. Returns the inputs unchanged when there is no
+    leading pad run (the overwhelmingly common case), so right-padded and
+    unpadded examples are bit-identical to before.
+
+    ``attention_mask`` (the tokenizer's own, when available) is authoritative
+    for locating the pad run: matching on ``pad_token_id`` alone misclassifies
+    a real leading token whenever ``pad_token_id == eos_token_id``.
+    """
+    if not input_ids:
+        return input_ids, assistant_masks, attention_mask
+    if attention_mask is not None and len(attention_mask) == len(input_ids):
+        lead = 0
+        while lead < len(attention_mask) and not attention_mask[lead]:
+            lead += 1
+    elif pad_token_id is not None:
+        lead = 0
+        while lead < len(input_ids) and input_ids[lead] == pad_token_id:
+            lead += 1
+    else:
+        lead = 0
+    if lead == 0 or lead == len(input_ids):
+        return input_ids, assistant_masks, attention_mask
+    if "rotated" not in _warned_left_padding:
+        _warned_left_padding.add("rotated")
+        logger.warning(
+            "Received a left-padded example (%d leading pad tokens); rotating the pad run to the "
+            "end so the label shift and attention mask stay aligned.",
+            lead,
+        )
+    rotate = lambda seq: (seq[lead:] + seq[:lead]) if seq is not None and len(seq) == len(input_ids) else seq
+    return rotate(input_ids), rotate(assistant_masks), rotate(attention_mask)
 
 
 def _is_consistent_render_prefix(
@@ -478,6 +565,7 @@ def _package_tokenized_example(
     truncation="do_not_truncate",
     padding="do_not_pad",
     unshifted=False,
+    attention_mask=None,
 ):
     """
     Package a tokenized example with proper masking and padding.
@@ -494,10 +582,18 @@ def _package_tokenized_example(
         unshifted: If True, return unshifted format for dLLM training
             (``input_ids`` at full length with ``loss_mask`` instead of
             shifted ``input_ids``/``labels``).
+        attention_mask: The tokenizer's own attention mask for ``input_ids``,
+            when available. Used only to locate a leading pad run; the mask
+            returned to the caller is always rebuilt here.
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
         When *unshifted* is True, ``labels`` is replaced by ``loss_mask``.
     """
+    # All logic below assumes pads are trailing; rotate if they are not.
+    input_ids, assistant_masks, attention_mask = _normalize_left_padding(
+        input_ids, assistant_masks, attention_mask, pad_token_id
+    )
+
     if unshifted:
         # --- Unshifted dLLM format ---
         # No shift: input_ids stays at full length, loss_mask = assistant_masks.
@@ -618,24 +714,13 @@ def format_prompt_completion(
         len_prompt_ids = len(prompt_ids)
     else:
         len_prompt_ids = 0
-    # transformers 5.5.0 still honored `padding_side: "right"` baked into the
-    # tokenizer's saved tokenizer_config.json, but 5.8.1 ignores that field and
-    # uses the LlamaTokenizer class default ("left"). Hardcode "right" here so
-    # pad positions land at the end (the label-masking / attention-mask logic
-    # below assumes right padding).
-    _saved_padding_side = getattr(tokenizer, "padding_side", None)
-    if _saved_padding_side is not None:
-        tokenizer.padding_side = "right"
-    try:
+    with _pin_padding_side_right(tokenizer):
         tokenized = tokenizer(
             full_text,
             padding=padding,
             truncation=truncation,
             max_length=seq_length,
         )
-    finally:
-        if _saved_padding_side is not None:
-            tokenizer.padding_side = _saved_padding_side
     input_ids = tokenized["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
@@ -658,6 +743,7 @@ def format_prompt_completion(
         seq_length=seq_length,
         truncation=truncation,
         padding=padding,
+        attention_mask=tokenizer_attn_mask,
         unshifted=unshifted,
     )
 
@@ -717,16 +803,17 @@ def format_chat_template(
             "`reasoning_content`. Those reasoning traces may be dropped from training data."
         )
 
-    tokenized_chat = tokenizer.apply_chat_template(
-        formatted_text,
-        tools=tools,
-        tokenize=True,
-        return_dict=True,
-        return_assistant_tokens_mask=template_has_generation_kwd,
-        padding=padding,
-        truncation=truncation,
-        max_length=seq_length,
-    )
+    with _pin_padding_side_right(tokenizer):
+        tokenized_chat = tokenizer.apply_chat_template(
+            formatted_text,
+            tools=tools,
+            tokenize=True,
+            return_dict=True,
+            return_assistant_tokens_mask=template_has_generation_kwd,
+            padding=padding,
+            truncation=truncation,
+            max_length=seq_length,
+        )
 
     input_ids = tokenized_chat.get("input_ids")
 
@@ -804,4 +891,5 @@ def format_chat_template(
         truncation=truncation,
         padding=padding,
         unshifted=unshifted,
+        attention_mask=tokenized_chat.get("attention_mask"),
     )
