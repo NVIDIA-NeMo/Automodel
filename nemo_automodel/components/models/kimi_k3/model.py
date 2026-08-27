@@ -973,6 +973,218 @@ class KimiDeltaAttention(nn.Module):
                 self.o_norm.reset_parameters()
 
 
+# The eager fp32 path in _weighted_situ upcasts the whole
+# [tokens, 2 * intermediate] projection to fp32 and lets autograd save the
+# fp32 intermediates for backward; under activation checkpointing every MoE
+# layer of a recompute region holds them simultaneously (multi-GiB transients
+# per layer at large token counts). _WeightedSiTUFunction computes the
+# identical fp32 math in row chunks and saves only the low-precision inputs,
+# recomputing fp32 per chunk in backward with analytic gradients. The chain is
+# elementwise per row, so the forward is bitwise-identical to the eager path.
+_SITU_CHUNK_ROWS = 32768
+# Engage the chunked path only for large dispatch tensors, where the memory
+# saving matters; below this the backward recompute is a net compute tax.
+_SITU_CHUNK_THRESHOLD = 12288
+
+
+def _situ_fwd_core(
+    g: torch.Tensor,
+    u0: torch.Tensor,
+    w: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+) -> torch.Tensor:
+    """Compute the fp32 SiTU chain for one chunk of rows.
+
+    Args:
+        g: fp32 gate projections of shape [rows, intermediate].
+        u0: fp32 up projections of shape [rows, intermediate].
+        w: fp32 routing weights broadcastable to [rows, intermediate],
+            typically of shape [rows, 1].
+        beta: SiTU beta applied to the gate branch.
+        linear_beta: Optional bounded-linear beta applied to the up branch.
+
+    Returns:
+        fp32 tensor of shape [rows, intermediate]: ``situ(g) * up(u0) * w``.
+    """
+    tg = torch.tanh(g / beta)
+    a = beta * tg * torch.sigmoid(g)
+    if linear_beta is not None:
+        u = linear_beta * torch.tanh(u0 / linear_beta)
+    else:
+        u = u0
+    return a * u * w
+
+
+def _situ_bwd_core(
+    g: torch.Tensor,
+    u0: torch.Tensor,
+    w: torch.Tensor,
+    go: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    want_drw: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Compute analytic fp32 SiTU gradients for one chunk of rows.
+
+    Args:
+        g: fp32 gate projections of shape [rows, intermediate].
+        u0: fp32 up projections of shape [rows, intermediate].
+        w: fp32 routing weights broadcastable to [rows, intermediate],
+            typically of shape [rows, 1].
+        go: fp32 upstream gradient of shape [rows, intermediate].
+        beta: SiTU beta applied to the gate branch.
+        linear_beta: Optional bounded-linear beta applied to the up branch.
+        want_drw: Whether the routing-weight gradient reduction is needed.
+
+    Returns:
+        Tuple of fp32 tensors ``(d_g, d_u, red)`` where ``d_g`` and ``d_u``
+        of shape [rows, intermediate] are the gradients w.r.t. ``g`` and
+        ``u0``, and ``red`` of shape [rows, intermediate] is
+        ``go * situ(g) * up(u0)`` (the routing-weight gradient before its
+        broadcast reduction), or ``None`` when ``want_drw`` is False.
+    """
+    tg = torch.tanh(g / beta)
+    sg = torch.sigmoid(g)
+    a = beta * tg * sg
+    da_dg = (1.0 - tg * tg) * sg + beta * tg * sg * (1.0 - sg)
+    if linear_beta is not None:
+        tu = torch.tanh(u0 / linear_beta)
+        u = linear_beta * tu
+        du_du0 = 1.0 - tu * tu
+    else:
+        u = u0
+        du_du0 = None
+    gow = go * w
+    d_g = gow * u * da_dg
+    d_u = gow * a if du_du0 is None else gow * a * du_du0
+    red = go * (a * u) if want_drw else None
+    return d_g, d_u, red
+
+
+def _situ_rw_is_row_aligned(gate_up: torch.Tensor, routing_weights: torch.Tensor) -> bool:
+    """Return True when ``routing_weights`` carries one entry per ``gate_up`` row.
+
+    Args:
+        gate_up: Gate+up projections of shape [..., 2 * intermediate].
+        routing_weights: Routing weights; row-aligned when its shape is
+            [..., k] with the same leading dimensions as ``gate_up``.
+    """
+    return routing_weights.dim() == gate_up.dim() and routing_weights.shape[:-1] == gate_up.shape[:-1]
+
+
+class _WeightedSiTUFunction(torch.autograd.Function):
+    """Chunked fp32 weighted-SiTU that saves only the low-precision inputs.
+
+    The forward computes the same fp32 chain as the eager `_weighted_situ`
+    path in row chunks (bitwise-identical result); the backward recomputes
+    the fp32 intermediates per chunk with analytic gradients that match
+    autograd's fp32 chain, so autograd never stores full-size fp32 copies of
+    the [tokens, 2 * intermediate] projections.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        gate_up: torch.Tensor,
+        routing_weights: torch.Tensor,
+        beta: float,
+        linear_beta: float | None,
+    ) -> torch.Tensor:
+        """Apply SiTU and routing weights chunk by chunk.
+
+        Args:
+            ctx: Autograd context; saves ``gate_up`` and ``routing_weights``
+                in their original (typically bf16 / fp32) dtypes.
+            gate_up: Gate+up projections of shape [..., 2 * intermediate],
+                gate in the first half of the last axis, up in the second.
+            routing_weights: Routing weights, either row-aligned with shape
+                [..., k] matching ``gate_up``'s leading dimensions (typically
+                [tokens, 1]) or broadcastable against them.
+            beta: SiTU beta applied to the gate branch.
+            linear_beta: Optional bounded-linear beta applied to the up branch.
+
+        Returns:
+            Tensor of shape ``broadcast(gate_up.shape[:-1] + [intermediate],
+            routing_weights.shape)`` in ``gate_up``'s dtype.
+        """
+        ctx.beta, ctx.linear_beta = beta, linear_beta
+        ctx.save_for_backward(gate_up, routing_weights)
+        last = gate_up.shape[-1]
+        half = last // 2
+        gu2 = gate_up.reshape(-1, last)
+        row_aligned = _situ_rw_is_row_aligned(gate_up, routing_weights)
+        rw2 = routing_weights.reshape(-1, routing_weights.shape[-1]) if row_aligned else routing_weights
+        out = torch.empty((gu2.shape[0], half), dtype=gate_up.dtype, device=gate_up.device)
+        for s in range(0, gu2.shape[0], _SITU_CHUNK_ROWS):
+            e = min(s + _SITU_CHUNK_ROWS, gu2.shape[0])
+            g = gu2[s:e, :half].float()
+            u = gu2[s:e, half:].float()
+            w = rw2[s:e].float() if row_aligned else routing_weights.float()
+            out[s:e] = _situ_fwd_core(g, u, w, beta, linear_beta).to(gate_up.dtype)
+        # Match the eager broadcast semantics exactly: the result shape is
+        # broadcast(a * u, routing_weights) (e.g. 1-D gate_up x [1, 1] weights
+        # -> [1, half] in the experts.py zero-token dummy path). Only
+        # leading-1 expansions are legal here; a true row fan-out would change
+        # the element count.
+        out_shape = torch.broadcast_shapes((*gate_up.shape[:-1], half), routing_weights.shape)
+        return out.reshape(out_shape)
+
+    @staticmethod
+    def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, None, None]:
+        """Recompute fp32 per chunk and return analytic gradients.
+
+        Args:
+            ctx: Autograd context holding the saved low-precision inputs.
+            grad_out: Upstream gradient with the forward's output shape
+                [..., intermediate].
+
+        Returns:
+            Tuple ``(d_gate_up, d_routing_weights, None, None)`` where
+            ``d_gate_up`` has ``gate_up``'s shape and dtype and
+            ``d_routing_weights`` has ``routing_weights``'s shape and dtype
+            (or is ``None`` when no gradient is required).
+        """
+        gate_up, routing_weights = ctx.saved_tensors
+        beta, linear_beta = ctx.beta, ctx.linear_beta
+        last = gate_up.shape[-1]
+        half = last // 2
+        gu2 = gate_up.reshape(-1, last)
+        go2 = grad_out.reshape(-1, half)
+        row_aligned = _situ_rw_is_row_aligned(gate_up, routing_weights)
+        rw2 = routing_weights.reshape(-1, routing_weights.shape[-1]) if row_aligned else routing_weights
+        d_gu2 = torch.empty_like(gu2)
+        want_drw = ctx.needs_input_grad[1]
+        d_rw2 = torch.empty_like(rw2) if (want_drw and row_aligned) else None
+        d_rw_acc = (
+            torch.zeros(routing_weights.shape, dtype=torch.float32, device=routing_weights.device)
+            if (want_drw and not row_aligned)
+            else None
+        )
+        for s in range(0, gu2.shape[0], _SITU_CHUNK_ROWS):
+            e = min(s + _SITU_CHUNK_ROWS, gu2.shape[0])
+            g = gu2[s:e, :half].float()
+            u0 = gu2[s:e, half:].float()
+            w = rw2[s:e].float() if row_aligned else routing_weights.float()
+            go = go2[s:e].float()
+            d_g, d_u, red = _situ_bwd_core(g, u0, w, go, beta, linear_beta, want_drw)
+            d_gu2[s:e, :half] = d_g.to(gate_up.dtype)
+            d_gu2[s:e, half:] = d_u.to(gate_up.dtype)
+            if want_drw:
+                if row_aligned:
+                    d_rw2[s:e] = red.sum_to_size(e - s, rw2.shape[-1]).to(rw2.dtype)
+                else:
+                    d_rw_acc += red.sum_to_size(routing_weights.shape)
+        d_gate_up = d_gu2.reshape(gate_up.shape)
+        if not want_drw:
+            d_rw = None
+        elif row_aligned:
+            d_rw = d_rw2.reshape(routing_weights.shape)
+        else:
+            d_rw = d_rw_acc.to(routing_weights.dtype)
+        return d_gate_up, d_rw, None, None
+
+
 def _weighted_situ(
     gate_up: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -981,6 +1193,18 @@ def _weighted_situ(
     linear_beta: float | None,
 ) -> torch.Tensor:
     """Apply SiTU and routing weights to ``[tokens, 2 * intermediate]`` projections."""
+    # Route only the memory-relevant case (large 2-D row-aligned dispatch
+    # tensors) through the chunked custom Function; every small or irregular
+    # shape (zero-token dummy paths pass 1-D tensors, 0-row probs, broadcast
+    # [1, 1] weights, ...) keeps the eager implementation verbatim.
+    if (
+        gate_up.dim() == 2
+        and routing_weights.dim() == 2
+        and routing_weights.shape[0] == gate_up.shape[0]
+        and routing_weights.shape[1] == 1
+        and gate_up.shape[0] > _SITU_CHUNK_THRESHOLD
+    ):
+        return _WeightedSiTUFunction.apply(gate_up, routing_weights, beta, linear_beta)
     input_dtype = gate_up.dtype
     gate, up = gate_up.chunk(2, dim=-1)
     gate = gate.float()
