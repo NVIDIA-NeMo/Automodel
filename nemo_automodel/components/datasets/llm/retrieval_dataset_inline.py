@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -104,8 +104,9 @@ def _resolve_doc_to_example(doc: Any) -> dict:
     return example
 
 
-def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True,
-                  extra_columns: Optional[tuple[str, ...]] = None):
+def load_datasets(
+    data_dir_list: Union[List[str], str], concatenate: bool = True, extra_columns: Optional[tuple[str, ...]] = None
+):
     """
     Load retrieval datasets from JSON/JSONL files.
 
@@ -457,16 +458,13 @@ def _flatten_context_columns(data: dict, context_columns: tuple[str, ...]) -> di
     return flattened
 
 
-def _group_aware_split(dataset, validation_fraction: float, group_key: str | None,
-                       data_type: str, seed: int):
+def _group_aware_split(dataset, validation_fraction: float, group_key: str | None, data_type: str, seed: int):
     """Carve a deterministic held-out slice, keeping rows that share a group together.
 
     Splitting on rows alone leaks when one query contributes several rows -- a mixed
     dataset holding two labelings of the same query is the case that motivated this.
     Grouping on ``group_key`` puts every row of a group on the same side.
     """
-    import random
-
     if group_key is None:
         groups = list(range(len(dataset)))
         row_groups = groups
@@ -502,34 +500,48 @@ def _group_aware_split(dataset, validation_fraction: float, group_key: str | Non
     #
     # Hashing (seed, group) instead makes a group's side a pure function of its own id. Two
     # calls agree as long as they share the seed and fraction, whatever order the rows
-    # arrive in and whatever else is present. It is also stable as a dataset grows: adding
-    # trajectories leaves existing groups where they were, instead of reshuffling everything.
-    # Rank by hash and take the lowest n_val, rather than thresholding the score directly.
-    # Thresholding is simpler but makes the validation size binomial -- 0.2 of 40 groups came
-    # out as 7 rather than 8 in testing, and at 249 groups a 10% split would vary by about
-    # +/-5 -- where the previous implementation always produced exactly round(n * fraction).
-    # Ranking keeps that exact count while still depending only on the group ids.
-    def _val_score(group) -> tuple:
+    # arrive in and whatever else is present.
+    #
+    # The score is COMPARED AGAINST THE FRACTION rather than ranked, so a group's side
+    # depends on nothing but (seed, group, fraction). Ranking -- take the lowest
+    # round(n * fraction) scores -- yields an exact validation count, but the cutoff is a
+    # property of the whole group set, which reintroduces both failure modes this function
+    # exists to prevent:
+    #   * Adding one group can evict an existing group from validation into training. With
+    #     10 groups at 0.2, n_val is 2; add an 11th group that hashes low and n_val is
+    #     still 2, so whichever group held the second slot silently moves to training and
+    #     any model that already trained on the new split has seen it.
+    #   * Train and validation are built by two SEPARATE calls from two separate configs.
+    #     If those configs do not resolve to an identical group set -- one extra file, one
+    #     filtered row -- the two calls compute different cutoffs, and a group can land in
+    #     training on one side and validation on the other. That is silent leakage, not an
+    #     error.
+    # Thresholding costs an exact count: the size is binomial, so 0.2 of 40 groups can come
+    # out as 7 rather than 8, and at 249 groups a 10% split varies by roughly +/-5. A
+    # validation slice a few groups off target is a far cheaper failure than leakage.
+    def _in_validation(group) -> bool:
         h = hashlib.blake2b(f"{seed}:{group}".encode("utf-8"), digest_size=8).digest()
-        # group id breaks ties so the order is total even on a digest collision
-        return (int.from_bytes(h, "big"), str(group))
+        return int.from_bytes(h, "big") / 2.0**64 < validation_fraction
 
-    n_val = int(round(len(groups) * validation_fraction))
-    val_groups = set(sorted(groups, key=_val_score)[:n_val]) if n_val else set()
+    val_groups = {g for g in groups if _in_validation(g)} if validation_fraction > 0 else set()
 
     keep_val = data_type in ("validation", "eval")
     indices = [i for i, g in enumerate(row_groups) if (g in val_groups) == keep_val]
     # Log a fingerprint of the chosen validation set. The train and validation builds print
     # one of these each, back to back, so a seed or fraction mismatch between the two configs
     # is visible in the job log as two differing fingerprints rather than as silent leakage.
-    fp = hashlib.blake2b(
-        "|".join(sorted(map(str, val_groups))).encode("utf-8"), digest_size=6
-    ).hexdigest()
+    fp = hashlib.blake2b("|".join(sorted(map(str, val_groups))).encode("utf-8"), digest_size=6).hexdigest()
     logging.info(
         "group-aware split on %r: %d groups -> %d validation, %d rows selected for %s "
         "(seed=%s fraction=%s val_fingerprint=%s)",
-        group_key, len(groups), len(val_groups), len(indices), data_type,
-        seed, validation_fraction, fp,
+        group_key,
+        len(groups),
+        len(val_groups),
+        len(indices),
+        data_type,
+        seed,
+        validation_fraction,
+        fp,
     )
     return dataset.select(indices)
 
@@ -584,9 +596,7 @@ def make_context_aware_retrieval_dataset(
     if data_type not in ("train", "validation", "eval"):
         raise ValueError(f"Invalid data type: {data_type}")
 
-    requested = tuple(
-        c for c in (reasoning_column, global_query_column, validation_group_key) if c
-    )
+    requested = tuple(c for c in (reasoning_column, global_query_column, validation_group_key) if c)
     dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, extra_columns=requested)
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
@@ -601,9 +611,7 @@ def make_context_aware_retrieval_dataset(
                 range(train_data_select_offset, min(train_data_select_offset + max_train_samples, len(dataset)))
             )
 
-    context_columns = tuple(
-        c for c in ((reasoning_column, "reasoning"), (global_query_column, "global_query")) if c[0]
-    )
+    context_columns = tuple(c for c in ((reasoning_column, "reasoning"), (global_query_column, "global_query")) if c[0])
     negative_size = n_passages - 1
 
     def transform(examples):
