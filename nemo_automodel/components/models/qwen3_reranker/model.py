@@ -50,14 +50,14 @@ The model is auto-discovered by ``ModelRegistry`` via the ``ModelClass`` export.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-from transformers.utils import logging
+from transformers.utils import can_return_tuple, logging
 
 logger = logging.get_logger(__name__)
 
@@ -122,22 +122,30 @@ class Qwen3RerankerConfig(Qwen3Config):
 
 
 def _last_token_indices(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Return the index of the last non-padding token for each row.
+    """Return the index of the last attended token for each row.
 
-    Padding-side agnostic (mirrors the ``"last"`` branch of
-    :func:`nemo_automodel._transformers.retrieval.pool`). With left padding the
-    last token is at ``-1`` for every row; with right padding it is at
-    ``attention_mask.sum(dim=1) - 1``.
+    Padding-side agnostic: the result is the highest position index that the mask
+    attends to, so left padding resolves to the final position and right padding to
+    the last real token, with no assumption about which side a batch uses.
+
+    Args:
+        attention_mask: Tensor of shape [batch, sequence], 1 for attended tokens and
+            0 for padding. Each row is expected to attend to at least one token.
+
+    Returns:
+        Tensor of shape [batch] holding the last attended index per row.
     """
-    left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
-    if left_padding:
-        return torch.full(
-            (attention_mask.shape[0],),
-            attention_mask.shape[1] - 1,
-            device=attention_mask.device,
-            dtype=torch.long,
-        )
-    return attention_mask.sum(dim=1) - 1
+    # Branchless on purpose. Deciding the padding side from a tensor value forces a
+    # device-to-host sync on CUDA and a graph break under torch.compile. Masking the
+    # position indices and taking the row max is a single fused op that needs neither, and
+    # it is decided PER ROW: a batch mixing left- and right-padded rows resolves each one
+    # correctly, where a whole-batch padding-side guess would mislabel the minority.
+    #
+    # A row with an all-zero mask yields -1, which would silently index the last position.
+    # Callers pass masks with at least one attended token per row; this mirrors the prior
+    # behavior rather than paying for a check on every forward.
+    positions = torch.arange(attention_mask.shape[-1], device=attention_mask.device)
+    return positions.masked_fill(~attention_mask.bool(), -1).amax(dim=-1)
 
 
 class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
@@ -215,6 +223,7 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
             )
         return model
 
+    @can_return_tuple
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -222,9 +231,8 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
-        return_dict: Optional[bool] = None,
         **kwargs,
-    ) -> Union[tuple, SequenceClassifierOutputWithPast]:
+    ) -> SequenceClassifierOutputWithPast:
         if attention_mask is None:
             raise ValueError("attention_mask is required to locate the final token for yes/no scoring")
         if getattr(self.config, "yes_token_id", None) is None or getattr(self.config, "no_token_id", None) is None:
@@ -250,21 +258,11 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
                     "the official compute_logits."
                 )
 
-        # Resolve return_dict ONCE, before it is used. The signature defaults it to None, so a
-        # caller that omits it would otherwise fall through `if not return_dict` further down
-        # and get a bare tuple -- silently ignoring config.use_return_dict and denying callers
-        # the SequenceClassifierOutputWithPast they expect. Same normalisation the qwen2/qwen3
-        # models in this repo use.
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # The decoder call below pins return_dict=True regardless: last_hidden_state is only
-        # reachable on a ModelOutput. That is independent of what WE return, resolved above.
-        # return_dict=True is required, not cosmetic: last_hidden_state is only reachable on a
-        # ModelOutput, and this call does not forward the wrapper's return_dict. With
-        # config.use_return_dict False the decoder hands back a plain tuple and the attribute
-        # access below raises. Pin it here so the wrapper's own return_dict setting -- which
-        # controls the shape WE return -- cannot change how we read the decoder. Popped from
-        # kwargs first so an explicit caller value cannot override it.
+        # The decoder call below pins return_dict=True: last_hidden_state is only reachable
+        # on a ModelOutput, and with config.use_return_dict False the decoder would hand back
+        # a plain tuple and the attribute access would raise. That is independent of the shape
+        # WE return, which @can_return_tuple resolves from config/return_dict for us. Popped
+        # from kwargs first so an explicit caller value cannot override it.
         kwargs.pop("return_dict", None)
         outputs = self.model(
             input_ids=input_ids,
@@ -302,10 +300,6 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
             # and computes its own listwise loss, so this branch is for direct callers.
             labels = labels.to(yes_no_logits.device).view(-1)
             loss = F.cross_entropy(yes_no_logits.float(), labels)
-
-        if not return_dict:
-            output = (pooled_logits,)
-            return ((loss,) + output) if loss is not None else output
 
         return SequenceClassifierOutputWithPast(
             loss=loss,
