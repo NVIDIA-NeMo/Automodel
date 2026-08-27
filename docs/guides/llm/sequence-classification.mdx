@@ -1,17 +1,17 @@
 ---
 title: "Sequence Classification (SFT/PEFT) with NeMo AutoModel"
-description: ""
+description: "Train a sequence classification model with NeMo AutoModel using GLUE MRPC, RoBERTa, and optional LoRA."
 position: 10
 ---
 ## Introduction
 
-Sequence classification tasks (e.g., sentiment analysis, topic classification, GLUE tasks) map input text to a discrete label. NeMo AutoModel provides a lightweight recipe specialized for this setting that integrates with popular pretrained model formats and dataset sources. Integration with Hugging Face is supported.
+Sequence classification tasks (for example, sentiment analysis, topic classification, and GLUE tasks) map input text to a discrete label. NeMo AutoModel provides a lightweight recipe specialized for this setting that integrates with popular pretrained model formats and dataset sources. Integration with Hugging Face is supported.
 
-This guide shows how to train a sequence classification model using the `TrainFinetuneRecipeForSequenceClassification` recipe, including optional Parameter-Efficient Fine-Tuning (LoRA).
+This guide shows how to train a sequence classification model using the `TrainFinetuneRecipeForSequenceClassification` recipe, including optional Parameter-Efficient Fine-Tuning (PEFT) with LoRA.
 
 ## Quickstart
 
-Use the example config for GLUE MRPC with RoBERTa-large + LoRA:
+Use the example config for GLUE MRPC with RoBERTa-large and LoRA:
 
 ```bash
 uv run automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
@@ -113,10 +113,10 @@ optimizer:
 
 ## LoRA (PEFT) Settings
 
-- `target_modules`: glob to select linear layers (e.g., `"*.proj"`).
-- `dim` (rank), `alpha`, `dropout`: tune per model/compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
-- `freeze_config.unfreeze_modules`: keeps the classification head fully trainable while PEFT freezes other non-LoRA parameters.
-- `distributed.autocast_dtype`: runs the forward pass in the selected compute dtype while trainable parameters retain their configured storage dtype, including when single-rank FSDP is skipped.
+- `target_modules`: Glob to select linear layers (for example, `"*.proj"`).
+- `dim` (rank), `alpha`, `dropout`: Tune per model and compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
+- `freeze_config.unfreeze_modules`: Keeps the classification head fully trainable while PEFT freezes other non-LoRA parameters.
+- `distributed.autocast_dtype`: Runs the forward pass in the selected compute dtype while trainable parameters retain their configured storage dtype, including when single-rank FSDP is skipped.
 - The recipe automatically applies the adapters; no additional code changes are required.
 
 ## Running on Multiple GPUs
