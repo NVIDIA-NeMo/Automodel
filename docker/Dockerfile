@@ -139,7 +139,9 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
     NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
     ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
     apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
+        TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
+        pip install --no-cache-dir --no-build-isolation -v . && \
     apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/* && \
     cd / && rm -rf DeepEP
