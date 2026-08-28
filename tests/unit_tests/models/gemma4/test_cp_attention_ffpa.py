@@ -29,8 +29,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch.nn.attention.flex_attention import flex_attention as _eager_flex
+from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4Attention, Gemma4ForConditionalGeneration
 
 
 def _flex_module(sliding_window=None):
@@ -430,3 +433,70 @@ def test_attach_sets_ffpa_flag_and_cp_seam():
     default = torch.nn.Module()
     cpa.attach_gemma4_cp_ring_attention(default)
     assert default._gemma4_cp_use_ffpa is False
+
+
+def _make_cp_policy_model(*, enable_moe_block, full_backend=None, sliding_backend=None):
+    text_config_kwargs = dict(
+        vocab_size=32,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        global_head_dim=8,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_experts=2,
+        top_k_experts=1,
+        enable_moe_block=enable_moe_block,
+        layer_types=["full_attention"],
+        sliding_window=8,
+    )
+    if full_backend is not None:
+        text_config_kwargs["cp_full_attn_backend"] = full_backend
+    if sliding_backend is not None:
+        text_config_kwargs["cp_sliding_attn_backend"] = sliding_backend
+
+    config = Gemma4Config(
+        text_config=Gemma4TextConfig(**text_config_kwargs),
+        vision_config={"num_hidden_layers": 1},
+    )
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=False,
+    )
+
+    with torch.device("meta"):
+        return Gemma4ForConditionalGeneration(config, backend=backend)
+
+
+@pytest.mark.parametrize("enable_moe_block", [False, True])
+@pytest.mark.parametrize(
+    "backend_kwargs,expected_policy",
+    [({}, (False, "flex")), ({"full_backend": "FFPA", "sliding_backend": "FA"}, (True, "fa"))],
+)
+def test_model_applies_cp_attention_backend_policy(enable_moe_block, backend_kwargs, expected_policy):
+    model = _make_cp_policy_model(enable_moe_block=enable_moe_block, **backend_kwargs)
+    attention_modules = [module for module in model.modules() if isinstance(module, Gemma4Attention)]
+
+    assert len(attention_modules) == model.config.text_config.num_hidden_layers
+    assert all(
+        (module._gemma4_cp_use_ffpa, module._gemma4_cp_sliding_backend) == expected_policy
+        for module in attention_modules
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_kwargs,match",
+    [
+        ({"full_backend": "invalid"}, "cp_full_attn_backend"),
+        ({"sliding_backend": "invalid"}, "cp_sliding_attn_backend"),
+    ],
+)
+def test_model_rejects_unsupported_cp_attention_backend(backend_kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _make_cp_policy_model(enable_moe_block=False, **backend_kwargs)
