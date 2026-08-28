@@ -18,6 +18,8 @@
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
 import os
+import threading
+from contextlib import contextmanager
 
 try:
     from deep_ep import Buffer
@@ -47,6 +49,55 @@ import torch
 _buffer = None
 _nvshmem_available = None
 _uccl_buffer = None
+
+
+class HybridEPDispatchReplayRecorder:
+    """Record HybridEP layouts from checkpoint forward for deterministic replay."""
+
+    def __init__(self) -> None:
+        self._records: list = []
+        self._cursor = 0
+        self.replay_misses = 0
+
+    def record(self, entry) -> None:
+        self._records.append(entry)
+
+    def take(self):
+        """Return the next forward dispatch record, or ``None`` on divergence."""
+        if self._cursor >= len(self._records):
+            self.replay_misses += 1
+            return None
+        entry = self._records[self._cursor]
+        self._cursor += 1
+        return entry
+
+    def rewind(self) -> None:
+        self._cursor = 0
+
+
+class _HybridEPDispatchReplayState(threading.local):
+    def __init__(self) -> None:
+        self.recorder: HybridEPDispatchReplayRecorder | None = None
+        self.mode: str | None = None
+
+
+_hybridep_dispatch_replay_state = _HybridEPDispatchReplayState()
+
+
+@contextmanager
+def hybridep_dispatch_replay_scope(recorder: HybridEPDispatchReplayRecorder | None, mode: str):
+    """Bind a HybridEP dispatch recorder for checkpoint forward or recompute."""
+    if mode not in ("record", "replay"):
+        raise ValueError(f"Unsupported HybridEP dispatch replay mode: {mode}")
+    previous_recorder = _hybridep_dispatch_replay_state.recorder
+    previous_mode = _hybridep_dispatch_replay_state.mode
+    _hybridep_dispatch_replay_state.recorder = recorder
+    _hybridep_dispatch_replay_state.mode = mode if recorder is not None else None
+    try:
+        yield
+    finally:
+        _hybridep_dispatch_replay_state.recorder = previous_recorder
+        _hybridep_dispatch_replay_state.mode = previous_mode
 
 
 def _is_nvshmem_available() -> bool:
@@ -423,6 +474,31 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_sms_combine_api,
                 fp8_dispatch,
             )
+
+        recorder = _hybridep_dispatch_replay_state.recorder
+        if recorder is not None and _hybridep_dispatch_replay_state.mode == "replay":
+            replayed = recorder.take()
+            if replayed is not None:
+                handle, tokens_per_expert = replayed
+                replayed_outputs = _hybrid_ep_buffer.dispatch_with_permute(
+                    hidden=x,
+                    probs=probs,
+                    scaling_factor=None,
+                    handle=handle,
+                    pad_multiple=pad_multiple,
+                    num_permuted_tokens=tokens_per_expert.sum(),
+                )
+                dispatched_hidden, dispatched_probs, dispatched_scaling_factor, _, _ = replayed_outputs
+                ctx.handle = handle
+                ctx.pad_multiple = pad_multiple
+                return (
+                    dispatched_hidden,
+                    dispatched_probs,
+                    dispatched_scaling_factor,
+                    tokens_per_expert,
+                    handle,
+                )
+
         non_blocking = num_permuted_tokens is not None
         (
             dispatched_hidden,
@@ -443,6 +519,10 @@ class HybridEPDispatch(torch.autograd.Function):
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        if recorder is not None and _hybridep_dispatch_replay_state.mode == "record":
+            # Keep only the reusable layout and its output extent. Recomputed
+            # activations and probabilities are still redispatched through it.
+            recorder.record((handle, tokens_per_expert))
         return (
             dispatched_hidden,
             dispatched_probs,

@@ -459,6 +459,50 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
     apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
 
 
+def _replay_hybridep_dispatch_on_recompute(
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]],
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]]:
+    """Reuse checkpoint-forward HybridEP layouts during backward recomputation.
+
+    HybridEP can produce a different receive-token extent when it rebuilds a
+    layout during activation-checkpoint recompute, even when the saved router
+    top-k is identical. Reusing the forward handle keeps the layout stable while
+    still redispatching the recomputed activations, so activation memory remains
+    checkpointed.
+    """
+    from nemo_automodel.components.moe.megatron.fused_a2a import (
+        HybridEPDispatchReplayRecorder,
+        hybridep_dispatch_replay_scope,
+    )
+
+    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+        forward_context, recompute_context = context_fn()
+        recorder = HybridEPDispatchReplayRecorder()
+
+        @contextmanager
+        def scoped(mode: str, inner: AbstractContextManager):
+            if mode == "replay":
+                recorder.rewind()
+            with hybridep_dispatch_replay_scope(recorder, mode), inner:
+                yield
+
+        return scoped("record", forward_context), scoped("replay", recompute_context)
+
+    return checkpoint_context_fn
+
+
+def _uses_hybridep_dispatch(model: nn.Module) -> bool:
+    """Return whether any expert module uses the HybridEP dispatcher."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    return any(
+        isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE))
+        and getattr(module, "dispatcher_backend", None) == "hybridep"
+        for module in modules()
+    )
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -479,8 +523,8 @@ def apply_ac(
             first, then falls back to model.config attributes.
         selective: If True, applies TorchTitan-style per-op selective activation checkpointing
             (shared with the dense FSDP2 path) to each block. Takes precedence over
-            ``ignore_router``; the shared policy already saves expert-parallel communication
-            collectives and ``topk``, so it composes with expert parallelism.
+            ``ignore_router``; the shared policy saves ``topk``, and HybridEP reuses the
+            checkpoint-forward dispatch layout while redispatching recomputed activations.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
             the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
@@ -501,6 +545,7 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
+    uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
     repeated_mtp_moe_block_ids = _repeated_mtp_moe_block_ids(model) if checkpoint_decoder else set()
     if repeated_mtp_moe_block_ids:
         logger.info(
@@ -532,6 +577,8 @@ def apply_ac(
                 transformer_engine_attention_backend_snapshot_context_fn,
                 selective_context_fn,
             )
+            if uses_hybridep_dispatch:
+                attention_context_fn = _replay_hybridep_dispatch_on_recompute(attention_context_fn)
             for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
                 if id(block) in repeated_mtp_moe_block_ids:
                     continue
@@ -631,14 +678,17 @@ def apply_ac(
             logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
             continue
         if ignore_router:
+            block_context_fn = _preserve_gate_load_during_recompute(
+                block,
+                _with_attention_backend_snapshot(selective_checkpointing_context_fn),
+            )
+            if uses_hybridep_dispatch:
+                block_context_fn = _replay_hybridep_dispatch_on_recompute(block_context_fn)
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
                 determinism_check=_register_moe_checkpoint_determinism_check(),
-                context_fn=_preserve_gate_load_during_recompute(
-                    block,
-                    _with_attention_backend_snapshot(selective_checkpointing_context_fn),
-                ),
+                context_fn=block_context_fn,
             )
         else:
             block = ptd_checkpoint_wrapper(
