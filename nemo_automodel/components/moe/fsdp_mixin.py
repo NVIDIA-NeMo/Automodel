@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Any, Callable, Iterator
 
 import torch
@@ -22,6 +23,8 @@ from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.models.common.utils import get_is_optim_step
 from nemo_automodel.shared.multimodal_fsdp import iter_multimodal_modules
+
+logger = logging.getLogger(__name__)
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
@@ -128,14 +131,19 @@ def _run_post_backward_hooks(fsdp_module: FSDPModule) -> Callable:
         if state._fsdp_param_group:
             try:
                 state._fsdp_param_group.post_backward()
-            except AttributeError:
+            except AttributeError as exc:
+                if "post_forward_order" not in str(exc):
+                    raise
+                logger.debug("Skipping post_backward for never-forwarded FSDP group: %s", exc)
                 continue
 
     def _final_callback() -> None:
         try:
             fsdp_state._root_post_backward_final_callback()
-        except AttributeError:
-            pass
+        except AttributeError as exc:
+            if "post_forward_order" not in str(exc):
+                raise
+            logger.debug("Skipping root post-backward callback for never-forwarded FSDP root: %s", exc)
 
     return _final_callback
 

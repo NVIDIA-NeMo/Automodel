@@ -914,3 +914,30 @@ class TestPatchedBackwardMaybeWithNosync:
                 assert False, "Should have raised RuntimeError"
             except RuntimeError as e:
                 assert "Unknown backward type" in str(e)
+
+
+def test_run_post_backward_hooks_reraises_unrelated_attribute_error(monkeypatch):
+    """The never-forwarded guard must not swallow unrelated AttributeErrors."""
+    import pytest
+
+    from nemo_automodel.components.moe import fsdp_mixin as m
+
+    class _Group:
+        def post_backward(self):
+            raise AttributeError("'SomeOtherThing' object has no attribute 'unrelated_attr'")
+
+    class _State:
+        _fsdp_param_group = _Group()
+
+    class _StateCtx:
+        all_states = [_State()]
+
+    class _FsdpState:
+        _state_ctx = _StateCtx()
+
+        def _root_post_backward_final_callback(self):
+            pass
+
+    monkeypatch.setattr(m.fully_shard, "state", lambda module: _FsdpState())
+    with pytest.raises(AttributeError, match="unrelated_attr"):
+        m._run_post_backward_hooks(object())
