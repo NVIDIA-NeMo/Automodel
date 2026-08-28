@@ -144,6 +144,23 @@ def _get_moe_module(block: nn.Module) -> MoE | None:
             return module
 
 
+def _repeated_mtp_moe_block_ids(model: nn.Module) -> set[int]:
+    """Return weight-tied MTP blocks whose experts cannot be recomputed safely.
+
+    A repeated MTP depth may contain multiple physical sublayers. Only MoE
+    sublayers own the EP-sharded expert parameter group whose second FSDP2
+    checkpoint recompute is unsafe; attention, MLP, and Mamba sublayers remain
+    eligible for activation checkpointing.
+    """
+    mtp_module = getattr(model, "mtp", None)
+    if mtp_module is None or not hasattr(mtp_module, "layers"):
+        return set()
+    mtp_repeated = bool(getattr(getattr(mtp_module, "mtp_config", None), "use_repeated_layer", False))
+    if not mtp_repeated:
+        return set()
+    return {id(block) for block in mtp_module.layers.children() if _get_moe_module(block) is not None}
+
+
 def _preserve_gate_load_during_recompute(
     block: nn.Module,
     context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
@@ -484,6 +501,12 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
+    repeated_mtp_moe_block_ids = _repeated_mtp_moe_block_ids(model) if checkpoint_decoder else set()
+    if repeated_mtp_moe_block_ids:
+        logger.info(
+            "Skipping activation checkpointing on %d weight-tied MTP MoE block(s)",
+            len(repeated_mtp_moe_block_ids),
+        )
     if checkpoint_decoder and not selective and not ignore_router:
         logger.warning(
             "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
@@ -510,6 +533,8 @@ def apply_ac(
                 selective_context_fn,
             )
             for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
+                if id(block) in repeated_mtp_moe_block_ids:
+                    continue
                 if bool(getattr(block, "_nemo_disable_activation_checkpointing", False)):
                     logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
                     continue
@@ -595,26 +620,12 @@ def apply_ac(
     def _with_attention_backend_snapshot(context_fn=None):
         return functools.partial(transformer_engine_attention_backend_snapshot_context_fn, context_fn)
 
-    # Weight-tied (use_repeated_layer) MTP head blocks must NOT be activation
-    # checkpointed: the single physical block is recomputed once per MTP depth in
-    # backward, and FSDP2 cannot re-unshard the *shared* EP-sharded experts param
-    # group on the 2nd+ recompute (the 1st recompute's post_backward reshards it, and
-    # the 2nd recompute's pre_forward unshard does not re-gather it) -> the experts
-    # weight is read in the resharded Shard(1) state and grouped_gemm raises
-    # "Expected hidden_in == a.size(1)". The MTP head is tiny (1 physical block), so
-    # skipping its recompute costs negligible activation memory. Non-tied MTP heads
-    # (each physical block recomputed exactly once) are unaffected and keep AC.
-    mtp_module = getattr(model, "mtp", None)
-    mtp_block_ids: set[int] = set()
-    mtp_repeated = False
-    if mtp_module is not None and hasattr(mtp_module, "layers"):
-        mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
-        mtp_repeated = bool(getattr(getattr(mtp_module, "mtp_config", None), "use_repeated_layer", False))
-    if mtp_repeated and mtp_block_ids:
-        logger.info("Skipping activation checkpointing on %d weight-tied MTP head block(s)", len(mtp_block_ids))
-
     for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
-        if mtp_repeated and id(block) in mtp_block_ids:
+        # A weight-tied MoE block is recomputed once per logical MTP depth.
+        # FSDP2 cannot re-unshard its shared EP-sharded experts group after the
+        # first recompute, so leave only those blocks uncheckpointed. Repeated
+        # dense/attention/Mamba blocks have no such expert group and keep AC.
+        if id(block) in repeated_mtp_moe_block_ids:
             continue
         if bool(getattr(block, "_nemo_disable_activation_checkpointing", False)):
             logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
