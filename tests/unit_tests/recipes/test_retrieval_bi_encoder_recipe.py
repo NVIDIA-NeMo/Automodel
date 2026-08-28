@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
+from nemo_automodel.components.loggers.metric_logger import MetricLogger, MetricsSample
 from nemo_automodel.recipes.retrieval import train_bi_encoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
@@ -390,29 +392,50 @@ def test_metrics_persisted_when_the_loop_raises():
     assert len(recipe.metric_logger_train.persisted) == 2
 
 
-def test_checkpoint_flushes_metrics_when_not_buffer_aligned():
+def _durable_steps(path):
+    """Steps whose records are readable from the file right now, by anything else."""
+    if not path.exists():
+        return []
+    return [json.loads(line)["step"] for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_checkpoint_flushes_metrics_to_disk_mid_run(tmp_path):
     """The durability guarantee comes from the explicit flush, not from record counting.
 
-    The checkpoint here lands at step 3, which no record-count boundary coincides with --
-    the situation after resuming at a step that is not a multiple of ckpt_every_steps, or at
-    an epoch-boundary checkpoint. The metrics for the covered steps must be on disk by the
-    time the checkpoint is taken.
+    Uses a REAL MetricLogger and reads the real file, because the property under test is
+    whether records are on disk at a point in time -- which a stand-in that records calls
+    cannot show. It is also the only way this test can fail if the recipe's flush calls are
+    deleted: the earlier version sampled the count before the flush and then checked a total
+    that ``close()`` in the finally satisfies on its own, so it passed either way.
+
+    The checkpoint lands at step 3, which no record-count boundary coincides with -- the
+    situation after resuming at a step that is not a multiple of ckpt_every_steps, or at an
+    epoch-boundary checkpoint. buffer_size is far above the length of the run, so nothing
+    reaches the file on count alone.
     """
+    logfile = tmp_path / "train_metrics.jsonl"
     sched = _LoopStepScheduler(n_steps=6, ckpt_steps={3})
     recipe = _make_loop_recipe(sched)
-    persisted_at_ckpt = {}
-    original_save = recipe.save_checkpoint
+    recipe.metric_logger_train = MetricLogger(str(logfile), append=False, buffer_size=1000)
+    recipe.log_train_metrics = lambda d: recipe.metric_logger_train.log(
+        MetricsSample(step=sched.step, epoch=0, metrics={"loss": 1.0})
+    )
 
-    def _save(*a, **k):
-        original_save(*a, **k)
-        # sample AFTER the recipe's flush by deferring the read to the next step
-        persisted_at_ckpt["at_save"] = len(recipe.metric_logger_train.persisted)
+    # Observe the file at the TOP of each step, so step N sees the state left by step N-1.
+    seen = {}
+    inner_step = recipe._run_train_optim_step
 
-    recipe.save_checkpoint = _save
+    def _observing_step(batches, max_grad_norm):
+        seen[sched.step] = _durable_steps(logfile)
+        return inner_step(batches, max_grad_norm)
+
+    recipe._run_train_optim_step = _observing_step
     recipe.run_train_validation_loop()
 
-    # the flush runs immediately after save_checkpoint returns, so by step 4 the first three
-    # steps are durable rather than sitting in the buffer
     assert recipe.saved_at == [3]
-    assert len(recipe.metric_logger_train.persisted) == 6
-    assert persisted_at_ckpt["at_save"] == 0, "flush is after the save, not before"
+    assert seen[3] == [], "nothing durable before the checkpoint: the buffer is nowhere near full"
+    # THE ASSERTION THAT BITES: only the post-checkpoint flush can have put these on disk,
+    # and it is checked mid-run, before close() drains anything.
+    assert seen[4] == [1, 2, 3], "the checkpoint flush must have made the covered steps durable"
+    assert seen[6] == [1, 2, 3], "and no further flush happens until the run ends"
+    assert _durable_steps(logfile) == [1, 2, 3, 4, 5, 6], "close() drains the remainder"

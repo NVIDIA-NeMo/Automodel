@@ -448,8 +448,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
                             train_loss=train_log_data.metrics["loss"],
                             val_loss=val_loss,
                         )
-                        # Flush AFTER the checkpoint lands, so a checkpoint is never on disk
-                        # without the metrics describing the steps it covers. Buffer size alone
+                        # Flush once the checkpoint save returns, so the metrics describing the
+                        # steps it covers are durable by the time the loop moves on rather than
+                        # waiting for the buffer to fill. This is a post-save boundary, not an
+                        # atomic one: a crash between the save completing and this flush leaves
+                        # the checkpoint on disk with those records still buffered. Buffer size alone
                         # does not give this: it counts records, and the count only lines up
                         # with checkpoint steps while training runs from step 0 with periodic
                         # checkpoints. Resuming at a step that is not a multiple of
