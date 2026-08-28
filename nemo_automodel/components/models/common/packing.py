@@ -40,6 +40,51 @@ logger = logging.getLogger(__name__)
 
 _FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 
+# HF-style ``attn_implementation`` values that the custom-model path implements natively as a
+# ``BackendConfig.attn`` backend. Only FA4 has one; sdpa/eager/magi and FA2/FA3 do not, and are
+# deliberately absent so a recipe pairing e.g. ``attn_implementation: sdpa`` (which only gates HF
+# config validation) with ``backend.attn: te`` keeps running TE.
+_ATTN_IMPL_TO_NATIVE_BACKEND = {"flash_attention_4": "fa4"}
+
+# Resolved attention backends that consume the compact indexed ``[B, S]`` document map (from which
+# ``cu_seqlens`` is derived) rather than a dense block-causal mask. ``fa4`` belongs here even though
+# it is not an HF dispatch key: FlashAttention-4 has no dense-mask entry point, so handing it the
+# materialized 4D mask is not merely slow, it fails outright.
+_VARLEN_PACKING_BACKENDS = _FLASH_ATTN_IMPLEMENTATIONS + ("fa4",)
+
+
+def native_backend_from_attn_implementation(cfg_model) -> str | None:
+    """Return the native ``backend.attn`` requested via HF-style ``attn_implementation``, if any.
+
+    Custom models select attention through ``backend.attn``, so an ``attn_implementation`` naming a
+    flash variant used to be silently ignored on that path -- the model quietly ran whatever
+    ``backend.attn`` said. Honor the request when the value names a backend the native path actually
+    implements; return ``None`` (leave ``backend.attn`` alone) otherwise.
+
+    Args:
+        cfg_model: Model config node.
+
+    Returns:
+        The native backend name, or ``None`` when ``attn_implementation`` has no native equivalent.
+    """
+    if cfg_model is None:
+        return None
+    # Config nodes expose .get(); plain namespaces (and test doubles) may not.
+    getter = getattr(cfg_model, "get", None)
+    impl = getter("attn_implementation", None) if callable(getter) else getattr(cfg_model, "attn_implementation", None)
+    if not isinstance(impl, str):
+        return None
+    native = _ATTN_IMPL_TO_NATIVE_BACKEND.get(impl)
+    if native is None and impl in _FLASH_ATTN_IMPLEMENTATIONS:
+        logger.warning(
+            "model.attn_implementation=%r has no custom-model equivalent; the native attention "
+            "backend is selected by model.backend.attn (currently %r) and this key only affects "
+            "HF-implemented submodules such as a VLM vision tower.",
+            impl,
+            getattr(getattr(cfg_model, "backend", None), "attn", None),
+        )
+    return native
+
 
 def get_seqlens_in_batch(attention_mask: torch.Tensor) -> torch.Tensor:
     """Extract per-document sequence lengths from an indexed attention mask.
@@ -200,13 +245,44 @@ def get_attn_implementation(cfg_model, model=None) -> str:
             with TE attention injected on top.
     """
     if cfg_model is not None and hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn"):
-        return cfg_model.backend.attn
+        return native_backend_from_attn_implementation(cfg_model) or cfg_model.backend.attn
     resolved = _model_attn_implementation(model)
     if resolved is not None:
         return resolved
     if cfg_model is not None:
         return cfg_model.get("attn_implementation", "sdpa")
     return "sdpa"
+
+
+def apply_attn_implementation_to_backend(cfg_model) -> None:
+    """Promote a native-equivalent ``attn_implementation`` onto ``backend.attn``, in place.
+
+    Custom models build attention from ``backend.attn``, so setting only ``attn_implementation``
+    would leave the requested backend unbuilt even though :func:`get_attn_implementation` reports
+    it -- the packed mask and the attention module would then disagree. Rewrite the config once,
+    before the model is instantiated, so both follow the same key.
+
+    No-op unless ``attn_implementation`` names a backend the native path implements, so recipes
+    that intentionally pair ``attn_implementation`` (HF submodules, e.g. a VLM vision tower) with a
+    different ``backend.attn`` are untouched.
+
+    Args:
+        cfg_model: Model config node, mutated in place.
+    """
+    native = native_backend_from_attn_implementation(cfg_model)
+    if native is None:
+        return
+    backend = getattr(cfg_model, "backend", None)
+    if backend is None or not hasattr(backend, "attn"):
+        return
+    if backend.attn == native:
+        return
+    logger.info(
+        "model.attn_implementation selects the native %r attention backend (was backend.attn=%r).",
+        native,
+        backend.attn,
+    )
+    backend.attn = native
 
 
 def _patch_preprocess_mask_arguments_for_packing() -> None:
@@ -295,7 +371,7 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         attn_impl = getattr(config, "_attn_implementation", None) or getattr(
             config, "_attn_implementation_internal", None
         )
-        if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
+        if attn_impl in _VARLEN_PACKING_BACKENDS and is_indexed_packed_mask(attention_mask):
             return (
                 preprocess_result_template[0],
                 attention_mask,

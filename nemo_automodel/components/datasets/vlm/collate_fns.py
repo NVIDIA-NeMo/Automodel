@@ -1545,14 +1545,15 @@ def neat_packed_vlm_collater(
     if not batch:
         return {}
 
-    from nemo_automodel.components.models.common.packing import _FLASH_ATTN_IMPLEMENTATIONS
+    from nemo_automodel.components.models.common.packing import _VARLEN_PACKING_BACKENDS
 
     LABEL_PAD = -100
-    # Every flash variant derives cu_seqlens from the indexed [B, S] map, not just FA2.
-    # Matching only "flash_attention_2" here silently sent FA3/FA4 runs down the dense
-    # 4D-mask branch, which disqualifies SDPA's flash backend and lands on the cutlass
-    # mem-efficient kernels.
-    use_flash = attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS
+    # Every varlen-capable backend derives cu_seqlens from the indexed [B, S] map, not just FA2.
+    # Matching only "flash_attention_2" here silently sent FA3/FA4 runs down the dense 4D-mask
+    # branch, which disqualifies SDPA's flash backend and lands on the cutlass mem-efficient
+    # kernels. The custom-model "fa4" backend must take this branch too: FlashAttention-4 has no
+    # dense-mask entry point, so the 4D mask would abort the run rather than just slow it down.
+    use_flash = attn_implementation in _VARLEN_PACKING_BACKENDS
 
     # Determine pad target: fixed max_length or batch-dynamic
     max_len = (

@@ -15,8 +15,11 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import (
+    _FLASH_ATTN_IMPLEMENTATIONS,
+    _VARLEN_PACKING_BACKENDS,
     _passthrough_create_causal_mask,
     _patch_preprocess_mask_arguments_for_packing,
+    apply_attn_implementation_to_backend,
     configure_packing,
     get_attn_implementation,
     get_seqlens_in_batch,
@@ -412,3 +415,54 @@ class TestConfigurePackingFA3FA4:
 
         assert "transformers.models.llama.modeling_llama" in _PACKING_PATCH_MODULES
         assert "transformers.models.qwen3.modeling_qwen3" in _PACKING_PATCH_MODULES
+
+
+# ---------------------------------------------------------------------------
+# attn_implementation -> native backend promotion
+# ---------------------------------------------------------------------------
+
+
+class TestAttnImplementationPromotion:
+    """A native-equivalent attn_implementation must select the custom-model backend.
+
+    Custom models build attention from ``backend.attn``, so ``attn_implementation`` used to be
+    silently ignored on that path -- the model ran ``backend.attn`` regardless.
+    """
+
+    def test_flash_attention_4_promotes_to_fa4(self):
+        cfg = SimpleNamespace(backend=SimpleNamespace(attn="sdpa"), attn_implementation="flash_attention_4")
+        assert get_attn_implementation(cfg) == "fa4"
+        apply_attn_implementation_to_backend(cfg)
+        assert cfg.backend.attn == "fa4"
+
+    def test_sdpa_does_not_hijack_te_backend(self):
+        """Recipes pair attn_implementation=sdpa (HF config validation) with backend.attn=te."""
+        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"), attn_implementation="sdpa")
+        apply_attn_implementation_to_backend(cfg)
+        assert cfg.backend.attn == "te"
+        assert get_attn_implementation(cfg) == "te"
+
+    @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3"])
+    def test_flash_variants_without_native_equivalent_are_left_alone(self, impl):
+        """FA2/FA3 have no custom-model backend; backend.attn still decides."""
+        cfg = SimpleNamespace(backend=SimpleNamespace(attn="sdpa"), attn_implementation=impl)
+        apply_attn_implementation_to_backend(cfg)
+        assert cfg.backend.attn == "sdpa"
+        assert get_attn_implementation(cfg) == "sdpa"
+
+    def test_promotion_is_idempotent(self):
+        cfg = SimpleNamespace(backend=SimpleNamespace(attn="fa4"), attn_implementation="flash_attention_4")
+        apply_attn_implementation_to_backend(cfg)
+        apply_attn_implementation_to_backend(cfg)
+        assert cfg.backend.attn == "fa4"
+
+    def test_no_backend_block_is_a_noop(self):
+        cfg = SimpleNamespace(attn_implementation="flash_attention_4")
+        apply_attn_implementation_to_backend(cfg)  # must not raise
+        assert not hasattr(cfg, "backend")
+
+    def test_fa4_takes_the_varlen_packing_branch(self):
+        """FA4 has no dense-mask entry point, so packing must hand it the indexed map."""
+        assert "fa4" in _VARLEN_PACKING_BACKENDS
+        for impl in _FLASH_ATTN_IMPLEMENTATIONS:
+            assert impl in _VARLEN_PACKING_BACKENDS

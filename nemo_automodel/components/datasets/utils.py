@@ -527,7 +527,9 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
 
-    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
+    from nemo_automodel.components.models.common.packing import _VARLEN_PACKING_BACKENDS
+
+    if attn_implementation in _VARLEN_PACKING_BACKENDS:
         mask_out = attention_mask
     else:
         mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
