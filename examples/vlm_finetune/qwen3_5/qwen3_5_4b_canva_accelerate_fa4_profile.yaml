@@ -1,0 +1,57 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Licensed under the Apache License, Version 2.0.
+
+recipe: FinetuneRecipeForVLM
+
+benchmark_probe:
+  framework: accelerate
+  attention: flash_attention_4
+  gradient_accumulation_steps: 4
+  warmup_steps: 5
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 12
+
+model:
+  pretrained_model_name_or_path: Qwen/Qwen3.5-4B
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.5-4B
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+packed_sequence:
+  pretokenize: true
+  max_length: 16384
+  pack_size: 16384
+  packing_ratio: 0.9
+  drop_long_samples: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+
+ci:
+  recipe_owner: AlexandrosKoumparoulis
+  time: "01:00:00"
+  nproc_per_node: 4
+  cluster_tag: gb200
+  env_vars:
+    TEST_SCRIPT_PATH: examples/vlm_finetune/qwen3_5/canva_profile_runner.py
