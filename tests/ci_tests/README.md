@@ -63,6 +63,9 @@ ci:
   checkpoint_robustness:          # Optional. Enable robustness testing
     tokenizer_name: org/model
     parity_sequence_length: 2048  # Optional. Full-logit parity prompt length (default: 2048; 1K-4K recommended)
+    # cross_framework_gate_sequence_length: 128  # Exceptional: gate Phases 0/3 on this prefix of the same forward
+    # capture_router_diagnostics: true  # GLM-only Phase 0 router evidence; disabled by default
+    # shape_diagnostic: {sweep_lengths: [128, 256, 512, 1024]}  # Optional informational HF calibration sweep
     parity_tolerance_profile: standard  # Optional: strict, standard (default), or relaxed
     hf_device_map_auto: true      # Optional. Use for large HF reference loads that do not fit on one GPU
     # skip_resume: true           # Exceptional: skip native-checkpoint resume (Phase 4)
@@ -151,13 +154,44 @@ harness fails with an actionable error instead of repeating content if a request
 document. Pipeline-parallel runs resize their stage activation buffers to the configured parity length; reduce the
 length only when a model has a documented memory limit.
 
+For a diagnosed cross-framework instability, `cross_framework_gate_sequence_length` can gate Phases 0 and 3 on a
+prefix of the same long forward. It does not launch a shorter forward: the harness still runs and reports all
+`parity_sequence_length` tokens, while mean KL, p95 KL, and cosine use the configured prefix for pass/fail. Phase 2,
+Phase 5, repeatability records, and native resume keep their full-sequence behavior. Use this only when evidence has
+localized the full-sequence tail to a framework-sensitive numerical path, such as near-tied routed-MoE decisions;
+do not use it as a general substitute for fixing a model or selecting the appropriate tolerance profile.
+
+`capture_router_diagnostics: true` additionally records the full-sequence vanilla-HF and AutoModel router logits,
+correction biases, and actual expert selections during Phase 0 for GLM 4.7 Flash. Its concise CI summary focuses on
+layers 1-5: route-flip context, large-margin flips outside the measured score-noise band, and whether replacement
+experts systematically follow correction bias. Flip counts never gate because a stable MoE can flip many near ties.
+The full report also groups final-token KL by flipped-layer count, separating the zero-flipped-layer empirical floor
+from the routed tail. Raw captures and JSON evidence live under `.checkpoint_robustness/router_diagnostics/` and are
+embedded in the schema-v3 Phase 0 parity record. The option is model-specific and off by default because it retains
+router tensors until the forward finishes; unsupported model families and pipeline-parallel runs fail explicitly
+when it is enabled because global rank 0 can observe only its local pipeline stage.
+
+When `cross_framework_gate_sequence_length` is shorter than `parity_sequence_length`, the harness automatically runs
+the vanilla-HF reference at the gate length and reports `KL(HF_full[:gate_length] || HF_gate_length)` beside both the
+Phase 0 source and Phase 3 export-reload comparisons. No separate opt-in is required for this standing measurement.
+The optional `shape_diagnostic.sweep_lengths` mapping adds Phase 0 onboarding or kernel-upgrade calibration points,
+all using prefixes of the same SHA-checked fixed document. With router capture enabled, each Phase 0 point also reports
+self-flip counts and the final-token mean KL for tokens that flip in at least 11 layers; that amplification cost, not
+raw flip frequency, distinguishes sensitive GLM behavior from stable routed MoEs such as Qwen. Bitwise-zero points are
+labeled `same_kernel_regime_not_probing`, not evidence of general shape stability. Shape diagnostics are informational,
+print one concise CI line, and store full evidence under `.checkpoint_robustness/shape_diagnostics/` and in each
+schema-v3 parity record. Calibration sweeps add one vanilla-HF forward per unique length.
+
 Every comparison reports mean, p95, and max per-token `KL(reference || candidate)`; mean, p95, and max per-token
 Jensen-Shannon divergence (natural log, bounded by `ln(2)`); whole-tensor cosine similarity; and mean/max absolute
-logit difference. The full record is printed as `CHECKPOINT_PARITY_METRICS <json>` and saved under
-`<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`. Named profiles gate mean KL, p95 KL, and cosine similarity.
+logit difference. The full record is saved under `<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`, while a
+one-line `CHECKPOINT_PARITY_METRICS <json>` summary is printed for CI log consumers. When full shape or router evidence
+is embedded, the summary omits that bulky evidence and includes the complete artifact path instead. Named profiles
+gate mean KL, p95 KL, and cosine similarity.
 JSD, max KL, and absolute logit differences remain diagnostics, allowing their usefulness to be evaluated without
-changing pass/fail policy. Record schema version 2 adds `mean_jsd`, `p95_jsd`, and `max_jsd` under `metrics`; existing
-version 1 fields retain their meaning.
+changing pass/fail policy. Record schema version 3 keeps `metrics` as the full-sequence record and adds `gate_metrics`,
+`gate_sequence_length`, and explicit full-sequence failure diagnostics. Schema version 2 introduced `mean_jsd`,
+`p95_jsd`, and `max_jsd`; those metric fields retain their meaning.
 
 Each vanilla-HF reference is forwarded twice through the same loaded model. The resulting `hf_source_self_repeat`
 or `hf_export_self_repeat` record is informational and distinguishes cross-framework drift from an unstable reference.

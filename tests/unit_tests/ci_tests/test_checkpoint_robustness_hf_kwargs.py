@@ -29,6 +29,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _PARITY_DOCUMENT_SHA256,
     _assert_peft_adapter_matches_checkpoint,
     _automodel_reload_parity_policy,
+    _collect_hf_reload_shape_diagnostics,
     _compare_logits,
     _compare_source_load_parity,
     _cross_tp_parity_policy,
@@ -62,11 +63,13 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _replace_nemo_owned_reference_config,
     _resolve_hf_attn_implementation,
     _resolve_hf_model_class,
+    _run_hf_reload_standing_shape_diagnostic,
     _run_process_isolated_checkpoint_phase,
     _run_vanilla_hf_reload,
     _set_model_pretrained_path,
     _source_load_parity_policy,
     _trainable_parameter_digests,
+    _validate_router_diagnostic_config,
     _wait_for_hf_reload_rank0,
     _wait_for_source_load_artifacts,
 )
@@ -783,7 +786,9 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
         "    skip_automodel_reload_logit_parity: true\n"
         "    skip_hf_reload_logit_parity: true\n"
         "    trust_remote_code: false\n"
+        "    capture_router_diagnostics: true\n"
         "    parity_sequence_length: 1024\n"
+        "    cross_framework_gate_sequence_length: 256\n"
         "    parity_tolerance_profile: relaxed\n"
         "    parity_tolerance_profile_overrides:\n"
         "      source_load: strict\n"
@@ -804,7 +809,10 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert custom["skip_automodel_reload_logit_parity"] is True
     assert custom["skip_hf_reload_logit_parity"] is True
     assert custom["trust_remote_code"] is False
+    assert custom["capture_router_diagnostics"] is True
+    assert custom["shape_diagnostic"].sweep_lengths == ()
     assert custom["parity_sequence_length"] == "1024"
+    assert custom["cross_framework_gate_sequence_length"] == "256"
     assert custom["parity_tolerance_profile"] == "relaxed"
     assert custom["parity_tolerance_profile_overrides"] == {
         "source_load": "strict",
@@ -820,11 +828,50 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert remaining == ["--config", str(config_path)]
 
 
+def test_extract_custom_args_parses_quoted_false_router_capture(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text('ci:\n  checkpoint_robustness:\n    capture_router_diagnostics: "false"\n')
+
+    custom, _remaining = _extract_custom_args(["--config", str(config_path)])
+
+    assert custom["capture_router_diagnostics"] is False
+
+
+def test_extract_custom_args_reads_shape_diagnostic_mapping(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        "ci:\n"
+        "  checkpoint_robustness:\n"
+        "    parity_sequence_length: 1024\n"
+        "    cross_framework_gate_sequence_length: 256\n"
+        "    shape_diagnostic:\n"
+        "      sweep_lengths: [128, 512]\n"
+    )
+
+    custom, _remaining = _extract_custom_args(["--config", str(config_path)])
+
+    assert custom["shape_diagnostic"].sweep_lengths == (128, 512)
+
+
 def test_extract_custom_args_rejects_removed_config_fields(tmp_path):
     config_path = tmp_path / "recipe.yaml"
     config_path.write_text("ci:\n  checkpoint_robustness:\n    hf_kl_threshold: 0.01\n")
 
     with pytest.raises(ValueError, match="Removed checkpoint-robustness fields.*hf_kl_threshold"):
+        _extract_custom_args(["--config", str(config_path)])
+
+
+@pytest.mark.parametrize("gate_sequence_length", [0, 1025])
+def test_extract_custom_args_rejects_invalid_cross_framework_gate_length(tmp_path, gate_sequence_length):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        "ci:\n"
+        "  checkpoint_robustness:\n"
+        "    parity_sequence_length: 1024\n"
+        f"    cross_framework_gate_sequence_length: {gate_sequence_length}\n"
+    )
+
+    with pytest.raises(ValueError, match="cross_framework_gate_sequence_length"):
         _extract_custom_args(["--config", str(config_path)])
 
 
@@ -955,6 +1002,66 @@ def test_hf_reload_applies_remote_code_compatibility_patches():
     apply_compatibility.assert_called_once_with()
     assert error is not None
     assert "RuntimeError: compatibility sentinel" in error
+
+
+def test_hf_reload_standing_shape_diagnostic_is_automatic_for_shorter_gate(tmp_path):
+    logits = torch.randn(1, 4, 3)
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._run_hf_shape_diagnostic"
+    ) as run_shape_diagnostic:
+        _run_hf_reload_standing_shape_diagnostic(
+            Mock(),
+            [11, 12, 13, 14],
+            torch.device("cpu"),
+            logits,
+            artifact_dir=tmp_path,
+            custom_args={"cross_framework_gate_sequence_length": "2"},
+        )
+
+    call = run_shape_diagnostic.call_args
+    assert call.kwargs["config"].sweep_lengths == ()
+    assert call.kwargs["gate_sequence_length"] == 2
+    assert call.kwargs["capture_router_diagnostics"] is False
+    assert call.kwargs["phase"] == "phase_3"
+
+
+def test_hf_reload_standing_shape_diagnostic_skips_full_length_gate(tmp_path):
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._run_hf_shape_diagnostic"
+    ) as run_shape_diagnostic:
+        _run_hf_reload_standing_shape_diagnostic(
+            Mock(),
+            [11, 12],
+            torch.device("cpu"),
+            torch.randn(1, 2, 3),
+            artifact_dir=tmp_path,
+            custom_args={"cross_framework_gate_sequence_length": "2"},
+        )
+
+    run_shape_diagnostic.assert_not_called()
+
+
+def test_hf_reload_shape_diagnostic_failure_is_returned_as_evidence(tmp_path):
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+        "_run_hf_reload_standing_shape_diagnostic",
+        side_effect=ValueError("malformed shape probe"),
+    ):
+        diagnostics, failure = _collect_hf_reload_shape_diagnostics(
+            Mock(),
+            [1, 2],
+            torch.device("cpu"),
+            torch.zeros(1, 2, 3),
+            artifact_dir=tmp_path,
+            custom_args={"cross_framework_gate_sequence_length": "1"},
+        )
+
+    assert diagnostics["diagnostic_failure"] == {
+        "error_type": "ValueError",
+        "message": "malformed shape probe",
+    }
+    assert failure is not None
+    assert "malformed shape probe" in failure
 
 
 def test_process_isolated_cross_tp_reload_uses_exported_weights_and_reports_parity(tmp_path):
@@ -1091,6 +1198,9 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         hf_device_map_cpu_max_memory_gib=None,
         hf_source_post_load_dequantize=False,
         parity_tolerance_profile="standard",
+        capture_router_diagnostics=False,
+        shape_diagnostic=None,
+        cross_framework_gate_sequence_length=None,
     )
     persisted_logits = torch.load(
         tmp_path / ".checkpoint_robustness" / "source_load_reference_logits.pt",
@@ -1357,6 +1467,117 @@ def test_source_load_parity_success_returns_no_deferred_failure(tmp_path):
     assert failure is None
 
 
+def test_source_load_parity_emits_complete_schema_v3_metrics_once(tmp_path, capsys):
+    logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
+    shape_diagnostic = {"schema_version": 1, "enforced": False, "points": {}}
+    shape_report_path = tmp_path / "shape_diagnostics" / "phase_0_hf_shape.json"
+    shape_report_path.parent.mkdir(parents=True)
+    shape_report_path.write_text(json.dumps(shape_diagnostic) + "\n")
+    router_diagnostic = {"schema_version": 1, "frameworks": ["hf", "automodel"]}
+    router_dir = tmp_path / "router_diagnostics"
+    router_dir.mkdir()
+    (router_dir / "phase_0_hf.pt").touch()
+    (router_dir / "phase_0_automodel.pt").touch()
+
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.router_diagnostics.compare_glm_router_captures",
+        return_value=router_diagnostic,
+    ):
+        failure = _compare_source_load_parity(
+            (logits, None, None),
+            logits.clone(),
+            None,
+            artifact_dir=tmp_path,
+            policy=_source_load_parity_policy({"parity_tolerance_profile": "strict"}),
+        )
+
+    assert failure is None
+    payload = json.loads((tmp_path / "parity_metrics" / "phase_0_source_load.json").read_text())
+    assert payload["schema_version"] == 3
+    assert payload["shape_diagnostic"] == shape_diagnostic
+    assert payload["router_diagnostics"] == router_diagnostic
+    metric_lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("CHECKPOINT_PARITY_METRICS ")
+    ]
+    assert len(metric_lines) == 1
+    logged_payload = json.loads(metric_lines[0].removeprefix("CHECKPOINT_PARITY_METRICS "))
+    assert "shape_diagnostic" not in logged_payload
+    assert "router_diagnostics" not in logged_payload
+    assert logged_payload["embedded_diagnostics"] == ["router_diagnostics", "shape_diagnostic"]
+    assert logged_payload["report_path"] == str(tmp_path / "parity_metrics" / "phase_0_source_load.json")
+
+
+def test_source_load_diagnostic_failure_still_persists_parity_metrics(tmp_path):
+    logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
+    router_dir = tmp_path / "router_diagnostics"
+    router_dir.mkdir()
+    (router_dir / "phase_0_hf.pt").touch()
+    (router_dir / "phase_0_automodel.pt").touch()
+
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.router_diagnostics.compare_glm_router_captures",
+        side_effect=ValueError("malformed capture"),
+    ):
+        failure = _compare_source_load_parity(
+            (logits, None, None),
+            logits.clone(),
+            None,
+            artifact_dir=tmp_path,
+            policy=_source_load_parity_policy({"parity_tolerance_profile": "strict"}),
+        )
+
+    assert failure is not None
+    assert "Phase 0 diagnostics failed" in failure
+    payload = json.loads((tmp_path / "parity_metrics" / "phase_0_source_load.json").read_text())
+    assert payload["passed"] is True
+    assert payload["diagnostic_failure"] == {
+        "error_type": "ValueError",
+        "message": "malformed capture",
+    }
+
+
+def test_router_diagnostics_reject_pipeline_parallel_capture():
+    cfg = SimpleNamespace(distributed=SimpleNamespace(pp_size=2))
+
+    with pytest.raises(ValueError, match="does not support pipeline parallelism"):
+        _validate_router_diagnostic_config(cfg, {"capture_router_diagnostics": True})
+
+    _validate_router_diagnostic_config(cfg, {"capture_router_diagnostics": False})
+
+
+def test_router_diagnostics_accept_missing_distributed_section_for_supported_family():
+    cfg = SimpleNamespace(model=SimpleNamespace(pretrained_model_name_or_path="org/model"))
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._model_kwargs_from_config",
+            return_value={},
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_hf_config",
+            return_value=SimpleNamespace(model_type="glm4_moe_lite"),
+        ),
+    ):
+        _validate_router_diagnostic_config(cfg, {"capture_router_diagnostics": True})
+
+
+def test_router_diagnostics_reject_unsupported_family_before_model_load():
+    cfg = SimpleNamespace(model=SimpleNamespace(pretrained_model_name_or_path="org/model"))
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._model_kwargs_from_config",
+            return_value={},
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_hf_config",
+            return_value=SimpleNamespace(model_type="qwen3_moe"),
+        ),
+        pytest.raises(ValueError, match="supports only model_type='glm4_moe_lite'"),
+    ):
+        _validate_router_diagnostic_config(cfg, {"capture_router_diagnostics": True})
+
+
 def test_source_load_logit_skip_keeps_metrics_informational():
     policy = _source_load_parity_policy({"skip_source_load_logit_parity": True})
 
@@ -1378,6 +1599,7 @@ def test_repeatability_policy_is_same_implementation_and_informational():
 def test_parity_policies_use_structured_per_comparison_profile_and_threshold_overrides():
     custom_args = {
         "parity_tolerance_profile": "standard",
+        "cross_framework_gate_sequence_length": "128",
         "parity_tolerance_profile_overrides": {
             "source_load": "strict",
             "hf_reload": "relaxed",
@@ -1398,13 +1620,17 @@ def test_parity_policies_use_structured_per_comparison_profile_and_threshold_ove
 
     assert source.profile == "strict"
     assert source.mean_kl_threshold_override == 0.01
+    assert source.gate_sequence_length == 128
     assert automodel.profile == "standard"
+    assert automodel.gate_sequence_length is None
     assert automodel.mean_kl_threshold_override == 0.04
     assert automodel.p95_kl_threshold_override is None
     assert automodel.cosine_threshold_override == 0.99
     assert hf.profile == "relaxed"
     assert hf.p95_kl_threshold_override == 0.08
+    assert hf.gate_sequence_length == 128
     assert cross_tp.profile == "relaxed"
+    assert cross_tp.gate_sequence_length is None
     assert cross_tp.cosine_threshold_override == 0.997
 
 
@@ -1421,7 +1647,7 @@ def test_compare_logits_persists_machine_readable_metrics(tmp_path):
 
     assert failure is None
     payload = json.loads((tmp_path / "parity_metrics/phase_2_automodel_model_reload.json").read_text())
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["parity_document_sha256"] == _PARITY_DOCUMENT_SHA256
     assert payload["threshold_mode"] == "profile"
     assert payload["passed"] is True
@@ -1429,11 +1655,54 @@ def test_compare_logits_persists_machine_readable_metrics(tmp_path):
     assert payload["would_pass_profile"] is True
     assert payload["reference_logits"] == {"dtype": "torch.float32", "shape": [1, 2, 2]}
     assert payload["candidate_logits"] == {"dtype": "torch.float32", "shape": [1, 2, 2]}
+    assert payload["full_sequence_length"] == 2
+    assert payload["gate_sequence_length"] == 2
+    assert payload["uses_gate_prefix"] is False
     assert payload["metrics"]["token_count"] == 2
+    assert payload["gate_metrics"] == payload["metrics"]
     assert payload["metrics"]["mean_kl"] == pytest.approx(0.0, abs=1e-8)
     assert payload["metrics"]["mean_jsd"] == pytest.approx(0.0, abs=5e-8)
     assert payload["metrics"]["p95_jsd"] == pytest.approx(0.0, abs=5e-8)
     assert payload["metrics"]["max_jsd"] == pytest.approx(0.0, abs=5e-8)
+
+
+def test_compare_logits_rejects_diagnostic_key_collision(tmp_path):
+    logits = torch.tensor([[[2.0, -2.0]]])
+    policy = _LogitParityPolicy(
+        phase="phase_0",
+        comparison="source_load",
+        comparison_kind="cross_framework",
+        profile="standard",
+    )
+
+    with pytest.raises(ValueError, match="collide with parity record fields"):
+        _compare_logits(tmp_path, logits, logits.clone(), policy, diagnostics={"metrics": {}})
+
+
+def test_compare_logits_gates_cross_framework_prefix_and_reports_full_sequence(tmp_path):
+    reference_logits = torch.tensor([[[20.0, -20.0], [10.0, -10.0], [20.0, -20.0]]])
+    candidate_logits = reference_logits.clone()
+    candidate_logits[:, 2, :] = -candidate_logits[:, 2, :]
+    policy = _LogitParityPolicy(
+        phase="phase_0",
+        comparison="source_load",
+        comparison_kind="cross_framework",
+        profile="strict",
+        gate_sequence_length=2,
+    )
+
+    failure = _compare_logits(tmp_path, reference_logits, candidate_logits, policy)
+
+    assert failure is None
+    payload = json.loads((tmp_path / "parity_metrics/phase_0_source_load.json").read_text())
+    assert payload["passed"] is True
+    assert payload["uses_gate_prefix"] is True
+    assert payload["full_sequence_length"] == 3
+    assert payload["gate_sequence_length"] == 2
+    assert payload["gate_metrics"]["token_count"] == 2
+    assert payload["metrics"]["token_count"] == 3
+    assert payload["threshold_failures"] == []
+    assert payload["full_sequence_threshold_failures"]
 
 
 def test_compare_logits_marks_skipped_gate_as_informational(tmp_path):
