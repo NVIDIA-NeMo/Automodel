@@ -171,43 +171,9 @@ Implement files in dependency order:
 2. **rope_utils.py** (if needed) -- RoPE implementation
 3. **layers.py** (if needed) -- Attention, MLP, decoder block classes
 4. **model.py** -- The main `ForCausalLM` (or `ForConditionalGeneration`) class
-5. **state_dict_adapter.py** -- HF weight conversion. Leave
-   `_supports_low_memory_dcp_load` disabled unless most checkpoint tensors load
-   directly into final model storage and every remaining allocating conversion
-   has a small, bounded temporary footprint for every supported backend and
-   configuration. Any opt-in needs focused tests that prove direct destinations
-   alias model storage, bound allocating conversions, and report
-   `supports_low_memory_dcp_load=False` for unsafe variants; a model-sized device
-   temporary can otherwise cause an out-of-memory failure.
-
-   The checkpoint router currently uses this capability to let one-process
-   custom-model safetensors initialization avoid a full host checkpoint load.
-   Multi-process loads already use DCP, but they share the same adapter conversion
-   and expert-storage rules.
-
-   For adapters using `MoESplitExpertsStateDictMixin`, decide this capability
-   from the runtime expert storage, not only from the configured backend name:
-
-   - Non-EP dispatchers use ordinary grouped experts whose checkpoint tensors
-     alias the final model parameters.
-   - At world size one, the maintained EP dispatchers (`deepep`, `hybridep`, and
-     `uccl_ep`) fall back to ordinary grouped experts and can use the low-memory
-     path.
-   - At larger world sizes, the `gmm`, `torch_mm`, and `torch_mm_mxfp8` expert
-     backends use model-backed grouped storage. TE and other expert backends use
-     virtual grouped tensors assembled from per-expert parameters, so they must
-     not advertise low-memory DCP.
-   - The mixin reports the capability as false for `expert_bias=True` and MoK.
-     The loader must also bypass the low-memory route for quantized expert
-     conversion and any other variant that must rebuild model-sized checkpoint
-     tensors after reading them.
-
-   A false capability value does not mean checkpoint loading is unsupported; it
-   selects an allocating or rebuilding load path. A false positive is dangerous:
-   if an adapter marks a temporary tensor as loaded in-place, `from_hf` can skip
-   rebuilding the real parameter and silently leave its previous value. Test each
-   optimized destination by writing a sentinel value through it and asserting
-   that the final model parameter storage changes.
+5. **state_dict_adapter.py** -- HF weight conversion. Treat checkpoint I/O
+   performance as part of the implementation, and evaluate the low-memory DCP
+   capability as described in Section 2.6.
 6. **__init__.py** -- Re-export the main model class
 
 See the pattern files for detailed implementation guidance:
@@ -295,7 +261,38 @@ The implementation should explicitly cover:
 - Registration of the `ForConditionalGeneration` class in `_transformers/registry.py`.
 - Tiny tests that exercise image-text inputs and verify the adapter round-trip.
 
-### 2.6 Register in registry
+### 2.6 Checkpoint I/O performance
+
+Treat checkpoint performance as an implementation requirement, not a later
+optimization. For every new or materially changed state-dict adapter, evaluate
+both latency and peak host/device memory for loading and for any save or export
+path the change affects. In particular:
+
+- Avoid full-checkpoint or model-sized temporary copies when tensors can load
+  directly into final model storage or be transformed in bounded parts.
+- Keep distributed reads and conversions rank-local when a rank needs only its
+  shard; do not materialize a global tensor on every rank unnecessarily.
+- Avoid repeated tensor merges, copies, full-heap garbage collections, shard
+  scans, or file opens inside model-sized loops.
+- Record representative before/after latency and peak-memory evidence for an
+  optimized path, including the model, dtype, backend, and topology.
+
+Every adapter must evaluate `supports_low_memory_dcp_load`. Set
+`_supports_low_memory_dcp_load = True` only when most checkpoint tensors write
+directly into final model storage and every remaining allocating conversion has
+a small, bounded temporary footprint for every runtime variant that reports
+support. Keep it false when a backend, topology, dtype, quantization mode, or
+model option requires model-sized rebuilding. A false value selects the safe
+fallback; it does not mean checkpoint loading is unsupported.
+
+An opt-in needs focused tests that write sentinel values through direct
+destinations and prove the final model storage changes, bound any allocating
+conversions, and verify unsafe runtime variants report the capability as false.
+This storage test is also a correctness requirement: a false positive can cause
+the adapter to treat a temporary tensor as loaded in place and skip rebuilding
+the real parameter.
+
+### 2.7 Register in registry
 
 Add the model to `MODEL_ARCH_MAPPING` in `_transformers/registry.py`:
 
@@ -319,7 +316,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 }
 ```
 
-### 2.7 Declare capabilities and precision-sensitive params
+### 2.8 Declare capabilities and precision-sensitive params
 
 Every class registered in `MODEL_ARCH_MAPPING` must declare parallelism
 capabilities, either with a static nested `ModelCapabilities` dataclass or a
@@ -450,8 +447,9 @@ that only surface in a full parity comparison.
 - [ ] Implemented layers.py (if custom layers needed)
 - [ ] Implemented rope_utils.py (if custom RoPE needed)
 - [ ] Implemented model.py with `HFCheckpointingMixin`
-- [ ] Implemented state_dict_adapter.py; any low-memory DCP opt-in proves direct destinations reach model storage,
-  bounds allocating conversions, and reports `False` for unsafe variants
+- [ ] Implemented state_dict_adapter.py and evaluated checkpoint latency plus peak host/device memory per Section 2.6
+- [ ] Evaluated `supports_low_memory_dcp_load`; any opt-in proves direct destinations reach model storage, bounds
+  allocating conversions, and reports `False` for unsafe variants
 - [ ] Implemented __init__.py with re-export
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
 - [ ] Registered custom config in `_CUSTOM_CONFIG_REGISTRATIONS` (if applicable)
@@ -462,7 +460,7 @@ that only surface in a full parity comparison.
 - [ ] Created example YAML config
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)
-- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`, Mamba `D` when reference-fp32, MoE gate bias, attention-sink bias, `scale`, …) — see §2.7
+- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`, Mamba `D` when reference-fp32, MoE gate bias, attention-sink bias, `scale`, …) — see §2.8
 - [ ] Created layer equivalence tests for every rewritten layer (matching model dtype)
 - [ ] Created functional tests (training loss decreases)
 - [ ] Updated docs/model-coverage page
