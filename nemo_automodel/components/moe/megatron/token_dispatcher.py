@@ -340,6 +340,11 @@ class _HybridEPMetadataProcessor(nn.Module):
         ).scatter_add(1, safe_indices, safe_probs)
 
 
+# DeepEP's hybrid-ep metadata allgather asserts bytes_per_rank % 16 == 0 on a
+# 4-byte-per-token array, so per-rank token counts must be multiples of 4.
+_HYBRIDEP_TOKEN_ALIGNMENT = 4
+
+
 class _HybridEPManager(_DispatchManager):
     """
     A manager class to handle fused all-to-all communication processes for MoE models using
@@ -387,6 +392,9 @@ class _HybridEPManager(_DispatchManager):
         # Handle used for combine operation
         self.handle = None
         self.pad_multiple = None
+        # Set by dispatch() when this rank padded its tokens up to the EP-group
+        # maximum; combine() slices the padding back off.
+        self.num_unpadded_tokens: int | None = None
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -443,6 +451,27 @@ class _HybridEPManager(_DispatchManager):
         self.num_permuted_tokens = None
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
+
+        # HybridEP's fused all-to-all exchanges fixed-extent buffers, so every rank
+        # in the EP group must dispatch the same number of tokens, and the kernel's
+        # metadata allgather additionally requires that count to be 16-byte aligned
+        # (4 tokens). Unequal or unaligned counts (variable-length or packed dynamic
+        # batches) abort or deadlock the collective. Pad this rank's tokens up to
+        # the aligned group-wide maximum: padded rows route to no expert (all-False
+        # routing map), and combine() slices them back off.
+        self.num_unpadded_tokens = None
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
+            num_tokens = hidden_states.shape[0]
+            group_max = torch.tensor(num_tokens, device=hidden_states.device)
+            torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
+            target_tokens = -(-int(group_max) // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+            pad_tokens = target_tokens - num_tokens
+            if pad_tokens > 0:
+                self.num_unpadded_tokens = num_tokens
+                hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_tokens))
+                self.routing_map = nn.functional.pad(self.routing_map, (0, 0, 0, pad_tokens))
+                self.token_probs = nn.functional.pad(self.token_probs, (0, 0, 0, pad_tokens))
+
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
             x=hidden_states,
             topk_idx=self.token_indices,
@@ -481,6 +510,9 @@ class _HybridEPManager(_DispatchManager):
         )
         self.handle = None
         self.num_permuted_tokens = None
+        if self.num_unpadded_tokens is not None:
+            hidden_states = hidden_states[: self.num_unpadded_tokens]
+            self.num_unpadded_tokens = None
         return hidden_states
 
     def get_dispatched_metadata(self) -> torch.Tensor:

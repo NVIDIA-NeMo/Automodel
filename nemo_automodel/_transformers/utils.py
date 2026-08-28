@@ -261,9 +261,22 @@ def apply_cache_compatibility_patches():
 
         DynamicCache.to_legacy_cache = _to_legacy_cache
 
+    # OutputRecorder moved from transformers.utils.generic to
+    # transformers.utils.output_capturing in transformers v5.x. Pre-v5
+    # remote-code models (e.g. Kimi-Linear and MiniMax-M2 checkpoints) import
+    # it from the old location for their auxiliary router-logit recorders and
+    # otherwise fail at module import. Alias the relocated class back; v5.x
+    # re-exports it from transformers.modeling_utils.
+    import transformers.modeling_utils as mu
+    import transformers.utils.generic as generic_utils
+
+    if not hasattr(generic_utils, "OutputRecorder"):
+        _output_recorder = getattr(mu, "OutputRecorder", None)
+        if _output_recorder is not None:
+            generic_utils.OutputRecorder = _output_recorder
+
     # _tied_weights_keys changed from list to dict in transformers v5.x.
     # Patch post_init to auto-convert list -> dict for remote-code models.
-    import transformers.modeling_utils as mu
 
     if not getattr(mu.PreTrainedModel.post_init, "_nemo_tied_keys_patched", False):
         _orig_post_init = mu.PreTrainedModel.post_init

@@ -17,8 +17,7 @@
 import os
 
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
-    _DEFAULT_INPUT_IDS,
-    _DEFAULT_PROMPT,
+    _get_parity_document,
     run_checkpoint_robustness,
 )
 
@@ -26,7 +25,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
 def _get_vlm_input_ids(processor_name: str | None) -> list[int]:
     """Encode the parity prompt through the same processor family used by VLM data loading."""
     if processor_name is None:
-        return _DEFAULT_INPUT_IDS
+        raise ValueError("tokenizer_name is required to tokenize the checkpoint parity document")
 
     from transformers import AutoProcessor
 
@@ -36,7 +35,7 @@ def _get_vlm_input_ids(processor_name: str | None) -> list[int]:
         local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
     )
     tokenizer = getattr(processor, "tokenizer", processor)
-    return tokenizer.encode(_DEFAULT_PROMPT, add_special_tokens=False)
+    return tokenizer.encode(_get_parity_document(), add_special_tokens=False)
 
 
 def test_checkpoint_robustness_vlm() -> None:
