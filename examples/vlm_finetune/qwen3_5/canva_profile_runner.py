@@ -206,8 +206,8 @@ def _run_accelerate(cfg: RecipeConfig) -> None:
         model_name,
         torch_dtype=torch.bfloat16,
         attn_implementation=attention,
-        use_cache=False,
     )
+    model.config.use_cache = False
     model.train()
     accepted_forward_keys = _accepted_forward_keys(model)
 
