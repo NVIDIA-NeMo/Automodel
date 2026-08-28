@@ -269,7 +269,7 @@ navigation:
             path: ../../model-coverage/vlm/minimax/minimax-m3.mdx
             slug: minimax-m3
           - page: "GLM-5.3-Flash"
-            path: ../../model-coverage/vlm/zai-org/glm-5-3-flash.mdx
+            path: ../../model-coverage/vlm/thudm/glm-5-3-flash.mdx
             slug: glm-5-3-flash
       - section: "Multimodal"
         slug: multimodal
