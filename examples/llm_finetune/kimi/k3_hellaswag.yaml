@@ -142,3 +142,6 @@ ci:
   nodes: 64
   cluster_tag: gb200
   time: "01:30:00"
+
+prewarm:
+  comm_groups: true
