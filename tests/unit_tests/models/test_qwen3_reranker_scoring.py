@@ -30,6 +30,9 @@ import json
 
 import pytest
 import torch
+from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
 from nemo_automodel.components.models.qwen3_reranker.model import (
     Qwen3RerankerConfig,
@@ -175,9 +178,14 @@ def _yes_minus_no_from_causal_lm(model, input_ids, attention_mask) -> torch.Tens
 
 
 def test_checkpoint_reloads_as_stock_causal_lm_and_scores_identically(tmp_path):
-    """The point of the identity rewrite: no custom code, no trust_remote_code, same score."""
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+    """The point of the identity rewrite: no custom code, no trust_remote_code, same score.
 
+    Loaded through ``AutoModelForCausalLM``, which is how a consumer actually reaches this
+    checkpoint and the only path that exercises the rewrite. Naming ``Qwen3ForCausalLM``
+    directly would prove less: the concrete class does not consult ``model_type`` at all, so
+    it loads the weights happily even if the serialized identity still said this package's
+    class -- the very thing that would send a real caller looking for custom code.
+    """
     model = _tiny_model()
     input_ids = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
     attention_mask = torch.ones_like(input_ids)
@@ -186,11 +194,13 @@ def test_checkpoint_reloads_as_stock_causal_lm_and_scores_identically(tmp_path):
         original = model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
 
     model.save_pretrained(tmp_path)
-    reloaded = Qwen3ForCausalLM.from_pretrained(tmp_path)
+    reloaded = AutoModelForCausalLM.from_pretrained(tmp_path)
     reloaded.eval()
 
-    # The stock class must be what the checkpoint declares, so AutoModelForCausalLM and
-    # vLLM resolve it without consulting this package.
+    # Resolution, not just loadability: the checkpoint must land on upstream's class, and
+    # its config must come back as the stock Qwen3Config rather than the reranker subclass.
+    assert type(reloaded) is Qwen3ForCausalLM
+    assert type(AutoConfig.from_pretrained(tmp_path)) is Qwen3Config
     assert json.loads((tmp_path / "config.json").read_text())["architectures"] == ["Qwen3ForCausalLM"]
     torch.testing.assert_close(
         _yes_minus_no_from_causal_lm(reloaded, input_ids, attention_mask), original, rtol=1e-4, atol=1e-4
@@ -221,11 +231,13 @@ def test_checkpoint_reloads_as_the_reranker_and_keeps_the_yes_no_ids(tmp_path):
 
 
 def test_round_trip_preserves_no_weights_beyond_the_backbone(tmp_path):
-    """A reranker-only parameter would break the stock load; there must be none."""
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+    """A reranker-only parameter would break the stock load; there must be none.
 
+    Also via ``AutoModelForCausalLM``, so a stray parameter is caught on the same path a
+    consumer uses rather than one this test picked.
+    """
     model = _tiny_model()
     model.save_pretrained(tmp_path)
-    reloaded = Qwen3ForCausalLM.from_pretrained(tmp_path)
+    reloaded = AutoModelForCausalLM.from_pretrained(tmp_path)
 
     assert set(reloaded.state_dict()) == set(model.state_dict())
