@@ -16,11 +16,13 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
 
+from nemo_automodel.components.models.common.cudnn_sparse_attention import (
+    cudnn_sparse_attention as _shared_cudnn_sparse_attention,
+)
 from nemo_automodel.shared.import_utils import safe_import_from
 
 _HAS_CUDNN_DSA, _CUDNN_DSA = safe_import_from(
@@ -39,9 +41,7 @@ _HAS_FLASH_MLA, _FLASH_MLA_SPARSE_FWD = safe_import_from(
 
 _INDEX_HEAD_DIM = 128
 _ATTENTION_HEAD_DIM = 576
-_VALUE_HEAD_DIM = 512
 _MAX_TOPK = 2048
-_FLASH_MLA_TOPK_ALIGNMENT = 512
 _TOPK_SCRATCH_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 _TOPK_SCRATCH_INT32_FACTOR = 2
 _TOPK_ROW_ALIGNMENT = 512
@@ -565,185 +565,6 @@ def cudnn_indexer_topk(
     return global_indices.unsqueeze(1).contiguous()
 
 
-def _padded_head_count(num_heads: int, major: int) -> int:
-    """Return the FlashMLA-supported head count for one SM generation."""
-    if major >= 10:
-        for padded in (64, 128):
-            if num_heads == padded or (num_heads < padded and padded % num_heads == 0):
-                return padded
-        alignment = 128
-    else:
-        alignment = 64
-    if num_heads % alignment == 0:
-        return num_heads
-    if num_heads < alignment and alignment % num_heads == 0:
-        return alignment
-    raise ValueError(f"FlashMLA sparse prefill requires the query-head count to divide {alignment}, got H={num_heads}.")
-
-
-def _pad_attention_heads(
-    q: torch.Tensor, attn_sink: torch.Tensor, padded_heads: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pad query ``[T, H, 576]`` and sink ``[H]`` to ``padded_heads``."""
-    if q.shape[1] == padded_heads:
-        return q, attn_sink
-    q_padded = q.new_zeros((q.shape[0], padded_heads, q.shape[2]))
-    q_padded[:, : q.shape[1]] = q
-    sink_padded = attn_sink.new_full((padded_heads,), float("-inf"))
-    sink_padded[: q.shape[1]] = attn_sink
-    return q_padded, sink_padded
-
-
-class _CudnnSparseAttention(torch.autograd.Function):
-    """Pair FlashMLA forward with cuDNN backward for latent THD attention."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        kv_latent: torch.Tensor,
-        topk_indices: torch.Tensor,
-        softmax_scale: float,
-        padded_heads: int,
-        topk_length: torch.Tensor | None,
-        all_rows_nonempty: bool,
-        valid_row_indices: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Run FlashMLA forward and save tensors required by cuDNN backward.
-
-        Args:
-            ctx: Autograd context used to save forward tensors and scalar metadata.
-            q: CUDA BF16 query tensor of shape ``[T_q, H, 576]``.
-            kv_latent: CUDA BF16 gathered K/V tensor of shape ``[T_k, 1, 576]``.
-            topk_indices: CUDA int32 tensor of shape ``[T_q, 1, K]`` containing
-                global padded-storage K/V coordinates and a ``-1`` suffix.
-            softmax_scale: Scale applied to query-key scores.
-            padded_heads: FlashMLA-compatible padded head count.
-            topk_length: Optional int32 valid-prefix lengths of shape ``[T_q]``.
-            all_rows_nonempty: Whether every query has a positive valid prefix.
-            valid_row_indices: Optional int64 indices of nonempty queries with shape
-                ``[T_valid]``.
-
-        Returns:
-            CUDA BF16 latent values of shape ``[T_q, H, 512]``.
-        """
-        kv = kv_latent.squeeze(1).contiguous()
-        if topk_length is None:
-            indices, topk_length = _compact_and_sort_indices(topk_indices.squeeze(1), kv.shape[0])
-        else:
-            # Model-prepared lengths imply the indexer already emitted a compact, sorted
-            # valid prefix. Reuse it directly instead of sorting [T, K] in every shared layer.
-            indices = topk_indices.squeeze(1).contiguous()
-        padded_topk = math.ceil(indices.shape[-1] / _FLASH_MLA_TOPK_ALIGNMENT) * _FLASH_MLA_TOPK_ALIGNMENT
-        if padded_topk != indices.shape[-1]:
-            indices = torch.nn.functional.pad(indices, (0, padded_topk - indices.shape[-1]), value=-1)
-
-        attn_sink = torch.full((q.shape[1],), float("-inf"), dtype=torch.float32, device=q.device)
-        q_kernel, sink_kernel = _pad_attention_heads(q.contiguous(), attn_sink, padded_heads)
-        out_kernel, _max_logits, lse_kernel = _FLASH_MLA_SPARSE_FWD(
-            q_kernel,
-            kv.unsqueeze(1),
-            indices.unsqueeze(1),
-            softmax_scale,
-            d_v=_VALUE_HEAD_DIM,
-            attn_sink=sink_kernel,
-            topk_length=topk_length,
-            indexer_topk=0,
-        )
-        out = out_kernel[:, : q.shape[1]].contiguous()
-        lse = lse_kernel[:, : q.shape[1]].contiguous()
-        if not all_rows_nonempty:
-            out.masked_fill_(topk_length.eq(0).view(-1, 1, 1), 0)
-        cached_valid_rows = (
-            valid_row_indices if valid_row_indices is not None else torch.empty(0, dtype=torch.int64, device=q.device)
-        )
-        ctx.save_for_backward(q, kv, out, lse, attn_sink, indices.clamp_min(0), topk_length, cached_valid_rows)
-        ctx.softmax_scale = softmax_scale
-        ctx.padded_heads = padded_heads
-        ctx.all_rows_nonempty = all_rows_nonempty
-        ctx.has_cached_valid_rows = valid_row_indices is not None
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        """Map output gradients to query and gathered latent-KV layouts.
-
-        Args:
-            ctx: Autograd context populated by :meth:`forward`.
-            grad_output: CUDA BF16 output gradient of shape ``[T_q, H, 512]``.
-
-        Returns:
-            Gradients for the eight forward inputs: query ``[T_q, H, 576]``,
-            gathered latent K/V ``[T_k, 1, 576]``, then ``None`` for the index
-            and metadata inputs.
-        """
-        q, kv, out, lse, attn_sink, indices, topk_length, cached_valid_rows = ctx.saved_tensors
-        valid_row_indices = None
-        if not ctx.all_rows_nonempty:
-            valid_row_indices = (
-                cached_valid_rows
-                if ctx.has_cached_valid_rows
-                else torch.nonzero(topk_length > 0, as_tuple=False).flatten()
-            )
-
-        q_input = q
-        out_input = out
-        grad_input = grad_output
-        lse_input = lse
-        indices_kernel = indices
-        topk_length_kernel = topk_length
-        used_dummy = False
-        if valid_row_indices is not None:
-            if valid_row_indices.numel() == 0:
-                used_dummy = True
-                q_input = torch.zeros_like(q[:1])
-                out_input = torch.zeros_like(out[:1])
-                grad_input = torch.zeros_like(grad_output[:1])
-                lse_input = torch.zeros_like(lse[:1])
-                indices_kernel = torch.zeros_like(indices[:1])
-                topk_length_kernel = torch.ones_like(topk_length[:1])
-            else:
-                q_input = q.index_select(0, valid_row_indices)
-                out_input = out.index_select(0, valid_row_indices)
-                grad_input = grad_output.index_select(0, valid_row_indices)
-                lse_input = lse.index_select(0, valid_row_indices)
-                indices_kernel = indices.index_select(0, valid_row_indices)
-                topk_length_kernel = topk_length.index_select(0, valid_row_indices)
-
-        q_kernel, sink_kernel = _pad_attention_heads(q_input, attn_sink, ctx.padded_heads)
-        if ctx.padded_heads == q.shape[1]:
-            out_kernel = out_input
-            grad_kernel = grad_input.contiguous()
-            lse_kernel = lse_input
-        else:
-            out_kernel = out_input.new_zeros((out_input.shape[0], ctx.padded_heads, out_input.shape[2]))
-            out_kernel[:, : out_input.shape[1]] = out_input
-            grad_kernel = grad_input.new_zeros((grad_input.shape[0], ctx.padded_heads, grad_input.shape[2]))
-            grad_kernel[:, : grad_input.shape[1]] = grad_input
-            lse_kernel = lse_input.new_zeros((lse_input.shape[0], ctx.padded_heads))
-            lse_kernel[:, : lse_input.shape[1]] = lse_input
-
-        result = _CUDNN_DSA.sparse_attention_backward_wrapper(
-            q_kernel.contiguous(),
-            kv,
-            out_kernel.contiguous(),
-            grad_kernel.contiguous(),
-            lse_kernel.contiguous(),
-            sink_kernel,
-            indices_kernel,
-            softmax_scale=ctx.softmax_scale,
-            topk_length=topk_length_kernel,
-        )
-        if valid_row_indices is None:
-            grad_q = result["dq"][:, : q.shape[1]].contiguous()
-        else:
-            grad_q_valid = result["dq"][:0, : q.shape[1]] if used_dummy else result["dq"][:, : q.shape[1]]
-            grad_q = torch.zeros_like(q)
-            grad_q.index_copy_(0, valid_row_indices, grad_q_valid)
-        grad_kv = result["dkv"].unsqueeze(1).contiguous()
-        return grad_q, grad_kv, None, None, None, None, None, None
-
-
 def cudnn_sparse_attention(
     q: torch.Tensor,
     kv_latent: torch.Tensor,
@@ -753,90 +574,45 @@ def cudnn_sparse_attention(
     all_rows_nonempty: bool = False,
     valid_row_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run split GLM-5.2 sparse MLA with FlashMLA forward and cuDNN backward.
+    """Run GLM-5.2 sparse MLA through the shared cuDNN adapter.
 
     Args:
-        q: Absorbed MLA query, CUDA BF16 THD ``[T_q, H, 576]``. The final
-            dimension is ``kv_lora_rank + qk_rope_head_dim`` (``512 + 64``).
-        kv_latent: Shared latent key/value, CUDA BF16 THD ``[T_kv, 1, 576]``.
-        topk_indices: Global padded-storage K/V indices, CUDA int32
-            ``[T_q, 1, K]`` with ``-1`` for invalid slots.
-        softmax_scale: Already-computed MLA attention scale. It is forwarded
-            unchanged to both FlashMLA and cuDNN backward.
-        topk_length: Optional int32 valid-prefix lengths ``[T_q]`` prepared once
-            from packed causal metadata. When supplied, ``topk_indices`` must already
-            contain the indexer's canonical compact, ascending prefix.
+        q: Contiguous CUDA BF16 absorbed query tensor of shape
+            ``[query_tokens, heads, 576]``.
+        kv_latent: Contiguous CUDA BF16 latent K/V tensor of shape
+            ``[key_tokens, 1, 576]``.
+        topk_indices: Contiguous CUDA int32 tensor of shape
+            ``[query_tokens, 1, sparse_width]`` with global K/V coordinates
+            and invalid entries marked ``-1``.
+        softmax_scale: Scale forwarded unchanged to FlashMLA and cuDNN backward.
+        topk_length: Optional contiguous CUDA int32 valid-prefix lengths of shape
+            ``[query_tokens]``.
         all_rows_nonempty: Whether every query has a positive valid-prefix length.
-            The model supplies this cached metadata flag to keep unpadded inputs on
-            the allocation-free backward path.
-        valid_row_indices: Optional cached int64 row indices whose valid-prefix length
-            is positive. The model supplies these once per stage for padded inputs so
-            every attention layer can compact without rescanning CUDA metadata.
+        valid_row_indices: Optional contiguous CUDA int64 indices of nonempty
+            queries with shape ``[valid_query_tokens]``.
 
     Returns:
-        Latent sparse-attention output, CUDA BF16 ``[T_q, H, 512]``. The caller
-        applies the model-owned value up-projection ``w_vc``.
-
-    Raises:
-        RuntimeError: If optional kernels, CUDA, or SM90+ are unavailable.
-        TypeError: If compute tensors are not BF16 or indices are not int32.
-        ValueError: If tensor layouts, dimensions, top-k, or scale are invalid.
+        Contiguous CUDA BF16 latent output tensor of shape
+        ``[query_tokens, heads, 512]``.
     """
-    _require_available()
-    major, _ = _require_cuda_tensors("cuDNN DSA sparse attention", q, kv_latent, topk_indices)
-    if q.dtype != torch.bfloat16 or kv_latent.dtype != torch.bfloat16:
-        raise TypeError(f"q and kv_latent must be bfloat16, got {q.dtype} and {kv_latent.dtype}.")
-    if topk_indices.dtype != torch.int32:
-        raise TypeError(f"topk_indices must be int32, got {topk_indices.dtype}.")
-    if q.ndim != 3 or q.shape[-1] != _ATTENTION_HEAD_DIM:
-        raise ValueError(f"q must have shape [T_q, H, {_ATTENTION_HEAD_DIM}], got {tuple(q.shape)}.")
-    if kv_latent.ndim != 3 or kv_latent.shape[1:] != (1, _ATTENTION_HEAD_DIM):
-        raise ValueError(f"kv_latent must have shape [T_kv, 1, {_ATTENTION_HEAD_DIM}], got {tuple(kv_latent.shape)}.")
-    if topk_indices.ndim != 3 or topk_indices.shape[:2] != (q.shape[0], 1):
-        raise ValueError(f"topk_indices must have shape [T_q, 1, K], got {tuple(topk_indices.shape)}.")
-    _validate_topk(topk_indices.shape[-1])
-    if kv_latent.shape[0] >= torch.iinfo(torch.int32).max:
-        raise ValueError("The flattened KV token count must fit in an int32 global index.")
-    if not isinstance(softmax_scale, (float, int)) or not math.isfinite(float(softmax_scale)):
-        raise TypeError("softmax_scale must be a finite Python float.")
-    if float(softmax_scale) <= 0.0:
-        raise ValueError(f"softmax_scale must be positive, got {softmax_scale}.")
-    if not isinstance(all_rows_nonempty, bool):
-        raise TypeError(f"all_rows_nonempty must be a bool, got {type(all_rows_nonempty).__name__}.")
-    if all_rows_nonempty and valid_row_indices is not None:
-        raise ValueError("valid_row_indices must be None when all_rows_nonempty is true.")
-    if topk_length is not None:
-        if topk_length.shape != (q.shape[0],) or topk_length.dtype != torch.int32 or topk_length.device != q.device:
-            raise ValueError(
-                "topk_length must be an int32 tensor on the query device with shape "
-                f"{(q.shape[0],)}, got shape={tuple(topk_length.shape)}, "
-                f"dtype={topk_length.dtype}, device={topk_length.device}."
-            )
-        if not topk_length.is_contiguous():
-            raise ValueError("topk_length must be contiguous.")
-    if valid_row_indices is not None:
-        if topk_length is None:
-            raise ValueError("valid_row_indices requires precomputed topk_length metadata.")
-        if (
-            valid_row_indices.ndim != 1
-            or valid_row_indices.dtype != torch.int64
-            or valid_row_indices.device != q.device
-            or not valid_row_indices.is_contiguous()
-        ):
-            raise ValueError("valid_row_indices must be a contiguous int64 tensor on the query device.")
-        if valid_row_indices.numel() > q.shape[0]:
-            raise ValueError("valid_row_indices cannot contain more entries than query rows.")
-
-    padded_heads = _padded_head_count(q.shape[1], major)
-    return _CudnnSparseAttention.apply(
-        q.contiguous(),
-        kv_latent.contiguous(),
-        topk_indices.contiguous(),
-        float(softmax_scale),
-        padded_heads,
-        topk_length,
-        all_rows_nonempty,
-        valid_row_indices,
+    if q.ndim == 3 and q.shape[-1] != _ATTENTION_HEAD_DIM:
+        raise ValueError(
+            f"GLM-5.2 q must have shape [query_tokens, heads, {_ATTENTION_HEAD_DIM}], got {tuple(q.shape)}."
+        )
+    if kv_latent.ndim == 3 and kv_latent.shape[1:] != (1, _ATTENTION_HEAD_DIM):
+        raise ValueError(
+            f"GLM-5.2 kv_latent must have shape [key_tokens, 1, {_ATTENTION_HEAD_DIM}], got {tuple(kv_latent.shape)}."
+        )
+    if topk_indices.ndim == 3:
+        _validate_topk(topk_indices.shape[-1])
+    return _shared_cudnn_sparse_attention(
+        q,
+        kv_latent,
+        topk_indices,
+        softmax_scale,
+        topk_length=topk_length,
+        all_rows_nonempty=all_rows_nonempty,
+        valid_row_indices=valid_row_indices,
     )
 
 
