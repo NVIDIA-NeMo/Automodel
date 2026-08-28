@@ -62,6 +62,19 @@ def test_tiny_hybrid_packed_forward_backward_is_finite():
     assert model.model.language_model.layers["3"].self_attn.q_a_proj.weight.grad is not None
 
 
+def test_torch_kda_decay_scales_the_key_dimension():
+    q = torch.tensor([[[[0.0, 0.0]], [[1.0, 0.0]]]])
+    k = torch.tensor([[[[1.0, 0.0]], [[0.0, 0.0]]]])
+    v = torch.tensor([[[[1.0, 2.0]], [[0.0, 0.0]]]])
+    g = torch.tensor([[[[1.0, 1.0]], [[0.5, 0.25]]]]).log()
+    beta = torch.tensor([[[1.0], [0.0]]])
+
+    output = glm5_next_layers._torch_recurrent_kda(q, k, v, g, beta, cu_seqlens=None)
+
+    expected = torch.tensor([0.5, 1.0]) / torch.sqrt(torch.tensor(2.0))
+    torch.testing.assert_close(output[0, 1, 0], expected)
+
+
 def test_text_config_exposes_hidden_states_for_fused_linear_ce():
     model = tiny_glm5_next_model().eval()
     model.config.text_config.output_hidden_states = True

@@ -273,7 +273,7 @@ def _torch_recurrent_kda(
         for token in range(start, end):
             q_t = q[:, token].float() * (head_dim**-0.5)
             k_t, v_t = k[:, token].float(), v[:, token].float()
-            state = state * g[:, token].exp().unsqueeze(-2)
+            state = state * g[:, token].exp().unsqueeze(-1)
             prediction = torch.einsum("bhd,bhdv->bhv", k_t, state)
             error = (v_t - prediction) * beta[:, token].float().unsqueeze(-1)
             state = state + torch.einsum("bhd,bhv->bhdv", k_t, error)
