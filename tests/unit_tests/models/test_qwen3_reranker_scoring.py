@@ -26,6 +26,8 @@ This class returns the raw log-odds ``logit(yes) - logit(no)``; a sigmoid recove
 same probability.
 """
 
+import json
+
 import pytest
 import torch
 
@@ -151,3 +153,79 @@ def test_missing_attention_mask_raises():
     model = _tiny_model()
     with pytest.raises(ValueError, match="attention_mask is required"):
         model(input_ids=torch.tensor([[1, 2, 3]]))
+
+
+# ---------------------------------------------------------------------------
+# Save/reload round trip.
+#
+# to_dict() rewriting the serialized identity is only worth anything if a checkpoint
+# written from this class actually comes back through the stock loader and scores the
+# same. Asserting on to_dict() alone leaves the whole of save_pretrained/from_pretrained
+# untested: a weight-key rename, a dropped config field, or a tie_word_embeddings mismatch
+# would all pass that check and still produce a checkpoint that reloads wrong or not at
+# all. These reload it for real and compare scores.
+# ---------------------------------------------------------------------------
+
+
+def _yes_minus_no_from_causal_lm(model, input_ids, attention_mask) -> torch.Tensor:
+    """Score a plain causal LM the way the model card does, at the final position."""
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits[:, -1, :]
+    return logits[:, YES_ID] - logits[:, NO_ID]
+
+
+def test_checkpoint_reloads_as_stock_causal_lm_and_scores_identically(tmp_path):
+    """The point of the identity rewrite: no custom code, no trust_remote_code, same score."""
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+
+    model = _tiny_model()
+    input_ids = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        original = model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
+
+    model.save_pretrained(tmp_path)
+    reloaded = Qwen3ForCausalLM.from_pretrained(tmp_path)
+    reloaded.eval()
+
+    # The stock class must be what the checkpoint declares, so AutoModelForCausalLM and
+    # vLLM resolve it without consulting this package.
+    assert json.loads((tmp_path / "config.json").read_text())["architectures"] == ["Qwen3ForCausalLM"]
+    torch.testing.assert_close(
+        _yes_minus_no_from_causal_lm(reloaded, input_ids, attention_mask), original, rtol=1e-4, atol=1e-4
+    )
+
+
+def test_checkpoint_reloads_as_the_reranker_and_keeps_the_yes_no_ids(tmp_path):
+    """Resuming training must recover the token ids; without them the score is meaningless."""
+    model = _tiny_model()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        original = model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+    model.save_pretrained(tmp_path)
+    reloaded = Qwen3RerankerForCausalReranking.from_pretrained(
+        tmp_path, config=Qwen3RerankerConfig.from_pretrained(tmp_path)
+    )
+    reloaded.eval()
+
+    assert reloaded.config.yes_token_id == YES_ID
+    assert reloaded.config.no_token_id == NO_ID
+    with torch.no_grad():
+        torch.testing.assert_close(
+            reloaded(input_ids=input_ids, attention_mask=attention_mask).logits, original, rtol=1e-4, atol=1e-4
+        )
+
+
+def test_round_trip_preserves_no_weights_beyond_the_backbone(tmp_path):
+    """A reranker-only parameter would break the stock load; there must be none."""
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+
+    model = _tiny_model()
+    model.save_pretrained(tmp_path)
+    reloaded = Qwen3ForCausalLM.from_pretrained(tmp_path)
+
+    assert set(reloaded.state_dict()) == set(model.state_dict())

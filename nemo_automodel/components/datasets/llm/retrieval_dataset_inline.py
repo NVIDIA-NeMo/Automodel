@@ -595,7 +595,8 @@ def make_context_aware_retrieval_dataset(
         model_type: ``"cross_encoder"`` or ``"bi_encoder"``.
         data_type: ``"train"``, or ``"validation"``/``"eval"`` for the held-out side.
         n_passages: Passages per query (1 positive + ``n_passages - 1`` negatives).
-        validation_fraction: Fraction of groups held out. 0 uses the whole split.
+        validation_fraction: Fraction of groups held out, in [0, 1). 0 uses the whole
+            split; values outside the range are rejected.
         validation_group_key: Column defining a group; None groups by row.
         reasoning_column: Column holding the reasoning trace.
         global_query_column: Column holding the originating question.
@@ -612,6 +613,14 @@ def make_context_aware_retrieval_dataset(
         raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
     if data_type not in ("train", "validation", "eval"):
         raise ValueError(f"Invalid data type: {data_type}")
+    # Both ends fail silently rather than loudly if left unchecked. A negative fraction skips
+    # the split below entirely, so the validation build returns the WHOLE dataset and every
+    # training row is also an eval row -- total leakage, no error. A fraction of 1 or more
+    # puts every group in validation; that does raise, but from the empty-side check, whose
+    # message blames the group count and suggests changing the seed, none of which is the
+    # problem. Reject the value here, where it was supplied.
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError(f"validation_fraction must be in [0, 1), got {validation_fraction!r}")
 
     requested = tuple(c for c in (reasoning_column, global_query_column, validation_group_key) if c)
     dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, extra_columns=requested)
