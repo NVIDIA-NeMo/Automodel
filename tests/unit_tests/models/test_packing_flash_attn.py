@@ -86,6 +86,31 @@ def test_collater_flash_returns_2d_mask():
     assert result["attention_mask"][0].tolist() == [1, 1, 2, 2, 2]
 
 
+@pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+def test_collater_all_flash_variants_return_2d_mask(attn_implementation):
+    """Every flash variant keeps the indexed mask, not just FA2.
+
+    Regression: the collater matched ``== "flash_attention_2"`` exactly, so FA3/FA4
+    silently fell through to the dense 4D branch and lost the varlen fast path.
+    """
+    from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+    batch = [
+        {
+            "input_ids": torch.tensor([10, 20, 30, 40, 50]),
+            "labels": torch.tensor([-100, 20, 30, 40, 50]),
+            "attention_mask": torch.tensor([1, 1, 2, 2, 2]),
+            "position_ids": torch.tensor([0, 1, 0, 1, 2]),
+            "n_images": 0,
+            "n_videos": 0,
+        },
+    ]
+    result = neat_packed_vlm_collater(batch, attn_implementation=attn_implementation)
+    assert result["attention_mask"].ndim == 2, f"{attn_implementation} fell back to a dense mask"
+    assert result["attention_mask"].shape == (1, 5)
+    assert result["attention_mask"][0].tolist() == [1, 1, 2, 2, 2]
+
+
 def test_collater_sdpa_returns_4d_mask():
     """With sdpa, collater should return 4D block-causal mask."""
     from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater

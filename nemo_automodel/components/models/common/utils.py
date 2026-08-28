@@ -283,7 +283,10 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", "cudnn", or "fa4").
+            "fa4" selects FlashAttention-4 (CuTe) and is the only backend that reaches the
+            Blackwell FA4 kernels; it requires an INSTALL_FA4=true image and accepts only
+            causal or varlen (cu_seqlens) masks -- an explicit attention_mask raises.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
@@ -327,7 +330,7 @@ class BackendConfig:
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4"] = (
         "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     )
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"

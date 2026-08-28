@@ -1514,10 +1514,10 @@ def neat_packed_vlm_collater(
 
     1. Pads all text tensors to a common length.
     2. Converts the indexed ``attention_mask`` to the appropriate format:
-       - ``flash_attention_2``: keeps the indexed ``[B, S]`` mask (values
-         1, 2, … for documents, 0 for padding).  The monkey-patched
-         ``_get_unpad_data`` converts this to ``cu_seqlens`` for
-         ``flash_attn_varlen_func``.
+       - ``flash_attention_2`` / ``flash_attention_3`` / ``flash_attention_4``:
+         keeps the indexed ``[B, S]`` mask (values 1, 2, … for documents, 0 for
+         padding).  The monkey-patched ``_get_unpad_data`` converts this to
+         ``cu_seqlens`` for ``flash_attn_varlen_func``.
        - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
     3. Concatenates media tensors across the batch dimension.
 
@@ -1531,7 +1531,8 @@ def neat_packed_vlm_collater(
             A fixed length avoids recompilation with ``torch.compile``
             and ensures uniform tensor shapes across steps.
         attn_implementation: Attention backend (``"flash_attention_2"``,
-            ``"sdpa"``, or ``"eager"``).
+            ``"flash_attention_3"``, ``"flash_attention_4"``, ``"sdpa"``, or
+            ``"eager"``).
         materialize_4d_mask: Whether SDPA/eager packing should expand the
             indexed ``[B, S]`` document map into a dense
             ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
@@ -1544,8 +1545,14 @@ def neat_packed_vlm_collater(
     if not batch:
         return {}
 
+    from nemo_automodel.components.models.common.packing import _FLASH_ATTN_IMPLEMENTATIONS
+
     LABEL_PAD = -100
-    use_flash = attn_implementation == "flash_attention_2"
+    # Every flash variant derives cu_seqlens from the indexed [B, S] map, not just FA2.
+    # Matching only "flash_attention_2" here silently sent FA3/FA4 runs down the dense
+    # 4D-mask branch, which disqualifies SDPA's flash backend and lands on the cutlass
+    # mem-efficient kernels.
+    use_flash = attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS
 
     # Determine pad target: fixed max_length or batch-dynamic
     max_len = (

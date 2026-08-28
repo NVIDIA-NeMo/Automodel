@@ -86,6 +86,73 @@ def initialize_attn_module_and_func(
             )
 
         return None, attn_func
+    elif attn_impl == "fa4":
+        # FlashAttention-4 (CuTe). Consumes the native [b, s, nh, hd] (bshd) / [t, nh, hd]
+        # (thd) layout directly, like TE -- no transpose on the way in or out. FA4 has no
+        # dense-mask entry point by design: `causal` plus varlen `cu_seqlens` are its only
+        # mask forms, which is what makes it fast. preprocess_args_and_kwargs_for_attn
+        # rejects an explicit mask rather than silently materializing one.
+        try:
+            from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+        except Exception as exc:  # pragma: no cover - requires an INSTALL_FA4=true image
+            # Deliberately broad: flash_attn.cute imports cutlass, which probes the CUDA
+            # toolchain at module scope and raises FileNotFoundError (no nvcc) or a cutlass
+            # RuntimeError rather than ImportError when the install is incomplete. `from exc`
+            # keeps the original traceback.
+            raise ImportError(
+                "attn_impl='fa4' requires a working FlashAttention-4 (flash_attn.cute) "
+                f"install; importing it failed with {type(exc).__name__}: {exc}. Build the "
+                "container with INSTALL_FA4=true (docker/Dockerfile) -- note that image has "
+                "no tilelang backend."
+            ) from exc
+
+        if qkv_format not in ("bshd", "thd"):
+            raise ValueError(f"attn_impl='fa4' supports qkv_format 'bshd' or 'thd', got {qkv_format!r}")
+
+        supported_fa4_kwargs = {
+            "causal",
+            "window_size",
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "max_seqlen_q",
+            "max_seqlen_kv",
+            "softcap",
+            "learnable_sink",
+        }
+        default_causal = attn_mask_type == "causal"
+
+        def attn_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **call_kwargs: Any) -> torch.Tensor:
+            unexpected_call_kwargs = call_kwargs.keys() - supported_fa4_kwargs
+            if unexpected_call_kwargs:
+                raise TypeError(f"Unsupported FA4 attention kwargs: {sorted(unexpected_call_kwargs)}")
+
+            common: dict[str, Any] = {
+                "softmax_scale": softmax_scale,
+                "causal": cast(bool, call_kwargs.get("causal", default_causal)),
+                "window_size": call_kwargs.get("window_size", (None, None)),
+            }
+            for opt in ("softcap", "learnable_sink"):
+                if call_kwargs.get(opt) is not None:
+                    common[opt] = call_kwargs[opt]
+
+            cu_seqlens_q = call_kwargs.get("cu_seqlens_q")
+            if cu_seqlens_q is None:
+                return flash_attn_func(q, k, v, **common)
+
+            cu_seqlens_kv = call_kwargs.get("cu_seqlens_kv", cu_seqlens_q)
+            max_seqlen_q = call_kwargs.get("max_seqlen_q")
+            return flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=call_kwargs.get("max_seqlen_kv", max_seqlen_q),
+                **common,
+            )
+
+        return None, attn_func
     elif attn_impl == "flex":
         attn_module = FlexAttention()
         # We still return the module and a reference to its call for parity with other backends
@@ -186,6 +253,45 @@ def preprocess_args_and_kwargs_for_attn(
                 attn_kwargs["max_seqlen_q"] = kwargs["max_seqlen_q"]
             if "max_seqlen_kv" in kwargs:
                 attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen_kv"]
+
+    elif attn_impl == "fa4":
+        # FA4 consumes the native [b, s, nh, hd] / [t, nh, hd] layout -- no transpose.
+        # Window convention differs from the rest of the codebase: here (-1, 0) means
+        # "causal, unbounded left context", whereas FA4 spells unbounded as None and
+        # derives `local` from a non-None left window (_resolve_causal_local_window).
+        attn_kwargs = {"causal": True}
+        window_size = kwargs.get("window_size", (-1, 0))
+        left_window, right_window = window_size if isinstance(window_size, tuple) else (window_size, 0)
+        attn_kwargs["window_size"] = (
+            None if left_window is None or left_window < 0 else left_window,
+            None if right_window is None or right_window <= 0 else right_window,
+        )
+        for opt in ("softcap", "learnable_sink"):
+            if kwargs.get(opt) is not None:
+                attn_kwargs[opt] = kwargs[opt]
+
+        if "cu_seqlens" in kwargs:
+            attn_kwargs["cu_seqlens_q"] = kwargs["cu_seqlens"]
+            attn_kwargs["cu_seqlens_kv"] = kwargs["cu_seqlens"]
+            if "max_seqlen" in kwargs:
+                attn_kwargs["max_seqlen_q"] = kwargs["max_seqlen"]
+                attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen"]
+        elif "cu_seqlens_q" in kwargs and "cu_seqlens_kv" in kwargs:
+            attn_kwargs["cu_seqlens_q"] = kwargs["cu_seqlens_q"]
+            attn_kwargs["cu_seqlens_kv"] = kwargs["cu_seqlens_kv"]
+            if "max_seqlen_q" in kwargs:
+                attn_kwargs["max_seqlen_q"] = kwargs["max_seqlen_q"]
+            if "max_seqlen_kv" in kwargs:
+                attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen_kv"]
+        elif attention_mask is not None:
+            # Anything left is either a padding mask (needs unpadding to varlen) or a dense
+            # block-causal mask. Silently dropping it would attend across documents/padding;
+            # materializing it is exactly the SDPA slow path FA4 exists to avoid.
+            raise ValueError(
+                "attn_impl='fa4' cannot consume an explicit attention_mask "
+                f"(got shape {tuple(attention_mask.shape)}). Pass packed sequences so the "
+                "model supplies cu_seqlens (varlen), or use attn='te'/'sdpa' for masked batches."
+            )
 
     elif attn_impl == "flex":
         attn_kwargs = kwargs

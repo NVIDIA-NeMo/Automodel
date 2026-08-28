@@ -188,7 +188,11 @@ RUN mkdir -p /wheels && \
 # (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
 ARG FLASH_ATTN_REF=ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820
 ARG INSTALL_FA3=true
-ARG INSTALL_FA4=false
+# FA4 on by default: it is the only attention backend that reaches the Blackwell
+# CuTe kernels (backend.attn="fa4"). See the runtime-dep note in the final stage --
+# this upgrades apache-tvm-ffi past tilelang's cap, so backend.attn="tilelang"
+# (DeepSeek-V4 sparse MLA, GLM DSA) is NOT available in the default image.
+ARG INSTALL_FA4=true
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
@@ -213,10 +217,15 @@ WORKDIR /opt/Automodel
 # torchao MXFP8 + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
 # before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
-ARG INSTALL_FA4=false
+ARG INSTALL_FA4=true
+# The FA4 wheel is installed --no-deps (above), so flash_attn.cute's runtime deps have
+# to be named explicitly or `import flash_attn.cute` fails. apache-tvm-ffi>=0.1.12 is
+# the one that bites: the `cuda` extra caps it at <=0.1.11 for tilelang, so installing
+# FA4 upgrades it and disables the tilelang backend in this image (see pyproject.toml).
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     if [ "$INSTALL_FA4" = "true" ]; then \
-        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" && \
+        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" \
+            "apache-tvm-ffi>=0.1.12,<0.2" "quack-kernels>=0.5.3" torch-c-dlpack-ext einops && \
         FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
         VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
         { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; }; \

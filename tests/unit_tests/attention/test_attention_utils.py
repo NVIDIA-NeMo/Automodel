@@ -519,3 +519,85 @@ class TestEndToEndWorkflow:
 
         # Should remain the same shape
         assert final_output.shape == original_shape
+
+
+class TestFA4Backend:
+    """Tests for the FlashAttention-4 (CuTe) backend branch."""
+
+    def test_fa4_causal_defaults_without_mask(self):
+        """No mask -> plain causal, unbounded window, and no transpose."""
+        q = torch.randn(2, 8, 4, 16)
+        k = torch.randn(2, 8, 4, 16)
+        v = torch.randn(2, 8, 4, 16)
+
+        out_q, out_k, out_v, attn_kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4")
+
+        # FA4 consumes [b, s, nh, hd] directly, unlike sdpa/flex which transpose.
+        assert out_q is q and out_k is k and out_v is v
+        assert attn_kwargs == {"causal": True, "window_size": (None, None)}
+
+    @pytest.mark.parametrize(
+        "window_size, expected",
+        [
+            ((-1, 0), (None, None)),  # codebase's "unbounded causal"
+            ((128, 0), (128, None)),  # sliding window
+            ((None, None), (None, None)),
+        ],
+    )
+    def test_fa4_window_size_translation(self, window_size, expected):
+        """-1/0 sentinels translate to FA4's None-based window convention."""
+        q = k = v = torch.randn(1, 4, 2, 8)
+        _, _, _, attn_kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4", window_size=window_size)
+        assert attn_kwargs["window_size"] == expected
+
+    def test_fa4_varlen_from_cu_seqlens(self):
+        """Packed batches forward cu_seqlens/max_seqlen to the varlen entry point."""
+        q = k = v = torch.randn(1, 16, 2, 8)
+        cu_seqlens = torch.tensor([0, 5, 16], dtype=torch.int32)
+
+        _, _, _, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, None, "fa4", cu_seqlens=cu_seqlens, max_seqlen=11
+        )
+
+        assert attn_kwargs["cu_seqlens_q"] is cu_seqlens
+        assert attn_kwargs["cu_seqlens_kv"] is cu_seqlens
+        assert attn_kwargs["max_seqlen_q"] == 11
+        assert attn_kwargs["max_seqlen_kv"] == 11
+
+    def test_fa4_rejects_explicit_mask(self):
+        """A dense mask must raise -- dropping it would attend across documents."""
+        q = k = v = torch.randn(2, 8, 4, 16)
+        dense_mask = torch.ones(2, 1, 8, 8, dtype=torch.bool)
+
+        with pytest.raises(ValueError, match="cannot consume an explicit attention_mask"):
+            preprocess_args_and_kwargs_for_attn(q, k, v, dense_mask, "fa4")
+
+    def test_fa4_output_is_not_transposed(self):
+        """postprocess leaves FA4 output alone (already [b, s, nh, hd])."""
+        x = torch.randn(2, 8, 4, 16)
+        assert postprocess_output_for_attn(x, "fa4").shape == (2, 8, 4, 16)
+
+    def test_fa4_missing_install_raises_actionable_import_error(self):
+        """A broken/absent flash_attn.cute surfaces as an actionable ImportError."""
+        with mock.patch.dict("sys.modules", {"flash_attn.cute": None}):
+            with pytest.raises(ImportError, match="INSTALL_FA4=true"):
+                initialize_attn_module_and_func(
+                    attn_impl="fa4",
+                    num_attention_heads=4,
+                    num_qk_channels=16,
+                    num_v_channels=16,
+                    softmax_scale=0.25,
+                )
+
+    def test_fa4_rejects_unsupported_qkv_format(self):
+        """Only bshd/thd are meaningful for FA4."""
+        with mock.patch.dict("sys.modules", {"flash_attn.cute": mock.MagicMock()}):
+            with pytest.raises(ValueError, match="qkv_format"):
+                initialize_attn_module_and_func(
+                    attn_impl="fa4",
+                    num_attention_heads=4,
+                    num_qk_channels=16,
+                    num_v_channels=16,
+                    softmax_scale=0.25,
+                    qkv_format="sbhd",
+                )
