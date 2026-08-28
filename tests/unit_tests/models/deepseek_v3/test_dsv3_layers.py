@@ -226,7 +226,7 @@ class TestMLAInitialization:
         mock_init_rms.return_value = Mock()
         mock_init_attn.return_value = (Mock(), Mock())
 
-        mla = MLA(config, backend)
+        mla = MLA(config, backend, latent_norm_eps=1e-6)
 
         # Check basic attributes
         assert mla.n_heads == 32
@@ -264,7 +264,7 @@ class TestMLAInitialization:
         mock_init_rms.return_value = Mock()
         mock_init_attn.return_value = (Mock(), Mock())
 
-        mla = MLA(config, backend)
+        mla = MLA(config, backend, latent_norm_eps=1e-6)
 
         # Check that q_a_proj/q_b_proj were initialized (not q_proj)
         assert not hasattr(mla, "q_proj")
@@ -274,7 +274,7 @@ class TestMLAInitialization:
 
         assert mla.q_lora_rank == 1024
 
-    @pytest.mark.parametrize("latent_norm_eps", [None, 1e-6])
+    @pytest.mark.parametrize("latent_norm_eps", [1e-6, 2e-6])
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_attn_module_and_func")
@@ -287,7 +287,6 @@ class TestMLAInitialization:
     ):
         config = self.create_mock_config(q_lora_rank=1024, rms_norm_eps=1e-5)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
-        expected_epsilon = 1e-6 if latent_norm_eps is None else latent_norm_eps
 
         mock_init_linear.return_value = Mock()
         mock_init_rms.return_value = Mock()
@@ -296,9 +295,16 @@ class TestMLAInitialization:
         MLA(config, backend, latent_norm_eps=latent_norm_eps)
 
         assert [call.kwargs["eps"] for call in mock_init_rms.call_args_list] == [
-            expected_epsilon,
-            expected_epsilon,
+            latent_norm_eps,
+            latent_norm_eps,
         ]
+
+    def test_mla_requires_latent_norm_epsilon(self):
+        config = self.create_mock_config(q_lora_rank=1024, rms_norm_eps=1e-5)
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+
+        with pytest.raises(TypeError, match="latent_norm_eps"):
+            MLA(config, backend)
 
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_linear_module")
     @patch("nemo_automodel.components.models.deepseek_v3.layers.initialize_rms_norm_module")
@@ -311,7 +317,7 @@ class TestMLAInitialization:
         mock_init_rms.return_value = Mock()
         mock_init_attn.return_value = (Mock(), Mock())
 
-        mla = MLA(config, backend)
+        mla = MLA(config, backend, latent_norm_eps=1e-6)
 
         # Test that initialization works with SDPA backend
         assert mla.backend.attn == "sdpa"
@@ -338,7 +344,7 @@ class TestMLAInitialization:
         mock_init_attn.return_value = (Mock(), Mock())
         mock_yarn_get_mscale.return_value = 1.5
 
-        mla = MLA(config, backend)
+        mla = MLA(config, backend, latent_norm_eps=1e-6)
 
         # Check that YARN mscale was called and softmax_scale adjusted
         mock_yarn_get_mscale.assert_called_once_with(2.0, 1.0)
@@ -361,7 +367,7 @@ class TestMLAInitialization:
         mock_init_rms.return_value = Mock()
         mock_init_attn.return_value = (Mock(), Mock())
 
-        mla = MLA(config, backend)
+        mla = MLA(config, backend, latent_norm_eps=1e-6)
 
         # Check that softmax_scale was adjusted with the provided mscale
         base_scale = 128**-0.5
@@ -425,7 +431,7 @@ class TestMLAForward:
             mock_attn_func.side_effect = lambda q, k, v, **kwargs: torch.randn(2, 16, 8, 64)  # SDPA format
             mock_init_attn.return_value = (Mock(), mock_attn_func)
 
-            mla = MLA(config, backend)
+            mla = MLA(config, backend, latent_norm_eps=1e-6)
 
             # Test that MLA can be created without tensor shape errors
             assert mla.n_heads == 8
@@ -449,7 +455,7 @@ class TestMLAForward:
             mock_init_rms.return_value = Mock()
             mock_init_attn.return_value = (Mock(), Mock())
 
-            mla = MLA(config, backend)
+            mla = MLA(config, backend, latent_norm_eps=1e-6)
 
             # Verify q_lora configuration was set up correctly
             assert mla.q_lora_rank == 512
@@ -486,7 +492,7 @@ class TestMLAForward:
                 {"is_causal": True},
             )
 
-            mla = MLA(config, backend)
+            mla = MLA(config, backend, latent_norm_eps=1e-6)
 
             # Verify backend was set correctly
             assert mla.backend.attn == "sdpa"
@@ -552,7 +558,7 @@ class TestMLAInitWeights:
 
             mock_init_attn.return_value = (Mock(), Mock())
 
-            mla = MLA(config, backend)
+            mla = MLA(config, backend, latent_norm_eps=1e-6)
 
             # Test init_weights
             device = torch.device("cpu")
@@ -589,7 +595,7 @@ class TestMLAInitWeights:
 
             mock_init_attn.return_value = (Mock(), Mock())
 
-            mla = MLA(config, backend)
+            mla = MLA(config, backend, latent_norm_eps=1e-6)
 
             # Test init_weights
             device = torch.device("cpu")

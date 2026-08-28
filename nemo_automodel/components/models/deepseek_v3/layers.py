@@ -44,15 +44,17 @@ class MLA(nn.Module):
         config: DeepseekV3Config,
         backend: BackendConfig,
         *,
-        latent_norm_eps: float | None = None,
+        latent_norm_eps: float,
     ):
         """Initialize multi-head latent attention.
 
         Args:
             config: Model configuration that defines the MLA dimensions.
             backend: Kernel backend selections for attention, linear layers, and normalization.
-            latent_norm_eps: Epsilon for the internal query and key/value latent RMSNorms. Defaults to the upstream
-                MLA contract of ``1e-6`` when omitted.
+            latent_norm_eps: Epsilon for the internal query and key/value latent RMSNorms. Required so each
+                model states its checkpoint's contract explicitly: upstream Hugging Face MLA implementations
+                construct these two norms with the reference RMSNorm default of ``1e-6`` rather than
+                ``config.rms_norm_eps``, and the HF config carries no field for it.
         """
         super().__init__()
 
@@ -71,7 +73,6 @@ class MLA(nn.Module):
         attn_impl = backend.attn
         linear_impl = backend.linear
         rms_norm_impl = backend.rms_norm
-        latent_norm_eps = 1e-6 if latent_norm_eps is None else latent_norm_eps
 
         hidden_size = config.hidden_size
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
