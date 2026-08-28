@@ -98,6 +98,7 @@ def build_cache_manifest(
     shuffle_seed: int,
     mask_reasoning_content: bool,
     chat_template_sha256: str,
+    mask_generation_prompt: bool = False,
 ) -> dict[str, Any]:
     """Assemble the DSpark cache manifest.
 
@@ -129,11 +130,15 @@ def build_cache_manifest(
         "train_split": train_split,
         "shuffle_seed": int(shuffle_seed),
         "mask_reasoning_content": bool(mask_reasoning_content),
+        "mask_generation_prompt": bool(mask_generation_prompt),
         "chat_template_sha256": chat_template_sha256,
     }
 
 
 _IDENTITY_EXEMPT_FIELDS = ("format_version", "complete")
+# Identity fields added after the first release: a manifest written before a field
+# existed is compared as if it recorded that default, so older caches stay reusable.
+_IDENTITY_DEFAULTS = {"mask_generation_prompt": False}
 
 
 def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
@@ -145,7 +150,8 @@ def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any])
     return sorted(
         k
         for k in recorded.keys() | manifest.keys()
-        if k not in _IDENTITY_EXEMPT_FIELDS and recorded.get(k) != manifest.get(k)
+        if k not in _IDENTITY_EXEMPT_FIELDS
+        and recorded.get(k, _IDENTITY_DEFAULTS.get(k)) != manifest.get(k, _IDENTITY_DEFAULTS.get(k))
     )
 
 

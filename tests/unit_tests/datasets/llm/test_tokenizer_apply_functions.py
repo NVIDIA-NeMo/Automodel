@@ -31,10 +31,12 @@ import pytest
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
     _build_generation_prompt_mask,
+    _match_generation_prompt,
     _package_tokenized_example,
     _pad_to_seq_length,
     _tokenize_chat,
     _warned_add_pad_token,
+    _warned_generation_prompt,
     format_chat_template,
     format_prompt_completion,
 )
@@ -1421,17 +1423,6 @@ class _StubTokenizerChatNoGenThinkingSystemRewrite(_StubTokenizerChatNoGenThinki
         return ids
 
 
-def _label_by_token(tok, sample):
-    """Map each token string to its label (first occurrence), for readable asserts."""
-    inv = {v: k for k, v in tok._vocab.items()}
-    inv[tok.eos_token_id] = "<eos>"
-    inv[tok._start_of_turn_token_id] = "<sot>"
-    out = {}
-    for token_id, label in zip(sample["input_ids"], sample["labels"]):
-        out.setdefault(inv[token_id], label)
-    return out
-
-
 def _format(tok, messages, **kw):
     return format_chat_template(
         tok,
@@ -1550,7 +1541,7 @@ def test_mask_generation_prompt_accepts_generation_prompt_suffix():
 
     # ``/nothink`` never appears in the rendered turn, but the rest of the generation
     # prompt (``<assistant> <think> </think>``) does and is masked.
-    assert "/nothink" not in inv.values() or tok._id_for_token("/nothink") not in masked["input_ids"]
+    assert tok._id_for_token("/nothink") not in masked["input_ids"]
     assert supervised == ["final", "answer", "<eos>"]
 
 
@@ -1617,6 +1608,7 @@ def test_mask_generation_prompt_warns_when_base_prefix_does_not_match_full_rende
 
     tok = _RewritesHistory()
     full = tok.apply_chat_template([m.copy() for m in _NO_REASONING])
+    _warned_generation_prompt.clear()  # the warning is emitted once per process
     with caplog.at_level("WARNING"):
         mask = _build_generation_prompt_mask(tok, [m.copy() for m in _NO_REASONING], full, unpadded_full_ids=full)
 
@@ -1638,3 +1630,204 @@ def test_tokenize_chat_only_forwards_generation_prompt_kwargs_when_requested():
 
     assert "add_generation_prompt" not in seen[0] and "enable_thinking" not in seen[0]
     assert seen[1]["add_generation_prompt"] is True and seen[1]["enable_thinking"] is False
+
+
+class _StubTokenizerChatNoGenQwen3Like(_StubTokenizerChatNoGen):
+    """Qwen3 style: the thinking generation prompt is the bare header and the model emits
+    ``<think>`` itself; the non-thinking prompt appends an empty ``<think> </think>``. A turn
+    whose reasoning sits inline in ``content`` renders exactly like a ``reasoning_content``
+    turn, which is the common distilled-data format."""
+
+    chat_template = "<dummy qwen3-like enable_thinking template>"
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        ids: List[int] = [self._start_of_turn_token_id]
+        for msg in messages:
+            ids.append(self._id_for_token(f"<{msg['role']}>"))
+            content = str(msg["content"])
+            if msg["role"] == "assistant":
+                reasoning = str(msg.get("reasoning_content") or "")
+                if reasoning:
+                    ids.append(self._id_for_token("<think>"))
+                    ids.extend(self._id_for_token(tok) for tok in reasoning.split())
+                    ids.append(self._id_for_token("</think>"))
+                elif "<think>" not in content:
+                    ids.append(self._id_for_token("<think>"))
+                    ids.append(self._id_for_token("</think>"))
+                ids.extend(self._id_for_token(tok) for tok in content.split())
+                ids.append(self.eos_token_id)
+            else:
+                ids.extend(self._id_for_token(tok) for tok in content.split())
+        if kwargs.get("add_generation_prompt"):
+            ids.append(self._id_for_token("<assistant>"))
+            if not kwargs.get("enable_thinking", True):
+                ids.append(self._id_for_token("<think>"))
+                ids.append(self._id_for_token("</think>"))
+        if kwargs.get("return_dict", False):
+            return {"input_ids": ids}
+        return ids
+
+
+class _StubTokenizerChatNoGenPlainHeader(_StubTokenizerChatNoGen):
+    """Plain-text header whose last token equals its first (``nl ### Assistant: nl``)."""
+
+    chat_template = "<dummy plain header template>"
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        ids: List[int] = [self._start_of_turn_token_id]
+        for msg in messages:
+            if msg["role"] == "assistant":
+                ids.extend(self._id_for_token(tok) for tok in ("nl", "###", "Assistant:", "nl"))
+                ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+                ids.append(self.eos_token_id)
+            else:
+                ids.extend(self._id_for_token(tok) for tok in ("nl", "###", "User:", "nl"))
+                ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+        if kwargs.get("add_generation_prompt"):
+            ids.extend(self._id_for_token(tok) for tok in ("nl", "###", "Assistant:", "nl"))
+        if kwargs.get("return_dict", False):
+            return {"input_ids": ids}
+        return ids
+
+
+class _StubTokenizerChatNoGenRewriteNoHeader(_StubTokenizerChatNoGenThinking):
+    """Pathological: ``enable_thinking=False`` rewrites the first token but the template
+    ignores ``add_generation_prompt``, so the only thing the prompt render adds is the
+    rewritten history, which contains earlier assistant turns verbatim."""
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        ids = super().apply_chat_template(messages, **{**kwargs, "return_dict": False, "add_generation_prompt": False})
+        if kwargs.get("add_generation_prompt") and not kwargs.get("enable_thinking", True):
+            ids = [ids[0], self._id_for_token("<no_think_system>")] + ids[1:]
+        if kwargs.get("return_dict", False):
+            return {"input_ids": ids}
+        return ids
+
+
+def _decode(tok, sample):
+    inv = {v: k for k, v in tok._vocab.items()}
+    inv[tok.eos_token_id] = "<eos>"
+    inv[tok._start_of_turn_token_id] = "<sot>"
+    return [inv[i] for i, keep in zip(sample["input_ids"], sample["loss_mask"]) if keep]
+
+
+def test_mask_generation_prompt_keeps_think_opener_when_reasoning_is_inline_in_content():
+    # No reasoning_content key, but the content carries the trace. The thinking prompt (bare
+    # header) reproduces the turn completely, the non-thinking prompt only partially, so the
+    # thinking mode wins and the <think> the model must emit stays supervised.
+    tok = _StubTokenizerChatNoGenQwen3Like()
+    inline = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "<think> deep thought </think> final answer"},
+    ]
+    assert _decode(tok, _format(tok, inline, mask_generation_prompt=True)) == [
+        "<think>",
+        "deep",
+        "thought",
+        "</think>",
+        "final",
+        "answer",
+        "<eos>",
+    ]
+    # The plain non-thinking turn still gets its template-inserted empty block removed.
+    assert _decode(tok, _format(tok, _NO_REASONING, mask_generation_prompt=True)) == ["final", "answer", "<eos>"]
+
+
+def test_mask_generation_prompt_masks_plain_text_header_ending_with_its_first_token():
+    tok = _StubTokenizerChatNoGenPlainHeader()
+    masked = _format(tok, _NO_REASONING, mask_generation_prompt=True)
+    assert _decode(tok, masked) == ["final", "answer", "<eos>"]
+
+
+def test_mask_generation_prompt_rejects_anchor_inside_rendered_history():
+    # The prompt render adds no header, only a rewritten history whose last assistant header
+    # is followed by a real turn (and its EOS). Matching from there would mask content, so
+    # that anchor is rejected and the turn is left as the assistant mask had it.
+    tok = _StubTokenizerChatNoGenRewriteNoHeader()
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "same answer"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "same answer"},
+    ]
+    default = _format(tok, messages)
+    masked = _format(tok, messages, mask_generation_prompt=True)
+    assert masked["loss_mask"] == default["loss_mask"]
+
+
+def test_match_generation_prompt_prefers_complete_then_longer_match():
+    eos = 99
+    # Prompt starts at the turn: complete match of all 3 tokens.
+    assert _match_generation_prompt([7, 8, 9], [7, 8, 9, 1, 2], eos) == (3, True)
+    # Prompt extends past the turn (SmolLM3): partial, anchored at its start.
+    assert _match_generation_prompt([7, 8, 9, 5, 6], [7, 8, 9, 1, 2], eos) == (3, False)
+    # Prompt starts before the header (GLM's /nothink): anchored at the last occurrence.
+    assert _match_generation_prompt([4, 4, 7, 8, 9], [7, 8, 9, 1, 2], eos) == (3, True)
+    # Last occurrence followed by an end-of-turn token is rendered history, not a prompt.
+    assert _match_generation_prompt([7, 8, eos, 3], [7, 8, 9], eos) == (2, False)
+    assert _match_generation_prompt([4, 7, 8, eos, 3], [7, 8, 9], eos) == (0, False)
+    assert _match_generation_prompt([], [7], eos) == (0, False)
+    assert _match_generation_prompt([7], [], eos) == (0, False)
+
+
+def test_mask_generation_prompt_handles_left_truncation_with_generation_kwd():
+    # With a {% generation %} template the multiturn builder never runs, so the truncation
+    # window must be mapped through the untruncated reference render (reference_offset).
+    class _LeftTruncating(_StubTokenizerChatGenThinking):
+        def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+            result = super().apply_chat_template(messages, **kwargs)
+            max_length = kwargs.get("max_length")
+            if kwargs.get("truncation") and max_length:
+                if isinstance(result, dict):
+                    result = {k: v[-max_length:] for k, v in result.items()}
+                else:
+                    result = result[-max_length:]
+            return result
+
+    tok = _LeftTruncating()
+    full = tok.apply_chat_template([m.copy() for m in _NO_REASONING])
+    keep = len(full) - 2  # drop the leading <sot> and <user>
+    masked = _format(tok, _NO_REASONING, mask_generation_prompt=True, truncation=True, seq_length=keep)
+    assert len(masked["input_ids"]) == keep
+    assert _decode(tok, masked) == ["final", "answer", "<eos>"]
+
+
+def test_mask_generation_prompt_rejects_non_contiguous_truncation():
+    class _MiddleTruncating(_StubTokenizerChatGenThinking):
+        def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+            result = super().apply_chat_template(messages, **kwargs)
+            max_length = kwargs.get("max_length")
+            if kwargs.get("truncation") and max_length:
+                drop = len(result["input_ids"]) - max_length if isinstance(result, dict) else len(result) - max_length
+                if isinstance(result, dict):
+                    result = {k: v[1 : 1 + max_length] for k, v in result.items()}
+                else:
+                    result = result[1 : 1 + max_length]
+                assert drop >= 1
+            return result
+
+    tok = _MiddleTruncating()
+    full = tok.apply_chat_template([m.copy() for m in _NO_REASONING])
+    with pytest.raises(ValueError, match="contiguous prefix or suffix"):
+        _format(tok, _NO_REASONING, mask_generation_prompt=True, truncation=True, seq_length=len(full) - 2)
+
+
+def test_mask_generation_prompt_reuses_multiturn_prefix_renders():
+    calls = []
+
+    class _Counting(_StubTokenizerChatNoGenThinking):
+        def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+            calls.append((len(messages), kwargs.get("add_generation_prompt", False)))
+            return super().apply_chat_template(messages, **kwargs)
+
+    tok = _Counting()
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "alpha"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "beta"},
+    ]
+    _format(tok, messages, mask_generation_prompt=True)
+    plain_prefix_renders = [n for n, gen in calls if not gen and n < len(messages)]
+    # Each proper prefix (1, 2, 3 messages) is rendered once and shared by both builders.
+    assert sorted(plain_prefix_renders) == [1, 2, 3]

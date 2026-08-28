@@ -152,6 +152,7 @@ def build_eagle3_dataloader(
     shuffle_seed: int | None = 42,
     mask_reasoning_content: bool = False,
     packed_sequence_size: int = 0,
+    mask_generation_prompt: bool = False,
     dp_mesh=None,
 ) -> DataLoader:
     """Build a dataloader backed by the repo's chat formatting utilities.
@@ -178,6 +179,7 @@ def build_eagle3_dataloader(
             shuffle_seed=shuffle_seed,
             unshifted=True,
             mask_reasoning_content=mask_reasoning_content,
+            mask_generation_prompt=mask_generation_prompt,
         )
         dataset = build_packed_eagle3_dataset(
             source,
@@ -196,6 +198,7 @@ def build_eagle3_dataloader(
             shuffle_seed=shuffle_seed,
             unshifted=True,
             mask_reasoning_content=mask_reasoning_content,
+            mask_generation_prompt=mask_generation_prompt,
         )
     sampler = None
     if distributed:

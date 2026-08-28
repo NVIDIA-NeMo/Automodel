@@ -366,7 +366,7 @@ tool_call_eval:
 - `train_on_last_turn_only`: Supervises only the final assistant turn (`mask_history`).
 - `mask_reasoning_content`: Renders assistant `reasoning_content` (thinking) into the prompt but excludes it from the loss. Defaults to `false`, so a chat template that emits `reasoning_content` inside its `{% generation %}` block trains the model to reproduce that reasoning. The SynthTraces template does exactly this; see the warning in [Train on the Generated Traces](#train-on-the-generated-traces).
 - `drop_history_reasoning_content`: Strips prior-turn thinking from the prompt entirely to match inference. This option works best with `train_on_last_turn_only=true`.
-- `mask_generation_prompt`: Excludes from the loss the tokens of each assistant turn that the chat template's generation prompt supplies at inference: the role header and any template-inserted empty reasoning block (for example the `<think></think>` that Nemotron and Qwen3 templates emit for turns without `reasoning_content`). The model never generates those tokens, so supervising them only reinforces template boilerplate. Detected by rendering the generation prompt, so it works for any template. Defaults to `false`.
+- `mask_generation_prompt`: Excludes from the loss the tokens of each assistant turn that the chat template's generation prompt supplies at inference: the role header and any template-inserted empty reasoning block (for example the `<think></think>` Nemotron templates emit, or the `<think>\n\n</think>\n\n` Qwen3 emits, for turns without `reasoning_content`). The model never generates those tokens, so supervising them only reinforces template boilerplate. Detected by rendering the generation prompt, so it works for any template. Defaults to `false`.
 
 </Tip>
 

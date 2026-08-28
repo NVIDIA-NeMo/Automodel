@@ -929,6 +929,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
             packed_sequence_size=recipe_cfg.get("packed_sequence_size", 0),
             dp_mesh=self.dp_mesh,
         )
@@ -1064,6 +1065,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                 packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )

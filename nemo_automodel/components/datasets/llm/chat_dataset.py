@@ -432,8 +432,8 @@ class ChatDataset(Dataset):
                 load; those still raise when a sample is accessed.
             mask_generation_prompt: If ``True``, exclude from the loss the tokens of each assistant turn that
                 the chat template's generation prompt supplies at inference: the role header and any
-                template-inserted empty reasoning block (for example the ``<think></think>`` Nemotron and
-                Qwen3 templates emit for non-thinking turns). The model never generates those tokens, so
+                template-inserted empty reasoning block (for example the ``<think></think>`` Nemotron
+                templates emit for non-thinking turns). The model never generates those tokens, so
                 supervising them only reinforces template boilerplate. Detected per template by rendering
                 the generation prompt, so no tag strings are hardcoded.
         """
