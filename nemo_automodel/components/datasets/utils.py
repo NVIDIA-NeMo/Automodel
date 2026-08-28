@@ -17,6 +17,10 @@ import math
 import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
+from nemo_automodel.shared.packed_sequence import get_unpad_data
+
+_VARLEN_PACKING_BACKENDS = ("flash_attention_2", "flash_attention_3", "flash_attention_4", "fa4")
+
 
 def batchify(tensor, default_tensor_cls=torch.LongTensor):
     """
@@ -507,8 +511,10 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
     indexed ``attention_mask`` to the format required by the attention backend.
 
-    For flash attention (``flash_attention_2`` / ``flash_attention_3`` /
-    ``flash_attention_4``): keeps the indexed 2D mask ``[B, S]``.
+    For Hugging Face flash attention (``flash_attention_2`` /
+    ``flash_attention_3`` / ``flash_attention_4``): keeps the indexed 2D mask
+    ``[B, S]``. Native ``fa4`` additionally emits unpadding indices and
+    cumulative document lengths for its BSHD-to-varlen adapter.
     For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
 
     Args:
@@ -517,7 +523,9 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
             ``"sdpa"``, or ``"eager"``).
 
     Returns:
-        Dict with batched tensors ready for model forward.
+        Dict with batched tensors ready for model forward. Native ``fa4`` adds
+        ``_fa4_unpad_indices`` of shape [tokens], ``cu_seqlens`` of shape
+        [documents + 1], and scalar ``max_seqlen``.
     """
     if not batch:
         return {}
@@ -526,8 +534,6 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     labels = batchify(torch.stack([torch.as_tensor(x["labels"]) for x in batch]))
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
-
-    from nemo_automodel.components.models.common.packing import _VARLEN_PACKING_BACKENDS
 
     if attn_implementation in _VARLEN_PACKING_BACKENDS:
         mask_out = attention_mask
@@ -540,7 +546,16 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
         "position_ids": position_ids,
         "attention_mask": mask_out,
     }
-    if attention_mask.max() > 1:
+    if attn_implementation == "fa4":
+        indices, cu_seqlens, max_seqlen = get_unpad_data(attention_mask)
+        result.update(
+            {
+                "_fa4_unpad_indices": indices,
+                "cu_seqlens": cu_seqlens,
+                "max_seqlen": max_seqlen,
+            }
+        )
+    if attention_mask.max() > 1 or attn_implementation == "fa4":
         result["_packed_seq_ids"] = attention_mask
     return result
 

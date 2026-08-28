@@ -19,6 +19,8 @@ from unittest.mock import MagicMock
 import torch
 from PIL import Image as PILImage
 
+from nemo_automodel.shared.packed_sequence import get_unpad_data
+
 try:
     from qwen_vl_utils import process_vision_info
 
@@ -36,6 +38,8 @@ except ImportError:
     process_mm_info = MagicMock()
 
 logger = logging.getLogger(__name__)
+
+_VARLEN_PACKING_BACKENDS = ("flash_attention_2", "flash_attention_3", "flash_attention_4", "fa4")
 
 # Default vision-tower patch merge kernel used by `_expand_image_tokens` and any
 # caller that needs to predict expanded image-token counts. Keep this as the
@@ -1518,6 +1522,8 @@ def neat_packed_vlm_collater(
          keeps the indexed ``[B, S]`` mask (values 1, 2, … for documents, 0 for
          padding).  The monkey-patched ``_get_unpad_data`` converts this to
          ``cu_seqlens`` for ``flash_attn_varlen_func``.
+       - Native ``fa4``: keeps the indexed mask and emits unpadding indices plus
+         ``cu_seqlens`` once for the BSHD-to-varlen attention adapter.
        - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
     3. Concatenates media tensors across the batch dimension.
 
@@ -1540,12 +1546,12 @@ def neat_packed_vlm_collater(
             False to avoid the quadratic allocation.
 
     Returns:
-        Dict with batched tensors ready for model forward.
+        Dict with batched tensors ready for model forward. Native ``fa4`` adds
+        ``_fa4_unpad_indices`` of shape [tokens], ``cu_seqlens`` of shape
+        [documents + 1], and scalar ``max_seqlen``.
     """
     if not batch:
         return {}
-
-    from nemo_automodel.components.models.common.packing import _VARLEN_PACKING_BACKENDS
 
     LABEL_PAD = -100
     # Every varlen-capable backend derives cu_seqlens from the indexed [B, S] map, not just FA2.
@@ -1616,13 +1622,22 @@ def neat_packed_vlm_collater(
         "attention_mask": attention_mask_out,
         "mm_token_type_ids": mm_token_type_ids,
     }
+    if attn_implementation == "fa4":
+        indices, cu_seqlens, max_seqlen = get_unpad_data(attention_mask)
+        result.update(
+            {
+                "_fa4_unpad_indices": indices,
+                "cu_seqlens": cu_seqlens,
+                "max_seqlen": max_seqlen,
+            }
+        )
 
     # Store indexed attention mask for loss functions that need per-sample
     # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
     # ``attention_mask_out`` is already converted to 4D, so keep a copy.
     has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
-    if has_multiple_docs or not materialize_4d_mask:
+    if has_multiple_docs or not materialize_4d_mask or attn_implementation == "fa4":
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)

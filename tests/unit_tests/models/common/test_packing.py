@@ -15,8 +15,6 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import (
-    _FLASH_ATTN_IMPLEMENTATIONS,
-    _VARLEN_PACKING_BACKENDS,
     _passthrough_create_causal_mask,
     _patch_preprocess_mask_arguments_for_packing,
     apply_attn_implementation_to_backend,
@@ -460,9 +458,3 @@ class TestAttnImplementationPromotion:
         cfg = SimpleNamespace(attn_implementation="flash_attention_4")
         apply_attn_implementation_to_backend(cfg)  # must not raise
         assert not hasattr(cfg, "backend")
-
-    def test_fa4_takes_the_varlen_packing_branch(self):
-        """FA4 has no dense-mask entry point, so packing must hand it the indexed map."""
-        assert "fa4" in _VARLEN_PACKING_BACKENDS
-        for impl in _FLASH_ATTN_IMPLEMENTATIONS:
-            assert impl in _VARLEN_PACKING_BACKENDS

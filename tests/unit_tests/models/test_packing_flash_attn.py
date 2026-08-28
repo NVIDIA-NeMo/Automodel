@@ -111,6 +111,38 @@ def test_collater_all_flash_variants_return_2d_mask(attn_implementation):
     assert result["attention_mask"][0].tolist() == [1, 1, 2, 2, 2]
 
 
+def test_collater_native_fa4_emits_varlen_metadata():
+    """Native FA4 receives the unpadding metadata consumed by its BSHD adapter."""
+    from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+    batch = [
+        {
+            "input_ids": torch.tensor([10, 20, 30, 40, 50]),
+            "labels": torch.tensor([-100, 20, 30, 40, 50]),
+            "attention_mask": torch.tensor([1, 1, 2, 2, 2]),
+            "position_ids": torch.tensor([0, 1, 0, 1, 2]),
+            "n_images": 0,
+            "n_videos": 0,
+        },
+        {
+            "input_ids": torch.tensor([60, 70, 80]),
+            "labels": torch.tensor([-100, 70, 80]),
+            "attention_mask": torch.tensor([1, 1, 1]),
+            "position_ids": torch.tensor([0, 1, 2]),
+            "n_images": 0,
+            "n_videos": 0,
+        },
+    ]
+
+    result = neat_packed_vlm_collater(batch, attn_implementation="fa4")
+
+    assert result["attention_mask"].tolist() == [[1, 1, 2, 2, 2], [1, 1, 1, 0, 0]]
+    assert result["_packed_seq_ids"].tolist() == result["attention_mask"].tolist()
+    assert result["_fa4_unpad_indices"].tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert result["cu_seqlens"].tolist() == [0, 2, 5, 8]
+    assert result["max_seqlen"] == 3
+
+
 def test_collater_sdpa_returns_4d_mask():
     """With sdpa, collater should return 4D block-causal mask."""
     from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater

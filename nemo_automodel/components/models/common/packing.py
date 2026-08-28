@@ -34,7 +34,9 @@ This is the same approach used by LlamaFactory.
 import logging
 
 import torch
-import torch.nn.functional as F
+
+from nemo_automodel.shared.packed_sequence import get_seqlens_in_batch as get_seqlens_in_batch
+from nemo_automodel.shared.packed_sequence import get_unpad_data
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +47,6 @@ _FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_
 # deliberately absent so a recipe pairing e.g. ``attn_implementation: sdpa`` (which only gates HF
 # config validation) with ``backend.attn: te`` keeps running TE.
 _ATTN_IMPL_TO_NATIVE_BACKEND = {"flash_attention_4": "fa4"}
-
-# Resolved attention backends that consume the compact indexed ``[B, S]`` document map (from which
-# ``cu_seqlens`` is derived) rather than a dense block-causal mask. ``fa4`` belongs here even though
-# it is not an HF dispatch key: FlashAttention-4 has no dense-mask entry point, so handing it the
-# materialized 4D mask is not merely slow, it fails outright.
-_VARLEN_PACKING_BACKENDS = _FLASH_ATTN_IMPLEMENTATIONS + ("fa4",)
 
 
 def native_backend_from_attn_implementation(cfg_model) -> str | None:
@@ -84,64 +80,6 @@ def native_backend_from_attn_implementation(cfg_model) -> str | None:
             getattr(getattr(cfg_model, "backend", None), "attn", None),
         )
     return native
-
-
-def get_seqlens_in_batch(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Extract per-document sequence lengths from an indexed attention mask.
-
-    Args:
-        attention_mask: ``[B, S]`` integer tensor where each position contains
-            the 1-based document index (0 = padding).
-
-    Returns:
-        1D tensor of all individual document lengths across the batch.
-
-    Example::
-
-        >>> get_seqlens_in_batch(torch.tensor([[1, 1, 2, 2, 2, 0],
-        ...                                    [1, 2, 2, 3, 3, 3]]))
-        tensor([2, 3, 1, 2, 3])
-    """
-    bsz = attention_mask.size(0)
-    dtype, device = attention_mask.dtype, attention_mask.device
-    max_num = torch.max(attention_mask).item()
-    counts = torch.zeros((bsz, max_num), dtype=dtype, device=device)
-    for i in range(max_num):
-        counts[:, i] = torch.sum(attention_mask == (i + 1), dim=-1)
-
-    counts = counts.flatten()
-    seqlens = counts[counts.nonzero().squeeze(dim=-1)]
-    return seqlens
-
-
-def get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Prepare indices and cu_seqlens for ``flash_attn_varlen_func``.
-
-    This is a drop-in replacement for
-    ``transformers.modeling_flash_attention_utils._get_unpad_data``
-    that handles **indexed** attention masks (values 1, 2, 3, …) instead of
-    binary (0/1) masks.  Each unique non-zero value is treated as a separate
-    document, so ``flash_attn_varlen_func`` applies causal attention
-    *within* each document without cross-document attention.
-
-    Returns:
-        indices: Indices of non-padding tokens from the flattened sequence.
-        cu_seqlens: Cumulative sequence lengths (starts from 0).
-        max_seqlen_in_batch: Largest document length in the batch.
-
-    Example::
-
-        >>> get_unpad_data(torch.tensor([[1, 1, 2, 2, 2, 0],
-        ...                              [1, 2, 2, 3, 3, 3]]))
-        (tensor([0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11]),
-         tensor([ 0,  2,  5,  6,  8, 11], dtype=torch.int32),
-         3)
-    """
-    seqlens_in_batch = get_seqlens_in_batch(attention_mask)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
-    return indices, cu_seqlens, max_seqlen_in_batch
 
 
 def is_indexed_packed_mask(attention_mask: torch.Tensor | None) -> bool:
@@ -371,7 +309,7 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         attn_impl = getattr(config, "_attn_implementation", None) or getattr(
             config, "_attn_implementation_internal", None
         )
-        if attn_impl in _VARLEN_PACKING_BACKENDS and is_indexed_packed_mask(attention_mask):
+        if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
             return (
                 preprocess_result_template[0],
                 attention_mask,

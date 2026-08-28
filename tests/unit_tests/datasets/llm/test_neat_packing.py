@@ -428,3 +428,12 @@ class TestNeatPackedCollaterFlashVersions:
     def test_sdpa_gets_4d_mask(self):
         out = neat_packed_collater(self._batch(), attn_implementation="sdpa")
         assert out["attention_mask"].dim() == 4
+
+    def test_native_fa4_emits_varlen_metadata(self):
+        """Native FA4 gets unpadding indices and cumulative document lengths."""
+        out = neat_packed_collater(self._batch(), attn_implementation="fa4")
+
+        assert out["attention_mask"].tolist() == [[1, 1, 2, 2]]
+        assert out["_fa4_unpad_indices"].tolist() == [0, 1, 2, 3]
+        assert out["cu_seqlens"].tolist() == [0, 2, 4]
+        assert out["max_seqlen"] == 2

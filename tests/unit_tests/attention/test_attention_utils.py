@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from types import ModuleType
 from unittest import mock
 
 import pytest
@@ -24,6 +26,56 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
+
+
+def _reference_varlen_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    **kwargs,
+) -> torch.Tensor:
+    """Evaluate independent per-document SDPA for a fake FA4 varlen kernel.
+
+    Args:
+        q: Query tensor of shape [tokens, heads, head_dim].
+        k: Key tensor of shape [tokens, heads, head_dim].
+        v: Value tensor of shape [tokens, heads, head_dim].
+        cu_seqlens_q: Query boundaries of shape [documents + 1].
+        cu_seqlens_k: Key/value boundaries of shape [documents + 1].
+        max_seqlen_q: Maximum query document length.
+        max_seqlen_k: Maximum key/value document length.
+        softmax_scale: Attention score scale.
+        causal: Whether to apply causal attention.
+        **kwargs: Unused FA4 options accepted for signature compatibility.
+
+    Returns:
+        Tensor of shape [tokens, heads, head_dim] containing independently
+        evaluated document outputs.
+    """
+    del max_seqlen_q, max_seqlen_k, kwargs
+    outputs = []
+    for document_idx in range(cu_seqlens_q.numel() - 1):
+        q_start, q_end = (int(x) for x in cu_seqlens_q[document_idx : document_idx + 2])
+        k_start, k_end = (int(x) for x in cu_seqlens_k[document_idx : document_idx + 2])
+        q_document = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
+        k_document = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        v_document = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        output = F.scaled_dot_product_attention(
+            q_document,
+            k_document,
+            v_document,
+            is_causal=causal,
+            scale=softmax_scale,
+        )
+        outputs.append(output.squeeze(0).transpose(0, 1))
+    return torch.cat(outputs)
 
 
 class TestInitializeAttnModuleAndFunc:
@@ -564,6 +616,87 @@ class TestFA4Backend:
         assert attn_kwargs["max_seqlen_q"] == 11
         assert attn_kwargs["max_seqlen_kv"] == 11
 
+    def test_fa4_packed_bshd_forward_backward_matches_document_sdpa(self):
+        """The production packed adapter preserves output and gradient boundaries."""
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        flash_attn_cute = ModuleType("flash_attn.cute")
+        flash_attn_cute.flash_attn_func = mock.Mock(side_effect=AssertionError("dense FA4 path was selected"))
+        flash_attn_cute.flash_attn_varlen_func = _reference_varlen_sdpa
+
+        collated = neat_packed_vlm_collater(
+            [
+                {
+                    "input_ids": torch.arange(6),
+                    "labels": torch.arange(6),
+                    "attention_mask": torch.tensor([1, 1, 2, 2, 2, 0]),
+                    "position_ids": torch.tensor([0, 1, 0, 1, 2, 0]),
+                    "n_images": 0,
+                    "n_videos": 0,
+                },
+                {
+                    "input_ids": torch.arange(6),
+                    "labels": torch.arange(6),
+                    "attention_mask": torch.tensor([1, 2, 2, 3, 3, 3]),
+                    "position_ids": torch.tensor([0, 0, 1, 0, 1, 2]),
+                    "n_images": 0,
+                    "n_videos": 0,
+                },
+            ],
+            attn_implementation="fa4",
+        )
+        attention_mask = collated["attention_mask"]
+        q = torch.randn(2, 6, 2, 8, requires_grad=True)
+        k = torch.randn(2, 6, 2, 8, requires_grad=True)
+        v = torch.randn(2, 6, 2, 8, requires_grad=True)
+        q_ref = q.detach().clone().requires_grad_()
+        k_ref = k.detach().clone().requires_grad_()
+        v_ref = v.detach().clone().requires_grad_()
+
+        with mock.patch.dict(sys.modules, {"flash_attn.cute": flash_attn_cute}):
+            _, fa4 = initialize_attn_module_and_func(
+                attn_impl="fa4",
+                num_attention_heads=2,
+                num_qk_channels=8,
+                num_v_channels=8,
+                softmax_scale=0.5,
+            )
+        packed_q, packed_k, packed_v, fa4_kwargs = preprocess_args_and_kwargs_for_attn(
+            q,
+            k,
+            v,
+            attention_mask,
+            "fa4",
+            cu_seqlens=collated["cu_seqlens"],
+            max_seqlen=collated["max_seqlen"],
+            _fa4_unpad_indices=collated["_fa4_unpad_indices"],
+        )
+        output = fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
+
+        reference = torch.zeros_like(q_ref)
+        for batch_idx in range(attention_mask.shape[0]):
+            for document_id in range(1, int(attention_mask[batch_idx].max().item()) + 1):
+                positions = torch.nonzero(attention_mask[batch_idx] == document_id, as_tuple=False).flatten()
+                q_document = q_ref[batch_idx, positions].transpose(0, 1).unsqueeze(0)
+                k_document = k_ref[batch_idx, positions].transpose(0, 1).unsqueeze(0)
+                v_document = v_ref[batch_idx, positions].transpose(0, 1).unsqueeze(0)
+                document_output = F.scaled_dot_product_attention(
+                    q_document,
+                    k_document,
+                    v_document,
+                    is_causal=True,
+                    scale=0.5,
+                )
+                reference[batch_idx, positions] = document_output.squeeze(0).transpose(0, 1)
+
+        torch.testing.assert_close(output, reference)
+        output_weight = torch.randn_like(output)
+        (output * output_weight).sum().backward()
+        (reference * output_weight).sum().backward()
+        torch.testing.assert_close(q.grad, q_ref.grad)
+        torch.testing.assert_close(k.grad, k_ref.grad)
+        torch.testing.assert_close(v.grad, v_ref.grad)
+
     def test_fa4_rejects_explicit_mask(self):
         """A dense mask must raise -- dropping it would attend across documents."""
         q = k = v = torch.randn(2, 8, 4, 16)
@@ -588,6 +721,22 @@ class TestFA4Backend:
                     num_v_channels=16,
                     softmax_scale=0.25,
                 )
+
+    def test_fa4_broken_cuda_probe_raises_actionable_import_error(self):
+        """Non-ImportError failures from CuTe's CUDA probe retain their cause."""
+        with mock.patch(
+            "nemo_automodel.components.attention.utils.safe_import",
+            side_effect=RuntimeError("CUDA toolkit probe failed"),
+        ):
+            with pytest.raises(ImportError, match="RuntimeError: CUDA toolkit probe failed") as exc_info:
+                initialize_attn_module_and_func(
+                    attn_impl="fa4",
+                    num_attention_heads=4,
+                    num_qk_channels=16,
+                    num_v_channels=16,
+                    softmax_scale=0.25,
+                )
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
 
     def test_fa4_rejects_unsupported_qkv_format(self):
         """Only bshd/thd are meaningful for FA4."""
