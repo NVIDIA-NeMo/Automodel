@@ -573,6 +573,24 @@ class _MoEModule(nn.Module):
 class TestScaleGradsAndClipGradNorm:
     """Tests for scale_grads_and_clip_grad_norm with EP scaling."""
 
+    def test_scaling_and_clipping_does_not_own_replicated_gradient_sync(self, monkeypatch):
+        """FSDP's backward lifecycle, not this generic helper, owns replicated sync."""
+        import nemo_automodel.components.training.utils as training_utils
+
+        model = nn.Linear(2, 1, bias=False)
+        model.weight.grad = torch.ones_like(model.weight)
+        order = []
+
+        monkeypatch.setattr(
+            training_utils,
+            "clip_grad_norm",
+            lambda *args, **kwargs: order.append(("clip", args[1])) or 0.0,
+        )
+
+        scale_grads_and_clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
+
+        assert order == [("clip", [model])]
+
     def test_owner_shard_uses_explicit_gradient_divisor(self):
         """Owner scaling is declared by the model and independent of DP arguments."""
         model = nn.Linear(2, 1, bias=False)

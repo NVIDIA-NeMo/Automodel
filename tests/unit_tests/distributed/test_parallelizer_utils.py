@@ -19,24 +19,31 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
-from nemo_automodel.components.distributed.parallelizer_utils import (
+import nemo_automodel.components.distributed.fsdp2_extensions.utils as parallelizer_utils
+from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
+    patch_fsdp_uniform_reduce_dtype,
+    patch_fsdp_unused_param_reduction,
+)
+from nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype import (
+    _fsdp_post_all_gather_in_compute_dtype,
+    _fsdp_pre_all_gather_in_compute_dtype,
+    fully_shard_with_compute_dtype_fallback,
+    fully_shard_with_per_param_compute_dtypes,
+)
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import (
     _fully_shard,
     _get_module_from_path,
     _group_params_by_dtype,
-    _make_compute_dtype_fn,
     _mp_policy_with_param_dtype,
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     get_internal_fsdp_mp_policy,
     iter_maximal_uniform_dtype_subtrees,
+    make_parameter_compute_dtype_resolver,
     reject_unsupported_mtp_cp,
     reject_unsupported_mtp_cp_pp,
-)
-from nemo_automodel.shared.torch_patches import (
-    patch_fsdp_uniform_reduce_dtype,
-    patch_fsdp_unused_param_reduction,
 )
 
 
@@ -68,7 +75,6 @@ def test_reject_unsupported_mtp_cp_allows_supported_or_disabled_model():
 
 
 def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
-    from nemo_automodel.components.distributed import parallelizer_utils
 
     class FakeFSDPModule(nn.Module):
         def __init__(self):
@@ -90,7 +96,7 @@ def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch)
 
 
 def test_configure_fsdp_unused_param_reduction_uses_legacy_fallback(monkeypatch):
-    from nemo_automodel.components.distributed import parallelizer_utils
+    import nemo_automodel.components.distributed.fsdp2_extensions.utils as parallelizer_utils
 
     class LegacyFSDPModule(nn.Module):
         pass
@@ -240,7 +246,7 @@ def test_uniform_reduce_dtype_patch_is_idempotent(monkeypatch):
 
 def test_configure_fsdp_unused_param_reduction_installs_dtype_alignment_first(monkeypatch):
     """The zero fill must wrap the alignment so filled zeros are aligned too."""
-    from nemo_automodel.components.distributed import parallelizer_utils
+    import nemo_automodel.components.distributed.fsdp2_extensions.utils as parallelizer_utils
 
     class LegacyFSDPModule(nn.Module):
         pass
@@ -413,7 +419,7 @@ def test__fully_shard_calls_for_single_module(monkeypatch):
 
     # Monkeypatch the symbol inside the utils module
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
     mod = nn.Linear(2, 2, bias=False)
     mesh, mp_policy, offload_policy = object(), object(), object()
@@ -432,7 +438,7 @@ def test__fully_shard_calls_for_modulelist(monkeypatch):
         calls.append(mod)
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
 
     ml = nn.ModuleList([nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)])
@@ -500,10 +506,12 @@ def test_fully_shard_by_dtype_no_params(monkeypatch):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils._fully_shard",
+        fake__fully_shard,
+        raising=True,
     )
 
     model = nn.Identity()
@@ -523,10 +531,12 @@ def test_fully_shard_by_dtype_single_dtype(monkeypatch):
         sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils._fully_shard",
+        fake__fully_shard,
+        raising=True,
     )
 
     # All parameters are float32 storage, but the policy requests bf16 compute
@@ -559,7 +569,7 @@ def test_fully_shard_by_dtype_omits_none_reshard_kwarg(monkeypatch):
         calls.append((mod, kwargs))
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard",
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard",
         fake_fully_shard,
         raising=True,
     )
@@ -610,7 +620,7 @@ def test_fully_shard_by_dtype_storage_equals_compute_keeps_storage_dtype(monkeyp
         fully_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
 
     # bf16 storage and bf16 compute -> param_dtype stays bf16 (no decoupling needed).
@@ -630,7 +640,7 @@ def test_fully_shard_by_dtype_genuine_fp32_compute_unchanged(monkeypatch):
         fully_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
 
     model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float32, b_dtype_l2=torch.float32)
@@ -641,7 +651,7 @@ def test_fully_shard_by_dtype_genuine_fp32_compute_unchanged(monkeypatch):
     assert fully_calls[0][1].param_dtype == torch.float32
 
 
-def test_make_compute_dtype_fn_precedence():
+def test_make_parameter_compute_dtype_resolver_precedence():
     """Resolver precedence: pinned fp32 > HF-recorded > mp_policy.param_dtype."""
 
     class Holder(nn.Module):
@@ -663,7 +673,7 @@ def test_make_compute_dtype_fn_precedence():
     mixer.recorded_fp32.weight._hf_compute_dtype = torch.float32
     mixer.recorded_bf16.weight._hf_compute_dtype = torch.bfloat16
 
-    fn = _make_compute_dtype_fn(mixer, _make_mp_policy(), ("_fp32_params",))
+    fn = make_parameter_compute_dtype_resolver(mixer, _make_mp_policy(), ("_fp32_params",))
 
     # Pinned wins even though storage is fp32 and nothing was recorded.
     assert fn(mixer._fp32_params.weight) == torch.float32
@@ -674,16 +684,270 @@ def test_make_compute_dtype_fn_precedence():
     assert fn(mixer.recorded_fp32.weight) == torch.float32
 
 
-def test_make_compute_dtype_fn_fallback_to_policy_then_storage():
+def test_make_parameter_compute_dtype_resolver_fallback_to_policy_then_storage():
     model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float32, b_dtype_l2=torch.float32)
 
     # No record, no pin, bf16 policy -> fall back to policy (bf16) despite fp32 storage.
-    fn = _make_compute_dtype_fn(model, _make_mp_policy(), ())
+    fn = make_parameter_compute_dtype_resolver(model, _make_mp_policy(), ())
     assert fn(model.a.weight) == torch.bfloat16
 
     # No policy -> fall back to storage dtype.
-    fn_no_policy = _make_compute_dtype_fn(model, None, ())
+    fn_no_policy = make_parameter_compute_dtype_resolver(model, None, ())
     assert fn_no_policy(model.a.weight) == torch.float32
+
+
+def test_pre_all_gather_reuses_tensor_when_compute_dtype_matches():
+    """A pinned FP32 shard should not dispatch a redundant FP32 cast."""
+
+    class MatchingDtypeTensor:
+        dtype = torch.float32
+
+        def to(self, _dtype):
+            raise AssertionError("matching-dtype tensor should be reused without calling to()")
+
+    tensor = MatchingDtypeTensor()
+    tensor._compute_dtype = torch.float32
+    inputs, metadata = _fsdp_pre_all_gather_in_compute_dtype(
+        tensor,
+        SimpleNamespace(size=lambda: 2),
+        torch.Size((4,)),
+        (1,),
+        nn.Module(),
+        _make_mp_policy(),
+    )
+
+    assert inputs == (tensor,)
+    assert metadata == (torch.float32, torch.Size((4,)), (1,))
+
+
+def test_post_all_gather_updates_grad_requiring_leaf_without_version_change():
+    """FSDP materialization may update a leaf parameter while grad mode is enabled."""
+    gathered = torch.arange(4, dtype=torch.float32)
+    out = torch.empty(4, dtype=torch.float32, requires_grad=True)
+    original_version = out._version
+
+    result = _fsdp_post_all_gather_in_compute_dtype(
+        torch.empty(2, dtype=torch.float32),
+        (gathered,),
+        (torch.float32, torch.Size((4,)), (1,)),
+        torch.bfloat16,
+        out=out,
+    )
+
+    assert result is None
+    torch.testing.assert_close(out, gathered)
+    assert out.requires_grad
+    assert out._version == original_version
+
+
+def test_per_param_compute_casting_keeps_one_fsdp_owner(monkeypatch):
+    """One parent wrap owns FP32 masters while the holder overrides compute dtype."""
+    import nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype as compute_dtype
+
+    class Mixer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = nn.Linear(4, 4, bias=False, dtype=torch.float32)
+            self._fp32_params = nn.Module()
+            self._fp32_params.A_log = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+    mixer = Mixer()
+    mixer.projection.weight._hf_compute_dtype = torch.float16
+    fully_shard_calls = []
+    installed_mappings = []
+    reduce_patch_calls = []
+
+    def fake_fully_shard(module, **kwargs):
+        fully_shard_calls.append((module, kwargs))
+        return module
+
+    def fake_install(module, mapping, policy_dtype):
+        installed_mappings.append((module, mapping, policy_dtype))
+        return 1
+
+    monkeypatch.setattr(compute_dtype, "_install_per_param_compute_dtypes", fake_install)
+    monkeypatch.setattr(compute_dtype, "patch_fsdp_uniform_reduce_dtype", lambda: reduce_patch_calls.append(1))
+
+    result = fully_shard_with_per_param_compute_dtypes(
+        mixer,
+        fp32_compute_module_names=("_fp32_params",),
+        fully_shard_fn=fake_fully_shard,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+    )
+
+    assert result is mixer
+    assert len(fully_shard_calls) == 1
+    assert len(installed_mappings) == 1
+    _, mapping, policy_dtype = installed_mappings[0]
+    assert mapping[(id(mixer.projection), "weight")] is torch.float16
+    assert mapping[(id(mixer._fp32_params), "A_log")] is torch.float32
+    assert policy_dtype is torch.bfloat16
+    assert reduce_patch_calls == [1]
+
+
+@pytest.mark.parametrize(
+    "active_state",
+    ("compiled_autograd_enabled", "compiled_autograd_enabled_force_eager", "in_compiled_autograd_region"),
+)
+def test_per_param_compute_casting_rejects_compiled_autograd(monkeypatch, active_state):
+    """Every PyTorch compiled-autograd execution state must reject the extension."""
+    import torch._dynamo.compiled_autograd as compiled_autograd
+
+    import nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype as compute_dtype
+
+    for state in ("compiled_autograd_enabled", "compiled_autograd_enabled_force_eager", "in_compiled_autograd_region"):
+        monkeypatch.setattr(compiled_autograd, state, state == active_state)
+
+    with pytest.raises(NotImplementedError, match="incompatible with compiled autograd"):
+        compute_dtype._install_per_param_compute_dtypes(nn.Module(), {}, torch.bfloat16)
+
+
+def test_per_param_compute_casting_rejects_non_fp32_master():
+    """The casting layer must not silently treat checkpoint BF16 storage as a master."""
+    mixer = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="requires FP32 resident/master weights"):
+        fully_shard_with_per_param_compute_dtypes(
+            mixer,
+            fp32_compute_module_names=(),
+            fully_shard_fn=lambda module, **kwargs: module,
+            mesh=object(),
+            mp_policy=_make_mp_policy(),
+            offload_policy=object(),
+        )
+
+
+class _MixedComputeLayer(nn.Module):
+    def __init__(
+        self,
+        bulk_dtype: torch.dtype = torch.float32,
+        sensitive_dtype: torch.dtype = torch.float32,
+        sensitive_size: int = 4,
+    ):
+        super().__init__()
+        self.projection = nn.Linear(4, 4, bias=False, dtype=bulk_dtype)
+        self._fp32_params = nn.Module()
+        self._fp32_params.A_log = nn.Parameter(torch.zeros(sensitive_size, dtype=sensitive_dtype))
+
+
+def _record_compute_dtype_path(
+    monkeypatch,
+    module,
+    *,
+    mp_policy,
+    offload_policy=None,
+    ignored_params=None,
+    fp32_compute_module_names=("_fp32_params",),
+):
+    import nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype as compute_dtype
+
+    calls = []
+    monkeypatch.setattr(
+        compute_dtype,
+        "fully_shard_with_per_param_compute_dtypes",
+        lambda model, **kwargs: calls.append(("single_owner", model)) or model,
+    )
+    monkeypatch.setattr(
+        compute_dtype,
+        "fully_shard_by_dtype",
+        lambda model, **kwargs: calls.append(("dtype_split", model)),
+    )
+    result = fully_shard_with_compute_dtype_fallback(
+        module,
+        fp32_compute_module_names=fp32_compute_module_names,
+        mesh=SimpleNamespace(ndim=1, shape=(2,), size=lambda: 2),
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        ignored_params=ignored_params,
+        fully_shard_fn=lambda model, **kwargs: model,
+    )
+    assert result is module
+    return calls
+
+
+def test_compute_dtype_dispatch_uses_single_owner_for_fp32_master_layout(monkeypatch):
+    layer = _MixedComputeLayer()
+
+    calls = _record_compute_dtype_path(monkeypatch, layer, mp_policy=_make_mp_policy())
+
+    assert calls == [("single_owner", layer)]
+
+
+@pytest.mark.parametrize(
+    "layer, policy",
+    [
+        (_MixedComputeLayer(), _mp_policy_with_param_dtype(_make_mp_policy(), torch.float32)),
+        (_MixedComputeLayer(bulk_dtype=torch.bfloat16), _make_mp_policy()),
+        (_MixedComputeLayer(sensitive_size=3), _make_mp_policy()),
+        (
+            _MixedComputeLayer(bulk_dtype=torch.bfloat16, sensitive_dtype=torch.bfloat16),
+            _make_mp_policy(),
+        ),
+    ],
+    ids=("uniform-fp32-compute", "mixed-resident-storage", "uneven-sensitive-shape", "invalid-bf16-sensitive"),
+)
+def test_compute_dtype_dispatch_falls_back_for_non_extension_layouts(monkeypatch, layer, policy):
+    calls = _record_compute_dtype_path(monkeypatch, layer, mp_policy=policy)
+
+    assert calls == [("dtype_split", layer)]
+
+
+def test_compute_dtype_dispatch_falls_back_for_cpu_offload(monkeypatch):
+    layer = _MixedComputeLayer()
+
+    calls = _record_compute_dtype_path(
+        monkeypatch,
+        layer,
+        mp_policy=_make_mp_policy(),
+        offload_policy=CPUOffloadPolicy(pin_memory=False),
+    )
+
+    assert calls == [("dtype_split", layer)]
+
+
+def test_compute_dtype_dispatch_falls_back_for_compiled_autograd(monkeypatch):
+    import nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype as compute_dtype
+
+    layer = _MixedComputeLayer()
+    monkeypatch.setattr(compute_dtype, "_compiled_autograd_is_enabled", lambda: True)
+
+    calls = _record_compute_dtype_path(monkeypatch, layer, mp_policy=_make_mp_policy())
+
+    assert calls == [("dtype_split", layer)]
+
+
+def test_compute_dtype_dispatch_excludes_replicated_parameter_from_decision(monkeypatch):
+    layer = _MixedComputeLayer()
+
+    calls = _record_compute_dtype_path(
+        monkeypatch,
+        layer,
+        mp_policy=_make_mp_policy(),
+        ignored_params={layer._fp32_params.A_log},
+    )
+
+    assert calls == [("dtype_split", layer)]
+
+
+@pytest.mark.parametrize(
+    "layer",
+    [
+        _MixedComputeLayer(bulk_dtype=torch.float32, sensitive_dtype=torch.bfloat16),
+        _MixedComputeLayer(bulk_dtype=torch.bfloat16, sensitive_dtype=torch.float32),
+    ],
+    ids=("fp32-bulk-bf16-sensitive", "bf16-bulk-fp32-sensitive"),
+)
+def test_compute_dtype_dispatch_splits_mixed_storage_even_with_uniform_bf16_compute(monkeypatch, layer):
+    calls = _record_compute_dtype_path(
+        monkeypatch,
+        layer,
+        mp_policy=_make_mp_policy(),
+        fp32_compute_module_names=(),
+    )
+
+    assert calls == [("dtype_split", layer)]
 
 
 def test_fully_shard_by_dtype_fp32_master_pins_compute(monkeypatch):
@@ -698,10 +962,12 @@ def test_fully_shard_by_dtype_fp32_master_pins_compute(monkeypatch):
         sub_calls.append((mod, mp_policy, reshard_after_forward))
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils._fully_shard",
+        fake__fully_shard,
+        raising=True,
     )
 
     class Fp32Holder(nn.Module):
@@ -748,10 +1014,12 @@ def test_fully_shard_by_dtype_fp32_master_hf_recorded_compute(monkeypatch):
         sub_calls.append((mod, mp_policy, reshard_after_forward))
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils._fully_shard",
+        fake__fully_shard,
+        raising=True,
     )
 
     # Uniform fp32 storage (master weights), but the checkpoint recorded 'a' as fp32
@@ -788,10 +1056,12 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
         sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils._fully_shard",
+        fake__fully_shard,
+        raising=True,
     )
 
     # Make float32 the least common (1 param) vs float16 (2 params)
@@ -818,10 +1088,12 @@ def test_fully_shard_by_dtype_internal_child_preserves_natural_output_dtype(monk
         sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils._fully_shard",
+        fake__fully_shard,
+        raising=True,
     )
 
     # The minority FP32-compute module becomes an internal child unit while the
@@ -987,10 +1259,12 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
         sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
     )
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils._fully_shard",
+        fake__fully_shard,
+        raising=True,
     )
 
     # Distinct dtypes across three subtrees: a=float32, b=float16, c=bfloat16

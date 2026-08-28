@@ -296,6 +296,10 @@ class FSDP2Config:
             memory at a small throughput cost.  Default ``2``.
         fsdp2_forward_prefetch_depth (int): Number of FSDP units to prefetch during
             forward pass.  Default ``1``.
+        max_replicated_fp32_param_bytes_per_module (int): Maximum logical bytes of explicitly
+            precision-sensitive FP32 parameters in each managed module that a model
+            strategy may keep replicated instead of FSDP-sharding. Set to ``0`` to
+            disable. Default ``8388608`` (8 MiB).
         multimodal: Policies for resolved multimodal modules that use the text
             model's distributed axes.
     """
@@ -322,6 +326,7 @@ class FSDP2Config:
     enable_fsdp2_prefetch: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
+    max_replicated_fp32_param_bytes_per_module: int = 8 * 1024 * 1024
     multimodal: MultimodalDistributedConfig = field(default_factory=MultimodalDistributedConfig)
 
     def __post_init__(self) -> None:
@@ -338,6 +343,8 @@ class FSDP2Config:
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
             self.activation_checkpointing_scope
         )
+        if self.max_replicated_fp32_param_bytes_per_module < 0:
+            raise ValueError("max_replicated_fp32_param_bytes_per_module must be non-negative")
         if not isinstance(self.multimodal, MultimodalDistributedConfig):
             raise TypeError("FSDP2Config.multimodal must be a MultimodalDistributedConfig instance.")
 

@@ -21,8 +21,10 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.parallel import ColwiseParallel
 
 from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
@@ -680,7 +682,7 @@ class TestNemotronHParallelizationStrategy:
             )
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard_by_dtype")
     def test_custom_tp_plan_not_supported(
         self,
         fully_shard,
@@ -716,7 +718,7 @@ class TestNemotronHParallelizationStrategy:
     @pytest.mark.parametrize("tp_size", [1, 2])
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard_by_dtype")
     def test_nemotron_specific_parallelization(
         self,
         fully_shard,
@@ -754,7 +756,7 @@ class TestNemotronHParallelizationStrategy:
         assert fully_shard_by_dtype.call_count + fully_shard.call_count == expected_fully_shard_calls
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard_by_dtype")
     def test_threads_reshard_after_forward_to_layer_sharding(
         self,
         fully_shard_by_dtype,
@@ -780,7 +782,7 @@ class TestNemotronHParallelizationStrategy:
 
     @patch("nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard_by_dtype")
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     def test_activation_checkpointing(
         self,
@@ -815,12 +817,101 @@ class TestNemotronHParallelizationStrategy:
 
 
 class TestQwen3_5ParallelizationStrategy:
-    """Test the Qwen3.5 dtype-based FSDP strategy."""
+    """Test the Qwen3.5 CP wiring over ordinary layer-owned FSDP."""
 
     @pytest.fixture
     def strategy(self):
         """Create a Qwen3_5ParallelizationStrategy instance."""
         return Qwen3_5ParallelizationStrategy()
+
+    @pytest.mark.parametrize(
+        "max_replicated_bytes, param_dtype, expect_replication",
+        [(64, None, True), (0, None, False), (64, torch.float32, False)],
+        ids=("bf16-fit", "bf16-oversized", "uniform-fp32-compute"),
+    )
+    @patch("nemo_automodel.components.distributed.parallelizer.make_fully_shard_with_replicated_parameter_grad_sync")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard_with_compute_dtype_fallback")
+    def test_small_fp32_parameters_are_replicated_with_bounded_fallback(
+        self,
+        fully_shard_with_compute_dtype_fallback,
+        fully_shard,
+        make_fully_shard_with_replicated_parameter_grad_sync,
+        strategy,
+        mock_device_mesh,
+        max_replicated_bytes,
+        param_dtype,
+        expect_replication,
+    ):
+        """Small FP32 holders stay outside FSDP; oversized sets retain sharded ownership."""
+
+        class MockLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.projection = nn.Linear(4, 4, bias=False)
+                self._fp32_params = nn.Module()
+                self._fp32_params.A_log = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+                self._fp32_params.dt_bias = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+        class MockQwen35Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([MockLayer()])
+
+        class MockQwen35Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=64)
+                self.model = MockQwen35Inner()
+
+        mesh, _, _, _ = mock_device_mesh
+        model = MockQwen35Model()
+        sensitive_params = set(model.model.layers[0]._fp32_params.parameters())
+        fully_shard.side_effect = lambda module, **kwargs: module
+
+        def fake_make_fully_shard_with_grad_sync(root_module, parameters, mesh, *, fully_shard_fn):
+            def wrapped_fully_shard(module, **kwargs):
+                result = fully_shard_fn(module, **kwargs)
+                if module is root_module:
+                    root_module._nemo_fsdp2_replicated_grad_sync = object()
+                return result
+
+            return wrapped_fully_shard
+
+        make_fully_shard_with_replicated_parameter_grad_sync.side_effect = fake_make_fully_shard_with_grad_sync
+        fully_shard_with_compute_dtype_fallback.side_effect = lambda module, *, fully_shard_fn, **kwargs: (
+            fully_shard_fn(module, **kwargs)
+        )
+
+        parallelize_kwargs = {}
+        if param_dtype is not None:
+            parallelize_kwargs["mp_policy"] = MixedPrecisionPolicy(
+                param_dtype=param_dtype,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.float32,
+            )
+        result = strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            max_replicated_fp32_param_bytes_per_module=max_replicated_bytes,
+            **parallelize_kwargs,
+        )
+
+        assert result is model
+        if expect_replication:
+            make_fully_shard_with_replicated_parameter_grad_sync.assert_called_once()
+            assert fully_shard_with_compute_dtype_fallback.call_count == fully_shard.call_count
+            layer_call = next(
+                call_args for call_args in fully_shard.call_args_list if call_args.args[0] is model.model.layers[0]
+            )
+            assert layer_call.kwargs["ignored_params"] == sensitive_params
+            assert fully_shard.call_args_list[-1].kwargs["ignored_params"] == sensitive_params
+            assert hasattr(model, "_nemo_fsdp2_replicated_grad_sync")
+        else:
+            make_fully_shard_with_replicated_parameter_grad_sync.assert_not_called()
+            assert fully_shard_with_compute_dtype_fallback.call_count == fully_shard.call_count
+            assert all("ignored_params" not in call_args.kwargs for call_args in fully_shard.call_args_list)
+            assert not hasattr(model, "_nemo_fsdp2_replicated_grad_sync")
 
     @pytest.mark.parametrize(
         "frozen_multimodal_sharding, expected_ignored, expected_vision_sharded",
@@ -831,9 +922,11 @@ class TestQwen3_5ParallelizationStrategy:
         ],
     )
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard_with_compute_dtype_fallback")
     def test_frozen_multimodal_modules_are_not_separately_sharded(
         self,
+        fully_shard_with_compute_dtype_fallback,
         fully_shard_by_dtype,
         fully_shard,
         strategy,
@@ -842,7 +935,7 @@ class TestQwen3_5ParallelizationStrategy:
         expected_ignored,
         expected_vision_sharded,
     ):
-        """Qwen3.5 applies all three frozen multimodal policies."""
+        """Qwen3.5 applies frozen policies without dtype-specific child units."""
 
         class MockQwen35Inner(nn.Module):
             def __init__(self):
@@ -864,6 +957,9 @@ class TestQwen3_5ParallelizationStrategy:
         frozen_vision_params = set(model.model.vision_tower.parameters())
         fully_shard.side_effect = lambda model, **kwargs: model
         fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
+        fully_shard_with_compute_dtype_fallback.side_effect = lambda model, *, fully_shard_fn, **kwargs: fully_shard_fn(
+            model, **kwargs
+        )
 
         result = strategy.parallelize(
             model=model,
@@ -871,10 +967,12 @@ class TestQwen3_5ParallelizationStrategy:
             frozen_multimodal_sharding=frozen_multimodal_sharding,
         )
 
-        sharded_by_dtype = [call_args.args[0] for call_args in fully_shard_by_dtype.call_args_list]
+        sharded_modules = [call_args.args[0] for call_args in fully_shard.call_args_list]
         assert result is model
-        assert model.model.layers[0] in sharded_by_dtype
-        assert (model.model.vision_tower.layers[0] in sharded_by_dtype) is expected_vision_sharded
+        assert fully_shard_by_dtype.call_count == 0
+        assert fully_shard_with_compute_dtype_fallback.call_count == fully_shard.call_count
+        assert model.model.layers[0] in sharded_modules
+        assert (model.model.vision_tower.layers[0] in sharded_modules) is expected_vision_sharded
         root_kwargs = fully_shard.call_args_list[-1].kwargs
         if expected_ignored:
             assert root_kwargs["ignored_params"] == frozen_vision_params
@@ -1173,7 +1271,7 @@ class TestFsdp2StrategyParallelizeIntegration:
 
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard_by_dtype")
     def test_delegates_to_nemotron_strategy(
         self, fully_shard, fully_shard_by_dtype, mock_parallelize_module, mock_device_mesh
     ):
