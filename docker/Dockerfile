@@ -186,7 +186,7 @@ RUN mkdir -p /wheels && \
 # Pin >= #2762/#2507: older refs rebuilt the CuTe compile key every call when max_seqlen
 # is a tensor (varlen/packed), so HF models recompiled each step. Also picks up #2745
 # (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
-ARG FLASH_ATTN_REF=ce088ab9ce0f
+ARG FLASH_ATTN_REF=ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=false
 ARG TARGETARCH
