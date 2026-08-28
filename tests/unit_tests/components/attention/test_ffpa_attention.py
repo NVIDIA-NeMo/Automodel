@@ -35,8 +35,7 @@ def _reset_module_state():
     ffpa_mod._SDPA_FN = None
     ffpa_mod._EAGER_FN = None
     ffpa_mod._FLEX_FN = None
-    ffpa_mod._FFPA_FN = None
-    ffpa_mod._CUTEDSL_BACKEND = None
+    ffpa_mod._FFPA_HIGH_LEVEL = None
     ffpa_mod._FFPA_LOW_LEVEL_READY = None
     yield
     ffpa_mod._FALLBACK_WARNED.clear()
@@ -69,6 +68,15 @@ def _patch_eager(rv=None):
 
 def _warns(caplog, substr):
     return [r for r in caplog.records if r.name == ffpa_mod.__name__ and substr in r.getMessage()]
+
+
+def test_module_exports_only_public_entry_points():
+    assert ffpa_mod.__all__ == [
+        "ffpa_attention_forward",
+        "ffpa_mask",
+        "register_ffpa_attention",
+        "setup_ffpa_backend",
+    ]
 
 
 def test_registration_idempotent_and_visible():
@@ -195,32 +203,53 @@ def test_warning_is_deduped_across_calls(caplog):
 def test_dense_path_calls_high_level_func_with_fa_layout():
     B, Hq, Hkv, S, D = 1, 8, 4, 16, 512
     q, k, v = _qkv(B, Hq, Hkv, S, D)
-    fwd_calls = []
     backend = mock.MagicMock()
-
-    def fake_ffpa(qn, kn, vn, attn_mask, dropout_p, is_causal, scale, enable_gqa, backend):
-        fwd_calls.append((qn, kn, vn, attn_mask, dropout_p, is_causal, scale, enable_gqa, backend))
-        return torch.zeros(B, Hq, S, D, dtype=torch.bfloat16)
+    ffpa_fn = mock.Mock(return_value=torch.zeros(B, Hq, S, D, dtype=torch.bfloat16))
 
     with (
         mock.patch.object(ffpa_mod, "_ffpa_low_level_ready", return_value=True),
-        mock.patch.object(ffpa_mod, "_get_ffpa_high_level", return_value=(fake_ffpa, backend)),
+        mock.patch.object(ffpa_mod, "_get_ffpa_high_level", return_value=(ffpa_fn, backend)),
     ):
         out, weights = ffpa_attention_forward(_module(512), q, k, v, attention_mask=None, dropout=0.0, scaling=0.0442)
 
-    assert len(fwd_calls) == 1
-    qn, kn, vn, attn_mask, dropout_p, is_causal, scale, enable_gqa, used_backend = fwd_calls[0]
-    assert qn.shape == (B, Hq, S, D)
-    assert kn.shape == (B, Hkv, S, D)
-    assert vn.shape == (B, Hkv, S, D)
-    assert attn_mask is None
-    assert dropout_p == 0.0
-    assert is_causal is True
-    assert scale == 0.0442
-    assert enable_gqa is True
-    assert used_backend is backend
+    ffpa_fn.assert_called_once()
+    args, kwargs = ffpa_fn.call_args
+    assert args[0] is q and args[1] is k and args[2] is v
+    assert kwargs == {
+        "attn_mask": None,
+        "dropout_p": 0.0,
+        "is_causal": True,
+        "scale": 0.0442,
+        "enable_gqa": True,
+        "backend": backend,
+    }
     assert out.shape == (B, S, Hq, D)
     assert weights is None
+
+
+def test_2d_bool_mask_returns_padded_output():
+    B, Hq, Hkv, S, D = 1, 2, 1, 2, 512
+    q, k, v = _qkv(B, Hq, Hkv, S, D)
+    attention_mask = torch.tensor([[True, False]])
+    out_pack = q.transpose(1, 2)[attention_mask]
+    expected = torch.zeros_like(q.transpose(1, 2))
+    expected[attention_mask] = out_pack
+
+    with (
+        mock.patch.object(ffpa_mod, "_ffpa_low_level_ready", return_value=True),
+        mock.patch.object(ffpa_mod, "_ffpa_varlen_fwd", return_value=(out_pack, torch.empty(Hq, 1))),
+    ):
+        out, weights = ffpa_attention_forward(_module(D), q, k, v, attention_mask, scaling=0.0442)
+
+    assert torch.equal(out, expected)
+    assert weights is None
+
+
+def test_ffpa_mask_returns_only_nontrivial_padding_mask():
+    attention_mask = torch.ones(1, 4, dtype=torch.bool)
+    assert ffpa_mod.ffpa_mask(1, 4, 4, attention_mask=attention_mask) is None
+    attention_mask[0, 1] = False
+    assert torch.equal(ffpa_mod.ffpa_mask(1, 4, 4, attention_mask=attention_mask), attention_mask)
 
 
 @pytest.mark.parametrize("causal", [False, True])
