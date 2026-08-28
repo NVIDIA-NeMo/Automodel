@@ -371,8 +371,17 @@ def ffpa_mask(
 
         if mask_function is not causal_mask_function:
             device = kwargs.pop("device", None) or (attention_mask.device if attention_mask is not None else "cpu")
-            # BlockMask preserves sliding sparsity and selects the Flex path in ffpa_attention_forward.
-            return flex_attention_mask(
+            sliding_backend = str(getattr(cfg, "ffpa_sliding_attn_backend", "flex")).lower()
+            if sliding_backend == "sdpa":
+                from transformers.masking_utils import sdpa_mask
+
+                mask_builder = sdpa_mask
+            elif sliding_backend == "flex":
+                # BlockMask preserves sliding sparsity and selects the Flex path in ffpa_attention_forward.
+                mask_builder = flex_attention_mask
+            else:
+                raise ValueError(f"ffpa_sliding_attn_backend must be 'flex' or 'sdpa', got {sliding_backend!r}.")
+            return mask_builder(
                 batch_size=batch_size,
                 q_length=q_length,
                 kv_length=kv_length,

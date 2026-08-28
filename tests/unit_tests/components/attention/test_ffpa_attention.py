@@ -15,6 +15,7 @@
 """Unit tests for nemo_automodel/components/attention/ffpa_attention.py."""
 
 import logging
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -264,6 +265,46 @@ def test_ffpa_mask_routes_only_sliding_to_flex(causal):
         )
     assert (mock_flex_mask.call_count == 1) is (not causal)
     assert out is (None if causal else sentinel)
+
+
+def test_ffpa_mask_can_route_sliding_to_sdpa():
+    from transformers.masking_utils import sliding_window_causal_mask_function
+
+    config = SimpleNamespace(ffpa_sliding_attn_backend="sdpa")
+    out = ffpa_mod.ffpa_mask(
+        batch_size=1,
+        q_length=4,
+        kv_length=4,
+        mask_function=sliding_window_causal_mask_function(2),
+        device="cpu",
+        config=config,
+        local_size=2,
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [False, True, True, False],
+                    [False, False, True, True],
+                ]
+            ]
+        ]
+    )
+    assert torch.equal(out, expected)
+
+
+def test_ffpa_mask_rejects_unknown_sliding_backend():
+    with pytest.raises(ValueError, match="ffpa_sliding_attn_backend must be 'flex' or 'sdpa', got 'invalid'"):
+        ffpa_mod.ffpa_mask(
+            batch_size=1,
+            q_length=4,
+            kv_length=4,
+            mask_function=lambda b, h, qi, ki: ki <= qi,
+            config=SimpleNamespace(ffpa_sliding_attn_backend="invalid"),
+        )
 
 
 def test_block_mask_routes_to_flex_not_sdpa():
