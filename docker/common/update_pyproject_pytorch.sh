@@ -68,7 +68,10 @@ if ! grep -q "^\[tool\.uv\]$" "$PYPROJECT_FILE"; then
 fi
 
 # Replace existing override-dependencies and inject PyTorch overrides in [tool.uv].
-sed -i '/^override-dependencies[[:space:]]*=[[:space:]]*\[/,/]/d' "$PYPROJECT_FILE"
+# End the range at a closing bracket in column 0, not at any "]": entries carrying an extra
+# (e.g. "nvidia-cutlass-dsl[cu13]==4.6.2") contain a bracket and would otherwise truncate the
+# deletion mid-array, leaving orphaned entries and an unparseable pyproject.toml.
+sed -i '/^override-dependencies[[:space:]]*=[[:space:]]*\[/,/^]/d' "$PYPROJECT_FILE"
 sed -i "$SED_INSERT_SCRIPT" "$PYPROJECT_FILE"
 
 # Update uv lock with additonal uv configurations

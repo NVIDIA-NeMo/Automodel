@@ -189,9 +189,7 @@ RUN mkdir -p /wheels && \
 ARG FLASH_ATTN_REF=ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820
 ARG INSTALL_FA3=true
 # FA4 on by default: it is the only attention backend that reaches the Blackwell
-# CuTe kernels (backend.attn="fa4"). See the runtime-dep note in the final stage --
-# this upgrades apache-tvm-ffi past tilelang's cap, so backend.attn="tilelang"
-# (DeepSeek-V4 sparse MLA, GLM DSA) is NOT available in the default image.
+# CuTe kernels (backend.attn="fa4"). Coexists with tilelang -- see the final stage.
 ARG INSTALL_FA4=true
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
@@ -218,14 +216,17 @@ WORKDIR /opt/Automodel
 # before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
 ARG INSTALL_FA4=true
-# The FA4 wheel is installed --no-deps (above), so flash_attn.cute's runtime deps have
-# to be named explicitly or `import flash_attn.cute` fails. apache-tvm-ffi>=0.1.12 is
-# the one that bites: the `cuda` extra caps it at <=0.1.11 for tilelang, so installing
-# FA4 upgrades it and disables the tilelang backend in this image (see pyproject.toml).
+# The FA4 wheel is installed --no-deps (above). flash_attn.cute's declared dependency list
+# is wider than what it imports: at this ref the cute package imports only cutlass, torch
+# and quack (compile_utils.make_fake_tensor) -- never apache-tvm-ffi, einops or
+# torch-c-dlpack-ext. Installing its declared apache-tvm-ffi>=0.1.12 would cross tilelang's
+# <=0.1.11 cap and break backend.attn="tilelang" for no runtime benefit, so it is left
+# alone; the tvm-ffi that does get loaded comes via quack-kernels, which accepts 0.1.11.
+# cutlass-dsl is the one FA4 genuinely needs, and 4.6.2 matches what the venv resolves to
+# (quack-kernels 0.6.4 pins it there too), so system and venv agree on one version.
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     if [ "$INSTALL_FA4" = "true" ]; then \
-        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" \
-            "apache-tvm-ffi>=0.1.12,<0.2" "quack-kernels>=0.5.3" torch-c-dlpack-ext einops && \
+        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" && \
         FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
         VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
         { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; }; \
