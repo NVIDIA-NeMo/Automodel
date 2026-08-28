@@ -31,7 +31,10 @@ except ImportError:
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
-from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
+from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import (
+    GlmMoeDsaStateDictAdapter,
+    should_quantize_key,
+)
 from nemo_automodel.components.moe.config import MoEConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -45,6 +48,10 @@ def config():
     cfg.intermediate_size = 128
     cfg.num_attention_heads = 4
     cfg.num_experts = 4
+    cfg.quantization_config = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
     return cfg
 
 
@@ -189,9 +196,11 @@ class TestConvertSingleTensorToHfQuantization:
         with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
-            assert len(result) == 1
+            assert len(result) == 2
             assert result[0][0] == fqn
             assert result[0][1].dtype == torch.float8_e4m3fn
+            assert result[1][0] == fqn + "_scale_inv"
+            assert result[1][1].shape == (1, 1)
 
     def test_quantization_skips_non_weight_keys(self, adapter):
         tensor = torch.randn(64)
@@ -244,9 +253,44 @@ class TestConvertSingleTensorToHfQuantization:
         with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
-            assert len(result) == 1
+            assert len(result) == 2
             assert result[0][0] == fqn
             assert result[0][1].dtype == torch.float8_e4m3fn
+            assert result[1][0] == fqn + "_scale_inv"
+
+    @pytest.mark.parametrize(
+        "fqn",
+        [
+            "model.embed_tokens.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.self_attn.q_a_layernorm.weight",
+            "model.layers.0.mlp.gate.weight",
+            "model.layers.78.eh_proj.weight",
+            "model.layers.78.enorm.weight",
+            "lm_head.weight",
+        ],
+    )
+    def test_quantization_skips_unscaled_glm53_weights(self, adapter, fqn):
+        tensor = torch.randn(64, 64)
+
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        assert len(result) == 1
+        assert result[0][0] == fqn
+        assert result[0][1] is tensor
+
+    def test_quantization_is_not_enabled_for_bf16_checkpoint(self, adapter):
+        adapter.config.quantization_config = None
+        tensor = torch.randn(64, 64)
+        fqn = "model.layers.0.self_attn.q_a_proj.weight"
+
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        assert len(result) == 1
+        assert result[0][0] == fqn
+        assert result[0][1] is tensor
 
     def test_without_quantization_preserves_dtype(self, adapter):
         tensor = torch.randn(64, 64)
@@ -269,3 +313,40 @@ class TestConvertSingleTensorToHfQuantization:
             )
 
             assert len(result) == 0
+
+
+class TestGlm53Fp8Dequantization:
+    @pytest.mark.parametrize(
+        ("key", "expected"),
+        [
+            ("model.layers.0.self_attn.q_a_proj.weight", True),
+            ("model.layers.10.mlp.experts.3.down_proj.weight", True),
+            ("model.layers.0.self_attn.indexer.wq_b.weight", True),
+            ("model.layers.0.input_layernorm.weight", False),
+            ("model.layers.0.self_attn.indexer.k_norm.weight", False),
+            ("model.layers.0.self_attn.indexer.weights_proj.weight", False),
+            ("model.layers.10.mlp.gate.weight", False),
+            ("model.layers.78.eh_proj.weight", False),
+            ("model.layers.78.enorm.weight", False),
+            ("model.embed_tokens.weight", False),
+            ("lm_head.weight", False),
+        ],
+    )
+    def test_should_quantize_key_matches_glm53_checkpoint(self, key, expected):
+        assert should_quantize_key(key) is expected
+
+    def test_dequantize_applies_scale_and_removes_scale_tensor(self, adapter):
+        weight = torch.full((128, 128), 2.0).to(torch.float8_e4m3fn)
+        scale_inv = torch.full((1, 1), 0.25)
+        state_dict = {
+            "model.layers.0.self_attn.q_a_proj.weight": weight,
+            "model.layers.0.self_attn.q_a_proj.weight_scale_inv": scale_inv,
+            "model.layers.0.input_layernorm.weight": torch.ones(128),
+        }
+
+        result = adapter._dequantize(state_dict)
+
+        assert result["model.layers.0.self_attn.q_a_proj.weight"].dtype == torch.float32
+        assert torch.all(result["model.layers.0.self_attn.q_a_proj.weight"] == 0.5)
+        assert "model.layers.0.self_attn.q_a_proj.weight_scale_inv" not in result
+        assert "model.layers.0.input_layernorm.weight" in result
