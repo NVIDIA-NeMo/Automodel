@@ -270,27 +270,44 @@ def _elig_module(sliding_window=None, use_ffpa=True):
     return SimpleNamespace(_gemma4_cp_use_ffpa=use_ffpa, sliding_window=sliding_window)
 
 
-def _elig_ctx(*, head_dim=512, packed=True):
+def _elig_ctx(*, head_dim=512, packed=True, dropout_p=0.0):
     md = {"_packed_seq_ids": torch.tensor([[1, 1, 1, 1]])} if packed else {}
     return SimpleNamespace(
-        is_causal=True, metadata=md, query=torch.zeros(1, 1, 4, head_dim, dtype=torch.bfloat16), scale=0.0625
+        is_causal=True,
+        metadata=md,
+        query=torch.zeros(1, 1, 4, head_dim, dtype=torch.bfloat16),
+        scale=0.0625,
+        dropout_p=dropout_p,
     )
 
 
 @pytest.mark.parametrize(
     "avail,mod_kw,ctx_kw,expected",
     [
-        (True, {}, {}, True),  # happy path
+        (True, {}, {}, True),  # zero-dropout happy path
         (True, {}, {"packed": False}, False),  # no _packed_seq_ids
         (True, {"sliding_window": 512}, {}, False),  # sliding-window layer
         (True, {"use_ffpa": False}, {}, False),  # backend flag off
         (True, {}, {"head_dim": 256}, False),  # wrong head_dim
+        (True, {"sliding_window": 512}, {"dropout_p": 0.1}, False),  # dropout on non-FFPA layer
+        (True, {}, {"head_dim": 256, "dropout_p": 0.1}, False),  # dropout with wrong head_dim
         (False, {}, {}, False),  # kernel unavailable
     ],
 )
 def test_ring_use_ffpa_varlen(monkeypatch, avail, mod_kw, ctx_kw, expected):
     monkeypatch.setattr(cpa, "_ffpa_varlen_ring_available", lambda: avail)
     assert cpa._ring_use_ffpa_varlen(_elig_module(**mod_kw), _elig_ctx(**ctx_kw)) is expected
+
+
+def test_ring_use_ffpa_varlen_rejects_dropout_before_kernel_probe(monkeypatch):
+    monkeypatch.setattr(
+        cpa,
+        "_ffpa_varlen_ring_available",
+        lambda: pytest.fail("FFPA availability must not be queried for unsupported dropout"),
+    )
+
+    with pytest.raises(NotImplementedError, match=r"ffpa-attn requires dropout_p=0\.0, got 0\.1"):
+        cpa._ring_use_ffpa_varlen(_elig_module(), _elig_ctx(dropout_p=0.1))
 
 
 # Flex ring forward (eager flex kernel, no GPU)
@@ -364,6 +381,27 @@ def test_ring_dispatch_routes_to_flex_when_not_eligible(monkeypatch):
     monkeypatch.setattr(cpa, "_run_gemma4_flex_chunk", _sdpa_flex_surrogate)
     ctx = _make_ctx(_flex_module(), seq=4, head_dim=8)
     assert cpa._run_gemma4_cp_ring_attention(ctx.module, ctx).shape == ctx.query.shape
+
+
+def test_ring_dispatch_rejects_ffpa_dropout_before_ring_work(monkeypatch):
+    monkeypatch.setattr(
+        cpa,
+        "_collect_ring_kv_chunks",
+        lambda _ctx: pytest.fail("ring chunks must not be collected for unsupported dropout"),
+    )
+    ctx = _make_ctx(
+        _elig_module(), seq=4, head_dim=512, metadata={"_packed_seq_ids": torch.ones(1, 4, dtype=torch.long)}
+    )
+    ctx = cpa.replace(
+        ctx,
+        query=ctx.query.to(torch.bfloat16),
+        key=ctx.key.to(torch.bfloat16),
+        value=ctx.value.to(torch.bfloat16),
+        dropout_p=0.1,
+    )
+
+    with pytest.raises(NotImplementedError, match="Gemma4 FFPA ring CP does not support attention dropout"):
+        cpa._run_gemma4_cp_ring_attention(ctx.module, ctx)
 
 
 def test_ring_dispatch_routes_to_varlen_when_eligible(monkeypatch):
