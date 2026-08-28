@@ -37,6 +37,9 @@ class _ParityMetrics:
     mean_kl: float
     p95_kl: float
     max_kl: float
+    mean_jsd: float
+    p95_jsd: float
+    max_jsd: float
     cosine_similarity: float
     mean_absolute_logit_difference: float
     max_absolute_logit_difference: float
@@ -139,6 +142,7 @@ def _compute_parity_metrics(
         raise ValueError("Cannot compare empty logit tensors")
 
     kl_chunks: list[torch.Tensor] = []
+    jsd_chunks: list[torch.Tensor] = []
     absolute_difference_sum = 0.0
     max_absolute_difference = 0.0
     dot_product = 0.0
@@ -160,6 +164,14 @@ def _compute_parity_metrics(
         token_kl = (reference_probs * (reference_log_probs - candidate_log_probs)).sum(dim=-1)
         kl_chunks.append(token_kl.cpu())
 
+        mixture_log_probs = torch.logaddexp(reference_log_probs, candidate_log_probs) - math.log(2.0)
+        candidate_probs = candidate_log_probs.exp()
+        token_jsd = 0.5 * (
+            (reference_probs * (reference_log_probs - mixture_log_probs)).sum(dim=-1)
+            + (candidate_probs * (candidate_log_probs - mixture_log_probs)).sum(dim=-1)
+        )
+        jsd_chunks.append(token_jsd.clamp(min=0.0, max=math.log(2.0)).cpu())
+
         absolute_difference = (reference_chunk - candidate_chunk).abs()
         absolute_difference_sum += absolute_difference.sum(dtype=torch.float64).item()
         max_absolute_difference = max(max_absolute_difference, absolute_difference.max().item())
@@ -170,6 +182,9 @@ def _compute_parity_metrics(
     per_token_kl = torch.cat(kl_chunks)
     if not bool(torch.isfinite(per_token_kl).all()):
         raise ValueError("KL divergence contains non-finite values")
+    per_token_jsd = torch.cat(jsd_chunks)
+    if not bool(torch.isfinite(per_token_jsd).all()):
+        raise ValueError("Jensen-Shannon divergence contains non-finite values")
 
     norm_product = math.sqrt(reference_squared_norm * candidate_squared_norm)
     if norm_product == 0.0:
@@ -183,6 +198,9 @@ def _compute_parity_metrics(
         mean_kl=per_token_kl.mean().item(),
         p95_kl=torch.quantile(per_token_kl, 0.95).item(),
         max_kl=per_token_kl.max().item(),
+        mean_jsd=per_token_jsd.mean().item(),
+        p95_jsd=torch.quantile(per_token_jsd, 0.95).item(),
+        max_jsd=per_token_jsd.max().item(),
         cosine_similarity=cosine_similarity,
         mean_absolute_logit_difference=absolute_difference_sum / reference_logits.numel(),
         max_absolute_logit_difference=max_absolute_difference,

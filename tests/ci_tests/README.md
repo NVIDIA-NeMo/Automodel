@@ -151,11 +151,13 @@ harness fails with an actionable error instead of repeating content if a request
 document. Pipeline-parallel runs resize their stage activation buffers to the configured parity length; reduce the
 length only when a model has a documented memory limit.
 
-Every comparison reports mean, p95, and max per-token `KL(reference || candidate)`; whole-tensor cosine similarity;
-and mean/max absolute logit difference. The full record is printed as `CHECKPOINT_PARITY_METRICS <json>` and saved
-under `<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`. Named profiles gate mean KL, p95 KL, and cosine
-similarity. Max KL and absolute logit differences remain diagnostics, allowing a single extreme token to remain
-visible without making the default gate as unstable as max KL.
+Every comparison reports mean, p95, and max per-token `KL(reference || candidate)`; mean, p95, and max per-token
+Jensen-Shannon divergence (natural log, bounded by `ln(2)`); whole-tensor cosine similarity; and mean/max absolute
+logit difference. The full record is printed as `CHECKPOINT_PARITY_METRICS <json>` and saved under
+`<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`. Named profiles gate mean KL, p95 KL, and cosine similarity.
+JSD, max KL, and absolute logit differences remain diagnostics, allowing their usefulness to be evaluated without
+changing pass/fail policy. Record schema version 2 adds `mean_jsd`, `p95_jsd`, and `max_jsd` under `metrics`; existing
+version 1 fields retain their meaning.
 
 Each vanilla-HF reference is forwarded twice through the same loaded model. The resulting `hf_source_self_repeat`
 or `hf_export_self_repeat` record is informational and distinguishes cross-framework drift from an unstable reference.
@@ -214,7 +216,7 @@ parity_threshold_overrides:
 ```
 
 Supported metric names are `mean_kl`, `p95_kl`, and `cosine_similarity`. Numeric overrides are exceptional calibration
-escape hatches, not additional profiles. Max KL remains diagnostic and cannot be overridden.
+escape hatches, not additional profiles. JSD and max KL remain diagnostic and cannot be overridden.
 
 Legacy positive `check_*` controls, generic numeric cosine fields, and max-KL threshold fields are no longer accepted.
 All live recipes use default-on phases, semantic `skip_*` controls, and named profiles. The optional structured

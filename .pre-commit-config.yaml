@@ -14,7 +14,7 @@
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.4.0
+    rev: "3e8a8703264a2f4a69428a0aa4dcb512790b2c8c"  # frozen: v6.0.0
     hooks:
     - id: end-of-file-fixer
       # only include python files
@@ -24,24 +24,21 @@ repos:
       files: \.py$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: "v0.12.12"
+    rev: "aab412d509121cb5f7533134b7e67f9fab59c682"  # frozen: v0.16.4
     hooks:
-    - id: ruff
+    - id: ruff-check
       args: ["--fix"]
-    - id: ruff
-      args: ["check", "--select", "I", "--fix"]
     - id: ruff-format
 
   - repo: https://github.com/PyCQA/bandit
-    rev: "1.9.4"
+    rev: "92ae8b82fb422a639f0ed8d99e96cea769594e08"  # frozen: 1.9.4
     hooks:
     - id: bandit
       args: ["-t", "B614"]
       exclude: "^tests/"
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    # Use the latest version
-    rev: 0.9.2
+    rev: "b84c4a0a90bd58c7d82ae8f0d4d5e77b1ddd3ce6"  # frozen: 0.12.5
     hooks:
       - id: uv-lock
 
