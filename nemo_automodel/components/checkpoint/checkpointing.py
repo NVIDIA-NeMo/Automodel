@@ -2024,7 +2024,12 @@ def _create_dirs(*dirs: str | None) -> None:
     """Create local directory paths and ignore cloud paths."""
     for directory in dirs:
         if directory and not is_cloud_path(directory):
-            os.makedirs(directory, exist_ok=True)
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except FileExistsError:
+                # virtiofs & co.: a racing rank's mkdir can surface as EEXIST while isdir() lags
+                if not os.path.isdir(directory):
+                    raise
 
 
 def _ensure_dirs(*dirs: str | None, process_group: torch.distributed.ProcessGroup | None = None) -> None:
