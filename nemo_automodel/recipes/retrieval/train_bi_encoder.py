@@ -27,6 +27,7 @@ from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.retrieval_types import PASSAGE_MODALITY_NAMES
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -226,6 +227,52 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     return query_batch_dict, doc_batch_dict
 
 
+def _positive_passage_modality(
+    batch: dict[str, Any],
+    batch_size: int,
+    n_passages: int,
+) -> torch.Tensor | None:
+    """Return modality labels for each query's positive passage."""
+    passage_modality = batch.get("passage_modality")
+    if passage_modality is None:
+        return None
+    if not isinstance(passage_modality, torch.Tensor):
+        return None
+
+    passage_modality = passage_modality.reshape(-1).long()
+    expected_passages = batch_size * n_passages
+    if passage_modality.numel() != expected_passages:
+        logger.warning(
+            "Skipping modality loss logging because passage_modality has %d entries, expected %d",
+            passage_modality.numel(),
+            expected_passages,
+        )
+        return None
+    return passage_modality.reshape(batch_size, n_passages)[:, 0]
+
+
+def _append_modality_loss_stats(
+    batch: dict[str, Any],
+    per_query_loss: torch.Tensor,
+    n_passages: int,
+    modality_loss_buffers: dict[str, list[torch.Tensor]] | None,
+) -> None:
+    """Append modality-specific loss sum-count pairs for logging only."""
+    if modality_loss_buffers is None:
+        return
+
+    positive_modality = _positive_passage_modality(batch, per_query_loss.shape[0], n_passages)
+    if positive_modality is None:
+        return
+
+    for modality_id, key in PASSAGE_MODALITY_NAMES.items():
+        mask = positive_modality == modality_id
+        mask = mask.to(device=per_query_loss.device)
+        count = mask.sum().to(per_query_loss.dtype)
+        loss_sum = (per_query_loss.detach() * mask.to(per_query_loss.dtype)).sum()
+        modality_loss_buffers[key].append(torch.stack([loss_sum, count.to(loss_sum.dtype)]))
+
+
 class TrainBiEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
@@ -371,6 +418,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.dataloader = materialize_loader(dataloader_config)
         _configure_sentence_transformer_export(self.model_parts[0], self.dataloader.collate_fn)
         self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
+        self.log_modality_loss = bool(self.cfg.get("log_modality_loss", False))
 
         self.val_dataloader = None
         validation_configs = self.cfg.validation_dataloaders
@@ -474,7 +522,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self._finalize_and_close_checkpointer()
 
-    def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
+    def _forward_backward_step(
+        self,
+        idx,
+        batch,
+        *,
+        loss_buffer,
+        num_batches,
+        is_train: bool = True,
+        modality_loss_buffers: dict[str, list[torch.Tensor]] | None = None,
+    ):
         """Forward and backward pass for a single micro-batch."""
         batch = {
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
@@ -565,9 +622,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
                 if attr_model.l2_normalize:
                     scores = scores / self.temperature
-            loss = F.cross_entropy(scores, labels)
+            per_query_loss = F.cross_entropy(scores, labels, reduction="none")
+            loss = per_query_loss.mean()
 
             loss_buffer.append(loss.clone().detach())
+            _append_modality_loss_stats(batch, per_query_loss, n_passages, modality_loss_buffers)
 
             if is_train:
                 # Scale loss by number of gradient accumulation steps to get correct average gradients
@@ -578,8 +637,18 @@ class TrainBiEncoderRecipe(BaseRecipe):
     def _run_train_optim_step(self, batches, max_grad_norm=None):
         """Run one optimization step with gradient accumulation."""
         loss_buffer = []
+        modality_loss_buffers = (
+            {name: [] for name in PASSAGE_MODALITY_NAMES.values()} if self.log_modality_loss else None
+        )
         for idx, batch in enumerate(batches):
-            self._forward_backward_step(idx, batch, loss_buffer=loss_buffer, num_batches=len(batches), is_train=True)
+            self._forward_backward_step(
+                idx,
+                batch,
+                loss_buffer=loss_buffer,
+                num_batches=len(batches),
+                is_train=True,
+                modality_loss_buffers=modality_loss_buffers,
+            )
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
@@ -626,6 +695,17 @@ class TrainBiEncoderRecipe(BaseRecipe):
             "mem": mem_allocated,
             "time_per_step": elapsed,
         }
+        if modality_loss_buffers is not None:
+            for modality, stats_buffer in modality_loss_buffers.items():
+                if stats_buffer:
+                    stats = torch.stack(stats_buffer).sum(dim=0)
+                else:
+                    stats = torch.zeros(2, device=self.dist_env.device)
+                if torch.distributed.is_initialized():
+                    stats = self._dp_allreduce(stats, include_cp=True)
+                loss_sum, count = stats[0].item(), stats[1].item()
+                if count > 0:
+                    metrics[f"loss_{modality}"] = loss_sum / count
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -733,8 +813,20 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self.metric_logger_train.log(log_data)
 
+        modality_loss_log = ""
+        for modality in ("text_only", "image_only", "image_text"):
+            metric_name = f"loss_{modality}"
+            if metric_name in log_data.metrics:
+                modality_loss_log += " | {} {:.4f}".format(
+                    metric_name,
+                    log_data.metrics[metric_name],
+                )
+
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | loss_avg_window {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
+            (
+                "step {} | epoch {} | loss {:.4f} | loss_avg_window {:.4f} | "
+                "grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s{}"
+            ).format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
@@ -743,6 +835,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
                 log_data.metrics["time_per_step"],
+                modality_loss_log,
             )
         )
 

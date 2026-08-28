@@ -46,7 +46,11 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
     Mistral3BidirectionalModel,
     Mistral3VLBidirectionalForSequenceClassification,
 )
-from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor, load_image
+from nemo_automodel.components.models.ministral_bidirectional.processor import (
+    Mistral3BiEncoderProcessor,
+    PassageModality,
+    load_image,
+)
 
 
 def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:
@@ -701,12 +705,19 @@ def test_ministral3_biencoder_processor_merges_biencoder_batch(pixtral_processor
         "d_attention_mask",
         "d_pixel_values",
         "d_image_sizes",
+        "passage_modality",
         "labels",
     }
     assert output["q_input_ids"].shape[0] == 2
     assert output["d_input_ids"].shape[0] == 4
     assert output["d_pixel_values"].shape[0] == 2
     assert output["d_image_sizes"].tolist() == [[4, 4], [4, 4]]
+    assert output["passage_modality"].tolist() == [
+        PassageModality.IMAGE_TEXT,
+        PassageModality.TEXT_ONLY,
+        PassageModality.TEXT_ONLY,
+        PassageModality.IMAGE_TEXT,
+    ]
     assert torch.equal(output["labels"], torch.zeros(2, dtype=torch.long))
 
 
