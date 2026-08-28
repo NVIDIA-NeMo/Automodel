@@ -397,6 +397,7 @@ def _format_example(
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
+    mask_generation_prompt: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
     truncate_history: bool = False,
@@ -420,6 +421,7 @@ def _format_example(
             padding=padding,
             truncation=truncation,
             mask_reasoning_content=mask_reasoning_content,
+            mask_generation_prompt=mask_generation_prompt,
             train_on_last_turn_only=train_on_last_turn_only,
             drop_history_reasoning_content=drop_history_reasoning_content,
             truncate_history=truncate_history,
@@ -438,6 +440,7 @@ def _format_example_impl(
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
+    mask_generation_prompt: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
     truncate_history: bool = False,
@@ -487,6 +490,7 @@ def _format_example_impl(
         truncation=truncation,
         answer_only_loss_mask=True,
         mask_reasoning_content=mask_reasoning_content,
+        mask_generation_prompt=mask_generation_prompt,
         train_on_last_turn_only=train_on_last_turn_only,
     )
     # Truncation (or over-aggressive last-turn masking) can leave a sample with no
@@ -674,6 +678,7 @@ def make_agent_chat_dataset(
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
+    mask_generation_prompt: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
     truncate_history: bool = False,
@@ -712,6 +717,14 @@ def make_agent_chat_dataset(
             prompt. Requires a chat template that emits ``reasoning_content``.
             Defaults to False, which trains on reasoning tokens like any other
             assistant content.
+        mask_generation_prompt: If True, exclude from the loss the tokens of each
+            assistant turn that the chat template's generation prompt supplies at
+            inference: the role header and any template-inserted empty reasoning
+            block (for example the ``<think></think>`` that Nemotron and Qwen3
+            templates emit for non-thinking turns). The model never generates
+            those tokens, so supervising them only reinforces template
+            boilerplate. Detected per template by rendering the generation
+            prompt, so no tag strings are hardcoded. Defaults to False.
         train_on_last_turn_only: If True, supervise only the final assistant
             turn of each dialogue (``mask_history``); all earlier assistant
             turns are excluded from the loss. Defaults to False, which
@@ -790,6 +803,7 @@ def make_agent_chat_dataset(
                 padding=False,
                 truncation=True,
                 mask_reasoning_content=mask_reasoning_content,
+                mask_generation_prompt=mask_generation_prompt,
                 train_on_last_turn_only=train_on_last_turn_only,
                 drop_history_reasoning_content=drop_history_reasoning_content,
                 truncate_history=truncate_history,
@@ -811,6 +825,7 @@ def make_agent_chat_dataset(
         padding=padding,
         truncation=truncation,
         mask_reasoning_content=mask_reasoning_content,
+        mask_generation_prompt=mask_generation_prompt,
         train_on_last_turn_only=train_on_last_turn_only,
         drop_history_reasoning_content=drop_history_reasoning_content,
         truncate_history=truncate_history,
@@ -854,6 +869,9 @@ class AgentChatConfig:
     """Truncation strategy forwarded to the tokenizer."""
     mask_reasoning_content: bool = False
     """If True, exclude assistant ``reasoning_content`` tokens from the loss."""
+    mask_generation_prompt: bool = False
+    """If True, exclude the template-supplied prefix of each assistant turn (role header and any
+    empty reasoning block such as ``<think></think>``) from the loss."""
     train_on_last_turn_only: bool = False
     """If True, supervise only the final assistant turn of each dialogue."""
     drop_history_reasoning_content: bool = False
@@ -878,6 +896,7 @@ class AgentChatConfig:
             padding=self.padding,
             truncation=self.truncation,
             mask_reasoning_content=self.mask_reasoning_content,
+            mask_generation_prompt=self.mask_generation_prompt,
             train_on_last_turn_only=self.train_on_last_turn_only,
             drop_history_reasoning_content=self.drop_history_reasoning_content,
             truncate_history=self.truncate_history,

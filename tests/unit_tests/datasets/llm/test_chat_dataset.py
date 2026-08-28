@@ -335,6 +335,7 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
         start_of_turn_token="<|sot|>",
         chat_template="OVERRIDE",
         mask_reasoning_content=True,
+        mask_generation_prompt=True,
     )
 
     # init effects
@@ -356,6 +357,7 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
     assert calls[1]["kwargs"]["tools"] == tools_list
     assert calls[2]["kwargs"]["tools"] is None
     assert calls[0]["kwargs"]["mask_reasoning_content"] is True
+    assert calls[0]["kwargs"]["mask_generation_prompt"] is True
 
     # Bad row: messages not a list → ValueError
     monkeypatch.setattr(tcd, "_load_openai_messages", lambda *a, **k: [{"messages": "oops"}])
@@ -606,6 +608,7 @@ def test_getitem_auto_converts_conversations(monkeypatch):
     ds.mask_reasoning_content = False
     ds.mask_history = False
     ds.unshifted = False
+    ds.mask_generation_prompt = False
 
     out = ds[0]
     assert out == {"input_ids": [1], "labels": [1]}
@@ -621,3 +624,16 @@ def test_getitem_still_rejects_rows_without_messages_or_conversations(monkeypatc
     ds.pad_token_id = 0
     with pytest.raises(ValueError, match="`messages`.*or a `conversations`"):
         _ = ds[0]
+
+
+def test_chat_dataset_config_forwards_mask_generation_prompt(monkeypatch):
+    captured = {}
+
+    class _FakeChatDataset:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(tcd, "ChatDataset", _FakeChatDataset)
+    tcd.ChatDatasetConfig(path_or_dataset_id="ignored", mask_generation_prompt=True).build(tokenizer=object())
+    assert captured["mask_generation_prompt"] is True
+    assert tcd.ChatDatasetConfig(path_or_dataset_id="ignored").mask_generation_prompt is False

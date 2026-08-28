@@ -345,6 +345,9 @@ class ChatDatasetConfig:
     """If set, shuffles Hub/Parquet data before applying a split slice."""
     mask_reasoning_content: bool = False
     """If ``True``, exclude rendered reasoning traces from the loss mask."""
+    mask_generation_prompt: bool = False
+    """If ``True``, exclude the template-supplied prefix of each assistant turn (role header and any
+    empty reasoning block such as ``<think></think>``) from the loss mask."""
     mask_history: bool = False
     """If ``True``, supervise only the final assistant turn."""
     unshifted: bool = False
@@ -366,6 +369,7 @@ class ChatDatasetConfig:
             chat_template=self.chat_template,
             shuffle_seed=self.shuffle_seed,
             mask_reasoning_content=self.mask_reasoning_content,
+            mask_generation_prompt=self.mask_generation_prompt,
             mask_history=self.mask_history,
             unshifted=self.unshifted,
             skip_invalid_samples=self.skip_invalid_samples,
@@ -400,6 +404,7 @@ class ChatDataset(Dataset):
         mask_history: bool = False,
         unshifted: bool = False,
         skip_invalid_samples: bool = False,
+        mask_generation_prompt: bool = False,
     ) -> None:
         """Load OpenAI-format chat rows and tokenize via the chat template.
 
@@ -425,6 +430,12 @@ class ChatDataset(Dataset):
             skip_invalid_samples: If ``True``, skip malformed JSONL lines when reading local files (warning logs
                 include skip counts). If ``False``, a bad line raises. Does not skip invalid structured rows after
                 load; those still raise when a sample is accessed.
+            mask_generation_prompt: If ``True``, exclude from the loss the tokens of each assistant turn that
+                the chat template's generation prompt supplies at inference: the role header and any
+                template-inserted empty reasoning block (for example the ``<think></think>`` Nemotron and
+                Qwen3 templates emit for non-thinking turns). The model never generates those tokens, so
+                supervising them only reinforces template boilerplate. Detected per template by rendering
+                the generation prompt, so no tag strings are hardcoded.
         """
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -442,6 +453,7 @@ class ChatDataset(Dataset):
         self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
         self.mask_reasoning_content = mask_reasoning_content
+        self.mask_generation_prompt = mask_generation_prompt
         self.mask_history = mask_history
         self.unshifted = unshifted
         self.skip_invalid_samples = skip_invalid_samples
@@ -524,6 +536,7 @@ class ChatDataset(Dataset):
             tools=tools,
             mask_reasoning_content=self.mask_reasoning_content,
             unshifted=self.unshifted,
+            mask_generation_prompt=self.mask_generation_prompt,
         )
         if self.mask_history:
             # Collapse multi-turn supervision to the final assistant turn so the

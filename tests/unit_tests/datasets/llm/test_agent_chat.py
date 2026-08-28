@@ -772,6 +772,42 @@ def test_format_example_forwards_mask_reasoning_content(monkeypatch):
     assert captured["mask_reasoning_content"] is True
 
 
+def test_format_example_forwards_mask_generation_prompt(monkeypatch):
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
+
+    agent_chat._format_example(example, Tok(), 0, 0)
+    assert captured["mask_generation_prompt"] is False
+
+    agent_chat._format_example(example, Tok(), 0, 0, mask_generation_prompt=True)
+    assert captured["mask_generation_prompt"] is True
+
+
+def test_agent_chat_config_forwards_mask_generation_prompt(monkeypatch):
+    captured = {}
+
+    def fake_make(tokenizer, **kwargs):
+        captured.update(kwargs)
+        return "dataset"
+
+    monkeypatch.setattr(agent_chat, "make_agent_chat_dataset", fake_make)
+    cfg = agent_chat.AgentChatConfig(dataset_name="x", mask_generation_prompt=True)
+    assert cfg.build(tokenizer=object()) == "dataset"
+    assert captured["mask_generation_prompt"] is True
+    assert agent_chat.AgentChatConfig(dataset_name="x").mask_generation_prompt is False
+
+
 def test_convert_messages_drops_history_reasoning_keeps_last():
     # Two assistant turns each carry reasoning; only the final one should keep it.
     messages = [

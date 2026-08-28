@@ -67,8 +67,17 @@ def _tokenize_chat(
     tools: List[Dict] | None = None,
     truncation: Union[str, bool] = "do_not_truncate",
     seq_length: int | None = None,
+    add_generation_prompt: bool = False,
+    **template_kwargs: Any,
 ) -> List[int]:
-    """Tokenize chat messages without padding and return input ids."""
+    """Tokenize chat messages without padding and return input ids.
+
+    ``add_generation_prompt`` and any ``template_kwargs`` (for example
+    ``enable_thinking``) are forwarded to ``apply_chat_template`` only when set,
+    so tokenizers that do not accept them keep working for the default path.
+    """
+    if add_generation_prompt:
+        template_kwargs["add_generation_prompt"] = True
     tokenized_chat = tokenizer.apply_chat_template(
         messages,
         tools=tools,
@@ -78,6 +87,7 @@ def _tokenize_chat(
         padding=False,
         truncation=truncation,
         max_length=seq_length,
+        **template_kwargs,
     )
     return tokenized_chat.get("input_ids", [])
 
@@ -231,14 +241,19 @@ def _masked_reasoning_message(message: Dict[str, Any]) -> Dict[str, Any]:
     return masked
 
 
+def _common_prefix_length(left: List[int], right: List[int]) -> int:
+    """Return the number of leading elements ``left`` and ``right`` share."""
+    n = 0
+    for a, b in zip(left, right):
+        if a != b:
+            break
+        n += 1
+    return n
+
+
 def _find_reasoning_span(full_segment: List[int], masked_segment: List[int]) -> tuple[int, int] | None:
     """Locate the contiguous token span attributable to reasoning content."""
-    prefix_len = 0
-    while (
-        prefix_len < min(len(full_segment), len(masked_segment))
-        and full_segment[prefix_len] == masked_segment[prefix_len]
-    ):
-        prefix_len += 1
+    prefix_len = _common_prefix_length(full_segment, masked_segment)
 
     suffix_len = 0
     max_suffix = min(len(full_segment) - prefix_len, len(masked_segment) - prefix_len)
@@ -332,6 +347,102 @@ def _build_reasoning_mask(
             reasoning_mask[pos] = 1
 
     return reasoning_mask
+
+
+def _build_generation_prompt_mask(
+    tokenizer: "PreTrainedTokenizer",
+    formatted_text: List[Dict[str, Any]],
+    input_ids: List[int],
+    *,
+    tools: List[Dict] | None = None,
+    truncation: Union[str, bool] = "do_not_truncate",
+    seq_length: int | None = None,
+    unpadded_full_ids: "list[int] | None" = None,
+) -> List[int]:
+    """Mark the tokens of each assistant turn that the generation prompt supplies.
+
+    At inference the chat template, not the model, emits the assistant role
+    header plus whatever it inserts ahead of the first generated token. For a
+    turn without reasoning that is typically an empty reasoning block such as
+    ``<think></think>`` (Nemotron), ``<think>\\n\\n</think>\\n\\n`` (Qwen3) or
+    ``</think>`` (DeepSeek V3.1); for a thinking turn it may be an opening
+    ``<think>\\n``. The model never produces these tokens, so supervising them
+    only teaches template boilerplate, and an empty reasoning block also
+    teaches an immediate ``<think>`` -> ``</think>`` transition.
+
+    The span is located without knowing any tag string: ``messages[:idx]`` is
+    rendered with and without ``add_generation_prompt=True`` (``enable_thinking``
+    set to whether the turn carries ``reasoning_content``), and the tokens the
+    generation prompt adds are matched against the start of that turn in the
+    full render. The match is anchored on the **last** occurrence of the turn's
+    first token in those added tokens, because a template appends its generation
+    prompt at the very end of the render: anything earlier belongs to the
+    conversation prefix. That keeps the rule template-agnostic in both
+    directions. The added tokens may extend *before* the assistant header
+    (GLM appends ``/nothink`` to the preceding user turn, SmolLM3 rewrites the
+    system block) or *past* what the turn actually contains (SmolLM3's prompt
+    ends with an empty reasoning block its training render omits); either way
+    only the run that matches token for token from the turn's first token is
+    marked, so assistant content is never touched.
+
+    A turn whose prefix render cannot be aligned with the full render is left
+    untouched with a warning. Positions are computed from unpadded
+    (left-aligned) ids, like :func:`_build_multiturn_assistant_mask`. Two extra
+    ``apply_chat_template`` renders per assistant turn are the price, which is
+    why the behavior is opt-in.
+    """
+    generation_prompt_mask = [0] * len(input_ids)
+
+    if unpadded_full_ids is None:
+        unpadded_full_ids = _tokenize_chat(
+            tokenizer,
+            formatted_text,
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    render_kwargs = dict(tools=tools, truncation=truncation, seq_length=seq_length)
+
+    for idx, message in enumerate(formatted_text):
+        # A leading assistant turn has no prefix to render a generation prompt from.
+        if message.get("role") != "assistant" or idx == 0:
+            continue
+
+        prefix = formatted_text[:idx]
+        base_ids = _tokenize_chat(tokenizer, prefix, **render_kwargs)
+        if not _is_consistent_render_prefix(base_ids, unpadded_full_ids, trailing_token_id=eos_token_id):
+            logger.warning(
+                "Could not align the generation prompt for assistant message %s; its template-supplied "
+                "tokens stay in the loss.",
+                idx,
+            )
+            continue
+        # Equals len(base_ids), or one less when the prefix render ends on a
+        # trailing terminator that the full render replaces.
+        start = _common_prefix_length(base_ids, unpadded_full_ids)
+
+        generation_ids = _tokenize_chat(
+            tokenizer,
+            prefix,
+            add_generation_prompt=True,
+            enable_thinking=bool(message.get("reasoning_content")),
+            **render_kwargs,
+        )
+        # Everything the generation prompt adds to (or changes in) the plain prefix render.
+        block = generation_ids[_common_prefix_length(base_ids, generation_ids) :]
+        turn = unpadded_full_ids[start:]
+        matched = 0
+        if turn:
+            # Last occurrence only: an earlier one belongs to the rendered prefix, and
+            # matching from there would run into already-rendered assistant content.
+            anchor = next((i for i in reversed(range(len(block))) if block[i] == turn[0]), None)
+            if anchor is not None:
+                matched = _common_prefix_length(block[anchor:], turn)
+        for pos in range(start, min(start + matched, len(generation_prompt_mask))):
+            generation_prompt_mask[pos] = 1
+
+    return generation_prompt_mask
 
 
 def _mask_labels_to_last_turn(mask: List[int], ignore_index: int = -100) -> List[int]:
@@ -675,6 +786,7 @@ def format_chat_template(
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
     unshifted: bool = False,
+    mask_generation_prompt: bool = False,
 ) -> Dict[str, List[int]]:
     """
     Format a chat template style example.
@@ -691,6 +803,11 @@ def format_chat_template(
         train_on_last_turn_only: Whether to supervise only the final assistant turn,
             masking every earlier assistant turn (``mask_history``). Applied to the
             assistant mask before reasoning_content is masked out.
+        mask_generation_prompt: Whether to exclude from the loss the tokens of each
+            assistant turn that the chat template's generation prompt supplies at
+            inference: the role header and any template-inserted empty reasoning
+            block (for example ``<think></think>``). See
+            :func:`_build_generation_prompt_mask`.
 
     Returns:
         A dictionary with the formatted example.
@@ -777,6 +894,25 @@ def format_chat_template(
     # contiguous-run heuristic sees a hole-free mask (one run per turn).
     if train_on_last_turn_only:
         _mask_labels_to_last_turn(mask, ignore_index=0)
+
+    # Drop the template-supplied prefix of every assistant turn (role header and
+    # any empty reasoning block). Independent of the reasoning mask below: that one
+    # removes rendered reasoning text, this one removes what the generation prompt
+    # would emit around it.
+    if mask_generation_prompt:
+        generation_prompt_mask = _build_generation_prompt_mask(
+            tokenizer,
+            formatted_text,
+            input_ids,
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+            unpadded_full_ids=unpadded_full_ids(),
+        )
+        generation_prompt_mask = _maybe_shift_mask_for_left_padding(
+            generation_prompt_mask, tokenizer, tokenized_chat.get("attention_mask")
+        )
+        mask = [keep if not supplied else 0 for keep, supplied in zip(mask, generation_prompt_mask)]
 
     if mask_reasoning_content and has_reasoning_content:
         reasoning_mask = _build_reasoning_mask(
