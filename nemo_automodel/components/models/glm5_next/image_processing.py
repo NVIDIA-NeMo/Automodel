@@ -8,12 +8,18 @@ from __future__ import annotations
 import math
 
 import torch
-from torchvision.transforms.v2 import functional as tvF
 from transformers.image_processing_backends import TorchvisionBackend
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_transforms import group_images_by_shape, reorder_images
 from transformers.image_utils import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD, PILImageResampling, SizeDict
 from transformers.processing_utils import ImagesKwargs
+
+from nemo_automodel.shared.import_utils import safe_import
+
+_, tvF = safe_import(
+    "torchvision.transforms.v2.functional",
+    msg="GLM-5.3 image preprocessing requires torchvision. Install the `vlm` extra.",
+)
 
 
 class Glm5NextImageProcessorKwargs(ImagesKwargs, total=False):

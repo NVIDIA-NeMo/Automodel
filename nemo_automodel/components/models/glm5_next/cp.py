@@ -19,8 +19,14 @@ import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+from nemo_automodel.shared.import_utils import safe_import_from
 
 _PAD_DOC_ID = 0
+_FLA_CP_AVAILABLE, _build_cp_context = safe_import_from(
+    "fla.ops.cp",
+    "build_cp_context",
+    msg="GLM-5.3 context parallelism requires the `fla` optional dependency.",
+)
 
 
 @dataclass
@@ -134,13 +140,11 @@ def build_fla_cp_context(
     Returns:
         FLA ``FLACPContext`` carrying segment and process-group metadata.
     """
-    try:
-        from fla.ops.cp import build_cp_context
-    except ImportError as exc:
-        raise RuntimeError("GLM-5.3 context parallelism requires the `fla` optional dependency") from exc
+    if not _FLA_CP_AVAILABLE:
+        raise RuntimeError("GLM-5.3 context parallelism requires the `fla` optional dependency")
 
     cu_seqlens, cu_seqlens_cpu = packed_context.row_cu_seqlens(row)
-    return build_cp_context(
+    return _build_cp_context(
         cu_seqlens=cu_seqlens,
         group=cp_group,
         conv1d_kernel_size=conv_kernel_size,

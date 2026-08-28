@@ -7,13 +7,21 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
+from huggingface_hub.utils import EntryNotFoundError
 from transformers import AutoTokenizer
 from transformers.models.glm46v.processing_glm46v import Glm46VProcessor
-from transformers.models.glm46v.video_processing_glm46v import Glm46VVideoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from nemo_automodel.components.models.glm5_next.image_processing import Glm5NextImageProcessor
+from nemo_automodel.shared.import_utils import safe_import_from
+
+_, Glm46VVideoProcessor = safe_import_from(
+    "transformers.models.glm46v.video_processing_glm46v",
+    "Glm46VVideoProcessor",
+    msg="GLM-5.3 processor construction requires torchvision. Install the `vlm` extra.",
+)
 
 _MEDIA_REMINDER = (
     '{{- "<reminder>You are unable to process this " ~ media_type ~ '
@@ -26,7 +34,7 @@ _IMAGE_PLACEHOLDER = """{%- if media_type == 'image' -%}
                 {%- endif -%}"""
 
 
-def _load_processor_config(path_or_id: str, **kwargs) -> dict:
+def _load_processor_config(path_or_id: str, **kwargs: Any) -> dict[str, Any]:
     local = os.path.join(path_or_id, "processor_config.json")
     if not os.path.isfile(local):
         from huggingface_hub import hf_hub_download
@@ -37,15 +45,17 @@ def _load_processor_config(path_or_id: str, **kwargs) -> dict:
         return json.load(stream)
 
 
-def _load_chat_template(path_or_id: str, **kwargs) -> str | None:
+def _load_chat_template(path_or_id: str, **kwargs: Any) -> str | None:
     local = os.path.join(path_or_id, "chat_template.jinja")
     if not os.path.isfile(local):
+        if os.path.isdir(path_or_id):
+            return None
         try:
             from huggingface_hub import hf_hub_download
 
             hub_kwargs = {key: kwargs[key] for key in ("cache_dir", "revision", "token") if key in kwargs}
             local = hf_hub_download(path_or_id, "chat_template.jinja", **hub_kwargs)
-        except Exception:
+        except EntryNotFoundError:
             return None
     with open(local, encoding="utf-8") as stream:
         return stream.read()
@@ -69,7 +79,7 @@ def _enable_image_placeholders(template: str | None) -> str | None:
     return template.replace(_MEDIA_REMINDER, _IMAGE_PLACEHOLDER, 1)
 
 
-def build_glm5_next_processor(pretrained_model_name_or_path: str, **kwargs) -> ProcessorMixin:
+def build_glm5_next_processor(pretrained_model_name_or_path: str, **kwargs: Any) -> ProcessorMixin:
     """Create the image-only GLM-5.3 processor used by MedPix recipes."""
     processor_config = _load_processor_config(pretrained_model_name_or_path, **kwargs)
     image_kwargs = dict(processor_config.get("image_processor", {}))

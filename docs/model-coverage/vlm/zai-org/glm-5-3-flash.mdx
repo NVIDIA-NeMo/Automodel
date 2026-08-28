@@ -1,0 +1,41 @@
+---
+title: "GLM-5.3-Flash"
+description: "Fine-tune the GLM-5.3-Flash mixture-of-experts vision-language model with packed context and expert parallelism."
+slug: model-coverage/vision-language-models/zai-org/glm-5-3-flash
+---
+
+[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) is a mixture-of-experts vision-language model with a hybrid Kimi Delta Attention and Dynamic Sparse Attention language backbone.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Glm5NextForConditionalGeneration` |
+| **Language Module** | Hybrid KDA / KPool-DSA MoE decoder |
+| **Training Precision** | BF16 after FP8 checkpoint dequantization |
+| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
+
+</Info>
+
+## Supported Training Path
+
+NeMo AutoModel provides a native configuration, image processor, vision tower, language model, and Hugging Face state-dict adapter for GLM-5.3-Flash. The supported full-model initialization path loads the base checkpoint through distributed checkpointing; single-GPU full-checkpoint loading is not supported.
+
+The current onboarding supports image training. Video inputs, tensor parallelism, and pipeline parallelism are not enabled for this model. The validated recipe uses FSDP2 with expert parallelism, contiguous packed context parallelism, and HybridEP dispatch.
+
+## Attention Backends
+
+- KDA layers use Flash Linear Attention kernels.
+- Sparse DSA layers support the SDPA reference path.
+- On SM90 or later, `backend.attn: cudnn` uses FlashMLA forward with cuDNN sparse-attention backward. This optional path requires compatible FlashMLA and cuDNN Frontend installations.
+
+## Example Recipe
+
+- [Full SFT — MedPix, packed 2K, EP72 + CP2](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml)
+
+The recipe is sized for 9 nodes with 8 GPUs per node. It uses local batch size 1 and four gradient-accumulation microsteps to form a global batch of 144 packed samples.
+
+## Hugging Face Model Card
+
+- [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
