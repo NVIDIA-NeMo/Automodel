@@ -169,6 +169,10 @@ class NemotronV3MTPSublayer(NemotronV3Block):
 
 _VALID_BLOCK_TYPES = frozenset(_PATTERN_SYMBOL_TO_BLOCK_TYPE.values())
 
+# Transformers 5.15 canonicalized the hybrid discriminators. Map them back to the
+# local names, matching NemotronV3Block and NemotronHybridCache.
+_CANONICAL_BLOCK_TYPE_ALIASES = {"linear_attention": "mamba", "full_attention": "attention"}
+
 
 def _resolve_block_types_per_sublayer(config) -> list[str] | None:
     """Resolve the per-depth MTP block-type list from either HF field.
@@ -192,7 +196,7 @@ def _resolve_block_types_per_sublayer(config) -> list[str] | None:
         return parse_mtp_layer_pattern(pattern)
     block_types = getattr(config, "mtp_layers_block_type", None)
     if block_types:
-        block_types = list(block_types)
+        block_types = [_CANONICAL_BLOCK_TYPE_ALIASES.get(bt, bt) for bt in block_types]
         for bt in block_types:
             if bt not in _VALID_BLOCK_TYPES:
                 raise ValueError(
