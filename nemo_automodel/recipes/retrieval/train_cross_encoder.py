@@ -89,8 +89,29 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
 
         torch.cuda.reset_peak_memory_stats()
 
-    def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
-        """Forward and backward pass for a single micro-batch."""
+    def _forward_backward_step(
+        self,
+        idx,
+        batch,
+        *,
+        loss_buffer,
+        num_batches,
+        is_train: bool = True,
+        modality_loss_buffers: dict[str, list[torch.Tensor]] | None = None,
+    ):
+        """Forward and backward pass for a single micro-batch.
+
+        Args:
+            idx: Index of this micro-batch within the gradient accumulation window.
+            batch: Collated cross-encoder batch of flattened query-passage pairs.
+            loss_buffer: Accumulator the scalar loss is appended to.
+            num_batches: Number of micro-batches in the accumulation window.
+            is_train: Whether to run the backward pass and gradient sync.
+            modality_loss_buffers: Accepted for compatibility with
+                ``TrainBiEncoderRecipe._run_train_optim_step``, which always forwards it.
+                Unused here because the grouped cross-entropy is reduced to a scalar before
+                it could be split per modality.
+        """
         batch = {
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
