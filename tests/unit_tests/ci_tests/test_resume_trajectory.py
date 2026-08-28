@@ -30,6 +30,7 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _configure_resumed_run,
     _configure_uninterrupted_run,
     _disable_checkpoint_saves_after_restore,
+    _optimizer_step_summary,
     _report_resume_comparison,
     _report_training_reproducibility,
     _resolve_resume_loss_tolerance,
@@ -143,6 +144,29 @@ def test_resume_state_check_detects_omitted_rng_state():
     mismatch = _restored_state_mismatch(reference, restored)
 
     assert mismatch == "restored snapshot omitted required RNG state (rng_digest)"
+
+
+def test_optimizer_step_summary_treats_missing_adam_state_as_effective_zero():
+    class PartiallyUsedModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.used = torch.nn.Linear(2, 1, bias=False)
+            self.unused = torch.nn.Linear(2, 1, bias=False)
+
+    model = PartiallyUsedModel()
+    optimizer = torch.optim.AdamW(model.parameters())
+    model.used(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+
+    before_materialization = _optimizer_step_summary(optimizer)
+    optimizer.state[model.unused.weight] = {
+        "step": torch.tensor(0.0),
+        "exp_avg": torch.zeros_like(model.unused.weight),
+        "exp_avg_sq": torch.zeros_like(model.unused.weight),
+    }
+
+    assert before_materialization == [{"0.0": 1, "1.0": 1}]
+    assert _optimizer_step_summary(optimizer) == before_materialization
 
 
 @pytest.mark.parametrize(

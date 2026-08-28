@@ -71,11 +71,22 @@ def test_full_logit_metrics_match_direct_reference_computation():
     assert metrics.p95_jsd == pytest.approx(torch.quantile(expected_jsd, 0.95).item(), rel=1e-6, abs=1e-8)
     assert metrics.max_jsd == pytest.approx(expected_jsd.max().item(), rel=1e-6, abs=1e-8)
     assert metrics.cosine_similarity == pytest.approx(
-        F.cosine_similarity(reference.flatten(), candidate.flatten(), dim=0).item(), rel=1e-6
+        F.cosine_similarity(reference.flatten().double(), candidate.flatten().double(), dim=0).item(), abs=1e-12
     )
     absolute_difference = (reference - candidate).abs()
     assert metrics.mean_absolute_logit_difference == pytest.approx(absolute_difference.mean().item())
     assert metrics.max_absolute_logit_difference == pytest.approx(absolute_difference.max().item())
+
+
+def test_cosine_uses_float64_products_for_large_logit_comparison():
+    generator = torch.Generator().manual_seed(1234)
+    reference = torch.randn(1, 100, 100, generator=generator)
+    candidate = reference + 0.0633 * torch.randn(1, 100, 100, generator=generator)
+
+    metrics = _compute_parity_metrics(reference, candidate)
+
+    expected_cosine = F.cosine_similarity(reference.flatten().double(), candidate.flatten().double(), dim=0).item()
+    assert metrics.cosine_similarity == pytest.approx(expected_cosine, abs=1e-12)
 
 
 def test_p95_is_stable_against_a_single_token_outlier_while_max_remains_diagnostic():

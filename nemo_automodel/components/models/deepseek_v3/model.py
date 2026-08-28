@@ -51,7 +51,7 @@ class Block(nn.Module):
         backend: BackendConfig,
     ):
         super().__init__()
-        self.self_attn = MLA(config, backend)
+        self.self_attn = MLA(config, backend, latent_norm_eps=1e-6)
         self.is_moe_layer = layer_idx >= config.first_k_dense_replace
 
         # Thread dtype from config.torch_dtype so the block's own params stay
