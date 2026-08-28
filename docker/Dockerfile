@@ -183,7 +183,10 @@ RUN mkdir -p /wheels && \
     rm -rf /tmp/torchao
 
 # FA3 (Hopper-only, SM90a-locked, ~25 min nvcc) + FA4 cute (Blackwell, lightweight). arm64 -> skip FA3: GB200 target, QEMU cross-build impractical.
-ARG FLASH_ATTN_REF=002cce0a1
+# Pin >= #2762/#2507: older refs rebuilt the CuTe compile key every call when max_seqlen
+# is a tensor (varlen/packed), so HF models recompiled each step. Also picks up #2745
+# (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
+ARG FLASH_ATTN_REF=ce088ab9ce0f
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=false
 ARG TARGETARCH
@@ -213,7 +216,7 @@ COPY --from=wheel_builder /wheels /tmp/wheels/
 ARG INSTALL_FA4=false
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     if [ "$INSTALL_FA4" = "true" ]; then \
-        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" && \
+        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" && \
         FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
         VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
         { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; }; \
