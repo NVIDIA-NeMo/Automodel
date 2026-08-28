@@ -250,6 +250,7 @@ def preprocess_args_and_kwargs_for_attn(
         arguments. Packed BSHD FA4 tensors are unpadded to [tokens, heads,
         head_dim]; the FA4 callable restores its output to BSHD.
     """
+    attn_kwargs: dict[str, Any]
     # Create attention kwargs based on backend
     if attn_impl == "te":
         attn_kwargs = {
