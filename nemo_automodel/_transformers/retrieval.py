@@ -17,7 +17,8 @@
 import inspect
 import os
 from collections.abc import Iterable, Sequence
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -941,6 +942,58 @@ def _get_layers(model: nn.Module) -> nn.ModuleList:
     raise AttributeError("Could not locate transformer layers on model (tried .layers, .model.layers, .transformer.h)")
 
 
+def _get_config_hidden_size(config) -> int:
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is not None:
+        return int(hidden_size)
+    text_config = getattr(config, "text_config", None)
+    if isinstance(text_config, dict):
+        hidden_size = text_config.get("hidden_size")
+    else:
+        hidden_size = getattr(text_config, "hidden_size", None)
+    if hidden_size is not None:
+        return int(hidden_size)
+    raise AttributeError("Could not infer hidden_size from config.hidden_size or config.text_config.hidden_size")
+
+
+def _resolve_projection_checkpoint_path(
+    pretrained_model_name_or_path: str,
+    projection_path: str | None = None,
+) -> Path:
+    if projection_path is not None:
+        return Path(projection_path)
+
+    model_path = Path(pretrained_model_name_or_path)
+    if model_path.name == "consolidated" and model_path.parent.name == "model":
+        return model_path.parent.parent / "projection.pt"
+    raise ValueError(
+        "restore_projection expects pretrained_model_name_or_path to point to "
+        "epoch_0_step_x/model/consolidated, or projection_path to be set explicitly."
+    )
+
+
+class _RetrieverStudentProjectionStateDictAdapter(EncoderStateDictAdapter):
+    def __init__(self, student_adapter: EncoderStateDictAdapter) -> None:
+        super().__init__()
+        self.student_adapter = student_adapter
+
+    def to_hf(self, state_dict, **kwargs):
+        student_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("student."):
+                student_state_dict[key[len("student.") :]] = value
+        return self.student_adapter.to_hf(student_state_dict, **kwargs)
+
+    def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
+        student_state_dict = self.student_adapter.from_hf(hf_state_dict, device_mesh=device_mesh, **kwargs)
+        return {f"student.{key}": value for key, value in student_state_dict.items()}
+
+    def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+        if not fqn.startswith("student."):
+            return []
+        return self.student_adapter.convert_single_tensor_to_hf(fqn[len("student.") :], tensor, **kwargs)
+
+
 class RetrieverStudentWithProjection(nn.Module):
     """Bi-encoder student with a trainable linear projection into teacher space."""
 
@@ -952,7 +1005,13 @@ class RetrieverStudentWithProjection(nn.Module):
     ) -> None:
         super().__init__()
         self.student = student
-        student_hidden = int(self.student.model.config.hidden_size)
+        self.config = student.config
+        self.name_or_path = getattr(student, "name_or_path", None)
+        self.source_model_path = getattr(student, "source_model_path", None)
+        self.source_repository_path = getattr(student, "source_repository_path", None)
+        self.state_dict_adapter = _RetrieverStudentProjectionStateDictAdapter(student.state_dict_adapter)
+        self.sentence_transformer_export_config = getattr(student, "sentence_transformer_export_config", None)
+        student_hidden = _get_config_hidden_size(self.student.model.config)
         self.student_hidden = student_hidden
         self.teacher_hidden = int(teacher_hidden_size)
 
@@ -977,6 +1036,8 @@ class RetrieverStudentWithProjection(nn.Module):
         l2_normalize: bool = False,
         capture_layers: Sequence[int] | None = None,
         trust_remote_code: bool = True,
+        restore_projection: bool = False,
+        projection_path: str | None = None,
         **kwargs,
     ) -> "RetrieverStudentWithProjection":
         from nemo_automodel import NeMoAutoModelBiEncoder
@@ -988,7 +1049,50 @@ class RetrieverStudentWithProjection(nn.Module):
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
-        return cls(student=student, teacher_hidden_size=teacher_hidden_size, capture_layers=capture_layers)
+        model = cls(
+            student=student,
+            teacher_hidden_size=teacher_hidden_size,
+            capture_layers=capture_layers,
+        )
+        if restore_projection:
+            model.restore_projection_from_checkpoint(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                projection_path=projection_path,
+            )
+        return model
+
+    def restore_projection_from_checkpoint(
+        self,
+        pretrained_model_name_or_path: str,
+        projection_path: str | None = None,
+    ) -> None:
+        checkpoint_path = _resolve_projection_checkpoint_path(pretrained_model_name_or_path, projection_path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Could not find distillation projection checkpoint: {checkpoint_path}")
+
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if "weight" in state:
+            projection_state = {"weight": state["weight"], "bias": state.get("bias")}
+        elif "projection.weight" in state:
+            projection_state = {
+                "weight": state["projection.weight"],
+                "bias": state.get("projection.bias"),
+            }
+        else:
+            raise RuntimeError(f"Projection checkpoint {checkpoint_path} does not contain projection weights")
+
+        expected_shape = tuple(self.projection.weight.shape)
+        loaded_shape = tuple(projection_state["weight"].shape)
+        if loaded_shape != expected_shape:
+            raise RuntimeError(
+                f"Projection checkpoint shape mismatch: checkpoint={loaded_shape}, model={expected_shape}"
+            )
+
+        if projection_state["bias"] is None:
+            raise RuntimeError(f"Projection checkpoint {checkpoint_path} does not contain projection bias")
+        self.projection.load_state_dict(projection_state, strict=True)
+
+        logger.info("Restored distillation projection head from %s", checkpoint_path)
 
     def attach_intermediate_capture(self, layer_indices: Iterable[int]) -> "RetrieverStudentWithProjection":
         self._capture.attach(_get_layers(self.student.model), layer_indices)
@@ -1001,6 +1105,32 @@ class RetrieverStudentWithProjection(nn.Module):
         # Keep the save format HF-compatible for evaluator tooling: this stores
         # only the student backbone; the projection is saved by the recipe.
         self.student.save_pretrained(save_directory, **kwargs)
+
+    def _get_consolidated_hf_metadata_exporter(
+        self,
+        *,
+        tokenizer=None,
+        original_model_path: str | None = None,
+    ):
+        get_exporter = getattr(self.student, "_get_consolidated_hf_metadata_exporter", None)
+        if not callable(get_exporter):
+            return None
+        return get_exporter(tokenizer=tokenizer, original_model_path=original_model_path)
+
+    def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
+        configure_prompts = getattr(self.student, "configure_sentence_transformer_prompts", None)
+        if callable(configure_prompts):
+            configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
+        self.sentence_transformer_export_config = getattr(self.student, "sentence_transformer_export_config", None)
+
+    def disable_sentence_transformer_export(self) -> None:
+        disable_export = getattr(self.student, "disable_sentence_transformer_export", None)
+        if callable(disable_export):
+            disable_export()
+        self.sentence_transformer_export_config = getattr(self.student, "sentence_transformer_export_config", None)
+
+    def get_hf_export_config(self) -> PretrainedConfig:
+        return self.student.get_hf_export_config()
 
     def _encode(self, input_dict: dict) -> torch.Tensor:
         if not input_dict:
@@ -1036,7 +1166,7 @@ class RetrieverTeacherEmbeddingEncoder(nn.Module):
         for param in self.teacher.parameters():
             param.requires_grad_(False)
 
-        self.hidden_size = int(self.teacher.model.config.hidden_size)
+        self.hidden_size = _get_config_hidden_size(self.teacher.model.config)
         self._capture = LayerCapture(detach=True)
         if capture_layers:
             self.attach_intermediate_capture(capture_layers)

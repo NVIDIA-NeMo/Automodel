@@ -281,6 +281,7 @@ def _make_recipe_for_optim_step(distributed_config):
     recipe.lr_scheduler = None
     recipe.step_scheduler = _FakeStepScheduler()
     recipe.loss_average_window = deque(maxlen=50)
+    recipe.log_modality_loss = False
     recipe.timestamp = 0.0
     recipe._get_dp_group_size = lambda include_cp=True: 1
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import os
+from enum import IntEnum
 from io import BytesIO
 from typing import Any, Literal
 
@@ -113,6 +114,12 @@ def _apply_mistral_retrieval_ownership_policy(tokenizer: TokenizersBackend) -> s
         tokenizer.backend_tokenizer.normalizer = Sequence(ownership_normalizers)
         tokenizer.init_kwargs["nemo_control_token_escape_policy"] = _CONTROL_TOKEN_ESCAPE_POLICY
     return _MISTRAL_RETRIEVAL_CHAT_TEMPLATE
+
+
+class PassageModality(IntEnum):
+    TEXT_ONLY = 0
+    IMAGE_ONLY = 1
+    IMAGE_TEXT = 2
 
 
 def load_image(image: Any) -> Image.Image:
@@ -359,6 +366,16 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             queries.append(feature["question"])
             pos_neg_text_batch.extend(feature["doc_text"])
             pos_neg_image_batch.extend(feature["doc_image"])
+        doc_modalities = []
+        for text, image in zip(pos_neg_text_batch, pos_neg_image_batch):
+            has_text = text is not None and not (isinstance(text, str) and text == "")
+            has_image = image is not None and not (isinstance(image, str) and image == "")
+            if has_text and has_image:
+                doc_modalities.append(PassageModality.IMAGE_TEXT)
+            elif has_image:
+                doc_modalities.append(PassageModality.IMAGE_ONLY)
+            else:
+                doc_modalities.append(PassageModality.TEXT_ONLY)
 
         query_batch_dict = self.process_queries(queries, return_tensors=return_tensors, **kwargs)
         doc_batch_dict = self.process_documents(
@@ -367,6 +384,10 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             **kwargs,
         )
         merged_batch_dict = self.merge_batch_dict(query_batch_dict, doc_batch_dict)
+        if return_tensors == "pt":
+            merged_batch_dict["passage_modality"] = torch.tensor(doc_modalities, dtype=torch.long)
+        elif return_tensors == "np":
+            merged_batch_dict["passage_modality"] = np.asarray(doc_modalities, dtype=np.int64)
         return self.add_dummy_labels(queries, merged_batch_dict, return_tensors=return_tensors)
 
     def prompt_template_question_passage(self, question: str, text: str) -> str:
