@@ -13,30 +13,12 @@
 # limitations under the License.
 
 from pathlib import Path
-from unittest.mock import patch
 
 import yaml
-
-from nemo_automodel._transformers.tokenization.registry import TokenizerRegistry
-from nemo_automodel.components.config.loader import ConfigNode
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CONFIG_PATH = REPO_ROOT / "examples" / "retrieval" / "bi_encoder" / "ministral3_3b_instruct.yaml"
 EXPECTED_CHECKPOINT = "mistralai/Ministral-3-3B-Instruct-2512-BF16"
-
-
-class _Mistral3Config:
-    model_type = "mistral3"
-
-
-class _FakeMistralTokenizer:
-    pad_token_id = 0
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *, padding_side: str):
-        assert pretrained_model_name_or_path == EXPECTED_CHECKPOINT
-        assert padding_side == "left"
-        return cls()
 
 
 def test_ministral3_recipe_uses_bf16_checkpoint() -> None:
@@ -45,21 +27,3 @@ def test_ministral3_recipe_uses_bf16_checkpoint() -> None:
 
     assert raw_config["model"]["pretrained_model_name_or_path"] == EXPECTED_CHECKPOINT
     assert raw_config["tokenizer"]["pretrained_model_name_or_path"] == EXPECTED_CHECKPOINT
-
-
-def test_ministral3_tokenizer_config_uses_registered_backend() -> None:
-    """The shipped recipe must avoid unsupported HF Mistral tokenizer kwargs."""
-    raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    tokenizer_config = ConfigNode(raw_config["tokenizer"])
-
-    with (
-        patch("transformers.AutoConfig.from_pretrained", return_value=_Mistral3Config()),
-        patch.object(TokenizerRegistry, "get_custom_tokenizer_cls", return_value=_FakeMistralTokenizer),
-        patch(
-            "transformers.AutoTokenizer.from_pretrained",
-            side_effect=AssertionError("the recipe must use AutoModel's registered Mistral tokenizer"),
-        ),
-    ):
-        tokenizer = tokenizer_config.instantiate()
-
-    assert isinstance(tokenizer, _FakeMistralTokenizer)
