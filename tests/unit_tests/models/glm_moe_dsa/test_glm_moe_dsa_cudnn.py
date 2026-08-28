@@ -21,6 +21,7 @@ import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
+import nemo_automodel.components.models.common.cudnn_sparse_attention as shared_cudnn
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm_moe_dsa import layers as layer_mod
 from nemo_automodel.components.models.glm_moe_dsa.kernels import cudnn_dsa
@@ -641,11 +642,11 @@ def test_cudnn_sparse_attention_dispatches_padded_forward_and_exact_backward(
 ) -> None:
     fake_flash_mla = _FakeFlashMla()
     fake_dsa = _FakeSparseDsa(fake_flash_mla)
-    monkeypatch.setattr(cudnn_dsa, "_HAS_CUDNN_DSA", True)
-    monkeypatch.setattr(cudnn_dsa, "_HAS_FLASH_MLA", True)
-    monkeypatch.setattr(cudnn_dsa, "_CUDNN_DSA", fake_dsa)
-    monkeypatch.setattr(cudnn_dsa, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
-    monkeypatch.setattr(cudnn_dsa, "_require_cuda_tensors", _accept_cpu_tensors)
+    monkeypatch.setattr(shared_cudnn, "_HAS_CUDNN_DSA", True)
+    monkeypatch.setattr(shared_cudnn, "_HAS_FLASH_MLA", True)
+    monkeypatch.setattr(shared_cudnn, "_CUDNN_DSA", fake_dsa)
+    monkeypatch.setattr(shared_cudnn, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
+    monkeypatch.setattr(shared_cudnn, "_require_cuda_tensors", _accept_cpu_tensors)
 
     q = torch.ones(SPARSE_TOKENS, SPARSE_HEADS, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
     kv_latent = torch.ones(SPARSE_TOKENS, 1, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
@@ -674,6 +675,88 @@ def test_cudnn_sparse_attention_dispatches_padded_forward_and_exact_backward(
     assert fake_dsa.called
 
 
+def test_shared_cudnn_sparse_attention_accepts_glm53_dimensions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared adapter accepts GLM-5.3's 512 latent dim and 2051 raw indices."""
+    query_tokens = 2
+    key_tokens = 2304
+    sparse_width = 2051
+
+    def fake_flash_mla(
+        q: torch.Tensor,
+        kv_latent: torch.Tensor,
+        indices: torch.Tensor,
+        softmax_scale: float,
+        *,
+        d_v: int,
+        attn_sink: torch.Tensor,
+        topk_length: torch.Tensor,
+        indexer_topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Validate GLM-5.3 kernel layouts and return deterministic tensors.
+
+        Args:
+            q: Padded absorbed queries with shape ``[queries, heads, 512]``.
+            kv_latent: Shared latent K/V with shape ``[keys, 1, 512]``.
+            indices: Aligned sparse indices with shape ``[queries, 1, 2560]``.
+            softmax_scale: Scale applied to attention scores.
+            d_v: FlashMLA latent value width.
+            attn_sink: Per-head attention sinks with shape ``[heads]``.
+            topk_length: Valid index counts with shape ``[queries]``.
+            indexer_topk: Number of positions selected inside FlashMLA.
+
+        Returns:
+            Output, maximum-logit, and log-sum-exp tensors in FlashMLA layouts.
+        """
+        assert q.shape == (query_tokens, 64, 512)
+        assert kv_latent.shape == (key_tokens, 1, 512)
+        assert indices.shape == (query_tokens, 1, 2560)
+        assert softmax_scale == 0.125
+        assert d_v == 512
+        assert attn_sink.shape == (64,)
+        torch.testing.assert_close(topk_length, torch.full((query_tokens,), sparse_width, dtype=torch.int32))
+        assert indexer_topk == 0
+        output = torch.zeros(query_tokens, 64, 512, dtype=torch.bfloat16)
+        logits = torch.zeros(query_tokens, 64, dtype=torch.float32)
+        return output, logits, logits
+
+    monkeypatch.setattr(shared_cudnn, "_HAS_CUDNN_DSA", True)
+    monkeypatch.setattr(shared_cudnn, "_HAS_FLASH_MLA", True)
+    monkeypatch.setattr(shared_cudnn, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
+    monkeypatch.setattr(shared_cudnn, "_require_cuda_tensors", _accept_cpu_tensors)
+
+    q = torch.ones(query_tokens, 64, 512, dtype=torch.bfloat16)
+    kv_latent = torch.ones(key_tokens, 1, 512, dtype=torch.bfloat16)
+    indices = torch.arange(sparse_width, dtype=torch.int32).view(1, 1, -1).expand(query_tokens, -1, -1)
+    output = shared_cudnn.cudnn_sparse_attention(
+        q,
+        kv_latent,
+        indices,
+        softmax_scale=0.125,
+        all_rows_nonempty=True,
+    )
+
+    assert output.shape == (query_tokens, 64, 512)
+
+
+def test_glm52_sparse_wrapper_preserves_model_specific_dimensions() -> None:
+    """Sharing the adapter does not widen GLM-5.2's public tensor contract."""
+    with pytest.raises(ValueError, match="GLM-5.2 q must have shape"):
+        cudnn_dsa.cudnn_sparse_attention(
+            torch.ones(2, 64, 512, dtype=torch.bfloat16),
+            torch.ones(2, 1, 512, dtype=torch.bfloat16),
+            torch.zeros(2, 1, 1, dtype=torch.int32),
+            softmax_scale=0.125,
+        )
+
+    with pytest.raises(ValueError, match="index_topk must be in"):
+        cudnn_dsa.cudnn_sparse_attention(
+            torch.ones(2, 64, 576, dtype=torch.bfloat16),
+            torch.ones(2, 1, 576, dtype=torch.bfloat16),
+            torch.zeros(2, 1, 2049, dtype=torch.int32),
+            softmax_scale=0.125,
+        )
+
+
 @pytest.mark.parametrize("cache_valid_rows", [False, True])
 def test_cudnn_sparse_attention_compacts_zero_length_rows(
     monkeypatch: pytest.MonkeyPatch, cache_valid_rows: bool
@@ -682,11 +765,11 @@ def test_cudnn_sparse_attention_compacts_zero_length_rows(
     topk_length = torch.tensor([0, 2], dtype=torch.int32)
     fake_flash_mla = _FakeZeroLengthFlashMla(topk_length)
     fake_dsa = _FakeCompactedSparseDsa(valid_rows=1, dkv_value=5)
-    monkeypatch.setattr(cudnn_dsa, "_HAS_CUDNN_DSA", True)
-    monkeypatch.setattr(cudnn_dsa, "_HAS_FLASH_MLA", True)
-    monkeypatch.setattr(cudnn_dsa, "_CUDNN_DSA", fake_dsa)
-    monkeypatch.setattr(cudnn_dsa, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
-    monkeypatch.setattr(cudnn_dsa, "_require_cuda_tensors", _accept_cpu_tensors)
+    monkeypatch.setattr(shared_cudnn, "_HAS_CUDNN_DSA", True)
+    monkeypatch.setattr(shared_cudnn, "_HAS_FLASH_MLA", True)
+    monkeypatch.setattr(shared_cudnn, "_CUDNN_DSA", fake_dsa)
+    monkeypatch.setattr(shared_cudnn, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
+    monkeypatch.setattr(shared_cudnn, "_require_cuda_tensors", _accept_cpu_tensors)
 
     q = torch.ones(SPARSE_TOKENS, SPARSE_HEADS, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
     kv_latent = torch.ones(SPARSE_TOKENS, 1, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
@@ -718,11 +801,11 @@ def test_cudnn_sparse_attention_all_empty_rows_use_only_dummy(monkeypatch: pytes
     topk_length = torch.zeros(SPARSE_TOKENS, dtype=torch.int32)
     fake_flash_mla = _FakeZeroLengthFlashMla(topk_length)
     fake_dsa = _FakeCompactedSparseDsa(valid_rows=0, dkv_value=0)
-    monkeypatch.setattr(cudnn_dsa, "_HAS_CUDNN_DSA", True)
-    monkeypatch.setattr(cudnn_dsa, "_HAS_FLASH_MLA", True)
-    monkeypatch.setattr(cudnn_dsa, "_CUDNN_DSA", fake_dsa)
-    monkeypatch.setattr(cudnn_dsa, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
-    monkeypatch.setattr(cudnn_dsa, "_require_cuda_tensors", _accept_cpu_tensors)
+    monkeypatch.setattr(shared_cudnn, "_HAS_CUDNN_DSA", True)
+    monkeypatch.setattr(shared_cudnn, "_HAS_FLASH_MLA", True)
+    monkeypatch.setattr(shared_cudnn, "_CUDNN_DSA", fake_dsa)
+    monkeypatch.setattr(shared_cudnn, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
+    monkeypatch.setattr(shared_cudnn, "_require_cuda_tensors", _accept_cpu_tensors)
 
     q = torch.ones(SPARSE_TOKENS, SPARSE_HEADS, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
     kv_latent = torch.ones(SPARSE_TOKENS, 1, QK_DIM, dtype=torch.bfloat16, requires_grad=True)

@@ -642,9 +642,13 @@ class OptimizerState:
         # quantized frozen params (Params4bit/Int8Params) alongside trainable LoRA
         # params, or when expert weights are sharded across EP ranks (MoE+EP) and
         # the optimizer only tracks trainable params. Use native state_dict instead.
+        # Adam creates state lazily only after a parameter receives a gradient. Discrete routing/indexing parameters
+        # can remain trainable yet unused for a step, so normalize missing state before both native and flattened DCP
+        # serialization. This makes the save and subsequent load skeletons agree without changing a future first
+        # update: the materialized step and moment tensors are all zero.
+        for optimizer in self.optimizer:
+            _materialize_missing_adam_state(optimizer)
         if self._use_native_optimizer_state:
-            for optimizer in self.optimizer:
-                _materialize_missing_adam_state(optimizer)
             if self.optimizer_part_ids is None:
                 if len(self.optimizer) != 1:
                     raise ValueError(

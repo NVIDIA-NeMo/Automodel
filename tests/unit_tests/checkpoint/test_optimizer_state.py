@@ -291,6 +291,27 @@ def test_native_single_optimizer_state_preserves_existing_checkpoint_schema():
     assert state_dict["optim"].keys() == {"state", "param_groups"}
 
 
+def test_flattened_adam_state_materializes_never_used_parameters():
+    class PartiallyUsedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.used = nn.Linear(2, 1, bias=False)
+            self.unused = nn.Linear(2, 1, bias=False)
+
+    model = PartiallyUsedModel()
+    optimizer = torch.optim.AdamW(model.parameters())
+    model.used(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    assert model.unused.weight not in optimizer.state
+
+    OptimizerState(model, optimizer).state_dict()
+
+    assert optimizer.state[model.unused.weight].keys() == {"step", "exp_avg", "exp_avg_sq"}
+    assert optimizer.state[model.unused.weight]["step"].item() == 0
+    assert torch.count_nonzero(optimizer.state[model.unused.weight]["exp_avg"]).item() == 0
+    assert torch.count_nonzero(optimizer.state[model.unused.weight]["exp_avg_sq"]).item() == 0
+
+
 def test_flattened_untagged_optimizer_state_preserves_existing_checkpoint_schema():
     model = nn.Linear(2, 1, bias=False)
     optimizer = torch.optim.AdamW(model.parameters())
