@@ -29,6 +29,7 @@ from nemo_automodel.components.models.ernie4_5.state_dict_adapter import (
 from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
 from nemo_automodel.components.models.gemma4_unified.state_dict_adapter import Gemma4UnifiedStateDictAdapter
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
+from nemo_automodel.components.models.glm5_next.state_dict_adapter import Glm5NextStateDictAdapter
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.models.hy_mt2.state_dict_adapter import HyMT2StateDictAdapter
 from nemo_automodel.components.models.hy_v3.state_dict_adapter import HYV3StateDictAdapter
@@ -50,7 +51,6 @@ from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3M
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
 from nemo_automodel.components.models.qwen3_vl_moe.state_dict_adapter import Qwen3VLMoeStateDictAdapter
-
 
 _LOW_MEMORY_GROUPED_ADAPTERS = (
     Ernie4_5_MoeStateDictAdapter,
@@ -226,6 +226,7 @@ def test_low_memory_grouped_adapters_forward_checkpoint_load_flag(adapter_type: 
     [
         DeepSeekV3StateDictAdapter,
         GlmMoeDsaStateDictAdapter,
+        Glm5NextStateDictAdapter,
         KimiK25VLStateDictAdapter,
         KimiK3StateDictAdapter,
         KimiLinear48BStateDictAdapter,
