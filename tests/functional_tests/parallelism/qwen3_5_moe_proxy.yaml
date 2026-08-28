@@ -1,0 +1,149 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Small randomly-initialized Qwen3.5-MoE for the 2-GPU runners, shrunk from
+# `examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b_neat_packing.yaml` (pp2, ep4).
+#
+# That recipe is a VLM, but no Qwen3.5 processor is staged in TEST_DATA_DIR, so
+# this uses the text-only `Qwen3_5MoeForCausalLM`. Expert routing, expert
+# sharding and the pipeline split all live in the text part, so they are
+# covered; the vision tower is not.
+#
+# The expert counts are not scaled down, since that is what EP shards.
+#
+# Backends: `attn` matches the recipe. `experts` is torch_mm because the
+# recipe's `gmm` only works with a deepep dispatcher. `dispatcher` is torch
+# because deepep falls back to plain experts at world_size 1, which would make
+# the PP test's 1-rank baseline run different code than its 2-rank leg.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  max_steps: 6
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.models.qwen3_5_moe.configuration_qwen3_5_moe.Qwen3_5MoeTextConfig
+    # Routes NeMoAutoModel to the NeMo class via MODEL_ARCH_MAPPING, not the HF one.
+    architectures: [Qwen3_5MoeForCausalLM]
+    vocab_size: 32000
+    hidden_size: 256
+    num_hidden_layers: 6
+    num_attention_heads: 8
+    num_key_value_heads: 2
+    head_dim: 32
+    intermediate_size: 256
+    moe_intermediate_size: 128
+    shared_expert_intermediate_size: 128
+    num_experts: 8
+    num_experts_per_tok: 2
+    max_position_embeddings: 4096
+    rms_norm_eps: 1.0e-6
+    # pad_token_id is left unset on purpose: it makes the embedding carry a
+    # padding_idx, and under FSDP2 that makes weight init get skipped, so the
+    # model trains on uninitialized weights.
+    # All full_attention: linear-attention layers keep two params in fp32, and
+    # this class does not set up the separate FSDP group they need.
+    layer_types: [full_attention, full_attention, full_attention, full_attention, full_attention, full_attention]
+    dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: torch
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: false
+    # Recipe value. Gates the MoEFSDPSyncMixin sync deferral that the
+    # gradient-accumulation path under test runs through.
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/qwen3_5_moe_proxy/
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+
+  sequence_parallel: false
+  activation_checkpointing: false
+
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    scale_grads_in_schedule: false
+    # Recipe values.
+    patch_inner_model: false
+    patch_causal_lm_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+# Synthetic fixed-length token sequences, so the test depends on no staged
+# tokenizer or dataset. What is under test is whether two topologies agree on
+# identical inputs, not what those inputs say. `std_len: 0` makes every sample
+# the same length, which is what lets the pipeline stages use static shapes.
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 64
+  mean_len: 127
+  std_len: 0
+  vocab_size: 32000
+  max_sentence_len: 128
+  seed: 42
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 8
+  mean_len: 127
+  std_len: 0
+  vocab_size: 32000
+  max_sentence_len: 128
+  seed: 7
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
