@@ -78,7 +78,9 @@ distributed:
   pp_size: 1
   ep_size: 1
   sequence_parallel: false
-  activation_checkpointing: true
+  # The frozen base and short HellaSwag sequences fit on GB10 without activation
+  # checkpointing. Ling's block currently assumes its MLP is not runtime-wrapped.
+  activation_checkpointing: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
