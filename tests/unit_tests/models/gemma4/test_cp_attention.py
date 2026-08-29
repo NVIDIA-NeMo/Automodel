@@ -819,55 +819,6 @@ def test_manual_attention_entry_promotes_rank_uniform_vision_flag(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _patch_fsdp_accumulated_grad_guard
-# ---------------------------------------------------------------------------
-def test_fsdp_guard_skips_uninitialized_and_runs_orig_and_is_idempotent(monkeypatch):
-    """The guard only skips the exact missing lazy ``_unsharded_param`` case."""
-    import sys
-    import types
-
-    calls = {"n": 0}
-
-    class FakeFSDPParam:
-        def __init__(self, mode="ok"):
-            self.mode = mode
-
-        def to_accumulated_grad_if_needed(self):
-            calls["n"] += 1
-            if self.mode == "missing":
-                return self._unsharded_param.grad
-            return "ran"
-
-    fake_mod = types.ModuleType("torch.distributed.fsdp._fully_shard._fsdp_param")
-    fake_mod.FSDPParam = FakeFSDPParam
-    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_mod)
-
-    cpa._patch_fsdp_accumulated_grad_guard()
-
-    p = FakeFSDPParam()
-    assert p.to_accumulated_grad_if_needed() == "ran"
-    assert calls["n"] == 1
-    p.mode = "missing"
-    assert p.to_accumulated_grad_if_needed() is None
-    assert calls["n"] == 2
-    # Marked guarded; a second patch is a no-op (does not double-wrap).
-    assert FakeFSDPParam.to_accumulated_grad_if_needed._gemma4_guarded is True
-    wrapped = FakeFSDPParam.to_accumulated_grad_if_needed
-    cpa._patch_fsdp_accumulated_grad_guard()
-    assert FakeFSDPParam.to_accumulated_grad_if_needed is wrapped
-
-
-def test_fsdp_guard_noop_when_import_unavailable(monkeypatch):
-    """If the FSDP internal module can't be imported, the patch returns quietly."""
-    import sys
-
-    # Setting the module to None makes `from ... import FSDPParam` raise ImportError,
-    # which the guard swallows.
-    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", None)
-    cpa._patch_fsdp_accumulated_grad_guard()  # must not raise
-
-
-# ---------------------------------------------------------------------------
 # _install_gemma4_cp_ring_sdpa: dense _cp_dense_metadata fallback in the pre-hook
 # ---------------------------------------------------------------------------
 def test_pre_hook_falls_back_to_dense_metadata(monkeypatch):

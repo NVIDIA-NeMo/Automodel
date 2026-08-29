@@ -136,6 +136,13 @@ def test_activation_checkpointing_scope_normalization(value, expected):
     assert DDPConfig(activation_checkpointing_scope=value).activation_checkpointing_scope == expected
 
 
+def test_fsdp2_replicated_fp32_byte_limit_validation():
+    assert FSDP2Config().max_replicated_fp32_param_bytes_per_module == 8 * 1024 * 1024
+    assert FSDP2Config(max_replicated_fp32_param_bytes_per_module=0).max_replicated_fp32_param_bytes_per_module == 0
+    with pytest.raises(ValueError, match="must be non-negative"):
+        FSDP2Config(max_replicated_fp32_param_bytes_per_module=-1)
+
+
 @pytest.mark.parametrize("value", ["all+vision", "encoder", "trainable", [1]])
 def test_activation_checkpointing_scope_normalization_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="activation_checkpointing_scope"):
