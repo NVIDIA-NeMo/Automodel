@@ -108,6 +108,32 @@ def _qwen3_5_backend(backend: BackendConfig | None = None) -> BackendConfig:
     return resolved
 
 
+def _splice_multimodal_features(
+    inputs_embeds: torch.Tensor,
+    input_ids: torch.Tensor,
+    features: torch.Tensor,
+    token_id: int,
+    modality: str,
+) -> torch.Tensor:
+    """Replace multimodal placeholder rows without dynamic-size indexing.
+
+    ``masked_scatter`` implements its source gradient through ``masked_select``.
+    On CUDA that dynamic-size selection synchronizes the stream before allocating
+    its result. The feature row count is already known, so use fixed-size
+    ``nonzero_static`` indices and ``index_copy`` instead. Its backward is the
+    asynchronous ``index_fill``/``index_select`` pair.
+    """
+    token_mask = input_ids.eq(token_id).reshape(-1)
+    num_features = features.shape[0]
+    torch._assert_async(
+        token_mask.sum().eq(num_features),
+        f"{modality} features and placeholder tokens do not match",
+    )
+    token_indices = torch.nonzero_static(token_mask, size=num_features).squeeze(-1)
+    flat_embeds = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
+    return flat_embeds.index_copy(0, token_indices, features).view_as(inputs_embeds)
+
+
 def build_mtp_config_from_hf(
     config: Any,
     *,
@@ -615,6 +641,60 @@ class Qwen3_5Model(HFQwen3_5Model):
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
             if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
+
+            # With token IDs available, keep the HF vision/position path but
+            # replace its dynamic masked-scatter backward with fixed-size indices.
+            # The inputs-embeds-only generation path retains the upstream fallback.
+            if input_ids_for_super is not None:
+                if inputs_embeds_for_super is None:
+                    inputs_embeds_for_super = embed_tokens(input_ids_for_super)
+                if pixel_values is not None:
+                    image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+                    image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
+                        inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                    )
+                    inputs_embeds_for_super = _splice_multimodal_features(
+                        inputs_embeds_for_super,
+                        input_ids_for_super,
+                        image_embeds,
+                        self.config.image_token_id,
+                        "Image",
+                    )
+                if pixel_values_videos is not None:
+                    video_outputs = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
+                    video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
+                        inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                    )
+                    inputs_embeds_for_super = _splice_multimodal_features(
+                        inputs_embeds_for_super,
+                        input_ids_for_super,
+                        video_embeds,
+                        self.config.video_token_id,
+                        "Video",
+                    )
+                if position_ids is None:
+                    position_ids = self.compute_3d_position_ids(
+                        input_ids=input_ids_for_super,
+                        inputs_embeds=inputs_embeds_for_super,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        mm_token_type_ids=kwargs.get("mm_token_type_ids"),
+                    )
+                return super().forward(
+                    input_ids=None,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds_for_super,
+                    pixel_values=None,
+                    pixel_values_videos=None,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
             return super().forward(
                 input_ids=input_ids_for_super,
                 attention_mask=attention_mask,
@@ -1201,12 +1281,13 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     image_grid_thw,
                     is_video=False,
                 ).to(inputs_embeds.device, inputs_embeds.dtype)
-                image_mask, _ = self.model.get_placeholder_mask(
+                inputs_embeds = _splice_multimodal_features(
+                    inputs_embeds,
                     input_ids,
-                    inputs_embeds=inputs_embeds,
-                    image_features=image_embeds,
+                    image_embeds,
+                    self.config.image_token_id,
+                    "Image",
                 )
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
                 if hasattr(self.model.visual, "rotary_pos_emb"):
@@ -1216,12 +1297,13 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     video_grid_thw,
                     is_video=True,
                 ).to(inputs_embeds.device, inputs_embeds.dtype)
-                _, video_mask = self.model.get_placeholder_mask(
+                inputs_embeds = _splice_multimodal_features(
+                    inputs_embeds,
                     input_ids,
-                    inputs_embeds=inputs_embeds,
-                    video_features=video_embeds,
+                    video_embeds,
+                    self.config.video_token_id,
+                    "Video",
                 )
-                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         return inputs_embeds
 
