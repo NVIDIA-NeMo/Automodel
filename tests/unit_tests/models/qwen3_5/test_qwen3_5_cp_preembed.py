@@ -28,6 +28,7 @@ from nemo_automodel.components.models.qwen3_5.model import (
     HFQwen3_5Model,
     Qwen3_5ForConditionalGeneration,
     Qwen3_5Model,
+    _splice_multimodal_features,
 )
 
 
@@ -209,6 +210,51 @@ class TestPopStagedVlmMedia:
 class TestEmbedAndSpliceForCP:
     """The in-forward embed + vision splice (moved out of the CP hook)."""
 
+    def test_static_splice_matches_masked_scatter_forward_and_gradients(self):
+        input_ids = torch.tensor([[7, 99, 8, 99]])
+        inputs_embeds = torch.randn(1, 4, 3, requires_grad=True)
+        features = torch.randn(2, 3, requires_grad=True)
+        grad_output = torch.randn_like(inputs_embeds)
+
+        actual = _splice_multimodal_features(inputs_embeds, input_ids, features, 99, "Image")
+        actual.backward(grad_output, retain_graph=True)
+        actual_input_grad = inputs_embeds.grad.detach().clone()
+        actual_feature_grad = features.grad.detach().clone()
+
+        inputs_embeds.grad = None
+        features.grad = None
+        mask = input_ids.eq(99).unsqueeze(-1).expand_as(inputs_embeds)
+        expected = inputs_embeds.masked_scatter(mask, features)
+        expected.backward(grad_output)
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_input_grad, inputs_embeds.grad)
+        torch.testing.assert_close(actual_feature_grad, features.grad)
+
+    def test_static_splice_backward_has_no_dynamic_selection(self):
+        input_ids = torch.tensor([[7, 99, 8, 99]])
+        inputs_embeds = torch.randn(1, 4, 3, requires_grad=True)
+        features = torch.randn(2, 3, requires_grad=True)
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
+            _splice_multimodal_features(inputs_embeds, input_ids, features, 99, "Image").sum().backward()
+
+        operator_names = {event.key for event in profiler.key_averages()}
+        assert "aten::nonzero_static" in operator_names
+        assert "aten::nonzero" not in operator_names
+        assert "aten::masked_select" not in operator_names
+
+    def test_static_splice_rejects_placeholder_feature_mismatch(self):
+        input_ids = torch.tensor([[7, 99, 8, 99]])
+        with pytest.raises(RuntimeError, match="Image features and placeholder tokens do not match"):
+            _splice_multimodal_features(
+                torch.randn(1, 4, 3),
+                input_ids,
+                torch.randn(1, 3),
+                99,
+                "Image",
+            )
+
     def test_image_features_scattered_into_embeds(self):
         """pixel_values path: image features replace image-token embeddings via masked_scatter."""
         model = _build_model(image_token_id=99)
@@ -303,13 +349,20 @@ class TestQwen3_5ModelForward:
         model = Qwen3_5Model.__new__(Qwen3_5Model)
         nn.Module.__init__(model)
         model.visual = types.SimpleNamespace(rotary_pos_emb=types.SimpleNamespace(to=lambda device: None))
-        model.get_input_embeddings = lambda: lambda input_ids: pytest.fail("media forward should keep input_ids")
+        model.config = types.SimpleNamespace(image_token_id=99, video_token_id=98)
+        model.get_input_embeddings = lambda: (
+            lambda input_ids: input_ids.unsqueeze(-1).expand(*input_ids.shape, 4).float()
+        )
         return model
 
-    def test_media_forward_keeps_input_ids_for_hf_placeholder_mask(self, monkeypatch):
+    def test_media_forward_splices_with_static_indices_before_hf_forward(self, monkeypatch):
         model = self._build_inner_model()
         captured = {}
         sentinel = object()
+        image_features = torch.full((1, 4), 8.0)
+        position_ids = torch.arange(3).view(1, 3)
+        model.get_image_features = lambda *args, **kwargs: types.SimpleNamespace(pooler_output=[image_features])
+        model.compute_3d_position_ids = lambda **kwargs: position_ids
 
         def _fake_hf_forward(self, **kwargs):
             captured.update(kwargs)
@@ -326,9 +379,11 @@ class TestQwen3_5ModelForward:
         )
 
         assert out is sentinel
-        assert captured["input_ids"] is input_ids
-        assert captured["inputs_embeds"] is None
-        assert captured["pixel_values"] is pixel_values
+        assert captured["input_ids"] is None
+        assert captured["pixel_values"] is None
+        assert captured["position_ids"] is position_ids
+        torch.testing.assert_close(captured["inputs_embeds"][0, 0], torch.full((4,), 5.0))
+        torch.testing.assert_close(captured["inputs_embeds"][0, 1], image_features[0])
 
     def test_media_forward_accepts_hidden_states_as_input_ids(self, monkeypatch):
         model = self._build_inner_model()
