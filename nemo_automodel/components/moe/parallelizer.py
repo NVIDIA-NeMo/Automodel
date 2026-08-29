@@ -483,8 +483,14 @@ def _replay_hybridep_dispatch_on_recompute(
         def scoped(mode: str, inner: AbstractContextManager):
             if mode == "replay":
                 recorder.rewind()
-            with hybridep_dispatch_replay_scope(recorder, mode), inner:
-                yield
+            with hybridep_dispatch_replay_scope(recorder, mode):
+                with inner:
+                    yield
+                if mode == "record":
+                    # Cache the dispatch extents only after the selective-op
+                    # context exits. Recompute can then reuse them without an
+                    # extra aten.sum that would diverge from the forward trace.
+                    recorder.finalize()
 
         return scoped("record", forward_context), scoped("replay", recompute_context)
 

@@ -59,8 +59,14 @@ class HybridEPDispatchReplayRecorder:
         self._cursor = 0
         self.replay_misses = 0
 
-    def record(self, entry) -> None:
-        self._records.append(entry)
+    def record(self, handle, tokens_per_expert) -> None:
+        self._records.append([handle, tokens_per_expert, None])
+
+    def finalize(self) -> None:
+        """Cache each layout extent after the checkpoint-forward op context exits."""
+        for entry in self._records:
+            if entry[2] is None:
+                entry[2] = entry[1].sum()
 
     def take(self):
         """Return the next forward dispatch record, or ``None`` on divergence."""
@@ -479,14 +485,14 @@ class HybridEPDispatch(torch.autograd.Function):
         if recorder is not None and _hybridep_dispatch_replay_state.mode == "replay":
             replayed = recorder.take()
             if replayed is not None:
-                handle, tokens_per_expert = replayed
+                handle, tokens_per_expert, num_permuted_tokens = replayed
                 replayed_outputs = _hybrid_ep_buffer.dispatch_with_permute(
                     hidden=x,
                     probs=probs,
                     scaling_factor=None,
                     handle=handle,
                     pad_multiple=pad_multiple,
-                    num_permuted_tokens=tokens_per_expert.sum(),
+                    num_permuted_tokens=num_permuted_tokens,
                 )
                 dispatched_hidden, dispatched_probs, dispatched_scaling_factor, _, _ = replayed_outputs
                 ctx.handle = handle
@@ -522,7 +528,7 @@ class HybridEPDispatch(torch.autograd.Function):
         if recorder is not None and _hybridep_dispatch_replay_state.mode == "record":
             # Keep only the reusable layout and its output extent. Recomputed
             # activations and probabilities are still redispatched through it.
-            recorder.record((handle, tokens_per_expert))
+            recorder.record(handle, tokens_per_expert)
         return (
             dispatched_hidden,
             dispatched_probs,
