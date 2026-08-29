@@ -1,0 +1,38 @@
+---
+title: "Wan-Animate-2 14B"
+description: ""
+slug: model-coverage/diffusion/wan-ai/wan-animate-2-14b
+---
+[Wan-Animate-2](https://huggingface.co/Wan-AI) is a character-animation flow-matching DiT from Wan AI. Given a reference image of a character and a driving video of someone moving, it generates the reference character performing the driving motion. It uses no pose extractor: the driving video is consumed directly, and motion transfers through frame-aligned attention.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Character Animation |
+| **Architecture** | DiT (Flow Matching) |
+| **Parameters** | 16.4B |
+| **HF Org** | [Wan-AI](https://huggingface.co/Wan-AI) |
+
+</Info>
+
+## Available Models
+
+Wan-Animate-2 14B has 40 layers, a shared Wan VAE and UMT5-XXL text encoder, and CLIP ViT-H image conditioning.
+
+Training is limited to full-parameter and LoRA fine-tuning of the base checkpoint on a single node, from a cached triplet dataset. Tensor parallelism, context parallelism, multi-resolution bucketing, and a per-rank batch larger than one are not supported by this architecture. The 10-step distilled checkpoint is not supported for training. The flow-matching objective regresses the full-trajectory velocity and would erode the step distillation.
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| [wan_animate2_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan_animate2_flow.yaml) | Full fine-tuning on eight GPUs with FSDP2, FP32 master weights, and BF16 compute |
+| [wan_animate2_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan_animate2_flow_lora.yaml) | LoRA fine-tuning that targets the three self-attention input projections |
+
+## Fine-Tuning
+
+See the [Wan-Animate-2 Fine-Tuning Guide](/recipes-e2e-examples/wan-animate-2) for the triplet dataset format, preprocessing, and launch commands.
+
+<Warning>
+A training sample must not use the same clip as both the driving video and the target. Because the driving video is consumed directly with no pose extraction, the model can then reach zero loss by copying it and ignoring the reference image, while the loss curve looks healthy.
+</Warning>

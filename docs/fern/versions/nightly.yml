@@ -324,6 +324,9 @@ navigation:
           - page: "Wan 2.2 T2V-A14B"
             path: ../../model-coverage/diffusion/wan-ai/wan2-2-t2v.mdx
             slug: wan-2-2-t2v-a14b
+          - page: "Wan-Animate-2 14B"
+            path: ../../model-coverage/diffusion/wan-ai/wan-animate-2.mdx
+            slug: wan-animate-2-14b
           - page: "FLUX.1-dev"
             path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
             slug: flux-1-dev
@@ -436,6 +439,9 @@ navigation:
       - page: "Wan2.1-T2V Fine-Tuning"
         path: ../../guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
+      - page: "Fine-Tune Wan-Animate-2"
+        path: ../../guides/diffusion/wan-animate-2.mdx
+        slug: wan-animate-2
       - page: "Fine-Tuning DiffusionGemma"
         path: ../../guides/dllm/diffusiongemma.mdx
         slug: diffusiongemma

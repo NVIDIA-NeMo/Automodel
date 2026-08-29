@@ -14,17 +14,17 @@ Diffusion model training in NeMo AutoModel requires pre-encoded `.meta` files ra
 Place your images in a directory. Supported formats: `jpg`, `jpeg`, `png`, `webp`, `bmp`.
 
 Captions can be provided in several formats:
-- **Sidecar JSON** (default for images): A `.json` file alongside each image with a caption field
-- **JSONL**: A `.jsonl` file with `internvl` or `usr` caption fields
+- **Sidecar JSON** (default for images): A `.json` file alongside each image with a caption field.
+- **JSONL**: A `.jsonl` file with `internvl` or `usr` caption fields.
 
 ### Videos
 
 Place your videos in a directory. Supported formats: `mp4`, `avi`, `mov`, `mkv`, `webm`.
 
 Captions can be provided in several formats:
-- **Sidecar JSON** (`--caption_format sidecar`): A `.json` file alongside each video
-- **meta.json** (`--caption_format meta_json`): A single `meta.json` manifest in the video directory
-- **JSONL** (`--caption_format jsonl`): A `.jsonl` file with captions
+- **Sidecar JSON** (`--caption_format sidecar`): A `.json` file alongside each video.
+- **meta.json** (`--caption_format meta_json`): A single `meta.json` manifest in the video directory.
+- **JSONL** (`--caption_format jsonl`): A `.jsonl` file with captions.
 
 If no caption is found for a sample, the filename (with underscores replaced by spaces) is used as a fallback.
 
@@ -50,6 +50,7 @@ The tool automatically distributes work across all available GPUs using multipro
 |-----------|-----------|-------|
 | `flux` | Image | FLUX.1-dev |
 | `wan` | Video | Wan 2.1 |
+| `wan_animate2` | Video triplet | Wan-Animate-2 |
 | `hunyuan` | Video | HunyuanVideo 1.5 |
 
 You can list all registered processors with:
@@ -70,7 +71,7 @@ python -m tools.diffusion.preprocessing_multiprocess image \
 
 ### Video Preprocessing (Wan 2.1)
 
-**Video mode** (encodes the full video as a single sample, recommended for training):
+Use video mode to encode the full video as a single sample. This mode is recommended for training:
 
 ```bash
 python -m tools.diffusion.preprocessing_multiprocess video \
@@ -81,7 +82,7 @@ python -m tools.diffusion.preprocessing_multiprocess video \
   --caption_format sidecar
 ```
 
-**Frames mode** (extracts evenly-spaced frames, each becomes a separate sample):
+Use frames mode to extract evenly spaced frames. Each frame becomes a separate sample:
 
 ```bash
 python -m tools.diffusion.preprocessing_multiprocess video \
@@ -111,9 +112,9 @@ python -m tools.diffusion.preprocessing_multiprocess video \
 | Argument | Description |
 |----------|-------------|
 | `--processor` | Processor name (`flux`, `wan`, `hunyuan`) |
-| `--model_name` | HuggingFace model name (uses processor default if omitted) |
+| `--model_name` | Hugging Face model name (uses processor default if omitted) |
 | `--output_dir` | Output directory for cached data |
-| `--shard_size` | Number of samples per metadata shard (default: 10000) |
+| `--shard_size` | Number of samples per metadata shard (default: 10,000) |
 
 **Image-specific arguments:**
 
@@ -130,13 +131,13 @@ python -m tools.diffusion.preprocessing_multiprocess video \
 | Argument | Description |
 |----------|-------------|
 | `--video_dir` | Input video directory |
-| `--mode` | `video` (full video) or `frames` (extract evenly-spaced frames) |
+| `--mode` | `video` (full video) or `frames` (extract evenly spaced frames) |
 | `--num_frames` | Number of frames to extract in `frames` mode |
 | `--target_frames` | Target frame count (for example, 121 for HunyuanVideo 4n+1 constraint) |
 | `--resolution_preset` | Resolution preset for bucketing |
 | `--height` / `--width` | Explicit target size (disables bucketing) |
 | `--resize_mode` | Interpolation: `bilinear`, `bicubic`, `nearest`, `area`, `lanczos` |
-| `--center_crop` / `--no_center_crop` | Enable/disable center cropping (default: enabled) |
+| `--center_crop` / `--no_center_crop` | Enable or disable center cropping (default: enabled) |
 | `--caption_format` | Caption source: `sidecar`, `meta_json`, `jsonl` |
 | `--caption_field` | Field name for captions (default: `caption`) |
 | `--output_format` | Output format: `meta` (pickle) or `pt` (torch.save) |
@@ -159,27 +160,27 @@ The preprocessing tool produces a cache directory organized by resolution bucket
 
 Each cache file (`.meta` or `.pt`) contains:
 
-- **Encoded latents** — VAE latent representations of the image or video
-- **Text embeddings** — Pre-computed from the model's text encoder
-- **First frame** — Reference image for image-to-video conditioning (video mode only)
-- **Image embeddings** — For models that support i2v conditioning (video mode only)
-- **Metadata** — Original and bucket resolutions, caption, source path
+- **Encoded latents**: VAE latent representations of the image or video.
+- **Text embeddings**: Pre-computed embeddings from the model text encoder.
+- **First frame**: Reference image for image-to-video conditioning (video mode only).
+- **Image embeddings**: Embeddings for models that support i2v conditioning (video mode only).
+- **Metadata**: Original and bucket resolutions, caption, and source path.
 
 ## Multiresolution Bucketing
 
 NeMo AutoModel supports multiresolution training through bucketed sampling. This groups samples by their spatial resolution so that each batch contains samples of the same size, avoiding padding waste.
 
-During preprocessing, the `--resolution_preset` argument controls the pixel budget used for bucketing. Available presets: `256p`, `512p`, `768p`, `1024p`, `1536p`. Alternatively, use `--max_pixels` for a custom pixel budget, or `--height`/`--width` to disable bucketing and use a fixed resolution.
+During preprocessing, the `--resolution_preset` argument controls the pixel budget used for bucketing. Available presets: `256p`, `512p`, `768p`, `1024p`, `1536p`. Alternatively, use `--max_pixels` for a custom pixel budget, or `--height` and `--width` to disable bucketing and use a fixed resolution.
 
 During training, the dataloader uses these key configuration parameters:
 
-- `base_resolution`: The target resolution used for bucketing (for example, `[512, 512]`)
-- The `SequentialBucketSampler` groups samples by resolution bucket
-- `dynamic_batch_size`: When `true`, adjusts batch size per resolution bucket to maintain constant memory usage
+- `base_resolution`: The target resolution used for bucketing (for example, `[512, 512]`).
+- `SequentialBucketSampler`: Groups samples by resolution bucket.
+- `dynamic_batch_size`: When `true`, adjusts the batch size per resolution bucket to maintain constant memory usage.
 
 ## YAML Configuration
 
-### Video Dataloader (Wan 2.1 / HunyuanVideo)
+### Video Dataloader (Wan 2.1 and HunyuanVideo)
 
 Used for text-to-video models. Set `model_type` to match your model (`wan` or `hunyuan`):
 
