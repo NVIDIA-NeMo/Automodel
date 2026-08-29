@@ -20,12 +20,13 @@ wrapping whole decoder blocks, training still runs and the loss does not move, s
 the only symptom is memory -- PR #3513 did exactly that and the nightly
 Gemma4-E4B benchmark gained 16% peak memory before anyone noticed.
 
-Two checks, both of which that regression fails:
+Three checks, the first of which that regression fails:
 
 1. every language decoder block is checkpoint-wrapped, so attention is recomputed
    rather than kept alive for the backward;
-2. the checkpointed run's gradients match an un-checkpointed run, which is what
-   the KV-sharing guard was worried about -- a replayed block writing K/V twice.
+2. the checkpointed logits match an un-checkpointed run;
+3. so do the gradients, over exactly the same parameter set -- which is what the
+   KV-sharing guard was worried about, a replayed block writing K/V twice.
 
 Peak-memory magnitude stays with the nightly benchmark; a proxy this small cannot
 measure it without a threshold that says more about the proxy than the code.
@@ -56,6 +57,10 @@ from nemo_automodel.components.models.gemma4_moe.model import (
 )
 
 SEQUENCE_LENGTH = 128
+
+# The input is text-only, so the vision tower and the vision->text embedder are
+# exactly the parameters expected to come back without a gradient.
+VISION_PARAMETER_PREFIXES = ("model.vision_tower.", "model.embed_vision.")
 
 
 def _tiny_e4b_config() -> Gemma4Config:
@@ -195,38 +200,77 @@ def main() -> None:
             "checkpointing fell back to sub-module wrapping, which excludes self_attn"
         )
 
-    # 2. Recomputing a whole KV-shared block does not change the gradients.
+    # 2. The forward is unchanged.
     input_ids = torch.randint(0, 100, (1, SEQUENCE_LENGTH), device=device)
     checkpointed_logits = checkpointed(input_ids=input_ids).logits
     plain_logits = plain(input_ids=input_ids).logits
+    torch.testing.assert_close(
+        _as_local(checkpointed_logits),
+        _as_local(plain_logits),
+        rtol=1e-5,
+        atol=1e-5,
+        msg=lambda message: f"logits diverged under activation checkpointing: {message}",
+    )
 
+    # 3. Recomputing a whole KV-shared block does not change the gradients.
     torch.manual_seed(2026)
     logits_grad = torch.randn_like(_as_local(plain_logits))
     _as_local(checkpointed_logits).backward(logits_grad)
     _as_local(plain_logits).backward(logits_grad)
     torch.cuda.synchronize(device)
 
+    # Checkpoint wrappers insert a `_checkpoint_wrapped_module` path component.
+    checkpointed_parameters = {
+        name.replace("_checkpoint_wrapped_module.", ""): parameter
+        for name, parameter in checkpointed.named_parameters()
+    }
     plain_parameters = dict(plain.named_parameters())
-    compared = 0
-    for name, parameter in checkpointed.named_parameters():
-        # Checkpoint wrappers insert a `_checkpoint_wrapped_module` path component.
-        plain_name = name.replace("_checkpoint_wrapped_module.", "")
-        counterpart = plain_parameters.get(plain_name)
-        if counterpart is None or parameter.grad is None or counterpart.grad is None:
-            continue
+    if set(checkpointed_parameters) != set(plain_parameters):
+        only_checkpointed = sorted(set(checkpointed_parameters) - set(plain_parameters))
+        only_plain = sorted(set(plain_parameters) - set(checkpointed_parameters))
+        raise AssertionError(
+            f"parameter names differ after wrapping: only-checkpointed={only_checkpointed} only-plain={only_plain}"
+        )
+
+    # Gradient presence must match exactly, so a dropped gradient cannot be
+    # silently skipped instead of compared.
+    checkpointed_with_grad = {name for name, p in checkpointed_parameters.items() if p.grad is not None}
+    plain_with_grad = {name for name, p in plain_parameters.items() if p.grad is not None}
+    if checkpointed_with_grad != plain_with_grad:
+        raise AssertionError(
+            "gradient presence differs: "
+            f"missing-in-checkpointed={sorted(plain_with_grad - checkpointed_with_grad)} "
+            f"missing-in-plain={sorted(checkpointed_with_grad - plain_with_grad)}"
+        )
+
+    # A text-only input reaches every parameter except the vision ones, so the
+    # ungraded set must be exactly the vision parameters -- no more (a language
+    # parameter silently dropping out) and no fewer (the check going vacuous).
+    ungraded = set(plain_parameters) - plain_with_grad
+    vision_names = {name for name in plain_parameters if name.startswith(VISION_PARAMETER_PREFIXES)}
+    if ungraded != vision_names:
+        raise AssertionError(
+            "ungraded parameters are not exactly the vision path: "
+            f"language-path-without-grad={sorted(ungraded - vision_names)} "
+            f"vision-path-with-grad={sorted(vision_names - ungraded)}"
+        )
+    if not vision_names:
+        raise AssertionError("the proxy has no vision parameters, so the omission check is vacuous")
+
+    for name in sorted(checkpointed_with_grad):
         torch.testing.assert_close(
-            _as_local(parameter.grad),
-            _as_local(counterpart.grad),
+            _as_local(checkpointed_parameters[name].grad),
+            _as_local(plain_parameters[name].grad),
             rtol=1e-5,
             atol=1e-5,
-            msg=lambda message, key=plain_name: f"{key} gradient: {message}",
+            msg=lambda message, key=name: f"{key} gradient: {message}",
         )
-        compared += 1
-    if compared == 0:
-        raise AssertionError("No gradients were compared; the parameter-name mapping is wrong")
 
     if dist.get_rank() == 0:
-        print(f"gemma4 kv-shared activation checkpointing OK ({compared} gradients compared)")
+        print(
+            "gemma4 kv-shared activation checkpointing OK "
+            f"({len(checkpointed_with_grad)} gradients compared, {len(vision_names)} vision-only omissions)"
+        )
     dist.destroy_process_group()
 
 

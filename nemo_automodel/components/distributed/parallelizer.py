@@ -411,12 +411,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     layer_groups,
                     ac_scopes,
                     enable_compile=enable_compile,
-                ):
+                ) and (not _has_kv_sharing or _kv_sharing_survives_checkpoint_replay(model)):
                     # Work around a PyTorch FSDP2 bug that skips mixed-precision input casts during
                     # checkpoint recomputation. Remove when the minimum PyTorch version is 2.13.
-                    #
-                    # KV-shared models belong on this path too; they rode the equivalent HF-native
-                    # full-layer path until #3513 rewrote this branch.
                     apply_full_layer_checkpointing_to_layers(model, ac_layers)
                 else:
                     apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
@@ -2109,6 +2106,31 @@ def _should_use_hf_native_gradient_checkpointing(
         and getattr(model, "supports_gradient_checkpointing", False)
         and hasattr(model, "gradient_checkpointing_enable")
     )
+
+
+def _kv_sharing_survives_checkpoint_replay(model: nn.Module) -> bool:
+    """Return whether whole-block activation checkpointing is safe for a KV-shared model.
+
+    ``checkpoint_wrapper`` replays a whole decoder block during backward with the
+    arguments the forward saw. Unlike HF's ``GradientCheckpointingLayer.__call__``
+    it cannot drop ``past_key_values`` from that replay, so a model whose shared
+    layers read an accumulating ``Cache`` calls ``Cache.update()`` twice and the
+    recomputed K/V no longer matches the forward. That surfaces as a
+    ``CheckpointError`` about changed tensor metadata (observed on native HF
+    ``Gemma3nForCausalLM`` with ``use_cache=True``), so KV-shared models stay on
+    ``apply_submodule_checkpointing`` by default.
+
+    A model whose shared-K/V store is replay-safe -- a pass-through holder rather
+    than an accumulating cache -- opts in by setting the class attribute
+    ``kv_sharing_survives_checkpoint_replay = True``.
+
+    Args:
+        model: The model about to be checkpointed.
+
+    Returns:
+        Whether the model declares its KV sharing safe under whole-block replay.
+    """
+    return bool(getattr(model, "kv_sharing_survives_checkpoint_replay", False))
 
 
 def _uses_custom_moe_modules(model: nn.Module) -> bool:
