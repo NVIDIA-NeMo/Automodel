@@ -1,0 +1,91 @@
+model:
+  pretrained_model_name_or_path: Qwen/Qwen-Image
+  mode: finetune
+
+dmd2:
+  pred_type: flow
+  guidance_scale: 4.0
+  student_sample_steps: 4
+  student_update_freq: 5
+  fake_score_pred_type: x0
+  gan_loss_weight_gen: 0.03
+  gan_use_same_t_noise: true
+  gan_r1_reg_weight: 0.0
+  sample_t_cfg:
+    time_dist_type: uniform
+    # Four LightX2V shift-3 student steps plus the terminal point.
+    t_list: [1.0, 0.9, 0.75, 0.5, 0.0]
+  # The validated run disabled EMA. Set an EMAConfig here to enable it.
+  ema: null
+
+  pipeline:
+    _target_: modelopt.torch.fastgen.plugins.qwen_image.QwenImageDMDPipeline
+
+  discriminator:
+    _target_: modelopt.torch.fastgen.discriminators.Discriminator_ImageDiT
+    feature_indices: [30]
+    num_blocks: 60
+    inner_dim: 3072
+
+  feature_capture:
+    _target_: modelopt.torch.fastgen.plugins.qwen_image.attach_feature_capture
+
+  # Generate this once with the same Qwen text encoder used for the data cache.
+  negative_prompt_embedding_path: PATH_TO_NEGATIVE_PROMPT_EMBEDDING
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-6
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  foreach: false
+  fused: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+lr_scheduler:
+  lr_decay_style: constant
+  lr_warmup_steps: 0
+  min_lr: 2.0e-6
+
+fsdp:
+  dp_size: 8
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  # AutoModel's native whole-block checkpointing mode for Qwen-Image.
+  activation_checkpointing: selective
+
+step_scheduler:
+  num_epochs: 200
+  local_batch_size: 1
+  global_batch_size: 8
+  max_steps: 50000
+  ckpt_every_steps: 1000
+  save_checkpoint_every_epoch: false
+  log_remote_every_steps: 1
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
+    cache_dir: PATH_TO_AUTOMODEL_QWEN_IMAGE_CACHE
+    train_text_encoder: false
+    num_workers: 2
+    base_resolution: [1024, 1024]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_CHECKPOINT_DIR
+  model_save_format: safetensors
+  save_consolidated: final
+  diffusers_compatible: true
+
+wandb:
+  enable: false
+  project: qwen-image-dmd2
+  mode: online

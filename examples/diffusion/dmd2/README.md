@@ -1,0 +1,68 @@
+# Qwen-Image DMD2
+
+This example runs DMD2 through AutoModel's standard diffusion fine-tuning
+trainer. AutoModel continues to own data loading, FSDP2, optimizers, gradient
+accumulation, logging, and checkpoint cadence. The top-level `dmd2` block in
+the YAML contains the DMD2 parameters and selects Model Optimizer's Qwen-Image
+pipeline, discriminator, and feature-capture callback.
+
+Install the DMD2 dependency:
+
+```bash
+uv sync --extra dmd2
+```
+
+Use this `uv` workflow rather than `pip install nemo_automodel[dmd2]`. The pinned
+ModelOpt rev is required, not a convenience: released ModelOpt (through
+`0.46.0rc1`) still passes `txt_seq_lens` to `QwenImageTransformer2DModel`, which
+diffusers removed in `0.39` — the version this package requires. Only the pinned
+rev guards that call behind a diffusers-version check. `[tool.uv.sources]` is not
+carried in the published wheel metadata, so the PyPI install path resolves a
+release that does not work here.
+
+If you already have an environment, add the extra rather than replacing it:
+`uv sync --extra all --extra dmd2` (a bare `uv sync --extra dmd2` syncs *only*
+that extra and drops the rest).
+
+The negative-prompt embedding is required by CFG, not by DMD2 itself. Because
+this example uses `guidance_scale: 4.0`, generate it once with the same
+Qwen-Image text encoder used for the data cache. Save a single canonical
+floating-point tensor with shape `[sequence, hidden]`; do not save a mapping or
+mask. From the repository root:
+
+```bash
+uv run --extra dmd2 python - <<'PY'
+import torch
+from tools.diffusion.processors.qwen_image import QwenImageProcessor
+
+model = "Qwen/Qwen-Image"
+output = "/path/to/negative_prompt_embedding.pt"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+processor = QwenImageProcessor()
+models = processor.load_models(model, device)
+embed = processor.encode_text("", models, device)["prompt_embeds"]
+if embed.ndim != 3 or embed.shape[0] != 1:
+    raise ValueError(f"Expected [1, sequence, hidden], got {tuple(embed.shape)}")
+torch.save(embed.squeeze(0).contiguous(), output)
+PY
+```
+
+Set the three `PATH_TO_*` values in
+`examples/diffusion/dmd2/qwen_image_dmd2.yaml`, adjust `dp_size` and
+global batch size for the launch, then use the existing fine-tuning entry
+point:
+
+```bash
+uv run --extra dmd2 torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  --config examples/diffusion/dmd2/qwen_image_dmd2.yaml
+```
+
+The DMD2 hyperparameters mirror the validated Qwen-Image recipe: CFG 4.0, four
+student steps, a 1:4 student-to-fake update pattern, and GAN weight 0.03. The
+YAML uses AutoModel's native selective activation checkpointing, so validate
+peak memory on the target topology. It uses the 2e-6
+student/fake-score/discriminator learning rate. R1 and EMA are available
+through ModelOpt but disabled in this YAML. EMA requires additional student
+shadow storage, so enable it only when that memory cost fits the launch.

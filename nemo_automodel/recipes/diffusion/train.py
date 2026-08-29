@@ -467,6 +467,10 @@ def build_diffusion_pipeline(
 class TrainDiffusionRecipe(BaseRecipe):
     """Training recipe for diffusion models."""
 
+    # Class-level default so recipe methods can rely on the attribute even when
+    # setup() has not run; setup() overrides it when a `dmd2:` block is present.
+    _dmd2 = None
+
     def __init__(self, cfg):
         _reject_removed_diffusion_keys(cfg)
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
@@ -583,6 +587,12 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         self.cpu_offload = fsdp_cfg.get("cpu_offload", False) if fsdp_cfg else False
         self.defer_fsdp_grad_sync = fsdp_cfg.get("defer_fsdp_grad_sync", True) if fsdp_cfg else True
+        self._dmd2 = None
+        if self.cfg.get("dmd2", None) is not None:
+            from nemo_automodel.recipes.diffusion.step_distillation import _DMD2Objective
+
+            self._dmd2 = _DMD2Objective(self.cfg.dmd2)
+            self._dmd2.configure(self)
 
         # Flow matching configuration
         self.adapter_type = fm_cfg.get("adapter_type", "simple")
@@ -633,17 +643,20 @@ class TrainDiffusionRecipe(BaseRecipe):
             self.stage = stage
             self.active_transformer = "transformer" if stage == "high_noise" else "transformer_2"
 
-        logging.info("[INFO] Flow Matching V2 Pipeline")
-        logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
-        logging.info(f"[INFO]   - Timestep sampling: {self.timestep_sampling}")
-        logging.info(f"[INFO]   - Flow shift: {self.flow_shift}")
-        logging.info(f"[INFO]   - Mix uniform ratio: {self.mix_uniform_ratio}")
-        logging.info(f"[INFO]   - Use sigma noise: {self.use_sigma_noise}")
-        logging.info(f"[INFO]   - CFG dropout prob: {self.cfg_dropout_prob}")
-        logging.info(f"[INFO]   - Use loss weighting: {self.use_loss_weighting}")
-        logging.info(f"[INFO]   - Loss weighting scheme: {self.loss_weighting_scheme}")
-        if self.stage is not None:
-            logging.info(f"[INFO]   - Two-stage finetune: stage={self.stage}, active={self.active_transformer}")
+        if self._dmd2 is None:
+            logging.info("[INFO] Flow Matching V2 Pipeline")
+            logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
+            logging.info(f"[INFO]   - Timestep sampling: {self.timestep_sampling}")
+            logging.info(f"[INFO]   - Flow shift: {self.flow_shift}")
+            logging.info(f"[INFO]   - Mix uniform ratio: {self.mix_uniform_ratio}")
+            logging.info(f"[INFO]   - Use sigma noise: {self.use_sigma_noise}")
+            logging.info(f"[INFO]   - CFG dropout prob: {self.cfg_dropout_prob}")
+            logging.info(f"[INFO]   - Use loss weighting: {self.use_loss_weighting}")
+            logging.info(f"[INFO]   - Loss weighting scheme: {self.loss_weighting_scheme}")
+            if self.stage is not None:
+                logging.info(f"[INFO]   - Two-stage finetune: stage={self.stage}, active={self.active_transformer}")
+        else:
+            logging.info("[INFO] Model Optimizer DMD2 objective")
 
         # Get pipeline_spec for pretraining mode (required when mode != "finetune")
         pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
@@ -843,37 +856,45 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.num_epochs = self.step_scheduler.num_epochs
 
         self.lr_scheduler = (
-            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
-            if self.cfg.lr_scheduler is not None
-            else None
+            self._dmd2.build_lr_scheduler(self)
+            if self._dmd2 is not None
+            else (
+                self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+                if self.cfg.lr_scheduler is not None
+                else None
+            )
         )
 
+        if self._dmd2 is not None:
+            self._dmd2.setup(self)
         self.load_checkpoint(self.restore_from)
-
-        # Init Flow Matching Pipeline V2 with model adapter
-        model_adapter = create_adapter(self.adapter_type, **self.adapter_kwargs)
-        self.flow_matching_pipeline = FlowMatchingPipeline(
-            model_adapter=model_adapter,
-            num_train_timesteps=self.num_train_timesteps,
-            timestep_sampling=self.timestep_sampling,
-            flow_shift=self.flow_shift,
-            i2v_prob=self.i2v_prob,
-            cfg_dropout_prob=self.cfg_dropout_prob,
-            logit_mean=self.logit_mean,
-            logit_std=self.logit_std,
-            mix_uniform_ratio=self.mix_uniform_ratio,
-            beta_alpha=self.beta_alpha,
-            beta_beta=self.beta_beta,
-            use_sigma_noise=self.use_sigma_noise,
-            sigma_min=self.sigma_min,
-            sigma_max=self.sigma_max,
-            use_loss_weighting=self.use_loss_weighting,
-            loss_weighting_scheme=self.loss_weighting_scheme,
-            log_interval=self.log_interval,
-            summary_log_interval=self.summary_log_interval,
-            device=self.device,
-        )
-        logging.info(f"[INFO] Flow Matching Pipeline V2 initialized with {self.adapter_type} adapter")
+        if self._dmd2 is not None:
+            self._dmd2.after_restore(self)
+        else:
+            # Init Flow Matching Pipeline V2 with model adapter
+            model_adapter = create_adapter(self.adapter_type, **self.adapter_kwargs)
+            self.flow_matching_pipeline = FlowMatchingPipeline(
+                model_adapter=model_adapter,
+                num_train_timesteps=self.num_train_timesteps,
+                timestep_sampling=self.timestep_sampling,
+                flow_shift=self.flow_shift,
+                i2v_prob=self.i2v_prob,
+                cfg_dropout_prob=self.cfg_dropout_prob,
+                logit_mean=self.logit_mean,
+                logit_std=self.logit_std,
+                mix_uniform_ratio=self.mix_uniform_ratio,
+                beta_alpha=self.beta_alpha,
+                beta_beta=self.beta_beta,
+                use_sigma_noise=self.use_sigma_noise,
+                sigma_min=self.sigma_min,
+                sigma_max=self.sigma_max,
+                use_loss_weighting=self.use_loss_weighting,
+                loss_weighting_scheme=self.loss_weighting_scheme,
+                log_interval=self.log_interval,
+                summary_log_interval=self.summary_log_interval,
+                device=self.device,
+            )
+            logging.info(f"[INFO] Flow Matching Pipeline V2 initialized with {self.adapter_type} adapter")
 
         if self.dist_env.is_main:
             os.makedirs(self.checkpoint_config.checkpoint_dir, exist_ok=True)
@@ -897,8 +918,103 @@ class TrainDiffusionRecipe(BaseRecipe):
             amax_reduction_group=self._te_fp8_group,
         )
 
+    def _train_batch_group(
+        self,
+        batch_group: list[Dict[str, Any]],
+        global_step: int,
+    ) -> tuple[float, float]:
+        """Run one accumulated outer step through the configured objective.
+
+        Args:
+            batch_group: Microbatches with image latents ``[B,C,H,W]`` or video
+                latents ``[B,C,F,H,W]``, plus text embeddings ``[B,S,D]`` and
+                objective-specific conditioning tensors such as masks ``[B,S]``.
+            global_step: Zero-based outer optimizer-step index.
+
+        Returns:
+            Mean loss and active-model gradient norm scalars.
+        """
+        if self._dmd2 is not None:
+            # StepScheduler increments only after the yielded group resumes, so
+            # its live counter is the exact DMD2 phase, including after restore.
+            return self._dmd2.train_batch_group(
+                self,
+                batch_group,
+                global_step=int(self.step_scheduler.step),
+            )
+
+        for optimizer in self.optimizer:
+            optimizer.zero_grad(set_to_none=True)
+
+        micro_losses = []
+        prepare_for_grad_accumulation([self.model], pp_enabled=False)
+        num_microbatches = len(batch_group)
+        for microbatch_idx, micro_batch in enumerate(batch_group):
+            is_final_microbatch = microbatch_idx == num_microbatches - 1
+            if is_final_microbatch:
+                prepare_for_final_backward([self.model], pp_enabled=False)
+
+            sync_context = get_sync_ctx(
+                self.model,
+                is_final_microbatch,
+                defer_fsdp_grad_sync=self.defer_fsdp_grad_sync,
+            )
+            with sync_context:
+                try:
+                    with self._autocast_context(), self._transformer_engine_fp8_context():
+                        _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
+                            model=self.model,
+                            batch=micro_batch,
+                            device=self.device,
+                            dtype=self.compute_dtype,
+                            global_step=global_step,
+                            collect_metrics=False,
+                            check_loss=self.check_loss,
+                        )
+                except Exception as exc:
+                    logging.info(f"[ERROR] Training step failed at step {global_step}: {exc}")
+                    video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
+                    text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
+                    logging.info(f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}")
+                    raise
+
+                # CP peers each backpropagate one sequence chunk. Convert FSDP2's
+                # mean over the dp_shard_cp mesh into a sum over CP and mean over DP.
+                (average_weighted_loss * self.cp_size / num_microbatches).backward()
+            micro_losses.append(average_weighted_loss.detach())
+            if microbatch_idx == 0:
+                prepare_after_first_microbatch()
+
+        grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
+        grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else float(grad_norm)
+
+        # LoRA gradient diagnostic (step 1 only).
+        if global_step == 1 and self.peft_cfg is not None:
+            for name, parameter in self.model.named_parameters():
+                if "lora_B" not in name:
+                    continue
+                try:
+                    grad_value = parameter.grad.to_local().float().norm().item() if parameter.grad is not None else None
+                except Exception:
+                    grad_value = parameter.grad.float().norm().item() if parameter.grad is not None else None
+                logging.info(
+                    "[GRAD CHECK] %s: grad_norm=%s, param_norm=%.6f",
+                    name,
+                    grad_value,
+                    parameter.data.float().norm().item(),
+                )
+                break
+
+        for optimizer in self.optimizer:
+            optimizer.step()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler[0].step(1)
+
+        return float(torch.stack(micro_losses).mean().item()), grad_norm
+
     def run_train_validation_loop(self):
-        logging.info("[INFO] Starting T2V training with Flow Matching")
+        objective_name = "DMD2" if self._dmd2 is not None else "T2V training with Flow Matching"
+        logging.info("[INFO] Starting %s", objective_name)
         logging.info(f"[INFO] Global Batch size: {self.global_batch_size}; Local Batch size: {self.local_batch_size}")
         logging.info(f"[INFO] Num nodes: {self.num_nodes}; DP size: {self.dp_size}")
 
@@ -927,78 +1043,9 @@ class TrainDiffusionRecipe(BaseRecipe):
             num_steps = 0
 
             for batch_group in self.step_scheduler:
-                for optimizer in self.optimizer:
-                    optimizer.zero_grad(set_to_none=True)
-
-                micro_losses = []
-                prepare_for_grad_accumulation([self.model], pp_enabled=False)
-                num_microbatches = len(batch_group)
-                for microbatch_idx, micro_batch in enumerate(batch_group):
-                    is_final_microbatch = microbatch_idx == num_microbatches - 1
-                    if is_final_microbatch:
-                        prepare_for_final_backward([self.model], pp_enabled=False)
-
-                    sync_context = get_sync_ctx(
-                        self.model,
-                        is_final_microbatch,
-                        defer_fsdp_grad_sync=self.defer_fsdp_grad_sync,
-                    )
-                    with sync_context:
-                        try:
-                            with self._autocast_context(), self._transformer_engine_fp8_context():
-                                _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
-                                    model=self.model,
-                                    batch=micro_batch,
-                                    device=self.device,
-                                    dtype=self.compute_dtype,
-                                    global_step=global_step,
-                                    collect_metrics=False,
-                                    check_loss=self.check_loss,
-                                )
-                        except Exception as exc:
-                            logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
-                            video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
-                            text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
-                            logging.info(f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}")
-                            raise
-
-                        # Use average_weighted_loss for backprop (scalar for gradient accumulation).
-                        # With CP, every peer computes the full-sequence loss on the gathered
-                        # output, so each rank's backward yields a partial gradient (its
-                        # sequence chunk's contribution); FSDP2 then mean-reduces over the
-                        # dp_shard_cp mesh. Scaling the loss by cp_size turns that mean into
-                        # a sum over CP peers and a mean over DP ranks, matching the
-                        # single-GPU gradient (verified numerically against a 1-GPU baseline).
-                        (average_weighted_loss * self.cp_size / num_microbatches).backward()
-                    micro_losses.append(average_weighted_loss.detach())
-
-                    if microbatch_idx == 0:
-                        prepare_after_first_microbatch()
-
-                grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
-                grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
-
-                # ── LoRA gradient diagnostic (step 1 only) ───────────────────
-                if global_step == 1 and self.peft_cfg is not None:
-                    for n, p in self.model.named_parameters():
-                        if "lora_B" in n:
-                            try:
-                                grad_val = p.grad.to_local().float().norm().item() if p.grad is not None else None
-                            except Exception:
-                                grad_val = p.grad.float().norm().item() if p.grad is not None else None
-                            logging.info(
-                                f"[GRAD CHECK] {n}: grad_norm={grad_val}, param_norm={p.data.float().norm().item():.6f}"
-                            )
-                            break
-
-                for optimizer in self.optimizer:
-                    optimizer.step()
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler[0].step(1)
-
+                group_loss_mean, grad_norm = self._train_batch_group(batch_group, global_step)
                 perf_window_steps += 1
                 perf_window_local_samples += _count_local_batch_group_samples(batch_group)
-                group_loss_mean = float(torch.stack(micro_losses).mean().item())
                 epoch_loss += group_loss_mean
                 num_steps += 1
                 global_step = int(self.step_scheduler.step)
