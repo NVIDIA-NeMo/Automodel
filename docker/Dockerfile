@@ -188,7 +188,7 @@ RUN mkdir -p /wheels && \
 # (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
 ARG FLASH_ATTN_REF=ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820
 ARG INSTALL_FA3=true
-ARG INSTALL_FA4=false
+ARG INSTALL_FA4=true
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
@@ -213,7 +213,7 @@ WORKDIR /opt/Automodel
 # torchao MXFP8 + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
 # before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
-ARG INSTALL_FA4=false
+ARG INSTALL_FA4=true
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     if [ "$INSTALL_FA4" = "true" ]; then \
         pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" && \
