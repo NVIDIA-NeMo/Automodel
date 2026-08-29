@@ -102,7 +102,7 @@ ci:
   checkpoint_robustness:
     hf_kl_threshold: 7e-2
     hf_device_map_auto: true
-    experts_implementation: grouped_mm
+    experts_implementation: eager
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     no_check_resume: true
     dataset.num_samples_limit: 500
