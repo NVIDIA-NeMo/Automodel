@@ -66,7 +66,12 @@ class HybridEPDispatchReplayRecorder:
         """Cache each layout extent after the checkpoint-forward op context exits."""
         for entry in self._records:
             if entry[2] is None:
-                entry[2] = entry[1].sum()
+                # HybridEP's sync-free replay API expects a host integer.  Do
+                # both the reduction and device-to-host scalar conversion only
+                # after the selective-checkpoint context exits; otherwise the
+                # replay-only conversion adds aten._local_scalar_dense to the
+                # recompute trace.
+                entry[2] = int(entry[1].sum().item())
 
     def take(self):
         """Return the next forward dispatch record, or ``None`` on divergence."""
