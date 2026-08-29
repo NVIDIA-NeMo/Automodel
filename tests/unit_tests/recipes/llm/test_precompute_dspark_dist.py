@@ -465,14 +465,21 @@ def test_main_parses_config_and_runs(monkeypatch):
 
 def test_manifest_without_mask_generation_prompt_matches_default(tmp_path):
     """Caches written before the field existed compare as ``mask_generation_prompt=False``."""
-    from nemo_automodel.components.datasets.llm.dspark_cache import manifest_mismatch_fields, write_manifest
+    from nemo_automodel.components.datasets.llm.dspark_cache import (
+        manifest_mismatch_fields,
+        read_manifest,
+        write_manifest,
+    )
 
     current = pdd.build_cache_manifest(**_manifest_kwargs())
     legacy = {k: v for k, v in current.items() if k != "mask_generation_prompt"}
-    assert manifest_mismatch_fields(legacy, current) == []
-    assert manifest_mismatch_fields(
-        legacy, pdd.build_cache_manifest(**_manifest_kwargs(mask_generation_prompt=True))
-    ) == ["mask_generation_prompt"]
-
     write_manifest(str(tmp_path), legacy)
+
+    # The reader fills the field in, so the legacy cache compares (and trains) as False.
+    recorded = read_manifest(str(tmp_path), allow_incomplete=True)
+    assert recorded["mask_generation_prompt"] is False
+    assert manifest_mismatch_fields(recorded, current) == []
+    assert manifest_mismatch_fields(
+        recorded, pdd.build_cache_manifest(**_manifest_kwargs(mask_generation_prompt=True))
+    ) == ["mask_generation_prompt"]
     pdd._ensure_output_dir_compatible(str(tmp_path), current)  # no raise

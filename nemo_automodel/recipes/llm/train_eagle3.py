@@ -50,6 +50,7 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
     build_cached_eagle3_dataloader,
     read_manifest,
 )
+from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -321,6 +322,41 @@ def _best_effort(label: str, fn) -> None:
         fn()
     except Exception:
         logger.exception("error %s during cleanup", label)
+
+
+def _validate_cached_eagle3_manifest(
+    cache_dir: str, manifest: dict, draft_base_config, *, mask_reasoning_content: bool, mask_generation_prompt: bool
+) -> None:
+    """Validate that an EAGLE-3 offline cache matches the configured target and recipe options.
+
+    The cached trainer streams the precomputed aux features, draft-vocab targets
+    and ``loss_mask``/``position_mask`` as stored, so the target's vocabulary and
+    width and the recipe's mask options must be the ones the producer
+    (``precompute_eagle3``) ran with; a mismatch would otherwise crash
+    deep inside the draft or, for the mask, train silently on the wrong tokens.
+    """
+    if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
+        raise ValueError(
+            f"EAGLE-3 cache at {cache_dir} was built for target_vocab_size={manifest['target_vocab_size']}, "
+            f"but the configured target has {draft_base_config.vocab_size}. The cache does not match this target."
+        )
+    # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
+    # cache from a different-width target would otherwise crash deep inside
+    # ``fc`` with a confusing shape error.
+    expected_aux_dim = int(draft_base_config.hidden_size) * 3
+    if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
+        raise ValueError(
+            f"EAGLE-3 cache at {cache_dir} has aux_hidden_dim={manifest['aux_hidden_dim']}, but the configured "
+            f"target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 aux layers). "
+            "The cache was built for a different target."
+        )
+    ensure_supervision_options_match(
+        manifest,
+        {"mask_reasoning_content": mask_reasoning_content, "mask_generation_prompt": mask_generation_prompt},
+        cache_name="EAGLE-3",
+        cache_dir=cache_dir,
+        producer_name="precompute_eagle3",
+    )
 
 
 def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int, lk_loss_type=None) -> None:
@@ -1321,22 +1357,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_model = None
         self.target_wrapper = None
         manifest = read_manifest(self.cached_target_path)
-        if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
-            raise ValueError(
-                f"EAGLE-3 cache at {self.cached_target_path} was built for target_vocab_size="
-                f"{manifest['target_vocab_size']}, but the configured target has {draft_base_config.vocab_size}. "
-                "The cache does not match this target."
-            )
-        # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
-        # cache from a different-width target would otherwise crash deep inside
-        # ``fc`` with a confusing shape error.
-        expected_aux_dim = int(draft_base_config.hidden_size) * 3
-        if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
-            raise ValueError(
-                f"EAGLE-3 cache at {self.cached_target_path} has aux_hidden_dim={manifest['aux_hidden_dim']}, "
-                f"but the configured target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 "
-                "aux layers). The cache was built for a different target."
-            )
+        _validate_cached_eagle3_manifest(
+            self.cached_target_path,
+            manifest,
+            draft_base_config,
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
+        )
         selected_token_ids = torch.tensor(manifest["selected_token_ids"], dtype=torch.long)
         selected_token_mask = torch.zeros(int(draft_base_config.vocab_size), dtype=torch.bool)
         selected_token_mask[selected_token_ids] = True
