@@ -1254,7 +1254,11 @@ class Checkpointer:
             assert model_name is not None, "model_name is required when loading base model"
             # Get combined key mapping from model attribute and model-type specific conversions
             model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-            key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
+            key_mapping = get_combined_key_mapping(
+                model_type,
+                model_key_mapping,
+                model=model,
+            )
             # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
             # skip backbone.*→model.* conversion to avoid key mismatch
             if model_type == "nemotron_h" and hasattr(model, "backbone"):

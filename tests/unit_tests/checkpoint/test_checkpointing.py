@@ -2177,6 +2177,53 @@ class TestInitializeModelWeights:
         sig = inspect.signature(Checkpointer.load_base_model)
         assert "peft_init_method" not in sig.parameters
 
+    def test_load_base_model_applies_class_registered_qwen_vl_mapping(self, tmp_path):
+        """Old Qwen-VL checkpoint keys populate both nested in-memory towers."""
+        import torch.nn as nn
+
+        class Qwen2_5_VLForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(model_type="qwen2_5_vl", tie_word_embeddings=False)
+                self.model = nn.Module()
+                self.model.visual = nn.Module()
+                self.model.visual.proj = nn.Linear(2, 2, bias=False)
+                self.model.language_model = nn.Module()
+                self.model.language_model.proj = nn.Linear(2, 2, bias=False)
+
+        model = Qwen2_5_VLForConditionalGeneration()
+        model.model.visual.proj.weight.data.zero_()
+        model.model.language_model.proj.weight.data.zero_()
+
+        vision_weight = torch.arange(4, dtype=torch.float32).view(2, 2)
+        language_weight = torch.arange(4, 8, dtype=torch.float32).view(2, 2)
+        save_file(
+            {
+                "visual.proj.weight": vision_weight,
+                "model.proj.weight": language_weight,
+            },
+            tmp_path / "model.safetensors",
+        )
+
+        checkpointer = Checkpointer.__new__(Checkpointer)
+        checkpointer.config = SimpleNamespace(
+            is_peft=False,
+            cpu_offload=False,
+            dequantize_base_checkpoint=False,
+            skip_task_head_prefixes_for_base_model=None,
+        )
+        checkpointer.moe_mesh = None
+
+        checkpointer.load_base_model(
+            model,
+            torch.device("cpu"),
+            root_dir=str(tmp_path),
+            model_name=str(tmp_path),
+        )
+
+        torch.testing.assert_close(model.model.visual.proj.weight, vision_weight)
+        torch.testing.assert_close(model.model.language_model.proj.weight, language_weight)
+
 
 class TestLmHeadWeightTying:
     """Tests that load_base_model calls tie_weights for tied models."""
