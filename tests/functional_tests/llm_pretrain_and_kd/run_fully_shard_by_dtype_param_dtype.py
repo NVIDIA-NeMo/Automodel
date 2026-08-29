@@ -31,7 +31,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
 
 
 def _is_distributed() -> bool:

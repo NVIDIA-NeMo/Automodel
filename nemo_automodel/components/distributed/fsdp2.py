@@ -129,6 +129,7 @@ class FSDP2Manager:
         self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
         self.fsdp2_backward_prefetch_depth = config.fsdp2_backward_prefetch_depth
         self.fsdp2_forward_prefetch_depth = config.fsdp2_forward_prefetch_depth
+        self.max_replicated_fp32_param_bytes_per_module = config.max_replicated_fp32_param_bytes_per_module
         self.frozen_multimodal_sharding = config.multimodal.frozen_sharding
 
     def parallelize(self, model):
@@ -186,6 +187,7 @@ class FSDP2Manager:
             enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
+            max_replicated_fp32_param_bytes_per_module=self.max_replicated_fp32_param_bytes_per_module,
             reshard_after_forward=self.reshard_after_forward,
             activation_checkpointing_scope=self.activation_checkpointing_scope,
             frozen_multimodal_sharding=self.frozen_multimodal_sharding,

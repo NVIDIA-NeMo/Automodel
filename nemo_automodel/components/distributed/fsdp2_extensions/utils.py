@@ -18,17 +18,12 @@ from typing import Callable, Dict, Iterator, List, Set, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import (
-    FSDPModule,
-    MixedPrecisionPolicy,
-    OffloadPolicy,
-    fully_shard,
-)
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
-from nemo_automodel.shared.torch_patches import (
+from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
-from nemo_automodel.shared.torch_patches import (
+from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
     patch_fsdp_unused_param_reduction as _patch_fsdp_unused_param_reduction,
 )
 
@@ -285,13 +280,13 @@ def get_internal_fsdp_mp_policy(
     return mp_policy_copy
 
 
-def _make_compute_dtype_fn(
+def make_parameter_compute_dtype_resolver(
     module: nn.Module,
     mp_policy: MixedPrecisionPolicy | None,
-    fp32_compute_module_names: Tuple[str, ...],
+    fp32_compute_module_names: tuple[str, ...],
     ignored_params: set[nn.Parameter] | None = None,
 ) -> Callable[[torch.Tensor], torch.dtype]:
-    """Build the per-parameter *compute* dtype resolver used to group FSDP units.
+    """Build the per-parameter compute-dtype resolver used by FSDP policies.
 
     The compute dtype of a floating tensor is resolved by precedence:
 
@@ -306,13 +301,24 @@ def _make_compute_dtype_fn(
          lower-precision policy is an fp32 master weight and computes in
          ``mp_policy.param_dtype`` (the requested compute dtype, typically bf16); any
          other storage keeps its own dtype (and so does the fp32 case when no policy is
-         given). Resolved per-param -- a single genuinely lower-precision sibling (e.g.
-         Qwen3.5-MoE's bf16 ``shared_expert_gate``) no longer forces the layer's fp32
-         master weights into fp32 compute. Intrinsic fp32 is already covered by #1/#2;
+         given). Resolved per-param -- a single genuinely lower-precision sibling no
+         longer forces the layer's fp32 master weights into fp32 compute. Intrinsic
+         fp32 is already covered by #1/#2;
          the ``(storage, compute)`` grouping still keeps each FSDP unit storage-uniform.
-         See NVIDIA-NeMo/Automodel#3327.
 
     Non-floating tensors always keep their storage dtype.
+
+    Args:
+        module: Module whose parameters and buffers define the resolver's naming scope.
+        mp_policy: FSDP mixed-precision policy defining the fallback compute dtype.
+        fp32_compute_module_names: Parameter- or buffer-name fragments pinned to FP32
+            compute.
+        ignored_params: Parameters owned outside this FSDP policy and excluded from
+            name-based pinning.
+
+    Returns:
+        A resolver that maps any parameter or buffer tensor of arbitrary shape to
+        its compute dtype without modifying or aliasing that tensor.
     """
     policy_dtype = getattr(mp_policy, "param_dtype", None)
 
@@ -325,6 +331,14 @@ def _make_compute_dtype_fn(
                 pinned_ids.add(id(tensor))
 
     def compute_dtype_of(t: torch.Tensor) -> torch.dtype:
+        """Resolve one parameter or buffer tensor's compute dtype.
+
+        Args:
+            t: Parameter or buffer tensor of arbitrary shape.
+
+        Returns:
+            The dtype in which FSDP should materialize ``t`` for computation.
+        """
         if not t.dtype.is_floating_point:
             return t.dtype
         if id(t) in pinned_ids:
@@ -357,7 +371,7 @@ def fully_shard_by_dtype(
     except parameters that must stay in fp32 -- their FSDP unit gets ``param_dtype=fp32``
     while the rest of the module computes in the policy dtype. A parameter "must stay
     fp32" if it is pinned via ``fp32_compute_module_names`` or HF stored it in fp32 (see
-    ``_make_compute_dtype_fn`` for the full precedence). This decouples *compute* dtype
+    ``make_parameter_compute_dtype_resolver`` for the full precedence). This decouples *compute* dtype
     from *storage* dtype, so fp32 master weights (uniform fp32 storage) still compute in
     bf16 for the bulk.
 
@@ -376,7 +390,7 @@ def fully_shard_by_dtype(
 
     Args:
         fp32_compute_module_names: Parameter/buffer name substrings that must compute in
-            fp32 (e.g. ``("_fp32_params",)`` for Qwen3.5's GatedDeltaNet fp32 holder).
+            fp32 (for example, an explicitly named FP32 parameter holder).
             Sourced from the model's ``_keep_in_fp32_modules_strict``. Matched callable
             modules must cast their own inputs when required; their nested FP32 FSDP
             units preserve the parent activation dtype at the module boundary.
@@ -390,7 +404,7 @@ def fully_shard_by_dtype(
     """
     ignored_params = set(ignored_params or ())
     ignored_param_ids = {id(param) for param in ignored_params}
-    compute_dtype_of = _make_compute_dtype_fn(
+    compute_dtype_of = make_parameter_compute_dtype_resolver(
         module,
         mp_policy,
         fp32_compute_module_names,

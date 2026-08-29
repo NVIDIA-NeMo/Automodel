@@ -91,7 +91,7 @@ def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping():
     """
     import torch.distributed.fsdp as fsdp
 
-    from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+    from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
 
     config = AutoConfig.for_model("minimax_m2", torch_dtype="bfloat16", **TINY)
     model = MiniMaxM2ForCausalLM(config, backend=_cpu_backend())
