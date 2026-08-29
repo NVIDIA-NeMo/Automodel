@@ -19,7 +19,7 @@ from unittest import mock
 
 import pytest
 import torch
-from torch.utils.checkpoint import CheckpointError, checkpoint
+from torch.utils.checkpoint import CheckpointError, CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
 import nemo_automodel.components.moe.megatron.fused_a2a as fused_a2a
 
@@ -146,6 +146,24 @@ def test_hybridep_checkpoint_reuses_forward_layout_on_recompute():
     buffer = _DriftingHybridEPBuffer()
     fused_a2a._hybrid_ep_buffer = buffer
     context_fn = _replay_hybridep_dispatch_on_recompute(lambda: (nullcontext(), nullcontext()))
+
+    _run_checkpointed_hybridep(context_fn)
+
+    assert buffer.full_dispatches == 1
+    assert buffer.cached_dispatches == 1
+
+
+def test_hybridep_checkpoint_replay_does_not_add_sum_to_selective_recompute():
+    from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
+
+    buffer = _DriftingHybridEPBuffer()
+    fused_a2a._hybrid_ep_buffer = buffer
+    aten_sum = torch.ops.aten.sum.default
+
+    def save_sums_policy(ctx, func, *args, **kwargs):
+        return CheckpointPolicy.MUST_SAVE if func == aten_sum else CheckpointPolicy.PREFER_RECOMPUTE
+
+    context_fn = _replay_hybridep_dispatch_on_recompute(lambda: create_selective_checkpoint_contexts(save_sums_policy))
 
     _run_checkpointed_hybridep(context_fn)
 
