@@ -67,12 +67,12 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
         return cfg
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
-        """Build the DFlash 2 trainer wrapper (block CE + candidate-selection CE)."""
-        if (recipe_cfg.get("loss_type", None) or "dflash") != "dflash":
-            raise ValueError(
-                "loss_type is only supported by the DFlash recipe; the DFlash 2 trainer teacher-forces the "
-                "selector's predecessor from the fixed-anchor block layout and would silently ignore it."
-            )
+        """Build the DFlash 2 trainer wrapper (block CE + candidate-selection CE).
+
+        ``loss_type="variable_prefix"`` is rejected by ``DFlash2TrainerModule``
+        itself: the selector teacher-forces the predecessor from the fixed-anchor
+        block layout, which a variable visible prefix breaks.
+        """
         return DFlash2TrainerModule(
             draft_model=self.draft_model,
             target_lm_head=self.target_model.get_output_embeddings(),
@@ -85,6 +85,10 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
             # matches DFlashDecayLoss's own default. Set null explicitly in YAML
             # to disable the position decay (uniform weighting).
             loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
+            # ``or`` folds an explicit ``loss_type: null`` back to the default,
+            # matching the null convention of loss_decay_gamma above.
+            loss_type=str(recipe_cfg.get("loss_type", None) or "dflash"),
+            dpace_alpha=float(recipe_cfg.get("dpace_alpha", 0.5)),
             selector_loss_weight=float(recipe_cfg.get("selector_loss_weight", 1.0)),
             sliding_window=self.draft_sliding_window,
         )

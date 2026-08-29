@@ -67,6 +67,8 @@ def _draft_cfg(attention_backend="sdpa", selector_top_k=TOP_K):
 def _build_trainer(
     num_anchors=8,
     loss_decay_gamma=None,
+    loss_type="dflash",
+    dpace_alpha=0.5,
     attention_backend="sdpa",
     selector_loss_weight=1.0,
     selector_top_k=TOP_K,
@@ -82,6 +84,8 @@ def _build_trainer(
         attention_backend=attention_backend,
         num_anchors=num_anchors,
         loss_decay_gamma=loss_decay_gamma,
+        loss_type=loss_type,
+        dpace_alpha=dpace_alpha,
         selector_loss_weight=selector_loss_weight,
     )
 
@@ -115,15 +119,17 @@ def test_forward_returns_finite_loss_and_grads_flow_to_draft():
     assert grad > 0
 
 
-def test_selector_term_is_the_only_difference_from_dflash():
+@pytest.mark.parametrize("loss_type", ["dflash", "dpace"])
+def test_selector_term_is_the_only_difference_from_dflash(loss_type):
     """With ``selector_loss_weight=0`` the objective must be DFlash's, exactly.
 
     The convolutions and the selector start at the identity, so a zero-weighted
     selector term leaves a loss that has to match ``DFlashTrainerModule`` on the
-    same weights and the same sampled anchors. If it does not, the DFlash 2
-    wrapper has changed the backbone objective rather than only adding to it.
+    same weights, the same sampled anchors, and the same ``loss_type``. If it does
+    not, the DFlash 2 wrapper has changed the backbone objective rather than only
+    adding to it -- covers both the fixed-decay and the D-PACE schedule.
     """
-    trainer2 = _build_trainer(loss_decay_gamma=7.0, selector_loss_weight=0.0)
+    trainer2 = _build_trainer(loss_decay_gamma=7.0, loss_type=loss_type, selector_loss_weight=0.0)
     torch.manual_seed(0)
     dflash_draft = Qwen3DFlashDraftModel(_draft_cfg())
     dflash_draft.load_state_dict(
@@ -138,6 +144,7 @@ def test_selector_term_is_the_only_difference_from_dflash():
         attention_backend="sdpa",
         num_anchors=8,
         loss_decay_gamma=7.0,
+        loss_type=loss_type,
     )
 
     input_ids, hidden, loss_mask = _inputs()
@@ -148,6 +155,7 @@ def test_selector_term_is_the_only_difference_from_dflash():
 
     torch.testing.assert_close(out2.loss, out1.loss)
     torch.testing.assert_close(out2.base_loss, out1.loss)
+    torch.testing.assert_close(out2.loss_weight, out1.loss_weight)
     torch.testing.assert_close(out2.valid_tokens, out1.valid_tokens)
     torch.testing.assert_close(out2.base_accuracy, out1.accuracy)
 
@@ -253,3 +261,44 @@ def test_requires_a_dflash2_draft_model():
 def test_rejects_a_negative_selector_loss_weight():
     with pytest.raises(ValueError, match="selector_loss_weight"):
         _build_trainer(selector_loss_weight=-1.0)
+
+
+def test_rejects_variable_prefix_loss_type():
+    """The selector teacher-forces the predecessor from the fixed-anchor block
+    layout (see ``_selector_scores``), which a variable visible prefix breaks."""
+    with pytest.raises(ValueError, match="variable_prefix"):
+        _build_trainer(loss_type="variable_prefix")
+
+
+def test_dpace_loss_type_runs_finite_and_trains_both_terms():
+    """``loss_type="dpace"`` must run end to end: a finite loss for both terms,
+    and gradients reaching the backbone, the convolutions, and the selector."""
+    trainer = _build_trainer(loss_type="dpace", dpace_alpha=0.35, selector_top_k=VOCAB)
+    input_ids, hidden, loss_mask = _inputs()
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    assert torch.isfinite(out.loss) and out.loss.item() > 0
+    assert torch.isfinite(out.base_loss) and torch.isfinite(out.selector_loss)
+    assert out.selector_loss.item() > 0
+    out.loss.backward()
+    selector = trainer.draft_model.candidate_selector
+    assert selector.successor_codebook.grad.abs().sum() > 0
+    for name, param in trainer.draft_model.named_parameters():
+        if "conv" in name:
+            assert param.grad is not None, name
+
+
+def test_dpace_alpha_changes_the_selector_loss():
+    """``dpace_alpha`` must reach the selector term too, not only the base one --
+    otherwise the two terms would silently disagree on the D-PACE schedule."""
+    input_ids, hidden, loss_mask = _inputs()
+
+    torch.manual_seed(1234)
+    low_alpha = _build_trainer(loss_type="dpace", dpace_alpha=0.1, selector_top_k=VOCAB)(
+        input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask
+    )
+    torch.manual_seed(1234)
+    high_alpha = _build_trainer(loss_type="dpace", dpace_alpha=0.9, selector_top_k=VOCAB)(
+        input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask
+    )
+
+    assert not torch.allclose(low_alpha.selector_loss, high_alpha.selector_loss, atol=1e-4)

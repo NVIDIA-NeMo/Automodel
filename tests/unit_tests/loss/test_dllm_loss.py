@@ -515,6 +515,84 @@ class TestDFlashDecayLoss:
         assert torch.isclose(mean.loss_denominator, expected_denom + 1e-6, atol=1e-4)
 
 
+class TestDFlashDecayLossWeightedMean:
+    """``position_weights`` / ``weighted_mean`` let a second objective over the same
+    fixed-anchor block layout (DFlash 2's candidate-selector CE) share this loss's
+    exact position weighting instead of re-deriving it."""
+
+    def test_position_weights_matches_the_dflash_decay_curve(self, dflash_inputs):
+        logits, target_ids, block_mask = dflash_inputs
+        token_nll = F.cross_entropy(logits.reshape(-1, V_D), target_ids.reshape(-1), reduction="none").view(
+            B_D, N_D, K_D
+        )
+
+        weights = DFlashDecayLoss(loss_gamma=7.0).position_weights(token_nll, block_mask)
+
+        expected = torch.exp(-torch.arange(K_D, dtype=torch.float) / 7.0).view(1, 1, K_D) * block_mask
+        assert torch.allclose(weights, expected)
+
+    def test_position_weights_matches_dpace(self, dflash_inputs):
+        logits, target_ids, block_mask = dflash_inputs
+        token_nll = F.cross_entropy(logits.reshape(-1, V_D), target_ids.reshape(-1), reduction="none").view(
+            B_D, N_D, K_D
+        )
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.35)
+
+        weights = loss_fn.position_weights(token_nll, block_mask)
+
+        expected = block_mask * loss_fn._dpace_weight(token_nll, block_mask, block_mask > 0)
+        assert torch.allclose(weights, expected)
+
+    @pytest.mark.parametrize("loss_type", ["dflash", "dpace"])
+    def test_weighted_mean_reproduces_forward_for_the_same_values(self, dflash_inputs, loss_type):
+        """Feeding ``forward``'s own ``token_nll`` back through ``weighted_mean`` as
+        both the weighted value and the weight source must reproduce ``forward``'s
+        ``total_loss`` exactly: this is exactly how a caller with its own per-position
+        loss (DFlash 2's selector CE) is meant to reuse the schedule."""
+        logits, target_ids, block_mask = dflash_inputs
+        loss_fn = DFlashDecayLoss(loss_type=loss_type, loss_gamma=7.0, dpace_alpha=0.35, normalize="mean")
+        token_nll = F.cross_entropy(logits.reshape(-1, V_D), target_ids.reshape(-1), reduction="none").view(
+            B_D, N_D, K_D
+        )
+
+        expected = loss_fn(logits, target_ids, block_mask).total_loss
+        actual = loss_fn.weighted_mean(token_nll, token_nll, block_mask)
+
+        assert torch.isclose(actual, expected, atol=1e-6)
+
+    def test_weighted_mean_weights_by_one_tensor_and_reduces_another(self, dflash_inputs):
+        """The weight source and the reduced value are independent tensors -- DFlash
+        2 weights the selector CE by the *backbone's* confidence, not its own."""
+        _, _, block_mask = dflash_inputs
+        torch.manual_seed(7)
+        weight_source = torch.rand(B_D, N_D, K_D)  # stands in for the backbone's NLL
+        values = torch.rand(B_D, N_D, K_D)  # stands in for the selector's own CE
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.35, normalize="mean")
+
+        actual = loss_fn.weighted_mean(values, weight_source, block_mask)
+
+        weights = loss_fn.position_weights(weight_source, block_mask)
+        expected = (values * weights).sum() / float(B_D * N_D)
+        assert torch.isclose(actual, expected, atol=1e-6)
+
+    def test_weighted_mean_dpace_denominator_is_batch_times_blocks(self, dflash_inputs):
+        """Matches ``forward``'s D-PACE ``normalize="mean"`` denominator (batch *
+        blocks, not the weight sum) so a caller sharing the schedule also shares the
+        learning-rate scale across ``loss_type`` values."""
+        logits, target_ids, block_mask = dflash_inputs
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.35, normalize="mean")
+        token_nll = F.cross_entropy(logits.reshape(-1, V_D), target_ids.reshape(-1), reduction="none").view(
+            B_D, N_D, K_D
+        )
+
+        weights = loss_fn.position_weights(token_nll, block_mask)
+        expected = (token_nll * weights).sum() / float(B_D * N_D)
+        actual = loss_fn.weighted_mean(token_nll, token_nll, block_mask)
+
+        assert torch.isclose(actual, expected, atol=1e-6)
+        assert not torch.isclose(actual, (token_nll * weights).sum() / (weights.sum() + 1e-6), atol=1e-6)
+
+
 class TestDFlashDraftAccuracy:
     """Per-position draft top-1 accuracy (correct, count) sums.
 
@@ -1347,9 +1425,7 @@ class TestSCDDLossChunking:
 
     def _run(self, chunk_size, logits, x0, z_t, loss_mask, p_mask):
         logits = logits.clone().requires_grad_(True)
-        loss_fn = SCDDLoss(
-            mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.15, chunk_size=chunk_size
-        )
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.15, chunk_size=chunk_size)
         out = loss_fn(
             logits=logits,
             target_ids=x0,

@@ -902,6 +902,104 @@ class DFlashDecayLoss(nn.Module):
             return torch.exp(log_suffix - log_prefix).to(token_nll.dtype)
         raise ValueError(f"unknown D-PACE loss_type {self.loss_type!r}")
 
+    def position_weights(self, token_nll: torch.Tensor, block_mask: torch.Tensor) -> torch.Tensor:
+        """Per-position loss weights for this instance's ``loss_type``, unreduced.
+
+        Exposed (beyond :meth:`forward` / :meth:`forward_fused`) so a second
+        training objective over the same fixed-anchor block layout -- DFlash 2's
+        candidate-selector CE -- can weight its own per-position loss by the exact
+        same schedule instead of re-deriving one, keeping "position importance"
+        identical between the two objectives by construction.
+
+        Args:
+            token_nll: Per-token NLL, shape ``[batch, blocks, k]`` (``k =
+                block_size - 1`` predicted positions per block). Only its shape,
+                device, and dtype are used for ``loss_type="dflash"``; the D-PACE
+                variants read its values as the draft's per-position confidence.
+            block_mask: Valid-position mask, same shape ``[batch, blocks, k]``;
+                zero entries (padding) are excluded.
+
+        Returns:
+            Tensor of shape ``[batch, blocks, k]``: ``block_mask`` scaled by the
+            decay weights (``"dflash"``) or the detached D-PACE confidence product
+            (``"dpace*"`` -- the ``cumprod`` runs over the last (``k``) axis, so it
+            resets per block by construction).
+        """
+        _, _, k = token_nll.shape
+        block_mask = block_mask.to(token_nll.dtype)
+        if self.loss_type == "dflash":
+            w = self._decay_weights(k, token_nll.device, token_nll.dtype)
+            return w.view(1, 1, k) * block_mask  # [batch, blocks, k]
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            with torch.no_grad():
+                dpace_weights = self._dpace_weight(token_nll.detach(), block_mask, block_mask > 0)
+            return block_mask * dpace_weights
+        raise ValueError(f"unknown loss_type {self.loss_type!r}")
+
+    def _mean_denominator(self, weights: torch.Tensor, bsz: int, n_blocks: int) -> torch.Tensor:
+        """Denominator for ``normalize="mean"``: weight sum for ``"dflash"``, else block count.
+
+        Args:
+            weights: Position weights from :meth:`position_weights`, shape
+                ``[batch, blocks, k]``.
+            bsz: Batch size (``weights.shape[0]``).
+            n_blocks: Sampled-block count (``weights.shape[1]``).
+
+        Returns:
+            Scalar tensor.
+
+        D-PACE is a weighted *sum*: the weight magnitude is the signal (the
+        expected accepted-prefix length), so a weight-sum denominator would cancel
+        exactly the variation the objective encodes, and a data-dependent
+        denominator would desync the DP gradient average (exact only when every
+        rank divides by the same constant).
+
+        The published objective divides by the batch size alone. We also divide by
+        the block count: it counts sampled anchors, not unmasked tokens, so unlike
+        a weight sum it cancels nothing the objective encodes, and it is
+        ``num_anchors`` whenever the batch supplies that many valid anchors --
+        i.e. a constant, leaving the gradient direction and the optimum unchanged.
+        What it buys is scale: without it, flipping ``loss_type`` in the YAML
+        moves the effective learning rate by orders of magnitude and the run
+        diverges instead of erroring. The reported value is correspondingly
+        ``n_blocks`` times smaller than the published one.
+        """
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            return weights.new_tensor(max(float(bsz * n_blocks), 1.0))
+        return weights.sum() + 1e-6
+
+    def weighted_mean(
+        self,
+        values: torch.Tensor,
+        token_nll: torch.Tensor,
+        block_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Weight ``values`` by :meth:`position_weights` and reduce with ``normalize="mean"`` semantics.
+
+        Lets a second training objective over the same fixed-anchor block layout
+        (DFlash 2's candidate-selector CE) share this loss's exact position
+        weighting and denominator instead of re-deriving both, so switching
+        ``loss_type`` (``"dflash"`` <-> a D-PACE variant) rescales every objective
+        built on this block layout identically, not only the one :meth:`forward`
+        computes directly.
+
+        Args:
+            values: Per-position loss values to weight and reduce, shape
+                ``[batch, blocks, k]``.
+            token_nll: Per-token NLL the position weights are derived from --
+                typically the backbone's own per-position NLL over the same
+                block, shape ``[batch, blocks, k]``. Ignored for
+                ``loss_type="dflash"``.
+            block_mask: Valid-position mask, shape ``[batch, blocks, k]``.
+
+        Returns:
+            Scalar tensor: the weighted mean of ``values``.
+        """
+        bsz, n_blocks, _ = block_mask.shape
+        weights = self.position_weights(token_nll, block_mask)
+        denom = self._mean_denominator(weights, bsz, n_blocks)
+        return (values * weights).sum() / denom
+
     def _reduce(
         self,
         token_nll: torch.Tensor,
@@ -925,49 +1023,12 @@ class DFlashDecayLoss(nn.Module):
         Returns:
             :class:`DLLMLossOutput` whose ``loss_denominator`` is the exact scalar
             the weighted sum was divided by, so callers never recompute it.
-
-        ``loss_type`` selects the weights (decay for ``"dflash"``, detached D-PACE
-        confidence for the ``"dpace*"`` variants -- the ``cumprod`` runs over the
-        last (``k``) axis, so it resets per block by construction). The denominator
-        for D-PACE (the global ``num_tokens``, or ``batch * blocks``) counts
-        sequences and sampled blocks rather than surviving tokens, so it does not
-        vary with the mask: the DP gradient average is not skewed and the
-        objective's weight magnitudes are preserved.
         """
-        bsz, n_blocks, k = token_nll.shape
-        block_mask = block_mask.to(token_nll.dtype)
-        if self.loss_type == "dflash":
-            w = self._decay_weights(k, token_nll.device, token_nll.dtype)
-            weights = w.view(1, 1, k) * block_mask  # [batch, blocks, k]
-        elif self.loss_type in _DPACE_LOSS_TYPES:
-            with torch.no_grad():
-                dpace_weights = self._dpace_weight(token_nll.detach(), block_mask, block_mask > 0)
-            weights = block_mask * dpace_weights
-        else:
-            raise ValueError(f"unknown loss_type {self.loss_type!r}")
-
+        bsz, n_blocks, _ = token_nll.shape
+        weights = self.position_weights(token_nll, block_mask)
         weighted_sum = (token_nll * weights).sum()
         if self.normalize == "mean":
-            if self.loss_type in _DPACE_LOSS_TYPES:
-                # D-PACE is a weighted *sum*: the weight magnitude is the signal (the
-                # expected accepted-prefix length), so a weight-sum denominator would
-                # cancel exactly the variation the objective encodes, and a
-                # data-dependent denominator would desync the DP gradient average
-                # (exact only when every rank divides by the same constant).
-                #
-                # The published objective divides by the batch size alone. We also
-                # divide by the block count: it counts sampled anchors, not unmasked
-                # tokens, so unlike a weight sum it cancels nothing the objective
-                # encodes, and it is ``num_anchors`` whenever the batch supplies that
-                # many valid anchors -- i.e. a constant, leaving the gradient direction
-                # and the optimum unchanged. What it buys is scale: without it,
-                # flipping ``loss_type`` in the YAML moves the effective learning rate
-                # by orders of magnitude and the run diverges instead of erroring. The
-                # reported value is correspondingly ``n_blocks`` times smaller than the
-                # published one.
-                denom = weighted_sum.new_tensor(max(float(bsz * n_blocks), 1.0))
-            else:
-                denom = weights.sum() + 1e-6
+            denom = self._mean_denominator(weights, bsz, n_blocks)
         elif num_tokens is not None:
             denom = weighted_sum.new_tensor(max(float(num_tokens), 1.0))
         else:

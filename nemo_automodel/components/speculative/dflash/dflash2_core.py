@@ -34,8 +34,14 @@ inside the candidate list. Positions whose true token missed the candidate list
 carry no selector signal -- there is nothing there to select -- and are excluded
 from the selector term; ``candidate_recall`` reports how often that happens.
 
-Both terms use the same block-position decay weights, so a position's importance
-is identical in the two objectives.
+Both terms share ``base_loss``'s ``DFlashDecayLoss`` position-weighting scheme
+(fixed decay for ``loss_type="dflash"``, detached D-PACE confidence for the
+``"dpace*"`` variants, arXiv:2605.18810) via
+:meth:`~nemo_automodel.components.loss.dllm_loss.DFlashDecayLoss.weighted_mean`,
+so a position's importance is identical in the two objectives and switching
+``loss_type`` rescales both consistently. ``loss_type="variable_prefix"`` is
+rejected: the selector teacher-forces the predecessor from the fixed-anchor
+block layout, which a variable visible prefix breaks.
 """
 
 from __future__ import annotations
@@ -114,9 +120,17 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: float | None = None,
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
         selector_loss_weight: float = 1.0,
         sliding_window: int | None = None,
     ):
+        if loss_type == "variable_prefix":
+            raise ValueError(
+                "DFlash 2 does not support loss_type='variable_prefix': the candidate selector "
+                "teacher-forces the predecessor from the fixed-anchor block layout, which a variable "
+                "visible prefix breaks."
+            )
         super().__init__(
             draft_model=draft_model,
             target_lm_head=target_lm_head,
@@ -126,6 +140,8 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
+            loss_type=loss_type,
+            dpace_alpha=dpace_alpha,
             sliding_window=sliding_window,
         )
         if getattr(draft_model, "candidate_selector", None) is None:
@@ -136,22 +152,6 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         if selector_loss_weight < 0:
             raise ValueError(f"selector_loss_weight must be >= 0, got {selector_loss_weight}.")
         self.selector_loss_weight = float(selector_loss_weight)
-
-    def _depth_weights(self, mask: torch.Tensor) -> torch.Tensor:
-        """Block-position decay weights for the ``block_size - 1`` predicted positions.
-
-        Args:
-            mask: Tensor of shape [batch, blocks, depth]; the supervised-position
-                mask the weights are multiplied into.
-
-        Returns:
-            Tensor of shape [batch, blocks, depth] equal to ``mask`` scaled by
-            ``exp(-k / loss_decay_gamma)``, or ``mask`` itself when decay is off.
-        """
-        if self.loss_decay_gamma is None:
-            return mask
-        depth = torch.exp(-torch.arange(mask.shape[-1], device=mask.device, dtype=mask.dtype) / self.loss_decay_gamma)
-        return mask * depth
 
     def _selector_scores(
         self,
@@ -252,22 +252,24 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         pred_mask = block_mask[:, :, 1:]
 
         loss_fn = self.loss_fn
-        assert loss_fn is not None, "loss_fn is always constructed for loss_type='dflash'"
-        loss_out = loss_fn(
-            pred_logits.reshape(bsz, n * (bs - 1), -1),
-            pred_targets.reshape(bsz, -1),
-            pred_mask.reshape(bsz, -1),
-            num_tokens=None,
-            block_size=bs,
-        )
+        assert loss_fn is not None, "loss_fn is always constructed (loss_type='variable_prefix' is rejected)"
+        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None)
 
         scores, candidate_ids, target_index, has_target = self._selector_scores(pred_hidden, pred_logits, target_ids)
         selector_mask = pred_mask * has_target.to(pred_mask.dtype)
-        selector_weights = self._depth_weights(selector_mask)
-        token_nll = F.cross_entropy(
+        selector_nll = F.cross_entropy(
             scores.reshape(-1, scores.shape[-1]).float(), target_index.reshape(-1), reduction="none"
         ).view_as(selector_mask)
-        selector_loss = (token_nll * selector_weights).sum() / (selector_weights.sum() + 1e-6)
+        # The backbone's own per-position NLL, only ever read (never backpropped
+        # through) as the D-PACE confidence signal -- computed under no_grad so it
+        # does not double the base term's backward graph over pred_logits.
+        with torch.no_grad():
+            base_token_nll = F.cross_entropy(
+                pred_logits.reshape(-1, pred_logits.shape[-1]).float(), pred_targets.reshape(-1), reduction="none"
+            ).view_as(pred_mask)
+        # Shares base_loss's DFlashDecayLoss weighting scheme (see module docstring)
+        # so the selector term rescales identically when loss_type changes.
+        selector_loss = loss_fn.weighted_mean(selector_nll, base_token_nll, selector_mask)
         loss = loss_out.total_loss + self.selector_loss_weight * selector_loss
 
         with torch.no_grad():
@@ -283,7 +285,7 @@ class DFlash2TrainerModule(DFlashTrainerModule):
 
         return DFlash2StepMetrics(
             loss=loss,
-            loss_weight=self._depth_weights(pred_mask).sum().detach(),
+            loss_weight=loss_out.loss_denominator.detach(),
             accuracy=(correct_tokens / denominator).detach(),
             valid_tokens=valid_tokens.detach(),
             correct_tokens=correct_tokens.detach(),
