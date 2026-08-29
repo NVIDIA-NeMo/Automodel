@@ -365,7 +365,9 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.distributed.pipelining.config",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
         "nemo_automodel.components.distributed.mesh_utils",
-        "nemo_automodel.components.distributed.parallelizer_utils",
+        "nemo_automodel.components.distributed.fsdp2_extensions",
+        "nemo_automodel.components.distributed.fsdp2_extensions.compat",
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils",
     ]:
         if mod in sys.modules:
             sys.modules.pop(mod)
@@ -399,6 +401,8 @@ def _import_parallelizer_with_stubs(monkeypatch):
     pipelining_stub.hf_utils = hf_utils_stub
 
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed", distributed_stub)
+    components_package = importlib.import_module("nemo_automodel.components")
+    monkeypatch.setattr(components_package, "distributed", distributed_stub, raising=False)
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.config", config_stub)
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining", pipelining_stub)
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining.config", pipelining_config_stub)
@@ -409,7 +413,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     mesh_utils_stub.get_fsdp_dp_mesh = lambda mesh, *_axis_names: mesh[("dp_replicate", "dp_shard_cp")]
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.mesh_utils", mesh_utils_stub)
 
-    parallelizer_utils_stub = types.ModuleType("nemo_automodel.components.distributed.parallelizer_utils")
+    parallelizer_utils_stub = types.ModuleType("nemo_automodel.components.distributed.fsdp2_extensions.utils")
 
     def fully_shard_by_dtype(
         module,
@@ -455,13 +459,30 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     parallelizer_utils_stub.reject_unsupported_mtp_cp_pp = reject_unsupported_mtp_cp_pp
 
+    fsdp2_compat_stub = types.ModuleType("nemo_automodel.components.distributed.fsdp2_extensions.compat")
+    fsdp2_compat_stub.patch_fsdp_accumulated_grad_guard = lambda: None
+    fsdp2_compat_stub.patch_fsdp_uniform_reduce_dtype = lambda: None
+    fsdp2_extensions_stub = types.ModuleType("nemo_automodel.components.distributed.fsdp2_extensions")
+    fsdp2_extensions_stub.__path__ = []
+    fsdp2_extensions_stub.compat = fsdp2_compat_stub
+    fsdp2_extensions_stub.parallelize = parallelizer_utils_stub
     monkeypatch.setitem(
         sys.modules,
-        "nemo_automodel.components.distributed.parallelizer_utils",
+        "nemo_automodel.components.distributed.fsdp2_extensions.compat",
+        fsdp2_compat_stub,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils",
         parallelizer_utils_stub,
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.fsdp2_extensions",
+        fsdp2_extensions_stub,
+    )
     distributed_package = importlib.import_module("nemo_automodel.components.distributed")
-    monkeypatch.setattr(distributed_package, "parallelizer_utils", parallelizer_utils_stub, raising=False)
+    monkeypatch.setattr(distributed_package, "fsdp2_extensions", fsdp2_extensions_stub, raising=False)
 
     # Stub dtype_from_str utility
     shared_utils_stub = types.ModuleType("nemo_automodel.shared.utils")
