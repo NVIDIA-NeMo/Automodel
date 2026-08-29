@@ -91,7 +91,9 @@ dependencies = [
     "torchao",
     "mlflow",
     "flashoptim>=0.1.3",
-    "quack-kernels==0.6.1; sys_platform == 'linux'",
+    # 0.6.4 pins nvidia-cutlass-dsl==4.6.2, matching what flash_attn.cute requires at the
+    # pinned FLASH_ATTN_REF. Both import `cutlass`, so they have to agree. (0.6.1 pinned 4.6.0.)
+    "quack-kernels==0.6.4; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -124,11 +126,12 @@ cuda = [
     "tile-kernels==1.0.0",
     # tilelang 0.1.11 does not cap its TVM ffi dependency, but 0.1.12 is
     # incompatible with its bundled TVM. Keep pip installs on the known-good ffi.
-    # NOTE: flash-attn-4 (attn_implementation="flash_attention_4") requires
-    # apache-tvm-ffi>=0.1.12,<0.2 -- mutually exclusive with this pin until
-    # tilelang ships a release built against ffi 0.1.12. The container installs
-    # FA4 only when built with INSTALL_FA4=true (docker/Dockerfile), which
-    # upgrades ffi and disables the tilelang backend in that image.
+    # NOTE: flash-attn-4 declares apache-tvm-ffi>=0.1.12,<0.2, but it never imports
+    # tvm-ffi -- flash_attn.cute imports only cutlass, torch and quack. The ffi that is
+    # actually loaded comes via quack-kernels, which accepts >=0.1.6,<0.2. So FA4 and
+    # tilelang are NOT mutually exclusive: this cap holds and both work in one image.
+    # Do not "resolve" FA4's declared bound by upgrading past 0.1.11 -- that
+    # double-registers TVM FFI TypeAttrs and SIGABRTs the tilelang kernels.
     "apache-tvm-ffi<=0.1.11",
 ]
 cuda_source = [
@@ -136,7 +139,10 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-ffpa = ["ffpa-attn>=0.2.2", "nvidia-cutlass-dsl==4.6.0"]
+# ffpa-attn 0.2.3 is the first release that pins nvidia-cutlass-dsl==4.6.2 and
+# quack-kernels==0.6.4, i.e. the same cutlass-dsl flash_attn.cute (FA4) needs. 0.2.2 hard-pinned
+# 4.6.0/0.6.1 and was unsatisfiable alongside FA4, so do not relax this floor.
+ffpa = ["ffpa-attn>=0.2.3", "nvidia-cutlass-dsl==4.6.2"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]
