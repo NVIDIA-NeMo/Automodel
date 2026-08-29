@@ -78,10 +78,16 @@ class _DriftingHybridEPBuffer:
         self.full_dispatches = 0
         self.cached_dispatches = 0
         self.input_shape = None
+        self.replayed_num_permuted_tokens = None
 
     def dispatch_with_permute(self, *, hidden, routing_map=None, probs=None, handle=None, **kwargs):
         if handle is not None:
             self.cached_dispatches += 1
+            self.replayed_num_permuted_tokens = kwargs["num_permuted_tokens"]
+            # Model the scalar conversion performed by HybridEP when its
+            # sync-free token extent is accidentally passed as a tensor.
+            if isinstance(self.replayed_num_permuted_tokens, torch.Tensor):
+                int(self.replayed_num_permuted_tokens.item())
             dispatched_hidden = torch.cat((hidden, hidden[:1]), dim=0)
             dispatched_probs = torch.cat((probs[:, :1], probs[:1, :1]), dim=0)
             return dispatched_hidden, dispatched_probs, None, None, None
@@ -153,19 +159,25 @@ def test_hybridep_checkpoint_reuses_forward_layout_on_recompute():
     assert buffer.cached_dispatches == 1
 
 
-def test_hybridep_checkpoint_replay_does_not_add_sum_to_selective_recompute():
+def test_hybridep_checkpoint_replay_preserves_selective_op_trace():
     from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
 
     buffer = _DriftingHybridEPBuffer()
     fused_a2a._hybrid_ep_buffer = buffer
     aten_sum = torch.ops.aten.sum.default
+    aten_local_scalar_dense = torch.ops.aten._local_scalar_dense.default
 
-    def save_sums_policy(ctx, func, *args, **kwargs):
-        return CheckpointPolicy.MUST_SAVE if func == aten_sum else CheckpointPolicy.PREFER_RECOMPUTE
+    def save_replay_sensitive_ops(ctx, func, *args, **kwargs):
+        replay_sensitive_ops = (aten_sum, aten_local_scalar_dense)
+        return CheckpointPolicy.MUST_SAVE if func in replay_sensitive_ops else CheckpointPolicy.PREFER_RECOMPUTE
 
-    context_fn = _replay_hybridep_dispatch_on_recompute(lambda: create_selective_checkpoint_contexts(save_sums_policy))
+    context_fn = _replay_hybridep_dispatch_on_recompute(
+        lambda: create_selective_checkpoint_contexts(save_replay_sensitive_ops)
+    )
 
     _run_checkpointed_hybridep(context_fn)
 
     assert buffer.full_dispatches == 1
     assert buffer.cached_dispatches == 1
+    assert buffer.replayed_num_permuted_tokens == 5
+    assert isinstance(buffer.replayed_num_permuted_tokens, int)
