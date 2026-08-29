@@ -164,4 +164,25 @@ wandb:
 ci:
   recipe_owner: athitten
   nodes: 8
-  time: "00:20:00"
+  # The robustness matrix (train/save, reload, resume) measured 1028s of
+  # phase time on the first scoped run (job 412098422, ~32 min including
+  # CI-side setup outside the Slurm window); 45 min covers it with headroom.
+  time: "00:45:00"
+  checkpoint_robustness:
+    # PP=4 with pp_microbatch_size=1 needs at least four pipeline microbatches;
+    # dp = 64/4 = 16, so global = 4 * 16 with one grad-accum step.
+    step_scheduler.local_batch_size: 4
+    step_scheduler.global_batch_size: 64
+    tokenizer_name: MiniMaxAI/MiniMax-M3
+    # The 427B (854 GiB bf16) vanilla reference does not fit rank 0's eight
+    # GPUs (uncapped device_map OOMs on the fused-expert concat; capped, it
+    # CPU-offloads ~400 GiB and idles all 64 GPUs for hours per run). Skip
+    # both vanilla-HF phases entirely: MiniMax-M2.7 carries the family's
+    # blocking cross-framework parity gates with the same measured knife-edge
+    # router lattice (AMINT-286), while this recipe keeps the AutoModel-side
+    # gates blocking (train/save, bitwise reload, resume) for the VL wrapper
+    # and mixed dense/sparse decoder.
+    skip_source_load_parity: true
+    skip_hf_reload: true
+    # Routed hybrid-MoE resume precedent (MiniMax M2.7, Nemotron chat).
+    resume_tolerance_profile: relaxed

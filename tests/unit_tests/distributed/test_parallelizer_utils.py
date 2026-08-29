@@ -29,12 +29,42 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _mp_policy_with_param_dtype,
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
+    get_internal_fsdp_mp_policy,
     iter_maximal_uniform_dtype_subtrees,
+    reject_unsupported_mtp_cp,
+    reject_unsupported_mtp_cp_pp,
 )
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_uniform_reduce_dtype,
     patch_fsdp_unused_param_reduction,
 )
+
+
+def test_reject_unsupported_mtp_cp_pp_allows_disabled_model():
+    model = nn.Linear(2, 2)
+    model.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp_pp=False)
+    reject_unsupported_mtp_cp_pp(model)
+
+
+def test_reject_unsupported_mtp_cp_rejects_enabled_unsupported_model():
+    model = nn.Module()
+    model.mtp_config = SimpleNamespace(enabled=True)
+    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=False)
+
+    with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
+        reject_unsupported_mtp_cp(model)
+
+
+def test_reject_unsupported_mtp_cp_allows_supported_or_disabled_model():
+    model = nn.Module()
+    model.mtp_config = SimpleNamespace(enabled=True)
+    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+    reject_unsupported_mtp_cp(model)
+
+    model.mtp_config.enabled = False
+    model.supports.mtp_enabled = False
+    model.supports.supports_mtp_cp = False
+    reject_unsupported_mtp_cp(model)
 
 
 def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
@@ -445,6 +475,20 @@ def test_mp_policy_with_bf16_param_dtype_preserves_policy():
     assert copied_policy.cast_forward_inputs is True
 
 
+def test_internal_fsdp_mp_policy_drops_only_output_dtype():
+    mp_policy = _make_mp_policy()
+
+    internal_policy = get_internal_fsdp_mp_policy(mp_policy)
+
+    assert internal_policy is not mp_policy
+    assert internal_policy.param_dtype == mp_policy.param_dtype
+    assert internal_policy.reduce_dtype == mp_policy.reduce_dtype
+    assert internal_policy.output_dtype is None
+    assert internal_policy.cast_forward_inputs == mp_policy.cast_forward_inputs
+    assert mp_policy.output_dtype == torch.float32
+    assert get_internal_fsdp_mp_policy(None) is None
+
+
 def test_fully_shard_by_dtype_no_params(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
@@ -763,6 +807,41 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
     assert sub_calls[0][1].param_dtype == torch.float32
 
 
+def test_fully_shard_by_dtype_internal_child_preserves_natural_output_dtype(monkeypatch):
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+    sub_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+        fully_calls.append((mod, mp_policy))
+
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+        sub_calls.append((mod, mp_policy))
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+    )
+
+    # The minority FP32-compute module becomes an internal child unit while the
+    # BF16 majority remains owned by the enclosing FSDP boundary.
+    model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.bfloat16, b_dtype_l2=torch.bfloat16)
+    _tag_hf_compute_dtype(model)
+    mp_policy = _make_mp_policy()
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=mp_policy, offload_policy=object())
+
+    assert [mod for mod, _ in sub_calls] == [model.a]
+    assert sub_calls[0][1].param_dtype == torch.float32
+    assert sub_calls[0][1].reduce_dtype == torch.float32
+    assert sub_calls[0][1].output_dtype is None
+    assert sub_calls[0][1].cast_forward_inputs is False
+    assert [mod for mod, _ in fully_calls] == [model]
+    assert fully_calls[0][1].param_dtype == torch.bfloat16
+    assert fully_calls[0][1].output_dtype == torch.float32
+    assert mp_policy.output_dtype == torch.float32
+
+
 def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
     """Ignored EP experts do not affect grouping and remain excluded from the block unit."""
 
@@ -806,8 +885,8 @@ def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
     assert all(module is not block.experts for module, _ in calls)
 
 
-def test_fully_shard_by_dtype_fp32_holder_uses_full_fp32_policy():
-    """Callable fp32 holders keep fp32 parameters, reductions, and outputs under FSDP."""
+def test_fully_shard_by_dtype_fp32_holder_preserves_natural_output_dtype():
+    """Internal fp32 holders keep fp32 compute without forcing their output dtype."""
 
     class Fp32Holder(nn.Module):
         def __init__(self):
@@ -844,7 +923,7 @@ def test_fully_shard_by_dtype_fp32_holder_uses_full_fp32_policy():
     holder_policy = next(kwargs["mp_policy"] for module, kwargs in calls if module is block._fp32_params)
     assert holder_policy.param_dtype == torch.float32
     assert holder_policy.reduce_dtype == torch.float32
-    assert holder_policy.output_dtype == torch.float32
+    assert holder_policy.output_dtype is None
     assert holder_policy.cast_forward_inputs is False
 
 

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -64,7 +64,7 @@ class Mistral4MLA(MLA):
     """
 
     def __init__(self, config, backend: BackendConfig):
-        super().__init__(config, backend)
+        super().__init__(config, backend, latent_norm_eps=1e-6)
         # DeepSeek V3 folds YaRN's mscale into the attention softmax scale. Mistral 4
         # instead keeps the standard qk head-dimension scale and applies its separate
         # Llama 4 position-dependent multiplier directly to the query.
@@ -422,7 +422,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (

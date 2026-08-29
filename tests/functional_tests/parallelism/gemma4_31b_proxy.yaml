@@ -1,0 +1,127 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Proxy for Gemma4 31B, shaped like
+# `examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp2.yaml` but small enough for the
+# 2-GPU PR runners. Used by the L2_Parallelism tests to exercise the TP and PP
+# code paths of the real 31B recipe.
+#
+# `model.pretrained_model_name_or_path` and `processor.pretrained_model_name_or_path`
+# are overridden per-test to a checkpoint built at test time by
+# `make_gemma4_proxy_checkpoint.py`, which also holds the shrunk config and
+# documents which fields are deliberately not scaled down. Nothing needs staging
+# in TEST_DATA_DIR beyond the Gemma4 processor that script copies.
+#
+# This uses `from_pretrained` rather than `from_config` both to match the real
+# recipe and because `from_config` currently yields an all-zero Gemma4 -- see the
+# generator script's module docstring.
+
+recipe: FinetuneRecipeForVLM
+
+# `local_batch_size` matches the real 31B recipe and must stay >= pp_size, since
+# the pipeline splits it into `pp_microbatch_size` chunks and needs at least one
+# microbatch per stage.
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  max_steps: 6
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /dev/null  # overridden per-test
+  torch_dtype: torch.bfloat16
+  attn_implementation: eager
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  text_config:
+    use_cache: false
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: /dev/null  # overridden per-test
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: vlm_checkpoints/gemma4_31b_proxy/
+  model_save_format: torch_save
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+
+  # Matches the real 31B recipes: SP-sharded activations crossing PP boundaries
+  # fail c10d::send.
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    scale_grads_in_schedule: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  # No `max_length`, matching the real 31B recipes. Passing one used to corrupt
+  # image batches; fixed in PR #3531.
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false

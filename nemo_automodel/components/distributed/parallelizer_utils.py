@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from copy import copy
-from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -33,6 +33,26 @@ from nemo_automodel.shared.torch_patches import (
 )
 
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
+
+
+def reject_unsupported_mtp_cp(model: nn.Module) -> None:
+    """Reject enabled MTP when the model has not declared CP support."""
+    if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
+        raise RuntimeError(f"{type(model).__name__} does not support MTP with context parallelism")
+
+
+def reject_unsupported_mtp_cp_pp(model: nn.Module) -> None:
+    """Reject MTP+CP on every trimmed pipeline stage before CP collectives."""
+    is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
+    if (
+        model.supports.mtp_enabled
+        and not model.supports.supports_mtp_cp_pp
+        and callable(is_pp_stage_fn)
+        and is_pp_stage_fn()
+    ):
+        raise NotImplementedError(
+            "MTP with context and pipeline parallelism is not supported; use PP size 1 or CP size 1"
+        )
 
 
 def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
@@ -72,8 +92,8 @@ def iter_maximal_uniform_dtype_subtrees(
     module: nn.Module,
     *,
     include_buffers: bool = True,
-    tensor_pred: Optional[Callable[[torch.Tensor], bool]] = None,
-    dtype_of: Optional[Callable[[torch.Tensor], torch.dtype]] = None,
+    tensor_pred: Callable[[torch.Tensor], bool] | None = None,
+    dtype_of: Callable[[torch.Tensor], torch.dtype] | None = None,
     return_paths: bool = False,
 ) -> Iterator[UniformSubtreeItem]:
     """
@@ -139,7 +159,7 @@ def iter_maximal_uniform_dtype_subtrees(
 
 def _group_params_by_dtype(
     layer: nn.Module,
-    dtype_of: Optional[Callable[[torch.Tensor], torch.dtype]] = None,
+    dtype_of: Callable[[torch.Tensor], torch.dtype] | None = None,
     ignored_params: set[nn.Parameter] | None = None,
 ) -> Dict[torch.dtype, List[nn.Parameter]]:
     if dtype_of is None:
@@ -165,8 +185,8 @@ def _get_module_from_path(layer: nn.Module, path: str) -> nn.Module:
 def _fully_shard(
     module: nn.Module,
     mesh: DeviceMesh,
-    mp_policy: Optional[MixedPrecisionPolicy],
-    offload_policy: Optional[OffloadPolicy],
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None,
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
     fully_shard_fn: Callable[..., None] | None = None,
@@ -197,8 +217,8 @@ def _fully_shard(
 def _call_fully_shard(
     module: nn.Module,
     mesh: DeviceMesh,
-    mp_policy: Optional[MixedPrecisionPolicy],
-    offload_policy: Optional[OffloadPolicy],
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None,
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
     fully_shard_fn: Callable[..., None] | None = None,
@@ -224,9 +244,9 @@ def _call_fully_shard(
 
 
 def _mp_policy_with_param_dtype(
-    mp_policy: Optional[MixedPrecisionPolicy],
+    mp_policy: MixedPrecisionPolicy | None,
     param_dtype: torch.dtype,
-) -> Optional[MixedPrecisionPolicy]:
+) -> MixedPrecisionPolicy | None:
     if mp_policy is None:
         return None
     mp_policy_copy = copy(mp_policy)
@@ -241,9 +261,33 @@ def _mp_policy_with_param_dtype(
     return mp_policy_copy
 
 
+def get_internal_fsdp_mp_policy(
+    mp_policy: MixedPrecisionPolicy | None,
+) -> MixedPrecisionPolicy | None:
+    """Clone an FSDP policy without imposing an external output dtype.
+
+    Internal FSDP units are implementation details inside a parent module's
+    forward. Their outputs may feed an unwrapped sibling before another FSDP
+    input cast, so they preserve the wrapped module's natural output dtype.
+
+    Args:
+        mp_policy: Mixed-precision policy inherited from the enclosing FSDP
+            boundary, or ``None`` when mixed precision is disabled.
+
+    Returns:
+        A cloned policy with ``output_dtype=None``, or ``None`` when no policy
+        was provided. Parameter, reduction, and input-cast settings are unchanged.
+    """
+    if mp_policy is None:
+        return None
+    mp_policy_copy = copy(mp_policy)
+    object.__setattr__(mp_policy_copy, "output_dtype", None)
+    return mp_policy_copy
+
+
 def _make_compute_dtype_fn(
     module: nn.Module,
-    mp_policy: Optional[MixedPrecisionPolicy],
+    mp_policy: MixedPrecisionPolicy | None,
     fp32_compute_module_names: Tuple[str, ...],
     ignored_params: set[nn.Parameter] | None = None,
 ) -> Callable[[torch.Tensor], torch.dtype]:
@@ -300,8 +344,8 @@ def _make_compute_dtype_fn(
 def fully_shard_by_dtype(
     module: nn.Module,
     mesh: DeviceMesh,
-    mp_policy: Optional[MixedPrecisionPolicy],
-    offload_policy: Optional[OffloadPolicy],
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None,
     fp32_compute_module_names: Tuple[str, ...] = (),
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
@@ -325,6 +369,10 @@ def fully_shard_by_dtype(
       * 2 compute dtypes -> shard the minority-dtype subtrees on their own, then shard
         the parent with the majority dtype (keeps the bulk as one FSDP unit).
       * 3+ compute dtypes -> shard every maximal compute-dtype-uniform subtree on its own.
+
+    Dtype-specific child units are internal to the enclosing module's forward, so they
+    preserve their module's natural output dtype. Any enclosing FSDP boundary created
+    by this function retains the caller's ``output_dtype`` as its external contract.
 
     Args:
         fp32_compute_module_names: Parameter/buffer name substrings that must compute in
@@ -423,7 +471,7 @@ def fully_shard_by_dtype(
         for path, key, _ in selected_subtrees:
             subtree_kwargs = {
                 "mesh": mesh,
-                "mp_policy": _mp_policy_with_param_dtype(mp_policy, key[1]),
+                "mp_policy": get_internal_fsdp_mp_policy(_mp_policy_with_param_dtype(mp_policy, key[1])),
                 "offload_policy": offload_policy,
                 "reshard_after_forward": reshard_after_forward,
             }

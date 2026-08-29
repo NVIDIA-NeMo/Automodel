@@ -14,7 +14,7 @@
 
 import logging
 from functools import partial
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -320,7 +320,7 @@ def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
             sd[k[: -len(".lora_magnitude_vector")] + ".lora_magnitude"] = sd.pop(k)
 
 
-def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
+def _get_lm_head_weight_and_name(model: torch.nn.Module) -> tuple[torch.Tensor, str] | None:
     return get_lm_head_weight_and_name(model)
 
 
@@ -576,7 +576,7 @@ class OptimizerState:
         self,
         model: torch.nn.Module | list[torch.nn.Module],
         optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
-        scheduler: Optional[Any] = None,
+        scheduler: Any | None = None,
         is_peft: bool = False,
         cpu_offload: bool = False,
         *,
@@ -642,9 +642,13 @@ class OptimizerState:
         # quantized frozen params (Params4bit/Int8Params) alongside trainable LoRA
         # params, or when expert weights are sharded across EP ranks (MoE+EP) and
         # the optimizer only tracks trainable params. Use native state_dict instead.
+        # Adam creates state lazily only after a parameter receives a gradient. Discrete routing/indexing parameters
+        # can remain trainable yet unused for a step, so normalize missing state before both native and flattened DCP
+        # serialization. This makes the save and subsequent load skeletons agree without changing a future first
+        # update: the materialized step and moment tensors are all zero.
+        for optimizer in self.optimizer:
+            _materialize_missing_adam_state(optimizer)
         if self._use_native_optimizer_state:
-            for optimizer in self.optimizer:
-                _materialize_missing_adam_state(optimizer)
             if self.optimizer_part_ids is None:
                 if len(self.optimizer) != 1:
                     raise ValueError(

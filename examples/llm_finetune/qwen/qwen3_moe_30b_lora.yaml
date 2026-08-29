@@ -102,25 +102,14 @@ optimizer:
 
 ci:
   recipe_owner: adil-a
+  # Allow the complete source, reload, and resume matrix to finish.
   time: "00:30:00"
   nodes: 1
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   checkpoint_robustness:
-    check_source_load_parity: true
-    # HF+PEFT reload remains gated by exact adapter fingerprints and a successful
-    # forward; its live-LoRA logits are not a stable cross-runtime reference (AMINT-216).
-    skip_hf_logit_parity: true
-    # Derive isolated source, train/save, and reload phases from the standard
-    # check/skip options below; no resume phases are selected.
-    process_isolation: true
-    # Exact-image BF16 source parity measured max/mean KL 0.0161/0.00407 and cosine 0.99764.
-    source_load_kl_threshold: 3e-2
-    source_load_mean_kl_threshold: 6e-3
-    source_load_cosine_threshold: 0.997
     tokenizer_name: Qwen/Qwen3-30B-A3B
     trust_remote_code: true
     hf_device_map_auto: true
-    no_check_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500

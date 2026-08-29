@@ -13,7 +13,6 @@
 # limitations under the License.
 import warnings
 from functools import partial
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -147,8 +146,8 @@ class FakeBalancedGate(nn.Module):
         self,
         x: torch.Tensor,
         token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        cp_mesh: DeviceMesh | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the gating mechanism.
 
@@ -218,7 +217,7 @@ class _GateRoutingCore(nn.Module):
     independent, parameterless CUDA graph boundary and survives model copies.
     """
 
-    def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Select experts and compute routing probabilities from projected scores."""
         return gate._route_scores(scores)
 
@@ -267,16 +266,24 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
+        # Score arithmetic always has a concrete dtype: an explicit
+        # gate_precision wins, otherwise fp32 (the shared default of both
+        # score branches). gate_precision itself stays tri-state because
+        # None means "project in the input's runtime dtype", which several
+        # reference routers require (AM-821: Qwen3-MoE, GPT-OSS, DSV4,
+        # Laguna project in bf16 while scoring in fp32).
+        self.score_dtype = gate_precision if gate_precision is not None else torch.float32
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
 
+        gate_dtype = config.gate_dtype or config.dtype
         self.weight = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype), requires_grad=self.train_gate
+            torch.empty(config.n_routed_experts, config.dim, dtype=gate_dtype), requires_grad=self.train_gate
         )
         if config.router_bias:
             self.bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=config.dtype), requires_grad=self.train_gate
+                torch.empty(config.n_routed_experts, dtype=gate_dtype), requires_grad=self.train_gate
             )
         else:
             self.bias = None
@@ -296,16 +303,16 @@ class Gate(nn.Module):
         # Cumulative expert load is a tensor representing the number of tokens
         # routed to each expert on the current rank, accumulated across gradient
         # accumulation steps.
-        self._cumulative_expert_load: Optional[torch.Tensor] = None
+        self._cumulative_expert_load: torch.Tensor | None = None
 
         # Load balance tracking (enabled externally via enable_load_balance_tracking)
         self._track_load_balance: bool = False
-        self._last_expert_load: Optional[torch.Tensor] = None
-        self._last_aux_loss: Optional[torch.Tensor] = None
+        self._last_expert_load: torch.Tensor | None = None
+        self._last_aux_loss: torch.Tensor | None = None
 
         # Rollout Routing Replay (R3): owns a handle only when enabled so the
         # default routing path stays a no-op.
-        self.router_replay: Optional[RouterReplay] = (
+        self.router_replay: RouterReplay | None = (
             RouterReplay() if getattr(config, "enable_routing_replay", False) else None
         )
         self.routing_core = _GateRoutingCore()
@@ -390,7 +397,7 @@ class Gate(nn.Module):
             return self.e_score_correction_bias.to_local()
         return self.e_score_correction_bias
 
-    def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Apply fixed-shape expert selection and probability math to router logits.
 
         Args:
@@ -406,7 +413,7 @@ class Gate(nn.Module):
 
         if self.score_func == "softmax":
             if self.softmax_before_topk:
-                scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+                scores = scores.softmax(dim=-1, dtype=self.score_dtype)
                 original_scores = scores
                 indices = torch.topk(scores, k=self.topk, dim=-1)[1]
                 indices = replay_selection(self.router_replay, indices)
@@ -419,14 +426,14 @@ class Gate(nn.Module):
                     # replayed experts. Skipped (zero overhead) on the default path.
                     values = scores.gather(1, replayed)
                     indices = replayed
-                weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
+                weights = values.softmax(dim=1, dtype=self.score_dtype)
                 # Use full softmax for aux_loss so P_i represents proper probabilities.
                 # Raw logits can be negative, causing aux_loss to diverge negative.
-                original_scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+                original_scores = scores.softmax(dim=-1, dtype=self.score_dtype)
         elif self.score_func == "softmax_with_bias":
             # softmax first, then add bias for expert selection,
             # group routing on biased scores, final weights from unbiased softmax scores.
-            scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+            scores = scores.softmax(dim=-1, dtype=self.score_dtype)
             original_scores = scores
 
             # Add correction bias for expert SELECTION only
@@ -459,7 +466,11 @@ class Gate(nn.Module):
             indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sigmoid_with_bias":
-            scores = scores.sigmoid()
+            # Score in fp32 like the softmax path: HF sigmoid-router references
+            # compute sigmoid(logits.float()), and bf16 sigmoid quantizes scores
+            # at ~2e-3 — enough to flip knife-edge e_score_correction_bias
+            # selections (AMINT-286).
+            scores = torch.sigmoid(scores.to(dtype=self.score_dtype))
             original_scores = scores
             scores_for_choice = scores
 
@@ -480,7 +491,8 @@ class Gate(nn.Module):
             indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         else:
-            scores = scores.sigmoid()
+            # Score in fp32 like the softmax path (see sigmoid_with_bias above).
+            scores = torch.sigmoid(scores.to(dtype=self.score_dtype))
             original_scores = scores
 
             # Add correction bias to balance tokens across gates.
@@ -517,8 +529,8 @@ class Gate(nn.Module):
         self,
         x: torch.Tensor,
         token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        cp_mesh: DeviceMesh | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the gating mechanism.
 
@@ -673,7 +685,7 @@ class Gate(nn.Module):
         original_scores: torch.Tensor,
         expert_load: torch.Tensor,
         token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
+        cp_mesh: DeviceMesh | None,
     ) -> torch.Tensor:
         """
         Computes the auxiliary loss for load balancing.
@@ -833,13 +845,13 @@ class MoE(nn.Module):
             self.fc2_latent_proj = None
 
         # Set during model parallelization (see parallelizer.apply_cp)
-        self.cp_mesh: Optional[DeviceMesh] = None
+        self.cp_mesh: DeviceMesh | None = None
 
     def forward(
         self,
         x: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        cp_mesh: Optional[DeviceMesh] = None,
+        padding_mask: torch.Tensor | None = None,
+        cp_mesh: DeviceMesh | None = None,
     ) -> torch.Tensor:
         """Route tokens through shared and routed experts.
 

@@ -54,7 +54,7 @@ All layers share the same sliding-window causal mask on the local KV path.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -1263,7 +1263,7 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
-        position_embeddings_compress: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings_compress: tuple[torch.Tensor, torch.Tensor] | None = None,
         rotary_compress: nn.Module | None = None,
         start_pos: int = 0,
         position_ids: torch.Tensor | None = None,

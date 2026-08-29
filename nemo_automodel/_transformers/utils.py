@@ -16,7 +16,7 @@ import inspect
 import logging
 from collections import deque
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -25,7 +25,7 @@ from transformers import AutoConfig
 logger = logging.getLogger(__name__)
 
 
-def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
+def resolve_get_rope_index(model: nn.Module) -> Callable | None:
     """Locate a model's mRoPE position-id builder.
 
     Transformers does not keep ``get_rope_index`` at a fixed depth, and a plain
@@ -93,13 +93,13 @@ def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
 
 def _should_load_before_shard(
     *,
-    autopipeline: Optional[object],
+    autopipeline: object | None,
     tp_size: int,
     ep_size: int,
     dp_shard_size: int = 1,
     pretrained_model_name_or_path: str,
     load_base_model: bool,
-    peft_config: Optional[object],
+    peft_config: object | None,
 ) -> bool:
     """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
 
@@ -261,9 +261,22 @@ def apply_cache_compatibility_patches():
 
         DynamicCache.to_legacy_cache = _to_legacy_cache
 
+    # OutputRecorder moved from transformers.utils.generic to
+    # transformers.utils.output_capturing in transformers v5.x. Pre-v5
+    # remote-code models (e.g. Kimi-Linear and MiniMax-M2 checkpoints) import
+    # it from the old location for their auxiliary router-logit recorders and
+    # otherwise fail at module import. Alias the relocated class back; v5.x
+    # re-exports it from transformers.modeling_utils.
+    import transformers.modeling_utils as mu
+    import transformers.utils.generic as generic_utils
+
+    if not hasattr(generic_utils, "OutputRecorder"):
+        _output_recorder = getattr(mu, "OutputRecorder", None)
+        if _output_recorder is not None:
+            generic_utils.OutputRecorder = _output_recorder
+
     # _tied_weights_keys changed from list to dict in transformers v5.x.
     # Patch post_init to auto-convert list -> dict for remote-code models.
-    import transformers.modeling_utils as mu
 
     if not getattr(mu.PreTrainedModel.post_init, "_nemo_tied_keys_patched", False):
         _orig_post_init = mu.PreTrainedModel.post_init

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -51,7 +51,7 @@ class Block(nn.Module):
         backend: BackendConfig,
     ):
         super().__init__()
-        self.self_attn = MLA(config, backend)
+        self.self_attn = MLA(config, backend, latent_norm_eps=1e-6)
         self.is_moe_layer = layer_idx >= config.first_k_dense_replace
 
         # Thread dtype from config.torch_dtype so the block's own params stay
@@ -347,7 +347,7 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass returning :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.

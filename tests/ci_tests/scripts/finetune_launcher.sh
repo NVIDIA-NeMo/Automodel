@@ -147,7 +147,7 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     # recipes also retain enough CUDA, PP, scheduler, and dataloader ownership
     # that rebuilding several trainers in one interpreter is not reliable.
     read -r -a ROBUSTNESS_PHASES <<< \
-      "${CHECKPOINT_ROBUSTNESS_PHASES:-train_and_save automodel_reload resume}"
+      "${CHECKPOINT_ROBUSTNESS_PHASES:-source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume}"
     # Preserve the old harness's deferred-comparison behavior: record a failed
     # parity phase, continue independent phases, and return the first failure
     # only after every reachable phase has reported a result.

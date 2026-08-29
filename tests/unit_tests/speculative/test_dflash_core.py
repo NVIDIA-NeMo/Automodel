@@ -35,7 +35,14 @@ BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 
 
-def _build_trainer(num_anchors=8, loss_decay_gamma=None, loss_type="dflash", dpace_alpha=0.5, attention_backend="sdpa"):
+def _build_trainer(
+    num_anchors=8,
+    loss_decay_gamma=None,
+    loss_type="dflash",
+    dpace_alpha=0.5,
+    attention_backend="sdpa",
+    sliding_window=None,
+):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -67,6 +74,7 @@ def _build_trainer(num_anchors=8, loss_decay_gamma=None, loss_type="dflash", dpa
         loss_decay_gamma=loss_decay_gamma,
         loss_type=loss_type,
         dpace_alpha=dpace_alpha,
+        sliding_window=sliding_window,
     )
 
 
@@ -365,3 +373,35 @@ def test_no_valid_anchors_error_mentions_the_document_bound_when_packing():
     doc_remaining = torch.zeros(2, seq_len, dtype=torch.long)
     with pytest.raises(NoValidAnchorsError, match="document"):
         trainer._sample_anchor_positions(seq_len, loss_mask, torch.device("cpu"), doc_remaining=doc_remaining)
+
+
+def test_sliding_window_narrows_the_context_without_breaking_training():
+    """A windowed draft must still train, and must not be a silent no-op.
+
+    The window bounds how far back a block reads the target context (what the
+    published DFlash 2 drafters do, and what keeps the flex BlockMask sparse on
+    long sequences), so the loss has to move while gradients stay finite.
+    """
+    full = _build_trainer(loss_decay_gamma=7.0)
+    windowed = _build_trainer(loss_decay_gamma=7.0, sliding_window=4)
+    windowed.draft_model.load_state_dict(full.draft_model.state_dict())
+    assert windowed.sliding_window == 4
+
+    input_ids, hidden, loss_mask = _inputs()
+    torch.manual_seed(7)
+    out_full = full(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    torch.manual_seed(7)
+    out_win = windowed(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+
+    assert torch.isfinite(out_win.loss)
+    assert not torch.allclose(out_win.loss, out_full.loss), "the window must change what the draft sees"
+
+    out_win.loss.backward()
+    for name, param in windowed.draft_model.named_parameters():
+        assert param.grad is None or torch.isfinite(param.grad).all(), name
+
+
+def test_sliding_window_defaults_to_off_and_rejects_non_positive():
+    assert _build_trainer().sliding_window is None
+    with pytest.raises(ValueError, match="sliding_window"):
+        _build_trainer(sliding_window=0)

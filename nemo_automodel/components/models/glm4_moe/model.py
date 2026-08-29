@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from typing import Any, Optional, Union
+from dataclasses import dataclass, replace
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -149,6 +149,7 @@ class Glm4MoeModel(nn.Module):
             expert_activation="swiglu",
             apply_router_weight_after_down=True,
             softmax_before_topk=False,  # GLM4 uses sigmoid, not softmax
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -279,7 +280,11 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
-        self.backend = backend or BackendConfig()
+        resolved_backend = backend or BackendConfig()
+        # HF computes the GLM router projection and selected mixture weights in fp32.
+        if resolved_backend.gate_precision is None:
+            resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
+        self.backend = resolved_backend
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Glm4MoeModel(
             config,
@@ -316,7 +321,7 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (

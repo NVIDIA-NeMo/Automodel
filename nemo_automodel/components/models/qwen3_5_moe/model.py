@@ -18,7 +18,7 @@ import copy
 import inspect
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -75,12 +75,22 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
+from nemo_automodel.components.models.common.mtp import (
+    MTPConfig,
+    MTPContextParallelInputs,
+    MTPModule,
+    prepare_mtp_context_parallel_inputs,
+    roll_tensor,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.qwen3_5.packing import (
+    GatedDeltaPackedMetadata,
+    prepare_gated_delta_packed_metadata,
+)
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -160,16 +170,26 @@ class Qwen3_5MoeBlock(Block):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        packed_gdn_metadata: GatedDeltaPackedMetadata | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        """Mirror :meth:`Block.forward` but thread NEAT-packing kwargs into
-        ``CPAwareGatedDeltaNet``.
+        """Run one Qwen3.5-MoE decoder block.
 
-        The parent ``Block.forward`` calls ``linear_attn`` with only
-        ``hidden_states`` and ``attention_mask``; for packed sequences the
-        gated_delta_rule kernel additionally needs ``cu_seqlens`` /
-        ``indices`` to reset state at document boundaries (issue #2131).
-        Derived once per forward from the indexed attention mask.
+        Args:
+            x: Hidden states of shape [batch, sequence, hidden].
+            freqs_cis: Rotary frequencies of shape [axes, batch, sequence,
+                head_dim].
+            attention_mask: Optional validity, indexed document, or backend mask
+                of shape [batch, sequence] or [batch, 1, sequence, sequence].
+            padding_mask: Optional padding mask of shape [batch, sequence].
+            position_ids: Optional positions of shape [batch, sequence] or
+                [axes, batch, sequence].
+            packed_gdn_metadata: Optional model-forward-owned packing metadata;
+                tensor layouts are documented by :class:`GatedDeltaPackedMetadata`.
+            **attn_kwargs: Backend-specific attention arguments.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden].
         """
         if self.layer_type != "linear_attention":
             attn_kwargs = dict(attn_kwargs)
@@ -183,26 +203,20 @@ class Qwen3_5MoeBlock(Block):
                 **attn_kwargs,
             )
 
-        # Local imports to avoid pulling packing utilities into the module
-        # import graph for non-Qwen3.5 callers.
-        from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
-
-        cu_seqlens: torch.Tensor | None = None
-        indices: torch.Tensor | None = None
         linear_attn_mask = attention_mask
-        packed_seq_ids = attn_kwargs.get("_packed_seq_ids")
-        if is_indexed_packed_mask(attention_mask):
-            packing_mask = attention_mask
-        elif is_indexed_packed_mask(packed_seq_ids):
-            packing_mask = packed_seq_ids
-        else:
-            packing_mask = None
+        from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
 
-        if packing_mask is not None:
-            indices_t, cu_seqlens_t, _ = get_unpad_data(packing_mask)
-            cu_seqlens = cu_seqlens_t.to(torch.long)
-            indices = indices_t
-            linear_attn_mask = packing_mask
+        if current_blockdiag_cp_state() is not None:
+            packed_gdn_metadata = None
+            linear_attn_mask = None
+        elif packed_gdn_metadata is None:
+            packed_gdn_metadata = prepare_gated_delta_packed_metadata(
+                attention_mask,
+                attn_kwargs.get("_packed_seq_ids"),
+            )
+
+        if packed_gdn_metadata is not None:
+            linear_attn_mask = packed_gdn_metadata.document_ids
 
         if linear_attn_mask is not None and padding_mask is None:
             padding_mask = linear_attn_mask.bool().logical_not()
@@ -213,8 +227,9 @@ class Qwen3_5MoeBlock(Block):
             attention_mask=linear_attn_mask,
             position_ids=position_ids,
             seq_index=attn_kwargs.get("seq_index"),
-            cu_seqlens=cu_seqlens,
-            indices=indices,
+            cu_seqlens=packed_gdn_metadata.cu_seqlens if packed_gdn_metadata is not None else None,
+            cu_seqlens_cpu=packed_gdn_metadata.cu_seqlens_cpu if packed_gdn_metadata is not None else None,
+            indices=packed_gdn_metadata.indices if packed_gdn_metadata is not None else None,
         )
         x = x + attn_out
 
@@ -336,6 +351,36 @@ def _rolled_embed_inputs(inputs_embeds: torch.Tensor, num_depths: int) -> tuple[
         cur = roll_tensor(cur, shifts=-1, dim=-2)
         embed_inputs.append(cur)
     return tuple(embed_inputs)
+
+
+def _mask_mtp_embed_inputs(
+    embed_inputs: tuple[torch.Tensor, ...],
+    valid_masks: tuple[torch.BoolTensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    """Zero invalid future-token embeddings in the local CP layout.
+
+    Args:
+        embed_inputs: Per-depth embeddings of shape ``[batch, sequence, hidden]``.
+        valid_masks: Per-depth masks of shape ``[batch, sequence]`` in the same
+            local CP token layout as ``embed_inputs``.
+
+    Returns:
+        Per-depth embeddings of shape ``[batch, sequence, hidden]`` with invalid
+        trailing or packed-boundary positions set to zero.
+    """
+    if len(embed_inputs) != len(valid_masks):
+        raise ValueError(
+            f"MTP embed depth count {len(embed_inputs)} does not match valid-mask count {len(valid_masks)}"
+        )
+    masked = []
+    for depth, (embed_input, valid_mask) in enumerate(zip(embed_inputs, valid_masks), start=1):
+        if valid_mask.shape != embed_input.shape[:-1]:
+            raise ValueError(
+                f"MTP depth {depth} valid-mask shape {tuple(valid_mask.shape)} "
+                f"does not match embedding token shape {tuple(embed_input.shape[:-1])}"
+            )
+        masked.append(embed_input.masked_fill(~valid_mask.bool().unsqueeze(-1), 0))
+    return tuple(masked)
 
 
 class Qwen3_5MoeMTPSublayer(Qwen3_5MoeBlock):
@@ -649,6 +694,28 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         use_cache: bool | None = None,
         **attn_kwargs: Any,
     ) -> Qwen3_5MoeModelOutputWithPast:
+        """Decode text tokens with model-forward-owned packed GDN metadata.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence].
+            inputs_embeds: Optional token embeddings of shape [batch, sequence,
+                hidden].
+            attention_mask: Optional validity, indexed document, or backend mask
+                of shape [batch, sequence] or [batch, 1, sequence, sequence].
+            position_ids: Optional positions of shape [batch, sequence] or
+                [axes, batch, sequence].
+            cache_position: Optional token positions of shape [sequence].
+            padding_mask: Optional padding mask of shape [batch, sequence].
+            past_key_values: Unsupported recurrent or KV cache.
+            use_cache: Whether to use a cache; only ``False`` or ``None`` is
+                supported.
+            **attn_kwargs: Backend-specific attention arguments, including optional
+                ``_packed_seq_ids`` of shape [batch, sequence].
+
+        Returns:
+            Model output whose ``last_hidden_state`` has shape [batch, sequence,
+            hidden].
+        """
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache is not supported for the Qwen3.5-MoE backend implementation.")
 
@@ -700,6 +767,12 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
+        packed_gdn_metadata = None
+        if not getattr(self, "_cp_enabled", False):
+            packed_gdn_metadata = prepare_gated_delta_packed_metadata(
+                attention_mask,
+                attn_kwargs.get("_packed_seq_ids"),
+            )
 
         # --- Decoder layers (Qwen3Next Block, unmodified) ---
         for decoder_layer in self.layers.values():
@@ -709,6 +782,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 position_ids=position_ids,
+                packed_gdn_metadata=packed_gdn_metadata,
                 **attn_kwargs,
             )
 
@@ -759,6 +833,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+        supports_mtp_cp: bool = True
 
     @classmethod
     def from_config(
@@ -859,6 +934,25 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
         self.lm_head = new_embeddings
 
+    def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
+        """Prepare text-model future-token streams before CP sharding.
+
+        Args:
+            batch: Full-sequence batch whose ``input_ids``, ``labels``, and
+                optional ``position_ids`` tensors have shape ``[batch, sequence]``.
+            ignore_index: Fill value for invalid targets at trailing and packed
+                document-boundary positions.
+
+        Returns:
+            Global per-depth token IDs, position IDs, targets, and validity masks.
+            Token tensors have shape ``[batch, sequence]``.
+        """
+        return prepare_mtp_context_parallel_inputs(
+            batch,
+            num_depths=self.mtp_config.num_layers,
+            ignore_index=ignore_index,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -867,6 +961,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         past_key_values: Any | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
+        mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
@@ -891,6 +987,10 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 ``[batch, sequence, hidden]``.
             labels: Optional labels of shape ``[batch, sequence]``. Accepted for
                 Hugging Face compatibility; loss is computed outside this model.
+            mtp_per_depth_input_ids: Optional globally shifted then CP-sharded
+                token IDs, one tensor of shape ``[batch, sequence]`` per depth.
+            mtp_per_depth_position_ids: Optional globally shifted then CP-sharded
+                positions, one tensor of shape ``[batch, sequence]`` per depth.
             use_cache: Whether to use a KV cache; ``True`` is unsupported.
             logits_to_keep: ``0`` to project every position, a positive integer
                 to keep the last positions, or indices of shape
@@ -945,7 +1045,22 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 device=source_embeds.device,
                 cache_position=cache_position,
             )
-            if input_ids is None:
+            if mtp_per_depth_input_ids is not None:
+                if mtp_per_depth_position_ids is None:
+                    raise ValueError("Qwen3.5-MoE MTP per-depth token IDs require per-depth position IDs")
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    input_ids_per_depth=mtp_per_depth_input_ids,
+                    embed_fn=self.model.embed_tokens,
+                    position_ids_per_depth=mtp_per_depth_position_ids,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                    rotary_emb=self.model.rotary_emb,
+                    **kwargs,
+                )
+            elif int(kwargs.get("cp_size", 1) or 1) > 1:
+                raise ValueError("Context-parallel Qwen3.5-MoE MTP requires precomputed per-depth inputs and positions")
+            elif input_ids is None:
                 mtp_per_depth_h = self.mtp(
                     hidden_states,
                     embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
@@ -1043,6 +1158,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         supports_pp: bool = True
         supports_ep: bool = True
         supports_thd: bool = False
+        supports_mtp_cp: bool = True
         supports_cp_vision_frame_sharding: bool = True
 
     @classmethod
@@ -1325,6 +1441,30 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             **promoted,
         }
 
+    def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
+        """Prepare Qwen VLM future-token streams before CP sharding.
+
+        Call this after :meth:`prepare_model_inputs_for_cp` has materialized
+        full-sequence mRoPE positions.
+
+        Args:
+            batch: Full-sequence batch whose ``input_ids`` and ``labels`` tensors
+                have shape ``[batch, sequence]`` and whose ``position_ids`` tensor
+                has shape ``[axes, batch, sequence]``.
+            ignore_index: Fill value for invalid targets at trailing and packed
+                document-boundary positions.
+
+        Returns:
+            Global per-depth token IDs, mRoPE position IDs, targets, and validity
+            masks. Token tensors have shape ``[batch, sequence]`` and position
+            tensors have shape ``[axes, batch, sequence]``.
+        """
+        return prepare_mtp_context_parallel_inputs(
+            batch,
+            num_depths=self.mtp_config.num_layers,
+            ignore_index=ignore_index,
+        )
+
     def _embed_and_splice_for_cp(
         self,
         input_ids: torch.Tensor,
@@ -1439,8 +1579,11 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
+        mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_valid_masks: tuple[torch.BoolTensor, ...] | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
         """Run Qwen3.5-MoE VLM generation with model-owned CP embedding.
@@ -1457,6 +1600,14 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             inputs_embeds: Optional embeddings of shape
                 ``[batch, sequence, hidden]``.
             cache_position: Optional token positions of shape ``[sequence]``.
+            mtp_per_depth_input_ids: Optional globally shifted then CP-sharded
+                token IDs, one tensor of shape ``[batch, sequence]`` per depth.
+            mtp_per_depth_position_ids: Optional globally shifted then CP-sharded
+                mRoPE positions, one tensor of shape
+                ``[axes, batch, sequence]`` per depth.
+            mtp_per_depth_valid_masks: Optional CP-sharded masks, one tensor of
+                shape ``[batch, sequence]`` per depth, where ``True`` marks a
+                valid same-document future token.
             logits_to_keep: Number of trailing logits to retain, or indices of
                 shape ``[kept_sequence]``.
             output_hidden_states: Whether to expose final decoder states for the
@@ -1541,6 +1692,33 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # the packed contiguous shard or the ordinary round-robin chunk pair.
         # Auxiliary streams and mRoPE positions already use the matching layout.
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        mtp_embed_inputs = None
+        if (
+            cp_size <= 1
+            and self.mtp is not None
+            and self.training
+            and inputs_embeds is None
+            and input_ids is not None
+            and not torch.is_floating_point(input_ids)
+            and has_media_tokens
+            and (
+                (isinstance(pixel_values, torch.Tensor) and pixel_values.numel() > 0)
+                or (isinstance(pixel_values_videos, torch.Tensor) and pixel_values_videos.numel() > 0)
+            )
+        ):
+            # MTP predicts from the same fused text/vision embedding stream as
+            # the backbone. Re-embedding media placeholder IDs would silently
+            # discard the continuous image/video features on the CP1 reference.
+            inputs_embeds = self._embed_and_splice_for_cp(
+                input_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+            )
+            input_ids = None
+            for media_key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"):
+                kwargs.pop(media_key, None)
         if cp_size > 1 and inputs_embeds is None and input_ids is not None and not torch.is_floating_point(input_ids):
             is_first_stage = getattr(self.model.language_model, "embed_tokens", None) is not None
             is_last_stage = getattr(self, "lm_head", None) is not None
@@ -1559,7 +1737,30 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 )
                 from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
 
-                if current_blockdiag_cp_state() is not None:
+                uses_blockdiag_cp = current_blockdiag_cp_state() is not None
+                if self.mtp is not None and self.training:
+                    if (
+                        mtp_per_depth_input_ids is None
+                        or mtp_per_depth_position_ids is None
+                        or mtp_per_depth_valid_masks is None
+                    ):
+                        raise ValueError(
+                            "Context-parallel Qwen3.5-MoE MTP requires precomputed per-depth inputs, positions, and masks"
+                        )
+                    rolled_embed_inputs = _rolled_embed_inputs(inputs_embeds, self.mtp.num_depths)
+                    if uses_blockdiag_cp:
+                        mtp_embed_inputs = tuple(
+                            shard_sequence_for_cp_contiguous(self.cp_mesh, embed_input, seq_dim=1)[0]
+                            for embed_input in rolled_embed_inputs
+                        )
+                    else:
+                        mtp_embed_inputs = tuple(
+                            shard_sequence_for_cp_round_robin(self.cp_mesh, embed_input, seq_dim=1)[0]
+                            for embed_input in rolled_embed_inputs
+                        )
+                    mtp_embed_inputs = _mask_mtp_embed_inputs(mtp_embed_inputs, mtp_per_depth_valid_masks)
+
+                if uses_blockdiag_cp:
                     inputs_embeds, _, _ = shard_sequence_for_cp_contiguous(self.cp_mesh, inputs_embeds, seq_dim=1)
                 else:
                     inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
@@ -1608,7 +1809,19 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     "mm_token_type_ids",
                 }
             }
-            if input_ids is None:
+            if mtp_embed_inputs is not None:
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    embed_inputs=mtp_embed_inputs,
+                    position_ids_per_depth=mtp_per_depth_position_ids,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                    rotary_emb=language_model.rotary_emb,
+                    **mtp_kwargs,
+                )
+            elif cp_size > 1:
+                raise ValueError("Context-parallel Qwen3.5-MoE MTP requires globally prepared per-depth inputs")
+            elif input_ids is None:
                 mtp_per_depth_h = self.mtp(
                     hidden_states,
                     embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
