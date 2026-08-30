@@ -51,6 +51,10 @@ DEFAULT_LOSS_TOL = 0.05
 # Gradient norm is a sum over every parameter, so it carries more accumulated
 # rounding than a single loss value; compared as a relative delta.
 DEFAULT_GRAD_NORM_RTOL = 0.05
+# Smallest believable spread between the highest and lowest baseline loss across
+# steps. Real runs here span 0.05-0.10 nats batch to batch; a run that computed
+# nothing spans exactly 0.
+MIN_LOSS_SPREAD = 1e-4
 
 
 def read_metrics(jsonl_path: str, *, metric: str = "loss") -> dict[int, dict[str, float]]:
@@ -79,6 +83,50 @@ def read_metrics(jsonl_path: str, *, metric: str = "loss") -> dict[int, dict[str
                 sample["grad_norm"] = float(grad_norm)
             entries[int(record["step"])] = sample
     return entries
+
+
+def _assert_both_runs_trained(
+    baseline: dict[int, dict[str, float]],
+    parallel: dict[int, dict[str, float]],
+    common_steps: list[int],
+) -> None:
+    """Reject a comparison where neither run actually trained.
+
+    Everything above only checks that the two runs *agree*. Two equally broken
+    runs agree perfectly, so a model that never got initialized passes every
+    check while proving nothing. This happened for real: a proxy whose weights
+    were silently left uninitialized reported zero gradients and a loss pinned
+    at ln(vocab_size) on both legs, and the comparison called it a pass.
+
+    Args:
+        baseline: Per-step metrics from the baseline run.
+        parallel: Per-step metrics from the parallel run.
+        common_steps: Steps present in both runs.
+
+    Raises:
+        AssertionError: If either run shows a zero gradient norm, or the loss
+            does not move across steps that saw different batches.
+    """
+    for name, metrics in (("baseline", baseline), ("parallel", parallel)):
+        dead = [step for step in common_steps if metrics[step].get("grad_norm") == 0.0]
+        assert not dead, (
+            f"The {name} run reported grad_norm exactly 0 at step(s) {dead}. A model that trains "
+            "produces a non-zero gradient norm, so this run never trained and the comparison "
+            "above proves nothing. Check that the model's weights were initialized."
+        )
+
+    # Needs at least two steps to have anything to compare against, and the
+    # steps must have seen different batches -- true for every recipe here,
+    # which draw from a multi-sample dataset without repeating.
+    if len(common_steps) < 2:
+        return
+    losses = [baseline[step]["loss"] for step in common_steps]
+    spread = max(losses) - min(losses)
+    assert spread > MIN_LOSS_SPREAD, (
+        f"The baseline loss is flat across {len(common_steps)} steps (spread {spread:.3e} <= "
+        f"{MIN_LOSS_SPREAD}). Each step sees a different batch, so a loss that never moves means "
+        "the model's output does not depend on its input and the comparison above proves nothing."
+    )
 
 
 def main() -> None:
@@ -172,6 +220,8 @@ def main() -> None:
             "Neither log reported grad_norm, so the gradient-sync half of this check did not run. "
             "Confirm the recipe logs grad_norm to training.jsonl."
         )
+
+    _assert_both_runs_trained(baseline, parallel, common_steps)
 
     print(
         f"{args.axis} {args.metric} parity OK: {len(common_steps)} steps, {compared_grad_norms} gradient norms compared"

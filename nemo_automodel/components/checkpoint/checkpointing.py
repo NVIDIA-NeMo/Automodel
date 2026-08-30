@@ -830,11 +830,10 @@ class Checkpointer:
         # fall behind other ranks' async allocations.
         is_safetensors = _is_safetensors_checkpoint(model_path)
         is_custom_model = _is_custom_model(model_state.model[0])
-        # Custom adapters traditionally took the frugal full-state path here because converting
-        # grouped experts into load destinations could materialize a second on-device copy and OOM.
-        # Adapters whose destinations all alias final model storage can now opt into the standard
-        # DCP path below, which writes checkpoint tensors directly through those views. Keep the CPU
-        # path for non-aliasing backends and quantized initialization, whose conversion allocates.
+        # Custom models traditionally loaded the complete checkpoint on the host because model-specific conversion
+        # could otherwise create a second full copy on the GPU. Use DCP when the adapter can place large checkpoint
+        # tensors directly in model weight memory. An adapter such as Gemma4 may also use a small temporary tensor that
+        # it applies after the read. Other custom adapters and quantized initialization keep the host fallback.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
         if torch.distributed.is_initialized():
@@ -842,13 +841,16 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
-        supports_write_through_checkpoint_load = (
+        can_load_without_full_copy = (
             isinstance(state_dict_adapter, StateDictAdapter)
-            and state_dict_adapter.supports_write_through_checkpoint_load
+            and (
+                state_dict_adapter.supports_write_through_checkpoint_load
+                or state_dict_adapter.supports_checkpoint_load_without_full_copy
+            )
             and not self.config.dequantize_base_checkpoint
         )
         single_device_custom_safetensors = (
-            is_safetensors and is_custom_model and world_size == 1 and not supports_write_through_checkpoint_load
+            is_safetensors and is_custom_model and world_size == 1 and not can_load_without_full_copy
         )
         if (
             is_init_step
@@ -868,6 +870,7 @@ class Checkpointer:
                 )
             else:
                 state_dict_from_disk = {}
+            t_adapt = time.monotonic()
 
             # Apply key_mapping (e.g. _checkpoint_conversion_mapping) so that
             # HF checkpoint keys are renamed to match the model's parameter FQNs.
@@ -896,13 +899,14 @@ class Checkpointer:
             t_end = time.monotonic()
 
             disk_s = t_disk - t0
-            dist_s = t_end - t_disk
+            adapt_s = t_adapt - t_disk
+            install_s = t_end - t_adapt
             total_s = t_end - t0
             gb = total_bytes / (1 << 30)
             logging.info(
                 f"load_model: {gb:.2f} GB loaded in {total_s:.2f}s "
                 f"({gb / total_s:.2f} GB/s overall | "
-                f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
+                f"disk read {disk_s:.2f}s, adapt {adapt_s:.2f}s, install {install_s:.2f}s)"
             )
             del state_dict_from_disk
             gc.collect()
@@ -930,6 +934,7 @@ class Checkpointer:
             # Only base-checkpoint initialization needs FP8 scale destinations.
             quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
+            for_checkpoint_load=True,
         )
         destinations_ready = time.monotonic()
         requested_bytes = sum(
@@ -1346,7 +1351,7 @@ class Checkpointer:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
                 if is_rank_0():
                     logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
-            except BaseException as e:  # noqa: B036 - re-raised on the main thread in async_wait
+            except BaseException as e:  # Re-raised on the main thread in async_wait.
                 self._consolidation_error = e
 
         self._consolidation_thread = threading.Thread(
@@ -2023,7 +2028,12 @@ def _create_dirs(*dirs: str | None) -> None:
     """Create local directory paths and ignore cloud paths."""
     for directory in dirs:
         if directory and not is_cloud_path(directory):
-            os.makedirs(directory, exist_ok=True)
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except FileExistsError:
+                # virtiofs & co.: a racing rank's mkdir can surface as EEXIST while isdir() lags
+                if not os.path.isdir(directory):
+                    raise
 
 
 def _ensure_dirs(*dirs: str | None, process_group: torch.distributed.ProcessGroup | None = None) -> None:

@@ -755,7 +755,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     dp_world_size=self._get_dp_group_size(),
                     pp_enabled=self.pp_enabled,
                     supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
-                    cp_size=self.cfg.get("distributed.cp_size", 1),
+                    # Models that own their CP shard the packed row contiguously;
+                    # per-document CP padding is a TE blockdiag concern and would
+                    # make pack composition depend on the topology.
+                    cp_size=(
+                        1
+                        if getattr(self.model_parts[0], "_owns_cp_attention", False)
+                        else self.cfg.get("distributed.cp_size", 1)
+                    ),
                     attn_implementation=attn_implementation,
                     # THD already encodes document boundaries in cu_seqlens;
                     # a dense PP causal mask is redundant and prohibitively large.
@@ -1377,7 +1384,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
                 "tps": tps,
-                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+                # tps is global tokens/sec (num_tokens_in_batch is summed over
+                # the DP group), so per-GPU must divide by the full world size.
+                # Dividing by dp*cp alone inflates it by the pp (and tp) factor.
+                "tps_per_gpu": tps / max(self.dist_env.world_size, 1),
                 "mfu": mfu,
                 "num_tokens_per_step": num_tokens_in_batch,
                 "num_label_tokens": num_label_tokens,
