@@ -25,6 +25,45 @@ CONVERSATION = [
 ]
 
 
+class TestFindPatternIndices:
+    @pytest.mark.parametrize(
+        ("template", "pattern", "search_start", "allow_first_mismatch", "expected"),
+        [
+            ([1, 2, 3, 2, 3], [2, 3], 0, False, (1, 3)),
+            ([1, 2, 3, 2, 3], [2, 3], 2, False, (3, 5)),
+            ([1, 9, 3, 4], [2, 3, 4], 0, True, (1, 4)),
+            ([1, 9, 3, 4], [2, 3, 4], 0, False, (-1, -1)),
+            ([1, 2], [1, 2, 3], 0, False, (-1, -1)),
+            ([1, 2], [], 0, False, (0, 0)),
+            ([1, 2], [9], 1, True, (1, 2)),
+        ],
+    )
+    def test_matches_expected_semantics(self, template, pattern, search_start, allow_first_mismatch, expected):
+        from nemo_automodel.components.datasets.vlm.collate_fns import _find_pattern_indices
+
+        actual = _find_pattern_indices(
+            torch.tensor(template),
+            torch.tensor(pattern),
+            search_start_index=search_start,
+            allow_first_token_mismatch=allow_first_mismatch,
+        )
+
+        assert actual == expected
+
+    def test_long_scan_does_not_scalarize_each_candidate(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import _find_pattern_indices
+
+        template = torch.zeros(16_384, dtype=torch.long)
+        pattern = torch.arange(1, 9, dtype=torch.long)
+        template[-len(pattern) :] = pattern
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            actual = _find_pattern_indices(template, pattern)
+
+        assert actual == (16_376, 16_384)
+        assert "aten::item" not in {event.key for event in prof.key_averages()}
+
+
 class DummyTokenizer:
     def __init__(self, pad_token_id=0):
         self.pad_token_id = pad_token_id
