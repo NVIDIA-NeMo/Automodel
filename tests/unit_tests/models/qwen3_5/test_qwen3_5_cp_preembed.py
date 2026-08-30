@@ -255,6 +255,36 @@ class TestEmbedAndSpliceForCP:
                 "Image",
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        ("attn_implementation", "expected_device"),
+        [("sdpa", "cpu"), ("flash_attention_4", "cuda")],
+    )
+    def test_vision_grid_device_matches_attention_metadata_requirement(self, attn_implementation, expected_device):
+        model = _build_model()
+        model.model.visual = types.SimpleNamespace(
+            config=types.SimpleNamespace(_attn_implementation=attn_implementation),
+            dtype=torch.float32,
+        )
+        captured = {}
+        expected = torch.randn(1, 4, device="cuda")
+
+        def _get_image_features(_pixel_values, image_grid_thw, return_dict=True):
+            assert return_dict is True
+            captured["grid"] = image_grid_thw
+            return types.SimpleNamespace(pooler_output=[expected])
+
+        model.model.get_image_features = _get_image_features
+
+        actual = model._encode_vision_for_cp(
+            torch.randn(4, 8, device="cuda"),
+            torch.tensor([[1, 2, 2]], device="cuda"),
+            is_video=False,
+        )
+
+        assert captured["grid"].device.type == expected_device
+        torch.testing.assert_close(actual, expected)
+
     def test_image_features_scattered_into_embeds(self):
         """pixel_values path: image features replace image-token embeddings via masked_scatter."""
         model = _build_model(image_token_id=99)

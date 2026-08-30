@@ -235,6 +235,22 @@ class TestDenseTextBackbone:
         assert metadata.document_ids is attention_mask
         assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_metadata_uses_pinned_h2d_transfer(self):
+        packed_seq_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long, device="cuda")
+        torch.cuda.synchronize()
+
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as profiler:
+            metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(None, packed_seq_ids)
+            torch.cuda.synchronize()
+
+        assert metadata is not None
+        operator_names = {event.key for event in profiler.key_averages()}
+        assert "Memcpy HtoD (Pinned -> Device)" in operator_names
+        assert "Memcpy HtoD (Pageable -> Device)" not in operator_names
+
     def test_builds_expected_layer_types(self):
         cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
         backbone = Qwen3_5DenseTextBackbone(cfg, _backend())

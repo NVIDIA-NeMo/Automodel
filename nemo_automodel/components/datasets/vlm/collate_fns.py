@@ -98,10 +98,33 @@ def make_robust_collate(dataset, collate_fn, max_retries=10):
 def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
     template_len = len(template)
     pattern_len = len(pattern)
-    for i in range(search_start_index, template_len - pattern_len + 1):
-        match = template[i : i + pattern_len] == pattern
-        if torch.all(match) or (allow_first_token_mismatch and torch.all(match[1:])):
-            return i, i + pattern_len
+    search_stop_index = template_len - pattern_len + 1
+    if search_start_index >= search_stop_index:
+        return -1, -1
+    if pattern_len == 0:
+        return search_start_index, search_start_index
+
+    # Filter candidate starts with one token before comparing full slices.  The
+    # previous loop evaluated a tensor in a Python condition at every possible
+    # offset, producing one aten::is_nonzero/aten::item pair per comparison.
+    # On a 16K packed sample that can mean tens of thousands of scalarizations
+    # for each assistant span.
+    if allow_first_token_mismatch:
+        if pattern_len == 1:
+            return search_start_index, search_start_index + 1
+        anchor_offset = 1
+    else:
+        anchor_offset = 0
+    anchor = pattern[anchor_offset]
+    candidate_positions = torch.nonzero(
+        template[search_start_index + anchor_offset : search_stop_index + anchor_offset] == anchor,
+        as_tuple=True,
+    )[0]
+    for candidate_offset in candidate_positions.tolist():
+        start = search_start_index + candidate_offset
+        compare_start = anchor_offset if allow_first_token_mismatch else 0
+        if torch.equal(template[start + compare_start : start + pattern_len], pattern[compare_start:]):
+            return start, start + pattern_len
     return -1, -1
 
 
