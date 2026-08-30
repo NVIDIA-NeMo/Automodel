@@ -19,10 +19,11 @@
 import dataclasses
 import json
 import logging
+import mmap
 import os
 import queue
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
@@ -92,15 +93,15 @@ class _HuggingFaceStorageWriter(FsspecWriter):
     def __init__(
         self,
         path: str,
-        fqn_to_index_mapping: Optional[dict[str, int]] = None,
+        fqn_to_index_mapping: dict[str, int] | None = None,
         thread_count: int = 1,
-        token: Optional[str] = None,
+        token: str | None = None,
         save_sharded: bool = False,
-        consolidated_output_path: Optional[str] = None,
-        num_threads_consolidation: Optional[int] = None,
-        staging_dir: Optional[str] = None,
+        consolidated_output_path: str | None = None,
+        num_threads_consolidation: int | None = None,
+        staging_dir: str | None = None,
         diffusers_compatible: bool = False,
-        fqn_to_dtype_mapping: Optional[dict[str, str]] = None,
+        fqn_to_dtype_mapping: dict[str, str] | None = None,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -136,7 +137,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                 path=path,
                 serialization_format=SerializationFormat.SAFETENSORS,
             )
-        self._fqn_to_index_mapping: Optional[dict[str, int]] = fqn_to_index_mapping
+        self._fqn_to_index_mapping: dict[str, int] | None = fqn_to_index_mapping
         self._save_sharded = save_sharded
         self._consolidated_output_path = consolidated_output_path
         self._staging_dir = staging_dir
@@ -178,8 +179,8 @@ class _HuggingFaceStorageWriter(FsspecWriter):
 
         # storage_plan is a map from key to file index
         storage_data: dict[str, Any] = plan.storage_data
-        storage_plan: Optional[dict[str, int]] = None
-        shard_index: Optional[int] = None
+        storage_plan: dict[str, int] | None = None
+        shard_index: int | None = None
         if "fqn_to_index_mapping" in storage_data:
             storage_plan = storage_data["fqn_to_index_mapping"]
         if "shard_index" in storage_data:
@@ -199,13 +200,12 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         if self._save_sharded and not self._consolidated_output_path:
             return
         if self._save_sharded:
-            # Use staging for single-rank consolidation path
             consolidate_safetensors_files(
                 input_dir=self.path,
                 output_dir=self._consolidated_output_path,
                 num_threads=self._num_threads_consolidation,
                 fqn_to_index_mapping=self._fqn_to_index_mapping,
-                use_staging=True,
+                use_staging=self._staging_dir is not None,
                 staging_dir=self._staging_dir,
                 fqn_to_dtype_mapping=self._fqn_to_dtype_mapping,
             )
@@ -227,7 +227,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             json.dump(metadata_to_write, metadata_file, indent=2)
 
     def _split_by_storage_plan(
-        self, storage_plan: Optional[dict[str, int]], items: list[WriteItem]
+        self, storage_plan: dict[str, int] | None, items: list[WriteItem]
     ) -> dict[int, list[WriteItem]]:
         # storage_plan is a map from key to index
         if storage_plan is None:
@@ -257,7 +257,7 @@ class _HuggingFaceStorageReader(FsspecReader):
     Fsspec registration of the storage solution is required.
     """
 
-    def __init__(self, path: str, token: Optional[str] = None, key_mapping: Optional[dict[str, str]] = None) -> None:
+    def __init__(self, path: str, token: str | None = None, key_mapping: dict[str, str] | None = None) -> None:
         """
         Initialize the huggingface reader pointing to path.
 
@@ -286,27 +286,86 @@ class _HuggingFaceStorageReader(FsspecReader):
             per_file.setdefault(file_name, []).append(read_item)
 
         for file_name, reqs in per_file.items():
-            with self.fs.create_stream(file_name, "rb") as stream:
-                for req in reqs:
-                    item_md = self.storage_data[req.storage_index]
+            # Prefer mmap for local files: each request copies out only its narrowed slice,
+            # so only those pages fault in -- and they are file-backed (reclaimable) rather
+            # than anonymous host RAM. The previous path read every full tensor into a host
+            # bytearray (plus a second copy), which host-OOM-kills very large checkpoints
+            # (e.g. a 355B fp8 model with 8 ranks/node). Falls back to the streaming read for
+            # remote/non-local files.
+            mm = None
+            mfile = None
+            try:
+                if os.path.isfile(file_name):
+                    mfile = open(file_name, "rb")  # noqa: SIM115
+                    # Copy-on-write mmap keeps pages file-backed unless mutated, while
+                    # giving torch.frombuffer a writable view so it does not warn.
+                    mm = mmap.mmap(mfile.fileno(), 0, access=mmap.ACCESS_COPY)
+            except (OSError, ValueError):
+                if mm is not None:
+                    mm.close()
+                    mm = None
+                if mfile is not None:
+                    mfile.close()
+                    mfile = None
 
-                    stream.seek(item_md.offset)
-                    tensor_bytes = bytearray(stream.read(item_md.length))
+            try:
+                if mm is not None:
+                    view = memoryview(mm)
+                    for req in reqs:
+                        item_md = self.storage_data[req.storage_index]
+                        # torch.frombuffer is zero-copy but requires the byte offset to be
+                        # aligned to the dtype; safetensors headers can misalign (e.g. bf16),
+                        # so copy just that one tensor's bytes when unaligned.
+                        if item_md.offset % item_md.dtype.itemsize == 0:
+                            numel = item_md.length // item_md.dtype.itemsize
+                            tensor = torch.frombuffer(
+                                view, dtype=item_md.dtype, count=numel, offset=item_md.offset
+                            ).reshape(item_md.shape)
+                        else:
+                            tensor = torch.frombuffer(
+                                bytearray(view[item_md.offset : item_md.offset + item_md.length]),
+                                dtype=item_md.dtype,
+                            ).reshape(item_md.shape)
+                        tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
+                        target_tensor = planner.resolve_tensor(req).detach()
 
-                    tensor = torch.frombuffer(
-                        tensor_bytes,
-                        dtype=item_md.dtype,
-                    )
-                    tensor = tensor.reshape(item_md.shape)
-                    tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
-                    target_tensor = planner.resolve_tensor(req).detach()
+                        assert target_tensor.size() == tensor.size(), (
+                            f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                        )
 
-                    assert target_tensor.size() == tensor.size(), (
-                        f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
-                    )
+                        # copy_ from a pageable host buffer is synchronous, so the mmap can be
+                        # released right after this loop without racing an in-flight H2D copy.
+                        target_tensor.copy_(tensor)
+                        planner.commit_tensor(req, target_tensor)
+                        del tensor
+                    view.release()
+                else:
+                    with self.fs.create_stream(file_name, "rb") as stream:
+                        for req in reqs:
+                            item_md = self.storage_data[req.storage_index]
 
-                    target_tensor.copy_(tensor)
-                    planner.commit_tensor(req, target_tensor)
+                            stream.seek(item_md.offset)
+                            tensor_bytes = bytearray(stream.read(item_md.length))
+
+                            tensor = torch.frombuffer(
+                                tensor_bytes,
+                                dtype=item_md.dtype,
+                            )
+                            tensor = tensor.reshape(item_md.shape)
+                            tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
+                            target_tensor = planner.resolve_tensor(req).detach()
+
+                            assert target_tensor.size() == tensor.size(), (
+                                f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                            )
+
+                            target_tensor.copy_(tensor)
+                            planner.commit_tensor(req, target_tensor)
+            finally:
+                if mm is not None:
+                    mm.close()
+                if mfile is not None:
+                    mfile.close()
 
         fut: Future = Future()
         fut.set_result(None)
@@ -423,7 +482,7 @@ def _extract_file_index_with_status(filename: str) -> tuple[int, bool]:
 
 
 def get_fqn_to_file_index_mapping(
-    reference_model_path: str, key_mapping: Optional[dict[str, str]] = None
+    reference_model_path: str, key_mapping: dict[str, str] | None = None
 ) -> dict[str, int]:
     """
     Get the FQN to file index mapping from the metadata.
@@ -486,7 +545,7 @@ def get_fqn_to_file_index_mapping(
     return fqn_to_file_index_mapping
 
 
-def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: Optional[dict[str, str]] = None) -> dict[str, str]:
+def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: dict[str, str] | None = None) -> dict[str, str]:
     """
     Get the FQN to original safetensors dtype mapping from HF shard headers.
 
@@ -526,7 +585,7 @@ def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: Optional[di
 # the following function is taken from https://github.com/huggingface/transformers/blob/b85ed49e0a5f1bd9fd887f497d055b22b9319a12/src/transformers/modeling_utils.py#L4989-L5047
 def _get_key_renaming_mapping(
     key: str,
-    key_mapping: Optional[dict[str, str]] = None,
+    key_mapping: dict[str, str] | None = None,
 ) -> str:
     if key_mapping is None:
         return key

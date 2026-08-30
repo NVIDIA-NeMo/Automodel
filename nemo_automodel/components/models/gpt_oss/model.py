@@ -14,7 +14,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -28,13 +28,17 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
-from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
+from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention, _has_thd_metadata
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -75,16 +79,9 @@ class Block(nn.Module):
         x = x + attn_out
 
         mlp_in = self.post_attention_layernorm(x)
-        mlp_out = self._mlp(mlp_in, padding_mask)
+        mlp_out = self.mlp(mlp_in, padding_mask)
         x = x + mlp_out
         return x
-
-    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
-            return self.mlp(x)
-        else:
-            assert isinstance(self.mlp, MoE)
-            return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -222,6 +219,8 @@ class GptOssModel(nn.Module):
 
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -260,6 +259,7 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig(attn="flex")
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
@@ -292,7 +292,7 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass returning :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.
@@ -319,8 +319,20 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             else getattr(self.config, "output_hidden_states", False)
         )
 
-        is_thd = attn_kwargs.get("qkv_format") == "thd"
+        is_thd = attn_kwargs.get("qkv_format") == "thd" or (
+            _has_thd_metadata(attn_kwargs) and (input_ids.ndim == 1 or input_ids.shape[0] == 1)
+        )
         if is_thd:
+            attn_kwargs = {**attn_kwargs, "qkv_format": "thd"}
+            if position_ids is None:
+                if input_ids.ndim == 1:
+                    position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
+                else:
+                    position_ids = (
+                        torch.arange(0, input_ids.shape[1], device=input_ids.device)
+                        .unsqueeze(0)
+                        .expand(input_ids.shape[0], -1)
+                    )
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )

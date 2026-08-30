@@ -15,7 +15,7 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,7 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,12 +72,12 @@ class KimiVLConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vision_config: Optional[Union[Dict, MoonViTConfig]] = None,
-        text_config: Optional[Union[Dict, DeepseekV3Config]] = None,
+        vision_config: Union[Dict, MoonViTConfig] | None = None,
+        text_config: Union[Dict, DeepseekV3Config] | None = None,
         ignore_index: int = -100,
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
-        architectures: Optional[List[str]] = None,
+        architectures: List[str] | None = None,
         **kwargs,
     ):
         if vision_config is None:
@@ -108,6 +109,10 @@ class KimiVLConfig(PretrainedConfig):
 
 
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
@@ -632,6 +637,8 @@ class KimiVLModel(nn.Module):
 class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiVL model with backend-aware DeepseekV3 language model."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
@@ -655,8 +662,10 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(self, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
+        warn_deprecated_model_class("KimiVLForConditionalGeneration")
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
 
         self.model = KimiVLModel(config, moe_config=moe_config, backend=self.backend)
@@ -709,7 +718,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         labels=None,
         use_cache=None,
         output_attentions=None,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         return_dict=None,
         pixel_values=None,
         image_grid_hws=None,

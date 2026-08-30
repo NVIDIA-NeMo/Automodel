@@ -65,7 +65,13 @@ class QwenImageProcessor(BaseModelProcessor):
         """
         from diffusers import QwenImagePipeline
 
+        from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
+
         logger.info("[Qwen-Image] Loading models from %s...", model_name)
+
+        # Resolve to a local snapshot dir so a warm HF cache is not re-validated
+        # (and potentially re-downloaded) over the network on every run.
+        model_name = resolve_diffusion_model_dir(model_name)
 
         # Load pipeline without transformer (not needed for preprocessing)
         pipeline = QwenImagePipeline.from_pretrained(

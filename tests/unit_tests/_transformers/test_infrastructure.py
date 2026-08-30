@@ -103,6 +103,41 @@ class TestShouldLoadBeforeShard:
         assert _should_load_before_shard(**{**self._DEFAULTS, "ep_size": 1}) is True
 
 
+def test_moe_infrastructure_forwards_fsdp2_tp_sequence_and_offload_settings():
+    """EP's dedicated parallelizer must retain the FSDP2 manager's TP settings."""
+    from nemo_automodel._transformers.infrastructure import instantiate_infrastructure
+    from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+
+    manager = object.__new__(FSDP2Manager)
+    manager.tp_plan = {"lm_head": object()}
+    manager.sequence_parallel = False
+    manager.offload_policy = object()
+    manager.mp_policy = object()
+    manager.reshard_after_forward = True
+    manager.enable_async_tensor_parallel = False
+    manager.frozen_multimodal_sharding = "replicate"
+    mesh = SimpleNamespace(ep_size=2)
+
+    with (
+        patch(f"{_INFRA_MODULE}._instantiate_distributed", return_value=manager),
+        patch(f"{_INFRA_MODULE}._instantiate_pipeline", return_value=None),
+        patch(f"{_INFRA_MODULE}._instantiate_qat", return_value=None),
+    ):
+        model_wrapper, _, parallelize_fn, _ = instantiate_infrastructure(
+            distributed_config=SimpleNamespace(activation_checkpointing=False),
+            mesh=mesh,
+        )
+
+    assert model_wrapper is manager
+    assert parallelize_fn.keywords["tp_shard_plan"] is manager.tp_plan
+    assert parallelize_fn.keywords["sequence_parallel"] is False
+    assert parallelize_fn.keywords["offload_policy"] is manager.offload_policy
+    assert parallelize_fn.keywords["mp_policy"] is manager.mp_policy
+    assert parallelize_fn.keywords["reshard_after_forward"] is True
+    assert parallelize_fn.keywords["enable_async_tensor_parallel"] is False
+    assert parallelize_fn.keywords["frozen_multimodal_sharding"] == "replicate"
+
+
 # =============================================================================
 # Tests for apply_model_infrastructure: post-shard initialize_model_weights
 # =============================================================================
@@ -113,6 +148,38 @@ class _DummyModel(torch.nn.Module):
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
         self.config = SimpleNamespace()
+
+
+def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():
+    from nemo_automodel._transformers.infrastructure import (
+        _validate_safe_moe_tp_weight_source,
+        _verify_safe_moe_tp_weights_loaded,
+    )
+
+    model = _DummyModel()
+    model._nemo_moe_tp_requires_pretrained_weights = True
+
+    with pytest.raises(ValueError, match="from_config/random initialization"):
+        _validate_safe_moe_tp_weight_source(
+            model,
+            checkpoint_source_available=False,
+            peft_config=None,
+        )
+    with pytest.raises(ValueError, match="does not support PEFT"):
+        _validate_safe_moe_tp_weight_source(
+            model,
+            checkpoint_source_available=True,
+            peft_config=object(),
+        )
+
+    _validate_safe_moe_tp_weight_source(
+        model,
+        checkpoint_source_available=True,
+        peft_config=None,
+    )
+    with pytest.raises(RuntimeError, match="without a completed checkpoint"):
+        _verify_safe_moe_tp_weights_loaded(model, checkpoint_loaded=False)
+    _verify_safe_moe_tp_weights_loaded(model, checkpoint_loaded=True)
 
 
 _INFRA_MODULE = "nemo_automodel._transformers.infrastructure"
@@ -502,7 +569,9 @@ class TestApplyModelInfrastructurePostShardInit:
 # =============================================================================
 
 
-def _run_apply_model_infrastructure_load_before_shard(*, peft_config=None):
+def _run_apply_model_infrastructure_load_before_shard(
+    *, peft_config=None, is_meta_device=True, weights_already_loaded=False
+):
     """Helper that invokes apply_model_infrastructure with load_before_shard=True."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
@@ -521,12 +590,13 @@ def _run_apply_model_infrastructure_load_before_shard(*, peft_config=None):
 
         result = apply_model_infrastructure(
             model=model,
-            is_meta_device=True,
+            is_meta_device=is_meta_device,
             device=torch.device("cpu"),
             load_base_model=True,
             peft_config=peft_config,
             pretrained_model_name_or_path="test/model",
             cache_dir="/tmp/cache",
+            weights_already_loaded=weights_already_loaded,
         )
 
         return result, mock_ckpt, model
@@ -564,6 +634,76 @@ class TestLoadBeforeShardPath:
 
         _, kwargs = mock_ckpt.load_base_model.call_args
         assert "peft_init_method" not in kwargs
+
+    def test_load_before_shard_loads_checkpoint_when_init_left_weights_unloaded(self):
+        """A non-meta model whose init did not load weights must still read the checkpoint.
+
+        ``is_meta_device`` is False for every model built under DDP or MegatronFSDP,
+        including AutoModel's own implementations, whose constructor only creates the
+        architecture. Gating the read on it left those models randomly initialized.
+        """
+        _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard(
+            is_meta_device=False, weights_already_loaded=False
+        )
+
+        mock_ckpt.load_base_model.assert_called_once_with(
+            model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True
+        )
+        # Nothing is on meta, so there are no parameter shells to materialize.
+        mock_ckpt.initialize_model_weights.assert_not_called()
+
+    def test_load_before_shard_skips_checkpoint_when_init_already_loaded_weights(self):
+        """HF's from_pretrained already populated the weights; only re-tie, do not re-read."""
+        _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard(
+            is_meta_device=False, weights_already_loaded=True
+        )
+
+        mock_ckpt.load_base_model.assert_called_once_with(
+            model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=False
+        )
+        mock_ckpt.initialize_model_weights.assert_not_called()
+
+
+def test_load_before_shard_populates_unloaded_model_from_checkpoint(tmp_path):
+    """End-to-end guard on CPU: the model must end up holding the checkpoint's values.
+
+    The mocked tests above pin the call; this one pins the outcome, using the real
+    Checkpointer and a real safetensors checkpoint whose every tensor is 0.5.
+    """
+    from transformers import LlamaConfig
+    from transformers import LlamaForCausalLM as HFLlamaForCausalLM
+
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+    from nemo_automodel.components.models.llama.model import LlamaForCausalLM
+
+    config = LlamaConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=256,
+        max_position_embeddings=128,
+        tie_word_embeddings=False,
+    )
+    reference = HFLlamaForCausalLM(config)
+    with torch.no_grad():
+        for param in reference.parameters():
+            param.fill_(0.5)
+    reference.save_pretrained(tmp_path, safe_serialization=True)
+
+    config.torch_dtype = torch.float32
+    model = apply_model_infrastructure(
+        model=LlamaForCausalLM(config),
+        is_meta_device=False,
+        device=torch.device("cpu"),
+        load_base_model=True,
+        pretrained_model_name_or_path=str(tmp_path),
+        weights_already_loaded=False,
+    )
+
+    for name, param in model.named_parameters():
+        assert torch.equal(param.detach(), torch.full_like(param, 0.5)), f"{name} was not loaded"
 
 
 # =============================================================================
@@ -633,11 +773,11 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
         patch(f"{_INFRA_MODULE}._uses_te_attention", return_value=False),
         patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
         patch(
-            "nemo_automodel.components.distributed.cp_utils.attach_context_parallel_hooks",
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_context_parallel_hooks",
             side_effect=lambda mp: attached.__setitem__("ctx", attached["ctx"] + 1),
         ),
         patch(
-            "nemo_automodel.components.distributed.cp_utils.attach_cp_sdpa_hooks",
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_cp_sdpa_hooks",
             side_effect=lambda mp, cp_mesh: attached.__setitem__("attn", attached["attn"] + 1),
         ),
     ):
@@ -655,3 +795,133 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
         )
 
     assert attached == {"ctx": 1, "attn": 0}
+
+
+def test_apply_model_infrastructure_configures_dense_thd_te_and_bshd_sdpa_cp():
+    """THD-only TE models need both TE and BSHD SDPA context-parallel setup."""
+    from nemo_automodel._transformers import infrastructure as infra
+
+    model = _DummyModel()
+    cp_mesh = SimpleNamespace(size=lambda: 2)
+    mesh = SimpleNamespace(
+        cp_size=2,
+        pp_size=1,
+        tp_size=1,
+        ep_size=1,
+        dp_size=1,
+        dp_shard_size=1,
+        dp_replicate_size=1,
+        device_mesh={"cp": cp_mesh},
+        moe_mesh=None,
+    )
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._uses_te_attention", return_value=True),
+        patch(f"{_INFRA_MODULE}._uses_thd_only_te_attention", return_value=True),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        patch(
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_te_context_parallel",
+            return_value=1,
+        ) as attach_te,
+        patch(
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_context_parallel_hooks",
+        ) as attach_sdpa,
+    ):
+        mock_ckpt = MockCheckpointer.return_value
+        mock_ckpt.config = MagicMock()
+        mock_ckpt.config.dequantize_base_checkpoint = False
+        infra.apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=None,
+            mesh=mesh,
+            pretrained_model_name_or_path="",
+        )
+
+    attach_te.assert_called_once_with(model, cp_mesh, None)
+    attach_sdpa.assert_called_once_with(model)
+
+
+def test_apply_model_infrastructure_configures_dense_thd_te_for_tp_without_cp():
+    """Packed TP-only models must configure TE's tensor-parallel group."""
+    from nemo_automodel._transformers import infrastructure as infra
+
+    model = _DummyModel()
+    tp_mesh = SimpleNamespace(size=lambda: 2)
+    mesh = SimpleNamespace(
+        cp_size=1,
+        pp_size=1,
+        tp_size=2,
+        ep_size=1,
+        dp_size=1,
+        dp_shard_size=1,
+        dp_replicate_size=1,
+        device_mesh={"tp": tp_mesh},
+        moe_mesh=None,
+    )
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._uses_te_attention", return_value=True),
+        patch(f"{_INFRA_MODULE}._uses_thd_only_te_attention", return_value=True),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        patch(
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_te_context_parallel",
+            return_value=1,
+        ) as attach_te,
+        patch(
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_context_parallel_hooks",
+        ) as attach_sdpa,
+    ):
+        mock_ckpt = MockCheckpointer.return_value
+        mock_ckpt.config = MagicMock()
+        mock_ckpt.config.dequantize_base_checkpoint = False
+        infra.apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=None,
+            mesh=mesh,
+            pretrained_model_name_or_path="",
+        )
+
+    attach_te.assert_called_once_with(model, None, tp_mesh)
+    attach_sdpa.assert_not_called()
+
+
+# =============================================================================
+# Tests for instantiate_infrastructure: MoE parallelize_fn option threading
+# =============================================================================
+
+
+def test_instantiate_infrastructure_threads_ac_scope_into_moe_parallelize_fn():
+    """Expert-parallel configs must inherit the strategy config's normalized AC scope."""
+    from nemo_automodel._transformers.infrastructure import instantiate_infrastructure
+    from nemo_automodel.components.distributed.config import DDPConfig
+    from nemo_automodel.components.moe.parallelizer import parallelize_model
+
+    distributed_config = DDPConfig(activation_checkpointing=True, activation_checkpointing_scope="vision")
+    mesh = SimpleNamespace(ep_size=2, pp_size=1, device_mesh=None, moe_mesh=None)
+
+    # The manager needs an initialized process group; the scope is read from the
+    # strategy config, so the manager itself is irrelevant here.
+    with patch(f"{_INFRA_MODULE}._instantiate_distributed", return_value=None):
+        _, _, parallelize_fn, _ = instantiate_infrastructure(
+            distributed_config=distributed_config,
+            mesh=mesh,
+        )
+
+    assert parallelize_fn.func is parallelize_model
+    assert parallelize_fn.keywords["activation_checkpointing"] is True
+    # DDPConfig.__post_init__ normalizes the scope; the partial must carry it through.
+    assert parallelize_fn.keywords["activation_checkpointing_scope"] == ("vision",)

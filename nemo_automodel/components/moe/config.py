@@ -15,7 +15,7 @@
 """MoE model configuration."""
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 
@@ -43,6 +43,8 @@ class MoEConfig:
     router_bias: bool = False
     expert_bias: bool = False
     expert_activation: Literal["swiglu", "swigluoai", "quick_geglu", "geglu", "relu2"] = "swiglu"
+    # Preserve models whose low-precision numerics require routing after the down projection.
+    apply_router_weight_after_down: bool = False
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
     # When > 0, ``expert_activation="swiglu"`` dispatches to a clamped FP32
@@ -51,12 +53,23 @@ class MoEConfig:
     # Default 0.0 preserves the existing ``weighted_bias_swiglu_impl`` path.
     swiglu_limit: float = 0.0
     softmax_before_topk: bool = False
+    router_weights_fp32: bool = False
+    router_weight_uses_score_correction_bias: bool = False
     dtype: str | torch.dtype = torch.bfloat16
+    # Storage dtype for the router gate parameters. None inherits ``dtype``.
+    # Models whose checkpoints store the gate in fp32 (e.g. MiniMax-M2) set
+    # this so the gate is fp32 from allocation on every construction path,
+    # keeping FSDP dtype groups uniform with the fp32 correction-bias buffer.
+    gate_dtype: str | torch.dtype | None = None
     shared_expert_gate: bool = False
     shared_expert_inter_dim: int | None = None
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
     force_e_score_correction_bias: bool = False  # Force creation of e_score_correction_bias buffer
     moe_latent_size: int | None = None
+    # Rollout Routing Replay (R3): when True, each gate records/replays its top-k
+    # expert selection so RL training reuses the rollout's routing decisions. See
+    # nemo_automodel.components.moe.router_replay.
+    enable_routing_replay: bool = False
 
     @property
     def expert_dim(self) -> int:
@@ -66,6 +79,8 @@ class MoEConfig:
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
+        if isinstance(self.gate_dtype, str):
+            self.gate_dtype = dtype_from_str(self.gate_dtype, default=torch.bfloat16)
 
 
 @dataclass
@@ -85,5 +100,5 @@ class MoEMetricsConfig:
 
     enabled: bool = False
     mode: str = "brief"
-    detailed_every_steps: Optional[int] = None
+    detailed_every_steps: int | None = None
     top_k_experts: int = 0

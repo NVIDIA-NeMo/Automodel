@@ -255,6 +255,81 @@ def test_pretokenized_wrapper_truncate_mm_token_type_ids():
     assert sample["mm_token_type_ids"].shape[0] <= ml
 
 
+class _MediaTruncationProcessor:
+    image_token_id = 99
+
+    class _tokenizer:
+        pad_token_id = 0
+        eos_token = "</s>"
+        unk_token_id = -1
+
+        @staticmethod
+        def convert_tokens_to_ids(token):
+            return {"<|image_pad|>": 99}.get(token)
+
+        @staticmethod
+        def decode(token):
+            return str(token.item() if isinstance(token, torch.Tensor) else token)
+
+    class _image_processor:
+        merge_size = 2
+
+    tokenizer = _tokenizer()
+    image_processor = _image_processor()
+
+    def apply_chat_template(self, conversations, *, tokenize=False, **kwargs):
+        for item in conversations[0][0]["content"]:
+            if item["type"] == "text":
+                return item["text"]
+        return "good"
+
+    def __call__(self, *, text, images=None, videos=None, return_tensors="pt", **kwargs):
+        seq_len = 64
+        input_ids = torch.arange(1000, 1000 + seq_len, dtype=torch.long).unsqueeze(0)
+        image_start = 40 if text[0] == "bad" else 10
+        input_ids[0, image_start : image_start + 4] = self.image_token_id
+        return {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones(1, seq_len, dtype=torch.long),
+            "pixel_values": torch.ones(4, 3, dtype=torch.bfloat16),
+            "image_grid_thw": torch.tensor([[1, 4, 4]], dtype=torch.long),
+        }
+
+
+def test_pretokenized_wrapper_retries_when_truncation_orphans_image_tokens(monkeypatch):
+    """Truncation must not return image grids/pixels with zero image tokens."""
+    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
+
+    def _sample(name):
+        return {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": Image.new("RGB", (4, 4))},
+                        {"type": "text", "text": name},
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+            ]
+        }
+
+    wrapper = PreTokenizedDatasetWrapper(
+        [_sample("bad"), _sample("good")],
+        _MediaTruncationProcessor(),
+        max_length=32,
+        max_retries=2,
+        truncate=True,
+    )
+    monkeypatch.setattr(f"{_DS_MODULE}.random.randint", lambda _a, _b: 1)
+
+    sample = _patched_getitem(wrapper, 0)
+
+    assert sample["input_ids"].shape == (32,)
+    assert int((sample["input_ids"] == _MediaTruncationProcessor.image_token_id).sum().item()) == 4
+    assert sample["image_grid_thw"].tolist() == [[1, 4, 4]]
+
+
 # ---------- pad_collate_fn with mm_token_type_ids ----------------------------
 
 

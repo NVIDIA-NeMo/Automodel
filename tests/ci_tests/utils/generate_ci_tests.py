@@ -15,6 +15,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -120,6 +121,7 @@ CI_KEY_TO_VAR = {
     "time": "TIME",
     "nodes": "TEST_NODE_COUNT",
     "node_multiplier": "NODE_MULTIPLIER",
+    "max_steps": "MAX_STEPS",
     "local_batch_size": "LOCAL_BATCH_SIZE",
     "ep_size": "EP_SIZE",
     "recipe_owner": "RECIPE_OWNER",
@@ -132,8 +134,14 @@ def _compute_base_stage(test_folder: str, config: Path, has_robustness: bool) ->
     """Pick the GitLab CI stage for a base recipe job."""
     if "benchmark" in test_folder:
         return "performance"
+    if test_folder == "llm_pretrain":
+        return "pretrain"
     if "benchmark" in config.stem:
         return "benchmark"
+    if test_folder == "convergence":
+        # Weekly train-then-eval flow; the .convergence_test template runs
+        # convergence_tests_launcher.sh (train -> IFEval -> threshold gate).
+        return "convergence"
     if test_folder.startswith("diffusion"):
         return "diffusion_peft" if ("lora" in config.stem or "peft" in config.stem) else "diffusion_sft"
     if test_folder.startswith("retrieval"):
@@ -170,7 +178,13 @@ def _build_job(
     return job
 
 
-def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str) -> None:
+def _enrich_base_job(
+    job: Dict[str, Any],
+    ci_config: Dict[str, Any],
+    scope: str,
+    test_folder: str,
+    config: Path,
+) -> None:
     """Add base-only extras: resource overrides, env_vars, HAS_ROBUSTNESS, convergence time."""
     for ci_key, ci_var in CI_KEY_TO_VAR.items():
         if ci_key not in ci_config:
@@ -188,7 +202,27 @@ def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str)
     for key, value in ci_config.get("env_vars", {}).items():
         job["variables"][key] = str(value)
 
-    job["variables"]["HAS_ROBUSTNESS"] = str(bool(ci_config.get("checkpoint_robustness"))).lower()
+    has_robustness = "checkpoint_robustness" in ci_config
+    robustness_config = ci_config.get("checkpoint_robustness") or {}
+    job["variables"]["HAS_ROBUSTNESS"] = str(has_robustness).lower()
+    supports_process_isolation = test_folder in {"llm_finetune", "vlm_finetune"}
+    process_isolation = supports_process_isolation and robustness_config.get("process_isolation", True)
+    if has_robustness and process_isolation:
+        job["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] = "true"
+        if "CHECKPOINT_ROBUSTNESS_PHASES" not in job["variables"]:
+            robustness_phases = []
+            source_load_parity_enabled = not robustness_config.get("skip_source_load_parity", False)
+            if source_load_parity_enabled:
+                robustness_phases.extend(("source_load_reference", "source_load_parity"))
+            robustness_phases.extend(("train_and_save", "automodel_reload"))
+            if not robustness_config.get("skip_hf_reload"):
+                robustness_phases.append("hf_reload")
+            if not robustness_config.get("skip_resume"):
+                robustness_phases.append("resume")
+            is_peft = "peft" in config.stem or "lora" in config.stem
+            if int(robustness_config.get("cross_tp_size") or 0) > 0 and not is_peft:
+                robustness_phases.append("cross_tp_reload")
+            job["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] = " ".join(robustness_phases)
 
     # Convergence tests run for 2 epochs; double the slurm time allocation.
     if scope == "convergence":
@@ -227,7 +261,7 @@ def generate_job(
     if known_issue_id and not recipe_allow_failure:
         return []
 
-    has_robustness = bool(ci_config.get("checkpoint_robustness"))
+    has_robustness = "checkpoint_robustness" in ci_config
     base_allow_failure = recipe_allow_failure or config.stem in (config_override.get("known_issue") or [])
 
     base_job = _build_job(
@@ -238,12 +272,15 @@ def generate_job(
         allow_failure=base_allow_failure,
         known_issue_id=known_issue_id,
     )
-    _enrich_base_job(base_job, ci_config, scope)
+    _enrich_base_job(base_job, ci_config, scope, test_folder, config)
     variants: list[tuple[str, Dict[str, Any]]] = [("", base_job)]
 
     # vLLM deploy variant. `ci.vllm_deploy_known_issue_id` suppresses just this
     # variant (base job still runs) -- use for bugs that only manifest in vllm deploy.
     if ci_config.get("vllm_deploy") and not ci_config.get("vllm_deploy_known_issue_id"):
+        vllm_deploy_vars = {}
+        if "vllm_deploy_time" in ci_config:
+            vllm_deploy_vars["TIME"] = DQ(str(ci_config["vllm_deploy_time"]))
         variants.append(
             (
                 "_vllm_deploy",
@@ -252,6 +289,7 @@ def generate_job(
                     scope,
                     extends=".vllm_deploy_test",
                     stage="peft_vllm_deploy" if "peft" in config.stem else "sft_vllm_deploy",
+                    extra_vars=vllm_deploy_vars,
                     allow_failure=recipe_allow_failure,
                     known_issue_id=known_issue_id,
                 ),
@@ -304,6 +342,7 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
     exempt_configs = set(config_override.get("exempt_configs") or [])
 
     pipeline: Dict[str, Any] = {"include": ["automodel/automodel_ci_template.yml"]}
+    job_name_suffix = os.environ.get("AUTOMODEL_CI_JOB_NAME_SUFFIX", "")
 
     for config in yml_configs:
         # Skip missing recipes so one bad reference doesn't abort the whole pipeline.
@@ -318,7 +357,7 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
 
         for suffix, job in generate_job(config, config_override, scope, test_folder, automodel_dir):
             job["variables"]["MODEL_FAMILY"] = model_name
-            pipeline[f"{config_name}{suffix}"] = job
+            pipeline[f"{config_name}{suffix}{job_name_suffix}"] = job
 
     return pipeline
 

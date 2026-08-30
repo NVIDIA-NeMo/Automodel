@@ -26,12 +26,22 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    round_robin_local_indices,
+    shard_batch_aux_only,
+    shard_sequence_for_cp_round_robin,
+)
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
     initialize_linear_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
@@ -86,6 +96,11 @@ def build_moe_config(config: Any, dtype: torch.dtype) -> MoEConfig:
         activation_limit=float(getattr(config, "swiglu_limit", 7.0)),
         softmax_before_topk=False,
         force_e_score_correction_bias=bool(getattr(config, "use_routing_bias", True)),
+        # Released MiniMax-M3 checkpoints store the router gate weight in fp32
+        # (same 1e-3-quantized correction-bias lattice as MiniMax-M2.7); allocate
+        # it fp32 so every construction path keeps the gate's FSDP dtype group
+        # uniform with its fp32 bias buffer (AMINT-286 pattern).
+        gate_dtype=torch.float32,
         dtype=dtype,
     )
 
@@ -188,6 +203,10 @@ class MiniMaxM3TextModel(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                # Forwarded so CP-aware sparse attention can derive per-document
+                # boundaries (position_ids reset to 0 per packed document) for
+                # block-diagonal masking; ignored/popped by the eager path.
+                position_ids=position_ids,
                 **attn_kwargs,
             )
 
@@ -248,6 +267,10 @@ class MiniMaxM3TextModel(nn.Module):
 class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Standalone M3 text backbone for causal LM (Stage 1 parity target)."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
+    _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
+
     # The state-dict adapter loads every tensor from the checkpoint, so skip HF
     # random init on load (also avoids DTensor-collective hangs under sharding/PP).
     _skip_init_weights_on_load = True
@@ -272,6 +295,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         self.model = MiniMaxM3TextModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
@@ -360,6 +384,8 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     positions, then run through the (sparse/dense MoE) language model + lm_head.
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # Pipeline-parallel routing: keep this VLM's own forward (which splices vision
     # features) instead of letting patch_hf_model_for_pp swap in the generic
     # CausalLM forward (which would drop pixel_values). MTP per-depth outputs are
@@ -368,24 +394,42 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # (vision_encoder.py) fp32 — the bf16 cast would otherwise round it and degrade
     # vision RoPE (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb", "inv_freq"]
+    _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
     _pp_keep_self_forward: bool = True
     mtp_outputs_are_logits = True
+    # Opt into context parallelism on the SDPA attention backend (M3's block-sparse DSA
+    # bias is an explicit additive mask that only SDPA accepts, not TE). Dense layers use
+    # the standard CP path (mask-strip hook + is_causal); sparse layers require the
+    # CP-aware indexer attention for a correct global-sequence bias.
+    _supports_cp_sdpa = True
+    # MiniMaxM3CPSparseAttention derives per-document ids from the packed position ids
+    # and builds its own block mask, so packing needs no packing-aware attention backend.
+    _owns_packed_attention = True
+    # The same attention shards the packed sequence in forward and carries the document
+    # boundaries into every layer, so it owns the packed CP path end to end.
+    _owns_cp_attention = True
     # The state-dict adapter fully populates every tensor from the checkpoint
     # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
     # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
     _skip_init_weights_on_load = True
+    # CP submesh, installed by the MoE parallelizer's apply_cp when context
+    # parallelism is active; None (default) means the forward embeds and shards
+    # nothing for CP. See prepare_model_inputs_for_cp / forward.
+    cp_mesh = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class.
 
         Mirrors the MiniMax M2 backbone: PP + EP are validated; TP is unsupported
-        by the custom MoE parallelizer. Context parallelism for the block-sparse
-        DSA attention is a separate (CP-aware) implementation, so it stays off here.
+        by the custom MoE parallelizer. Context parallelism is supported via the
+        CP-aware block-sparse DSA attention (dense layers use the standard CP
+        path; sparse layers gather K/V and rebuild the global block-sparse mask
+        using FlexAttention).
         """
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
 
@@ -409,6 +453,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         text_config = config.text_config
         self.backend = backend or BackendConfig()
         self.model = MiniMaxM3TextModel(text_config, backend=self.backend, moe_config=moe_config)
@@ -505,13 +550,26 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         """Per-stage input/output meta tensors for the PP schedule's shape inference.
 
-        First stage consumes token ids ``[mb, seq]``; later stages consume hidden
-        states ``[mb, seq, hidden]``. The final stage (owning ``lm_head``) emits
-        logits ``[mb, seq, vocab]``; earlier stages emit hidden states.
+        First stage consumes the FULL token ids ``[mb, seq]``; later stages
+        consume hidden states. The final stage (owning ``lm_head``) emits logits;
+        earlier stages emit hidden states.
+
+        Under context parallelism the first stage embeds the full sequence and
+        shards it to this rank's round-robin chunk pair inside forward
+        (see :func:`shard_sequence_for_cp_round_robin`), so every stage output and every
+        later-stage input carries the LOCAL (padded-to-``2*cp`` then ``//cp``)
+        sequence length while the first stage's input stays full-length. At
+        ``cp_size == 1`` the lengths coincide and the layout is symmetric.
         """
         text_config = self.config.text_config
         hidden_size = text_config.hidden_size
         vocab_size = text_config.vocab_size
+
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        local_seq_len = seq_len
+        if cp_size > 1:
+            padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
+            local_seq_len = padded_seq_len // cp_size
 
         def meta(*shape: int) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dtype)
@@ -521,16 +579,16 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         if is_first:
             inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
-            inputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
+            inputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
 
         if self.lm_head is not None:
             # Logits follow lm_head's own param dtype, which may diverge from the
             # model dtype if lm_head is ever kept in fp32 (_keep_in_fp32_modules);
             # deriving it here keeps the schedule's output buffer correctly sized.
             head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
-            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=head_dtype),)
+            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=head_dtype),)
         else:
-            outputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
+            outputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
         return inputs_meta, outputs_meta
 
     @staticmethod
@@ -547,7 +605,16 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         grid_thw,
         token_index: int,
     ) -> torch.Tensor:
-        features = self.vision_tower(pixel_values, self._to_grid_list(grid_thw))
+        # The vision tower's bidirectional patch attention is not CP-sharded; when
+        # this embed+splice runs in-forward under an active CP ring context it must
+        # suspend the ring dispatcher, or torch's load-balanced ring SDPA rejects
+        # the non-causal attention. No-op when CP is inactive.
+        from nemo_automodel.components.distributed.context_parallel.utils import (
+            cp_dispatcher_suspended,  # noqa: PLC0415
+        )
+
+        with cp_dispatcher_suspended(self.cp_mesh):
+            features = self.vision_tower(pixel_values, self._to_grid_list(grid_thw))
         mask = input_ids == token_index
         expected = int(mask.sum().item())
         if features.shape[0] != expected:
@@ -557,6 +624,62 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             )
         inputs_embeds[mask] = features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
         return inputs_embeds
+
+    def _embed_and_splice(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw=None,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw=None,
+    ) -> torch.Tensor:
+        """Embed token ids and splice vision/video features into the embeddings.
+
+        Shared by ``forward`` and ``prepare_model_inputs_for_cp`` so the splice logic
+        lives in one place.
+        """
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        if pixel_values is not None or pixel_values_videos is not None:
+            inputs_embeds = inputs_embeds.clone()
+        if pixel_values is not None:
+            inputs_embeds = self._splice_multimodal(
+                inputs_embeds, input_ids, pixel_values, image_grid_thw, self.image_token_index
+            )
+        if pixel_values_videos is not None:
+            inputs_embeds = self._splice_multimodal(
+                inputs_embeds, input_ids, pixel_values_videos, video_grid_thw, self.video_token_index
+            )
+        return inputs_embeds
+
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Return a sharder-only CP backend; embed + splice + shard happen in forward.
+
+        The returned :class:`ContextParallelSharder` round-robin-shards only the
+        no-grad aux streams (labels/position_ids/loss_mask/padding_mask) via
+        :func:`shard_batch_aux_only`, leaving ``input_ids`` and the multimodal inputs
+        full-length; the forward then embeds + splices and calls
+        :func:`shard_sequence_for_cp_round_robin` per microbatch, so embeddings and vision stay
+        trainable under CP. Nothing is consumed here.
+        Defining this method is the opt-in signal the recipe checks
+        (``hasattr(model, "prepare_model_inputs_for_cp")``).
+
+        Args:
+            batch: The full-sequence batch; left intact (nothing consumed).
+            num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
+        """
+        del batch, num_chunks
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_aux_only,
+                local_token_global_indices=round_robin_local_indices,
+            )
+        }
 
     def forward(
         self,
@@ -569,8 +692,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        logits_to_keep: int | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | MiniMaxM3CausalLMOutput | dict[str, torch.Tensor]:
         is_pp_stage = self._is_pipeline_parallel_stage()
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the
@@ -615,6 +739,15 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             if consumed:
                 self._vlm_chunk_idx = chunk_idx + 1
 
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+
+        # Media under CP×PP rides the same per-microbatch side channel as cp1×PP:
+        # stage_vlm_media_for_pp stashed grid-aware pixel chunks (pulled just above),
+        # and the embed + vision splice below runs on this microbatch's FULL sequence
+        # before shard_sequence_for_cp_round_robin shards it. So the CP shard composes with the
+        # media staging without changing the stage metas (the first-stage input is
+        # still input_ids [mb, S]; media never enters the stage tensor stream).
+
         # Pipeline stages after the first receive the previous stage's hidden
         # states in the input_ids slot (a float tensor); route them straight to
         # the text model (no embedding / vision splicing on non-first stages).
@@ -623,17 +756,18 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             input_ids = None
 
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
-            if pixel_values is not None or pixel_values_videos is not None:
-                inputs_embeds = inputs_embeds.clone()
-            if pixel_values is not None:
-                inputs_embeds = self._splice_multimodal(
-                    inputs_embeds, input_ids, pixel_values, image_grid_thw, self.image_token_index
-                )
-            if pixel_values_videos is not None:
-                inputs_embeds = self._splice_multimodal(
-                    inputs_embeds, input_ids, pixel_values_videos, video_grid_thw, self.video_token_index
-                )
+            inputs_embeds = self._embed_and_splice(
+                input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+            )
+            # Per-microbatch CP: keep this rank's round-robin chunk pair of the
+            # freshly embedded full sequence (aux streams + ring-SDPA context aligned
+            # by shard_batch_aux_only). Differentiable: gradients reach embeddings/vision.
+            if cp_size > 1:
+                inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
 
         hidden = self.model(
             None,
@@ -642,6 +776,18 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             attention_mask=attention_mask,
             **kwargs,
         )
+        # Fused-loss path: hand back hidden states and skip lm_head, so the
+        # [tokens, vocab_size] logits tensor is never materialised. Requesting this
+        # alongside MTP raises rather than returning something mtp_logits cannot
+        # consume, matching the MTP-under-PP guard above.
+        if logits_to_keep is not None and not is_pp_stage:
+            if self.model.mtp is not None and self.training and input_ids is not None:
+                raise NotImplementedError(
+                    "logits_to_keep (fused-loss path) is not supported together with MTP "
+                    "modules, which need full logits; set text_config.num_mtp_modules=0."
+                )
+            return {"hidden_states": hidden}
+
         # lm_head is None on non-final pipeline stages -> forward hidden states.
         logits = self.lm_head(hidden) if self.lm_head is not None else hidden
 

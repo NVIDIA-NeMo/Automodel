@@ -22,16 +22,20 @@ fp32-safe rotary embedding. All tests are CPU-only.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 
 pytest.importorskip("transformers.models.qwen3_5")
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig, packing
+from nemo_automodel.components.models.qwen3_5 import packing as qwen3_5_packing
 from nemo_automodel.components.models.qwen3_5.model import (
     Fp32SafeQwen3_5TextRotaryEmbedding,
     Qwen3_5DenseTextBackbone,
@@ -55,7 +59,7 @@ def _backend():
         # Qwen3.5 recipe sets rope_fusion=false. Pin it here so the test exercises
         # the supported (non-fused) path deterministically on both CPU and GPU.
         rope_fusion=False,
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=True,
     )
@@ -240,6 +244,42 @@ class TestDenseTextBackbone:
         embeds = torch.randn(1, 4, cfg.hidden_size)
         out = backbone(inputs_embeds=embeds)
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
+
+    def test_reuses_packed_metadata_across_checkpointed_layers(self):
+        torch.manual_seed(123)
+        cfg = _tiny_config(layer_types=("linear_attention", "linear_attention"))
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend()).float().train()
+        linear_attn_modules = []
+        for name in list(backbone.layers):
+            linear_attn_modules.append(backbone.layers[name].linear_attn)
+            backbone.layers[name] = checkpoint_wrapper(
+                backbone.layers[name],
+                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            )
+
+        get_unpad_data = MagicMock(wraps=packing.get_unpad_data)
+        chunk_gated_delta_rule = MagicMock(side_effect=lambda *args, **_kwargs: (args[2], None))
+        for linear_attn in linear_attn_modules:
+            linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda **kwargs: kwargs["x"])
+            linear_attn.chunk_gated_delta_rule = chunk_gated_delta_rule
+            linear_attn.norm.forward = MagicMock(side_effect=torch.add)
+
+        with patch.object(qwen3_5_packing, "get_unpad_data", get_unpad_data):
+            output = backbone(
+                input_ids=torch.tensor([[1, 2, 3, 4]]),
+                attention_mask=torch.tensor([[1, 1, 2, 2]]),
+            ).last_hidden_state
+            output.backward(torch.randn_like(output))
+
+        assert get_unpad_data.call_count == 1
+        assert chunk_gated_delta_rule.call_count == 4
+        call_kwargs = [call.kwargs for call in chunk_gated_delta_rule.call_args_list]
+        device_cu_seqlens = call_kwargs[0]["cu_seqlens"]
+        cpu_cu_seqlens = call_kwargs[0]["cu_seqlens_cpu"]
+        assert cpu_cu_seqlens.device.type == "cpu"
+        assert cpu_cu_seqlens.tolist() == [0, 2, 4]
+        assert all(kwargs["cu_seqlens"] is device_cu_seqlens for kwargs in call_kwargs)
+        assert all(kwargs["cu_seqlens_cpu"] is cpu_cu_seqlens for kwargs in call_kwargs)
 
     def test_kv_cache_not_supported(self):
         cfg = _tiny_config(layer_types=("full_attention",))

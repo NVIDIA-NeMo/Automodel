@@ -19,7 +19,7 @@ tool responses, then renders them through the tokenizer's chat template
 with ``answer_only_loss_mask=True`` so that ``user`` and ``tool`` tokens
 are excluded from the loss.
 
-Two input schemas are accepted:
+Three input schemas are accepted:
 
 1. Swift / chatml ``messages`` schema (used by
    ``AI-ModelScope/function-calling-chatml``)::
@@ -47,21 +47,43 @@ Two input schemas are accepted:
            ]
        }
 
+3. OpenAI ``messages`` schema (used by ``julien-c/synthtraces``)::
+
+       {
+           "tools": [{...openai tool schema...}],
+           "messages": [
+               {"role": "user", "content": "..."},
+               {
+                   "role": "assistant",
+                   "content": "",
+                   "reasoning_content": "...",
+                   "tool_calls": [{...openai tool call...}]
+               },
+               {"role": "tool", "tool_call_id": "call_1", "content": "..."}
+           ]
+       }
+
 Consecutive ``tool_call`` entries are merged into a single assistant
 message with parallel ``tool_calls``; the following ``tool_response``
 entries are paired with those calls in order.
 """
 
+from __future__ import annotations
+
 import json
 import logging
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Union
 
 from datasets import load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
-    _tokenized_chat_length,
+    _resolve_chat_template,
     format_chat_template,
 )
 
@@ -92,7 +114,7 @@ def _json_load_if_str(value: Any) -> Any:
     return value
 
 
-def _reasoning_content(turn: Dict[str, Any]) -> Optional[str]:
+def _reasoning_content(turn: Dict[str, Any]) -> str | None:
     """Return a turn's reasoning/thinking trace as a string, or ``None`` if absent.
 
     Shared by every conversion path so the ``reasoning_content`` field is read
@@ -121,15 +143,36 @@ def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, A
     return out
 
 
+def _has_assistant_message(example: Dict[str, Any]) -> bool:
+    """Return whether an example contains at least one assistant message."""
+    messages = example.get("messages")
+    if isinstance(messages, list):
+        return any(message.get("role") == "assistant" for message in messages if isinstance(message, dict))
+    conversations = example.get("conversations")
+    if isinstance(conversations, list):
+        return any(turn.get("from") in ("assistant", "gpt") for turn in conversations if isinstance(turn, dict))
+    return False
+
+
+def _trim_after_last_assistant(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove an incomplete trailing exchange after the final assistant message."""
+    last_assistant = max(
+        (idx for idx, message in enumerate(messages) if message.get("role") == "assistant"),
+        default=-1,
+    )
+    return messages[: last_assistant + 1] if last_assistant >= 0 else messages
+
+
 def _convert_messages(
     messages: List[Dict[str, Any]],
-    example_id: Optional[Union[int, str]] = None,
+    example_id: Union[int, str] | None = None,
     drop_history_reasoning_content: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert chatml-style agent messages to OpenAI chat-completions format.
 
-    Consecutive ``tool_call`` entries collapse into one assistant message
-    with parallel ``tool_calls``. When the preceding emitted turn is an
+    Native OpenAI assistant ``tool_calls`` and tool ``tool_call_id`` fields
+    are preserved. Consecutive ``tool_call`` entries collapse into one
+    assistant message with parallel ``tool_calls``. When the preceding emitted turn is an
     assistant message without tool_calls (e.g. an assistant ``content``
     that reasons before calling tools), the tool_calls attach to that
     message instead of creating a second consecutive assistant turn —
@@ -191,14 +234,21 @@ def _convert_messages(
         elif role in ("tool_response", "tool"):
             local_idx = 0
             while i < len(messages) and messages[i].get("role") in ("tool_response", "tool"):
-                if local_idx < len(pending_call_ids):
+                provided_call_id = messages[i].get("tool_call_id")
+                if isinstance(provided_call_id, str) and provided_call_id:
+                    tool_call_id = provided_call_id
+                elif local_idx < len(pending_call_ids):
                     tool_call_id = pending_call_ids[local_idx]
                 else:
                     tool_call_id = f"{id_prefix}_response_{call_counter}_{local_idx}"
                 content = messages[i].get("content", "")
                 if not isinstance(content, str):
                     content = json.dumps(content, ensure_ascii=False)
-                out.append({"role": "tool", "content": content, "tool_call_id": tool_call_id})
+                tool_message = {"role": "tool", "content": content, "tool_call_id": tool_call_id}
+                tool_name = messages[i].get("name")
+                if isinstance(tool_name, str) and tool_name:
+                    tool_message["name"] = tool_name
+                out.append(tool_message)
                 i += 1
                 local_idx += 1
         else:
@@ -218,6 +268,37 @@ def _convert_messages(
                 reasoning = _reasoning_content(messages[i])
                 if reasoning is not None:
                     msg["reasoning_content"] = reasoning
+                raw_tool_calls = messages[i].get("tool_calls")
+                if raw_tool_calls is not None:
+                    if not isinstance(raw_tool_calls, list):
+                        raise ValueError(f"assistant `tool_calls` must be a list: {raw_tool_calls!r}")
+                    tool_calls: List[Dict[str, Any]] = []
+                    pending_call_ids = []
+                    for call in raw_tool_calls:
+                        if not isinstance(call, dict):
+                            raise ValueError(f"assistant tool call must be an object: {call!r}")
+                        function = call.get("function")
+                        if not isinstance(function, dict):
+                            raise ValueError(f"assistant tool call missing `function`: {call!r}")
+                        name = function.get("name")
+                        if not isinstance(name, str) or not name:
+                            raise ValueError(f"assistant tool call missing function `name`: {call!r}")
+                        arguments = function.get("arguments", "")
+                        if not isinstance(arguments, str):
+                            arguments = json.dumps(arguments, ensure_ascii=False)
+                        call_id = call.get("id")
+                        if not isinstance(call_id, str) or not call_id:
+                            call_id = f"{id_prefix}_{call_counter}"
+                        call_counter += 1
+                        pending_call_ids.append(call_id)
+                        tool_calls.append(
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }
+                        )
+                    msg["tool_calls"] = tool_calls
             out.append(msg)
             i += 1
 
@@ -233,10 +314,29 @@ def _convert_messages(
     return out
 
 
+def _chat_fits_sequence_length(
+    tokenizer,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+    seq_length: int,
+) -> bool:
+    """Check a rendered length without materializing tokens beyond the budget."""
+    tokenized = tokenizer.apply_chat_template(
+        messages,
+        tools=tools,
+        tokenize=True,
+        return_dict=True,
+        padding=False,
+        truncation=True,
+        max_length=seq_length + 1,
+    )
+    return len(tokenized["input_ids"]) <= seq_length
+
+
 def _truncate_messages_to_fit(
     tokenizer,
     messages: List[Dict[str, Any]],
-    tools: Optional[List[Dict[str, Any]]],
+    tools: List[Dict[str, Any]] | None,
     seq_length: int,
 ) -> List[Dict[str, Any]]:
     """Drop the oldest conversation exchanges until the dialogue fits ``seq_length``.
@@ -262,7 +362,7 @@ def _truncate_messages_to_fit(
         overflows, that minimal suffix is returned and the caller's token-level
         ``truncation`` (if enabled) clips the remainder.
     """
-    if _tokenized_chat_length(tokenizer, messages, tools=tools) <= seq_length:
+    if _chat_fits_sequence_length(tokenizer, messages, tools, seq_length):
         return messages
 
     n_system = 0
@@ -280,7 +380,7 @@ def _truncate_messages_to_fit(
 
     for b in boundaries:
         candidate = system + history[b:]
-        if _tokenized_chat_length(tokenizer, candidate, tools=tools) <= seq_length:
+        if _chat_fits_sequence_length(tokenizer, candidate, tools, seq_length):
             return candidate
 
     # Even the final exchange alone overflows; return it and let token-level
@@ -293,13 +393,14 @@ def _format_example(
     tokenizer,
     eos_token_id: int,
     pad_token_id: int,
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
     truncate_history: bool = False,
+    trim_incomplete_last_turn: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``.
 
@@ -322,6 +423,7 @@ def _format_example(
             train_on_last_turn_only=train_on_last_turn_only,
             drop_history_reasoning_content=drop_history_reasoning_content,
             truncate_history=truncate_history,
+            trim_incomplete_last_turn=trim_incomplete_last_turn,
         )
     except Exception as e:
         raise ValueError(f"Failed to format agent SFT example (id={example.get('id')!r}): {e}") from e
@@ -332,13 +434,14 @@ def _format_example_impl(
     tokenizer,
     eos_token_id: int,
     pad_token_id: int,
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
     truncate_history: bool = False,
+    trim_incomplete_last_turn: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``."""
     raw_tools = example.get("tools")
@@ -360,6 +463,9 @@ def _format_example_impl(
         raw_messages = _sharegpt_to_chatml(sharegpt)
     elif not isinstance(raw_messages, list):
         raise ValueError(f"`messages` must be a list, got {type(raw_messages).__name__}")
+
+    if trim_incomplete_last_turn:
+        raw_messages = _trim_after_last_assistant(raw_messages)
 
     formatted = _convert_messages(
         raw_messages,
@@ -492,11 +598,12 @@ def _extract_eval_samples_from_example(
 
 def make_agent_chat_eval_samples(
     *,
-    dataset_name: Optional[str] = None,
-    path: Optional[Union[str, List[str]]] = None,
+    dataset_name: str | None = None,
+    path: Union[str, List[str]] | None = None,
     split: str = "train",
-    limit_dataset_samples: Optional[int] = None,
-    max_eval_samples: Optional[int] = None,
+    revision: str | None = None,
+    limit_dataset_samples: int | None = None,
+    max_eval_samples: int | None = None,
 ) -> List[Dict[str, Any]]:
     """Build a flat list of tool-call eval samples from an agent SFT dataset.
 
@@ -512,6 +619,7 @@ def make_agent_chat_eval_samples(
         dataset_name: HF Hub dataset id, e.g. ``llamafactory/glaive_toolcall_en``.
         path: Local JSON/JSONL file path or list of paths.
         split: Dataset split (only used with ``dataset_name``).
+        revision: Optional Hugging Face dataset revision.
         limit_dataset_samples: If set, read only the first N dialogues
             before expansion. Useful to bound evaluation cost.
         max_eval_samples: If set, cap the total expanded sample count.
@@ -533,7 +641,7 @@ def make_agent_chat_eval_samples(
                     "Dataset split %s already contains slice, skipping limit_dataset_samples",
                     split,
                 )
-        dataset = load_dataset(dataset_name, split=split)
+        dataset = load_dataset(dataset_name, split=split, revision=revision)
     else:
         data_files = [str(p) for p in (path if isinstance(path, list) else [path])]
         dataset = load_dataset("json", data_files=data_files, split="train")
@@ -553,11 +661,16 @@ def make_agent_chat_eval_samples(
 def make_agent_chat_dataset(
     tokenizer,
     *,
-    dataset_name: Optional[str] = None,
-    path: Optional[Union[str, List[str]]] = None,
+    dataset_name: str | None = None,
+    path: Union[str, List[str]] | None = None,
     split: str = "train",
-    seq_length: Optional[int] = None,
-    limit_dataset_samples: Optional[int] = None,
+    revision: str | None = None,
+    filter_no_assistant: bool = False,
+    filter_overlong: bool = False,
+    trim_incomplete_last_turn: bool = False,
+    chat_template: str | None = None,
+    seq_length: int | None = None,
+    limit_dataset_samples: int | None = None,
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
@@ -577,6 +690,19 @@ def make_agent_chat_dataset(
         dataset_name: HF Hub dataset id, e.g. ``llamafactory/glaive_toolcall_en``.
         path: Local JSON/JSONL file path or list of paths.
         split: Dataset split (only used with ``dataset_name``).
+        revision: Optional Hugging Face dataset revision. Agent trace repositories
+            may expose training-ready rows under ``refs/convert/parquet``.
+        filter_no_assistant: If True, discard incomplete traces that contain no
+            assistant message and therefore have no supervised target.
+        filter_overlong: If True, discard traces that still exceed ``seq_length``
+            after whole-exchange history truncation. This avoids token-level
+            truncation changing chat-template prefixes while answer-only loss
+            masks are constructed.
+        trim_incomplete_last_turn: If True, discard messages after the final
+            assistant message so an unfinished user turn cannot replace the
+            supervised target during history truncation.
+        chat_template: Optional Jinja template string or file path overriding
+            ``tokenizer.chat_template``.
         seq_length: Optional max sequence length for the tokenizer.
         limit_dataset_samples: If set, keep only the first N examples.
         padding: Padding strategy forwarded to the tokenizer.
@@ -610,6 +736,10 @@ def make_agent_chat_dataset(
     """
     if (dataset_name is None) == (path is None):
         raise ValueError("Exactly one of `dataset_name` or `path` must be provided")
+    if filter_overlong and seq_length is None:
+        raise ValueError("`filter_overlong=True` requires `seq_length` to be set")
+    if chat_template is not None:
+        tokenizer.chat_template = _resolve_chat_template(chat_template)
 
     # ``seq_length`` is forwarded to ``apply_chat_template(max_length=...)``, which
     # the tokenizer only honors when truncation is enabled (to cap the length) or
@@ -634,7 +764,7 @@ def make_agent_chat_dataset(
                 split = f"{split}[:{limit_dataset_samples}]"
             else:
                 logger.warning("Dataset split %s already contains slice, skipping limit_dataset_samples", split)
-        dataset = load_dataset(dataset_name, split=split)
+        dataset = load_dataset(dataset_name, split=split, revision=revision)
     else:
         data_files = [str(p) for p in (path if isinstance(path, list) else [path])]
         dataset = load_dataset("json", data_files=data_files, split="train")
@@ -642,8 +772,35 @@ def make_agent_chat_dataset(
             assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
             dataset = dataset.select(range(min(limit_dataset_samples, len(dataset))))
 
+    if filter_no_assistant:
+        dataset = dataset.filter(_has_assistant_message)
+
     eos_token_id = getattr(tokenizer, "eos_token_id", 0)
     pad_token_id = _add_pad_token(tokenizer) or eos_token_id
+
+    if filter_overlong:
+
+        def fits_sequence_length(example: Dict[str, Any]) -> bool:
+            tokenized = _format_example(
+                example,
+                tokenizer,
+                eos_token_id,
+                pad_token_id,
+                seq_length=seq_length + 1,
+                padding=False,
+                truncation=True,
+                mask_reasoning_content=mask_reasoning_content,
+                train_on_last_turn_only=train_on_last_turn_only,
+                drop_history_reasoning_content=drop_history_reasoning_content,
+                truncate_history=truncate_history,
+                trim_incomplete_last_turn=trim_incomplete_last_turn,
+            )
+            # Rendered with a ``seq_length + 1`` budget above, so an over-long
+            # trace comes back at ``seq_length + 1`` tokens. A trace that lands
+            # on exactly ``seq_length`` fits the real budget and is kept.
+            return len(tokenized["input_ids"]) <= seq_length
+
+        dataset = dataset.filter(fits_sequence_length)
 
     fmt_fn = lambda x: _format_example(  # noqa: E731
         x,
@@ -657,5 +814,71 @@ def make_agent_chat_dataset(
         train_on_last_turn_only=train_on_last_turn_only,
         drop_history_reasoning_content=drop_history_reasoning_content,
         truncate_history=truncate_history,
+        trim_incomplete_last_turn=trim_incomplete_last_turn,
     )
     return LazyMappedDataset(dataset, fmt_fn)
+
+
+@dataclass
+class AgentChatConfig:
+    """Construction-time configuration for the agent chat dataset (tokenizer is a build arg).
+
+    Exactly one of ``dataset_name`` or ``path`` must be set when calling :func:`build`.
+    """
+
+    accepts_tokenizer: ClassVar[bool] = True
+
+    dataset_name: str | None = None
+    """HF Hub dataset id, e.g. ``llamafactory/glaive_toolcall_en``."""
+    path: str | list[str] | None = None
+    """Local JSON/JSONL file path or list of paths."""
+    split: str = "train"
+    """Dataset split (only used with ``dataset_name``)."""
+    revision: str | None = None
+    """Optional Hugging Face dataset revision."""
+    filter_no_assistant: bool = False
+    """If True, discard examples without an assistant message."""
+    filter_overlong: bool = False
+    """If True, discard examples that remain longer than ``seq_length``."""
+    trim_incomplete_last_turn: bool = False
+    """If True, discard an unfinished exchange after the final assistant message."""
+    chat_template: str | None = None
+    """Optional Jinja template string or file path overriding the tokenizer template."""
+    seq_length: int | None = None
+    """Optional max sequence length for the tokenizer."""
+    limit_dataset_samples: int | None = None
+    """If set, keep only the first N examples."""
+    padding: str | bool = False
+    """Padding strategy forwarded to the tokenizer."""
+    truncation: str | bool = False
+    """Truncation strategy forwarded to the tokenizer."""
+    mask_reasoning_content: bool = False
+    """If True, exclude assistant ``reasoning_content`` tokens from the loss."""
+    train_on_last_turn_only: bool = False
+    """If True, supervise only the final assistant turn of each dialogue."""
+    drop_history_reasoning_content: bool = False
+    """If True, strip ``reasoning_content`` from all but the final assistant turn."""
+    truncate_history: bool = False
+    """If True, drop oldest exchanges until the dialogue fits ``seq_length``."""
+
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> LazyMappedDataset:
+        """Build the agent chat :class:`LazyMappedDataset` from this :class:`AgentChatConfig` and a runtime tokenizer."""
+        return make_agent_chat_dataset(
+            tokenizer,
+            dataset_name=self.dataset_name,
+            path=self.path,
+            split=self.split,
+            revision=self.revision,
+            filter_no_assistant=self.filter_no_assistant,
+            filter_overlong=self.filter_overlong,
+            trim_incomplete_last_turn=self.trim_incomplete_last_turn,
+            chat_template=self.chat_template,
+            seq_length=self.seq_length,
+            limit_dataset_samples=self.limit_dataset_samples,
+            padding=self.padding,
+            truncation=self.truncation,
+            mask_reasoning_content=self.mask_reasoning_content,
+            train_on_last_turn_only=self.train_on_last_turn_only,
+            drop_history_reasoning_content=self.drop_history_reasoning_content,
+            truncate_history=self.truncate_history,
+        )

@@ -17,7 +17,12 @@
 Provides ``DLLMSampler`` (core logic) with preset subclasses:
 
 - ``LLaDASampler``: no-cache, full-forward defaults.
+- ``SCDDSampler``: self-correcting ancestral sampling over the whole canvas.
+- ``LLaDA2Sampler``: built-in block-refinement generation defaults.
 - ``NemotronLabsDLLMSampler``: KV-cache block-diffusion defaults.
+- ``IDLMSampler``: I-DLM introspective strided decoding (Dream logit shift).
+- ``DiffusionGemmaSampler``: built-in HF diffusion-sampler defaults
+  (entropy-bounded denoising with adaptive stopping).
 
 Usage
 -----
@@ -28,6 +33,28 @@ LLaDA generation::
         --prompt "Explain what a neural network is." \
         --sampler llada
 
+SCDD generation (the schedule flags must match the training config)::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <path> \
+        --prompt "Explain what a neural network is." \
+        --sampler scdd --steps 128 --uniform_ratio 0.1
+
+I-DLM generation (``--mask_id`` is the reserved token used at training,
+e.g. 151669 for the Qwen3-based I-DLM checkpoint)::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <path> \
+        --prompt "Explain what a neural network is." \
+        --sampler idlm --mask_id 151669
+
+LLaDA2 generation::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <path> \
+        --prompt "Explain what a neural network is." \
+        --sampler llada2
+
 Nemotron-Labs-Diffusion generation::
 
     python examples/dllm_generate/generate.py \
@@ -35,13 +62,28 @@ Nemotron-Labs-Diffusion generation::
         --prompt "What is 2+2?" \
         --sampler nemotron
 
+Generate from a LoRA (PEFT) checkpoint — any sampler::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <base model id or SFT checkpoint> \
+        --adapter <lora checkpoint dir> \
+        --prompt "Explain what a neural network is." \
+        --sampler llada
+
+DiffusionGemma generation::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <path> \
+        --prompt "Explain what a neural network is." \
+        --sampler gemma
+
 Override preset defaults::
 
     python examples/dllm_generate/generate.py \
         --checkpoint <path> \
         --sampler nemotron --temperature 0.5 --steps 2048
 
-Infilling (any sampler)::
+Infilling (LLaDA sampler)::
 
     python examples/dllm_generate/generate.py \
         --checkpoint <path> \
@@ -63,16 +105,24 @@ from __future__ import annotations
 import argparse
 import math
 from dataclasses import dataclass, replace
-from typing import Optional
 
 import torch
 from utils import (
+    GEMMA_ADAPTER_KEY_MAP,
     get_num_transfer_tokens,
     get_transfer_index,
     load_model_and_tokenizer,
+    merge_adapter,
     resolve_checkpoint,
     trim_response,
 )
+
+from nemo_automodel.components.loss.dllm_loss import scdd_schedule
+
+# Probability floor for the SCDD reverse posterior: the schedule hits exact
+# zeros at t = 1 (no retained mass) and t = 0 (no absorbed mass), and those
+# divisions are only ever taken on the branch the result is discarded from.
+_SCDD_EPS = 1e-30
 
 # ---------------------------------------------------------------------------
 # Sampler config
@@ -89,9 +139,17 @@ class SamplerConfig:
     temperature: float = 0.0
     remasking: str = "low_confidence"
     use_kv_cache: bool = False
-    threshold: Optional[float] = None
+    threshold: float | None = None
     causal_context: bool = False
-    eos_token_id: Optional[int] = None
+    eos_token_id: int | None = None
+    # SCDD forward-process hyperparameters; must match the values the checkpoint
+    # was trained with (``dllm.uniform_ratio`` / ``schedule_shape`` /
+    # ``schedule_peak`` / ``eps`` in the training config). Ignored by the
+    # absorbing samplers.
+    uniform_ratio: float = 0.1
+    schedule_shape: float = 1.0
+    schedule_peak: float = 0.5
+    eps: float = 1e-3
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +166,12 @@ class DLLMSampler:
 
     default_config: SamplerConfig = SamplerConfig()
 
+    #: Next-token "logit shift". ``0`` reads the logit at position ``p`` to fill
+    #: mask ``p`` (standard masked diffusion, LLaDA). ``1`` reads the logit at
+    #: position ``p-1`` — the Dream-style shift I-DLM is trained with, where the
+    #: hidden state at ``i`` predicts token ``i+1``. Overridden by ``IDLMSampler``.
+    logit_shift: int = 0
+
     def __init__(self, model, mask_id: int, eos_id: int, **overrides):
         self.model = model
         self.mask_id = mask_id
@@ -115,6 +179,26 @@ class DLLMSampler:
         self.device = next(model.parameters()).device
         if overrides:
             self.default_config = replace(self.default_config, **overrides)
+
+    def _apply_logit_shift(self, logits: torch.Tensor) -> torch.Tensor:
+        """Align a next-token-shifted model's logits to the position they fill.
+
+        Args:
+            logits: Model logits of shape ``[batch, sequence, vocab]``, where row
+                ``i`` is the distribution over token ``i + logit_shift``.
+
+        Returns:
+            Logits of shape ``[batch, sequence, vocab]`` re-indexed so row ``p``
+            is the distribution predicting the token at position ``p``. The first
+            ``logit_shift`` rows are zeroed (they land on the prompt, which is
+            never masked, so they are ignored downstream).
+        """
+        s = self.logit_shift
+        if s == 0:
+            return logits
+        shifted = torch.zeros_like(logits)
+        shifted[:, s:] = logits[:, :-s]
+        return shifted
 
     def _set_diffusion_lm(self, enabled: bool):
         """Toggle the ``diffusion_lm`` flag on attention layers.
@@ -152,6 +236,12 @@ class DLLMSampler:
 
         use_kv_cache = cfg.use_kv_cache
         block_size = cfg.block_size
+
+        # The logit shift reads position p-1 to fill mask p. In the block-sliced
+        # KV path that predecessor lives in the cache (not in the current
+        # forward's logits), so the standalone shifted sampler runs full-forward.
+        if self.logit_shift and use_kv_cache:
+            raise ValueError("logit_shift (I-DLM) requires use_kv_cache=False for the standalone sampler.")
 
         if isinstance(inputs[0], list):
             inputs = [torch.as_tensor(p, dtype=torch.long, device=self.device) for p in inputs]
@@ -233,8 +323,17 @@ class DLLMSampler:
                     cur[transfer_idx] = x0[transfer_idx]
                     x[:, block_slice] = cur
                 else:
+                    # Restrict the candidate set to the current block BEFORE top-k
+                    # selection (matching the official LLaDA sampler and the KV-cache
+                    # branch above). Out-of-window positions must never win transfer
+                    # slots: cancelling them after selection leaves the block's
+                    # schedule underfilled, stranding mask tokens in the output.
                     mask_idx = x == self.mask_id
-                    logits = self.model(x, attention_mask=attention_mask).logits
+                    mask_idx[:, :block_start] = False
+                    mask_idx[:, block_end:] = False
+                    # No-op unless logit_shift != 0 (I-DLM); LLaDA/Nemotron presets
+                    # keep logit_shift = 0 and read the logit at the filled position.
+                    logits = self._apply_logit_shift(self.model(x, attention_mask=attention_mask).logits)
                     x0, transfer_idx = get_transfer_index(
                         logits,
                         cfg.temperature,
@@ -244,9 +343,6 @@ class DLLMSampler:
                         num_transfer_tokens=num_transfer_tokens[:, i],
                         threshold=cfg.threshold,
                     )
-                    for j in range(B):
-                        transfer_idx[j, :block_start] = False
-                        transfer_idx[j, block_end:] = False
                     x[transfer_idx] = x0[transfer_idx]
 
                 if cfg.eos_token_id is not None:
@@ -327,8 +423,15 @@ class DLLMSampler:
 
             transfer_schedule = get_num_transfer_tokens(block_mask, steps_per_block)
             for s in range(transfer_schedule.size(1)):
+                # Restrict the candidate set to this block's window BEFORE top-k
+                # (see the analogous fix in ``sample``): out-of-window masks must
+                # not steal transfer slots from the block's schedule.
                 mask_full = x == self.mask_id
-                logits = self.model(x, attention_mask=attention_mask).logits
+                for j in range(B):
+                    mask_full[j, :start] = False
+                    mask_full[j, start + widths[j] :] = False
+                # No-op unless logit_shift != 0 (I-DLM); see `sample` above.
+                logits = self._apply_logit_shift(self.model(x, attention_mask=attention_mask).logits)
                 x0, transfer_index = get_transfer_index(
                     logits,
                     cfg.temperature,
@@ -337,9 +440,6 @@ class DLLMSampler:
                     x,
                     num_transfer_tokens=transfer_schedule[:, s],
                 )
-                for j in range(B):
-                    transfer_index[j, :start] = False
-                    transfer_index[j, start + widths[j] :] = False
                 x[transfer_index] = x0[transfer_index]
 
         return x
@@ -361,6 +461,22 @@ class LLaDASampler(DLLMSampler):
         remasking="low_confidence",
         use_kv_cache=False,
         threshold=None,
+        causal_context=False,
+        eos_token_id=None,
+    )
+
+
+class LLaDA2Sampler(DLLMSampler):
+    """LLaDA2 defaults for the model's built-in block-refinement generation."""
+
+    default_config = SamplerConfig(
+        steps=32,
+        max_new_tokens=128,
+        block_size=32,
+        temperature=0.0,
+        remasking="low_confidence",
+        use_kv_cache=False,
+        threshold=0.5,
         causal_context=False,
         eos_token_id=None,
     )
@@ -389,10 +505,335 @@ class NemotronLabsDLLMSampler(DLLMSampler):
     )
 
 
+class IDLMSampler(DLLMSampler):
+    """I-DLM introspective strided decoding (Yu et al., 2026; arXiv:2604.11035).
+
+    I-DLM converts an AR model into a diffusion LM trained with a Dream-style
+    logit shift (the hidden state at ``i`` predicts token ``i+1``) under strict
+    causal attention. This standalone preset honours that contract:
+
+    - ``logit_shift = 1`` — fill mask ``p`` from the logit at position ``p-1``.
+      Without the shift a shifted checkpoint decodes garbage.
+    - The checkpoint is a causal LM, so the shared full-forward path already
+      attends causally (no bidirectional dLLM masking) — matching I-DLM's
+      strict-causal inference. ``use_kv_cache=False`` keeps the shifted decode
+      exact (the block-sliced KV path cannot see the ``p-1`` predecessor).
+    - ``block_size`` is the decode stride N (paper eval uses N=4); within each
+      block, confident masked positions are accepted in parallel via the
+      ``threshold`` rule, the diffusion parallelism over the AR baseline.
+
+    Checkpoint compatibility: the full-forward decode relies on the model
+    attending *causally* to an all-ones attention mask. This holds for an
+    Automodel I-DLM checkpoint (a plain ``Qwen3ForCausalLM``, causal by default),
+    so it decodes directly. It does NOT hold for the released HF reference
+    checkpoint (``yifanyu/I-DLM-8B``): its custom ``modeling_sdar.py`` treats an
+    all-ones mask as *bidirectional* and decodes garbage. To run those reference
+    weights, load them into a stock ``Qwen3ForCausalLM`` (their state-dict keys
+    match exactly) or pass an explicit causal mask.
+
+    The production engine is SGLang's ``IDLMBlockN`` (``--dllm-algorithm
+    IDLMBlockN``): each forward emits one clean AR anchor plus N-1 speculative
+    tokens that the next forward verifies left-to-right (``r = p/q``; greedy
+    argmax-verify), making it lossless-equivalent to AR decoding. That
+    speculative KV-cache engine is out of scope here; this preset is the portable
+    full-forward reference decode, mirroring ``NemotronLabsDLLMSampler``.
+    """
+
+    logit_shift = 1
+
+    default_config = SamplerConfig(
+        steps=256,
+        max_new_tokens=256,
+        block_size=4,
+        temperature=0.0,
+        remasking="low_confidence",
+        use_kv_cache=False,
+        threshold=0.9,
+        causal_context=False,
+        eos_token_id=None,  # resolved from tokenizer at runtime
+    )
+
+
+class SCDDSampler(DLLMSampler):
+    """SCDD ancestral sampler (openreview.net/forum?id=zQKlzKB6I9).
+
+    Where the absorbing samplers commit tokens irreversibly — each step unmasks
+    a few positions and never revisits them — SCDD resamples *every* generated
+    position from the exact reverse posterior at each step. A token the model
+    now believes is wrong can be replaced by a better one; that self-correction
+    is what keeps quality up when many positions are decoded per step.
+
+    Two cases make up the posterior, both derived from the mixed forward
+    schedule (:func:`~nemo_automodel.components.loss.dllm_loss.scdd_schedule`):
+
+    * a visible token can stay or be rewritten to another visible token. It is
+      never sent back to ``[MASK]``: ``[MASK]`` is absorbing in the forward
+      process, so the reverse posterior puts no mass on it,
+    * a ``[MASK]`` position un-absorbs into the denoiser's distribution or stays
+      masked.
+
+    A final argmax denoise at the last time point (SCDD's ``noise_removal``)
+    rewrites every generated position, clearing residual ``[MASK]`` and any
+    wrong-but-visible tokens the uniform channel left behind.
+
+    Unsupported knobs: ``use_kv_cache`` (every position is rewritten each step,
+    so nothing can be cached), ``block_size``, ``remasking`` and ``threshold``
+    (there is no top-k transfer schedule to gate). ``temperature`` sharpens the
+    denoiser distribution before the posterior is formed; ``0`` makes it
+    one-hot.
+    """
+
+    default_config = SamplerConfig(
+        steps=128,
+        max_new_tokens=128,
+        block_size=128,
+        temperature=1.0,
+        remasking="low_confidence",
+        use_kv_cache=False,
+        threshold=None,
+        causal_context=False,
+        eos_token_id=None,
+    )
+
+    def _denoiser_log_probs(self, x: torch.Tensor, attention_mask: torch.Tensor, temperature: float) -> torch.Tensor:
+        """Run the model and return log ``p_theta(. | x)`` over non-``[MASK]`` tokens.
+
+        Args:
+            x: Current token sequence, shape ``[batch, sequence]``.
+            attention_mask: Binary attention mask, shape ``[batch, sequence]``.
+            temperature: Softmax temperature. ``0`` yields a one-hot argmax
+                distribution (in log space, ``0`` and ``-inf``).
+
+        Returns:
+            Log-probabilities of shape ``[batch, sequence, vocab]`` with
+            ``-inf`` at the ``[MASK]`` column.
+        """
+        logits = self.model(x, attention_mask=attention_mask).logits.float()
+        mask_col = torch.tensor([self.mask_id], device=logits.device)
+        logits = logits.index_fill(-1, mask_col, float("-inf"))
+        if temperature == 0.0:
+            return torch.log_softmax(
+                torch.full_like(logits, float("-inf")).scatter(-1, logits.argmax(-1, keepdim=True), 0.0),
+                dim=-1,
+            )
+        return torch.log_softmax(logits / temperature, dim=-1)
+
+    @torch.no_grad()
+    def sample(
+        self,
+        inputs,
+        config: SamplerConfig | None = None,
+        **overrides,
+    ) -> torch.Tensor:
+        """Generate by iterating the SCDD reverse posterior over the full canvas.
+
+        Args:
+            inputs: List of prompt token tensors (each shape ``[prompt]``) or
+                lists of token IDs.
+            config: Full config. If ``None``, uses :attr:`default_config`.
+            **overrides: Override individual fields on the config.
+
+        Returns:
+            Token tensor of shape ``[batch, max_prompt + max_new_tokens]``.
+        """
+        cfg = config or self.default_config
+        if overrides:
+            cfg = replace(cfg, **overrides)
+        if cfg.use_kv_cache:
+            raise ValueError("SCDD resamples every position each step; use_kv_cache is not supported.")
+
+        if isinstance(inputs[0], list):
+            inputs = [torch.as_tensor(p, dtype=torch.long, device=self.device) for p in inputs]
+        prompt_lens = [p.shape[0] for p in inputs]
+        max_prompt_len = max(prompt_lens)
+        B = len(inputs)
+        gen_length = cfg.max_new_tokens
+        T = max_prompt_len + gen_length
+
+        x = torch.full((B, T), self.eos_id, dtype=torch.long, device=self.device)
+        attention_mask = torch.zeros((B, T), dtype=torch.long, device=self.device)
+        # Positions the sampler owns: the generation window of each prompt. Left
+        # of it is the prompt; right of it is padding for shorter prompts.
+        canvas = torch.zeros((B, T), dtype=torch.bool, device=self.device)
+        for i, p in enumerate(inputs):
+            x[i, : prompt_lens[i]] = p
+            end = min(prompt_lens[i] + gen_length, T)
+            x[i, prompt_lens[i] : end] = self.mask_id
+            canvas[i, prompt_lens[i] : end] = True
+            attention_mask[i, :end] = 1
+
+        timesteps = torch.linspace(1.0, cfg.eps, cfg.steps + 1, device=self.device)
+        schedule_kwargs = {
+            "max_ratio": cfg.uniform_ratio,
+            "gamma_shape": cfg.schedule_shape,
+            "t_peak": cfg.schedule_peak,
+        }
+
+        # Every sequence shares the same time grid, so the schedule is scalar and
+        # only the canvas positions are ever rewritten. Working on the flattened
+        # canvas rows keeps the posterior at [canvas_tokens, vocab] instead of
+        # [batch, sequence, vocab], and keeps the prompt out of it: at t = 1 the
+        # visible-token posterior there is identically zero (all mass sits on the
+        # absorbing state), which multinomial rejects.
+        canvas_flat = canvas.reshape(-1)
+
+        for i in range(cfg.steps):
+            sched_t = scdd_schedule(timesteps[i].reshape(1), **schedule_kwargs)
+            sched_s = scdd_schedule(timesteps[i + 1].reshape(1), **schedule_kwargs)
+
+            clean_transition = sched_t.clean_mass / sched_s.clean_mass.clamp(min=_SCDD_EPS)
+            uniform_transition = sched_t.gamma / sched_s.gamma.clamp(min=_SCDD_EPS) - clean_transition
+            absorbing_transition = 1.0 - clean_transition - uniform_transition
+
+            log_p = self._denoiser_log_probs(x, attention_mask, cfg.temperature)
+            vocab = log_p.size(-1)
+            # Domain of the denoiser: the vocabulary minus the absorbing state.
+            num_states = vocab - 1
+            p_theta = log_p.reshape(-1, vocab)[canvas_flat].exp()  # [canvas_tokens, vocab]
+            del log_p
+            current = x[canvas]  # [canvas_tokens]
+            p_at_current = p_theta.gather(-1, current[:, None])  # [canvas_tokens, 1]
+
+            # --- visible token: stay, or be rewritten (the correction channel) ---
+            denom = sched_t.uniform_mass / num_states + sched_t.clean_mass * p_at_current
+            numer = (sched_s.clean_mass * uniform_transition / num_states) * p_theta + (
+                sched_s.uniform_mass * uniform_transition
+            ) / num_states**2
+            stay = (sched_s.clean_mass * clean_transition) * p_at_current + (
+                clean_transition * sched_s.uniform_mass
+            ) / num_states
+            numer = numer.scatter_add(-1, current[:, None], stay)
+            numer[:, self.mask_id] = 0.0
+            visible_probs = numer / denom.clamp(min=_SCDD_EPS)
+
+            # --- [MASK]: un-absorb into the denoiser, or stay masked ---
+            release = absorbing_transition / sched_t.absorbed_mass.clamp(min=_SCDD_EPS)
+            masked_probs = release * sched_s.uniform_mass / num_states + (release * sched_s.clean_mass) * p_theta
+            masked_probs[:, self.mask_id] = sched_s.absorbed_mass / sched_t.absorbed_mass.clamp(min=_SCDD_EPS)
+
+            rows = torch.where((current == self.mask_id)[:, None], masked_probs, visible_probs).clamp(min=0)
+            # A posterior with no reachable state (possible only for a degenerate
+            # schedule, e.g. uniform_ratio=0) keeps the current token.
+            keep = torch.zeros_like(rows).scatter(-1, current[:, None], 1.0)
+            rows = torch.where(rows.sum(-1, keepdim=True) > 0, rows, keep)
+            x = x.clone()
+            x[canvas] = torch.multinomial(rows, 1).squeeze(-1)
+
+        # Final noise-removal denoise: argmax every canvas position, not just the
+        # residual [MASK]. At t = eps the uniform channel still leaves wrong-but-
+        # visible tokens that only this pass corrects; the mask column is -inf, so
+        # leftover [MASK] resolves too. The prompt is off-canvas and untouched.
+        if canvas.any():
+            final = self._denoiser_log_probs(x, attention_mask, 0.0).argmax(-1)
+            x = torch.where(canvas, final, x)
+
+        return x
+
+
+class DiffusionGemmaSampler(DLLMSampler):
+    """Config-preset holder for DiffusionGemma generation.
+
+    DiffusionGemma ships its own diffusion sampler inside ``transformers``
+    (entropy-bounded denoising with adaptive stopping over canvas blocks), so
+    the CLI in ``main`` routes generation through ``model.generate(...)`` via
+    :func:`generate_gemma`. The inherited mask-based ``sample`` method is
+    unused on this path; only ``max_new_tokens`` and ``steps`` (mapped to the
+    sampler's ``max_denoising_steps``) are forwarded — the remaining sampler
+    hyperparameters keep their upstream defaults.
+    """
+
+    default_config = SamplerConfig(
+        steps=48,  # transformers DiffusionGemmaGenerationConfig.max_denoising_steps default
+        max_new_tokens=256,  # transformers DiffusionGemmaGenerationConfig default
+    )
+
+
 SAMPLERS = {
     "llada": LLaDASampler,
+    "scdd": SCDDSampler,
+    "llada2": LLaDA2Sampler,
     "nemotron": NemotronLabsDLLMSampler,
+    "idlm": IDLMSampler,
+    "gemma": DiffusionGemmaSampler,
 }
+
+
+@torch.no_grad()
+def generate_llada2(model, tokenizer, inputs, config: SamplerConfig, mask_id: int, eos_id: int) -> list[str]:
+    """Generate one LLaDA2 response per prompt with the model's native sampler.
+
+    LLaDA2's remote-code implementation only supports batch size one and
+    returns generated tokens without the prompt, so prompts are processed
+    individually and the returned token IDs are decoded directly.
+    """
+    if mask_id is None or eos_id is None:
+        raise ValueError("LLaDA2 generation requires tokenizer mask and EOS token IDs")
+
+    device = next(model.parameters()).device
+    sequences = []
+    for prompt_ids in inputs:
+        prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+        generated = model.generate(
+            inputs=prompt_tensor,
+            temperature=config.temperature,
+            block_length=config.block_size,
+            steps=config.steps,
+            gen_length=config.max_new_tokens,
+            eos_early_stop=True,
+            threshold=config.threshold,
+            # LLaDA2-specific speed-mode settings; keep them out of the shared CLI.
+            editing_threshold=0.0,
+            max_post_steps=16,
+            eos_id=eos_id,
+            mask_id=mask_id,
+        )
+        sequences.append(tokenizer.decode(generated[0], skip_special_tokens=True))
+    return sequences
+
+
+@torch.no_grad()
+def generate_gemma(model, tokenizer, inputs, config: SamplerConfig, eos_id: int) -> list[str]:
+    """Generate one DiffusionGemma response per prompt with the model's built-in sampler.
+
+    DiffusionGemma's ``generate`` (shipped with ``transformers``) performs
+    entropy-bounded denoising with adaptive stopping over canvas blocks.
+    Returned sequences include the prompt (with post-EOS positions padded),
+    so only the tail is decoded.
+    """
+    if eos_id is None:
+        raise ValueError("DiffusionGemma generation requires a tokenizer EOS token ID")
+
+    pad_id = tokenizer.pad_token_id if getattr(tokenizer, "pad_token_id", None) is not None else eos_id
+    device = getattr(model, "device", None) or next(model.parameters()).device
+    sequences = []
+    for prompt_ids in inputs:
+        prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+        out = model.generate(
+            input_ids=prompt_tensor,
+            max_new_tokens=config.max_new_tokens,
+            max_denoising_steps=config.steps,
+            eos_token_id=eos_id,
+            pad_token_id=pad_id,
+        )
+        generated = out.sequences[0, prompt_tensor.shape[1] :]
+        sequences.append(tokenizer.decode(generated, skip_special_tokens=True))
+    return sequences
+
+
+def encode_generation_prompts(tokenizer, prompts: list[str], raw: bool) -> list[list[int]]:
+    """Tokenize raw prompts or a batch of single-turn chat prompts."""
+    if raw:
+        return [tokenizer.encode(prompt, add_special_tokens=True) for prompt in prompts]
+
+    messages = [[{"role": "user", "content": prompt}] for prompt in prompts]
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors=None,
+        return_dict=True,
+    )
+    return encoded["input_ids"]
 
 
 # ---------------------------------------------------------------------------
@@ -421,14 +862,53 @@ def main():
     parser.add_argument("--remasking", default=None, choices=["low_confidence", "random"])
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument(
+        "--uniform_ratio",
+        type=float,
+        default=None,
+        help="SCDD peak uniform-noise ratio; must match dllm.uniform_ratio used in training.",
+    )
+    parser.add_argument(
+        "--schedule_shape",
+        type=float,
+        default=None,
+        help="SCDD uniform-noise bump shape; must match dllm.schedule_shape used in training.",
+    )
+    parser.add_argument(
+        "--schedule_peak",
+        type=float,
+        default=None,
+        help="SCDD uniform-noise peak time; must match dllm.schedule_peak used in training.",
+    )
+    parser.add_argument(
+        "--mask_id",
+        type=int,
+        default=None,
+        help="Override the mask token id (required for I-DLM, whose Qwen3 tokenizer "
+        "has no mask token; use the reserved id from training, e.g. 151669).",
+    )
+    parser.add_argument(
         "--no_kv_cache",
         action="store_true",
         help="Disable KV cache (also disables causal context)",
     )
     parser.add_argument("--raw", action="store_true", help="No chat template")
     parser.add_argument("--infill", action="store_true", help="Infilling mode")
+    parser.add_argument(
+        "--adapter",
+        default=None,
+        help="Path to a PEFT (LoRA) adapter checkpoint dir; merged into the base --checkpoint model before generation",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    if args.infill and args.sampler == "llada2":
+        parser.error("--infill is not supported by the LLaDA2 generation path")
+    if args.infill and args.sampler == "nemotron":
+        parser.error("--infill is not supported by the Nemotron generation path (the tokenizer has no mask token)")
+    if args.infill and args.sampler == "gemma":
+        parser.error("--infill is not supported by the DiffusionGemma generation path")
+    if args.infill and args.sampler == "scdd":
+        parser.error("--infill is not supported by the SCDD sampler (it has no top-k transfer schedule)")
 
     try:
         checkpoint_path = resolve_checkpoint(args.checkpoint)
@@ -440,10 +920,34 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    model, tokenizer, mask_id, eos_id = load_model_and_tokenizer(checkpoint_path, sampler_name=args.sampler)
+    model, tokenizer, mask_id, eos_id = load_model_and_tokenizer(
+        checkpoint_path, sampler_name=args.sampler, mask_id_override=args.mask_id
+    )
+    if mask_id is None:
+        parser.error(
+            f"Could not resolve a mask token id for sampler {args.sampler!r}; "
+            "pass --mask_id (e.g. 151669 for the Qwen3-based I-DLM checkpoint)."
+        )
+
+    if args.adapter:
+        print(f"Merging adapter: {args.adapter}")
+        # DiffusionGemma trains on the native Automodel implementation but
+        # generates through the HF class; re-parent the adapter module paths.
+        key_map = GEMMA_ADAPTER_KEY_MAP if args.sampler == "gemma" else None
+        model = merge_adapter(model, args.adapter, key_map=key_map)
 
     overrides = {}
-    for key in ["steps", "max_new_tokens", "block_size", "temperature", "remasking", "threshold"]:
+    for key in [
+        "steps",
+        "max_new_tokens",
+        "block_size",
+        "temperature",
+        "remasking",
+        "threshold",
+        "uniform_ratio",
+        "schedule_shape",
+        "schedule_peak",
+    ]:
         val = getattr(args, key)
         if val is not None:
             overrides[key] = val
@@ -452,7 +956,7 @@ def main():
     if args.no_kv_cache:
         overrides["use_kv_cache"] = False
         overrides["causal_context"] = False
-    if args.sampler == "nemotron" and "eos_token_id" not in overrides:
+    if args.sampler in ("nemotron", "idlm") and "eos_token_id" not in overrides:
         overrides["eos_token_id"] = eos_id
 
     sampler_cls = SAMPLERS[args.sampler]
@@ -472,6 +976,7 @@ def main():
             add_generation_prompt=False,
             tokenize=True,
             return_tensors=None,
+            return_dict=True,
         )
         outputs = sampler.infill(encoded["input_ids"])
         for i, prompt in enumerate(args.prompt):
@@ -480,17 +985,7 @@ def main():
     else:
         gen_mode = "RAW" if args.raw else "CHAT"
         print(f"\n{'=' * 80}\n{f'{gen_mode} GENERATION ({args.sampler})':^80}\n{'=' * 80}")
-        if args.raw:
-            inputs = [tokenizer.encode(p, add_special_tokens=True) for p in args.prompt]
-        else:
-            messages_list = [[{"role": "user", "content": p}] for p in args.prompt]
-            encoded = tokenizer.apply_chat_template(
-                messages_list,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors=None,
-            )
-            inputs = encoded["input_ids"]
+        inputs = encode_generation_prompts(tokenizer, args.prompt, args.raw)
 
         if args.sampler == "nemotron":
             # Use the model's built-in block-diffusion generate (with the
@@ -520,11 +1015,34 @@ def main():
                     )
                 generated = out_ids[0, prompt_tensor.shape[1] :]
                 sequences.append(tokenizer.decode(generated, skip_special_tokens=True))
+        elif args.sampler == "llada2":
+            # LLaDA2 checkpoints ship a model-specific block-refinement
+            # ``generate`` implementation. It returns generated-only IDs and
+            # currently supports one prompt per call.
+            sequences = generate_llada2(model, tokenizer, inputs, sampler.default_config, mask_id, eos_id)
+        elif args.sampler == "gemma":
+            # DiffusionGemma ships its own diffusion sampler in ``transformers``
+            # (entropy-bounded denoising with adaptive stopping); route through it.
+            sequences = generate_gemma(model, tokenizer, inputs, sampler.default_config, eos_id)
         else:
             # LLaDA path: LLaDA checkpoints don't ship a built-in ``generate``
             # method, so fall back to the standalone ``DLLMSampler`` here.
-            outputs = sampler.sample(inputs)
-            sequences = trim_response(tokenizer, outputs.tolist(), inputs)
+            #
+            # ``sample()``'s batched EOS-stop and block windows assume every row has
+            # the longest prompt (the canvas is one rectangle sized to
+            # ``max_prompt_len``). With unequal-length prompts that strands the
+            # shorter rows: their tail EOS-fill reads as an early stop, one row
+            # finishing halts refinement for the whole batch, and their block
+            # windows are anchored past the real prompt. When an ``eos_token_id`` is
+            # active, decode one prompt at a time (B=1) so shorter prompts still
+            # complete. Inert for the current LLaDA preset (``eos_token_id=None``);
+            # guards the EOS-stop path once a preset sets it (e.g. I-DLM).
+            if len(inputs) > 1 and sampler.default_config.eos_token_id is not None:
+                outputs = [sampler.sample([inp]) for inp in inputs]
+                sequences = [trim_response(tokenizer, o.tolist(), [inp])[0] for o, inp in zip(outputs, inputs)]
+            else:
+                outputs = sampler.sample(inputs)
+                sequences = trim_response(tokenizer, outputs.tolist(), inputs)
         for i, (prompt, response) in enumerate(zip(args.prompt, sequences)):
             print(f"\n{'─' * 80}\n[Prompt {i}] {prompt}\n{'─' * 80}")
             print(response.strip() or "<empty>")

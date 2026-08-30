@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from datetime import timedelta
 from unittest.mock import Mock
 
 import pytest
@@ -20,8 +22,10 @@ import torch.nn as nn
 
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
+    _all_reduce_scalar,
     clip_grad_norm,
     count_tail_padding,
+    get_expert_tp_replication_factor,
     move_to_device,
     scale_grads_and_clip_grad_norm,
 )
@@ -98,7 +102,9 @@ def test_clip_grad_norm_with_pp_and_tp():
 
     device_mesh = Mock()
     device_mesh.mesh_dim_names = ["pp", "tp"]
-    device_mesh.__getitem__ = Mock(side_effect=lambda key: Mock(size=Mock(return_value=2)))
+    # device_type must be a real string: a DeviceMesh always exposes one, and the norm
+    # reduction compares it against the accumulator's device to pick the comm device.
+    device_mesh.__getitem__ = Mock(side_effect=lambda key: Mock(size=Mock(return_value=2), device_type="cpu"))
 
     grad_norm = clip_grad_norm(
         max_grad_norm=1.0,
@@ -122,7 +128,30 @@ def test_clip_grad_norm_works_without_pp():
         pp_enabled=False,
     )
 
+    assert isinstance(grad_norm, torch.Tensor)
     assert grad_norm > 0
+
+
+@pytest.mark.parametrize(
+    ("gradient", "expected"),
+    [
+        (0.0, 0.0),
+        (float("inf"), float("inf")),
+        (float("nan"), float("nan")),
+    ],
+)
+def test_clip_grad_norm_preserves_zero_and_nonfinite_results(gradient: float, expected: float):
+    """Branch-free scaling preserves the prior zero and non-finite norm behavior."""
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.full_like(model.weight, gradient)
+
+    grad_norm = clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
+
+    assert isinstance(grad_norm, torch.Tensor)
+    if math.isnan(expected):
+        assert torch.isnan(grad_norm)
+    else:
+        torch.testing.assert_close(grad_norm, torch.tensor(expected, dtype=grad_norm.dtype))
 
 
 def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
@@ -148,6 +177,28 @@ def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
     assert clip_grad_norm_mock.call_args.kwargs["error_if_nonfinite"] is False
     assert clip_grad_norm_mock.call_args.kwargs["foreach"] is True
     clip_grads_with_norm_mock.assert_not_called()
+
+
+def test_clip_grad_norm_disables_torch_fast_path_for_owner_shard(monkeypatch):
+    """A model-owned local shard requires the contract's global norm group."""
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0, 4.0]])
+    model.weight._nemo_model_owned_grad_divisor = 1.0
+
+    torch_clip_mock = Mock(return_value=torch.tensor(-1.0))
+    sharding_aware_clip_mock = Mock()
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", torch_clip_mock)
+    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", sharding_aware_clip_mock)
+
+    grad_norm = clip_grad_norm(
+        max_grad_norm=10.0,
+        model_parts=[model],
+        use_torch_clip_grad_norm=True,
+    )
+
+    torch.testing.assert_close(grad_norm, torch.tensor(5.0, dtype=torch.float64))
+    torch_clip_mock.assert_not_called()
+    sharding_aware_clip_mock.assert_called_once()
 
 
 def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
@@ -212,6 +263,150 @@ def test_clip_grad_norm_actually_clips():
     # Verify the actual gradients are clipped
     clipped_norm = torch.sqrt(model.weight.grad.pow(2).sum() + model.bias.grad.pow(2).sum()).item()
     assert abs(clipped_norm - max_norm) < 1e-3
+
+
+def test_clip_grad_norm_large_finite_gradients_do_not_overflow():
+    """Finite rare-token embedding gradients can exceed fp32 squared-norm range."""
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[6.0e31, 4.0]], dtype=model.weight.dtype)
+
+    max_norm = 0.3
+    grad_norm = clip_grad_norm(
+        max_grad_norm=max_norm,
+        model_parts=[model],
+        pp_enabled=False,
+    )
+
+    assert math.isfinite(grad_norm)
+    assert grad_norm > 1.0e31
+    assert torch.isfinite(model.weight.grad).all()
+    assert torch.linalg.vector_norm(model.weight.grad.double(), ord=2).item() <= max_norm + 1.0e-6
+
+
+def _run_empty_local_shard_clip_worker(rank: int, world_size: int, init_file: str) -> None:
+    """Exercise clipping when one rank owns an empty DTensor gradient shard."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
+        local_param = torch.ones(1, 2) if rank == 0 else torch.empty(0, 2)
+        local_grad = torch.tensor([[3.0, 4.0]]) if rank == 0 else torch.empty(0, 2)
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(
+            DTensor.from_local(
+                local_param,
+                mesh,
+                [Shard(0)],
+                run_check=False,
+                shape=(1, 2),
+                stride=(2, 1),
+            )
+        )
+        model.weight.grad = DTensor.from_local(
+            local_grad,
+            mesh,
+            [Shard(0)],
+            run_check=False,
+            shape=(1, 2),
+            stride=(2, 1),
+        )
+
+        grad_norm = clip_grad_norm(
+            max_grad_norm=1.0,
+            model_parts=[model],
+            pp_enabled=False,
+            foreach=False,
+        )
+
+        assert grad_norm == pytest.approx(5.0)
+        if rank == 0:
+            torch.testing.assert_close(model.weight.grad.to_local(), torch.tensor([[0.6, 0.8]]))
+        else:
+            assert model.weight.grad.to_local().numel() == 0
+        torch.distributed.barrier()
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_clip_grad_norm_handles_empty_local_dtensor_shards(tmp_path):
+    """Empty rank-local DTensor shards contribute zero without breaking collectives."""
+    torch.multiprocessing.spawn(
+        _run_empty_local_shard_clip_worker,
+        args=(2, str(tmp_path / "empty_local_shard_pg")),
+        nprocs=2,
+        join=True,
+    )
+
+
+class _FakeMesh:
+    """Minimal DeviceMesh stand-in; ``_all_reduce_scalar`` needs only these two members."""
+
+    def __init__(self, device_type: str):
+        self.device_type = device_type
+
+    def get_group(self, mesh_dim=None):
+        return f"pg:{mesh_dim}"
+
+
+def test_all_reduce_scalar_reduces_in_place_when_devices_match(monkeypatch):
+    """Without CPU offload the scalar already sits on the mesh device: reduce in place.
+
+    This is the guard that the fix is inert for every non-offload recipe -- the same
+    tensor object goes into the same in-place all_reduce and comes back out.
+    """
+    seen = {}
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        seen["tensor"] = tensor
+        seen["group"] = group
+        tensor.add_(1.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    mesh = _FakeMesh("cpu")
+    scalar = torch.zeros((), dtype=torch.float64)
+    out = _all_reduce_scalar(scalar, torch.distributed.ReduceOp.MAX, mesh, 0)
+
+    assert out is scalar
+    assert seen["tensor"] is scalar
+    assert seen["group"] == "pg:0"
+    assert out.item() == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_all_reduce_scalar_moves_offloaded_scalar_to_mesh_device(monkeypatch):
+    """CPU-offloaded gradients must not be all-reduced on the NCCL group as CPU tensors.
+
+    Regression test for the CPUOffloadPolicy crash: FSDP2 leaves the local gradient
+    shard -- and therefore the norm accumulator derived from it -- on CPU, while the
+    mesh's process group is NCCL and has no CPU backend.
+    """
+    seen = {}
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        seen["device"] = tensor.device
+        tensor.add_(1.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    mesh = _FakeMesh("cuda")
+    scalar = torch.zeros((), dtype=torch.float64)  # on CPU, as under CPUOffloadPolicy
+    out = _all_reduce_scalar(scalar, torch.distributed.ReduceOp.SUM, mesh, 1)
+
+    # Pre-fix this was "cpu", which NCCL rejects with
+    # "No backend type associated with device type cpu".
+    assert seen["device"].type == "cuda"
+    # The result returns to the gradients' device so the clip math stays consistent.
+    assert out.device.type == "cpu"
+    assert out.item() == 1.0
 
 
 def test_clip_grad_norm_with_inf_norm():
@@ -378,6 +573,20 @@ class _MoEModule(nn.Module):
 class TestScaleGradsAndClipGradNorm:
     """Tests for scale_grads_and_clip_grad_norm with EP scaling."""
 
+    def test_owner_shard_uses_explicit_gradient_divisor(self):
+        """Owner scaling is declared by the model and independent of DP arguments."""
+        model = nn.Linear(2, 1, bias=False)
+        model.weight.grad = torch.full_like(model.weight, 8.0)
+        model.weight._nemo_model_owned_grad_divisor = 4.0
+
+        scale_grads_and_clip_grad_norm(
+            max_grad_norm=None,
+            model_parts=[model],
+            dp_group_size=999,
+        )
+
+        torch.testing.assert_close(model.weight.grad, torch.full_like(model.weight, 2.0))
+
     def test_ep_scaling_for_expert_params_by_name(self):
         """Test that expert params are scaled by EP ratio based on param name."""
         model = _MoEModule()
@@ -403,6 +612,66 @@ class TestScaleGradsAndClipGradNorm:
         # Non-expert params (gate) should NOT be scaled
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 2.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 1.0)
+
+    def test_ep_scaling_removes_replicated_tp_token_factor_from_experts_only(self):
+        """TP-replicated MoE inputs add a TP factor only to expert gradients."""
+        model = _MoEModule()
+        expert_param = model.mlp["experts"].gate_up_linear.weight0
+        model.gate.weight.grad = torch.ones_like(model.gate.weight) * 8.0
+        expert_param.grad = torch.ones_like(expert_param) * 8.0
+
+        moe_mesh = Mock()
+        moe_mesh.mesh_dim_names = ["ep_shard"]
+        moe_mesh.__getitem__ = Mock(return_value=Mock(size=Mock(return_value=2)))
+
+        scale_grads_and_clip_grad_norm(
+            max_grad_norm=None,
+            model_parts=[model],
+            moe_mesh=moe_mesh,
+            dp_group_size=4,
+            expert_tp_replication_factor=2,
+        )
+
+        # Base EP divisor = 4/2 = 2; replicated TP tokens add another 2.
+        assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
+        # Router/dense replicas stay identical across TP ranks via the
+        # fail-closed identical-pretrained-weights invariant (no separate
+        # sync) and must never receive the expert-only divisor.
+        assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 8.0)
+
+    @pytest.mark.parametrize(
+        "factor,exc",
+        [(0, ValueError), (-1, ValueError), (True, TypeError), (1.5, TypeError)],
+    )
+    def test_ep_tp_replication_factor_is_strictly_validated(self, factor, exc):
+        with pytest.raises(exc, match="expert_tp_replication_factor"):
+            scale_grads_and_clip_grad_norm(
+                max_grad_norm=None,
+                model_parts=[_MoEModule()],
+                expert_tp_replication_factor=factor,
+            )
+
+    def test_get_expert_tp_replication_factor_requires_moe_tp_marker_and_tp_axis(self):
+        """The factor is tp_size only when the custom-MoE TP path marked the model."""
+        marked = _MoEModule()
+        marked._nemo_moe_tp_requires_replica_sync = True
+        unmarked = _MoEModule()
+
+        tp_mesh = Mock()
+        tp_mesh.mesh_dim_names = ("dp", "tp")
+        tp_mesh.__getitem__ = Mock(return_value=Mock(size=Mock(return_value=2)))
+        no_tp_mesh = Mock()
+        no_tp_mesh.mesh_dim_names = ("dp",)
+
+        assert get_expert_tp_replication_factor([marked], tp_mesh) == 2
+        assert get_expert_tp_replication_factor([unmarked], tp_mesh) == 1
+        assert get_expert_tp_replication_factor([marked], no_tp_mesh) == 1
+        assert get_expert_tp_replication_factor([marked], None) == 1
+
+        tp1_mesh = Mock()
+        tp1_mesh.mesh_dim_names = ("dp", "tp")
+        tp1_mesh.__getitem__ = Mock(return_value=Mock(size=Mock(return_value=1)))
+        assert get_expert_tp_replication_factor([marked], tp1_mesh) == 1
 
     def test_no_ep_scaling_without_moe_mesh(self):
         """Test that no EP scaling occurs when moe_mesh is None."""

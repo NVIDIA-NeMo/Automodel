@@ -103,3 +103,7 @@ freeze_config:
 
 ci:
   recipe_owner: akoumpa
+  nodes: 1
+  time: "00:15:00"
+  checkpoint_robustness:
+    tokenizer_name: mistralai/Ministral-3-3B-Reasoning-2512

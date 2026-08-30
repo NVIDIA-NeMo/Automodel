@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Union
 
 import torch
 from transformers import PretrainedConfig
@@ -43,8 +43,12 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
-from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
+from nemo_automodel.components.models.mistral3.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
 )
 
@@ -112,6 +116,13 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     Mistral3 VLM checkpoint (e.g. dawn-ridge-128B).
     """
 
+    # This class serves both tied checkpoints (Ministral-3, whose lm_head is not
+    # serialized) and untied checkpoints (Mistral-Medium-3.5-128B, Devstral-24B,
+    # tie_word_embeddings=False). Per-checkpoint tie semantics are enforced by
+    # the from_pretrained flip guard, not at construction.
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+
     # See checkpointing.py:initialize_model_weights — gate on this attribute
     # to skip HF's ``initialize_weights()``. The upcoming adapter load will
     # populate every tensor, and skipping avoids a stage-divergent DTensor
@@ -119,6 +130,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     # indefinitely (empirically verified: without this attribute the 4-layer
     # smoke never reaches the adapter load stage within 300s).
     _skip_init_weights_on_load = True
+    _supports_streaming_fp8_checkpoint_load = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -130,6 +142,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         supports_ep: bool = False
 
     def __init__(self, config: PretrainedConfig):
+        reject_unsupported_tie_word_embeddings(type(self), config)
         # HF's Mistral3ForConditionalGeneration.__init__ consults
         # ``config.quantization_config`` and swaps nn.Linear → FP8Linear for
         # every language_model Linear. FP8Linear registers a 0-d
@@ -152,7 +165,8 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 except AttributeError:
                     pass
         super().__init__(config)
-        self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full()
+        self.tie_weights()
+        self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
 
         # Lazy non-persistent buffer reinit. HF's Ministral3RotaryEmbedding /
         # PixtralRotaryEmbedding compute `inv_freq` in their __init__. Under
@@ -174,19 +188,24 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 sub._mistral3_fp8_rotary_reinit_done = False
                 sub.register_forward_pre_hook(_rotary_reinit_self_hook, with_kwargs=True, prepend=True)
 
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        """Tie ``lm_head`` to the active text embedding when requested."""
+        if getattr(getattr(self, "config", None), "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.language_model.embed_tokens.weight
+
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
         past_key_values=None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        image_sizes: Optional[torch.Tensor] = None,
-        output_hidden_states: Optional[bool] = None,
+        image_sizes: torch.Tensor | None = None,
+        output_hidden_states: bool | None = None,
         **kwargs,
     ) -> Mistral3CausalLMOutputWithPast:
         """Forward pass with memory-efficient fused cross-entropy (cut-CE) support.
@@ -263,16 +282,18 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
 
     @classmethod
     def supports_config(cls, config: PretrainedConfig) -> bool:
-        """Claim FP8-native Mistral3 VLM configs.
+        """Claim FP8-native and dequantized Mistral3 VLM configs.
 
         Matches ``Mistral3Config`` (outer VLM) with a ministral3 text backbone
-        and ``quantization_config.quant_method == 'fp8'``.
+        and either no quantization config or ``quantization_config.quant_method
+        == 'fp8'``. Consolidated checkpoints are saved in BF16 without the
+        source FP8 metadata and still require this class's rotary-buffer reinit.
         """
         text_config = getattr(config, "text_config", None)
         if text_config is None or getattr(text_config, "model_type", None) != "ministral3":
             return False
         qc = getattr(config, "quantization_config", None)
         if qc is None:
-            return False
+            return True
         method = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
         return method == "fp8"

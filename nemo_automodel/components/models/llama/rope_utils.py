@@ -30,7 +30,6 @@ with model-specific optimizations (YaRN, MLA, etc.).
 """
 
 import math
-from typing import Optional
 
 import torch
 from torch import nn
@@ -52,10 +51,14 @@ def apply_rotary_pos_emb(
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
-        q: Query tensor [batch, num_heads, seq_len, head_dim]
-        k: Key tensor [batch, num_kv_heads, seq_len, head_dim]
-        cos: Cosine embeddings [batch, seq_len, head_dim]
-        sin: Sine embeddings [batch, seq_len, head_dim]
+        q: Query tensor ``[B, Hq, S, D]`` in BSHD attention layout or
+            ``[T, Hq, D]`` in packed THD layout. ``B`` is batch, ``S`` is
+            sequence, ``T`` is total local tokens, ``Hq`` is query heads, and
+            ``D`` is head dimension.
+        k: Key tensor ``[B, Hkv, S, D]`` or ``[T, Hkv, D]``, where ``Hkv`` is
+            key/value heads.
+        cos: Cosine embeddings ``[B, S, D]`` or ``[T, D]``.
+        sin: Sine embeddings ``[B, S, D]`` or ``[T, D]``.
 
     Returns:
         Rotated (q, k) tensors
@@ -67,22 +70,99 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def apply_rotary_pos_emb_quack(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    quack_apply_rotary_emb,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Llama-style RoPE with QuACK's fused rotary kernel.
+
+    QuACK consumes BSHD tensors and half-width cosine/sine tables, whereas the
+    HuggingFace contract uses BHSD tensors and duplicates the table across the
+    full head dimension. Batch size one uses QuACK's in-place path. Larger
+    batches are rotated independently so batch-specific position IDs remain
+    correct rather than assuming every sequence uses the same positions.
+    """
+
+    rotary_dim = cos.shape[-1]
+    rotary_dim_half = rotary_dim // 2
+
+    def _apply(x: torch.Tensor) -> torch.Tensor:
+        x_bshd = x.permute(0, 2, 1, 3)
+        if x_bshd.shape[0] == 1:
+            out = quack_apply_rotary_emb(
+                x_bshd,
+                cos[0, :, :rotary_dim_half],
+                sin[0, :, :rotary_dim_half],
+                inplace=True,
+            )
+        else:
+            out = torch.cat(
+                [
+                    quack_apply_rotary_emb(
+                        x_bshd[batch_idx : batch_idx + 1],
+                        cos[batch_idx, :, :rotary_dim_half],
+                        sin[batch_idx, :, :rotary_dim_half],
+                    )
+                    for batch_idx in range(x_bshd.shape[0])
+                ],
+                dim=0,
+            )
+        return out.permute(0, 2, 1, 3)
+
+    return _apply(q), _apply(k)
+
+
 def apply_rotary_pos_emb_fused(
     q: torch.Tensor,
     k: torch.Tensor,
     freqs_cis: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies RoPE using TE's fused kernel.
 
     Args:
-        q: Query tensor [batch, num_heads, seq_len, head_dim]
-        k: Key tensor [batch, num_kv_heads, seq_len, head_dim]
-        freqs_cis: Raw angles [seq_len, 1, 1, head_dim] in TE format
+        q: Query tensor ``[B, Hq, S, D]`` or packed ``[T, Hq, D]``.
+        k: Key tensor ``[B, Hkv, S, D]`` or packed ``[T, Hkv, D]``.
+        freqs_cis: Global raw-angle table ``[S, 1, 1, D]`` in TE format.
+        cu_seqlens: Packed-document cumulative lengths ``[N + 1]``. Required
+            for THD, where ``N`` is the number of packed documents.
+        cp_size: Number of context-parallel ranks partitioning ``T``.
+        cp_rank: Rank within the context-parallel mesh.
 
     Returns:
-        Rotated (q, k) tensors
+        Rotated tensors with the same local shapes and storage ownership as
+        ``q`` and ``k``.
     """
     from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb as te_apply_rope
+
+    if q.ndim == 3:
+        if cu_seqlens is None:
+            raise ValueError("Packed THD fused RoPE requires cu_seqlens.")
+        q = te_apply_rope(
+            q,
+            freqs_cis,
+            tensor_format="thd",
+            fused=True,
+            cu_seqlens=cu_seqlens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
+        k = te_apply_rope(
+            k,
+            freqs_cis,
+            tensor_format="thd",
+            fused=True,
+            cu_seqlens=cu_seqlens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
+        return q, k
 
     # TE expects bshd format: [batch, seq, heads, head_dim]
     q_bshd = q.permute(0, 2, 1, 3)
@@ -109,7 +189,7 @@ def _get_rope_config(config) -> tuple[float, dict]:
     return base, rope_scaling
 
 
-def _compute_default_inv_freq(config, device: Optional[torch.device] = None) -> tuple[torch.Tensor, float]:
+def _compute_default_inv_freq(config, device: torch.device | None = None) -> tuple[torch.Tensor, float]:
     """Computes inverse frequencies for standard RoPE."""
     base, _ = _get_rope_config(config)
     dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
@@ -120,7 +200,7 @@ def _compute_default_inv_freq(config, device: Optional[torch.device] = None) -> 
     return inv_freq, 1.0
 
 
-def _compute_llama3_inv_freq(config, device: Optional[torch.device] = None) -> tuple[torch.Tensor, float]:
+def _compute_llama3_inv_freq(config, device: torch.device | None = None) -> tuple[torch.Tensor, float]:
     """Computes inverse frequencies for Llama3-style RoPE with smooth interpolation.
 
     Branch logic (matches HF _compute_llama3_parameters):
@@ -163,13 +243,16 @@ class LlamaRotaryEmbedding(nn.Module):
 
     inv_freq: torch.Tensor
 
-    def __init__(self, config, device: Optional[torch.device] = None, rope_fusion: bool = False):
+    def __init__(self, config, device: torch.device | None = None, rope_fusion: bool = False):
         super().__init__()
         self.max_seq_len_cached = 0
         self.rope_fusion = rope_fusion
         self.dtype = getattr(config, "torch_dtype", None) or torch.float32
 
-        # Map rope types to their respective computation functions
+        # ``default`` and ``llama3`` have local fast-path implementations. Every
+        # other schedule (``yarn``, ``linear``, ``dynamic``, ``longrope``, ...)
+        # is delegated to transformers' canonical ``ROPE_INIT_FUNCTIONS`` so the
+        # frequencies and attention scaling match HuggingFace exactly.
         rope_functions = {
             "default": _compute_default_inv_freq,
             "llama3": _compute_llama3_inv_freq,
@@ -179,8 +262,19 @@ class LlamaRotaryEmbedding(nn.Module):
         _, rope_scaling = _get_rope_config(config)
         rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
 
-        # Fallback to llama3 as the robust default if type is not in our map
-        compute_fn = rope_functions.get(rope_type, _compute_llama3_inv_freq)
+        # Resolve the compute function. An unrecognised ``rope_type`` previously
+        # fell back silently to the llama3 NTK schedule, which yields wrong
+        # frequencies for YaRN/linear/dynamic configs -- a latent bug, e.g. for
+        # an EAGLE dense draft that inherits a YaRN target's ``rope_scaling``.
+        # Delegate such types to transformers instead of guessing.
+        compute_fn = rope_functions.get(rope_type)
+        if compute_fn is None:
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            compute_fn = ROPE_INIT_FUNCTIONS.get(rope_type)
+            if compute_fn is None:
+                supported = sorted(set(rope_functions) | set(ROPE_INIT_FUNCTIONS))
+                raise ValueError(f"Unsupported RoPE rope_type={rope_type!r}; expected one of {supported}.")
         inv_freq, self.attention_scaling = compute_fn(config, device)
 
         # Keep the config + compute fn so ``_build_cache`` can recompute ``inv_freq``
@@ -231,7 +325,10 @@ class LlamaRotaryEmbedding(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        qkv_format: str = "bshd",
+        cp_size: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return (cos, sin) for the given positions.
 
         In the non-fused path ``cos`` / ``sin`` are gathered by the *values* in
@@ -250,19 +347,35 @@ class LlamaRotaryEmbedding(nn.Module):
         ``position_ids``.
 
         Args:
-            x: Input tensor (used for device and dtype)
-            position_ids: Position IDs tensor [batch, seq_len]
+            x: Hidden states ``[B, S, H]`` or packed ``[T, H]``; used for
+                device placement. ``H`` is hidden size.
+            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[T]``.
+            qkv_format: ``"bshd"`` for padded batches or ``"thd"`` for a
+                packed total-token layout.
+            cp_size: Context-parallel size. For fused THD RoPE, the cached raw
+                frequency table spans the global token count ``T * cp_size``.
 
         Returns:
-            (cos, sin) tensors [batch, seq_len, head_dim]
+            Cosine and sine tensors ``[B, S, D]`` or ``[T, D]``. When fused
+            RoPE is enabled, the tuple also carries a global raw-frequency
+            table ``[S, 1, 1, D]`` as its third item.
         """
+        if qkv_format not in ("bshd", "thd"):
+            raise ValueError(f"Unsupported qkv_format={qkv_format!r}; expected 'bshd' or 'thd'.")
+
         if self.rope_fusion:
             # The fused TE kernel indexes raw angles by sequence position and
             # assumes contiguous ``[0, seq_len)`` positions, so it only needs the
             # cache sized to ``seq_len`` -- and must avoid the ``position_ids``
             # host-device sync below on this default GPU training path.
             seq_len = position_ids.shape[-1]
-            self._ensure_cache(seq_len, x.device)
+            global_seq_len = seq_len * cp_size if qkv_format == "thd" else seq_len
+            self._ensure_cache(global_seq_len, x.device)
+            if qkv_format == "thd":
+                flat_position_ids = position_ids.reshape(-1)
+                cos = self._cos_cache[flat_position_ids]
+                sin = self._sin_cache[flat_position_ids]
+                return cos, sin, self._freqs_cache[:global_seq_len]
             cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
             sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
             return cos, sin, self._freqs_cache[:seq_len]
@@ -291,4 +404,5 @@ __all__ = [
     "rotate_half",
     "apply_rotary_pos_emb",
     "apply_rotary_pos_emb_fused",
+    "apply_rotary_pos_emb_quack",
 ]

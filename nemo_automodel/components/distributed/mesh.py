@@ -29,12 +29,13 @@ YAML / dict parsing belongs in the recipe layer — see
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple
 
 from nemo_automodel.components.distributed.config import DistributedStrategyConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
 
@@ -104,11 +105,14 @@ class MeshContext:
     Attributes:
         device_mesh: Device mesh for distributed training.
         moe_mesh: MoE-specific device mesh.
+        process_group: Optional model-local group for recipe-level collectives
+            that must not involve ranks outside this mesh.
     """
 
     # runtime mesh references
     device_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
     moe_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
+    process_group: "ProcessGroup | None" = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _validate_mesh_axis_names(self)
@@ -140,12 +144,12 @@ class MeshContext:
         return _get_axis_size(self.moe_mesh, MeshAxisName.EP)
 
     @property
-    def dp_size(self) -> Optional[int]:
+    def dp_size(self) -> int | None:
         """Data-parallel degree (from ``device_mesh``, default ``None``)."""
         return _get_axis_size(self.device_mesh, MeshAxisName.DP, default=None)
 
     @property
-    def dp_replicate_size(self) -> Optional[int]:
+    def dp_replicate_size(self) -> int | None:
         """HSDP replication degree (from ``device_mesh``, default ``None``)."""
         return _get_axis_size(self.device_mesh, MeshAxisName.DP_REPLICATE, default=None)
 
@@ -159,7 +163,10 @@ class MeshContext:
         """DP axis names for FSDP mesh slicing."""
         if self.device_mesh is not None:
             names = self.device_mesh.mesh_dim_names
-            if MeshAxisName.DP_REPLICATE in names and MeshAxisName.DP_SHARD_CP in names:
+            if (
+                MeshAxisName.DP_REPLICATE in names
+                and _get_axis_size(self.device_mesh, MeshAxisName.DP_SHARD_CP, default=None) is not None
+            ):
                 return (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD_CP)
         return (MeshAxisName.DP_SHARD_CP,)
 
@@ -190,6 +197,8 @@ class MeshContext:
         parallelism_sizes: ParallelismSizes | None = None,
         *,
         world_size: int | None = None,
+        timeout_minutes: int | None = None,
+        ranks: Sequence[int] | None = None,
     ) -> "MeshContext":
         """Build a topology-only :class:`MeshContext` from parallelism sizes.
 
@@ -200,6 +209,10 @@ class MeshContext:
                 DP inferred from ``world_size``.
             world_size: Total process count. If ``None``, inferred from the
                 distributed environment.
+            timeout_minutes: Optional timeout for process groups created by
+                ``DeviceMesh`` axes.
+            ranks: Optional ordered global ranks to use for the mesh. When
+                omitted, the mesh uses every rank in the default process group.
         """
         if world_size is None:
             world_size = get_world_size_safe()
@@ -212,6 +225,8 @@ class MeshContext:
             strategy_config,
             parallelism_sizes,
             world_size=world_size,
+            timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
         return cls.from_meshes(device_mesh, moe_mesh)
 
@@ -235,7 +250,7 @@ class MeshContext:
 
 
 # misc utils
-def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) -> Optional[int]:
+def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) -> int | None:
     """Return the size of *axis* if present in *mesh*, else *default*."""
     if mesh is None:
         return default
@@ -251,7 +266,7 @@ def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) 
     return default
 
 
-def _optional_axis(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> Optional[str]:
+def _optional_axis(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> str | None:
     """Return *axis* if present in *mesh*, else ``None``."""
     if mesh is not None and axis in mesh.mesh_dim_names:
         return axis

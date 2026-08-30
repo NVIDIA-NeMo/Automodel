@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits, yield_fp32_model
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
@@ -47,7 +51,7 @@ class Block(nn.Module):
         backend: BackendConfig,
     ):
         super().__init__()
-        self.self_attn = MLA(config, backend)
+        self.self_attn = MLA(config, backend, latent_norm_eps=1e-6)
         self.is_moe_layer = layer_idx >= config.first_k_dense_replace
 
         # Thread dtype from config.torch_dtype so the block's own params stay
@@ -257,6 +261,7 @@ class DeepseekV3Model(nn.Module):
 
 
 class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @dataclass(frozen=True)
@@ -299,6 +304,7 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         # The HF DeepSeek-V3 reference computes router scoring in fp32; routing is highly
         # precision-sensitive (small bf16 errors flip expert selection) and the gate is tiny,
@@ -341,7 +347,7 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass returning :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.

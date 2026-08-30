@@ -30,7 +30,7 @@ import logging
 import os
 import pathlib
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -38,7 +38,11 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
-from nemo_automodel.components.models.bagel.configuration import BagelConfig
+from nemo_automodel.components.models.bagel.configuration import (
+    BagelBackendConfig,
+    BagelConfig,
+    resolve_bagel_backend,
+)
 from nemo_automodel.components.models.bagel.connector import BagelMultiModalProjector
 from nemo_automodel.components.models.bagel.embeddings import BagelGridPositionEmbedding, BagelTimestepEmbedding
 from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2ForCausalLM
@@ -50,6 +54,10 @@ from nemo_automodel.components.models.bagel.state_dict_adapter import (
     load_bagel_checkpoint_state_dict,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,12 +152,13 @@ class BagelModel(nn.Module):
     ``BagelForUnifiedMultimodal.forward``.
     """
 
-    def __init__(self, config: BagelConfig) -> None:
+    def __init__(self, config: BagelConfig, backend: BagelBackendConfig | None = None) -> None:
         super().__init__()
         self.config = config
+        self.backend = resolve_bagel_backend(backend)
 
         # Text backbone - always present.
-        self.language_model = Qwen2ForCausalLM(config.text_config)
+        self.language_model = Qwen2ForCausalLM(config.text_config, backend=self.backend)
 
         # Understanding-side vision path. Built whenever the BAGEL config keeps
         # visual understanding enabled.
@@ -213,6 +222,10 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     """
 
     config_class = BagelConfig
+    # BAGEL's served checkpoints are untied; the tie flag lives on the nested
+    # text_config (aliased as llm_config), and the inner Qwen2 LM owns the head.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    backend_config_resolver = staticmethod(resolve_bagel_backend)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -223,11 +236,22 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: BagelConfig) -> None:
+    def __init__(self, config: BagelConfig, backend: BagelBackendConfig | None = None) -> None:
         super().__init__()
+        # Also covers the build_bagel_from_hf_backbones registry-bypass path, which
+        # constructs this class directly. Reads the nested text_config tie flag via
+        # the resolver's get_text_config fallback (BagelConfig has no top-level flag).
+        reject_unsupported_tie_word_embeddings(type(self), config)
         _prepare_config_for_stage(config)
         self.config = config
-        self.model = BagelModel(config)
+        self.backend = resolve_bagel_backend(backend)
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info(
+                "Resolved BAGEL backends: linear=%s, rms_norm=%s",
+                self.backend.linear,
+                self.backend.rms_norm,
+            )
+        self.model = BagelModel(config, backend=self.backend)
         _convert_patch_embedding_for_packed_vit(self.model, config)
 
         # Light state-dict adapter hook used by HFCheckpointingMixin /
@@ -317,7 +341,9 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
             strict: If ``True``, raise on state-dict keys that don't match the
                 adapter patterns. Defaults to ``False`` for compatibility with
                 checkpoint sidecar files.
-            **kwargs: Forwarded to ``BagelConfig.from_pretrained``.
+            **kwargs: Model overrides. ``backend`` is passed to the BAGEL model
+                constructor; the remaining values are forwarded to
+                ``BagelConfig.from_pretrained``.
 
         Returns:
             A fully-initialized ``BagelForUnifiedMultimodal`` with weights
@@ -326,11 +352,12 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         """
         path = pathlib.Path(pretrained_model_name_or_path)
 
+        backend = kwargs.pop("backend", None)
         cfg = BagelConfig.from_pretrained(str(path), **kwargs)
         cfg.stage = stage
         stage_int = _stage_to_int(stage)
 
-        model = cls(cfg)
+        model = cls(cfg, backend=backend)
 
         sd = load_bagel_checkpoint_state_dict(str(path), stage=stage_int, strict=strict)
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -371,26 +398,26 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         packed_text_indexes: torch.LongTensor,
         sample_lens: List[int],
         packed_position_ids: torch.LongTensor,
-        nested_attention_masks: Optional[List[torch.Tensor]] = None,
-        split_lens: Optional[List[int]] = None,
-        attn_modes: Optional[List[str]] = None,
+        nested_attention_masks: List[torch.Tensor] | None = None,
+        split_lens: List[int] | None = None,
+        attn_modes: List[str] | None = None,
         # --- understanding branch ---
-        packed_vit_tokens: Optional[torch.Tensor] = None,
-        packed_vit_token_indexes: Optional[torch.LongTensor] = None,
-        packed_vit_position_ids: Optional[torch.LongTensor] = None,
-        vit_token_seqlens: Optional[torch.Tensor] = None,
+        packed_vit_tokens: torch.Tensor | None = None,
+        packed_vit_token_indexes: torch.LongTensor | None = None,
+        packed_vit_position_ids: torch.LongTensor | None = None,
+        vit_token_seqlens: torch.Tensor | None = None,
         # --- generation branch (Stage 2) ---
-        padded_latent: Optional[torch.Tensor] = None,
-        patchified_vae_latent_shapes: Optional[List[Tuple[int, int]]] = None,
-        packed_latent_position_ids: Optional[torch.LongTensor] = None,
-        packed_vae_token_indexes: Optional[torch.LongTensor] = None,
-        packed_timesteps: Optional[torch.Tensor] = None,
-        mse_loss_indexes: Optional[torch.Tensor] = None,
+        padded_latent: torch.Tensor | None = None,
+        patchified_vae_latent_shapes: List[Tuple[int, int]] | None = None,
+        packed_latent_position_ids: torch.LongTensor | None = None,
+        packed_vae_token_indexes: torch.LongTensor | None = None,
+        packed_timesteps: torch.Tensor | None = None,
+        mse_loss_indexes: torch.Tensor | None = None,
         # --- loss ---
-        ce_loss_indexes: Optional[torch.Tensor] = None,
-        packed_label_ids: Optional[torch.Tensor] = None,
-        ce_loss_weights: Optional[torch.Tensor] = None,
-    ) -> Dict[str, Optional[torch.Tensor]]:
+        ce_loss_indexes: torch.Tensor | None = None,
+        packed_label_ids: torch.Tensor | None = None,
+        ce_loss_weights: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor | None]:
         """Run the BAGEL mixed-modal forward.
 
         Stage 1 (``visual_gen=False``) skips the flow-matching branch and MSE
@@ -420,7 +447,36 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         packed_sequence = packed_text_embedding.new_zeros(size=(sequence_length, self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
-        # --- attention mask ---
+        # --- MLM-style grouped routing: build the und/gen permutation ONCE ---
+        # Reorder the packed sequence so und tokens occupy ``[:Lund]`` and gen tokens
+        # ``[Lund:]`` (contiguous blocks). Every MoT layer then routes the *pointwise* path
+        # (LN / MLP / QKV / O-proj) by a scalar slice boundary instead of per-layer
+        # gather/scatter. Crucially — like MLM — attention still runs in ORIGINAL token order
+        # (so its block-diagonal mask stays block-sparse): each attention layer restores the
+        # original order via ``mot_inv`` before the kernel and re-groups via ``mot_perm``
+        # after. The output is un-permuted at exit so loss/downstream stay in original order.
+        mot_perm = None
+        mot_inv = None
+        if (
+            self.model.backend.mot_grouped
+            and self.use_moe
+            and self.config.visual_gen
+            and packed_vae_token_indexes is not None
+        ):
+            dev = packed_sequence.device
+            und = packed_text_indexes
+            if packed_vit_token_indexes is not None:
+                und = torch.cat([packed_text_indexes, packed_vit_token_indexes], dim=0)
+            gen = packed_vae_token_indexes
+            covered = torch.zeros(sequence_length, dtype=torch.bool, device=dev)
+            covered[und] = True
+            covered[gen] = True
+            rest = torch.nonzero(~covered, as_tuple=False).flatten()
+            mot_perm = torch.cat([und, gen, rest])
+            mot_inv = torch.empty(sequence_length, dtype=torch.long, device=dev)
+            mot_inv[mot_perm] = torch.arange(sequence_length, device=dev)
+
+        # --- attention mask (always ORIGINAL packed order; grouped mode restores order in-layer) ---
         if nested_attention_masks is None:
             if split_lens is None or attn_modes is None:
                 raise ValueError(
@@ -468,8 +524,8 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         # Keep ``packed_latent_clean`` and ``noise`` around because the MSE
         # computation below uses them to form the
         # flow-matching velocity target ``v_t = noise - clean``.
-        packed_latent_clean: Optional[torch.Tensor] = None
-        noise: Optional[torch.Tensor] = None
+        packed_latent_clean: torch.Tensor | None = None
+        noise: torch.Tensor | None = None
         if self.config.visual_gen and padded_latent is not None:
             if (
                 patchified_vae_latent_shapes is None
@@ -513,6 +569,17 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
             # no VAE tokens — Qwen2Model.forward_train tolerates None and
             # treats the gen-side expert as dormant.
             extra_inputs["packed_gen_token_indexes"] = packed_vae_token_indexes if self.config.visual_gen else None
+            if mot_perm is not None:
+                # Threaded to every MoT layer so attention can restore/re-group token order.
+                extra_inputs["mot_perm"] = mot_perm
+                extra_inputs["mot_inv"] = mot_inv
+
+        # --- apply the grouped permutation to the fully-populated sequence + RoPE ids ---
+        # In grouped mode the MoT layers read only ``packed_und_token_indexes.shape[0]`` as
+        # the und/gen slice boundary, so the (now-stale) index values are unused downstream.
+        if mot_perm is not None:
+            packed_sequence = packed_sequence[mot_perm]
+            packed_position_ids = packed_position_ids[mot_perm]
 
         # --- LM forward ---
         # Route through the language_model's train/inference dispatcher: at
@@ -526,8 +593,12 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
             **extra_inputs,
         )
 
+        # --- undo the grouped permutation so loss/downstream see original packed order ---
+        if mot_inv is not None:
+            last_hidden_state = last_hidden_state[mot_inv]
+
         # --- loss: CE (understanding) ---
-        ce: Optional[torch.Tensor] = None
+        ce: torch.Tensor | None = None
         if ce_loss_indexes is not None:
             if packed_label_ids is None:
                 raise ValueError("ce_loss_indexes was provided but packed_label_ids is None.")
@@ -540,7 +611,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         # 0 exactly, so
         # ``packed_timesteps > 0`` filters them out and only loss=1 positions
         # contribute to MSE.
-        mse: Optional[torch.Tensor] = None
+        mse: torch.Tensor | None = None
         if (
             self.config.visual_gen
             and mse_loss_indexes is not None

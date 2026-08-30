@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
@@ -97,7 +98,7 @@ class TestNemotronV3Model:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -130,6 +131,65 @@ class TestNemotronV3Model:
 
         assert model.layers["0"].block_type == "attention"
         assert model.layers["1"].block_type == "mlp"
+
+    def test_dense_model_builds_with_no_moe_config(self, backend):
+        """Dense Nemotron-H (no 'moe' layers, expert fields absent) builds with
+        moe_config=None and runs forward. Regression guard for issue #2004."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+        config = MockNemotronV3Config(layers_block_type=["attention", "mlp"])
+        # Real dense configs (e.g. NVIDIA-Nemotron-3-Nano-4B-BF16) omit the MoE fields.
+        for attr in (
+            "n_routed_experts",
+            "num_experts_per_tok",
+            "n_group",
+            "topk_group",
+            "routed_scaling_factor",
+            "moe_intermediate_size",
+            "norm_topk_prob",
+            "moe_shared_expert_intermediate_size",
+        ):
+            delattr(config, attr)
+
+        model = NemotronV3Model(config, backend=backend).to(torch.bfloat16)
+        assert model.moe_config is None
+        assert len(model.layers) == config.num_hidden_layers
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+        output = model(input_ids)
+        assert output.shape == (batch_size, seq_len, config.hidden_size)
+
+    def test_get_capabilities_moe_supports_ep(self):
+        """MoE config (has experts) reports supports_ep=True."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        caps = NemotronHForCausalLM.get_capabilities(MockNemotronV3Config())
+        assert caps.supports_ep is True
+
+    def test_get_capabilities_dense_no_ep(self):
+        """Dense config (no experts) reports supports_ep=False (PR #2670 review / #2004)."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config = MockNemotronV3Config(layers_block_type=["attention", "mlp"])
+        for attr in (
+            "n_routed_experts",
+            "num_experts_per_tok",
+            "n_group",
+            "topk_group",
+            "routed_scaling_factor",
+            "moe_intermediate_size",
+            "norm_topk_prob",
+            "moe_shared_expert_intermediate_size",
+        ):
+            delattr(config, attr)
+        caps = NemotronHForCausalLM.get_capabilities(config)
+        assert caps.supports_ep is False
+        assert caps.supports_cp is True
+        assert caps.supports_pp is True
+        assert caps.supports_mtp_cp is True
+        assert caps.supports_mtp_cp_pp is False
+        assert caps.supports_tp is False
 
     def test_model_embedding_dimensions(self, config, backend):
         """Test that embeddings have correct dimensions."""
@@ -328,7 +388,7 @@ class TestNemotronHForCausalLM:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -516,6 +576,29 @@ class TestNemotronHForCausalLM:
         model = NemotronHForCausalLM(config, backend=backend)
 
         assert hasattr(model, "state_dict_adapter")
+
+    def test_mamba_decay_params_stay_fp32_after_bf16_cast(self, config, backend):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention"]
+        model = NemotronHForCausalLM(config, backend=backend)
+        expected = {}
+        for name, param in model.named_parameters():
+            if name.endswith(("A_log", "dt_bias", "D")):
+                values = torch.linspace(0.00123, 0.00456, param.numel(), dtype=torch.float32).reshape_as(param)
+                param.data.copy_(values)
+                expected[name] = values
+
+        assert expected, "Nemotron V3 Mamba layers should create decay parameters"
+        assert all("._fp32_params." in name for name in expected)
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        params = dict(model.named_parameters())
+        for name, values in expected.items():
+            assert params[name].dtype == torch.float32
+            torch.testing.assert_close(params[name], values)
+        assert model.lm_head.weight.dtype == torch.bfloat16
 
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""
@@ -748,6 +831,44 @@ class TestNemotronHForCausalLM:
         assert output_ids.shape[1] >= prompt_len
         assert output_ids.shape[1] <= prompt_len + max_new_tokens
 
+    def test_dense_causal_lm_build_and_generate(self, config, backend):
+        """Dense Nemotron-H end-to-end: the CausalLM builds with moe_config=None and no
+        MTP, and .generate() produces tokens. Covers the issue #2004 inference path."""
+        from transformers import PretrainedConfig
+
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        hf_config = PretrainedConfig(is_encoder_decoder=False, eos_token_id=1, pad_token_id=0)
+        for attr, val in vars(config).items():
+            setattr(hf_config, attr, val)
+        # Make it dense: no 'moe' layers, and drop the MoE/expert fields entirely
+        # (real dense configs like NVIDIA-Nemotron-3-Nano-4B-BF16 omit them).
+        hf_config.layers_block_type = ["attention", "mlp"]
+        for attr in (
+            "n_routed_experts",
+            "num_experts_per_tok",
+            "n_group",
+            "topk_group",
+            "routed_scaling_factor",
+            "moe_intermediate_size",
+            "norm_topk_prob",
+            "moe_shared_expert_intermediate_size",
+        ):
+            if hasattr(hf_config, attr):
+                delattr(hf_config, attr)
+
+        model = NemotronHForCausalLM(hf_config, backend=backend).to(torch.bfloat16)
+        model.eval()
+        assert model.model.moe_config is None
+        assert model.mtp is None
+
+        batch_size, prompt_len, max_new_tokens = 1, 4, 3
+        input_ids = torch.randint(2, config.vocab_size, (batch_size, prompt_len))
+        output_ids = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
+
+        assert output_ids.shape[0] == batch_size
+        assert prompt_len <= output_ids.shape[1] <= prompt_len + max_new_tokens
+
 
 class TestNemotronV3KVCache:
     """Test NemotronHybridCache and cached generation."""
@@ -762,7 +883,7 @@ class TestNemotronV3KVCache:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -960,7 +1081,7 @@ class TestNemotronV3MambaCacheGPU:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -1118,7 +1239,7 @@ class TestNemotronV3ModelWithMoE:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=True,  # Use fake balanced gate for deterministic testing
             enable_hf_state_dict_adapter=False,
         )
@@ -1143,7 +1264,7 @@ class TestNemotronV3ModelWithMoE:
             linear=backend.linear,
             attn=backend.attn,
             rms_norm=backend.rms_norm,
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )

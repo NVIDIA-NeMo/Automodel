@@ -14,7 +14,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -39,6 +39,10 @@ from transformers.models.mbart.modeling_mbart import (
 )
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
 # -----------------------------------------------------------------------------
@@ -153,8 +157,8 @@ class NemotronParseConfig(PretrainedConfig):
 
     def __init__(
         self,
-        encoder: Optional[dict] = None,
-        decoder: Optional[dict] = None,
+        encoder: dict | None = None,
+        decoder: dict | None = None,
         tie_word_embeddings: bool = False,
         decoder_start_token_id: int = 2,
         pad_token_id: int = 1,
@@ -214,7 +218,7 @@ class NemotronParseConfig(PretrainedConfig):
 class NemotronParseDecoder(MBartPreTrainedModel):
     """Transformer decoder consisting of *config.decoder_layers* layers."""
 
-    def __init__(self, config: MBartConfig, embed_tokens: Optional[nn.Embedding] = None):
+    def __init__(self, config: MBartConfig, embed_tokens: nn.Embedding | None = None):
         super().__init__(config)
         self.dropout = config.dropout
         self.layerdrop = config.decoder_layerdrop
@@ -245,16 +249,16 @@ class NemotronParseDecoder(MBartPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        encoder_hidden_states: torch.FloatTensor | None = None,
+        encoder_attention_mask: torch.LongTensor | None = None,
+        past_key_values: Tuple[Tuple[torch.FloatTensor]] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -372,6 +376,8 @@ class RadioWithNeck(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.image_processor_normalizes = bool(getattr(config, "image_processor_normalizes", False))
+        self._radio_input_conditioner_externalized = False
 
         # Create RADIO encoder from config (which is now actual RADIOConfig)
         self.model_encoder = AutoModel.from_config(config, trust_remote_code=True)
@@ -387,7 +393,38 @@ class RadioWithNeck(nn.Module):
         self.sum_proj = nn.Linear(3840, last_hidden_state)
         self.layer_norm3 = nn.LayerNorm(last_hidden_state, eps=1e-06, elementwise_affine=True)
 
+    def _externalize_radio_input_conditioner(self) -> None:
+        if not self.image_processor_normalizes or self._radio_input_conditioner_externalized:
+            return
+
+        make_external = getattr(self.model_encoder, "make_preprocessor_external", None)
+        if make_external is None:
+            raise ValueError(
+                "image_processor_normalizes=True requires a RADIO encoder with make_preprocessor_external()."
+            )
+
+        make_external()
+        self._radio_input_conditioner_externalized = True
+
     def forward(self, pixel_values, output_attentions=False, output_hidden_states=False, return_dict=False, **kwargs):
+        """Encode document images into visual tokens.
+
+        Args:
+            pixel_values: Tensor of shape [batch, channels, height, width]. When the image processor normalizes
+                inputs, values must already contain that external normalization.
+            output_attentions: Accepted for model interface compatibility and currently unused.
+            output_hidden_states: Accepted for model interface compatibility and currently unused.
+            return_dict: Accepted for model interface compatibility and currently unused.
+            **kwargs: Additional model arguments accepted for interface compatibility.
+
+        Returns:
+            A DonutSwinModelOutput whose last_hidden_state has shape [batch, image_tokens, hidden].
+        """
+        self._externalize_radio_input_conditioner()
+        if self.image_processor_normalizes:
+            encoder_dtype = next(self.model_encoder.parameters()).dtype
+            pixel_values = pixel_values.to(dtype=encoder_dtype)
+
         radio_output = self.model_encoder(pixel_values)
         summary, feature = radio_output
 
@@ -434,6 +471,8 @@ class NemotronParsePreTrainedModel(PreTrainedModel):
 class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParsePreTrainedModel, GenerationMixin):
     """NemotronParse model for conditional generation tasks."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -444,6 +483,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         supports_ep: bool = False
 
     def __init__(self, config: NemotronParseConfig, loss_fn=None, **kwargs):
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.loss_fn = loss_fn
 
@@ -493,17 +533,17 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
 
     def forward(
         self,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        decoder_input_ids: Optional[torch.LongTensor] = None,
-        decoder_attention_mask: Optional[torch.BoolTensor] = None,
-        encoder_outputs: Optional[Tuple[torch.FloatTensor]] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        pixel_values: torch.FloatTensor | None = None,
+        decoder_input_ids: torch.LongTensor | None = None,
+        decoder_attention_mask: torch.BoolTensor | None = None,
+        encoder_outputs: Tuple[torch.FloatTensor] | None = None,
+        past_key_values: Tuple[Tuple[torch.FloatTensor]] | None = None,
+        decoder_inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:

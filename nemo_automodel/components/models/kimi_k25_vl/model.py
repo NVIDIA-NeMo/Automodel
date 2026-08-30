@@ -24,7 +24,7 @@ This is a self-contained implementation that includes all necessary components:
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import torch
@@ -94,18 +94,18 @@ class KimiK25VLConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vision_config: Optional[Union[Dict, MoonViT3dConfig]] = None,
-        text_config: Optional[Union[Dict, DeepseekV3Config]] = None,
+        vision_config: Union[Dict, MoonViT3dConfig] | None = None,
+        text_config: Union[Dict, DeepseekV3Config] | None = None,
         ignore_index: int = -100,
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
         tie_word_embeddings: bool = False,  # Must be False for pipeline parallelism
         # MM Projector parameters
         mm_projector_type: str = "patchmerger",
-        mm_hidden_size: Optional[int] = None,
+        mm_hidden_size: int | None = None,
         projector_hidden_act: str = "gelu",
         projector_ln_eps: float = 1e-5,
-        architectures: Optional[List[str]] = None,
+        architectures: List[str] | None = None,
         **kwargs,
     ):
         if vision_config is None:
@@ -146,6 +146,10 @@ class KimiK25VLConfig(PretrainedConfig):
 
 
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import KimiK25VLStateDictAdapter
@@ -676,8 +680,8 @@ class KimiK25VLModel(nn.Module):
         inputs_embeds: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        target_seq_length: Optional[int] = None,
+        labels: torch.Tensor | None = None,
+        target_seq_length: int | None = None,
     ):
         """Merge image features into input embeddings.
 
@@ -882,6 +886,8 @@ class KimiK25VLModel(nn.Module):
 class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiK25VL model with backend-aware DeepseekV3 language model."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # RoPE freqs/inv_freq must stay fp32: from_pretrained casts the model to bf16 and
     # nn.Module.to rounds floating buffers; routing through cast_model_to_dtype restores
     # these keep-fp32 buffers afterwards (see llama/rope_utils.py).
@@ -951,6 +957,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
     def __init__(self, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
 
         self.model = KimiK25VLModel(config, moe_config=moe_config, backend=self.backend)
@@ -1002,7 +1009,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         labels=None,
         use_cache=None,
         output_attentions=None,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         return_dict=None,
         pixel_values=None,
         grid_thws=None,

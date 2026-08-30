@@ -15,7 +15,8 @@ model:
   attn_implementation: sdpa
   backend:
     _target_: nemo_automodel.components.models.common.utils.BackendConfig
-    enable_deepep: false
+    experts: gmm
+    dispatcher: deepep
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: null
@@ -90,10 +91,7 @@ parallelizer:
 ci:
   time: "00:30:00"
   nproc_per_node: 4
-  known_issue_id: AM-149
   checkpoint_robustness:
-    hf_kl_threshold: 1e-1
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-    no_check_resume: true
     experts_implementation: grouped_mm
     trust_remote_code: true

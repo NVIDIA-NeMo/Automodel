@@ -37,7 +37,7 @@ Notes vs. ``components/models/hy_v3`` (Hy3-preview 295B):
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -50,6 +50,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.hy_mt2.layers import HyMT2Attention
@@ -279,6 +283,10 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ``from_pretrained`` / ``save_pretrained`` over the HF safetensors layout.
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -323,6 +331,7 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = HyMT2Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
@@ -361,7 +370,7 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass returning :class:`CausalLMOutputWithPast`.

@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from typing import Any, Optional, Union
+from dataclasses import dataclass, replace
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     cast_model_to_dtype,
@@ -43,7 +47,9 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 class Block(nn.Module):
     def __init__(self, layer_idx: int, config: Any, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
-        self.self_attn = MLA(config, backend)
+        # The upstream GLM implementation fixes the two MLA latent RMSNorms at
+        # 1e-6 independently of the model-wide rms_norm_eps=1e-5.
+        self.self_attn = MLA(config, backend, latent_norm_eps=1e-6)
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
@@ -148,7 +154,9 @@ class Glm4MoeLiteModel(nn.Module):
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
+            apply_router_weight_after_down=True,
             softmax_before_topk=False,  # GLM4 uses sigmoid, not softmax
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -231,6 +239,7 @@ class Glm4MoeLiteModel(nn.Module):
 
 
 class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @dataclass(frozen=True)
@@ -274,7 +283,12 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
-        self.backend = backend or BackendConfig()
+        reject_unsupported_tie_word_embeddings(type(self), config)
+        resolved_backend = backend or BackendConfig()
+        # HF computes the GLM router projection and selected mixture weights in fp32.
+        if resolved_backend.gate_precision is None:
+            resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
+        self.backend = resolved_backend
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Glm4MoeLiteModel(
             config,
@@ -311,7 +325,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (

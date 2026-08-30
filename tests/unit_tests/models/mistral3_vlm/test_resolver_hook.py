@@ -15,8 +15,9 @@
 """Unit tests for the mistral3_vlm package-level resolver hook.
 
 Importing the package installs a hook on
-``_resolve_custom_model_cls_for_config`` (model_init.py) that claims FP8
-Mistral3 VLM configs and dispatches to ``Mistral3FP8VLMForConditionalGeneration``.
+``_resolve_custom_model_cls_for_config`` (model_init.py) that claims FP8-native
+and dequantized Mistral3 VLM configs and dispatches to
+``Mistral3FP8VLMForConditionalGeneration``.
 """
 
 from types import SimpleNamespace
@@ -44,19 +45,27 @@ def _make_non_mistral3_cfg():
     )
 
 
+def _make_dequantized_mistral3_cfg():
+    return SimpleNamespace(text_config=SimpleNamespace(model_type="ministral3"))
+
+
 class TestHookInstallation:
     def test_hook_installed_marker(self):
         # Idempotent guard: re-importing must not stack hooks.
-        assert getattr(
-            _mi._resolve_custom_model_cls_for_config,
-            "_mistral3_vlm_hook_installed",
-            False,
-        ) is True
+        assert (
+            getattr(
+                _mi._resolve_custom_model_cls_for_config,
+                "_mistral3_vlm_hook_installed",
+                False,
+            )
+            is True
+        )
 
     def test_reimport_is_idempotent(self):
         before = _mi._resolve_custom_model_cls_for_config
         # The package's _install_resolver_hook short-circuits if already installed.
         from nemo_automodel.components.models.mistral3_vlm import _install_resolver_hook
+
         _install_resolver_hook()
         assert _mi._resolve_custom_model_cls_for_config is before
 
@@ -68,9 +77,12 @@ class TestHookDispatch:
         # Our hook short-circuits before calling the original.
         assert _mi._resolve_custom_model_cls_for_config(cfg) is Mistral3FP8VLMForConditionalGeneration
 
+    def test_claims_dequantized_mistral3_vlm(self):
+        cfg = _make_dequantized_mistral3_cfg()
+        assert _mi._resolve_custom_model_cls_for_config(cfg) is Mistral3FP8VLMForConditionalGeneration
+
     def test_passes_through_non_mistral3_to_original(self):
         cfg = _make_non_mistral3_cfg()
-        sentinel = object()
         # Patch the original (un-hooked) resolver that our hook delegates to.
         # The hook closes over the *original* resolver at install time; we
         # replicate that path by stubbing ModelRegistry interactions.

@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
+    NeatPackConfig,
     _build_packed_vlm_sample,
     _compute_mrope_position_ids,
     _shift_sample,
@@ -133,6 +135,25 @@ class TestBuildPackedVlmSample:
         assert result["n_images"] == 3
         assert result["n_videos"] == 0
 
+    def test_variable_resolution_media_lists_are_preserved(self):
+        samples = [
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "labels": torch.tensor([10, 20]),
+                "pixel_values": [torch.randn(3, 8, 12)],
+            },
+            {
+                "input_ids": torch.tensor([3, 4]),
+                "labels": torch.tensor([30, 40]),
+                "pixel_values": [torch.randn(3, 16, 8)],
+            },
+        ]
+
+        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+
+        assert isinstance(result["pixel_values"], list)
+        assert [tuple(value.shape) for value in result["pixel_values"]] == [(3, 8, 12), (3, 16, 8)]
+
     def test_mm_token_type_ids_propagated(self):
         samples = [
             {
@@ -148,6 +169,25 @@ class TestBuildPackedVlmSample:
         ]
         result = _build_packed_vlm_sample(samples, pack_size=8, padding_idx=0)
         assert result["mm_token_type_ids"].tolist() == [0, 1, 0, 1, 1]
+
+    def test_sequence_alignment_pads_each_document_and_preserves_real_lengths(self):
+        samples = [
+            {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([11, 12, 13])},
+            {"input_ids": torch.tensor([4, 5]), "labels": torch.tensor([14, 15])},
+        ]
+
+        result = _build_packed_vlm_sample(
+            samples,
+            pack_size=8,
+            padding_idx=0,
+            sequence_alignment=4,
+        )
+
+        assert result["input_ids"].tolist() == [1, 2, 3, 0, 4, 5, 0, 0]
+        assert result["labels"].tolist() == [11, 12, 13, -100, 14, 15, -100, -100]
+        assert result["seq_lens"] == [3, 2]
+        assert result["seq_lens_padded"] == [4, 4]
+        assert result["position_ids"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
 
 
 class TestNeatPackDatasetVlm:
@@ -233,6 +273,60 @@ class TestNeatPackDatasetVlm:
             drop_long_samples=True,
         )
         assert len(packed) == 1
+
+    def test_alignment_is_included_in_knapsack_capacity_and_materialization(self):
+        samples = [_make_vlm_sample(4) for _ in range(3)]  # shifted real length 3 each
+        raw = [{"_text_tokens": 4, "conversation": []} for _ in samples]
+
+        packed = neat_pack_dataset_vlm(
+            _FakeDataset(samples),
+            ds_raw=raw,
+            pack_size=16,
+            padding_idx=0,
+            sequence_alignment=8,
+            balance_media_tokens=False,
+        )
+
+        # Raw lengths total 9 and would fit one pack. CP-aligned lengths total
+        # 24, so the planner must produce two packs instead of overflowing later.
+        assert len(packed) == 2
+        materialized_lengths = sorted(len(packed[i]["input_ids"]) for i in range(len(packed)))
+        assert materialized_lengths == [8, 16]
+        for i in range(len(packed)):
+            item = packed[i]
+            assert sum(item["seq_lens_padded"]) == len(item["input_ids"])
+            assert all(length % 8 == 0 for length in item["seq_lens_padded"])
+
+    def test_thd_config_derives_alignment_from_cp_size(self):
+        samples = [_make_vlm_sample(4)]
+        config = NeatPackConfig(pack_size=16, collate_max_length=16, packing_format="thd")
+
+        packed = config.build(
+            dataset=_FakeDataset(samples),
+            padding_idx=0,
+            ds_raw=[{"_text_tokens": 4, "conversation": []}],
+            cp_size=4,
+        )
+
+        assert packed.sequence_alignment == 8
+        assert packed[0]["seq_lens"] == [3]
+        assert packed[0]["seq_lens_padded"] == [8]
+
+    def test_thd_config_rejects_mrope_cp_and_unaligned_collate_length(self):
+        with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
+            NeatPackConfig(pack_size=16, packing_format="thd").build(
+                dataset=_FakeDataset([]),
+                padding_idx=0,
+                get_rope_index=lambda: None,
+                cp_size=2,
+            )
+
+        with pytest.raises(ValueError, match=r"collate_max_length must be divisible by 2 \* cp_size"):
+            NeatPackConfig(pack_size=10, collate_max_length=10, packing_format="thd").build(
+                dataset=_FakeDataset([]),
+                padding_idx=0,
+                cp_size=2,
+            )
 
 
 class TestNeatPackedVlmCollater:
@@ -413,3 +507,80 @@ class TestMRoPESupport:
         assert result["position_ids"].shape == (3, 2, 4)
         assert result["position_ids"][0, 0].tolist() == [0, 1, 2, 0]
         assert result["position_ids"][0, 1].tolist() == [0, 1, 2, 3]
+
+
+def test_compute_mrope_position_ids_builds_required_mm_token_type_ids():
+    """Signatures with a required mm_token_type_ids (e.g. Qwen3-VL) must get it built.
+
+    When the pretokenized sample lacks the tensor, it is rebuilt from the bound
+    model config's image/video token ids (0 = text, 1 = image, 2 = video);
+    without this the packed mRoPE path crashes with a missing-argument TypeError.
+    """
+    import torch
+
+    from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _compute_mrope_position_ids
+
+    captured = {}
+
+    class _Cfg:
+        image_token_id = 7
+        video_token_id = 8
+
+    class _Model:
+        config = _Cfg()
+
+        def get_rope_index(
+            self,
+            input_ids,
+            mm_token_type_ids,
+            image_grid_thw=None,
+            video_grid_thw=None,
+            attention_mask=None,
+            **kwargs,
+        ):
+            """Fake Qwen3-VL-style rope builder.
+
+            Args:
+                input_ids: Tensor of shape [1, seq].
+                mm_token_type_ids: Tensor of shape [1, seq] (0 text, 1 image, 2 video).
+
+            Returns:
+                position_ids of shape [3, 1, seq] and a dummy rope-delta tensor.
+            """
+            captured["mm"] = mm_token_type_ids
+            seq = input_ids.shape[1]
+            pos = torch.arange(seq).unsqueeze(0).expand(3, seq).unsqueeze(1)
+            return pos, torch.zeros(1)
+
+    sample = {"input_ids": torch.tensor([1, 7, 7, 2, 8, 3])}
+    pos = _compute_mrope_position_ids(sample, _Model().get_rope_index)
+
+    assert pos.shape == (3, 6)
+    assert captured["mm"].tolist() == [[0, 1, 1, 0, 2, 0]]
+
+
+def test_compute_mrope_position_ids_passes_sample_mm_token_type_ids_through():
+    """A processor-produced mm_token_type_ids on the sample wins over reconstruction."""
+    import torch
+
+    from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _compute_mrope_position_ids
+
+    captured = {}
+
+    class _Model:
+        config = None
+
+        def get_rope_index(self, input_ids, mm_token_type_ids, attention_mask=None, **kwargs):
+            """Fake rope builder; input_ids/mm_token_type_ids are [1, seq]."""
+            captured["mm"] = mm_token_type_ids
+            seq = input_ids.shape[1]
+            return torch.arange(seq).unsqueeze(0).expand(3, seq).unsqueeze(1), torch.zeros(1)
+
+    sample = {
+        "input_ids": torch.tensor([1, 2, 3, 4]),
+        "mm_token_type_ids": torch.tensor([0, 1, 1, 0]),
+    }
+    pos = _compute_mrope_position_ids(sample, _Model().get_rope_index)
+
+    assert pos.shape == (3, 4)
+    assert captured["mm"].tolist() == [[0, 1, 1, 0]]

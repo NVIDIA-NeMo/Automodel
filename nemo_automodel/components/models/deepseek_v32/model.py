@@ -20,7 +20,7 @@ the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,10 @@ from nemo_automodel.components.models.common import (
     compute_lm_head_logits,
     get_rope_config,
     initialize_rms_norm_module,
+)
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,
@@ -166,6 +170,8 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
     Subclasses V3 ForCausalLM, using DeepseekV32Model and DeepSeekV32StateDictAdapter.
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -208,6 +214,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         from nemo_automodel.components.models.common import initialize_linear_module
 
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         # Use V3.2 Model instead of V3 Model
         moe_overrides = kwargs.pop("moe_overrides", None)
@@ -247,7 +254,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass returning :class:`CausalLMOutputWithPast`.

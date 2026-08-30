@@ -26,6 +26,8 @@ When no CP mesh is set, the module delegates to the original HF forward.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -33,8 +35,11 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
 
-from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+from nemo_automodel.components.models.qwen3_5.packing import prepare_gated_delta_packed_metadata
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelState
 
 
 class _AllGatherConcatFn(Function):
@@ -128,27 +133,27 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         cache_position=None,
         attention_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         indices: torch.Tensor | None = None,
-    ):
+    ) -> torch.Tensor:
         """HF GatedDeltaNet forward with FSDP-safe fp32 gate computation.
 
-        Mirrors transformers==5.5 ``Qwen3_5GatedDeltaNet.forward`` (per-layer
-        cache API; gate via ``self._compute_gate(a)``) and adds packing-aware
-        plumbing:
+        Args:
+            hidden_states: Hidden states of shape [batch, sequence, hidden].
+            cache_params: Optional Hugging Face recurrent cache.
+            cache_position: Optional token positions of shape [sequence]; unused
+                by the Transformers 5.5-compatible path.
+            attention_mask: Optional validity or indexed document mask of shape
+                [batch, sequence].
+            cu_seqlens: Optional cumulative document lengths of shape
+                [documents + 1] on the compute device.
+            cu_seqlens_cpu: Optional CPU mirror of ``cu_seqlens`` with shape
+                [documents + 1] for FLA host-side chunk planning.
+            indices: Optional flattened valid-token indices of shape [tokens] on
+                the compute device.
 
-        * ``cu_seqlens`` -- per-document cumulative lengths from the indexed
-          attention mask. When supplied, FLA's chunk kernel resets state at
-          every document boundary.
-        * ``indices`` -- non-padding token indices. When supplied AND padding
-          is actually present (B>1 case), the layer unpads activations to
-          ``[1, total_valid, ...]`` before conv/FLA and re-pads on the way
-          out. For B=1 with no padding, ``indices`` covers the whole sequence
-          and unpadding is skipped (preserves the bit-exact fast path).
-
-        Both kwargs are produced by ``Qwen3_5DecoderLayerWithPacking``. As a
-        safety net for direct callers (e.g. unit tests that bypass the
-        decoder-layer subclass), the layer derives them from ``attention_mask``
-        when both are ``None`` and the mask is indexed.
+        Returns:
+            GatedDeltaNet output of shape [batch, sequence, hidden].
         """
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
@@ -161,10 +166,16 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         # Resolve packing kwargs. Fallback to mask-derivation only when neither
         # was passed in (bypasses the decoder-layer subclass).
         if not use_precomputed_states and cu_seqlens is None and indices is None:
-            if is_indexed_packed_mask(attention_mask):
-                indices_t, cu_seqlens_t, _ = get_unpad_data(attention_mask)
-                cu_seqlens = cu_seqlens_t.to(torch.long)
-                indices = indices_t
+            packed_metadata = prepare_gated_delta_packed_metadata(attention_mask, None)
+            if packed_metadata is not None:
+                cu_seqlens = packed_metadata.cu_seqlens
+                cu_seqlens_cpu = packed_metadata.cu_seqlens_cpu
+                indices = packed_metadata.indices
+
+        if cu_seqlens is not None and cu_seqlens_cpu is None:
+            cu_seqlens_cpu = cu_seqlens.detach().cpu()
+        if cu_seqlens_cpu is not None and cu_seqlens_cpu.device.type != "cpu":
+            raise ValueError("cu_seqlens_cpu must reside on CPU for FLA host-side chunk planning.")
 
         is_packed = (not use_precomputed_states) and cu_seqlens is not None
         # Only unpad when there is actually padding to remove. For B=1 packs
@@ -263,6 +274,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                     output_final_state=cache_params is not None,
                     use_qk_l2norm_in_kernel=True,
                     cu_seqlens=cu_seqlens,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
                 )
                 if not needs_unpad:
                     core_attn_out = core_attn_out.reshape(batch_size, seq_len, *core_attn_out.shape[2:])
@@ -321,9 +333,35 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         position_ids: torch.Tensor | None = None,
         qkv_format: str | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         indices: torch.Tensor | None = None,
         seq_index: torch.Tensor | None = None,
-    ):
+    ) -> torch.Tensor:
+        """Run GatedDeltaNet with dense, round-robin CP, or packed contiguous CP.
+
+        Args:
+            hidden_states: Hidden states of shape ``[batch, sequence, hidden]``;
+                under CP, ``sequence`` is this rank's local shard.
+            cache_params: Optional Hugging Face recurrent cache.
+            cache_position: Optional token positions of shape ``[sequence]``.
+            attention_mask: Optional validity or document mask of shape
+                ``[batch, sequence]``.
+            position_ids: Optional positions of shape ``[batch, sequence]`` or
+                ``[axes, batch, sequence]``.
+            qkv_format: Optional attention layout tag; unused by this module.
+            cu_seqlens: Optional packed boundaries of shape
+                [documents + 1] for the non-CP path.
+            cu_seqlens_cpu: Optional CPU mirror of ``cu_seqlens`` with shape
+                [documents + 1] for FLA host-side chunk planning.
+            indices: Optional valid-token indices of shape ``[tokens]`` for the
+                non-CP packed path.
+            seq_index: Optional global token positions of shape ``[sequence]``
+                or ``[batch, sequence]`` for round-robin CP restoration.
+
+        Returns:
+            Hidden states of shape ``[batch, sequence, hidden]`` in the same
+            local sequence layout as ``hidden_states``.
+        """
         # Fast path: no CP → run HF forward with fp32-safe gate computation.
         if self._cp_mesh is None or self._cp_mesh.size() <= 1:
             return self._forward_no_cp(
@@ -331,13 +369,17 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 cache_params=cache_params,
                 attention_mask=attention_mask,
                 cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
                 indices=indices,
             )
+
+        from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
 
         return self._forward_with_cp(
             hidden_states,
             position_ids=position_ids,
             seq_index=seq_index,
+            blockdiag_state=current_blockdiag_cp_state(),
         )
 
     # ------------------------------------------------------------------
@@ -500,46 +542,87 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         *,
         position_ids: torch.Tensor | None,
         seq_index: torch.Tensor | None,
+        blockdiag_state: BlockdiagCpModelState | None = None,
     ) -> torch.Tensor:
+        """Run FLA GatedDeltaNet over a context-parallel sequence shard.
+
+        Args:
+            hidden_states: Local hidden states of shape ``[batch, local_sequence,
+                hidden]``. The sequence axis uses contiguous rank order when
+                ``blockdiag_state`` is active, otherwise PyTorch CP's
+                head-tail round-robin order.
+            position_ids: Optional local positions of shape ``[batch,
+                local_sequence]`` or mRoPE positions of shape ``[axes, batch,
+                local_sequence]``.
+            seq_index: Optional global token indices of shape
+                ``[local_sequence]`` or ``[batch, local_sequence]`` for the
+                round-robin layout.
+            blockdiag_state: Optional packed CP state whose cumulative-length
+                tensors have shape ``[num_documents + 1]`` and reset conv/GDN
+                recurrence at document boundaries.
+
+        Returns:
+            Local GatedDeltaNet output of shape ``[batch, local_sequence,
+            hidden]`` in the same sequence layout as ``hidden_states``.
+        """
         from fla.ops.cp import build_cp_context
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gated_delta_rule
 
         batch_size, seq_len, _ = hidden_states.shape
 
-        cp_group = self._cp_mesh.get_group()
-        cp_rank = dist.get_rank(cp_group)
         cp_size = self._cp_mesh.size()
-
-        local_positions = self._extract_local_seq_index(seq_index, seq_len)
-        if local_positions is None:
-            local_positions = self._build_dual_chunk_local_positions(
-                seq_len=seq_len,
-                cp_size=cp_size,
-                cp_rank=cp_rank,
-                device=hidden_states.device,
+        cp_group = blockdiag_state.group if blockdiag_state is not None else self._cp_mesh.get_group()
+        group_size = dist.get_world_size(cp_group)
+        if group_size != cp_size:
+            raise RuntimeError(
+                f"Qwen3.5-MoE GDN CP process-group size ({group_size}) does not match cp_mesh.size() ({cp_size})"
             )
+        cp_rank = dist.get_rank(cp_group)
+
+        uses_contiguous_layout = blockdiag_state is not None
+        local_positions = None
+        if not uses_contiguous_layout:
+            local_positions = self._extract_local_seq_index(seq_index, seq_len)
+            if local_positions is None:
+                local_positions = self._build_dual_chunk_local_positions(
+                    seq_len=seq_len,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                    device=hidden_states.device,
+                )
 
         # ---- Build FLA CP context (once, reused for every sequence) ----
         # After undoing the load-balanced attention layout, each rank again owns a
         # contiguous chunk of a dense global sequence of length seq_len * cp_size.
         global_seq_len = seq_len * cp_size
-        cu_seqlens_single = torch.tensor(
-            [0, global_seq_len],
-            dtype=torch.long,
-            device=hidden_states.device,
-        )
-        cp_context = build_cp_context(
-            cu_seqlens=cu_seqlens_single,
-            group=cp_group,
-            conv1d_kernel_size=self.conv_kernel_size,
-        )
+        if uses_contiguous_layout:
+            cu_seqlens = blockdiag_state.packed_cu_seqlens
+            cp_context = build_cp_context(
+                cu_seqlens=cu_seqlens,
+                group=cp_group,
+                conv1d_kernel_size=self.conv_kernel_size,
+                cu_seqlens_cpu=blockdiag_state.packed_cu_seqlens_cpu,
+            )
+        else:
+            cu_seqlens_single = torch.tensor(
+                [0, global_seq_len],
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            cp_context = build_cp_context(
+                cu_seqlens=cu_seqlens_single,
+                group=cp_group,
+                conv1d_kernel_size=self.conv_kernel_size,
+            )
         # Attention runs on a load-balanced CP layout, but conv + recurrent state
         # propagation require rank-order sequential tokens.
-        hidden_states, sorted_positions = self._undo_attention_load_balancing(
-            hidden_states,
-            local_positions,
-            cp_group,
-        )
+        sorted_positions = None
+        if not uses_contiguous_layout:
+            hidden_states, sorted_positions = self._undo_attention_load_balancing(
+                hidden_states,
+                local_positions,
+                cp_group,
+            )
 
         # ---- Projections (batched, pointwise) ----
         mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S_local, conv_dim]
@@ -598,12 +681,13 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         output = self.out_proj(core_attn_out)
-        output = self._redo_attention_load_balancing(
-            output,
-            local_positions,
-            sorted_positions,
-            cp_group=cp_group,
-        )
+        if not uses_contiguous_layout:
+            output = self._redo_attention_load_balancing(
+                output,
+                local_positions,
+                sorted_positions,
+                cp_group=cp_group,
+            )
         return output
 
 
@@ -654,8 +738,8 @@ def install_ssm_gate(mod, fp32_dtype=torch.float32):
 def _resolve_ssm_dtype(config):
     """Resolve the fp32 storage dtype for the SSM-gating params from ``config``.
 
-    Honors ``mamba_ssm_dtype`` (Qwen3.5 stores ``A_log``/``dt_bias`` in fp32);
-    defaults to ``torch.float32``.
+    Honors ``mamba_ssm_dtype`` when present; otherwise defaults to AutoModel's
+    fp32 training-storage contract for ``A_log``/``dt_bias``.
     """
     ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
     if isinstance(ssm_dtype, str):

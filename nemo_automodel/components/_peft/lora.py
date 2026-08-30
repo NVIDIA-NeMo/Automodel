@@ -15,13 +15,12 @@
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard as _Shard
 
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.lora_kernel import (
@@ -31,7 +30,9 @@ from nemo_automodel.components._peft.lora_kernel import (
 )
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+from nemo_automodel.shared.tp_linear import tp_linear_forward
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
@@ -52,7 +53,7 @@ class PeftConfig:
     dropout: float = 0.0
     dropout_position: Literal["pre", "post"] = "post"
     lora_A_init: str = "xavier"
-    lora_dtype: Optional[torch.dtype] = None
+    lora_dtype: torch.dtype | None = None
     use_memory_efficient_lora: bool = True
     use_triton: bool = False
     moe_rank_scaling: bool = False
@@ -233,6 +234,34 @@ class LinearLoRA(nn.Linear):
         weight_norm = torch.linalg.norm(weight + self.scale * delta_w, dim=1).to(weight.dtype)
         return weight_norm.detach()
 
+    def materialize_effective_weight(self) -> torch.Tensor:
+        """Return the differentiable dense weight represented by this LoRA layer.
+
+        Returns:
+            Tensor of shape [out_features, in_features] containing the frozen base
+            weight plus the scaled LoRA update.
+
+        Raises:
+            RuntimeError: If training-time dropout makes one fixed effective weight
+                unable to represent the layer's stochastic forward pass.
+            NotImplementedError: If DoRA, a delegated linear implementation, or an
+                unsupported quantized or non-strided weight layout is active.
+        """
+        if self.training and self.dropout_p > 0.0:
+            raise RuntimeError("materialize_effective_weight does not support active LoRA training dropout")
+        if self.use_dora:
+            raise NotImplementedError("materialize_effective_weight does not support DoRA")
+        if getattr(self, "super_fwd", None) is not None or getattr(self, "quant_state", None) is not None:
+            raise NotImplementedError(
+                "materialize_effective_weight supports only ordinary torch linear weights, not delegated or "
+                "quantized linear implementations"
+            )
+        if self.weight.layout != torch.strided or self.weight.is_quantized:
+            raise NotImplementedError(
+                "materialize_effective_weight supports only dense, strided, non-quantized linear weights"
+            )
+        return self.weight + self.scale * (self.lora_B.weight @ self.lora_A.weight)
+
     def _should_use_memory_efficient_lora(self, x: torch.Tensor) -> bool:
         """Return whether this LoRA branch can use the custom autograd path."""
         if not getattr(self, "use_memory_efficient_lora", False):
@@ -257,10 +286,19 @@ class LinearLoRA(nn.Linear):
         The result of the original linear transformation is combined with the LoRA output.
 
         Args:
-            x (Tensor): Input tensor of shape (batch_size, in_features).
+            x (Tensor): Input activations of shape ``[B, S, in_features]``
+                (``B`` = batch, ``S`` = sequence) or ``[N, in_features]``
+                (``N`` = flattened tokens).  May be a DTensor: a 3-D DTensor
+                sharded on dim 0 or 1 (e.g. ``Shard(1)`` from sequence
+                parallelism) routes the base projection through ``torch.bmm``;
+                replicated or last-dimension-sharded inputs (``Shard(2)`` or
+                ``Shard(-1)``) take ``F.linear``, which under async-TP tracing
+                is the fusable native linear graph.
 
         Returns:
-            Tensor: Output tensor of shape (batch_size, out_features).
+            Tensor: Output of shape ``[..., out_features]`` with the same
+            leading dimensions as ``x``; a DTensor if ``x`` and the weights
+            are DTensors.
         """
         # pylint: disable=C0115,C0116
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
@@ -274,21 +312,7 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            # bmm avoids aten.view which cannot flatten a sharded dimension.
-            # F.linear calls view([b,s,h]->[b*s,h]) which fails when dim 0/1 is sharded
-            # (sequence parallelism) or during AOT-autograd tracing with compile.
-            _x_needs_bmm = (
-                isinstance(x, DTensor)
-                and x.dim() == 3
-                and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
-            )
-            if torch.compiler.is_compiling() or _x_needs_bmm:
-                b = x.shape[0]
-                res = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
-                if bias is not None:
-                    res = res + bias
-            else:
-                res = F.linear(x, self.weight, bias)
+            res = tp_linear_forward(x, self.weight, bias, mm_for_2d_compile=False)
 
         if not self.use_dora:
             if self.dropout_position == "pre":
@@ -516,6 +540,8 @@ def patch_moe_module(
     Returns:
         nn.Module: The LoRA-wrapped MoE module (GroupedExpertsLoRA or GroupedExpertsDeepEPLoRA).
     """
+    if isinstance(orig_module, GroupedExpertsMoK):
+        raise NotImplementedError("LoRA is not supported for Mixture-of-Kittens expert modules.")
     if isinstance(orig_module, GroupedExpertsTE):
         raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
     elif isinstance(orig_module, GroupedExpertsDeepEP):
@@ -562,11 +588,12 @@ def apply_lora_to_linear_modules(
     Note:
         target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
 
-        Beyond per-linear LoRA, after the linear layers are patched this also fuses SiLU-SwiGLU
-        (gate/up/down) and ReLU² (up/down) MLPs whose projections were all LoRA-patched: their
-        forward is swapped to a single memory-efficient autograd op (see ``install_fused_lora_mlp``)
-        that recomputes the activation in backward. It transparently falls back to the per-linear
-        path under tensor/expert parallelism (DTensor), DoRA, or active dropout.
+        When ``use_memory_efficient_lora`` is enabled, after the linear layers are patched this also
+        fuses SiLU-SwiGLU (gate/up/down) and ReLU² (up/down) MLPs whose projections were all
+        LoRA-patched: their forward is swapped to a single memory-efficient autograd op (see
+        ``install_fused_lora_mlp``) that recomputes the activation in backward. It transparently
+        falls back to the per-linear path under tensor/expert parallelism (DTensor), DoRA, or active
+        dropout.
     """
     # Freeze base model parameters
     if not skip_freeze:
@@ -591,7 +618,7 @@ def apply_lora_to_linear_modules(
     )
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
-        if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)):
+        if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE, GroupedExpertsMoK)):
             if matcher.match(module, name):
                 if peft_config.use_dora:
                     raise NotImplementedError("DoRA is not supported for MoE expert modules in Automodel yet.")
@@ -659,14 +686,15 @@ def apply_lora_to_linear_modules(
                     layer_name=name,
                 )
 
-    # Fuse SwiGLU/ReLU² MLPs whose projections were just LoRA-patched into one memory-efficient
-    # autograd op (recompute the activation in backward); falls back per-MLP under
-    # sharding (DTensor) / DoRA / active dropout.
-    from nemo_automodel.components._peft.lora_mlp import install_fused_lora_mlp
+    if getattr(peft_config, "use_memory_efficient_lora", True):
+        # Fuse SwiGLU/ReLU² MLPs whose projections were just LoRA-patched into one memory-efficient
+        # autograd op (recompute the activation in backward); falls back per-MLP under
+        # sharding (DTensor) / DoRA / active dropout.
+        from nemo_automodel.components._peft.lora_mlp import install_fused_lora_mlp
 
-    n_fused_mlps = install_fused_lora_mlp(model)
-    if n_fused_mlps:
-        logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
+        n_fused_mlps = install_fused_lora_mlp(model)
+        if n_fused_mlps:
+            logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
 
     return num_modules_matched
 
@@ -723,11 +751,21 @@ class LoRATritonFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, d_y):
-        """
-        Backward method for memory-efficient LoRA.
+        """Compute gradients for memory-efficient LoRA.
 
         Reshapes 3D tensors into 2D and then updates d_lora_a, d_lora_b, and dx. The PyTorch matmul
         path recomputes ``x @ lora_A.T`` here instead of saving it from forward.
+
+        Args:
+            ctx: Autograd context containing the saved input and LoRA weights.
+            d_y: Tensor of shape ``[tokens, out_features]`` containing the output gradient in the forward compute
+                dtype.
+
+        Returns:
+            Gradients for the custom autograd inputs. The input gradient has shape ``[tokens, in_features]`` or
+            ``[batch, sequence, in_features]`` and matches the original input dtype. LoRA weight gradients have
+            shapes ``[rank, in_features]`` and ``[out_features, rank]`` and match their weight dtypes. When a
+            residual input is present, its gradient matches the original residual shape.
         """
         x, lora_A, lora_B = ctx.saved_tensors
         scale = ctx.scale
@@ -751,17 +789,23 @@ class LoRATritonFunction(torch.autograd.Function):
         else:
             d_x = d_lora_A = d_lora_B = None
             needs_x, needs_lora_A, needs_lora_B = ctx.needs_input_grad[:3]
+            # Custom backward executes outside autocast. Reuse d_y's forward compute dtype for the recomputed
+            # matmuls, then cast each returned gradient to the dtype of its corresponding input.
+            x_compute = x.to(d_y.dtype) if needs_lora_A or needs_lora_B else x
+            lora_A_compute = lora_A.to(d_y.dtype) if needs_x or needs_lora_B else lora_A
+            lora_B_compute = lora_B.to(d_y.dtype) if needs_x or needs_lora_A else lora_B
             if needs_x or needs_lora_A:
-                d_y_lora_B = torch.matmul(d_y, lora_B)
+                d_y_lora_B = torch.matmul(d_y, lora_B_compute)
+                d_y_lora_B.mul_(scale)
                 if needs_x:
-                    d_x = torch.empty_like(x)
-                    d_x.addmm_(d_y_lora_B, lora_A, beta=0, alpha=scale)
+                    d_x = torch.matmul(d_y_lora_B, lora_A_compute).to(x.dtype)
                 if needs_lora_A:
-                    d_lora_A = torch.matmul(d_y_lora_B.t(), x) * scale
+                    d_lora_A = torch.matmul(d_y_lora_B.t(), x_compute).to(lora_A.dtype)
 
             if needs_lora_B:
-                d_lora_B = torch.empty_like(lora_B)
-                d_lora_B.addmm_(d_y.t(), F.linear(x, lora_A), beta=0, alpha=scale)
+                x_lora_A = F.linear(x_compute, lora_A_compute)
+                x_lora_A.mul_(scale)
+                d_lora_B = torch.matmul(d_y.t(), x_lora_A).to(lora_B.dtype)
 
         if reshape and d_x is not None:
             d_x = d_x.view(bs, seq_len, d)
@@ -781,7 +825,28 @@ def apply_memory_efficient_lora(x, lora_A, lora_B, scale, use_triton_kernel, res
     autograd Function so the output is never a view). Reshape back to the input rank here; the result
     is an ordinary autograd view, which — unlike a custom-Function output view — a downstream consumer
     may mutate in place (e.g. transformers' gemma3n ``project_per_layer_inputs``).
+
+    Args:
+        x: Activation tensor of shape ``[tokens, in_features]`` or ``[batch, sequence, in_features]``.
+        lora_A: Tensor of shape ``[rank, in_features]``.
+        lora_B: Tensor of shape ``[out_features, rank]``.
+        scale: LoRA scaling factor (``alpha / rank``).
+        use_triton_kernel: Request the Triton kernels; declined when their dtype precondition
+            does not hold (see below).
+        res: Optional base-projection output to fold in, in ``x``'s leading shape with
+            ``out_features`` trailing.
+
+    Returns:
+        Tensor with ``x``'s leading dimensions and ``out_features`` trailing.
     """
+    if use_triton_kernel and not (x.dtype == lora_A.dtype == lora_B.dtype):
+        # The Triton kernels hand their operands straight to ``tl.dot``, which asserts a single dtype
+        # ("Both operands must be same dtype. Got fp32 and bf16"), and they run outside autocast, so
+        # nothing reconciles the two. Mixed precision reaches here whenever an FSDP2 unit's
+        # ``output_dtype=float32`` hands an fp32 activation to bf16 adapters — the layout in #3652,
+        # whose recipe does set ``use_triton: true``. Drop to the torch matmul path below, which
+        # follows the forward compute dtype and casts explicitly.
+        use_triton_kernel = False
     out = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, use_triton_kernel, res)
     if x.dim() == 3:
         out = out.reshape(*x.shape[:-1], -1)

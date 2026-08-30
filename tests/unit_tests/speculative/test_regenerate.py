@@ -29,6 +29,7 @@ from nemo_automodel.components.speculative.regenerate import (
     _existing_shard_indices,
     _extract_prompt_messages,
     _process_shard,
+    _regenerate_one,
     _validate_args,
     _write_shard,
 )
@@ -579,3 +580,49 @@ def test_chat_completion_raises_after_max_retries_exhausted(monkeypatch):
     # max_retries=2 → 3 total attempts, 2 sleeps
     assert session.call_count == 3
     assert len(sleep_calls) == 2
+
+
+def test_reasoning_disable_sends_top_level_chat_template_kwargs():
+    """--reasoning disable must land as a top-level request field, not extra_body.
+
+    ``extra_body`` is an OpenAI Python-client convenience merged into the body
+    client-side; this script POSTs raw JSON, so a literal ``extra_body`` key is
+    silently ignored by the server and thinking stays enabled.
+    """
+    session = _FakeSession(lambda payload: "ok")
+    gen_cfg = GenerationConfig(model="m", max_new_tokens=8, temperature=0.0, top_p=1.0, reasoning="disable")
+
+    asyncio.run(
+        _regenerate_one(
+            session,
+            url="http://server/v1/chat/completions",
+            prompt=[{"role": "user", "content": "q"}],
+            gen_cfg=gen_cfg,
+            timeout_s=10.0,
+            max_retries=0,
+        )
+    )
+
+    (call,) = session.calls
+    assert call["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "extra_body" not in call["json"]
+
+
+def test_reasoning_none_sends_no_chat_template_kwargs():
+    session = _FakeSession(lambda payload: "ok")
+    gen_cfg = GenerationConfig(model="m", max_new_tokens=8, temperature=0.0, top_p=1.0, reasoning="none")
+
+    asyncio.run(
+        _regenerate_one(
+            session,
+            url="http://server/v1/chat/completions",
+            prompt=[{"role": "user", "content": "q"}],
+            gen_cfg=gen_cfg,
+            timeout_s=10.0,
+            max_retries=0,
+        )
+    )
+
+    (call,) = session.calls
+    assert "chat_template_kwargs" not in call["json"]
+    assert "extra_body" not in call["json"]

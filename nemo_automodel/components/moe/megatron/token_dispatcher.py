@@ -15,9 +15,10 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Tuple
 
 import torch
+from torch import nn
 
 from .fused_a2a import (
     fused_combine,
@@ -118,11 +119,11 @@ class _DeepepManager(_DispatchManager):
         group: torch.distributed.ProcessGroup,
         router_topk: int,
         permute_fusion: bool = False,
-        capacity_factor: Optional[float] = None,
-        num_experts: Optional[int] = None,
-        num_local_experts: Optional[int] = None,
-        router_dtype: Optional[str] = None,
-        moe_router_expert_pad_multiple: Optional[int] = None,
+        capacity_factor: float | None = None,
+        num_experts: int | None = None,
+        num_local_experts: int | None = None,
+        router_dtype: str | None = None,
+        moe_router_expert_pad_multiple: int | None = None,
         _dispatch_fn=None,
         _combine_fn=None,
     ):
@@ -136,8 +137,8 @@ class _DeepepManager(_DispatchManager):
         self.moe_router_expert_pad_multiple = moe_router_expert_pad_multiple
 
         # Metadata
-        self.token_indices: Optional[torch.Tensor] = None
-        self.token_probs: Optional[torch.Tensor] = None
+        self.token_indices: torch.Tensor | None = None
+        self.token_probs: torch.Tensor | None = None
         # Handle used for combine operation
         self.handle = None
 
@@ -319,6 +320,43 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _HybridEPMetadataProcessor(nn.Module):
+    """Fixed-shape conversion from top-k metadata to HybridEP metadata."""
+
+    def __init__(self, *, num_experts: int, permute_fusion: bool):
+        super().__init__()
+        self.num_experts = num_experts
+        self.permute_fusion = permute_fusion
+
+    def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert compact top-k indices and probabilities to multihot tensors."""
+        if self.permute_fusion:
+            return fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
+
+        batch_size = token_indices.shape[0]
+        routing_map = torch.zeros(
+            (batch_size, self.num_experts),
+            dtype=torch.bool,
+            device=token_indices.device,
+        )
+        multihot_probs = torch.zeros(
+            (batch_size, self.num_experts),
+            dtype=torch.float,
+            device=token_indices.device,
+        )
+        mask = token_indices != -1
+        valid_indices = token_indices[mask]
+        row_indices = torch.arange(batch_size, device=token_indices.device).repeat_interleave(mask.sum(dim=1))
+        routing_map[row_indices, valid_indices] = True
+        multihot_probs[row_indices, valid_indices] = token_probs[mask]
+        return routing_map, multihot_probs
+
+
+# DeepEP's hybrid-ep metadata allgather asserts bytes_per_rank % 16 == 0 on a
+# 4-byte-per-token array, so per-rank token counts must be multiples of 4.
+_HYBRIDEP_TOKEN_ALIGNMENT = 4
+
+
 class _HybridEPManager(_DispatchManager):
     """
     A manager class to handle fused all-to-all communication processes for MoE models using
@@ -352,11 +390,14 @@ class _HybridEPManager(_DispatchManager):
         self.num_permuted_tokens = None
 
         # Metadata
-        self.token_probs: Optional[torch.Tensor] = None
-        self.routing_map: Optional[torch.Tensor] = None
+        self.token_probs: torch.Tensor | None = None
+        self.routing_map: torch.Tensor | None = None
         # Handle used for combine operation
         self.handle = None
         self.pad_multiple = None
+        # Set by dispatch() when this rank padded its tokens up to the EP-group
+        # maximum; combine() slices the padding back off.
+        self.num_unpadded_tokens: int | None = None
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -410,6 +451,27 @@ class _HybridEPManager(_DispatchManager):
         self.num_permuted_tokens = None
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
+
+        # HybridEP's fused all-to-all exchanges fixed-extent buffers, so every rank
+        # in the EP group must dispatch the same number of tokens, and the kernel's
+        # metadata allgather additionally requires that count to be 16-byte aligned
+        # (4 tokens). Unequal or unaligned counts (variable-length or packed dynamic
+        # batches) abort or deadlock the collective. Pad this rank's tokens up to
+        # the aligned group-wide maximum: padded rows route to no expert (all-False
+        # routing map), and combine() slices them back off.
+        self.num_unpadded_tokens = None
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
+            num_tokens = hidden_states.shape[0]
+            group_max = torch.tensor(num_tokens, device=hidden_states.device)
+            torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
+            target_tokens = -(-int(group_max) // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+            pad_tokens = target_tokens - num_tokens
+            if pad_tokens > 0:
+                self.num_unpadded_tokens = num_tokens
+                hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_tokens))
+                self.routing_map = nn.functional.pad(self.routing_map, (0, 0, 0, pad_tokens))
+                self.token_probs = nn.functional.pad(self.token_probs, (0, 0, 0, pad_tokens))
+
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
             x=hidden_states,
             routing_map=self.routing_map,
@@ -441,6 +503,9 @@ class _HybridEPManager(_DispatchManager):
         )
         self.handle = None
         self.num_permuted_tokens = None
+        if self.num_unpadded_tokens is not None:
+            hidden_states = hidden_states[: self.num_unpadded_tokens]
+            self.num_unpadded_tokens = None
         return hidden_states
 
     def get_dispatched_metadata(self) -> torch.Tensor:
@@ -466,14 +531,14 @@ class TokenDispatcherConfig:
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
-    moe_expert_capacity_factor: Optional[float] = None
+    moe_expert_capacity_factor: float | None = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
     will be dropped. The default is None."""
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
-    moe_router_expert_pad_multiple: Optional[int] = None
+    moe_router_expert_pad_multiple: int | None = None
     """Number of tokens to pad to a multiple of for each expert."""
 
     num_moe_experts: int = 64
@@ -498,7 +563,7 @@ class TokenDispatcherConfig:
     """Share one communication manager instance across MoE layers for the configured backend."""
 
     moe_deepep_async_dispatch: bool = False
-    """Use asynchronous DeepEP/UCCL-EP dispatch and allocate dispatched tensors on the communication stream."""
+    """Use asynchronous DeepEP/UCCL-EP dispatch/combine and communication-stream allocations."""
 
 
 class MoEFlexTokenDispatcher:
@@ -536,6 +601,7 @@ class MoEFlexTokenDispatcher:
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
+        self.hybridep_metadata_processor: _HybridEPMetadataProcessor | None = None
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
 
         backend = self.config.moe_flex_dispatcher_backend
@@ -611,6 +677,10 @@ class MoEFlexTokenDispatcher:
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                 )
+            self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                permute_fusion=self.config.moe_permute_fusion,
+            )
         else:
             raise ValueError(
                 f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
@@ -647,7 +717,10 @@ class MoEFlexTokenDispatcher:
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if isinstance(self._comm_manager, _HybridEPManager):
-            self._comm_manager.setup_metadata_from_indices(token_indices, token_probs)
+            assert self.hybridep_metadata_processor is not None
+            routing_map, multihot_probs = self.hybridep_metadata_processor(token_indices, token_probs)
+            self._comm_manager.routing_map = routing_map
+            self._comm_manager.token_probs = multihot_probs
         else:
             self._comm_manager.token_probs = token_probs
             self._comm_manager.token_indices = token_indices
@@ -797,7 +870,12 @@ class MoEFlexTokenDispatcher:
         3. Post-process the combined tokens to match the original input shape
         """
         hidden_states = self.combine_preprocess(hidden_states)
-        hidden_states = self.combine_all_to_all(hidden_states, False, False)
+        async_combine = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
+        hidden_states = self.combine_all_to_all(
+            hidden_states,
+            async_finish=async_combine,
+            allocate_on_comm_stream=async_combine,
+        )
         hidden_states = self.combine_postprocess(hidden_states)
 
         return hidden_states

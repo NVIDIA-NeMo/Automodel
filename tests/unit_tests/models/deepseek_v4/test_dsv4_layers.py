@@ -25,8 +25,10 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
+from nemo_automodel.components.models.deepseek_v4 import optimized_kernels as dsv4_optimized_kernels
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import build_dsv4_cp_causal_padding_mask
+from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4GroupedLinear,
@@ -54,6 +56,38 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     is_dsv4_kernel_available,
     sinkhorn_normalize_torch,
 )
+
+_MILES_INDEXER_REQUIRED_DYNAMIC_SMEM_BYTES = 229376
+
+
+def _cuda_device_capability() -> tuple[int, int]:
+    if not torch.cuda.is_available():
+        return (0, 0)
+    return torch.cuda.get_device_capability()
+
+
+def _cuda_device_optin_shared_memory() -> int:
+    if not torch.cuda.is_available():
+        return 0
+    return getattr(torch.cuda.get_device_properties(0), "shared_memory_per_block_optin", 0)
+
+
+def _can_run_tilelang_sparse_attn() -> bool:
+    return (
+        HAS_TILELANG
+        and is_dsv4_kernel_available("sparse_attn")
+        and torch.cuda.is_available()
+        and _cuda_device_capability() >= (8, 9)
+    )
+
+
+def _can_run_tilelang_indexer() -> bool:
+    return (
+        HAS_TILELANG
+        and is_dsv4_kernel_available("indexer")
+        and torch.cuda.is_available()
+        and _cuda_device_optin_shared_memory() >= _MILES_INDEXER_REQUIRED_DYNAMIC_SMEM_BYTES
+    )
 
 
 def _miles_q_positions(seqlen_local: int, cp_rank: int, device: torch.device) -> torch.Tensor:
@@ -269,6 +303,48 @@ class TestDeepseekV4AttentionMask:
 
         torch.testing.assert_close(actual, expected)
 
+    def test_compressed_window_metadata_handles_1d_mixed_and_short_windows(self):
+        seq_ids, positions = dsv4_layers._compressed_window_metadata(
+            seq_ids=torch.tensor([1, 1, 1, 1, 2, 2, 0, 0]),
+            position_ids=torch.tensor([0, 1, 2, 3, 0, 1, 0, 1]),
+            ready_len=8,
+            ratio=2,
+        )
+
+        torch.testing.assert_close(seq_ids, torch.tensor([[1, 1, 2, 0]]))
+        torch.testing.assert_close(positions, torch.tensor([[0, 1, 0, 0]]))
+
+        empty_seq_ids, empty_positions = dsv4_layers._compressed_window_metadata(
+            seq_ids=torch.tensor([1]),
+            position_ids=torch.tensor([0]),
+            ready_len=1,
+            ratio=2,
+        )
+        assert empty_seq_ids.shape == (1, 0)
+        assert empty_positions.shape == (1, 0)
+
+    def test_overlap_pool_all_masked_padding_window_is_finite_zero(self):
+        torch.manual_seed(1234)
+        batch, n_windows, ratio, head_dim = 1, 2, 4, 3
+        feat = 2 * head_dim
+        kv = torch.randn(batch, n_windows * ratio, feat)
+        gate = torch.randn(batch, n_windows * ratio, feat)
+        ape = torch.zeros(ratio, feat)
+        window_seq_ids = torch.tensor([[1, 0]])
+
+        pooled = dsv4_layers._pool_windows(
+            kv,
+            gate,
+            ape,
+            ratio=ratio,
+            head_dim=head_dim,
+            overlap=True,
+            window_seq_ids=window_seq_ids,
+        )
+
+        assert torch.isfinite(pooled).all()
+        torch.testing.assert_close(pooled[:, 1], torch.zeros(batch, head_dim))
+
     def test_packed_topk_uses_padded_lengths_for_tail_padding(self):
         seq_len = 8
         real_seq_lens = torch.tensor([[3, 2]], dtype=torch.long)
@@ -308,6 +384,103 @@ class TestDeepseekV4AttentionMask:
 
         assert (real_topk[0, 5:] >= 0).sum(dim=-1).eq(0).all()
         assert (padded_topk[0, 5:] >= 0).sum(dim=-1).gt(0).all()
+
+    def test_packed_hca_uses_document_metadata_for_compressed_mask(self):
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = cfg.compress_ratios[0]
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.eval()
+
+        with torch.no_grad():
+            _, attention_weights = attention(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_embeddings_compress=position_embeddings_compress,
+                rotary_compress=rotary_compress,
+                position_ids=torch.arange(seq_len),
+                packed_seq_ids=torch.ones(seq_len, dtype=torch.long),
+            )
+
+        assert attention_weights.shape[-1] == seq_len + 1
+        torch.testing.assert_close(
+            attention_weights[..., :-1, -1],
+            torch.zeros_like(attention_weights[..., :-1, -1]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        assert (attention_weights[..., -1, -1] > 0).all()
+
+    def test_packed_csa_indexer_filters_compressed_keys_by_document(self):
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        cfg.compress_ratios = [4]
+        cfg.sliding_window = 8
+        seq_len = 8
+        hidden_states = torch.randn(1, seq_len, cfg.hidden_size)
+        position_ids = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
+        packed_seq_ids = torch.tensor([1, 1, 1, 1, 2, 2, 2, 2])
+        partial_rotary_factor = float(cfg.qk_rope_head_dim) / float(cfg.head_dim)
+        rotary = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+        rotary_compress = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.compress_rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+        position_embeddings = rotary(hidden_states, position_ids.unsqueeze(0))
+        position_embeddings_compress = rotary_compress(hidden_states, position_ids.unsqueeze(0))
+        attention_mask = build_packed_causal_padding_mask(
+            torch.tensor([[4, 4]]),
+            seq_len=seq_len,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            sliding_window=cfg.sliding_window,
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.eval()
+
+        with torch.no_grad():
+            _, attention_weights = attention(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_embeddings_compress=position_embeddings_compress,
+                rotary_compress=rotary_compress,
+                position_ids=position_ids,
+                packed_seq_ids=packed_seq_ids,
+            )
+
+        compressed_weights = attention_weights[..., -2:]
+        torch.testing.assert_close(
+            compressed_weights[..., [0, 1, 2, 4, 5, 6], :],
+            torch.zeros_like(compressed_weights[..., [0, 1, 2, 4, 5, 6], :]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        assert (compressed_weights[..., 3, 0] > 0).all()
+        torch.testing.assert_close(
+            compressed_weights[..., 3, 1],
+            torch.zeros_like(compressed_weights[..., 3, 1]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            compressed_weights[..., 7, 0],
+            torch.zeros_like(compressed_weights[..., 7, 0]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        assert (compressed_weights[..., 7, 1] > 0).all()
 
     def test_short_hca_training_window_stays_disabled_without_group_hca(self):
         """All-short groups should keep the original no-HCA path and grad=None semantics."""
@@ -659,11 +832,8 @@ class TestDeepseekV4HyperConnection:
 
     @pytest.fixture
     def hc(self):
-        # ``DeepseekV4HyperConnection`` allocates ``fn``/``base``/``scale``
-        # via ``torch.empty(...)``; those are uninitialized memory and may
-        # contain NaN bit patterns.  Zero them so the Sinkhorn-row test has
-        # a well-defined starting point (real model loads init from the
-        # checkpoint via the state-dict adapter, not via ``empty``).
+        # Use explicit zeros so formula-specific tests have a deterministic
+        # starting point independent of the production random-init scheme.
         m = DeepseekV4HyperConnection(
             hc_mult=4,
             hidden_size=16,
@@ -676,6 +846,19 @@ class TestDeepseekV4HyperConnection:
             m.base.zero_()
             m.scale.zero_()
         return m
+
+    def test_init_weights_matches_reference_scheme(self, hc):
+        with torch.no_grad():
+            hc.fn.fill_(float("nan"))
+            hc.base.fill_(float("nan"))
+            hc.scale.fill_(float("nan"))
+
+        hc.init_weights(0.02)
+
+        assert torch.isfinite(hc.fn).all()
+        assert torch.count_nonzero(hc.fn) > 0
+        torch.testing.assert_close(hc.base, torch.zeros_like(hc.base))
+        torch.testing.assert_close(hc.scale, torch.ones_like(hc.scale))
 
     def test_parameter_dtypes_are_fp32(self, hc):
         # HC params must stay fp32 even when the surrounding model is bf16.
@@ -712,6 +895,34 @@ class TestDeepseekV4HyperConnection:
 
 class TestDeepseekV4OptimizedKernels:
     """Numerical equivalence tests for optional DSV4 kernel dispatch."""
+
+    def test_full_tensor_if_dtensor_clones_gathered_value(self, monkeypatch):
+        """Returned fp32 holder values must not alias storage FSDP may reshard."""
+        full = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        class FakeDTensor:
+            def full_tensor(self):
+                return full
+
+        monkeypatch.setattr(dsv4_layers, "DTensor", FakeDTensor)
+
+        gathered = dsv4_layers._full_tensor_if_dtensor(FakeDTensor())
+
+        assert torch.equal(gathered, full)
+        assert gathered.data_ptr() != full.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(full.grad, torch.ones_like(full))
+
+    def test_full_tensor_if_dtensor_clones_regular_tensor(self):
+        """FSDP can reshard a regular-looking tensor returned from an fp32 holder."""
+        tensor = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        gathered = dsv4_layers._full_tensor_if_dtensor(tensor)
+
+        assert torch.equal(gathered, tensor)
+        assert gathered.data_ptr() != tensor.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(tensor.grad, torch.ones_like(tensor))
 
     def test_eager_attention_with_sink_passes_reference_to_sinks_holder(self):
         """FSDP2-wrapped fp32 sink holders need a tensor input during recompute."""
@@ -829,13 +1040,22 @@ class TestDeepseekV4OptimizedKernels:
                 outputs.append(torch.cat(batch_outputs, dim=1))
             return torch.cat(outputs, dim=0)
 
-        expected, expected_grads = _run_forward_backward(unpacked_attention, (q, kv, sinks), grad)
-        actual, actual_grads = _run_forward_backward(packed_attention, (q, kv, sinks), grad)
+        previous_matmul_precision = torch.get_float32_matmul_precision()
+        if device == "cuda":
+            # Packed and unpacked inputs select different matmul kernels. Use IEEE
+            # FP32 so this test measures attention equivalence rather than TF32
+            # rounding differences between those kernels.
+            torch.set_float32_matmul_precision("highest")
+        try:
+            expected, expected_grads = _run_forward_backward(unpacked_attention, (q, kv, sinks), grad)
+            actual, actual_grads = _run_forward_backward(packed_attention, (q, kv, sinks), grad)
 
-        rtol, atol = (1e-4, 1e-5) if device == "cuda" else (1e-5, 1e-6)
-        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=rtol, atol=atol)
+            rtol, atol = (1e-4, 1e-5) if device == "cuda" else (1e-5, 1e-6)
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+            for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+                torch.testing.assert_close(actual_grad, expected_grad, rtol=rtol, atol=atol)
+        finally:
+            torch.set_float32_matmul_precision(previous_matmul_precision)
 
     def test_sinkhorn_torch_backend_matches_reference(self):
         torch.manual_seed(123)
@@ -853,6 +1073,68 @@ class TestDeepseekV4OptimizedKernels:
         )
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_sinkhorn_auto_backend_falls_back_to_torch_when_tilekernels_missing(self, monkeypatch):
+        monkeypatch.setattr(dsv4_optimized_kernels, "is_dsv4_kernel_available", lambda name: False)
+        torch.manual_seed(123)
+        x = torch.randn(2, 3, 4, 4)
+        grad = torch.randn_like(x)
+
+        expected, (expected_grad,) = _run_forward_backward(
+            lambda x_: sinkhorn_normalize_torch(x_, repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        actual, (actual_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="auto", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_tilelang_attention_keeps_sinkhorn_optional(self):
+        backend = type("Backend", (), {"attn": "tilelang"})()
+
+        assert dsv4_layers._dsv4_kernel_backend(backend) == "tilelang"
+        assert dsv4_layers._dsv4_sinkhorn_backend(backend) == "auto"
+
+    def test_vendored_tilelang_module_imports_with_phony_decorator(self, monkeypatch):
+        import builtins
+        import importlib
+        import importlib.util
+        import sys
+
+        from nemo_automodel.shared.import_utils import UnavailableError
+
+        helper_name = "nemo_automodel.components.models.deepseek_v4.kernels._tilelang"
+        module_name = "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd"
+        helper_path = dsv4_layers.__file__.rsplit("/", 1)[0] + "/kernels/_tilelang.py"
+        original_import = builtins.__import__
+        sys.modules.pop("tilelang", None)
+        sys.modules.pop("tilelang.language", None)
+
+        def block_tilelang(name, globals_=None, locals_=None, fromlist=(), level=0):
+            if name == "tilelang" or name.startswith("tilelang."):
+                raise ImportError("blocked tilelang")
+            return original_import(name, globals_, locals_, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", block_tilelang)
+        spec = importlib.util.spec_from_file_location(helper_name, helper_path)
+        helper = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(helper)
+        assert "tilelang" not in sys.modules
+
+        monkeypatch.setitem(sys.modules, helper_name, helper)
+        sys.modules.pop(module_name, None)
+        try:
+            module = importlib.import_module(module_name)
+            with pytest.raises(UnavailableError):
+                module.tl_indexer_fwd_impl(heads=1, index_dim=8)
+        finally:
+            sys.modules.pop(module_name, None)
 
     @pytest.mark.skipif(
         not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
@@ -1039,7 +1321,7 @@ class TestDeepseekV4OptimizedKernels:
             torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
 
     @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
+        not _can_run_tilelang_sparse_attn(),
         reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
     )
     def test_sparse_attention_tilelang_backend_matches_torch(self):
@@ -1084,7 +1366,7 @@ class TestDeepseekV4OptimizedKernels:
             torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
 
     @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
+        not _can_run_tilelang_sparse_attn(),
         reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
     )
     def test_sparse_attention_tilelang_backend_matches_torch_with_causal_padding_shape(self):
@@ -1232,7 +1514,7 @@ class TestDeepseekV4OptimizedKernels:
             torch.testing.assert_close(actual_grad, expected_grad)
 
     @pytest.mark.skipif(
-        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
+        not _can_run_tilelang_indexer(),
         reason="Miles DSV4 indexer kernel is not installed on a CUDA environment",
     )
     def test_indexer_tilelang_backend_matches_torch(self):
@@ -1264,7 +1546,7 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.skipif(
-        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
+        not _can_run_tilelang_indexer(),
         reason="Vendored Miles DSV4 indexer kernel is not available on a CUDA environment",
     )
     def test_indexer_topk_tilelang_backend_matches_torch(self):

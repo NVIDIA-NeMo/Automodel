@@ -35,16 +35,26 @@ from huggingface_hub import constants as hf_constants
 from packaging.version import parse
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
+from nemo_automodel.components.checkpoint.utils import is_cloud_path
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+_TORCH_2_7_1 = (2, 7, 1)
+_TORCH_2_9 = (2, 9)
+
+
+def _is_leq_torch_2_7_1() -> bool:
+    """Check if the current torch version is less than or equal to 2.7.1."""
+    return parse(torch.__version__).release <= _TORCH_2_7_1
+
 
 def _is_geq_torch_2_9() -> bool:
     """Check if the current torch version is greater than or equal to 2.9.0."""
-    return parse(torch.__version__).base_version >= "2.9.0"
+    return parse(torch.__version__).release >= _TORCH_2_9
 
 
 class SaveConsolidatedMode(str, Enum):
@@ -97,29 +107,42 @@ class CheckpointingConfig:
         None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
     )
     is_async: bool = False
+    wait_for_staging: bool = False  # block on async staging before freeing memory; no effect unless is_async
+    cpu_offload: bool = False  # If True, move DCP model and optimizer state dict tensors to CPU before saving.
+    # Permit pickle-based loading of legacy training state. Enable only for checkpoints from a trusted source.
+    allow_legacy_pickle_restore: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
     skip_task_head_prefixes_for_base_model: list[str] | None = (
         None  # Parameter prefixes to skip when loading base model
     )
     single_rank_consolidation: bool = False  # If True, only rank 0 performs consolidation.
-    # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
-    staging_dir: str | None = None  # Optional directory for staging files during consolidation.
-    # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
+    # Optional directory for staging files during consolidation. If provided, temp files will be created here instead
+    # of system temp before copying completed files to the final output directory.
+    staging_dir: str | None = None
     v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
     # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
     diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
+    consolidation_timeout_minutes: int = 30  # Timeout for inline consolidated-export synchronization.
+    # Retain this many recent checkpoint directories. Preserve checkpoints targeted by checkpoint-root pointers,
+    # such as `LATEST` and `LOWEST_VAL`, in addition to the recent window. `None` keeps all checkpoints.
+    max_recent_checkpoints: int | None = None
 
     def __post_init__(self):
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""
+        if self.consolidation_timeout_minutes <= 0:
+            raise ValueError("checkpoint.consolidation_timeout_minutes must be greater than 0")
+        if not isinstance(self.allow_legacy_pickle_restore, bool):
+            raise ValueError("checkpoint.allow_legacy_pickle_restore must be a boolean")
+
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE
 
         # PEFT checkpointing is not supported for `torch_save`; flip only the two
         # incompatible fields (format -> safetensors, save_consolidated -> FINAL).
-        # All other user-set fields (is_async, staging_dir, v4_compatible,
+        # All other user-set fields (is_async, cpu_offload, staging_dir, v4_compatible,
         # single_rank_consolidation, ...) are preserved.
         if self.is_peft and self.model_save_format == "torch_save":
             logging.warning(
@@ -128,6 +151,19 @@ class CheckpointingConfig:
             )
             self.model_save_format = "safetensors"
             self.save_consolidated = SaveConsolidatedMode.FINAL
+
+        if self.max_recent_checkpoints is not None:
+            if (
+                isinstance(self.max_recent_checkpoints, bool)
+                or not isinstance(self.max_recent_checkpoints, int)
+                or self.max_recent_checkpoints < 1
+            ):
+                raise ValueError("checkpoint.max_recent_checkpoints must be unset or a positive integer")
+            if is_cloud_path(self.checkpoint_dir):
+                raise ValueError(
+                    "checkpoint.max_recent_checkpoints is only supported for local checkpoint directories; "
+                    "unset it when checkpoint.checkpoint_dir uses msc:// storage"
+                )
 
         # Convert a raw string such as "safetensors" into the right Enum.
         formats = [v.value for v in SerializationFormat]
@@ -141,12 +177,13 @@ class CheckpointingConfig:
 
         # Consolidated HF safetensors export needs local filesystem semantics and is not
         # supported on msc:// cloud storage paths; use DCP (save_consolidated=false) instead.
-        if self.save_consolidated != SaveConsolidatedMode.FALSE and str(self.checkpoint_dir).startswith("msc://"):
+        if self.save_consolidated != SaveConsolidatedMode.FALSE and is_cloud_path(self.checkpoint_dir):
             raise ValueError(
                 f"Consolidated safetensors export (save_consolidated={self.save_consolidated.value}) is not "
                 f"compatible with remote cloud storage paths ('{self.checkpoint_dir}'). Set save_consolidated=false "
                 f"to use DCP format with MSC cloud storage instead."
             )
+
         if self.save_consolidated != SaveConsolidatedMode.FALSE and not self.is_peft:
             if self.model_save_format != SerializationFormat.SAFETENSORS:
                 logging.warning(
@@ -177,6 +214,8 @@ class CheckpointingConfig:
         tp_rank: int,
         pp_rank: int,
         moe_mesh: DeviceMesh | None = None,
+        process_group: ProcessGroup | None = None,
+        pp_group: ProcessGroup | None = None,
     ) -> Checkpointer:
         """Build the :class:`Checkpointer` engine for this config.
 
@@ -189,13 +228,25 @@ class CheckpointingConfig:
             tp_rank: Tensor-parallel rank.
             pp_rank: Pipeline-parallel rank.
             moe_mesh: Optional device mesh for MoE checkpointing.
+            process_group: Process group used for distributed checkpoint collectives.
+            pp_group: Optional pipeline-parallel process group. Threaded to the
+                PEFT save path so adapter weights are gathered across PP stages
+                (required for complete adapters when ``pp_size > 1``).
 
         Returns:
             Configured :class:`Checkpointer`.
         """
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
-        return Checkpointer(config=self, dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank, moe_mesh=moe_mesh)
+        return Checkpointer(
+            config=self,
+            dp_rank=dp_rank,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            moe_mesh=moe_mesh,
+            process_group=process_group,
+            pp_group=pp_group,
+        )
 
 
 __all__ = ["CheckpointingConfig", "SaveConsolidatedMode"]

@@ -38,7 +38,12 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
+from nemo_automodel.components.models.mistral3.state_dict_adapter import Mistral3FP8StateDictAdapter
 
 logger = logging.get_logger(__name__)
 
@@ -68,25 +73,25 @@ class Ministral3Config(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size: Optional[int] = 131072,
-        hidden_size: Optional[int] = 4096,
-        intermediate_size: Optional[int] = 14336,
-        num_hidden_layers: Optional[int] = 34,
-        num_attention_heads: Optional[int] = 32,
-        num_key_value_heads: Optional[int] = 8,
-        head_dim: Optional[int] = 128,
-        hidden_act: Optional[str] = "silu",
-        max_position_embeddings: Optional[int] = 262144,
-        initializer_range: Optional[float] = 0.02,
-        rms_norm_eps: Optional[float] = 1e-5,
-        use_cache: Optional[bool] = True,
-        pad_token_id: Optional[int] = 11,
-        bos_token_id: Optional[int] = 1,
-        eos_token_id: Optional[int] = 2,
-        tie_word_embeddings: Optional[bool] = False,
-        rope_parameters: Optional[dict] = None,
-        sliding_window: Optional[int] = None,
-        attention_dropout: Optional[float] = 0.0,
+        vocab_size: int | None = 131072,
+        hidden_size: int | None = 4096,
+        intermediate_size: int | None = 14336,
+        num_hidden_layers: int | None = 34,
+        num_attention_heads: int | None = 32,
+        num_key_value_heads: int | None = 8,
+        head_dim: int | None = 128,
+        hidden_act: str | None = "silu",
+        max_position_embeddings: int | None = 262144,
+        initializer_range: float | None = 0.02,
+        rms_norm_eps: float | None = 1e-5,
+        use_cache: bool | None = True,
+        pad_token_id: int | None = 11,
+        bos_token_id: int | None = 1,
+        eos_token_id: int | None = 2,
+        tie_word_embeddings: bool | None = False,
+        rope_parameters: dict | None = None,
+        sliding_window: int | None = None,
+        attention_dropout: float | None = 0.0,
         **kwargs,
     ):
         if rope_parameters is None:
@@ -178,7 +183,7 @@ class Ministral3PreTrainedModel(PreTrainedModel):
 
 @dataclass
 class Ministral3ModelOutputWithPast(BaseModelOutputWithPast):
-    image_hidden_states: Optional[torch.FloatTensor] = None
+    image_hidden_states: torch.FloatTensor | None = None
 
 
 @dataclass
@@ -210,9 +215,9 @@ class Ministral3RotaryEmbedding(nn.Module):
 
     @staticmethod
     def compute_default_rope_parameters(
-        config: Optional[Ministral3Config] = None,
+        config: Ministral3Config | None = None,
         device: Optional["torch.device"] = None,
-        seq_len: Optional[int] = None,
+        seq_len: int | None = None,
     ) -> tuple["torch.Tensor", float]:
         base = config.rope_parameters["rope_theta"]
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
@@ -259,7 +264,7 @@ def eager_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: torch.Tensor | None,
     scaling: float,
     dropout: float = 0.0,
     **kwargs: Unpack[TransformersKwargs],
@@ -305,11 +310,11 @@ class Ministral3Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -399,12 +404,12 @@ class Ministral3DecoderLayer(GradientCheckpointingLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -447,13 +452,13 @@ class Ministral3Model(Ministral3PreTrainedModel):
     @can_return_tuple
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -479,7 +484,6 @@ class Ministral3Model(Ministral3PreTrainedModel):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -506,9 +510,13 @@ class Ministral3Model(Ministral3PreTrainedModel):
 
 
 class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, GenerationMixin):
+    # No checkpoint served through this arch is tied (config default is untied);
+    # the 3B's text_config tie flag reaches the VLM class, not this one.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _supports_streaming_fp8_checkpoint_load = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -520,11 +528,31 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         supports_ep: bool = False
 
     def __init__(self, config: Ministral3Config):
+        quantization_config = getattr(config, "quantization_config", None)
+        quant_method = (
+            quantization_config.get("quant_method")
+            if isinstance(quantization_config, dict)
+            else getattr(quantization_config, "quant_method", None)
+        )
+        weight_block_size = (
+            quantization_config.get("weight_block_size")
+            if isinstance(quantization_config, dict)
+            else getattr(quantization_config, "weight_block_size", None)
+        )
+        if quant_method == "fp8" and weight_block_size is not None:
+            raise NotImplementedError(
+                "Ministral3ForCausalLM streaming FP8 loading currently supports per-tensor checkpoints only "
+                f"(weight_block_size must be null, got {weight_block_size!r})."
+            )
+
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = Ministral3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
+        if quant_method == "fp8":
+            self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_causal_lm()
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -541,16 +569,16 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
     @can_return_tuple
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (

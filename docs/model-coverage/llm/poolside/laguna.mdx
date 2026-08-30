@@ -1,0 +1,43 @@
+---
+title: "Laguna"
+description: ""
+slug: model-coverage/large-language-models/poolside/laguna
+---
+[Laguna](https://huggingface.co/poolside) is Poolside's hybrid-attention MoE language model family. The Automodel implementation supports full SFT with expert parallelism for Laguna S 2.1 and Laguna XS 2.1.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text Generation (MoE, hybrid attention) |
+| **Architecture** | `LagunaForCausalLM` |
+| **Checkpoints** | [Laguna S 2.1](https://huggingface.co/poolside/Laguna-S-2.1) (118B total, ~8B activated); [Laguna XS 2.1](https://huggingface.co/poolside/Laguna-XS-2.1) (33B total, ~3B activated) |
+| **HF Org** | [poolside](https://huggingface.co/poolside) |
+
+</Info>
+
+## Architecture
+
+- `LagunaForCausalLM`
+- Layer-specific attention head counts, QK RMSNorm, and softplus attention output gating.
+- Full and sliding-window attention layers can use separate RoPE settings.
+- MoE blocks use `nemo_automodel.components.moe.layers.MoE` with sigmoid routing, top-k probability normalization, fp32 gate compute, correction bias loading, one shared expert, and grouped expert weights for EP.
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| [laguna_s_2p1_hellaswag_ep16.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml) | SFT — Laguna S 2.1 on HellaSwag with EP16 |
+| [laguna_xs_2p1_hellaswag_ep8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml) | SFT — Laguna XS 2.1 on HellaSwag with EP8 and 1K NEAT sequence packing |
+
+## Run the Recipe
+
+```bash
+# Laguna XS 2.1 on one 8-GPU node
+uv run automodel --nproc-per-node=8 examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml
+
+# Laguna S 2.1 on two 8-GPU nodes
+uv run automodel --nproc-per-node=8 examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml
+```
+
+The Laguna XS 2.1 recipe uses `ep_size: 8` on one 8-GPU node and packs documents into 1,024-token sequences with `packing_strategy: neat`. Laguna currently supports expert parallelism, but not native THD packing or context parallelism; keep `cp_size: 1`. For the Laguna S 2.1 recipe, submit through your cluster launcher with two 8-GPU nodes for the default `ep_size: 16`.

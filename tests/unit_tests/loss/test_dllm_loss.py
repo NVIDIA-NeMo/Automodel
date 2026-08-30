@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for dLLM loss functions (MDLMCrossEntropyLoss, DFlashDecayLoss)."""
+"""Tests for dLLM loss functions (MDLMCrossEntropyLoss, DFlashDecayLoss, SCDDLoss)."""
 
 import pytest
 import torch
@@ -24,7 +24,9 @@ from nemo_automodel.components.loss.dllm_loss import (
     DLLMLossOutput,
     HybridDiffusionLLMLoss,
     MDLMCrossEntropyLoss,
+    SCDDLoss,
     _compute_per_token_nll,
+    scdd_schedule,
 )
 
 # ---------------------------------------------------------------------------
@@ -505,6 +507,148 @@ class TestDFlashDraftAccuracy:
         assert torch.isclose(overall_acc, expected_overall, atol=1e-6)
 
 
+class TestIDLMLoss:
+    """I-DLM block-diffusion loss: two CEs over the ``[x_t | x_0]`` halves.
+
+    The reference is the official combined-loss math (``train/sft/trainer.py``):
+    a decode CE on the noisy half and a verify CE on the clean half, both over
+    the Dream-shifted response (answer) positions.
+    """
+
+    def _reference(self, logits, target, answer_mask, valid_mask, alpha, L):
+        noisy, clean = logits[:, :L, :], logits[:, L : 2 * L, :]
+        shift_target = target[:, 1:]
+        supervise = (answer_mask[:, 1:].bool() & valid_mask[:, 1:].bool()).float()
+        denom = supervise.sum().clamp_min(1)
+
+        def ce(lg):
+            pt = F.cross_entropy(
+                lg[:, :-1, :].reshape(-1, lg.size(-1)).float(),
+                shift_target.reshape(-1),
+                reduction="none",
+            ).view(shift_target.shape)
+            return (pt * supervise).sum() / denom
+
+        ce_noisy, ce_clean = ce(noisy), ce(clean)
+        return ce_noisy + alpha * ce_clean, ce_noisy, ce_clean
+
+    def _inputs(self):
+        torch.manual_seed(0)
+        B, L, V = 2, 12, 32
+        logits = torch.randn(B, 2 * L, V)  # [x_t | x_0]
+        target = torch.randint(0, V, (B, L))
+        valid_mask = torch.ones(B, L, dtype=torch.long)
+        valid_mask[1, 10:] = 0  # pad the tail of sample 1
+        # All-masked: supervised region (after a 4-token prompt) is the response.
+        answer_mask = torch.zeros(B, L, dtype=torch.bool)
+        answer_mask[:, 4:] = True
+        answer_mask = answer_mask & valid_mask.bool()
+        return logits, target, answer_mask, valid_mask, L
+
+    def test_matches_reference_fixed_alpha(self):
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        out = IDLMLoss(clean_loss_weight=0.2)(logits, target, answer_mask, valid_mask, seq_len=L)
+        ref_total, ref_noisy, _ = self._reference(logits, target, answer_mask, valid_mask, 0.2, L)
+        assert torch.isclose(out.total_loss, ref_total, atol=1e-5)
+        assert torch.isclose(out.dllm_loss, ref_noisy, atol=1e-5)
+
+    def test_auto_balance_scales_clean_to_noisy(self):
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        out = IDLMLoss(auto_balance=True)(logits, target, answer_mask, valid_mask, seq_len=L)
+        _, ce_noisy, ce_clean = self._reference(logits, target, answer_mask, valid_mask, 0.0, L)
+        alpha = (ce_noisy / ce_clean.clamp_min(1e-6)).detach()
+        expected = ce_noisy + alpha * ce_clean
+        assert torch.isclose(out.total_loss, expected, atol=1e-5)
+
+    def test_excludes_padding_and_finite(self):
+        """Both CEs ignore padded positions and never produce NaN/inf."""
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        out = IDLMLoss(clean_loss_weight=1.0)(logits, target, answer_mask, valid_mask, seq_len=L)
+        assert torch.isfinite(out.total_loss)
+        assert out.total_loss.item() > 0
+
+    def test_normalization_by_num_diffusion_tokens(self):
+        """A global denominator rescales the loss vs the local supervised count.
+
+        The recipe passes an all-reduced ``num_diffusion_tokens`` so the loss is a
+        DP/grad-accum-invariant token-mean; here we assert the denominator swap is
+        exact (local sum-of-CE divided by the supplied global count).
+        """
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        loss_fn = IDLMLoss(clean_loss_weight=0.2)
+        local = loss_fn(logits, target, answer_mask, valid_mask, seq_len=L)
+
+        # Recover the un-normalised (summed) loss from the local-denominator run.
+        local_denom = (answer_mask[:, 1:].bool() & valid_mask[:, 1:].bool()).sum().clamp_min(1)
+        global_denom = 97
+        summed = local.total_loss * local_denom
+        out = loss_fn(logits, target, answer_mask, valid_mask, seq_len=L, num_diffusion_tokens=global_denom)
+        assert torch.isclose(out.total_loss, summed / global_denom, atol=1e-5)
+
+
+def _init_single_process_group():
+    """Trivial single-process gloo group for DTensor tests (mirrors test_kd_loss)."""
+    if not torch.distributed.is_available():
+        return None
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="gloo", init_method="tcp://127.0.0.1:29507", rank=0, world_size=1)
+    return torch.distributed.group.WORLD
+
+
+@pytest.fixture(scope="module")
+def trivial_pg():
+    process_group_already_initialized = torch.distributed.is_initialized()
+    pg = _init_single_process_group()
+    if pg is None:
+        pytest.skip("torch.distributed not available")
+    try:
+        yield pg
+    finally:
+        if not process_group_already_initialized and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+class TestIDLMLossDTensor:
+    """IDLMLoss on a vocab-sharded DTensor must match the plain-tensor result.
+
+    Single-process (world_size=1) gloo group: the shard is trivial, but this
+    exercises the DTensor code path (the ``full_tensor()`` materialisation in
+    ``_compute_per_token_nll`` plus the logit-shift slice on a DTensor) that the
+    FSDP2/TP training path hits, deterministically and without a GPU.
+    """
+
+    def test_vocab_sharded_dtensor_matches_plain(self, trivial_pg):
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import Shard, distribute_tensor
+
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        torch.manual_seed(0)
+        B, L, V = 2, 12, 32
+        logits = torch.randn(B, 2 * L, V)  # [x_t | x_0]
+        target = torch.randint(0, V, (B, L))
+        valid_mask = torch.ones(B, L, dtype=torch.long)
+        answer_mask = torch.zeros(B, L, dtype=torch.bool)
+        answer_mask[:, 4:] = True
+
+        loss_fn = IDLMLoss(clean_loss_weight=0.2)
+        plain = loss_fn(logits, target, answer_mask, valid_mask, seq_len=L).total_loss
+
+        mesh = init_device_mesh("cpu", (1,))
+        dlogits = distribute_tensor(logits, mesh, [Shard(-1)])  # vocab-sharded
+        sharded = loss_fn(dlogits, target, answer_mask, valid_mask, seq_len=L).total_loss
+
+        assert torch.allclose(plain, sharded, atol=1e-5), f"plain {plain.item():.6f} != DTensor {sharded.item():.6f}"
+
+
 class TestDFlashNormalizeMean:
     """``normalize="mean"`` divides by the effective weight sum (decay-weighted mean)."""
 
@@ -644,3 +788,421 @@ class TestBlockDiffusionCrossEntropyLoss:
         # global denominator = 10
         r_global = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask, num_diffusion_tokens=10)
         assert torch.allclose(r_global.total_loss, summed / 10, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# SCDD schedule + loss
+# ---------------------------------------------------------------------------
+
+
+class TestSCDDSchedule:
+    """Closed-form properties the SCDD derivation depends on."""
+
+    def test_boundaries_are_clean_and_fully_absorbed(self):
+        t = torch.tensor([0.0, 1.0])
+        s = scdd_schedule(t, max_ratio=0.3, gamma_shape=1.0, t_peak=0.5)
+        assert torch.allclose(s.clean_mass, torch.tensor([1.0, 0.0]))
+        assert torch.allclose(s.uniform_mass, torch.tensor([0.0, 0.0]))
+        assert torch.allclose(s.absorbed_mass, torch.tensor([0.0, 1.0]))
+        assert torch.allclose(s.gamma, torch.tensor([1.0, 0.0]))
+
+    def test_masses_form_a_distribution(self):
+        s = scdd_schedule(torch.linspace(0, 1, 51), max_ratio=0.25, gamma_shape=2.0, t_peak=0.4)
+        total = s.clean_mass + s.uniform_mass + s.absorbed_mass
+        assert torch.allclose(total, torch.ones_like(total), atol=1e-6)
+        assert (s.clean_mass >= 0).all() and (s.uniform_mass >= 0).all() and (s.absorbed_mass >= 0).all()
+
+    def test_uniform_mass_peaks_at_t_peak_with_the_configured_ratio(self):
+        # The normalisation is chosen so uniform_mass(t_peak) == max_ratio exactly.
+        for t_peak, ratio in [(0.5, 0.1), (0.3, 0.25)]:
+            s = scdd_schedule(torch.tensor([t_peak]), max_ratio=ratio, gamma_shape=2.0, t_peak=t_peak)
+            assert torch.allclose(s.uniform_mass, torch.tensor([ratio]), atol=1e-6)
+
+    def test_rho_and_gamma_are_monotonically_decreasing(self):
+        # Monotonicity is what makes [MASK] absorbing (no remasking at sampling).
+        s = scdd_schedule(torch.linspace(0, 1, 201), max_ratio=0.2, gamma_shape=1.0, t_peak=0.5)
+        assert (s.gamma.diff() <= 1e-6).all()
+        assert (s.rho.diff() <= 1e-6).all()
+
+    def test_zero_ratio_degenerates_to_absorbing_masking(self):
+        t = torch.linspace(0, 0.9, 10)
+        s = scdd_schedule(t, max_ratio=0.0, gamma_shape=1.0, t_peak=0.5)
+        assert torch.allclose(s.uniform_mass, torch.zeros_like(t))
+        assert torch.allclose(s.absorbed_mass, t)
+        # rho is a conditional given "not [MASK]", so it is 1 everywhere the
+        # conditioning event has mass (i.e. everywhere except t = 1).
+        assert torch.allclose(s.rho, torch.ones_like(t))
+
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            (dict(max_ratio=1.0, gamma_shape=1.0, t_peak=0.5), "max_ratio"),
+            (dict(max_ratio=0.1, gamma_shape=1.0, t_peak=0.0), "t_peak"),
+        ],
+    )
+    def test_rejects_out_of_range_hyperparameters(self, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            scdd_schedule(torch.tensor([0.5]), **kwargs)
+
+
+SCDD_MASK_ID = V - 1
+
+
+def _scdd_batch(seed=0, t=0.5):
+    """Build (logits, x0, z_t, loss_mask, p_mask) for the SCDD loss.
+
+    Returns tensors of shape ``[B, L, V]``, ``[B, L]``, ``[B, L]``, ``[B, L]``
+    and ``[B, L]`` respectively; ``p_mask`` carries the diffusion time.
+    """
+    torch.manual_seed(seed)
+    logits = torch.randn(B, L, V)
+    x0 = torch.randint(0, V - 1, (B, L))  # never the mask id
+    z_t = x0.clone()
+    loss_mask = torch.ones(B, L, dtype=torch.long)
+    p_mask = torch.full((B, L), t)
+    return logits, x0, z_t, loss_mask, p_mask
+
+
+class TestSCDDLoss:
+    @pytest.mark.parametrize("num_timesteps", [0, 1])
+    def test_rejects_grids_without_a_usable_point(self, num_timesteps):
+        """T = 1 leaves only t = 1, where the forward process is fully absorbed."""
+        with pytest.raises(ValueError, match="num_timesteps >= 2"):
+            SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=num_timesteps)
+
+    def test_reduces_to_mdlm_when_the_uniform_channel_is_off(self):
+        """With max_ratio=0 the NELBO collapses to -log p(x0)/t at masked
+        positions and exactly zero elsewhere — the MDLM objective."""
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=1, t=0.4)
+        z_t[:, ::2] = SCDD_MASK_ID  # every other position absorbed
+
+        loss = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.0)(
+            logits=logits,
+            target_ids=x0,
+            noise_mask=z_t == SCDD_MASK_ID,
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+        )
+
+        ref_logits = logits.clone()
+        ref_logits[:, :, SCDD_MASK_ID] = float("-inf")
+        log_p = torch.log_softmax(ref_logits, dim=-1)
+        nll = -log_p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+        expected = (nll * (z_t == SCDD_MASK_ID) / 0.4).sum() / loss_mask.sum()
+        torch.testing.assert_close(loss.total_loss, expected, rtol=1e-4, atol=1e-5)
+
+    def test_visible_wrong_token_drives_the_correction_term(self):
+        """At a visible position that disagrees with x0, putting mass on x0
+        must cost less than doubling down on the corrupted token."""
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=2, t=0.5)
+        z_t = (x0 + 1) % (V - 1)  # every visible token is wrong
+
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.2)
+        confident_x0 = torch.full_like(logits, -10.0).scatter(-1, x0.unsqueeze(-1), 10.0)
+        confident_zt = torch.full_like(logits, -10.0).scatter(-1, z_t.unsqueeze(-1), 10.0)
+
+        common = dict(
+            target_ids=x0,
+            noise_mask=torch.ones_like(x0, dtype=torch.bool),
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+        )
+        good = loss_fn(logits=confident_x0, **common).total_loss
+        bad = loss_fn(logits=confident_zt, **common).total_loss
+        assert good < bad
+
+    def test_correction_term_decreases_with_confidence_in_x0(self):
+        """At an uncorrupted visible position the correction term is still live
+        (it is a cross-entropy against the true posterior, so it is negative at
+        the optimum rather than zero) and must fall monotonically as the model
+        concentrates on x0."""
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=3, t=0.5)
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.2)
+        common = dict(
+            target_ids=x0,
+            noise_mask=torch.zeros_like(x0, dtype=torch.bool),
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+        )
+        losses = [
+            loss_fn(
+                logits=torch.zeros_like(logits).scatter(-1, x0.unsqueeze(-1), peak),
+                **common,
+            ).total_loss.item()
+            for peak in (0.0, 2.0, 10.0)
+        ]
+        assert losses[0] > losses[1] > losses[2]
+
+    @pytest.mark.parametrize("t", [0.001, 0.5, 0.9999])
+    def test_finite_forward_and_backward_across_the_schedule(self, t):
+        """t=1/T puts rho_s at 1 (zero uniform base) and t~1 empties the
+        retained mass; both boundaries must stay clear of inf/NaN."""
+        logits, x0, z_t, loss_mask, _ = _scdd_batch(seed=4, t=t)
+        logits = logits.requires_grad_(True)
+        z_t[:, ::3] = SCDD_MASK_ID
+        z_t[:, 1::3] = (x0[:, 1::3] + 5) % (V - 1)
+
+        loss = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.1)(
+            logits=logits,
+            target_ids=x0,
+            noise_mask=z_t != x0,
+            p_mask=torch.full((B, L), t),
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+        )
+        assert torch.isfinite(loss.total_loss)
+        loss.total_loss.backward()
+        assert torch.isfinite(logits.grad).all()
+
+    def test_unsupervised_positions_are_excluded(self):
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=5, t=0.6)
+        z_t[:, ::2] = SCDD_MASK_ID
+        loss_mask[:, L // 2 :] = 0
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.1)
+        common = dict(
+            target_ids=x0,
+            noise_mask=z_t == SCDD_MASK_ID,
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+            num_diffusion_tokens=int(loss_mask.sum()),
+        )
+        base = loss_fn(logits=logits, **common).total_loss
+        perturbed = logits.clone()
+        perturbed[:, L // 2 :] += 5.0
+        assert torch.equal(loss_fn(logits=perturbed, **common).total_loss, base)
+
+    def test_global_denominator_is_honoured(self):
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=6, t=0.5)
+        z_t[:, ::2] = SCDD_MASK_ID
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.1)
+        common = dict(
+            target_ids=x0,
+            noise_mask=z_t == SCDD_MASK_ID,
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+        )
+        local = loss_fn(logits=logits, **common).total_loss
+        halved = loss_fn(logits=logits, num_diffusion_tokens=2 * int(loss_mask.sum()), **common).total_loss
+        torch.testing.assert_close(halved, local / 2, rtol=1e-5, atol=1e-7)
+
+    def test_never_predicts_the_mask_token(self):
+        """The SCDD parameterisation removes [MASK] from the denoiser domain, so
+        the mask logit must not influence the loss at all."""
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=7, t=0.5)
+        z_t[:, ::2] = SCDD_MASK_ID
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.1)
+        common = dict(
+            target_ids=x0,
+            noise_mask=z_t == SCDD_MASK_ID,
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+        )
+        base = loss_fn(logits=logits, **common).total_loss
+        shifted = logits.clone()
+        shifted[:, :, SCDD_MASK_ID] += 50.0
+        torch.testing.assert_close(loss_fn(logits=shifted, **common).total_loss, base, rtol=1e-5, atol=1e-6)
+
+    def test_caller_logits_are_not_mutated(self):
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=8, t=0.5)
+        snapshot = logits.clone()
+        SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.1)(
+            logits=logits,
+            target_ids=x0,
+            noise_mask=torch.zeros_like(x0, dtype=torch.bool),
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+        )
+        assert torch.equal(logits, snapshot)
+
+    def test_requires_noisy_input_ids(self):
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=9, t=0.5)
+        with pytest.raises(ValueError, match="noisy_input_ids"):
+            SCDDLoss(mask_token_id=SCDD_MASK_ID)(
+                logits=logits,
+                target_ids=x0,
+                noise_mask=torch.zeros_like(x0, dtype=torch.bool),
+                p_mask=p_mask,
+                loss_mask=loss_mask,
+            )
+
+    def test_rejects_zero_timesteps(self):
+        with pytest.raises(ValueError, match="num_timesteps"):
+            SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=0)
+
+    def test_returns_dllm_loss_output(self):
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=10, t=0.5)
+        z_t[:, ::2] = SCDD_MASK_ID
+        out = SCDDLoss(mask_token_id=SCDD_MASK_ID, max_ratio=0.1)(
+            logits=logits,
+            target_ids=x0,
+            noise_mask=z_t == SCDD_MASK_ID,
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+        )
+        assert isinstance(out, DLLMLossOutput)
+        torch.testing.assert_close(out.dllm_loss, out.total_loss.detach())
+        assert out.draft_correct_per_pos is None and out.draft_count_per_pos is None
+
+
+class TestSCDDLossDistributed:
+    """Properties SCDD needs to hold under FSDP2/TP + gradient accumulation."""
+
+    def test_grad_accumulation_matches_the_full_batch(self):
+        """DP + grad-accum splits the global batch and sums per-microbatch
+        losses. With the global supervised-token denominator, that sum must
+        equal the single-batch loss, otherwise the gradient is mis-scaled by
+        the number of microbatches."""
+        torch.manual_seed(11)
+        big = 6
+        logits = torch.randn(big, L, V)
+        x0 = torch.randint(0, V - 1, (big, L))
+        z_t = x0.clone()
+        z_t[:, ::2] = SCDD_MASK_ID
+        z_t[:, 1::4] = (x0[:, 1::4] + 3) % (V - 1)
+        loss_mask = torch.ones(big, L, dtype=torch.long)
+        p_mask = torch.rand(big, 1).clamp(0.05, 0.95).expand(big, L).contiguous()
+        global_denom = int(loss_mask.sum())
+
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.15)
+
+        def _call(sl):
+            return loss_fn(
+                logits=logits[sl],
+                target_ids=x0[sl],
+                noise_mask=(z_t != x0)[sl],
+                p_mask=p_mask[sl],
+                loss_mask=loss_mask[sl],
+                noisy_input_ids=z_t[sl],
+                num_diffusion_tokens=global_denom,
+            ).total_loss
+
+        whole = _call(slice(None))
+        accumulated = sum(_call(slice(i, i + 2)) for i in range(0, big, 2))
+        torch.testing.assert_close(accumulated, whole, rtol=1e-5, atol=1e-6)
+
+    def test_per_sequence_times_are_read_independently(self):
+        """Each sequence carries its own diffusion time; batching sequences at
+        different times must not couple them (a DP rank sees a mixed batch)."""
+        torch.manual_seed(12)
+        logits = torch.randn(2, L, V)
+        x0 = torch.randint(0, V - 1, (2, L))
+        z_t = x0.clone()
+        z_t[:, ::2] = SCDD_MASK_ID
+        loss_mask = torch.ones(2, L, dtype=torch.long)
+        times = torch.tensor([0.2, 0.8])
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.15)
+
+        def _call(sl, t):
+            return loss_fn(
+                logits=logits[sl],
+                target_ids=x0[sl],
+                noise_mask=(z_t == SCDD_MASK_ID)[sl],
+                p_mask=t[:, None].expand(-1, L),
+                loss_mask=loss_mask[sl],
+                noisy_input_ids=z_t[sl],
+                num_diffusion_tokens=int(loss_mask.sum()),
+            ).total_loss
+
+        together = _call(slice(None), times)
+        apart = _call(slice(0, 1), times[:1]) + _call(slice(1, 2), times[1:])
+        torch.testing.assert_close(together, apart, rtol=1e-5, atol=1e-6)
+
+    def test_vocab_sharded_dtensor_matches_plain(self, trivial_pg):
+        """TP shards logits over the vocab axis; the SCDD parameterisation and
+        the sum over the non-[MASK] domain must survive the materialisation."""
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import Shard, distribute_tensor
+
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=13, t=0.5)
+        z_t[:, ::2] = SCDD_MASK_ID
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.15)
+        common = dict(
+            target_ids=x0,
+            noise_mask=z_t == SCDD_MASK_ID,
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+        )
+
+        plain = loss_fn(logits=logits, **common).total_loss
+        mesh = init_device_mesh("cpu", (1,))
+        sharded = loss_fn(logits=distribute_tensor(logits, mesh, [Shard(-1)]), **common).total_loss
+        torch.testing.assert_close(sharded, plain, rtol=1e-5, atol=1e-6)
+
+
+class TestSCDDLossChunking:
+    """The chunked vocabulary reduction must be numerically transparent.
+
+    The ELBO needs the model's probability of every non-[MASK] token, so it
+    cannot use a fused cross-entropy kernel; the vocab-sized work is instead
+    checkpointed in position chunks. Chunking changes peak memory, never the
+    result — each position is independent.
+    """
+
+    @staticmethod
+    def _inputs(seed=20):
+        """Build a batch big enough that a small chunk size spans the batch axis.
+
+        Returns tensors of shape ``[4, 16, V]``, ``[4, 16]`` x 3 and ``[4, 16]``.
+        """
+        torch.manual_seed(seed)
+        big_b, big_l = 4, 16
+        logits = torch.randn(big_b, big_l, V)
+        x0 = torch.randint(0, V - 1, (big_b, big_l))
+        z_t = x0.clone()
+        z_t[:, ::3] = SCDD_MASK_ID
+        z_t[:, 1::3] = (x0[:, 1::3] + 7) % (V - 1)
+        loss_mask = torch.ones(big_b, big_l, dtype=torch.long)
+        p_mask = torch.rand(big_b, 1).clamp(0.05, 0.95).expand(big_b, big_l).contiguous()
+        return logits, x0, z_t, loss_mask, p_mask
+
+    def _run(self, chunk_size, logits, x0, z_t, loss_mask, p_mask):
+        logits = logits.clone().requires_grad_(True)
+        loss_fn = SCDDLoss(
+            mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.15, chunk_size=chunk_size
+        )
+        out = loss_fn(
+            logits=logits,
+            target_ids=x0,
+            noise_mask=z_t != x0,
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+            num_diffusion_tokens=int(loss_mask.sum()),
+        )
+        out.total_loss.backward()
+        return out.total_loss.detach(), logits.grad
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 32, 1024])
+    def test_matches_the_unchunked_result(self, chunk_size):
+        """Chunk boundaries that split a sequence, align with it, and exceed the
+        whole batch must all give the same loss and the same gradient."""
+        args = self._inputs()
+        ref_loss, ref_grad = self._run(None, *args)
+        loss, grad = self._run(chunk_size, *args)
+        torch.testing.assert_close(loss, ref_loss, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(grad, ref_grad, rtol=1e-5, atol=1e-7)
+
+    def test_gradient_reaches_every_supervised_position(self):
+        """Checkpoint recompute must not drop gradient for chunks after the
+        first — a stale-boundary bug would leave later positions at zero."""
+        logits, x0, z_t, loss_mask, p_mask = self._inputs(seed=21)
+        _, grad = self._run(7, logits, x0, z_t, loss_mask, p_mask)
+        per_position = grad.abs().sum(dim=-1)
+        assert (per_position > 0).all(), f"zero-gradient positions: {(per_position == 0).nonzero().tolist()}"
+
+    def test_rejects_nonpositive_chunk_size(self):
+        with pytest.raises(ValueError, match="chunk_len"):
+            SCDDLoss(mask_token_id=SCDD_MASK_ID, chunk_size=0)
+
+    def test_defaults_to_chunking(self):
+        assert SCDDLoss(mask_token_id=SCDD_MASK_ID).chunk_size == 1024
+        assert SCDDLoss(mask_token_id=SCDD_MASK_ID, chunk_size=None).chunk_size is None

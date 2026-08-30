@@ -104,3 +104,7 @@ freeze_config:
 
 ci:
   recipe_owner: athitten
+  nodes: 1
+  time: "00:20:00"
+  checkpoint_robustness:
+    tokenizer_name: google/gemma-4-E2B-it

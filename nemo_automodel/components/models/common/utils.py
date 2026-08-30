@@ -14,17 +14,21 @@
 
 import importlib.util
 import logging
-import warnings
+import math
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol
 
 import torch
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-logger = logging.getLogger(__name__)
+from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
+
+logger = logging.getLogger(__name__)
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
@@ -153,15 +157,142 @@ class TEFp8Config:
 
 
 @dataclass(kw_only=True)
+class CudaGraphConfig:
+    """Configuration for scoped partial CUDA graphs.
+
+    Attributes:
+        modules: Per-layer modules to capture with Transformer Engine, following
+            Megatron Core's module names. AutoModel supports whole ``attn``,
+            ``moe_router``, and ``moe_preprocess`` scopes, plus the
+            AutoModel-specific narrow ``te_dpa`` scope. An empty list disables
+            CUDA graphs.
+    """
+
+    modules: list[Literal["attn", "te_dpa", "moe_router", "moe_preprocess"]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Validate the declarative CUDA-graph configuration."""
+        if not isinstance(self.modules, list):
+            raise TypeError("cuda_graph.modules must be a list")
+        if not all(isinstance(module, str) for module in self.modules):
+            raise TypeError("cuda_graph.modules entries must be strings")
+        supported_modules = {"attn", "te_dpa", "moe_router", "moe_preprocess"}
+        unknown_modules = set(self.modules) - supported_modules
+        if unknown_modules:
+            raise ValueError(
+                f"Unsupported cuda_graph.modules: {sorted(unknown_modules)}; "
+                f"supported modules are {sorted(supported_modules)}"
+            )
+        if len(self.modules) != len(set(self.modules)):
+            raise ValueError("cuda_graph.modules must not contain duplicates")
+        if {"attn", "te_dpa"}.issubset(self.modules):
+            raise ValueError("cuda_graph.modules cannot contain both 'attn' and 'te_dpa'")
+        if "moe_preprocess" in self.modules and "moe_router" not in self.modules:
+            raise ValueError("'moe_preprocess' in cuda_graph.modules requires 'moe_router'")
+
+
+class _MoKFunctionalConfig(Protocol):
+    """Structural type for the optional ``mok.functional.MoKConfig``."""
+
+    fwd_num_comm_sms: int
+    bwd_num_comm_sms: int
+    minibatch_size: int
+    macrobatch_size: int
+    schedule_capacity_multiplier: float
+    all_gather_top_experts_chunk_bytes: int
+
+
+@dataclass(kw_only=True, frozen=True)
+class MoKBackendConfig:
+    """Configuration for the optional Mixture-of-Kittens MoE backend.
+
+    Attributes:
+        fwd_num_comm_sms: Communication SMs reserved during the forward megakernel.
+        bwd_num_comm_sms: Communication SMs reserved during the backward megakernel.
+        minibatch_size: Routed-token overlap granularity, divisible by 256.
+        macrobatch_size: Routed-token ring-buffer capacity and a multiple of
+            ``minibatch_size``.
+        schedule_capacity_multiplier: Worst-case fraction of routes sent to one EP rank.
+        all_gather_top_experts_chunk_bytes: Routing all-gather chunk size in bytes.
+    """
+
+    fwd_num_comm_sms: int = 40
+    bwd_num_comm_sms: int = 28
+    minibatch_size: int = 4096
+    macrobatch_size: int = 131072
+    schedule_capacity_multiplier: float = 0.5
+    all_gather_top_experts_chunk_bytes: int = 2048
+
+    def __post_init__(self) -> None:
+        """Validate settings that do not depend on a CUDA device or EP group."""
+        for name, value in (
+            ("fwd_num_comm_sms", self.fwd_num_comm_sms),
+            ("bwd_num_comm_sms", self.bwd_num_comm_sms),
+        ):
+            if type(value) is not int or value <= 0 or value % 2 != 0:
+                raise ValueError(f"mok.{name} must be a positive even integer")
+        if type(self.minibatch_size) is not int or self.minibatch_size <= 0 or self.minibatch_size % 256 != 0:
+            raise ValueError("mok.minibatch_size must be a positive multiple of 256")
+        if (
+            type(self.macrobatch_size) is not int
+            or self.macrobatch_size <= 0
+            or self.macrobatch_size % self.minibatch_size != 0
+        ):
+            raise ValueError("mok.macrobatch_size must be a positive multiple of mok.minibatch_size")
+        if (
+            type(self.schedule_capacity_multiplier) not in (int, float)
+            or not math.isfinite(self.schedule_capacity_multiplier)
+            or self.schedule_capacity_multiplier <= 0
+        ):
+            raise ValueError("mok.schedule_capacity_multiplier must be a positive finite number")
+        if (
+            type(self.all_gather_top_experts_chunk_bytes) is not int
+            or self.all_gather_top_experts_chunk_bytes <= 0
+            or self.all_gather_top_experts_chunk_bytes % 16 != 0
+        ):
+            raise ValueError("mok.all_gather_top_experts_chunk_bytes must be a positive multiple of 16")
+
+    def build(self) -> _MoKFunctionalConfig:
+        """Build the optional MoK runtime configuration.
+
+        Returns:
+            A ``mok.functional.MoKConfig`` with these declarative settings.
+
+        Raises:
+            UnavailableError: If Mixture-of-Kittens is not installed.
+        """
+        _, mok_functional = safe_import(
+            "mok.functional",
+            msg=(
+                "dispatcher='mok' requires a built Mixture-of-Kittens installation or an importable "
+                "mixture-of-kittens checkout."
+            ),
+        )
+        return mok_functional.MoKConfig(
+            fwd_num_comm_sms=self.fwd_num_comm_sms,
+            bwd_num_comm_sms=self.bwd_num_comm_sms,
+            minibatch_size=self.minibatch_size,
+            macrobatch_size=self.macrobatch_size,
+            schedule_capacity_multiplier=self.schedule_capacity_multiplier,
+            all_gather_top_experts_chunk_bytes=self.all_gather_top_experts_chunk_bytes,
+        )
+
+
+@dataclass(kw_only=True)
 class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
-            indexer, and Sinkhorn kernels together.
-        linear: Linear layer backend ("torch" or "te").
-        rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
+            indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
+            "cudnn" select their respective packed sparse-attention kernels.
+            For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
+            CUDA BF16; CPU execution retains the PyTorch numerical oracle.
+        linear: Linear layer backend ("torch", "te", or "quack").
+        rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
+        rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
+            integrated for Llama-family rotary embeddings.
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
@@ -170,13 +301,15 @@ class BackendConfig:
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
-            "deepep" uses DeepEP for token dispatch,
-            "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
+            "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
+            and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
+        mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
-        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
-            and allocate dispatched tensors on the communication stream.
-        enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
+        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
+            asynchronously and allocate their outputs on the communication stream.
+        enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
+            and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
             that assigns tokens to experts without learned routing weights.
         fake_gate_noise: Noise level [0, 1] for FakeBalancedGate. When > 0, uses
@@ -191,16 +324,20 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+        cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
-    linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
-    rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
+        "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    )
+    linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
+    rope: Literal["torch", "quack"] = "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
@@ -210,7 +347,8 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
-    enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
+    mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
+    enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
     # 0.0→1.00x, 0.1→~1.2x, 0.3→~1.6x, 0.5→~2.0x, 1.0→~2.8x.
@@ -226,34 +364,57 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
+    cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
+        # instead assumes contiguous [0, seq_len) positions, so combining the two
+        # silently produces incorrect phases for packed, offset, or per-example
+        # position IDs.
+        if self.rope == "quack" and self.rope_fusion:
+            logger.warning("rope='quack' is incompatible with rope_fusion=True; disabling rope_fusion.")
+            self.rope_fusion = False
+
+        # TEMPORARY: force TE fused RoPE off globally. The fused kernel computes cos/sin
+        # in fp32 in-kernel while HF/vLLM rotate with bf16 tables, breaking logprob parity
+        # in some models. See #3027. This is the one chokepoint every BackendConfig passes
+        # through, so it also overrides an explicit rope_fusion=True from a recipe/config.
+        if self.rope_fusion:
+            logger.warning("rope_fusion is temporarily force-disabled globally (see #3027).")
+        self.rope_fusion = False
+
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
 
+        if isinstance(self.cuda_graph, dict):
+            self.cuda_graph = CudaGraphConfig(**self.cuda_graph)
+        elif not isinstance(self.cuda_graph, CudaGraphConfig):
+            raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
+
+        if isinstance(self.mok, dict):
+            self.mok = MoKBackendConfig(**self.mok)
+        elif not isinstance(self.mok, MoKBackendConfig):
+            raise TypeError("mok must be a MoKBackendConfig or mapping")
+
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
-        # Handle deprecated enable_deepep parameter
+        # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
+        # config still sets it so the user migrates to explicit dispatcher/experts. The field is
+        # retained only so loading an old config does not crash this kw_only dataclass.
         if self.enable_deepep is not None:
-            warnings.warn(
-                "enable_deepep is deprecated and will be removed in a future release. "
-                "Use experts='gmm' and dispatcher='deepep' instead of enable_deepep=True, "
-                "or dispatcher='torch' instead of enable_deepep=False.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if self.enable_deepep:
-                self.experts = "gmm"
-                self.dispatcher = "deepep"
-            else:
-                self.dispatcher = "torch"
-            # Clear the deprecated field after conversion
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.warning(
+                    "enable_deepep is no longer supported and is ignored. "
+                    "Set 'dispatcher' (deepep/hybridep/torch) and 'experts' explicitly instead. "
+                    "Previously enable_deepep=True was equivalent to experts=gmm + dispatcher=deepep, "
+                    "and enable_deepep=False to dispatcher=torch."
+                )
             self.enable_deepep = None
 
         # Backward compatibility
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
@@ -265,6 +426,27 @@ class BackendConfig:
             self.dispatcher = "torch"
             self.experts = "torch_mm"
 
+        graph_modules = self.cuda_graph.modules
+        attention_graph_modules = {"attn", "te_dpa"}.intersection(graph_modules)
+        if attention_graph_modules and self.attn != "te":
+            raise ValueError(f"{sorted(attention_graph_modules)} in cuda_graph.modules requires attn='te'")
+        if "attn" in graph_modules and self.linear != "torch":
+            raise ValueError("'attn' in cuda_graph.modules currently requires linear='torch'")
+        if "attn" in graph_modules and self.rms_norm != "torch":
+            raise ValueError("'attn' in cuda_graph.modules currently requires rms_norm='torch'")
+        if "attn" in graph_modules and self.rope_fusion:
+            raise ValueError("'attn' in cuda_graph.modules currently requires rope_fusion=False")
+        if attention_graph_modules and self.te_fp8 is not None:
+            recipe_fp8_dpa = getattr(self.te_fp8.recipe, "fp8_dpa", False)
+            if recipe_fp8_dpa:
+                raise ValueError(
+                    f"{sorted(attention_graph_modules)} in cuda_graph.modules requires BF16 dot-product attention "
+                    "(fp8_dpa=False)"
+                )
+        if "moe_router" in graph_modules and self.fake_balanced_gate:
+            raise ValueError("'moe_router' in cuda_graph.modules requires the learned Gate (fake_balanced_gate=False)")
+        if "moe_preprocess" in graph_modules and self.dispatcher != "hybridep":
+            raise ValueError("'moe_preprocess' in cuda_graph.modules requires dispatcher='hybridep'")
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(
@@ -273,7 +455,7 @@ class BackendConfig:
             )
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(dynamic=True)
 def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
     input_dtype = x.dtype
@@ -315,10 +497,11 @@ def initialize_rms_norm_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        rms_norm_impl: Backend implementation ("te", "torch", or "torch_fp32")
+        rms_norm_impl: Backend implementation ("te", "torch", "torch_fp32", or "quack")
             - "te": Transformer Engine fused RMSNorm kernel
             - "torch": PyTorch native nn.RMSNorm (computes in input dtype)
             - "torch_fp32": torch.compiled fp32 RMSNorm for training stability
+            - "quack": QuACK CuTe DSL RMSNorm kernel
         dim: Normalized dimension
         eps: Epsilon for numerical stability
         device: Device to create module on (None uses PyTorch default, typically CPU)
@@ -336,6 +519,15 @@ def initialize_rms_norm_module(
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     elif rms_norm_impl == "torch_fp32":
         return Float32RMSNorm(dim, eps=eps, device=device, dtype=dtype)
+    elif rms_norm_impl == "quack":
+        available, quack_rms_norm = safe_import_from(
+            "quack.rmsnorm",
+            "QuackRMSNorm",
+            msg="rms_norm='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+        )
+        if not available:
+            raise ImportError("rms_norm='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
+        return quack_rms_norm(dim, eps=eps, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 
@@ -354,7 +546,7 @@ def initialize_linear_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        linear_impl: Backend implementation ("te" or "torch")
+        linear_impl: Backend implementation ("te", "torch", or "quack")
         in_features: Input features
         out_features: Output features
         bias: Whether to use bias
@@ -374,6 +566,15 @@ def initialize_linear_module(
         return TransformerEngineLinear(
             in_features=in_features, out_features=out_features, bias=bias, device=device, params_dtype=dtype
         )
+    elif linear_impl == "quack":
+        available, quack_linear = safe_import_from(
+            "quack.linear",
+            "Linear",
+            msg="linear='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+        )
+        if not available:
+            raise ImportError("linear='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
+        return quack_linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported Linear implementation: {linear_impl}")
 
@@ -675,11 +876,24 @@ def _restore_fp32_tensor_snapshots(
         param.data = snapshot.to(dtype=torch.float32)
 
     for name, snapshot in buffer_snapshots.items():
-        module_name, _, buffer_name = name.rpartition(".")
-        module = model.get_submodule(module_name) if module_name else model
-        if buffer_name not in module._buffers:
-            continue
-        module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+        # ActivationWrapper forwards __getattr__ / __setattr__ to the wrapped
+        # module. Try the literal FQN first for buffers registered on the wrapped
+        # leaf, then strip the wrapper alias as a fallback for forwarded names.
+        candidate_names = [name]
+        stripped_name = canonical_parameter_fqn(name)
+        if stripped_name != name:
+            candidate_names.append(stripped_name)
+
+        for candidate_name in candidate_names:
+            module_name, _, buffer_name = candidate_name.rpartition(".")
+            try:
+                module = model.get_submodule(module_name) if module_name else model
+            except AttributeError:
+                continue
+            if buffer_name not in module._buffers:
+                continue
+            module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+            break
 
 
 def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
@@ -766,6 +980,10 @@ def compute_lm_head_logits(
       to fp32 (e.g. via the MoE ``lm_head_precision`` setting). The matmul goes
       through ``lm_head`` (``nn.Linear``, DTensor-aware under FSDP2) rather than
       ``F.linear`` so DTensor redistribution is preserved.
+    - Otherwise, cast the sliced input to the head's effective compute dtype.
+      For a standalone FSDP2 head this comes from its mixed-precision policy,
+      since its sharded weight may still expose the master-copy dtype before the
+      forward pre-hook runs. Other heads use their materialized weight dtype.
     - ``output_hidden_states``: when set, the (full-sequence, THD-restored)
       ``hidden_states`` are attached to the output so the fused cross-entropy
       path can recompute logits over every position; otherwise the field is
@@ -803,7 +1021,14 @@ def compute_lm_head_logits(
         if fp32_lm_head:
             logits = lm_head(sliced.float()).to(hidden_states.dtype)
         else:
-            logits = lm_head(sliced)
+            compute_dtype = None
+            if isinstance(lm_head, FSDPModule):
+                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
+            lm_head_weight = getattr(lm_head, "weight", None)
+            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
+                compute_dtype = lm_head_weight.dtype
+            projection_input = sliced.to(compute_dtype) if compute_dtype is not None else sliced
+            logits = lm_head(projection_input)
     if is_thd and logits.dim() == 2:
         logits = logits.unsqueeze(0)
 
@@ -815,13 +1040,15 @@ def compute_lm_head_logits(
 
 
 def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
-    """Cast the floating-point tensors of frozen submodules to ``compute_dtype``.
+    """Cast frozen floating-point tensors to ``compute_dtype``.
 
     When parameters are stored in fp32 (the fp32-master-weights pattern) while compute runs
     in bf16, a fully frozen submodule -- such as a frozen vision tower -- can still produce
     fp32 values that flow into bf16 trainable modules and raise a dtype mismatch in the next
-    matmul. This walks each maximal fully-frozen submodule and casts its parameters and
-    buffers to ``compute_dtype``, handling the two tensor kinds differently:
+    matmul. This walks each tensor independently so frozen base weights are still cast when
+    a module also contains trainable adapter weights. In that mixed-module case, its trainable
+    plain-tensor descendants are cast as well so unsharded execution does not introduce a new
+    mismatch in the adapter path. Parameters and buffers are handled differently:
 
     * **Parameters** are cast only when they are plain (unsharded) tensors. Sharded (DTensor)
       params are left as-is: FSDP all-gathers them to the compute dtype during forward, and
@@ -833,8 +1060,9 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
 
     Tensors whose qualified name matches ``_keep_in_fp32_modules`` or
     ``_keep_in_fp32_modules_strict`` are left in fp32. The function is a no-op when
-    ``compute_dtype`` is None and for tensors already in ``compute_dtype``. Frozen modules are
-    never updated, so casting them does not affect training accuracy.
+    ``compute_dtype`` is None and for tensors already in ``compute_dtype``. Frozen parameters
+    are never updated during training. Trainable plain tensors are cast only in mixed subtrees,
+    where unsharded execution must match the requested compute dtype.
 
     Args:
         model: The model, already materialized, checkpoint-loaded, and sharded.
@@ -853,41 +1081,71 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     def _is_fp32_pinned(name: str) -> bool:
         return any(kw in name for kw in fp32_keywords)
 
-    # ``named_modules`` yields parents before children, so the first fully-frozen subtree
-    # we accept is always maximal; descendants are skipped via the ancestor check below.
-    # Sharded subtrees are included so their buffers get cast; their params are skipped per-tensor.
-    selected: list[str] = []
-    for name, module in model.named_modules():
-        params = list(module.parameters(recurse=True))
-        if not params:
-            continue
-        if any(p.requires_grad for p in params):
-            continue
-        if any(name == anc or name.startswith(anc + ".") for anc in selected):
-            continue
-        selected.append(name)
+    # A LoRA-style module directly owns frozen base params and registers trainable adapter
+    # descendants. On a one-rank run FSDP is skipped, so cast the whole mixed subtree to keep
+    # both matmul paths uniform. With FSDP, the trainable params are DTensors and remain managed
+    # by its mixed-precision policy.
+    named_params = list(model.named_parameters())
+    frozen_param_owners: set[str] = set()
+    parameter_subtrees: set[str] = set()
+    trainable_subtrees: set[str] = set()
+    for name, param in named_params:
+        owner_name, _, _ = name.rpartition(".")
+        subtree = owner_name
+        while True:
+            parameter_subtrees.add(subtree)
+            if not subtree:
+                break
+            subtree, _, _ = subtree.rpartition(".")
+        if param.requires_grad:
+            subtree = owner_name
+            while True:
+                trainable_subtrees.add(subtree)
+                if not subtree:
+                    break
+                subtree, _, _ = subtree.rpartition(".")
+        elif param.is_floating_point() and not _is_fp32_pinned(name) and not (DTensor and isinstance(param, DTensor)):
+            frozen_param_owners.add(owner_name)
 
-    for name in selected:
-        module = model.get_submodule(name) if name else model
-        prefix = f"{name}." if name else ""
-        # Parameters: cast plain (unsharded) floats; leave sharded (DTensor) params to FSDP.
-        for param_name, param in module.named_parameters():
-            full_name = prefix + param_name
-            if _is_fp32_pinned(full_name):
-                continue
-            if DTensor and isinstance(param, DTensor):
-                continue
-            if param.is_floating_point() and param.dtype != compute_dtype:
-                param.data = param.data.to(compute_dtype)
-        # Buffers: never FSDP-managed (always plain tensors), so always safe to cast.
-        for buffer_name, buf in module.named_buffers():
-            full_name = prefix + buffer_name
-            if _is_fp32_pinned(full_name):
-                continue
-            if buf.is_floating_point() and buf.dtype != compute_dtype:
-                owner_name, _, leaf = buffer_name.rpartition(".")
-                owner = module.get_submodule(owner_name) if owner_name else module
-                owner._buffers[leaf] = buf.to(compute_dtype)
+    mixed_subtrees = frozen_param_owners & trainable_subtrees
+
+    def _is_in_subtrees(name: str, subtrees: set[str]) -> bool:
+        subtree = name
+        while True:
+            if subtree in subtrees:
+                return True
+            if not subtree:
+                return False
+            subtree, _, _ = subtree.rpartition(".")
+
+    # Parameters: cast frozen plain floats and plain floats in mixed adapter subtrees; leave
+    # all other trainable params and every sharded (DTensor) param to FSDP mixed precision.
+    for name, param in named_params:
+        if (param.requires_grad and not _is_in_subtrees(name, mixed_subtrees)) or _is_fp32_pinned(name):
+            continue
+        if DTensor and isinstance(param, DTensor):
+            continue
+        if param.is_floating_point() and param.dtype != compute_dtype:
+            param.data = param.data.to(compute_dtype)
+
+    # Preserve the existing buffer scope: fully frozen parameter subtrees plus the newly
+    # supported mixed adapter subtrees. Buffers never participate in FSDP parameter sharding.
+    fully_frozen_subtrees: set[str] = set()
+    for module_name, _ in model.named_modules():
+        if module_name not in parameter_subtrees or module_name in trainable_subtrees:
+            continue
+        if _is_in_subtrees(module_name, fully_frozen_subtrees):
+            continue
+        fully_frozen_subtrees.add(module_name)
+    buffer_subtrees = fully_frozen_subtrees | mixed_subtrees
+
+    for name, buf in model.named_buffers():
+        if not _is_in_subtrees(name, buffer_subtrees) or _is_fp32_pinned(name):
+            continue
+        if buf.is_floating_point() and buf.dtype != compute_dtype:
+            owner_name, _, leaf = name.rpartition(".")
+            owner = model.get_submodule(owner_name) if owner_name else model
+            owner._buffers[leaf] = buf.to(compute_dtype)
 
 
 __all__ = [

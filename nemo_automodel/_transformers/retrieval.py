@@ -16,19 +16,91 @@
 
 import inspect
 import os
-from typing import Optional
+from collections.abc import Iterable, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
-from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForSequenceClassification,
+    FineGrainedFP8Config,
+    PretrainedConfig,
+    PreTrainedModel,
+)
+from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel._transformers.sentence_transformer_export import (
+    SentenceTransformerExportConfig,
+    SentenceTransformerWrapperOptions,
+    _cache_hub_source_legal_assets,
+    _load_sentence_transformer_wrapper_options,
+    _resolve_cached_source_model_path,
+    _resolve_cached_source_repository_path,
+    _SentenceTransformerMetadataExporter,
+    _supports_standard_sentence_transformer_export,
+)
+from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
+
+
+_BI_ENCODER_DEFAULT_POOLING = "avg"
+_BI_ENCODER_DEFAULT_L2_NORMALIZE = True
+
+
+def _canonicalize_bi_encoder_pooling(pooling: str) -> str:
+    """Return the canonical AutoModel name for a bi-encoder pooling alias."""
+    return _BI_ENCODER_DEFAULT_POOLING if pooling == "mean" else pooling
+
+
+def _resolve_bi_encoder_options(
+    config: PretrainedConfig,
+    saved_options: SentenceTransformerWrapperOptions | None,
+    pooling: str | None,
+    l2_normalize: bool | None,
+) -> tuple[str, bool]:
+    """Resolve explicit wrapper arguments, then standard saved metadata, then defaults."""
+    if pooling is None:
+        if saved_options is not None:
+            pooling = saved_options.pooling
+        else:
+            pooling = getattr(config, "pooling", None) or _BI_ENCODER_DEFAULT_POOLING
+    if l2_normalize is None:
+        l2_normalize = saved_options.l2_normalize if saved_options is not None else _BI_ENCODER_DEFAULT_L2_NORMALIZE
+    pooling = _canonicalize_bi_encoder_pooling(pooling)
+    return pooling, l2_normalize
+
+
+def _get_fp8_dequantization_config(config) -> FineGrainedFP8Config | None:
+    """Build the Transformers config for loading trainable dense FP8 weights.
+
+    HuggingFace fine-grained FP8 linear modules register scalar scale
+    parameters, which FSDP2 cannot shard. Retrieval recipes train the extracted
+    backbone, so materialize the checkpoint weights in the requested dense
+    dtype instead of keeping the inference-only FP8 modules.
+
+    Args:
+        config: HuggingFace model config that may contain a native
+            ``quantization_config``.
+
+    Returns:
+        A dequantizing Transformers FP8 config for native FP8 checkpoints,
+        otherwise ``None``.
+    """
+    quantization_config = getattr(config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        if quantization_config.get("quant_method") != "fp8":
+            return None
+        return FineGrainedFP8Config(dequantize=True)
+
+    if getattr(quantization_config, "quant_method", None) != "fp8":
+        return None
+    return FineGrainedFP8Config(dequantize=True)
 
 
 def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
@@ -93,9 +165,9 @@ def _load_from_extracted_state(
 def _build_backbone_from_extracted_submodel(
     extracted_model: PreTrainedModel,
     task: str,
-    pooling: Optional[str],
-    num_labels: Optional[int],
-    temperature: Optional[float],
+    pooling: str | None,
+    num_labels: int | None,
+    temperature: float | None,
 ) -> PreTrainedModel:
     """Build a task-specific retrieval backbone from an extracted text submodel."""
     text_config = extracted_model.config
@@ -115,6 +187,8 @@ def _build_backbone_from_extracted_submodel(
         except KeyError as exc:
             raise ValueError(f"No HuggingFace sequence-classification model found for '{model_type}'.") from exc
     elif not has_supported_target:
+        if task == "embedding":
+            extracted_model.config.is_causal = False
         return extracted_model
     else:
         backbone_class = _get_supported_backbone_class(model_type, task)
@@ -152,6 +226,7 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
         Pooled embeddings [batch_size, hidden_size]
     """
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+    pool_type = _canonicalize_bi_encoder_pooling(pool_type)
 
     if pool_type == "avg":
         emb = last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
@@ -208,10 +283,11 @@ def build_encoder_backbone(
     model_name_or_path: str,
     task: str,
     trust_remote_code: bool = False,
-    pooling: Optional[str] = None,
-    extract_submodel: Optional[str] = None,
-    num_labels: Optional[int] = None,
-    temperature: Optional[float] = None,
+    pooling: str | None = None,
+    extract_submodel: str | None = None,
+    num_labels: int | None = None,
+    temperature: float | None = None,
+    loaded_config: PretrainedConfig | None = None,
     **hf_kwargs,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -219,15 +295,14 @@ def build_encoder_backbone(
     When ``extract_submodel`` is set, loads the parent model with HuggingFace
     Auto classes and extracts the dotted path. For supported extracted text
     backbones, it then builds the registered retrieval class for the requested
-    task (bidirectional base model for ``"embedding"``, sequence-classification
-    wrapper for ``"score"``). For unsupported extracted text backbones, it
-    returns the extracted model for ``"embedding"`` and wraps it with
+    task. For unsupported extracted text backbones, it returns the extracted model
+    with ``is_causal=False`` for ``"embedding"`` and wraps it with
     ``AutoModelForSequenceClassification`` for ``"score"``.
 
-    Without ``extract_submodel``, model types listed in
-    :data:`SUPPORTED_BACKBONES` resolve to custom bidirectional classes from
-    :class:`ModelRegistry`; all other model types fall back to HuggingFace Auto
-    classes.
+    Without ``extract_submodel``, model types listed in :data:`SUPPORTED_BACKBONES`
+    resolve to custom bidirectional classes from :class:`ModelRegistry`; all other
+    model types fall back to HuggingFace Auto classes, with embedding backbones
+    configured with ``is_causal=False``.
 
     Args:
         model_name_or_path: Path or HuggingFace Hub identifier.
@@ -240,6 +315,7 @@ def build_encoder_backbone(
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
+        loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -249,12 +325,27 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    config = loaded_config
+    if config is None:
+        config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **hf_kwargs,
+        )
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
         logger.info(f"Loading {model_name_or_path} with HuggingFace Auto classes to extract {extract_submodel}")
-        model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+        model_load_kwargs = hf_kwargs
+        fp8_dequantization_config = _get_fp8_dequantization_config(config)
+        if fp8_dequantization_config is not None:
+            logger.info("Dequantizing the native FP8 checkpoint for retrieval training")
+            model_load_kwargs = {**hf_kwargs, "quantization_config": fp8_dequantization_config}
+        model = AutoModel.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **model_load_kwargs,
+        )
         extracted_model = _extract_submodel(model, extract_submodel)
         return _build_backbone_from_extracted_submodel(
             extracted_model,
@@ -284,7 +375,10 @@ def build_encoder_backbone(
         return AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
-    return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    backbone = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    if task == "embedding":
+        backbone.config.is_causal = False
+    return backbone
 
 
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
@@ -292,7 +386,8 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
 
     If ``checkpointer`` is present in *kwargs*, delegates to
     ``Checkpointer.save_model`` for distributed/FSDP-safe saving.
-    Otherwise falls back to the inner ``PreTrainedModel.save_pretrained``.
+    Otherwise saves the inner ``PreTrainedModel`` and generates standard
+    Sentence Transformers metadata when the encoder can be represented by that format.
 
     The inner model is expected to be stored as ``model.model`` (the
     backbone wrapped by the encoder).
@@ -321,10 +416,47 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         return
 
     logger.info(f"Saving encoder model to {save_directory}")
+    export_config = getattr(model, "sentence_transformer_export_config", None)
+    tokenizer = kwargs.get("tokenizer", None)
+    if export_config is not None and tokenizer is None:
+        logger.warning(
+            "Sentence Transformers metadata export is disabled because no tokenizer was provided; "
+            "saving the standard encoder checkpoint instead."
+        )
+        export_config = None
+    deploy_config = None
+    original_model_path = getattr(model, "source_model_path", None)
+    if original_model_path is None:
+        model_reference = getattr(model.model, "name_or_path", None) or getattr(
+            model.model.config, "name_or_path", None
+        )
+        original_model_path = str(model_reference) if model_reference and os.path.isdir(str(model_reference)) else None
+    if export_config is not None:
+        from nemo_automodel._transformers.sentence_transformer_export import (
+            _save_generated_sentence_transformer_assets,
+            _validate_sentence_transformer_export,
+        )
+
+        try:
+            _validate_sentence_transformer_export(model, tokenizer, original_model_path)
+            deploy_config = model.get_hf_export_config()
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Sentence Transformers metadata export is disabled because this checkpoint cannot be "
+                "represented faithfully; saving the standard encoder checkpoint instead: %s",
+                exc,
+            )
+            export_config = None
     model.model.save_pretrained(save_directory)
+    if export_config is None:
+        return
+
+    deploy_config.save_pretrained(save_directory)
+    tokenizer.save_pretrained(save_directory)
+    _save_generated_sentence_transformer_assets(model, export_config, original_model_path, save_directory, tokenizer)
 
 
-# HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
+# Model types that require a registered custom retrieval backbone for each task.
 _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
     "score": "LlamaBidirectionalForSequenceClassification",
@@ -332,11 +464,14 @@ _LLAMA_TASKS = {
 _MINISTRAL3_BIDIREC_TASKS = {
     "embedding": "Ministral3BidirectionalModel",
 }
+_LLAMA_NEMOTRON_VL_TASKS = {
+    "embedding": "LlamaNemotronVLModel",
+}
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
-    "ministral3": _MINISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
+    "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,
 }
 
 
@@ -366,9 +501,13 @@ class BiEncoderModel(nn.Module):
         detach_distributed_inbatch_negatives: bool = True,
     ):
         super().__init__()
+        pooling = _canonicalize_bi_encoder_pooling(pooling)
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
+        self.sentence_transformer_export_config: SentenceTransformerExportConfig | None = None
+        if _supports_standard_sentence_transformer_export(model, pooling):
+            self.sentence_transformer_export_config = SentenceTransformerExportConfig()
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
         self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
 
@@ -377,8 +516,8 @@ class BiEncoderModel(nn.Module):
         cls,
         model_name_or_path: str,
         task: str = None,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
+        pooling: str | None = None,
+        l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         trust_remote_code: bool = False,
@@ -388,25 +527,132 @@ class BiEncoderModel(nn.Module):
         effective_task = cls._TASK if cls._TASK is not None else task
         if effective_task is None:
             raise ValueError("task must be specified when calling build()")
-
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
+        config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **hf_kwargs,
+        )
+        metadata_kwargs = dict(hf_kwargs)
+        commit_hash = getattr(config, "_commit_hash", None)
+        if commit_hash is not None:
+            metadata_kwargs["revision"] = commit_hash
+        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, metadata_kwargs)
+        pooling, l2_normalize = _resolve_bi_encoder_options(
+            config,
+            saved_options,
+            pooling,
+            l2_normalize,
+        )
         backbone = build_encoder_backbone(
-            model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
+            model_name_or_path,
+            effective_task,
+            trust_remote_code=trust_remote_code,
+            pooling=pooling,
+            loaded_config=config,
+            **hf_kwargs,
         )
 
-        return cls(
+        encoder = cls(
             model=backbone,
             pooling=pooling,
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
         )
+        if saved_options is not None:
+            encoder.configure_sentence_transformer_prompts(
+                query_prompt=saved_options.query_prompt or "",
+                document_prompt=saved_options.document_prompt or "",
+            )
+        encoder.source_model_path = _resolve_cached_source_model_path(
+            model_name_or_path,
+            backbone.config,
+            hf_kwargs,
+        )
+        encoder.source_repository_path = _resolve_cached_source_repository_path(
+            model_name_or_path,
+            encoder.source_model_path,
+            hf_kwargs,
+        )
+        if encoder.sentence_transformer_export_config is not None:
+            encoder.source_repository_path = (
+                _cache_hub_source_legal_assets(model_name_or_path, config, hf_kwargs) or encoder.source_repository_path
+            )
+        return encoder
+
+    def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
+        """Set the exact prompts used by the current retrieval pipeline."""
+        export_config = self.sentence_transformer_export_config
+        if export_config is None:
+            return
+        export_config.query_prompt = query_prompt
+        export_config.document_prompt = document_prompt
+
+    def disable_sentence_transformer_export(self) -> None:
+        """Disable standard export when runtime behavior cannot be represented faithfully."""
+        self.sentence_transformer_export_config = None
+
+    def _get_consolidated_hf_metadata_exporter(
+        self,
+        *,
+        tokenizer=None,
+        original_model_path: str | None = None,
+    ) -> _SentenceTransformerMetadataExporter | None:
+        """Return the retrieval-owned exporter for consolidated Hugging Face metadata."""
+        export_config = self.sentence_transformer_export_config
+        if export_config is None:
+            return None
+        if tokenizer is None:
+            logger.warning(
+                "Sentence Transformers metadata export is disabled because no tokenizer was provided; "
+                "saving the standard Hugging Face checkpoint metadata instead."
+            )
+            return None
+        exporter = _SentenceTransformerMetadataExporter(self, export_config)
+        try:
+            exporter.validate(tokenizer=tokenizer, original_model_path=original_model_path)
+            self.get_hf_export_config()
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Sentence Transformers metadata export is disabled because this checkpoint cannot be "
+                "represented faithfully; saving the standard Hugging Face checkpoint metadata instead: %s",
+                exc,
+            )
+            return None
+        return exporter
+
+    def get_hf_export_config(self) -> PretrainedConfig:
+        """Return a deployable Hugging Face config describing the effective bi-encoder."""
+        config_dict = self.config.to_dict()
+        model_type = getattr(type(self.config), "model_type", "")
+        if model_type.endswith("_bidirec"):
+            export_config_class = type(self.config).__mro__[1]
+            if not issubclass(export_config_class, PretrainedConfig):
+                raise TypeError(f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}.")
+
+            config_dict.pop("model_type", None)
+            config_dict.pop("auto_map", None)
+            export_config = export_config_class.from_dict(config_dict)
+            try:
+                export_model_class = MODEL_MAPPING[type(export_config)]
+            except KeyError as exc:
+                raise TypeError(
+                    f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}."
+                ) from exc
+            export_config.architectures = [export_model_class.__name__]
+            export_config.is_causal = False
+        else:
+            export_config = self.config.__class__.from_dict(config_dict)
+
+        export_config.pooling = self.pooling
+        return export_config
 
     def save_pretrained(self, save_directory: str, **kwargs):
         save_encoder_pretrained(self, save_directory, **kwargs)
 
-    def encode(self, input_dict: dict) -> Optional[torch.Tensor]:
+    def encode(self, input_dict: dict) -> torch.Tensor | None:
         """Encode inputs and return pooled embeddings.
 
         Args:
@@ -418,11 +664,16 @@ class BiEncoderModel(nn.Module):
         if not input_dict:
             return None
 
-        if "token_type_ids" not in inspect.getfullargspec(self.model.forward).args and "token_type_ids" in input_dict:
+        forward_args = inspect.getfullargspec(self.model.forward).args
+        if "token_type_ids" not in forward_args and "token_type_ids" in input_dict:
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
 
+        model_inputs = {k: v for k, v in input_dict.items() if k not in ["kd_labels", "run_dummy_vision"]}
+        if "run_dummy_vision" in forward_args and "run_dummy_vision" in input_dict:
+            model_inputs["run_dummy_vision"] = input_dict["run_dummy_vision"]
+
         outputs = self.model(
-            **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
+            **model_inputs,
             return_dict=True,
             output_hidden_states=True,
         )
@@ -442,7 +693,7 @@ class BiEncoderModel(nn.Module):
 
         return embeds.contiguous()
 
-    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
+    def forward(self, input_dict: dict = None, **kwargs) -> torch.Tensor | None:
         """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
         return self.encode(input_dict)
 
@@ -476,7 +727,164 @@ class CrossEncoderModel(nn.Module):
     def save_pretrained(self, save_directory: str, **kwargs):
         save_encoder_pretrained(self, save_directory, **kwargs)
 
-    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
+    def forward(self, input_dict: dict = None, **kwargs) -> torch.Tensor | None:
         inputs = input_dict if input_dict is not None else kwargs
         inputs.setdefault("return_dict", True)
         return self.model(**inputs)
+
+
+def _get_layers(model: nn.Module) -> nn.ModuleList:
+    """Locate the transformer block list on a HuggingFace backbone."""
+    if hasattr(model, "layers") and isinstance(model.layers, nn.ModuleList):
+        return model.layers
+    if hasattr(model, "model") and hasattr(model.model, "layers") and isinstance(model.model.layers, nn.ModuleList):
+        return model.model.layers
+    if (
+        hasattr(model, "transformer")
+        and hasattr(model.transformer, "h")
+        and isinstance(model.transformer.h, nn.ModuleList)
+    ):
+        return model.transformer.h
+    raise AttributeError("Could not locate transformer layers on model (tried .layers, .model.layers, .transformer.h)")
+
+
+class RetrieverStudentWithProjection(nn.Module):
+    """Bi-encoder student with a trainable linear projection into teacher space."""
+
+    def __init__(
+        self,
+        student: BiEncoderModel,
+        teacher_hidden_size: int,
+        capture_layers: Sequence[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.student = student
+        student_hidden = int(self.student.model.config.hidden_size)
+        self.student_hidden = student_hidden
+        self.teacher_hidden = int(teacher_hidden_size)
+
+        self.projection = nn.Linear(student_hidden, self.teacher_hidden, bias=True)
+        nn.init.xavier_uniform_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+        self.projection = self.projection.float()
+        if torch.cuda.is_available():
+            # Keep projection colocated with rank-local activations under distributed training.
+            self.projection = self.projection.to(device=torch.cuda.current_device())
+
+        self._capture = LayerCapture(detach=False)
+        if capture_layers:
+            self.attach_intermediate_capture(capture_layers)
+
+    @classmethod
+    def build(
+        cls,
+        pretrained_model_name_or_path: str,
+        teacher_hidden_size: int,
+        pooling: str = "avg",
+        l2_normalize: bool = False,
+        capture_layers: Sequence[int] | None = None,
+        trust_remote_code: bool = True,
+        **kwargs,
+    ) -> "RetrieverStudentWithProjection":
+        from nemo_automodel import NeMoAutoModelBiEncoder
+
+        student = NeMoAutoModelBiEncoder.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+        return cls(student=student, teacher_hidden_size=teacher_hidden_size, capture_layers=capture_layers)
+
+    def attach_intermediate_capture(self, layer_indices: Iterable[int]) -> "RetrieverStudentWithProjection":
+        self._capture.attach(_get_layers(self.student.model), layer_indices)
+        return self
+
+    def detach_intermediate_capture(self) -> None:
+        self._capture.detach_hooks()
+
+    def save_pretrained(self, save_directory: str, **kwargs) -> None:
+        # Keep the save format HF-compatible for evaluator tooling: this stores
+        # only the student backbone; the projection is saved by the recipe.
+        self.student.save_pretrained(save_directory, **kwargs)
+
+    def _encode(self, input_dict: dict) -> torch.Tensor:
+        if not input_dict:
+            return None
+        embeds = self.student(input_dict)
+        return embeds.contiguous()
+
+    def forward(
+        self,
+        input_dict: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
+        self._capture.reset()
+        pooled = self._encode(input_dict)
+        pooled_fp32 = pooled.float()
+
+        with torch.amp.autocast(device_type=pooled.device.type, enabled=False):
+            projected = self.projection(pooled_fp32)
+
+        return pooled_fp32, projected, dict(self._capture.outputs)
+
+
+class RetrieverTeacherEmbeddingEncoder(nn.Module):
+    """Frozen bi-encoder teacher with optional intermediate-layer capture."""
+
+    def __init__(
+        self,
+        teacher: BiEncoderModel,
+        capture_layers: Sequence[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.teacher = teacher
+        self.teacher.eval()
+        for param in self.teacher.parameters():
+            param.requires_grad_(False)
+
+        self.hidden_size = int(self.teacher.model.config.hidden_size)
+        self._capture = LayerCapture(detach=True)
+        if capture_layers:
+            self.attach_intermediate_capture(capture_layers)
+
+    @classmethod
+    def build(
+        cls,
+        pretrained_model_name_or_path: str,
+        pooling: str = "avg",
+        l2_normalize: bool = False,
+        capture_layers: Sequence[int] | None = None,
+        trust_remote_code: bool = True,
+        **kwargs,
+    ) -> "RetrieverTeacherEmbeddingEncoder":
+        from nemo_automodel import NeMoAutoModelBiEncoder
+
+        teacher = NeMoAutoModelBiEncoder.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+        return cls(teacher=teacher, capture_layers=capture_layers)
+
+    def attach_intermediate_capture(self, layer_indices: Iterable[int]) -> "RetrieverTeacherEmbeddingEncoder":
+        self._capture.attach(_get_layers(self.teacher.model), layer_indices)
+        return self
+
+    def detach_intermediate_capture(self) -> None:
+        self._capture.detach_hooks()
+
+    @torch.no_grad()
+    def _encode(self, input_dict: dict) -> torch.Tensor:
+        if not input_dict:
+            return None
+        embeds = self.teacher(input_dict)
+        return embeds.contiguous()
+
+    @torch.no_grad()
+    def forward(self, input_dict: dict) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        self._capture.reset()
+        pooled = self._encode(input_dict)
+        return pooled.float(), dict(self._capture.outputs)

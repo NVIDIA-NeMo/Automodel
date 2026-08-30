@@ -12,24 +12,94 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
-from typing import Any, Optional
+from collections import deque
+from collections.abc import Callable
+from typing import Any
 
 import torch
+import torch.nn as nn
 from transformers import AutoConfig
 
 logger = logging.getLogger(__name__)
 
 
+def resolve_get_rope_index(model: nn.Module) -> Callable | None:
+    """Locate a model's mRoPE position-id builder.
+
+    Transformers does not keep ``get_rope_index`` at a fixed depth, and a plain
+    ``getattr`` on the top-level module therefore finds nothing for most
+    layouts, which silently degrades packed multimodal training to 1D positions.
+    Three layouts exist as of transformers 5.8, so the search widens gradually:
+
+    1. The model itself, after unwrapping the ``module`` that DDP and
+       MegatronFSDP add without proxying attribute reads. Qwen2.5-Omni defines
+       ``get_rope_index`` on its top-level ``*ForConditionalGeneration``.
+    2. HuggingFace's ``base_model`` property, which resolves to
+       ``getattr(model, model.base_model_prefix, model)``. Qwen2-VL, Qwen2.5-VL,
+       Qwen3-VL, Qwen3-VL-MoE and GLM-4V put it on that inner ``*Model``.
+    3. Any remaining submodule, breadth-first so the shallowest match wins.
+       Qwen3-Omni reaches neither of the above: it owns no ``get_rope_index``,
+       and its ``base_model_prefix`` of ``model`` resolves back to itself
+       because the builder lives on the ``thinker`` submodule.
+
+    Breadth-first order matters because a model may hold several distinct
+    builders. Qwen3-Omni carries one on ``thinker`` and a different one on
+    ``talker``; both sit one level down, so the traversal must be deterministic
+    rather than depend on how a search happens to recurse. The sweep tracks
+    visited modules like ``nn.Module.named_modules`` does, since a module graph
+    may share a submodule across paths or contain an outright cycle.
+
+    Args:
+        model: The (possibly wrapped) model to search. Accepts any object; no
+            tensor inputs. Objects without the ``nn.Module`` child API, such as
+            the stage wrappers a pipeline-parallel run holds, are searched by
+            attribute only and never swept.
+
+    Returns:
+        The ``get_rope_index`` callable, or ``None`` when the model does not
+        expose one (i.e. it is not an mRoPE model).
+    """
+    model = getattr(model, "module", model)
+    get_rope_index = getattr(model, "get_rope_index", None)
+    if get_rope_index is not None:
+        return get_rope_index
+
+    get_rope_index = getattr(getattr(model, "base_model", None), "get_rope_index", None)
+    if get_rope_index is not None:
+        return get_rope_index
+
+    # Pipeline stages reach this as bare wrappers rather than nn.Modules, so the
+    # sweep is only available when the object actually carries the module API.
+    named_children = getattr(model, "named_children", None)
+    if named_children is None:
+        return None
+
+    seen = {id(model)}
+    queue = deque(named_children())
+    while queue:
+        name, submodule = queue.popleft()
+        if id(submodule) in seen:
+            continue
+        seen.add(id(submodule))
+        get_rope_index = getattr(submodule, "get_rope_index", None)
+        if get_rope_index is not None:
+            logger.debug("Resolved get_rope_index from submodule %r of %s", name, type(model).__name__)
+            return get_rope_index
+        queue.extend((f"{name}.{child_name}", child) for child_name, child in submodule.named_children())
+    return None
+
+
 def _should_load_before_shard(
     *,
-    autopipeline: Optional[object],
+    autopipeline: object | None,
     tp_size: int,
     ep_size: int,
     dp_shard_size: int = 1,
     pretrained_model_name_or_path: str,
     load_base_model: bool,
-    peft_config: Optional[object],
+    peft_config: object | None,
 ) -> bool:
     """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
 
@@ -191,9 +261,22 @@ def apply_cache_compatibility_patches():
 
         DynamicCache.to_legacy_cache = _to_legacy_cache
 
+    # OutputRecorder moved from transformers.utils.generic to
+    # transformers.utils.output_capturing in transformers v5.x. Pre-v5
+    # remote-code models (e.g. Kimi-Linear and MiniMax-M2 checkpoints) import
+    # it from the old location for their auxiliary router-logit recorders and
+    # otherwise fail at module import. Alias the relocated class back; v5.x
+    # re-exports it from transformers.modeling_utils.
+    import transformers.modeling_utils as mu
+    import transformers.utils.generic as generic_utils
+
+    if not hasattr(generic_utils, "OutputRecorder"):
+        _output_recorder = getattr(mu, "OutputRecorder", None)
+        if _output_recorder is not None:
+            generic_utils.OutputRecorder = _output_recorder
+
     # _tied_weights_keys changed from list to dict in transformers v5.x.
     # Patch post_init to auto-convert list -> dict for remote-code models.
-    import transformers.modeling_utils as mu
 
     if not getattr(mu.PreTrainedModel.post_init, "_nemo_tied_keys_patched", False):
         _orig_post_init = mu.PreTrainedModel.post_init
@@ -201,10 +284,35 @@ def apply_cache_compatibility_patches():
         def _find_embedding_source(model):
             """Resolve the weight name of the input embedding layer.
 
-            Prefer get_input_embeddings() (explicit HF contract), fall back
-            to scanning for the first nn.Embedding in the module tree.
+            Try the no-argument get_input_embeddings() HF contract, then scan
+            for the first nn.Embedding in the module tree.
             """
-            embed = model.get_input_embeddings()
+            get_input_embeddings = model.get_input_embeddings
+            call_get_input_embeddings = True
+            try:
+                parameters = inspect.signature(get_input_embeddings).parameters.values()
+            except (TypeError, ValueError):
+                pass
+            else:
+                has_required_argument = any(
+                    parameter.default is inspect.Parameter.empty
+                    and parameter.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                    for parameter in parameters
+                )
+                call_get_input_embeddings = not has_required_argument
+            embed = None
+            if call_get_input_embeddings:
+                try:
+                    embed = get_input_embeddings()
+                except TypeError:
+                    # Some remote-code wrappers expose the standard zero-argument
+                    # signature but delegate to an input-dependent inner accessor.
+                    pass
             if embed is not None:
                 for name, module in model.named_modules():
                     if module is embed:
@@ -340,7 +448,7 @@ def _patch_peft_prepare_inputs():
         from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
         if not getattr(Qwen3ForCausalLM.forward, "__nemo_dtensor_logits_to_keep_patched__", False):
-            from transformers.modeling_outputs import CausalLMOutputWithPast  # noqa: WPS433
+            from transformers.modeling_outputs import CausalLMOutputWithPast
 
             _orig_forward = Qwen3ForCausalLM.forward
 

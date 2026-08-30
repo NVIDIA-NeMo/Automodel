@@ -81,7 +81,7 @@ def _backend():
         # Qwen3.5's gated-query RoPE is incompatible with TE's fused rope kernel,
         # so every recipe sets rope_fusion=false. Pin it for deterministic tests.
         rope_fusion=False,
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=True,
     )

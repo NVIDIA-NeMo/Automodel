@@ -21,7 +21,7 @@ handling is applied in from_hf).
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 from transformers import LlamaConfig
 
@@ -56,7 +56,8 @@ class LlamaStateDictAdapter:
         # HF keys match model keys directly.
         # Only need to handle tied lm_head weights.
         custom_state_dict = dict(hf_state_dict)
-        if getattr(self.config, "tie_word_embeddings", True):
+        # Default False to match __init__/tie_weights (config always carries the flag).
+        if getattr(self.config, "tie_word_embeddings", False):
             embed_key = "model.embed_tokens.weight"
             lm_head_key = "lm_head.weight"
             if lm_head_key not in custom_state_dict and embed_key in custom_state_dict:
@@ -67,7 +68,7 @@ class LlamaStateDictAdapter:
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         # Model keys are already in HF format.

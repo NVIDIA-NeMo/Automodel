@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Sequence, Union
 
 from transformers.configuration_utils import PretrainedConfig
 
@@ -45,7 +45,7 @@ class StepRoboticsVisionEncoderConfig(PretrainedConfig):
         hidden_act="quick_gelu",
         layer_norm_eps=1e-5,
         ues_cls_token=False,
-        use_cls_token: Optional[bool] = None,
+        use_cls_token: bool | None = None,
         use_ln_pre=True,
         use_ln_post=False,
         use_abs_posemb=True,
@@ -88,7 +88,7 @@ class Step3p7TextConfig(PretrainedConfig):
         num_attention_groups: int = 8,
         num_hidden_layers: int = 45,
         num_nextn_predict_layers: int = 0,
-        mtp_base_layer_idx: Optional[int] = None,
+        mtp_base_layer_idx: int | None = None,
         max_seq_len: int = 128000,
         vocab_size: int = 128815,
         rms_norm_eps: float = 1e-5,
@@ -96,14 +96,14 @@ class Step3p7TextConfig(PretrainedConfig):
         moe_num_experts: int = 288,
         moe_top_k: int = 8,
         rope_theta: float = 10000,
-        rope_scaling: Optional[dict[str, Any]] = None,
+        rope_scaling: dict[str, Any] | None = None,
         max_position_embeddings: int = 128000,
         share_expert_dims: int = 1280,
-        share_expert_dim: Optional[int] = None,
+        share_expert_dim: int | None = None,
         head_dim: int = 128,
         norm_expert_weight: bool = True,
         layer_types: list[str] = None,
-        sliding_window: Optional[int] = None,
+        sliding_window: int | None = None,
         pad_token_id: int = 1,
         attention_dropout: float = 0.0,
         use_head_wise_attn_gate: bool = False,
@@ -111,11 +111,11 @@ class Step3p7TextConfig(PretrainedConfig):
         moe_router_activation: str = "softmax",
         moe_router_scaling_factor: float = 1.0,
         need_fp32_gate: bool = False,
-        attention_other_setting: Optional[dict[str, Any]] = None,
-        swiglu_limits: Optional[list[Optional[float]]] = None,
-        swiglu_limits_shared: Optional[list[Optional[float]]] = None,
-        use_rope_layers: Optional[list[bool]] = None,
-        yarn_only_types: Optional[list[str]] = None,
+        attention_other_setting: dict[str, Any] | None = None,
+        swiglu_limits: list[float | None] | None = None,
+        swiglu_limits_shared: list[float | None] | None = None,
+        use_rope_layers: list[bool] | None = None,
+        yarn_only_types: list[str] | None = None,
         moe_layers_enum: tuple[int] = (
             3,
             4,
@@ -252,9 +252,9 @@ class Step3p7TextConfig(PretrainedConfig):
 
 
 def _normalize_per_layer_values(
-    values: Optional[Sequence[Any]],
+    values: Sequence[Any] | None,
     num_hidden_layers: int,
-) -> Optional[list[Any]]:
+) -> list[Any] | None:
     if values is None:
         return None
     normalized = list(values)
@@ -268,7 +268,7 @@ def _normalize_per_layer_values(
 
 
 def _slice_mtp_per_layer_values(
-    values: Optional[Sequence[Any]],
+    values: Sequence[Any] | None,
     num_hidden_layers: int,
     num_nextn_predict_layers: int,
     default: Any,
@@ -293,8 +293,8 @@ class Step3p7Config(PretrainedConfig):
 
     def __init__(
         self,
-        vision_config: Optional[Union[dict, StepRoboticsVisionEncoderConfig]] = None,
-        text_config: Optional[Union[dict, Step3p7TextConfig]] = None,
+        vision_config: Union[dict, StepRoboticsVisionEncoderConfig] | None = None,
+        text_config: Union[dict, Step3p7TextConfig] | None = None,
         understand_projector_stride: int = 2,
         projector_bias: bool = False,
         image_token_id: int = 151679,
@@ -323,7 +323,11 @@ class Step3p7Config(PretrainedConfig):
 
         rope_scaling = kwargs.get("rope_scaling")
         if isinstance(rope_scaling, dict):
-            kwargs["rope_scaling"] = dict(rope_scaling)
+            rope_scaling = dict(rope_scaling)
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+            if rope_type == "yarn" and "original_max_position_embeddings" not in rope_scaling:
+                rope_scaling["original_max_position_embeddings"] = text_config.max_position_embeddings
+            kwargs["rope_scaling"] = rope_scaling
 
         self.understand_projector_stride = understand_projector_stride
         self.projector_bias = projector_bias

@@ -51,7 +51,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import re
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 
@@ -106,6 +106,10 @@ VAE_PATTERNS = [
     r"^decoder\.",
 ]
 
+EXTRA_STATE_PATTERNS = [
+    r"\._extra_state$",
+]
+
 # No physical tensor sharing: embed_tokens / lm_head / final norm are UND-side
 # but are logically READ by the gen path (gen tokens use text embeddings).
 SHARED_PATTERNS: list[str] = []
@@ -118,6 +122,7 @@ def _compile(patterns: list[str]) -> list[re.Pattern]:
 _UND_RES = _compile(UND_PATTERNS)
 _GEN_RES = _compile(GEN_PATTERNS)
 _VAE_RES = _compile(VAE_PATTERNS)
+_EXTRA_STATE_RES = _compile(EXTRA_STATE_PATTERNS)
 
 
 def _matches_any(key: str, patterns: list[re.Pattern]) -> bool:
@@ -139,10 +144,12 @@ def _normalize_stage(stage: Any) -> str:
 
 
 def _partition(state_dict: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Partition a flat checkpoint dict into UND / GEN / VAE / unknown buckets."""
-    buckets: dict[str, dict[str, Any]] = {"und": {}, "gen": {}, "vae": {}, "unknown": {}}
+    """Partition a flat checkpoint dict into UND / GEN / VAE / extra / unknown buckets."""
+    buckets: dict[str, dict[str, Any]] = {"und": {}, "gen": {}, "vae": {}, "extra": {}, "unknown": {}}
     for key, tensor in state_dict.items():
-        if _matches_any(key, _UND_RES):
+        if _matches_any(key, _EXTRA_STATE_RES):
+            buckets["extra"][key] = tensor
+        elif _matches_any(key, _UND_RES):
             buckets["und"][key] = tensor
         elif _matches_any(key, _GEN_RES):
             buckets["gen"][key] = tensor
@@ -168,11 +175,13 @@ class BagelStateDictAdapter(StateDictAdapter):
 
     Args:
         config: ``BagelConfig`` (or ``None``; currently only used for log
-            context — no shape sanity checks yet).
+            context -- no shape sanity checks yet).
         stage: Default stage used when ``from_hf`` is called without an
             explicit ``stage`` kwarg. Accepts ``"stage1"`` / ``"stage2"`` or
             ``1`` / ``2``.
     """
+
+    _supports_write_through_checkpoint_load = True
 
     def __init__(self, config: Any = None, *, stage: Any = "stage1") -> None:
         self.config = config
@@ -196,9 +205,9 @@ class BagelStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, "torch.Tensor"],
-        device_mesh: Optional["DeviceMesh"] = None,
+        device_mesh: "DeviceMesh" | None = None,
         *,
-        stage: Optional[Any] = None,
+        stage: Any | None = None,
         strict: bool = True,
         **kwargs: Any,
     ) -> dict[str, "torch.Tensor"]:
@@ -225,6 +234,12 @@ class BagelStateDictAdapter(StateDictAdapter):
         """
         stage = _normalize_stage(stage if stage is not None else self.stage)
         buckets = _partition({self._strip_nemo_root(k): v for k, v in hf_state_dict.items()})
+
+        if buckets["extra"]:
+            logger.info(
+                "BagelStateDictAdapter.from_hf: dropping %d Transformer-Engine _extra_state key(s).",
+                len(buckets["extra"]),
+            )
 
         if buckets["unknown"]:
             sample = list(buckets["unknown"])[:5]
@@ -273,14 +288,17 @@ class BagelStateDictAdapter(StateDictAdapter):
         """
         exclude_key_regex = kwargs.get("exclude_key_regex")
         exclude_pattern = re.compile(exclude_key_regex) if exclude_key_regex else None
-        return {
-            self._nemo_to_hf_key(k): v
-            for k, v in state_dict.items()
-            if exclude_pattern is None or not exclude_pattern.match(k)
-        }
+        converted: dict[str, "torch.Tensor"] = {}
+        for nemo_key, tensor in state_dict.items():
+            if "._extra_state" in nemo_key:
+                continue
+            if exclude_pattern is not None and exclude_pattern.match(nemo_key):
+                continue
+            converted[self._nemo_to_hf_key(nemo_key)] = tensor
+        return converted
 
     # ------------------------------------------------------------------
-    # Per-tensor rename (DCP save path).
+    # Per-tensor conversion for explicit HF export tools.
     # ------------------------------------------------------------------
     def convert_single_tensor_to_hf(
         self,
@@ -288,10 +306,9 @@ class BagelStateDictAdapter(StateDictAdapter):
         tensor: "torch.Tensor",
         **kwargs: Any,
     ) -> list[tuple[str, "torch.Tensor"]]:
-        """Return ``[(hf_fqn, tensor)]`` for a single NeMo tensor.
-
-        Identity for BAGEL checkpoint keys.
-        """
+        """Return ``[(hf_fqn, tensor)]`` for a single NeMo tensor."""
+        if "._extra_state" in fqn:
+            return []
         return [(self._nemo_to_hf_key(fqn), tensor)]
 
 

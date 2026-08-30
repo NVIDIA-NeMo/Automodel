@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for dLLM corruption functions (corrupt_uniform, corrupt_blockwise, corrupt_uniform_random)."""
+"""Tests for dLLM corruption functions (corrupt_uniform, corrupt_blockwise, corrupt_uniform_random, corrupt_mix)."""
 
 import pytest
 import torch
 
 from nemo_automodel.components.datasets.dllm.corruption import (
+    corrupt_all_masked,
     corrupt_blockwise,
+    corrupt_mix,
     corrupt_uniform,
     corrupt_uniform_random,
     gumbel_topk,
@@ -54,6 +56,32 @@ class TestGumbelTopk:
     def test_output_is_bool(self):
         mask = gumbel_topk(torch.zeros(10), 3)
         assert mask.dtype == torch.bool
+
+
+# ---------------------------------------------------------------------------
+# corrupt_all_masked
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptAllMasked:
+    def test_masks_all_supervised_positions(self, inputs):
+        input_ids, loss_mask = inputs
+        noisy, noise_mask, p_mask = corrupt_all_masked(input_ids, loss_mask, MASK_TOKEN_ID)
+        # Every supervised position is masked; no stochasticity.
+        assert torch.equal(noise_mask, loss_mask.bool())
+        assert (noisy[loss_mask.bool()] == MASK_TOKEN_ID).all()
+
+    def test_leaves_prompt_clean(self, inputs):
+        input_ids, loss_mask = inputs
+        noisy, _, _ = corrupt_all_masked(input_ids, loss_mask, MASK_TOKEN_ID)
+        clean = ~loss_mask.bool()
+        assert (noisy[clean] == input_ids[clean]).all()
+
+    def test_p_mask_is_all_ones(self, inputs):
+        input_ids, loss_mask = inputs
+        _, _, p_mask = corrupt_all_masked(input_ids, loss_mask, MASK_TOKEN_ID)
+        assert p_mask.shape == (B, L)
+        assert torch.all(p_mask == 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -258,3 +286,218 @@ class TestCorruptUniformRandom:
         input_ids, loss_mask = inputs
         noisy, _, _ = corrupt_uniform_random(input_ids, loss_mask, VOCAB_SIZE, block_size=8)
         assert noisy.dtype == input_ids.dtype
+
+
+class TestSeededGenerator:
+    """Seeded-generator contract shared by all mask-token corruption kernels.
+
+    The recipe passes a (step, dp_rank, microbatch)-seeded generator so that
+    corruption (a) reproduces exactly on checkpoint resume and (b) is identical
+    across ranks that share a batch — TP/CP peers hold the same dp_rank and must
+    feed identical noisy inputs into the sharded forward.
+    """
+
+    @pytest.mark.parametrize("kernel_kwargs", [{}, {"block_size": 8}])
+    def test_corrupt_blockwise_same_seed_is_identical(self, inputs, kernel_kwargs):
+        input_ids, loss_mask = inputs
+        out_a = corrupt_blockwise(
+            input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(1234), **kernel_kwargs
+        )
+        out_b = corrupt_blockwise(
+            input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(1234), **kernel_kwargs
+        )
+        for a, b in zip(out_a, out_b):
+            assert torch.equal(a, b)
+
+    def test_corrupt_uniform_same_seed_is_identical(self, inputs):
+        input_ids, loss_mask = inputs
+        out_a = corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(7))
+        out_b = corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(7))
+        for a, b in zip(out_a, out_b):
+            assert torch.equal(a, b)
+
+    def test_corrupt_uniform_different_seeds_differ(self, inputs):
+        input_ids, loss_mask = inputs
+        _, mask_a, _ = corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(7))
+        _, mask_b, _ = corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(8))
+        assert not torch.equal(mask_a, mask_b)
+
+    def test_corrupt_uniform_generator_does_not_consume_global_rng(self, inputs):
+        input_ids, loss_mask = inputs
+        torch.manual_seed(0)
+        expected = torch.rand(4)
+        torch.manual_seed(0)
+        corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(7))
+        assert torch.equal(torch.rand(4), expected)
+
+
+class TestCorruptMix:
+    """Two-channel absorbing + uniform-transition corruption (SCDD forward kernel)."""
+
+    def test_channels_are_mutually_exclusive_and_gated_by_loss_mask(self, inputs):
+        input_ids, loss_mask = inputs
+        noisy, noise_mask = corrupt_mix(
+            input_ids,
+            loss_mask,
+            MASK_TOKEN_ID,
+            vocab_size=1000,
+            mask_prob=torch.full((B,), 0.4),
+            uniform_prob=torch.full((B,), 0.4),
+            generator=torch.Generator().manual_seed(0),
+        )
+        assert noisy.shape == input_ids.shape
+        assert noise_mask.dtype == torch.bool
+        # Nothing outside the supervised span may change.
+        assert torch.equal(noisy[loss_mask == 0], input_ids[loss_mask == 0])
+        assert not noise_mask[loss_mask == 0].any()
+        # Every flagged position actually changed, and vice versa.
+        assert torch.equal(noise_mask, noisy != input_ids)
+
+    def test_uniform_replacements_exclude_mask_and_clean_token(self):
+        # Every supervised position goes through the uniform channel.
+        input_ids = torch.randint(0, 50, (8, 64))
+        loss_mask = torch.ones_like(input_ids)
+        noisy, noise_mask = corrupt_mix(
+            input_ids,
+            loss_mask,
+            MASK_TOKEN_ID,
+            vocab_size=1000,
+            mask_prob=torch.zeros(8),
+            uniform_prob=torch.ones(8),
+            generator=torch.Generator().manual_seed(1),
+        )
+        assert noise_mask.all()
+        assert (noisy != MASK_TOKEN_ID).all()
+        assert (noisy != input_ids).all()
+        assert (noisy >= 0).all() and (noisy < 1000).all()
+
+    def test_replacements_cover_the_allowed_support_uniformly(self):
+        # vocab 8, mask id 7, clean token 0 -> replacements must be {1..6}.
+        input_ids = torch.zeros(1, 60000, dtype=torch.long)
+        noisy, _ = corrupt_mix(
+            input_ids,
+            torch.ones_like(input_ids),
+            mask_token_id=7,
+            vocab_size=8,
+            mask_prob=torch.zeros(1),
+            uniform_prob=torch.ones(1),
+            generator=torch.Generator().manual_seed(2),
+        )
+        counts = torch.bincount(noisy.flatten(), minlength=8).float()
+        assert counts[0] == 0 and counts[7] == 0
+        expected = input_ids.numel() / 6
+        assert torch.allclose(counts[1:7], torch.full((6,), expected), rtol=0.05)
+
+    def test_channel_marginals_match_requested_probabilities(self):
+        input_ids = torch.randint(0, 50, (2, 40000))
+        loss_mask = torch.ones_like(input_ids)
+        noisy, noise_mask = corrupt_mix(
+            input_ids,
+            loss_mask,
+            MASK_TOKEN_ID,
+            vocab_size=1000,
+            mask_prob=torch.tensor([0.3, 0.1]),
+            uniform_prob=torch.tensor([0.5, 0.2]),
+            generator=torch.Generator().manual_seed(3),
+        )
+        absorbed = (noisy == MASK_TOKEN_ID).float().mean(dim=1)
+        transitioned = noise_mask.float().mean(dim=1) - absorbed
+        assert torch.allclose(absorbed, torch.tensor([0.3, 0.1]), atol=0.01)
+        assert torch.allclose(transitioned, torch.tensor([0.5, 0.2]), atol=0.01)
+
+    def test_clean_mask_tokens_are_never_routed_to_the_uniform_channel(self):
+        # A clean token that already IS [MASK] has no well-defined "different
+        # non-[MASK]" replacement, so it must be left alone by that channel.
+        input_ids = torch.full((1, 32), MASK_TOKEN_ID)
+        noisy, noise_mask = corrupt_mix(
+            input_ids,
+            torch.ones_like(input_ids),
+            MASK_TOKEN_ID,
+            vocab_size=1000,
+            mask_prob=torch.zeros(1),
+            uniform_prob=torch.ones(1),
+            generator=torch.Generator().manual_seed(4),
+        )
+        assert torch.equal(noisy, input_ids)
+        assert not noise_mask.any()
+
+    def test_same_seed_is_identical_and_global_rng_untouched(self, inputs):
+        input_ids, loss_mask = inputs
+        kwargs = dict(
+            vocab_size=1000,
+            mask_prob=torch.full((B,), 0.3),
+            uniform_prob=torch.full((B,), 0.3),
+        )
+        torch.manual_seed(0)
+        expected = torch.rand(4)
+        torch.manual_seed(0)
+        a = corrupt_mix(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(9), **kwargs)
+        assert torch.equal(torch.rand(4), expected)
+        b = corrupt_mix(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(9), **kwargs)
+        for x, y in zip(a, b):
+            assert torch.equal(x, y)
+
+    def test_rejects_degenerate_vocab(self, inputs):
+        input_ids, loss_mask = inputs
+        with pytest.raises(ValueError, match="vocab_size >= 3"):
+            corrupt_mix(
+                input_ids,
+                loss_mask,
+                MASK_TOKEN_ID,
+                vocab_size=2,
+                mask_prob=torch.zeros(B),
+                uniform_prob=torch.zeros(B),
+            )
+
+    def test_rejects_channel_probabilities_beyond_one(self, inputs):
+        """The two channels split one [0, 1) variate, so their sum cannot exceed 1.
+
+        Without the check the uniform channel is silently truncated and the
+        realised noise stops matching the schedule the ELBO weights assume.
+        """
+        input_ids, loss_mask = inputs
+        with pytest.raises(ValueError, match="mask_prob \\+ uniform_prob <= 1"):
+            corrupt_mix(
+                input_ids,
+                loss_mask,
+                MASK_TOKEN_ID,
+                vocab_size=1000,
+                mask_prob=torch.full((B,), 0.7),
+                uniform_prob=torch.full((B,), 0.4),
+            )
+
+    def test_probabilities_summing_to_exactly_one_are_accepted(self, inputs):
+        """A schedule whose masses sum to 1 must not trip the tolerance."""
+        input_ids, loss_mask = inputs
+        noisy, _ = corrupt_mix(
+            input_ids,
+            loss_mask,
+            MASK_TOKEN_ID,
+            vocab_size=1000,
+            mask_prob=torch.full((B,), 0.3),
+            uniform_prob=torch.full((B,), 0.7),
+        )
+        assert noisy.shape == input_ids.shape
+
+    def test_ids_stay_in_range_when_every_clean_token_is_mask(self):
+        """Clean ``[MASK]`` tokens make the two exclusion shifts collide.
+
+        ``lo == hi`` there, so an unclamped draw could reach ``vocab_size``.
+        Those positions are never routed to the uniform channel, so they must
+        come back unchanged and every id must stay addressable.
+        """
+        vocab_size, mask_id = 16, 5
+        input_ids = torch.full((B, L), mask_id, dtype=torch.long)
+        loss_mask = torch.ones(B, L, dtype=torch.long)
+        noisy, noise_mask = corrupt_mix(
+            input_ids,
+            loss_mask,
+            mask_id,
+            vocab_size=vocab_size,
+            mask_prob=torch.zeros(B),
+            uniform_prob=torch.ones(B),
+            generator=torch.Generator().manual_seed(0),
+        )
+        assert torch.equal(noisy, input_ids)
+        assert not noise_mask.any()
+        assert int(noisy.max()) < vocab_size

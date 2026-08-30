@@ -15,7 +15,8 @@ model:
   attn_implementation: sdpa
   backend:
     _target_: nemo_automodel.components.models.common.utils.BackendConfig
-    enable_deepep: false
+    experts: gmm
+    dispatcher: deepep
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: 8
@@ -510,6 +511,7 @@ parallelizer:
 ci:
   time: "00:30:00"
   checkpoint_robustness:
-    hf_kl_threshold: 5e-2
+    # Routed-MoE source parity measures 0.0064-0.0076 mean KL at 2K while
+    # p95 KL and cosine pass standard; retain every gate with the shared profile.
+    parity_tolerance_profile: relaxed
     tokenizer_name: openai/gpt-oss-20b
-    no_check_resume: true

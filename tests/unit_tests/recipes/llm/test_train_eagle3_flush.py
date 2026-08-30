@@ -291,3 +291,15 @@ def test_progress_bar_advances_per_optim_step(tmp_path, monkeypatch):
     assert fake.n == recipe.runtime.global_step == 2
     assert fake.closed
     assert set(fake.postfix) == {"loss", "acc", "lr"}
+
+
+def test_epoch_save_final_flag_only_on_last_epoch(tmp_path):
+    """With ``save_checkpoint_every_epoch`` over multiple epochs, only the last
+    epoch's save is the run's final checkpoint -- ``save_consolidated: final``
+    keys its HF safetensors export off that flag."""
+    recipe = _build_recipe(tmp_path, num_samples=4, grad_accum=2, num_epochs=2)
+    recipe.save_checkpoint_every_epoch = True
+    saves = []
+    recipe.save_checkpoint = lambda **kw: saves.append((kw["epoch"], kw["is_final_checkpoint"]))
+    recipe.run_train_validation_loop()
+    assert saves == [(1, False), (2, True)]

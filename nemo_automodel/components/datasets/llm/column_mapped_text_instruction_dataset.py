@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 import re
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Union
 
 from datasets import VerificationMode, load_dataset
 from torch.utils.data import Dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
@@ -90,9 +96,9 @@ def _str_is_hf_repo_id(val: str) -> bool:
 
 def _load_dataset(
     path_or_dataset_id: Union[str, List[str]],
-    split: Optional[str] = None,
+    split: str | None = None,
     streaming: bool = False,
-    name: Optional[str] = None,
+    name: str | None = None,
 ):
     """Load a dataset either from the Hugging Face Hub or from local JSON/JSONL files.
 
@@ -147,6 +153,50 @@ def _check_all_values_equal_length(sample: Dict[str, List[int]]) -> bool:
     return all_equal
 
 
+@dataclass
+class ColumnMappedTextInstructionDatasetConfig:
+    """Construction-time configuration for :class:`ColumnMappedTextInstructionDataset`."""
+
+    accepts_tokenizer: ClassVar[bool] = True
+
+    path_or_dataset_id: str | list[str]
+    """The path or dataset id of the dataset."""
+    column_mapping: dict[str, str]
+    """Mapping of logical column roles (context/question/answer) to raw column names."""
+    split: str | None = "train"
+    """The split of the dataset to load."""
+    name: str | None = None
+    """The name of the dataset configuration/subset to load."""
+    answer_only_loss_mask: bool = True
+    """Whether to compute the loss mask only on the answer tokens."""
+    seq_length: int | None = None
+    """The sequence length to use for padding."""
+    padding: str | bool = "do_not_pad"
+    """Padding mode for formatting."""
+    truncation: str | bool = "do_not_truncate"
+    """Truncation mode for formatting."""
+    limit_dataset_samples: int | None = None
+    """The number of samples to load from the dataset."""
+    use_hf_chat_template: bool = False
+    """Whether to format samples using the tokenizer's chat template."""
+
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "ColumnMappedTextInstructionDataset":
+        """Build a :class:`ColumnMappedTextInstructionDataset` from this :class:`ColumnMappedTextInstructionDatasetConfig` and tokenizer."""
+        return ColumnMappedTextInstructionDataset(
+            path_or_dataset_id=self.path_or_dataset_id,
+            column_mapping=self.column_mapping,
+            tokenizer=tokenizer,
+            split=self.split,
+            name=self.name,
+            answer_only_loss_mask=self.answer_only_loss_mask,
+            seq_length=self.seq_length,
+            padding=self.padding,
+            truncation=self.truncation,
+            limit_dataset_samples=self.limit_dataset_samples,
+            use_hf_chat_template=self.use_hf_chat_template,
+        )
+
+
 class ColumnMappedTextInstructionDataset(Dataset):
     """Generic instruction-tuning dataset that maps arbitrary column names.
 
@@ -165,13 +215,13 @@ class ColumnMappedTextInstructionDataset(Dataset):
         column_mapping: Dict[str, str],
         tokenizer,
         *,
-        split: Optional[str] = "train",
-        name: Optional[str] = None,
+        split: str | None = "train",
+        name: str | None = None,
         answer_only_loss_mask: bool = True,
-        seq_length: Optional[int] = None,
+        seq_length: int | None = None,
         padding: Union[str, bool] = "do_not_pad",
         truncation: Union[str, bool] = "do_not_truncate",
-        limit_dataset_samples: Optional[int] = None,
+        limit_dataset_samples: int | None = None,
         use_hf_chat_template: bool = False,
     ) -> None:
         """

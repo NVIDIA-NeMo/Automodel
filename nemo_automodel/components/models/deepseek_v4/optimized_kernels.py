@@ -39,6 +39,7 @@ from typing import Literal
 
 import torch
 
+from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
 
 Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "auto"]
@@ -93,9 +94,9 @@ def is_dsv4_kernel_available(name: Literal["sinkhorn", "sparse_attn", "indexer"]
     if name == "sinkhorn":
         return _HAS_TILE_KERNELS_SINKHORN and _HAS_TILE_KERNELS_SINKHORN_FWD and _HAS_TILE_KERNELS_SINKHORN_BWD
     if name == "sparse_attn":
-        return _HAS_MILES_SPARSE_ATTN
+        return HAS_TILELANG and _HAS_MILES_SPARSE_ATTN
     if name == "indexer":
-        return _HAS_MILES_INDEXER and _HAS_MILES_CU_SEQLENS and _HAS_MILES_INDEXER_AUTOGRAD
+        return HAS_TILELANG and _HAS_MILES_INDEXER and _HAS_MILES_CU_SEQLENS and _HAS_MILES_INDEXER_AUTOGRAD
     raise ValueError(f"Unknown DeepSeek V4 kernel name: {name}")
 
 

@@ -45,7 +45,8 @@ def _resident_compute_dtypes(model, mp_policy, fp32_compute_module_names, monkey
     """
     calls: list[tuple[nn.Module, torch.dtype]] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+        del reshard_after_forward
         calls.append((mod, mp_policy.param_dtype if mp_policy is not None else None))
 
     # Patch only fully_shard; the real _fully_shard (incl. ModuleList expansion)
@@ -105,6 +106,21 @@ class HybridLayer(nn.Module):
         self.in_proj = nn.Linear(8, 8, bias=False).to(dtype)
         self.out_proj = nn.Linear(8, 8, bias=False).to(dtype)
         self._fp32_params = Fp32Holder()
+
+
+class MoEMixedStorageLayer(nn.Module):
+    """Qwen3.5-MoE layer reproducing #3327: fp32 master projections and the
+    fp32 SSM-gating holder (A_log/dt_bias) coexisting with a genuinely-bf16
+    ``shared_expert_gate`` sibling, and no HF dtype records (custom-model path)."""
+
+    def __init__(self):
+        super().__init__()
+        self.in_proj = nn.Linear(8, 8, bias=False).to(torch.float32)
+        self.out_proj = nn.Linear(8, 8, bias=False).to(torch.float32)
+        self._fp32_params = nn.Module()
+        self._fp32_params.A_log = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+        self._fp32_params.dt_bias = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+        self.shared_expert_gate = nn.Linear(8, 1, bias=False).to(torch.bfloat16)
 
 
 # --------------------------------------------------------------------------- #
@@ -198,6 +214,22 @@ def test_hybrid_pin_overrides_hf_recorded_dtype(monkeypatch):
     assert resolved["in_proj.weight"] == torch.bfloat16
 
 
+def test_moe_mixed_storage_no_hf_hint_bulk_computes_bf16(monkeypatch):
+    """#3327: a lone genuinely-bf16 ``shared_expert_gate`` sibling must not drag
+    the fp32 master weights into fp32 compute. With no HF records, ordinary
+    weights and the gate compute bf16; only the pinned holder stays fp32."""
+    layer = MoEMixedStorageLayer()  # mixed storage {fp32, bf16}, no HF records
+    resolved = _resident_compute_dtypes(layer, _mp_policy(torch.bfloat16), ("_fp32_params",), monkeypatch)
+
+    assert resolved == {
+        "in_proj.weight": torch.bfloat16,
+        "out_proj.weight": torch.bfloat16,
+        "shared_expert_gate.weight": torch.bfloat16,
+        "_fp32_params.A_log": torch.float32,
+        "_fp32_params.dt_bias": torch.float32,
+    }
+
+
 def test_hybrid_stack_of_layers_master_weights(monkeypatch):
     """A ModuleList of hybrid layers: every A_log fp32, every projection bf16."""
     stack = nn.ModuleList([HybridLayer(dtype=torch.float32) for _ in range(3)])
@@ -223,3 +255,15 @@ def test_no_mixed_precision_policy_falls_back_to_storage(monkeypatch):
     assert resolved["in_proj.weight"] == torch.float32
     assert resolved["out_proj.weight"] == torch.float32
     assert resolved["_fp32_params.A_log"] == torch.float32
+
+
+def test_intrinsic_fp32_holder_models_declare_strict_pin():
+    """Models with the _fp32_params holder must list it in
+    _keep_in_fp32_modules_strict; the MoE parallelizer keys the fp32 compute
+    pin on that list, so a missing entry silently drops A_log/dt_bias to bf16."""
+    from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
+    from nemo_automodel.components.models.qwen3_8_flash_next.model import Qwen3_8_FlashNextForConditionalGeneration
+    from nemo_automodel.components.models.qwen3_next.model import Qwen3NextForCausalLM
+
+    for cls in (Qwen3_5MoeForConditionalGeneration, Qwen3NextForCausalLM, Qwen3_8_FlashNextForConditionalGeneration):
+        assert "_fp32_params" in getattr(cls, "_keep_in_fp32_modules_strict", [])

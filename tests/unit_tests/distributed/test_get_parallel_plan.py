@@ -30,6 +30,8 @@ from types import SimpleNamespace
 from typing import Dict
 
 import pytest
+from torch.distributed.tensor.parallel import ColwiseParallel
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 # Function under test and collaborators
 import nemo_automodel.components.distributed.parallelizer as parallelizer
@@ -77,6 +79,19 @@ def test_custom_dict_plan(monkeypatch):
     _set_global_model_cls(monkeypatch, _DummyModel)  # irrelevant but required
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_shard_plan=plan)
     assert result is plan  # identity check
+
+
+def test_custom_moe_explicit_plan_is_validated_even_when_ep_is_one(monkeypatch):
+    _set_global_model_cls(monkeypatch, _DummyModel)
+    monkeypatch.setattr(parallelizer, "_uses_custom_moe_modules", lambda model: True)
+
+    with pytest.raises(ValueError, match="EP-owned"):
+        _get_parallel_plan(
+            _DummyModel(),
+            sequence_parallel=False,
+            tp_shard_plan={"model.layers.*.mlp.experts": object()},
+            tp_size=2,
+        )
 
 
 # 2. Custom plan via *import path*
@@ -236,6 +251,37 @@ class _RemoteCodeDummyModel:
 
 # Mimic HF's dynamic-module convention so the fail-fast guard triggers.
 _RemoteCodeDummyModel.__module__ = "transformers_modules.fake_repo.modeling_fake"
+
+
+def test_nemotron_flash_remote_code_uses_registered_tp_plan():
+    """Nemotron Flash must retain its validated TP2 path after custom-code fail-fast checks."""
+    model_cls = type("NemotronFlashForCausalLM", (), {})
+    model_cls.__module__ = "transformers_modules.nemotron_flash.modeling_nemotron_flash"
+    model = model_cls()
+    model.config = type(
+        "Config",
+        (),
+        {"model_type": "nemotron_flash", "architectures": ["NemotronFlashForCausalLM"]},
+    )()
+
+    result = _get_parallel_plan(model, sequence_parallel=False, tp_size=2)
+
+    assert "model.layers.*.self_attn.qkv_proj" in result
+    assert "model.layers.*.mlp.gate_up_proj" in result
+    assert any(isinstance(layout, Shard) for layout in result["lm_head"].output_layouts)
+    assert result["lm_head"].use_local_output is False
+
+
+def test_nemotron_flash_drops_replicated_output_lm_head_plan():
+    """Nemotron Flash must not mix replicated logits with a sharded lm_head norm."""
+    model_cls = type("NemotronFlashForCausalLM", (), {})
+    model = model_cls()
+    model.config = SimpleNamespace(model_type="nemotron_flash")
+    custom_plan = {"lm_head": ColwiseParallel(output_layouts=Replicate())}
+
+    result = _get_parallel_plan(model, tp_shard_plan=custom_plan, tp_size=2)
+
+    assert "lm_head" not in result
 
 
 def test_default_plan_fallthrough_raises_for_remote_code_at_tp_size_gt_1(monkeypatch):
@@ -479,3 +525,14 @@ def test_named_plan_decilm_with_sequence_parallel():
     )
     assert "model.norm" in result
     assert "model.layers.*.self_attn.q_proj" in result
+
+
+def test_decilm_remote_code_class_auto_selects_nemotron_plan():
+    class DeciLMForCausalLM:
+        config = SimpleNamespace(model_type="nemotron-nas")
+
+    result = _get_parallel_plan(DeciLMForCausalLM(), sequence_parallel=False, tp_size=2)
+    assert "model.layers.*.self_attn.q_proj" in result
+    assert "model.layers.*.self_attn.k_proj" in result
+    assert "model.layers.*.self_attn.v_proj" in result
+    assert "model.layers.*.self_attn.qkv_proj" not in result

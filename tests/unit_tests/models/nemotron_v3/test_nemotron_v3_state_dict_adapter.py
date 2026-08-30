@@ -74,7 +74,7 @@ class TestNemotronV3StateDictAdapter:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
         )
 
     def test_adapter_init(self, config, moe_config, backend):
@@ -90,19 +90,41 @@ class TestNemotronV3StateDictAdapter:
         assert adapter.moe_config == moe_config
         assert adapter.backend == backend
         assert adapter.dtype == torch.bfloat16
-        assert adapter._uses_model_prefix is True
+        assert adapter._uses_model_prefix is False
 
     def test_hf_prefix_property(self, config, moe_config, backend):
-        """Test _hf_prefix property returns 'backbone.'"""
+        """The output prefix tracks the namespace detected from the source checkpoint."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
 
         assert adapter._hf_prefix == "backbone."
+        adapter._uses_model_prefix = True
+        assert adapter._hf_prefix == "model."
+
+    def test_peft_target_module_mapping_tracks_hf_prefix(self, config, moe_config, backend):
+        """PEFT target-module metadata uses the same public namespace as exported tensors."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        native_name = "model.layers.0.mixer.in_proj"
+
+        assert adapter.map_peft_target_module_to_hf(native_name) == "backbone.layers.0.mixer.in_proj"
+        adapter._uses_model_prefix = True
+        assert adapter.map_peft_target_module_to_hf(native_name) == native_name
 
     def test_expert_path_segment_property(self, config, moe_config, backend):
         """Test _expert_path_segment property returns 'mixer.experts'."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
 
         assert adapter._expert_path_segment == "mixer.experts"
+
+    def test_write_through_load_capability_requires_aliasing_expert_backend(self, config, moe_config, backend):
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        assert adapter.supports_write_through_checkpoint_load is True
+
+        adapter.backend.experts = "te"
+        assert adapter.supports_write_through_checkpoint_load is False
+
+        adapter.backend.experts = "gmm"
+        adapter.backend.dispatcher = "mok"
+        assert adapter.supports_write_through_checkpoint_load is False
 
     def test_from_hf_map_structure(self, config, moe_config, backend):
         """Test from_hf_map structure."""
@@ -111,6 +133,116 @@ class TestNemotronV3StateDictAdapter:
         # Check that mapping uses 'mixer.experts' path
         assert "model.layers.{}.mixer.experts.{}.up_proj.weight" in adapter.from_hf_map
         assert "model.layers.{}.mixer.experts.{}.down_proj.weight" in adapter.from_hf_map
+
+
+class TestNemotronV3AdapterDense:
+    """Dense Nemotron-H adapter (moe_config=None) — issue #2004.
+
+    Dense checkpoints carry no '.mixer.experts.' keys, so from_hf/to_hf reduce to
+    pure renames (backbone<->model, norm_f<->norm, embeddings<->embed_tokens) and
+    must not dereference moe_config.
+    """
+
+    @pytest.fixture
+    def backend(self):
+        return BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", enable_deepep=False)
+
+    @pytest.fixture
+    def adapter(self, backend):
+        return NemotronV3StateDictAdapter(config=MockNemotronV3Config(), moe_config=None, backend=backend)
+
+    def test_init_accepts_none_moe_config(self, adapter):
+        assert adapter.moe_config is None
+        assert adapter.supports_write_through_checkpoint_load is True
+
+    def test_from_hf_renames_without_experts(self, adapter):
+        hf_sd = {
+            "backbone.embeddings.weight": torch.randn(100, 256),
+            "backbone.layers.0.mixer.A_log": torch.randn(4),
+            "backbone.layers.1.mixer.up_proj.weight": torch.randn(512, 256),
+            "backbone.norm_f.weight": torch.randn(256),
+            "lm_head.weight": torch.randn(100, 256),
+        }
+        native = adapter.from_hf(dict(hf_sd))
+
+        assert "model.embed_tokens.weight" in native
+        assert "model.norm.weight" in native
+        assert "model.layers.0.mixer._fp32_params.A_log" in native
+        assert "model.layers.1.mixer.up_proj.weight" in native
+        assert "lm_head.weight" in native
+        assert not any(k.startswith("backbone.") for k in native)
+        assert not any(k.endswith("norm_f.weight") for k in native)
+        assert adapter._uses_model_prefix is False
+
+    def test_round_trip_dense(self, adapter):
+        hf_sd = {
+            "backbone.embeddings.weight": torch.randn(100, 256),
+            "backbone.layers.0.mixer.up_proj.weight": torch.randn(512, 256),
+            "backbone.norm_f.weight": torch.randn(256),
+        }
+        native = adapter.from_hf(dict(hf_sd))
+        back = adapter.to_hf(dict(native))
+
+        assert set(back.keys()) == set(hf_sd.keys())
+
+    def test_peft_outer_prefix_round_trip(self, adapter):
+        hf_key = "base_model.model.backbone.layers.0.mixer.in_proj.lora_A.weight"
+        native_key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
+        tensor = torch.randn(8, 256)
+
+        exported = adapter.to_hf({native_key: tensor})
+        restored = adapter.from_hf(dict(exported))
+
+        assert list(exported) == [hf_key]
+        assert list(restored) == [native_key]
+        torch.testing.assert_close(restored[native_key], tensor)
+
+
+class TestNemotronV3AdapterMTP:
+    """MTP checkpoint namespace regressions."""
+
+    def test_view_loaded_mtp_experts_keep_native_namespace(self):
+        config = MockNemotronV3Config()
+        moe_config = MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=1,
+            n_activated_experts=1,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            dim=256,
+            inter_dim=512,
+            moe_inter_dim=128,
+            norm_topk_prob=False,
+            expert_bias=False,
+            expert_activation="relu2",
+            dtype=torch.bfloat16,
+        )
+        adapter = NemotronV3StateDictAdapter(config, moe_config, BackendConfig(), dtype=torch.bfloat16)
+
+        # DCP writes these split tensors through views into the native grouped
+        # parameters. The merge therefore returns no tensor for them and uses
+        # view_loaded_native_keys to tell the loader they were loaded.
+        adapter._inplace_loaded_native_keys = {
+            "layers.1.mixer.experts.gate_and_up_projs",
+            "layers.1.mixer.experts.down_projs",
+        }
+        hf_state = {}
+        for expert_id in range(2):
+            hf_state[f"mtp.layers.1.mixer.experts.{expert_id}.up_proj.weight"] = torch.randn(128, 256)
+            hf_state[f"mtp.layers.1.mixer.experts.{expert_id}.down_proj.weight"] = torch.randn(256, 128)
+
+        native = adapter.from_hf(hf_state)
+
+        assert not native
+        assert adapter.view_loaded_native_keys == {
+            "mtp.layers.1.mixer.experts.gate_and_up_projs",
+            "mtp.layers.1.mixer.experts.down_projs",
+        }
 
 
 class TestNemotronV3AdapterToHf:
@@ -178,6 +310,50 @@ class TestNemotronV3AdapterToHf:
         assert "backbone.embeddings.weight" in hf_state_dict
         assert "exclude_me.weight" not in hf_state_dict
 
+    def test_to_hf_hides_mamba_fp32_holder(self, config, moe_config, backend):
+        """Test to_hf maps internal Mamba fp32 holder keys back to public HF keys."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        state_dict = {
+            "model.layers.0.mixer._fp32_params.A_log": torch.randn(4, dtype=torch.bfloat16),
+            "model.layers.0.mixer._fp32_params.dt_bias": torch.randn(4, dtype=torch.bfloat16),
+            "model.layers.0.mixer._fp32_params.D": torch.randn(4, dtype=torch.bfloat16),
+        }
+
+        hf_state_dict = adapter.to_hf(state_dict)
+
+        assert "backbone.layers.0.mixer.A_log" in hf_state_dict
+        assert "backbone.layers.0.mixer.dt_bias" in hf_state_dict
+        assert "backbone.layers.0.mixer.D" in hf_state_dict
+        assert "backbone.layers.0.mixer._fp32_params.A_log" not in hf_state_dict
+        assert "backbone.layers.0.mixer._fp32_params.dt_bias" not in hf_state_dict
+        assert "backbone.layers.0.mixer._fp32_params.D" not in hf_state_dict
+        assert hf_state_dict["backbone.layers.0.mixer.A_log"].dtype == torch.float32
+        assert hf_state_dict["backbone.layers.0.mixer.dt_bias"].dtype == torch.float32
+        assert hf_state_dict["backbone.layers.0.mixer.D"].dtype == torch.float32
+
+    def test_forced_hf_dtype_mapping_marks_fp32_protected_keys(self, config, moe_config, backend):
+        """Test Nemotron fp32-protected HF export keys keep fp32 consolidated metadata."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        state_dict = {
+            "backbone.layers.0.mixer.A_log": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.dt_bias": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.D": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.router.e_score_correction_bias": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.in_proj.weight": torch.randn(4, 4, dtype=torch.float32),
+            "lm_head.weight": torch.randn(4, 4, dtype=torch.bfloat16),
+        }
+
+        forced = adapter.forced_hf_dtype_mapping(state_dict)
+
+        assert forced == {
+            "backbone.layers.0.mixer.A_log": "F32",
+            "backbone.layers.0.mixer.dt_bias": "F32",
+            "backbone.layers.0.mixer.D": "F32",
+            "backbone.layers.0.mixer.router.e_score_correction_bias": "F32",
+        }
+
 
 class TestNemotronV3AdapterFromHf:
     """Test from_hf conversion."""
@@ -228,7 +404,7 @@ class TestNemotronV3AdapterFromHf:
                 "lm_head.weight": torch.randn(100, 256),
             }
 
-            result = adapter.from_hf(hf_state_dict)
+            adapter.from_hf(hf_state_dict)
 
             # Check that _from_hf_w_merged_experts was called with renamed state dict
             call_args = mock_merge.call_args[0][0]
@@ -265,6 +441,31 @@ class TestNemotronV3AdapterFromHf:
             adapter.from_hf(hf_state_dict)
 
             assert adapter._uses_model_prefix is True
+
+    def test_from_hf_routes_mamba_fp32_params_to_holder(self, config, moe_config, backend):
+        """Test from_hf maps public Mamba fp32 keys into the internal holder."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        hf_state_dict = {
+            "backbone.layers.0.mixer.A_log": torch.randn(4, dtype=torch.bfloat16),
+            "backbone.layers.0.mixer.dt_bias": torch.randn(4, dtype=torch.bfloat16),
+            "backbone.layers.0.mixer.D": torch.randn(4, dtype=torch.bfloat16),
+        }
+
+        with patch.object(adapter, "_from_hf_w_merged_experts") as mock_merge:
+            mock_merge.return_value = {}
+            adapter.from_hf(hf_state_dict)
+
+            call_args = mock_merge.call_args[0][0]
+            assert "model.layers.0.mixer._fp32_params.A_log" in call_args
+            assert "model.layers.0.mixer._fp32_params.dt_bias" in call_args
+            assert "model.layers.0.mixer._fp32_params.D" in call_args
+            assert "model.layers.0.mixer.A_log" not in call_args
+            assert "model.layers.0.mixer.dt_bias" not in call_args
+            assert "model.layers.0.mixer.D" not in call_args
+            assert call_args["model.layers.0.mixer._fp32_params.A_log"].dtype == torch.float32
+            assert call_args["model.layers.0.mixer._fp32_params.dt_bias"].dtype == torch.float32
+            assert call_args["model.layers.0.mixer._fp32_params.D"].dtype == torch.float32
 
 
 class TestNemotronV3AdapterConvertSingleTensor:
@@ -337,6 +538,19 @@ class TestNemotronV3AdapterConvertSingleTensor:
         assert len(result) == 1
         assert result[0][0] == "backbone.layers.0.mixer.weight"
         assert torch.equal(result[0][1], tensor)
+
+    def test_convert_mamba_fp32_holder_weight(self, config, moe_config, backend):
+        """Test single-tensor conversion hides Mamba fp32 holder keys."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(4, dtype=torch.bfloat16)
+        fqn = "model.layers.0.mixer._fp32_params.D"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 1
+        assert result[0][0] == "backbone.layers.0.mixer.D"
+        assert result[0][1].dtype == torch.float32
 
     def test_convert_expert_tensor(self, config, moe_config, backend):
         """Test converting merged expert tensor to split experts."""
@@ -472,6 +686,30 @@ class TestNemotronV3AdapterMixerExperts:
 
         assert adapter._expert_path_segment == "mixer.experts"
 
+    def test_default_lora_export_uses_v5_for_non_gated_experts(self, config, moe_config, backend):
+        """Nemotron V3 emits ParamWrapper weights for its fused up projection."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        tensor = torch.randn(moe_config.n_routed_experts, moe_config.dim, 8)
+
+        result = adapter.convert_single_tensor_to_hf("model.layers.0.mixer.experts.lora_gate_and_up_A", tensor)
+
+        keys = {key for key, _ in result}
+        assert keys == {"backbone.layers.0.mixer.experts.base_layer.lora_B.weight"}
+        assert adapter._v5_peft_target_parameters == ("mixer.experts.up_proj", "mixer.experts.down_proj")
+
+    def test_v4_lora_export_stays_per_expert_for_non_gated_experts(self, config, moe_config, backend):
+        """Explicit v4 compatibility retains the per-expert up projection."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        tensor = torch.randn(moe_config.n_routed_experts, moe_config.dim, 8)
+
+        result = adapter.convert_single_tensor_to_hf(
+            "model.layers.0.mixer.experts.lora_gate_and_up_A", tensor, v4_compatible=True
+        )
+
+        keys = {key for key, _ in result}
+        assert "backbone.layers.0.mixer.experts.0.up_proj.lora_A.weight" in keys
+        assert not any("base_layer" in key for key in keys)
+
     def test_from_hf_uses_mixer_experts_path(self, config, moe_config, backend):
         """Test that from_hf correctly parses mixer.experts paths."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
@@ -486,7 +724,10 @@ class TestNemotronV3AdapterMixerExperts:
 
         with patch.object(adapter, "_validate_expert_availability"):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
-                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
+                with patch(
+                    "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
+                    side_effect=lambda x, *args: x,
+                ):
                     result = adapter._from_hf_w_merged_experts(hf_state_dict)
 
         # Should have created merged expert tensors with mixer.experts path

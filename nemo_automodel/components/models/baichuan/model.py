@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -49,7 +49,12 @@ from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
+from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 logger = logging.get_logger(__name__)
 
@@ -171,12 +176,12 @@ class Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Tuple[torch.Tensor] | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor | None, Tuple[torch.Tensor] | None]:
         bsz, q_len, _ = hidden_states.size()
 
         proj = self.W_pack(hidden_states)
@@ -220,11 +225,11 @@ class DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Tuple[torch.Tensor] | None = None,
+        output_attentions: bool | None = False,
+        use_cache: bool | None = False,
     ) -> Tuple[torch.FloatTensor, ...]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -339,14 +344,14 @@ class BaichuanModel(BaichuanPreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: List[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
         **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -474,7 +479,9 @@ class BaichuanModel(BaichuanPreTrainedModel):
 # Causal LM head
 # ---------------------------------------------------------------------------
 class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    # lm_head is a weight-normalizing NormHead, so tying it to embed_tokens is
+    # semantically wrong; all shipped Baichuan checkpoints are untied.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -486,6 +493,8 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         supports_ep: bool = False
 
     def __init__(self, config: BaichuanConfig, **model_kwargs):
+        warn_deprecated_model_class("BaichuanForCausalLM")
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = BaichuanModel(config)
         self.lm_head = NormHead(config.hidden_size, config.vocab_size, bias=False)
@@ -512,15 +521,15 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: List[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:

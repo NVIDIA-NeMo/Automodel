@@ -36,6 +36,11 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     build_causal_padding_mask,
 )
 
+# Run only on the GPU job. Each test mp.spawns two gloo worker processes that
+# re-import the full package (~6s/test, ~18s total on the CPU unit-test job).
+# These are context-parallel tests (a multi-GPU feature), so skip them on CPU.
+pytestmark = pytest.mark.run_only_on("GPU")
+
 
 def _free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
