@@ -70,6 +70,14 @@ _DIFFUSERS_INDEX_FN = "diffusion_pytorch_model.safetensors.index.json"
 logger = logging.getLogger(__name__)
 
 
+def _is_integrated_cuda_device(device: torch.device) -> bool:
+    """Whether *device* is an integrated CUDA GPU sharing host memory."""
+    if device.type != "cuda":
+        return False
+    properties = torch.cuda.get_device_properties(device)
+    return bool(getattr(properties, "is_integrated", False))
+
+
 def _maybe_rename_index_for_diffusers(consolidated_dir: str) -> None:
     """Rename the consolidated index file to the diffusers-expected name.
 
@@ -321,17 +329,27 @@ class _HuggingFaceStorageReader(FsspecReader):
                             tensor = torch.frombuffer(
                                 view, dtype=item_md.dtype, count=numel, offset=item_md.offset
                             ).reshape(item_md.shape)
+                            file_backed = True
                         else:
                             tensor = torch.frombuffer(
                                 bytearray(view[item_md.offset : item_md.offset + item_md.length]),
                                 dtype=item_md.dtype,
                             ).reshape(item_md.shape)
+                            file_backed = False
                         tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
                         target_tensor = planner.resolve_tensor(req).detach()
 
                         assert target_tensor.size() == tensor.size(), (
                             f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
                         )
+
+                        # On integrated GPUs, copying a file-backed mmap directly to CUDA can
+                        # migrate it page-by-page and take minutes per tensor. Stage only this
+                        # requested slice in anonymous host memory; unlike the full-state loader,
+                        # peak host memory is bounded by one tensor. Discrete GPUs keep the
+                        # zero-copy mmap source used to avoid host OOM on very large checkpoints.
+                        if file_backed and _is_integrated_cuda_device(target_tensor.device):
+                            tensor = tensor.clone()
 
                         # copy_ from a pageable host buffer is synchronous, so the mmap can be
                         # released right after this loop without racing an in-flight H2D copy.
