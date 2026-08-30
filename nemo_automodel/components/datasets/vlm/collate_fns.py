@@ -120,10 +120,12 @@ def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_t
         template[search_start_index + anchor_offset : search_stop_index + anchor_offset] == anchor,
         as_tuple=True,
     )[0]
+    compare_start = anchor_offset if allow_first_token_mismatch else 0
+    pattern_values = pattern[compare_start:].tolist()
     for candidate_offset in candidate_positions.tolist():
         start = search_start_index + candidate_offset
-        compare_start = anchor_offset if allow_first_token_mismatch else 0
-        if torch.equal(template[start + compare_start : start + pattern_len], pattern[compare_start:]):
+        candidate_values = template[start + compare_start : start + pattern_len].tolist()
+        if candidate_values == pattern_values:
             return start, start + pattern_len
     return -1, -1
 
@@ -390,22 +392,18 @@ def _build_labels_from_markers(
         i = 0
 
         while i <= seq_len - marker_len:
-            if torch.equal(encoded[i : i + marker_len], marker_tensor):
-                content_start = i + marker_len  # first token of assistant content
+            marker_start, content_start = _find_pattern_indices(encoded, marker_tensor, i)
+            if marker_start < 0:
+                break
 
-                # Scan forward to find the closing stop token.
-                content_end = content_start
-                while content_end < seq_len and encoded[content_end].item() != stop_id:
-                    content_end += 1
+            # Locate every possible closing token with one tensor comparison,
+            # then use the first host index.  The previous token-by-token loop
+            # called ``item()`` for every assistant token in the packed stream.
+            stop_offsets = torch.nonzero(encoded[content_start:] == stop_id, as_tuple=True)[0].tolist()
+            content_end = content_start + stop_offsets[0] + 1 if stop_offsets else seq_len
 
-                # Include the stop token in labels so the model learns to emit it.
-                if content_end < seq_len:
-                    content_end += 1
-
-                labels[content_start:content_end] = encoded[content_start:content_end]
-                i = content_end
-            else:
-                i += 1
+            labels[content_start:content_end] = encoded[content_start:content_end]
+            i = content_end
 
         labels_list.append(labels)
 
