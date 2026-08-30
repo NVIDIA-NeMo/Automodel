@@ -209,16 +209,25 @@ WORKDIR /opt/Automodel
 
 # torchao MXFP8 + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
 # before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
-COPY --from=wheel_builder /wheels /tmp/wheels/
+# The wheelhouse is bind-mounted for the duration of this RUN rather than COPYed in. A
+# COPY commits /tmp/wheels to its own layer, and the `rm -rf /tmp/wheels` that used to be
+# at the end of this RUN could only write a whiteout on top of it -- a layer that is
+# already committed cannot be removed by a later one. Both layers shipped, so the prebuilt
+# wheels were in the image twice: once installed into site-packages, and once as the
+# deleted-but-still-present copy under /tmp/wheels.
+#
+# A bind mount is never committed, so there is nothing left to remove -- and `rm` could not
+# remove it anyway, since the mount is read-only and still busy while the RUN is executing.
+# That is why the `rm -rf /tmp/wheels` that used to end this RUN is gone.
 ARG INSTALL_FA4=false
-RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
+RUN --mount=type=bind,from=wheel_builder,source=/wheels,target=/tmp/wheels \
+    pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     if [ "$INSTALL_FA4" = "true" ]; then \
         pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" && \
         FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
         VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
         { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; }; \
-    fi && \
-    rm -rf /tmp/wheels
+    fi
 
 # Address base image CVE
 RUN pip install "aiohttp>=3.14.3" \
