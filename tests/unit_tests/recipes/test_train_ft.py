@@ -2051,6 +2051,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         dp_group_size=4,
         cp_group_size=1,
         pp_microbatches=1,
+        world_size=1,
     ):
         from nemo_automodel.components.config.loader import ConfigNode
 
@@ -2076,7 +2077,11 @@ class TestRunTrainOptimStepSetsMoEScale:
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
         recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
-        object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
+        object.__setattr__(
+            recipe,
+            "dist_env",
+            SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True, world_size=world_size),
+        )
         object.__setattr__(recipe, "device_mesh", None)
         object.__setattr__(recipe, "moe_mesh", None)
         object.__setattr__(recipe, "pp_enabled", pp_enabled)
@@ -2189,6 +2194,31 @@ class TestRunTrainOptimStepSetsMoEScale:
         recipe._run_train_optim_step(batches)
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.5)
+
+    def test_tps_per_gpu_divides_global_tps_by_world_size(self, monkeypatch):
+        """Under pp>1 the per-GPU divisor must be the full world size, not dp*cp.
+
+        With dp=4, cp=2, pp=2 (world size 16) dividing by dp*cp alone would
+        report a per-GPU tps inflated by the pp factor.
+        """
+        recipe = self._make_recipe(
+            monkeypatch,
+            pp_enabled=True,
+            dp_group_size=4,
+            cp_group_size=2,
+            pp_microbatches=2,
+            world_size=16,
+        )
+
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])},
+        ]
+
+        metrics = recipe._run_train_optim_step(batches)
+
+        tps = metrics.metrics["tps"]
+        assert tps > 0
+        assert metrics.metrics["tps_per_gpu"] == pytest.approx(tps / 16)
 
 
 # -----------------------------------------------------------------------------
