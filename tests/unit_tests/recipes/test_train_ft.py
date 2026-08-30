@@ -30,6 +30,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 from torch.utils.data import IterableDataset
 
+from nemo_automodel._transformers.mfu import MFUConfig
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
@@ -47,6 +48,16 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_model,
     compute_trust_remote_code_from_model,
 )
+
+
+def test_recipe_config_resolves_mfu_settings():
+    config = RecipeConfig(ConfigNode({"mfu": {"device": "h100", "peak_tflops": 1979.0}}))
+
+    assert config.mfu == MFUConfig(device="h100", peak_tflops=1979.0)
+
+
+def test_recipe_config_defaults_mfu_settings():
+    assert RecipeConfig(ConfigNode({})).mfu == MFUConfig()
 
 
 def _build_loader(
@@ -1827,15 +1838,20 @@ def test_pp_autoconfig_failure_skips_masks(caplog):
     add_masks.assert_not_called()
 
 
-def test_pp_deepseek_v4_skips_masks(caplog):
-    """DeepSeek V4 computes masks internally, so PP mask precomputation is skipped."""
+@pytest.mark.parametrize(
+    "model_type",
+    ["deepseek_v4", "glm_moe_dsa"],
+)
+def test_pp_custom_sparse_model_skips_masks(caplog, model_type):
+    """Custom sparse models compute masks internally, so PP precomputation is skipped."""
     calls = []
     cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "deepseek-ai/DeepSeek-V4-Pro"})
+    model_name = "zai-org/GLM-5.2" if model_type == "glm_moe_dsa" else "deepseek-ai/DeepSeek-V4-Pro"
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": model_name})
     with (
         patch(
             "nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained",
-            return_value=MagicMock(model_type="deepseek_v4"),
+            return_value=MagicMock(model_type=model_type),
         ),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.INFO),
@@ -1845,7 +1861,7 @@ def test_pp_deepseek_v4_skips_masks(caplog):
     collate_fn(["dummy"])
     assert calls == ["base"]
     add_masks.assert_not_called()
-    assert "Skipping pipeline parallel causal mask precomputation for model_type=deepseek_v4" in caplog.text
+    assert f"Skipping pipeline parallel causal mask precomputation for model_type={model_type}" in caplog.text
 
 
 def test_pp_autoconfig_success_chains_masks():
@@ -2035,6 +2051,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         dp_group_size=4,
         cp_group_size=1,
         pp_microbatches=1,
+        world_size=1,
     ):
         from nemo_automodel.components.config.loader import ConfigNode
 
@@ -2060,7 +2077,11 @@ class TestRunTrainOptimStepSetsMoEScale:
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
         recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
-        object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
+        object.__setattr__(
+            recipe,
+            "dist_env",
+            SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True, world_size=world_size),
+        )
         object.__setattr__(recipe, "device_mesh", None)
         object.__setattr__(recipe, "moe_mesh", None)
         object.__setattr__(recipe, "pp_enabled", pp_enabled)
@@ -2173,6 +2194,31 @@ class TestRunTrainOptimStepSetsMoEScale:
         recipe._run_train_optim_step(batches)
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.5)
+
+    def test_tps_per_gpu_divides_global_tps_by_world_size(self, monkeypatch):
+        """Under pp>1 the per-GPU divisor must be the full world size, not dp*cp.
+
+        With dp=4, cp=2, pp=2 (world size 16) dividing by dp*cp alone would
+        report a per-GPU tps inflated by the pp factor.
+        """
+        recipe = self._make_recipe(
+            monkeypatch,
+            pp_enabled=True,
+            dp_group_size=4,
+            cp_group_size=2,
+            pp_microbatches=2,
+            world_size=16,
+        )
+
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])},
+        ]
+
+        metrics = recipe._run_train_optim_step(batches)
+
+        tps = metrics.metrics["tps"]
+        assert tps > 0
+        assert metrics.metrics["tps_per_gpu"] == pytest.approx(tps / 16)
 
 
 # -----------------------------------------------------------------------------
@@ -2500,6 +2546,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
             super().__init__()
             self.lin = nn.Linear(4, 8)
             self.prepared = False
+            self.supports = SimpleNamespace(mtp_enabled=False)
 
         def prepare_model_inputs_for_cp(self, batch, **kwargs):
             self.prepared = True
@@ -2583,3 +2630,145 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     # backward through the local loss populated grads
     assert model.lin.weight.grad is not None
     assert torch.isfinite(model.lin.weight.grad).all()
+
+
+def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch):
+    """The recipe consumes raw packed lengths, shifts globally, then reuses the CP layout."""
+    from nemo_automodel.components.models.common.mtp import (
+        MTPConfig,
+        prepare_mtp_context_parallel_inputs,
+    )
+
+    captured = {}
+    local_indices = torch.tensor([0, 1, 4, 5])
+
+    class _MTPModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.0))
+            self.mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+            self.prepared_before_shard = False
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def prepare_mtp_inputs_for_cp(self, batch, *, ignore_index=-100):
+            self.prepared_before_shard = True
+            return prepare_mtp_context_parallel_inputs(
+                batch,
+                num_depths=self.mtp_config.num_layers,
+                ignore_index=ignore_index,
+            )
+
+        def forward(
+            self,
+            input_ids,
+            *,
+            mtp_per_depth_input_ids,
+            mtp_per_depth_position_ids,
+            **kwargs,
+        ):
+            captured["model_input_ids"] = input_ids.detach().clone()
+            captured["mtp_input_ids"] = tuple(t.detach().clone() for t in mtp_per_depth_input_ids)
+            captured["mtp_position_ids"] = tuple(t.detach().clone() for t in mtp_per_depth_position_ids)
+            hidden = self.scale * input_ids.float().unsqueeze(-1)
+            return SimpleNamespace(
+                logits=hidden,
+                mtp_per_depth_h=[hidden],
+                mtp_per_depth_logits=None,
+                mtp_loss_scaling_factor=1.0,
+            )
+
+    model = _MTPModel()
+
+    class _FakeContextParallelSharder:
+        def __init__(self, resolved_model, device_mesh, batch, **kwargs):
+            del device_mesh, kwargs
+            assert resolved_model is model
+            assert model.prepared_before_shard
+            assert batch["input_ids"].shape == (1, 6)
+            assert batch["seq_lens_padded"].tolist() == [[3, 3, -1000]]
+
+        def shard(self, batch):
+            assert model.prepared_before_shard
+            local_batch = dict(batch)
+            for key in ("input_ids", "labels", "position_ids"):
+                local_batch[key] = local_batch[key].index_select(1, local_indices)
+            local_batch.pop("seq_lens")
+            local_batch.pop("seq_lens_padded")
+            return nullcontext, local_batch
+
+        def shard_token_tensor(self, tensor, seq_dim=1, fill=None):
+            del fill
+            return tensor.index_select(seq_dim, local_indices)
+
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    object.__setattr__(
+        recipe,
+        "cfg",
+        SimpleNamespace(mtp=SimpleNamespace(ignore_index=-100, scaling_factor=1.0)),
+    )
+    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu")))
+    object.__setattr__(recipe, "device_mesh", object())
+    object.__setattr__(recipe, "pp_enabled", False)
+    object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "model_parts", [model])
+    object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
+    object.__setattr__(recipe, "loss_fn", object())
+    object.__setattr__(recipe, "_get_cp_group_size", lambda: 2)
+    object.__setattr__(recipe, "_get_dp_group_size", lambda include_cp=False: 1)
+
+    def _fake_calculate_loss(loss_fn, *, logits, **kwargs):
+        del loss_fn, kwargs
+        return logits.sum() * 0.0
+
+    def _fake_calculate_mtp_loss(loss_fn, *, mtp_per_depth_h, mtp_per_depth_targets, cu_seqlens, **kwargs):
+        del loss_fn, kwargs
+        captured["mtp_targets"] = tuple(t.detach().clone() for t in mtp_per_depth_targets)
+        captured["cu_seqlens"] = cu_seqlens
+        return sum(hidden.sum() for hidden in mtp_per_depth_h) * 0.01
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ContextParallelSharder", _FakeContextParallelSharder)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calculate_loss)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_mtp_loss", _fake_calculate_mtp_loss)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_sync_ctx", lambda *args, **kwargs: nullcontext())
+
+    batch = {
+        "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
+        "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
+        "position_ids": torch.tensor([[0, 1, 2, 0, 1, 2]]),
+        "seq_lens": torch.tensor([[3, 3, -1000]]),
+        "seq_lens_padded": torch.tensor([[3, 3, -1000]]),
+    }
+    loss_buffer = []
+
+    model.supports.supports_mtp_cp = False
+    with pytest.raises(NotImplementedError, match="supports_mtp_cp=False"):
+        recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=4,
+            num_batches=1,
+            is_train=True,
+        )
+    assert not model.prepared_before_shard
+    assert loss_buffer == []
+    model.supports.supports_mtp_cp = True
+
+    recipe._forward_backward_step(
+        idx=0,
+        batch=batch,
+        loss_buffer=loss_buffer,
+        num_label_tokens=4,
+        num_batches=1,
+        is_train=True,
+    )
+
+    assert captured["model_input_ids"].tolist() == [[10, 11, 21, 22]]
+    assert captured["mtp_input_ids"][0].tolist() == [[11, 12, 22, 0]]
+    assert captured["mtp_position_ids"][0].tolist() == [[1, 2, 2, 0]]
+    assert captured["mtp_targets"][0].tolist() == [[12, -100, -100, -100]]
+    assert captured["cu_seqlens"] is None
+    assert model.scale.grad is not None
+    assert len(loss_buffer) == 1

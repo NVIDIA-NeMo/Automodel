@@ -78,6 +78,8 @@ navigation:
             path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
           - page: "Qwen3.8-2.4T-A95B"
             path: ../../model-coverage/llm/qwen/qwen3-8-2-4t-a95b.mdx
+          - page: "Qwen3.8-Flash-Next"
+            path: ../../model-coverage/llm/qwen/qwen3-8-flash-next.mdx
           - page: "Qwen3-Next"
             path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - page: "ERNIE 4.5"
@@ -122,7 +124,7 @@ navigation:
           - page: "GLM-4 MoE (GLM-4.5 / GLM-4.7)"
             path: ../../model-coverage/llm/thudm/glm4-moe.mdx
             slug: glm-4-moe-glm-4-5-glm-4-7
-          - page: "GLM-5 / GLM-5.2 MoE (DSA)"
+          - page: "GLM-5 / GLM-5.3 (MoE + DSA)"
             path: ../../model-coverage/llm/thudm/glm5-moe-dsa.mdx
             slug: glm-5-moe-dsa
           - page: "Granite"
@@ -238,6 +240,9 @@ navigation:
           - page: "Qwen3.6"
             path: ../../model-coverage/vlm/qwen/qwen3-6-vl.mdx
             slug: qwen3-6-vl
+          - page: "Qwen3.8"
+            path: ../../model-coverage/vlm/qwen/qwen3-8-vl.mdx
+            slug: qwen3-8-vl
           - page: "Nemotron-Parse"
             path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - page: "Ministral3 VL"
@@ -263,6 +268,9 @@ navigation:
           - page: "MiniMax-M3"
             path: ../../model-coverage/vlm/minimax/minimax-m3.mdx
             slug: minimax-m3
+          - page: "GLM-5.3-Flash"
+            path: ../../model-coverage/vlm/thudm/glm-5-3-flash.mdx
+            slug: glm-5-3-flash
       - section: "Multimodal"
         slug: multimodal
         contents:
@@ -407,6 +415,9 @@ navigation:
       - page: "Qwen3.5-VL"
         path: ../../guides/vlm/qwen3-5.mdx
         slug: qwen3-5-vl
+      - page: "Fine-Tune Qwen3.8-27B"
+        path: ../../guides/vlm/qwen3-8.mdx
+        slug: qwen3-8-27b
       - page: "Nemotron-Omni"
         path: ../../guides/vlm/nemotron-omni.mdx
         slug: nemotron-omni
@@ -431,6 +442,9 @@ navigation:
       - page: "Train an EAGLE Drafter for Speculative Decoding"
         path: ../../guides/speculative/eagle.mdx
         slug: eagle-speculative-decoding
+      - page: "Train a DFlash Drafter for Speculative Decoding"
+        path: ../../guides/speculative/dflash.mdx
+        slug: dflash-speculative-decoding
       - page: "Train a DSpark Drafter for Speculative Decoding"
         path: ../../guides/speculative/dspark.mdx
         slug: dspark-speculative-decoding

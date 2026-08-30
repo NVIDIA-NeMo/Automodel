@@ -116,6 +116,7 @@ class _DeepseekV4Like(nn.Module):
 
 class _GlmMoeDsaLike(nn.Module):
     ModelCapabilities = _THDCapabilities
+    _packed_cp_attn_backends = ("tilelang", "cudnn")
 
     def __init__(self, backend_attn="tilelang"):
         super().__init__()
@@ -388,13 +389,14 @@ class TestModelSupportsCP:
         _attach(model)
         assert model.supports.supports_cp is False
 
-    def test_glm_moe_dsa_true_with_tilelang(self):
-        model = _GlmMoeDsaLike(backend_attn="tilelang")
+    @pytest.mark.parametrize("backend_attn", ["tilelang", "cudnn"])
+    def test_glm_moe_dsa_true_with_optimized_cp_backend(self, backend_attn):
+        model = _GlmMoeDsaLike(backend_attn=backend_attn)
         _attach(model)
         assert model.supports.supports_cp is True
 
     @pytest.mark.parametrize("backend_attn", ["te", "sdpa", "torch"])
-    def test_glm_moe_dsa_false_without_tilelang(self, backend_attn):
+    def test_glm_moe_dsa_false_without_optimized_cp_backend(self, backend_attn):
         model = _GlmMoeDsaLike(backend_attn=backend_attn)
         _attach(model)
         assert model.supports.supports_cp is False
@@ -413,6 +415,19 @@ class TestModelSupportsEP:
         assert model.supports.supports_ep is False
 
 
+class TestModelSupportsMTP:
+    def test_mtp_enabled_reflects_live_config(self):
+        model = _Bare()
+        model.mtp_config = SimpleNamespace(enabled=False)
+        _attach(model)
+
+        assert model.supports.mtp_enabled is False
+        model.mtp_config.enabled = True
+        assert model.supports.mtp_enabled is True
+        assert model.supports.supports_mtp_cp is False
+        assert model.supports.supports_mtp_cp_pp is False
+
+
 class TestModelSupportsSequencePacking:
     def test_true_with_seq_lens(self):
         model = _WithSeqLens()
@@ -428,6 +443,11 @@ class TestModelSupportsSequencePacking:
         model = _Bare()
         _attach(model)
         assert model.supports.supports_sequence_packing is False
+
+    def test_glm_moe_dsa_true_with_cudnn(self):
+        model = _GlmMoeDsaLike(backend_attn="cudnn")
+        _attach(model)
+        assert model.supports.supports_sequence_packing is True
 
 
 class TestModelSupportsGradientCheckpointing:
@@ -530,6 +550,12 @@ class TestModelSupportsCPWithSequencePacking:
 
     def test_glm_moe_dsa_cp_gt1_sequence_packing_supported_with_tilelang(self):
         model = _GlmMoeDsaLike(backend_attn="tilelang")
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_glm_moe_dsa_cp_gt1_sequence_packing_supported_with_cudnn(self):
+        model = _GlmMoeDsaLike(backend_attn="cudnn")
         _attach(model)
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is True
@@ -653,6 +679,11 @@ class TestValidateForMesh:
 
     def test_cp_passes_glm_moe_dsa_tilelang(self):
         model = _GlmMoeDsaLike(backend_attn="tilelang")
+        _attach(model)
+        validate_for_mesh(model, _mesh(cp=2))
+
+    def test_cp_passes_glm_moe_dsa_cudnn(self):
+        model = _GlmMoeDsaLike(backend_attn="cudnn")
         _attach(model)
         validate_for_mesh(model, _mesh(cp=2))
 

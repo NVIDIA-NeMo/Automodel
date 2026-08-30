@@ -284,10 +284,14 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", "hub", or "tilelang").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", "hub", "tilelang", or "cudnn").
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
-            indexer, and Sinkhorn kernels together. ``hub`` uses Hub flash attention
-            in native MLA/GQA factories (see ``hub_kernels``).
+            indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
+            "cudnn" select their respective packed sparse-attention kernels.
+            For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
+            CUDA BF16; CPU execution retains the PyTorch numerical oracle.
+            ``hub`` uses Hub flash attention in native MLA/GQA factories
+            (see ``hub_kernels``).
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
@@ -305,8 +309,8 @@ class BackendConfig:
         mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
-        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
-            and allocate dispatched tensors on the communication stream.
+        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
+            asynchronously and allocate their outputs on the communication stream.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -329,7 +333,7 @@ class BackendConfig:
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "hub", "tilelang"] = (
+    attn: Literal["te", "sdpa", "flex", "eager", "hub", "tilelang", "cudnn"] = (
         "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     )
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"

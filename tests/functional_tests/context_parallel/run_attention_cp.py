@@ -326,8 +326,8 @@ def get_model_config_and_attention(model_type, device):
             rope_scaling=getattr(config, "rope_scaling", None),
         ).to(device)
 
-        attn_no_cp = MLA(config, backend).to(device).to(torch.bfloat16)
-        attn_with_cp = MLA(config, backend).to(device).to(torch.bfloat16)
+        attn_no_cp = MLA(config, backend, latent_norm_eps=1e-6).to(device).to(torch.bfloat16)
+        attn_with_cp = MLA(config, backend, latent_norm_eps=1e-6).to(device).to(torch.bfloat16)
 
         def get_freqs_cis(position_ids, qkv_format, cp_size=1):
             return freqs_cis_from_position_ids(

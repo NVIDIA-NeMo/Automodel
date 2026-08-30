@@ -59,6 +59,91 @@ class _ResumePlan:
         return self.artifact_dir / "resumed_checkpoints"
 
 
+@dataclass(frozen=True)
+class _ResumeLossTolerance:
+    """Resolved loss envelope for one shared-trajectory resume check."""
+
+    profile: str
+    first_step_atol: float
+    first_step_rtol: float
+    later_step_atol: float
+    later_step_rtol: float
+
+
+_RESUME_LOSS_TOLERANCE_PROFILES = {
+    "strict": _ResumeLossTolerance(
+        profile="strict",
+        first_step_atol=1e-6,
+        first_step_rtol=0.0,
+        later_step_atol=1e-6,
+        later_step_rtol=0.0,
+    ),
+    "standard": _ResumeLossTolerance(
+        profile="standard",
+        first_step_atol=1e-5,
+        first_step_rtol=2e-3,
+        later_step_atol=5e-3,
+        later_step_rtol=2e-3,
+    ),
+    "relaxed": _ResumeLossTolerance(
+        profile="relaxed",
+        first_step_atol=1e-4,
+        first_step_rtol=7.5e-3,
+        later_step_atol=1e-2,
+        later_step_rtol=7.5e-3,
+    ),
+}
+
+
+def _resolve_resume_loss_tolerance(
+    profile: str = "standard",
+    *,
+    first_step_override: str | float | None = None,
+    later_step_override: str | float | None = None,
+) -> _ResumeLossTolerance:
+    """Resolve a named resume-loss profile with optional numeric overrides."""
+    normalized_profile = profile.strip().lower()
+    if normalized_profile not in _RESUME_LOSS_TOLERANCE_PROFILES:
+        valid_profiles = ", ".join(sorted(_RESUME_LOSS_TOLERANCE_PROFILES))
+        raise ValueError(f"unknown resume tolerance profile {profile!r}; expected one of: {valid_profiles}")
+
+    selected = _RESUME_LOSS_TOLERANCE_PROFILES[normalized_profile]
+    tolerance = _ResumeLossTolerance(
+        profile=normalized_profile,
+        first_step_atol=selected.first_step_atol if first_step_override is None else float(first_step_override),
+        first_step_rtol=selected.first_step_rtol if first_step_override is None else 0.0,
+        later_step_atol=selected.later_step_atol if later_step_override is None else float(later_step_override),
+        later_step_rtol=selected.later_step_rtol if later_step_override is None else 0.0,
+    )
+    for label, threshold in (
+        ("first-step absolute", tolerance.first_step_atol),
+        ("first-step relative", tolerance.first_step_rtol),
+        ("later-step absolute", tolerance.later_step_atol),
+        ("later-step relative", tolerance.later_step_rtol),
+    ):
+        if not math.isfinite(threshold) or threshold < 0:
+            raise ValueError(f"resume {label} loss threshold must be finite and non-negative, got {threshold}")
+    return tolerance
+
+
+def _loss_tolerance_for_step(
+    tolerance: _ResumeLossTolerance,
+    *,
+    first_step: bool,
+    reference_loss: float,
+    resumed_loss: float,
+) -> tuple[float, float, float]:
+    """Return the absolute term, relative term, and effective loss allowance."""
+    if first_step:
+        absolute = tolerance.first_step_atol
+        relative = tolerance.first_step_rtol
+    else:
+        absolute = tolerance.later_step_atol
+        relative = tolerance.later_step_rtol
+    scale = max(abs(reference_loss), abs(resumed_loss))
+    return absolute, relative, absolute + relative * scale
+
+
 class _TrajectoryRecorder:
     """Record checkpoint state plus the exact post-checkpoint batches and metrics."""
 
@@ -75,6 +160,30 @@ class _TrajectoryRecorder:
             trainer: Recipe whose optimizer-step and checkpoint calls are recorded.
         """
         original_train_step = trainer._run_train_optim_step
+        optimizers = trainer.optimizer if isinstance(trainer.optimizer, (list, tuple)) else [trainer.optimizer]
+        first_comparison_step = min(self.plan.comparison_steps)
+        first_step_pre_update_model_digests: dict[str, str] | None = None
+        first_step_pre_update_optimizer_digests: dict[str, str] | None = None
+        first_step_gradient_digests: dict[str, str] | None = None
+
+        if optimizers:
+            original_optimizer_step = optimizers[0].step
+
+            @wraps(original_optimizer_step)
+            def recorded_optimizer_step(*args, **kwargs):
+                nonlocal first_step_gradient_digests
+                nonlocal first_step_pre_update_model_digests
+                nonlocal first_step_pre_update_optimizer_digests
+                if int(trainer.step_scheduler.step) == first_comparison_step:
+                    first_step_pre_update_model_digests = _model_state_digests(trainer.model_parts)
+                    first_step_pre_update_optimizer_digests = _optimizer_state_digests(
+                        trainer.optimizer,
+                        trainer.model_parts,
+                    )
+                    first_step_gradient_digests = _gradient_state_digests(trainer.model_parts)
+                return original_optimizer_step(*args, **kwargs)
+
+            optimizers[0].step = recorded_optimizer_step
 
         @wraps(original_train_step)
         def recorded_train_step(batches, *args, **kwargs):
@@ -89,11 +198,29 @@ class _TrajectoryRecorder:
                 )
             log_data = original_train_step(batches, *args, **kwargs)
             if batch_digest is not None:
-                self.steps[step] = {
+                step_record = {
                     "batch_digest": batch_digest,
                     "loss": float(log_data.metrics["loss"]),
                     "lr": float(log_data.metrics["lr"]),
                 }
+                if step == first_comparison_step:
+                    if (
+                        first_step_pre_update_model_digests is None
+                        or first_step_pre_update_optimizer_digests is None
+                        or first_step_gradient_digests is None
+                    ):
+                        raise AssertionError("first resume comparison step did not execute an optimizer update")
+                    step_record["diagnostics"] = {
+                        "pre_update_model_digests": first_step_pre_update_model_digests,
+                        "pre_update_optimizer_digests": first_step_pre_update_optimizer_digests,
+                        "gradient_digests": first_step_gradient_digests,
+                        "post_step_model_digests": _model_state_digests(trainer.model_parts),
+                        "post_step_optimizer_digests": _optimizer_state_digests(
+                            trainer.optimizer,
+                            trainer.model_parts,
+                        ),
+                    }
+                self.steps[step] = step_record
             return log_data
 
         trainer._run_train_optim_step = recorded_train_step
@@ -183,7 +310,12 @@ def _resume_plan_from_config(cfg: object, *, continuation_steps: int = 3) -> _Re
 def _configure_uninterrupted_run(cfg: object, plan: _ResumePlan) -> None:
     """Extend Phase 1 while preserving its original LR schedule and checkpoint boundary."""
     cfg.step_scheduler.max_steps = plan.final_max_steps
+    # ``max_steps`` is only a cap: a finite dataloader can stop earlier when the
+    # configured epochs are exhausted. Allow one epoch per requested step so a
+    # non-empty dataloader always reaches the shared checkpoint and continuation.
+    cfg.step_scheduler.num_epochs = plan.final_max_steps
     cfg.step_scheduler.ckpt_every_steps = plan.boundary_step
+    cfg.step_scheduler.save_checkpoint_every_epoch = False
     cfg.checkpoint.save_consolidated = "final"
     if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
         cfg.lr_scheduler.lr_decay_steps = plan.boundary_step
@@ -192,12 +324,19 @@ def _configure_uninterrupted_run(cfg: object, plan: _ResumePlan) -> None:
 def _configure_resumed_run(cfg: object, plan: _ResumePlan, checkpoint_path: Path) -> None:
     """Restore the boundary checkpoint into an output directory separate from the reference branch."""
     cfg.step_scheduler.max_steps = plan.final_max_steps
+    cfg.step_scheduler.num_epochs = plan.final_max_steps
     cfg.step_scheduler.ckpt_every_steps = plan.boundary_step
+    cfg.step_scheduler.save_checkpoint_every_epoch = False
     if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
         cfg.lr_scheduler.lr_decay_steps = plan.boundary_step
     cfg.checkpoint.restore_from = str(checkpoint_path)
     cfg.checkpoint.checkpoint_dir = str(plan.resume_checkpoint_dir)
     cfg.checkpoint.save_consolidated = False
+
+
+def _disable_checkpoint_saves_after_restore(trainer: object) -> None:
+    """Disable new checkpoint writes after the resume checkpoint has loaded."""
+    trainer.checkpointer.config.enabled = False
 
 
 def _checkpoint_for_completed_steps(plan: _ResumePlan, completed_steps: int) -> Path:
@@ -255,7 +394,7 @@ def _state_digest(value: object) -> str:
         if isinstance(item, torch.Tensor):
             tensor = item.detach().contiguous().cpu()
             digest.update(f"tensor:{tensor.dtype}:{tuple(tensor.shape)}:".encode())
-            digest.update(tensor.view(torch.uint8).numpy())
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy())
             return
         if isinstance(item, dict):
             digest.update(b"dict{")
@@ -505,20 +644,110 @@ def _report_training_reproducibility(
 
 
 def _optimizer_step_summary(optimizers: object) -> list[dict[str, int]]:
-    """Summarize per-parameter optimizer step counters without persisting optimizer tensors."""
+    """Summarize per-parameter optimizer step counters without persisting optimizer tensors.
+
+    Adam initializes parameter state lazily. Treat an absent Adam/AdamW state entry as
+    effective step zero so the pre-save representation matches a checkpoint that
+    materializes explicit zero state for serialization.
+    """
     if not isinstance(optimizers, (list, tuple)):
         optimizers = [optimizers]
     summaries: list[dict[str, int]] = []
     for optimizer in optimizers:
         counter: Counter[str] = Counter()
-        for state in optimizer.state.values():
+        if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+            states = (
+                optimizer.state.get(parameter, {}) for group in optimizer.param_groups for parameter in group["params"]
+            )
+        else:
+            states = optimizer.state.values()
+        for state in states:
             step = state.get("step") if isinstance(state, dict) else None
+            if step is None and isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                step = 0.0
             if isinstance(step, torch.Tensor):
                 step = step.item()
             if step is not None:
                 counter[str(step)] += 1
         summaries.append(dict(sorted(counter.items())))
     return summaries
+
+
+def _model_parameter_names(model_parts: object) -> dict[int, str]:
+    """Map optimizer parameter identities to stable model-part names."""
+    if not isinstance(model_parts, (list, tuple)):
+        model_parts = [model_parts]
+    names: dict[int, str] = {}
+    for part_index, model in enumerate(model_parts):
+        for name, parameter in model.named_parameters():
+            names.setdefault(id(parameter), f"model_part_{part_index}.parameter.{name}")
+    return names
+
+
+def _model_state_digests(model_parts: object) -> dict[str, str]:
+    """Fingerprint every rank-local parameter and persistent buffer without gathering full tensors."""
+    if not isinstance(model_parts, (list, tuple)):
+        model_parts = [model_parts]
+    digests: dict[str, str] = {}
+    for part_index, model in enumerate(model_parts):
+        prefix = f"model_part_{part_index}"
+        for name, parameter in model.named_parameters():
+            digests[f"{prefix}.parameter.{name}"] = _state_digest(parameter)
+        for module_name, module in model.named_modules():
+            module_prefix = f"{prefix}.buffer"
+            if module_name:
+                module_prefix = f"{module_prefix}.{module_name}"
+            for name, buffer in module._buffers.items():
+                if buffer is None or name in module._non_persistent_buffers_set:
+                    continue
+                digests[f"{module_prefix}.{name}"] = _state_digest(buffer)
+    return dict(sorted(digests.items()))
+
+
+def _gradient_state_digests(model_parts: object) -> dict[str, str]:
+    """Fingerprint every rank-local parameter gradient immediately before the optimizer update."""
+    if not isinstance(model_parts, (list, tuple)):
+        model_parts = [model_parts]
+    digests: dict[str, str] = {}
+    for part_index, model in enumerate(model_parts):
+        for name, parameter in model.named_parameters():
+            key = f"model_part_{part_index}.gradient.{name}"
+            digests[key] = "none" if parameter.grad is None else _state_digest(parameter.grad)
+    return dict(sorted(digests.items()))
+
+
+def _optimizer_state_digests(optimizers: object, model_parts: object) -> dict[str, str]:
+    """Fingerprint every rank-local optimizer state value using stable parameter names."""
+    if not isinstance(optimizers, (list, tuple)):
+        optimizers = [optimizers]
+    parameter_names = _model_parameter_names(model_parts)
+    digests: dict[str, str] = {}
+    for optimizer_index, optimizer in enumerate(optimizers):
+        for group_index, group in enumerate(optimizer.param_groups):
+            for parameter_index, parameter in enumerate(group["params"]):
+                parameter_name = parameter_names.get(
+                    id(parameter),
+                    f"group_{group_index}.parameter_{parameter_index}",
+                )
+                prefix = f"optimizer_{optimizer_index}.{parameter_name}"
+                state = optimizer.state.get(parameter, {})
+                if not state:
+                    digests[f"{prefix}.<empty>"] = _state_digest({})
+                    continue
+                for name, value in sorted(state.items(), key=lambda item: str(item[0])):
+                    digests[f"{prefix}.{name}"] = _state_digest(value)
+    return dict(sorted(digests.items()))
+
+
+def _optimizer_group_digest(optimizers: object) -> str:
+    """Fingerprint complete optimizer parameter-group settings except parameter identities."""
+    if not isinstance(optimizers, (list, tuple)):
+        optimizers = [optimizers]
+    groups = [
+        [{key: value for key, value in group.items() if key != "params"} for group in optimizer.param_groups]
+        for optimizer in optimizers
+    ]
+    return _state_digest(groups)
 
 
 def _optimizer_group_state(optimizers: object) -> list[list[dict[str, float | None]]]:
@@ -538,7 +767,7 @@ def _optimizer_group_state(optimizers: object) -> list[list[dict[str, float | No
 
 
 def _checkpoint_state_snapshot(trainer: object, *, state_is_being_saved: bool) -> dict[str, object]:
-    """Capture discrete checkpoint state without materializing model or optimizer tensors."""
+    """Capture discrete optimizer, scheduler, and RNG checkpoint state."""
     step_scheduler = trainer.step_scheduler
     if state_is_being_saved:
         scheduler_state = step_scheduler.state_dict()
@@ -555,9 +784,40 @@ def _checkpoint_state_snapshot(trainer: object, *, state_is_being_saved: bool) -
         "step_scheduler": scheduler_position,
         "optimizer_steps": _optimizer_step_summary(trainer.optimizer),
         "optimizer_groups": _optimizer_group_state(trainer.optimizer),
+        "optimizer_group_digest": _optimizer_group_digest(trainer.optimizer),
         "lr_scheduler_digest": _state_digest(lr_scheduler_state),
         "rng_digest": _state_digest(trainer.rng.state_dict()),
     }
+
+
+def _digest_manifest_mismatch(reference: object, restored: object, *, label: str) -> str | None:
+    """Describe missing, unexpected, and changed entries in a state-digest manifest."""
+    if not isinstance(reference, dict) or not isinstance(restored, dict):
+        return f"{label} must be a digest mapping"
+    missing = sorted(set(reference) - set(restored))
+    unexpected = sorted(set(restored) - set(reference))
+    mismatched = sorted(key for key in set(reference) & set(restored) if reference[key] != restored[key])
+    if not missing and not unexpected and not mismatched:
+        return None
+    return (
+        f"{label} differs: "
+        f"missing={missing[:5]}, unexpected={unexpected[:5]}, mismatched={mismatched[:5]} "
+        f"(counts: {len(missing)}/{len(unexpected)}/{len(mismatched)})"
+    )
+
+
+def _parameter_digest_subset(model_digests: object) -> object:
+    """Return only parameter entries from a combined model parameter/buffer digest manifest."""
+    if not isinstance(model_digests, dict):
+        return model_digests
+    return {key: value for key, value in model_digests.items() if ".parameter." in key}
+
+
+def _buffer_digest_subset(model_digests: object) -> object:
+    """Return only buffer entries from a combined model parameter/buffer digest manifest."""
+    if not isinstance(model_digests, dict):
+        return model_digests
+    return {key: value for key, value in model_digests.items() if ".buffer." in key}
 
 
 def _restored_state_mismatch(reference: dict[str, object], restored: dict[str, object]) -> str | None:
@@ -566,6 +826,7 @@ def _restored_state_mismatch(reference: dict[str, object], restored: dict[str, o
         "step_scheduler": "step scheduler position",
         "optimizer_steps": "optimizer step counters",
         "optimizer_groups": "learning-rate/weight-decay state",
+        "optimizer_group_digest": "complete optimizer parameter-group state",
         "lr_scheduler_digest": "LR scheduler state",
         "rng_digest": "RNG state",
     }
@@ -583,12 +844,9 @@ def _trajectory_mismatch(
     reference: dict[str, object],
     resumed: dict[str, object],
     *,
-    first_loss_threshold: float,
-    later_loss_threshold: float,
+    tolerance: _ResumeLossTolerance,
 ) -> str | None:
     """Compare exact batches/LRs and bounded losses for the resumed continuation."""
-    if first_loss_threshold < 0 or later_loss_threshold < 0:
-        return "resume loss thresholds must be non-negative"
     reference_steps = {int(step): values for step, values in reference["steps"].items()}
     resumed_steps = {int(step): values for step, values in resumed["steps"].items()}
     if set(reference_steps) != set(resumed_steps):
@@ -602,16 +860,225 @@ def _trajectory_mismatch(
             return f"resumed batch identity differs at step {step}; stateful dataloader position was not restored"
         if expected["lr"] != actual["lr"]:
             return f"resumed learning rate differs at step {step}: {expected['lr']} != {actual['lr']}"
-        difference = abs(float(expected["loss"]) - float(actual["loss"]))
-        threshold = first_loss_threshold if step == first_step else later_loss_threshold
-        if not math.isfinite(difference) or difference > threshold:
-            threshold_label = "first-step" if step == first_step else "later-step"
+        if step == first_step:
+            expected_diagnostics = expected.get("diagnostics", {})
+            actual_diagnostics = actual.get("diagnostics", {})
+            for key, label in (
+                ("pre_update_model_digests", "pre-update model parameters"),
+                ("pre_update_optimizer_digests", "pre-update optimizer tensor state"),
+            ):
+                if key not in expected_diagnostics:
+                    return f"uninterrupted trajectory omitted required {label} diagnostics ({key})"
+                if key not in actual_diagnostics:
+                    return f"resumed trajectory omitted required {label} diagnostics ({key})"
+                reference_manifest = expected_diagnostics[key]
+                resumed_manifest = actual_diagnostics[key]
+                if key == "pre_update_model_digests":
+                    reference_manifest = _parameter_digest_subset(reference_manifest)
+                    resumed_manifest = _parameter_digest_subset(resumed_manifest)
+                mismatch = _digest_manifest_mismatch(reference_manifest, resumed_manifest, label=label)
+                if mismatch is not None:
+                    return f"shared-trajectory state mismatch at step {step}: {mismatch}"
+        reference_loss = float(expected["loss"])
+        resumed_loss = float(actual["loss"])
+        difference = abs(reference_loss - resumed_loss)
+        absolute, relative, allowed_difference = _loss_tolerance_for_step(
+            tolerance,
+            first_step=step == first_step,
+            reference_loss=reference_loss,
+            resumed_loss=resumed_loss,
+        )
+        if not math.isfinite(difference) or difference > allowed_difference:
+            scale = max(abs(reference_loss), abs(resumed_loss))
+            relative_difference = 0.0 if scale == 0 and difference == 0 else difference / scale
             return (
                 f"shared-trajectory loss mismatch at step {step}: uninterrupted={expected['loss']:.6f}, "
-                f"resumed={actual['loss']:.6f}, diff={difference:.6e}, "
-                f"{threshold_label}_threshold={threshold:.6e}"
+                f"resumed={actual['loss']:.6f}, abs_diff={difference:.6e}, "
+                f"relative_diff={relative_difference:.6e}, allowed_diff={allowed_difference:.6e}, "
+                f"atol={absolute:.6e}, rtol={relative:.6e}"
             )
     return None
+
+
+def _digest_manifest_comparison(reference: object, resumed: object) -> dict[str, object]:
+    """Return a compact comparison of two state-digest manifests."""
+    if not isinstance(reference, dict) or not isinstance(resumed, dict):
+        return {
+            "matches": False,
+            "reason": "diagnostic digest manifest missing or malformed",
+        }
+    missing = sorted(set(reference) - set(resumed))
+    unexpected = sorted(set(resumed) - set(reference))
+    mismatched = sorted(key for key in set(reference) & set(resumed) if reference[key] != resumed[key])
+    return {
+        "matches": not missing and not unexpected and not mismatched,
+        "reference_count": len(reference),
+        "resumed_count": len(resumed),
+        "missing_count": len(missing),
+        "unexpected_count": len(unexpected),
+        "mismatched_count": len(mismatched),
+        "missing": missing[:20],
+        "unexpected": unexpected[:20],
+        "mismatched": mismatched[:20],
+    }
+
+
+def _resume_comparison_report(
+    reference: dict[str, object],
+    resumed: dict[str, object],
+    tolerance: _ResumeLossTolerance,
+) -> dict[str, object]:
+    """Build a structured loss and first-update diagnostic report for one rank."""
+    reference_steps = {int(step): values for step, values in reference["steps"].items()}
+    resumed_steps = {int(step): values for step, values in resumed["steps"].items()}
+    first_step = min(reference_steps)
+    step_reports = []
+    for step in sorted(set(reference_steps) | set(resumed_steps)):
+        if step not in reference_steps or step not in resumed_steps:
+            step_reports.append(
+                {
+                    "step": step,
+                    "status": "missing",
+                    "present_in_reference": step in reference_steps,
+                    "present_in_resumed": step in resumed_steps,
+                }
+            )
+            continue
+        expected = reference_steps[step]
+        actual = resumed_steps[step]
+        reference_loss = float(expected["loss"])
+        resumed_loss = float(actual["loss"])
+        difference = abs(reference_loss - resumed_loss)
+        scale = max(abs(reference_loss), abs(resumed_loss))
+        relative_difference = 0.0 if scale == 0 and difference == 0 else difference / scale
+        absolute, relative, allowed_difference = _loss_tolerance_for_step(
+            tolerance,
+            first_step=step == first_step,
+            reference_loss=reference_loss,
+            resumed_loss=resumed_loss,
+        )
+        step_reports.append(
+            {
+                "step": step,
+                "stage": "first_forward_before_resumed_update" if step == first_step else "after_resumed_update",
+                "reference_loss": reference_loss,
+                "resumed_loss": resumed_loss,
+                "absolute_difference": difference,
+                "relative_difference": relative_difference,
+                "loss_atol": absolute,
+                "loss_rtol": relative,
+                "allowed_loss_difference": allowed_difference,
+                "within_loss_tolerance": math.isfinite(difference) and difference <= allowed_difference,
+                "batch_matches": expected["batch_digest"] == actual["batch_digest"],
+                "lr_matches": expected["lr"] == actual["lr"],
+            }
+        )
+
+    diagnostic_report: dict[str, object] = {}
+    if first_step in reference_steps and first_step in resumed_steps:
+        reference_diagnostics = reference_steps[first_step].get("diagnostics", {})
+        resumed_diagnostics = resumed_steps[first_step].get("diagnostics", {})
+        reference_model_digests = reference_diagnostics.get("pre_update_model_digests")
+        resumed_model_digests = resumed_diagnostics.get("pre_update_model_digests")
+        diagnostic_report["pre_update_model_parameter_digests"] = _digest_manifest_comparison(
+            _parameter_digest_subset(reference_model_digests),
+            _parameter_digest_subset(resumed_model_digests),
+        )
+        diagnostic_report["pre_update_model_buffer_digests"] = _digest_manifest_comparison(
+            _buffer_digest_subset(reference_model_digests),
+            _buffer_digest_subset(resumed_model_digests),
+        )
+        for key in (
+            "pre_update_optimizer_digests",
+            "gradient_digests",
+            "post_step_model_digests",
+            "post_step_optimizer_digests",
+        ):
+            diagnostic_report[key] = _digest_manifest_comparison(
+                reference_diagnostics.get(key),
+                resumed_diagnostics.get(key),
+            )
+
+    failure = _trajectory_mismatch(
+        reference,
+        resumed,
+        tolerance=tolerance,
+    )
+    return {
+        "status": "passed" if failure is None else "failed",
+        "tolerance": {
+            "profile": tolerance.profile,
+            "first_step_atol": tolerance.first_step_atol,
+            "first_step_rtol": tolerance.first_step_rtol,
+            "later_step_atol": tolerance.later_step_atol,
+            "later_step_rtol": tolerance.later_step_rtol,
+        },
+        "steps": step_reports,
+        "first_step_diagnostics": diagnostic_report,
+        "blocking_failure": failure,
+    }
+
+
+def _report_resume_comparison(
+    plan: _ResumePlan,
+    reference: dict[str, object],
+    resumed: dict[str, object],
+    tolerance: _ResumeLossTolerance,
+) -> dict[str, object]:
+    """Persist exact per-rank resume metrics and print a combined rank-0 summary."""
+    resumed_path = plan.artifact_dir / f"resumed_trajectory_rank_{_rank()}.json"
+    resumed_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = resumed_path.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(resumed, sort_keys=True))
+    temporary_path.replace(resumed_path)
+
+    local_report = _resume_comparison_report(reference, resumed, tolerance)
+    report_path = plan.artifact_dir / f"resume_comparison_rank_{_rank()}.json"
+    temporary_path = report_path.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(local_report, indent=2, sort_keys=True))
+    temporary_path.replace(report_path)
+
+    reports = [local_report]
+    if dist.is_initialized():
+        reports = [None] * dist.get_world_size()
+        dist.all_gather_object(reports, local_report)
+    if _rank() != 0:
+        return local_report
+
+    combined_path = plan.artifact_dir / "resume_comparison.json"
+    temporary_path = combined_path.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps({"reports": reports}, indent=2, sort_keys=True))
+    temporary_path.replace(combined_path)
+    print(
+        f"[Resume correctness] tolerance_profile={tolerance.profile} "
+        f"first_step_atol={tolerance.first_step_atol:.6e} first_step_rtol={tolerance.first_step_rtol:.6e} "
+        f"later_step_atol={tolerance.later_step_atol:.6e} later_step_rtol={tolerance.later_step_rtol:.6e}"
+    )
+    for rank, report in enumerate(reports):
+        for step_report in report["steps"]:
+            if step_report.get("status") == "missing":
+                print(f"[Resume correctness] rank={rank} {json.dumps(step_report, sort_keys=True)}")
+                continue
+            print(
+                f"[Resume correctness] rank={rank} step={step_report['step']} stage={step_report['stage']} "
+                f"reference_loss={step_report['reference_loss']:.9f} "
+                f"resumed_loss={step_report['resumed_loss']:.9f} "
+                f"abs_diff={step_report['absolute_difference']:.9e} "
+                f"relative_diff={step_report['relative_difference']:.9e} "
+                f"allowed_diff={step_report['allowed_loss_difference']:.9e}"
+            )
+        for name, diagnostic in report["first_step_diagnostics"].items():
+            print(
+                f"[Resume correctness] rank={rank} diagnostic={name} matches={diagnostic['matches']} "
+                f"mismatched={diagnostic.get('mismatched_count', 0)} "
+                f"missing={diagnostic.get('missing_count', 0)} "
+                f"unexpected={diagnostic.get('unexpected_count', 0)} "
+                f"mismatched_names={json.dumps(diagnostic.get('mismatched', [])[:5])} "
+                f"missing_names={json.dumps(diagnostic.get('missing', [])[:5])} "
+                f"unexpected_names={json.dumps(diagnostic.get('unexpected', [])[:5])}"
+            )
+    print(f"[Resume correctness] detailed comparison report={combined_path}")
+    return local_report
 
 
 def _gather_rank_failures(local_failure: str | None, *, check: str) -> str | None:
