@@ -1146,6 +1146,17 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             ``[total_patch_rows / spatial_merge_size**2, hidden]`` flat merged-token embeddings
             in original entry order (vision hidden size), on the vision tower's output device.
         """
+        visual_config = getattr(self.model.visual, "config", None)
+        attn_implementation = getattr(visual_config, "_attn_implementation", None)
+        if not str(attn_implementation).startswith("flash_attention") and grid_thw.device.type != "cpu":
+            # The HF SDPA/eager vision fallback calls ``lengths.tolist()`` in
+            # every vision block before splitting Q/K/V.  Keeping cu_seqlens on
+            # CUDA therefore repeats a pageable D2H synchronization per block.
+            # The vision preprocessing already consumes grid_thw as host values;
+            # copy it once so every block reuses CPU split metadata.  Flash
+            # Attention's varlen kernels require CUDA cu_seqlens and stay on the
+            # existing path.
+            grid_thw = grid_thw.detach().to(device="cpu")
         if cp_vision_frame_sharding_active():
             return maybe_distribute_visual(
                 self.model.visual, pixel_values.type(self.model.visual.dtype), grid_thw

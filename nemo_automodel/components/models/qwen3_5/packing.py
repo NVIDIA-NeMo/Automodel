@@ -87,7 +87,14 @@ def prepare_gated_delta_packed_metadata(
     indices_cpu = indices_cpu.to(torch.long)
     cu_seqlens_cpu = cu_seqlens_cpu.to(torch.long)
     num_indices = indices_cpu.numel()
-    device_metadata = torch.cat((indices_cpu, cu_seqlens_cpu)).to(device=document_ids.device)
+    device_metadata_cpu = torch.cat((indices_cpu, cu_seqlens_cpu))
+    if document_ids.is_cuda:
+        # A pageable H2D transfer calls cudaStreamSynchronize before staging the
+        # copy.  This function also runs during activation-checkpoint recompute,
+        # where that wait can serialize behind most of the layer's GPU work.
+        # Pin the tiny coalesced buffer so the transfer remains asynchronous.
+        device_metadata_cpu = device_metadata_cpu.pin_memory()
+    device_metadata = device_metadata_cpu.to(device=document_ids.device, non_blocking=document_ids.is_cuda)
     return GatedDeltaPackedMetadata(
         document_ids=document_ids,
         indices=device_metadata[:num_indices],

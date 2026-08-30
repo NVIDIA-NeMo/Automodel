@@ -71,8 +71,9 @@ def initialize_attn_module_and_func(
             enable_gqa = cast(bool, call_kwargs.get("enable_gqa", default_enable_gqa))
             if enable_gqa and attn_mask is not None:
                 groups = q.shape[-3] // k.shape[-3]
-                k = k.repeat_interleave(groups, dim=-3)
-                v = v.repeat_interleave(groups, dim=-3)
+                expanded_heads = k.shape[-3] * groups
+                k = k.repeat_interleave(groups, dim=-3, output_size=expanded_heads)
+                v = v.repeat_interleave(groups, dim=-3, output_size=expanded_heads)
                 enable_gqa = False
             return F.scaled_dot_product_attention(
                 q,

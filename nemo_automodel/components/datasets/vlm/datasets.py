@@ -1523,13 +1523,30 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     "text": [text],
                     "images": images,
                     "videos": videos,
-                    "return_tensors": "pt",
                     "do_sample_frames": False,
                 }
+                # transformers>=5.12 validates multimodal token counts before
+                # constructing its final BatchFeature.  When Qwen text output
+                # is already a tensor, that validation does
+                # ``list(ids).count(token_id)`` and scalarizes every token via
+                # eq/is_nonzero/item.  Keep only the tokenizer output as host
+                # lists through validation while media preprocessing still
+                # produces tensors, then convert the mixed BatchFeature once.
+                defer_qwen_text_tensor_conversion = type(self.processor).__name__ == "Qwen3VLProcessor"
+                if defer_qwen_text_tensor_conversion:
+                    processor_kwargs.update(
+                        text_kwargs={"return_tensors": None},
+                        images_kwargs={"return_tensors": "pt"},
+                        videos_kwargs={"return_tensors": "pt"},
+                    )
+                else:
+                    processor_kwargs["return_tensors"] = "pt"
                 if video_metadata:
                     processor_kwargs["video_metadata"] = [video_metadata]
 
                 result = self.processor(**processor_kwargs)
+                if defer_qwen_text_tensor_conversion:
+                    result.convert_to_tensors("pt")
                 if self.post_tokenize_hook is not None:
                     result = self.post_tokenize_hook(result, self.processor)
 
