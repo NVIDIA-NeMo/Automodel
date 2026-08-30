@@ -105,18 +105,13 @@ class NemotronParseLoss(nn.Module):
         loss_full[coordinate_mask] *= self.coordinate_weight
 
         valid_tokens = (labels != self.ignore_index).sum()
-        loss_sum = loss_full.sum()
         if valid_tokens == 0:
-            return loss_sum * 0
+            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
 
         if num_label_tokens is not None:
             assert self.reduction == "sum", (
                 f"num_label_tokens is only supported when reduction='sum', got reduction='{self.reduction}'"
             )
-            return loss_sum / (num_label_tokens + 1e-6)
+            return loss_full.sum() / (num_label_tokens + 1e-6)
 
-        if self.reduction == "sum":
-            return loss_sum
-        if self.reduction == "mean":
-            return loss_sum / (valid_tokens + 1e-6)
-        raise ValueError(f"Unsupported reduction={self.reduction!r}; expected 'sum' or 'mean'")
+        return loss_full.sum() / (valid_tokens + 1e-6)

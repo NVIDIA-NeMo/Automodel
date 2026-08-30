@@ -154,13 +154,9 @@ def _install_torch_and_layers_stubs(monkeypatch):
     # fsdp
     fsdp_stub = types.ModuleType("torch.distributed.fsdp")
 
-    class FSDPModule:
-        pass
-
     def fully_shard(*args, **kwargs):
         return None
 
-    fsdp_stub.FSDPModule = FSDPModule
     fsdp_stub.fully_shard = fully_shard
 
     fsdp_fully_stub = types.ModuleType("torch.distributed.fsdp._fully_shard")
@@ -229,7 +225,6 @@ def _install_torch_and_layers_stubs(monkeypatch):
         REENTRANT = "reentrant"
 
     cpw_stub.checkpoint_wrapper = checkpoint_wrapper
-    cpw_stub._CHECKPOINT_PREFIX = "_checkpoint_wrapped_module."
     # components/distributed/activation_checkpointing.py imports this at module
     # scope; without it that module only imports when an earlier test happened to
     # cache it under real torch, making this file order-dependent.

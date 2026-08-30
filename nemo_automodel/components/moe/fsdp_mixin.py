@@ -319,15 +319,21 @@ def patched_backward_maybe_with_nosync(
         result = perform_backward(backward_type)()
         if last_backward:
             # Manually call post backward for FSDP
-            _configure_fsdp_module(
-                self.submod,
-                is_last_backward=True,
-                reshard_after_backward=True,
-                requires_gradient_sync=True,
-            )
-            # Pipeline backward does not invoke ``.backward()``, so manually
-            # finish FSDP post-backward and synchronize its reduction stream.
-            _run_post_backward_hooks(self.submod)()
+            def run_post_backward(fsdp_module: FSDPModule) -> None:
+                fsdp_module.set_is_last_backward(True)
+                fsdp_module.set_reshard_after_backward(True)
+                fsdp_module.set_requires_gradient_sync(True)
+                fsdp_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
+                for state in fsdp_state._state_ctx.all_states:
+                    if state._fsdp_param_group:
+                        state._fsdp_param_group.post_backward()
+
+                # it would be much better if pipelining backward invoked .backward so autograd hooks
+                # worked and modules like DDP/FSDP behaved as expected.  Working around this for the time being,
+                # we need to call this too to ensure FSDP syncs its grad reduction ops back to the default stream.
+                fsdp_state._root_post_backward_final_callback()
+
+            run_post_backward(self.submod)
     # If submod is a MoEFSDPSyncMixin, use the MoE-specific FSDP functions
     elif isinstance(self.submod, MoEFSDPSyncMixin):
         _disable_fsdp_for_moe_module(self.submod)

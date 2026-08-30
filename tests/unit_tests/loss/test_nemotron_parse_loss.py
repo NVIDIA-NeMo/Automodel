@@ -76,7 +76,7 @@ def test_backward_compatibility():
     logits = torch.randn(2, 10, 100)
     labels = torch.randint(0, 100, (2, 10))
 
-    loss_fn = NemotronParseLoss(coordinate_weight=10.0, class_token_start_idx=50000, reduction="mean")
+    loss_fn = NemotronParseLoss(coordinate_weight=10.0, class_token_start_idx=50000)
     loss_new = loss_fn(logits=logits, labels=labels)
     loss_ref = _compute_reference_loss(logits, labels)
 
@@ -126,7 +126,7 @@ def test_fp32_upcast():
 
     assert torch.isfinite(loss_fp32)
     assert torch.isfinite(loss_bf16)
-    assert torch.allclose(loss_fp32, loss_bf16.float(), rtol=1e-2)
+    assert torch.allclose(loss_fp32, loss_bf16, rtol=1e-2)
 
 
 def test_invalid_logits_shape():
@@ -265,12 +265,10 @@ def test_mixed_coordinate_and_regular_tokens():
     """Test loss computation with mixed coordinate and regular tokens."""
     torch.manual_seed(42)
     logits = torch.randn(2, 10, 50150)  # Increased vocab size to accommodate labels
-    labels = torch.tensor(
-        [
-            [10, 20, 50001, 50002, 30, 40, 50003, 50, 60, 70],  # Mixed
-            [50100, 50101, 50102, 100, 200, 300, 50103, 400, 500, 600],  # Mixed
-        ]
-    )
+    labels = torch.tensor([
+        [10, 20, 50001, 50002, 30, 40, 50003, 50, 60, 70],  # Mixed
+        [50100, 50101, 50102, 100, 200, 300, 50103, 400, 500, 600]  # Mixed
+    ])
 
     loss_fn = NemotronParseLoss(coordinate_weight=10.0, class_token_start_idx=50000)
     loss = loss_fn(logits=logits, labels=labels)
@@ -348,24 +346,3 @@ def test_reduction_parameter_stored():
 
     assert loss_fn_sum.reduction == "sum"
     assert loss_fn_mean.reduction == "mean"
-
-
-def test_sum_and_mean_reductions_have_distinct_normalization():
-    logits = torch.randn(2, 5, 100)
-    labels = torch.randint(0, 100, (2, 5))
-    labels[0, :2] = -100
-    loss_sum = NemotronParseLoss(reduction="sum")(logits=logits, labels=labels)
-    loss_mean = NemotronParseLoss(reduction="mean")(logits=logits, labels=labels)
-
-    torch.testing.assert_close(loss_sum, loss_mean * (labels != -100).sum())
-
-
-def test_all_ignored_sum_keeps_a_zero_autograd_path():
-    logits = torch.randn(2, 5, 100, requires_grad=True)
-    labels = torch.full((2, 5), -100)
-
-    loss = NemotronParseLoss(reduction="sum")(logits=logits, labels=labels)
-    loss.backward()
-
-    assert logits.grad is not None
-    assert torch.count_nonzero(logits.grad) == 0

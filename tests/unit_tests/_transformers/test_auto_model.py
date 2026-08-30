@@ -1547,9 +1547,7 @@ class TestBuildModelRetryDepth:
                 "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
                 return_value=sentinel_model,
             ),
-            patch(
-                "nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model
-            ) as mock_apply,
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
             patch("torch.cuda.current_device", return_value=0),
         ):
             mock_init.side_effect = [
