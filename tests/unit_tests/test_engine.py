@@ -368,3 +368,17 @@ def test_reset_accumulation_recovers_a_failed_window():
     engine.backward(engine(torch.tensor(2.0)))
     engine.step()
     assert module.weight.grad is None
+
+
+def test_nonfinite_gradient_norm_skips_the_update(monkeypatch) -> None:
+    _skip_gradient_finalization(monkeypatch, norm=float("nan"))
+    module = _Scale()
+    optimizer = _CountingSGD(module.parameters())
+    engine = Engine(module, optimizer=optimizer)
+
+    engine.backward(engine(torch.ones(())) ** 2)
+    engine.step()
+
+    assert optimizer.step_calls == 0
+    assert optimizer.zero_grad_calls == 1
+    assert module.weight.item() == 1.0

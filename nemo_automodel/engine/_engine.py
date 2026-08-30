@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import sys
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -39,6 +41,8 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.shared.import_utils import MISSING_TORCHAO_MSG, safe_import_from
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_fp8_scale_precompute(module: nn.Module) -> Callable[[nn.Module], None] | None:
@@ -228,7 +232,16 @@ class Engine(nn.Module):
             expert_tp_replication_factor=get_expert_tp_replication_factor([self.module], device_mesh),
         )
 
-        self.optimizer.step()
+        grad_norm = self._global_grad_norm
+        grad_is_finite = (
+            bool(torch.isfinite(grad_norm).all()) if isinstance(grad_norm, torch.Tensor) else math.isfinite(grad_norm)
+        )
+        if grad_is_finite:
+            self.optimizer.step()
+        else:
+            # The gradients themselves are inf/NaN; stepping would write NaN
+            # into the weights, and recovering then requires a checkpoint.
+            logger.warning("skipping the optimizer update: non-finite gradient norm %s", grad_norm)
         self.zero_grad()
 
         update_moe_gate_bias = getattr(self.module, "update_moe_gate_bias", None)
