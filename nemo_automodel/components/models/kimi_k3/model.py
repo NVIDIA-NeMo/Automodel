@@ -1066,18 +1066,20 @@ _SITU_CORES_COMPILED = False
 
 
 def _compile_situ_cores() -> None:
-    """Wrap the SiTU chunk cores with ``torch.compile``, once per process.
+    """Wrap the SiTU chunk cores and the attn-res core with ``torch.compile``.
 
-    The compiled functions replace the module-level eager cores, so every
-    ``KimiK3MoE`` layer shares one pair of compiled kernels and repeated model
-    construction does not recompile. Compilation itself is lazy (at first
-    call). Compiled numerics are allclose to eager, not bitwise-identical.
+    Runs once per process: the compiled functions replace the module-level
+    eager cores, so every layer shares the same compiled kernels and repeated
+    model construction does not recompile. Compilation itself is lazy (at
+    first call). Compiled numerics are allclose to eager, not
+    bitwise-identical.
     """
-    global _situ_fwd_core, _situ_bwd_core, _SITU_CORES_COMPILED
+    global _situ_fwd_core, _situ_bwd_core, _attn_res_core, _SITU_CORES_COMPILED
     if _SITU_CORES_COMPILED:
         return
     _situ_fwd_core = torch.compile(_situ_fwd_core, dynamic=True)
     _situ_bwd_core = torch.compile(_situ_bwd_core, dynamic=True)
+    _attn_res_core = torch.compile(_attn_res_core, dynamic=True)
     _SITU_CORES_COMPILED = True
 
 
@@ -1432,6 +1434,33 @@ class KimiK3MoE(MoE):
             self.shared_experts.init_weights(buffer_device, init_std)
 
 
+def _attn_res_core(
+    values: torch.Tensor,
+    norm_weight: torch.Tensor,
+    proj_weight: torch.Tensor,
+    variance_epsilon: float,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """fp32 attention-residual mixing chain.
+
+    The weighted combine is multiply+sum rather than
+    ``torch.matmul(prob[T, 1, B], values[T, B, H])``: cuBLAS dispatches that
+    degenerate batched-GEMM shape to non-tensor-core fp32 kernels
+    (magma_sgemmEx / gemv2 — 4.3% of busy GPU time on a 256×GB200 Kimi-K3
+    profile). multiply+sum runs the same fp32 math on the elementwise/reduce
+    path (identical up to fp32 accumulation order, which is below bf16
+    resolution for typical shapes) and fuses cleanly under ``torch.compile``
+    when ``BackendConfig.compile_situ`` is set.
+    """
+    values_fp32 = values.float()
+    variance = values_fp32.pow(2).mean(-1, keepdim=True)
+    keys = values_fp32 * torch.rsqrt(variance + variance_epsilon)
+    score_weight = norm_weight.float() * proj_weight.float()
+    probabilities = (keys * score_weight).sum(-1).softmax(-1)
+    mixed = (probabilities.unsqueeze(-1) * values_fp32).sum(dim=1)
+    return mixed.to(out_dtype)
+
+
 def _apply_attn_res(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -1440,12 +1469,13 @@ def _apply_attn_res(
 ) -> torch.Tensor:
     """Mix ``[tokens, hidden]`` with prior ``[tokens, blocks, hidden]`` residuals."""
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    values_fp32 = values.float()
-    variance = values_fp32.pow(2).mean(-1, keepdim=True)
-    keys = values_fp32 * torch.rsqrt(variance + norm.variance_epsilon)
-    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
-    probabilities = (keys * score_weight).sum(-1).softmax(-1).unsqueeze(1)
-    return torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
+    return _attn_res_core(
+        values,
+        norm.weight,
+        projection.weight.squeeze(0),
+        norm.variance_epsilon,
+        values.dtype,
+    )
 
 
 class KimiDecoderLayer(nn.Module):
