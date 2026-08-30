@@ -865,6 +865,11 @@ class Checkpointer:
             t0 = time.monotonic()
             # Full-state safetensors remain mmap-backed. Prefault only when the
             # destination shares host memory; CPU and discrete-GPU paths stay unchanged.
+            # RTX Spark regression matrix for refactors here:
+            # - llama3_2_1b_squad_peft.yaml + Llama-3.1-8B, force_hf=false: this custom mmap load.
+            # - The same YAML's Spark-safe HF/FA2 + AC path, packed=128, batch=1: NVBug 6674647 end-to-end.
+            # - qwen3_8b_squad_spark.yaml: native GB10 packed-LoRA guard.
+            # - llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml: streaming guard; never full-materialize.
             model_cuda_devices = {
                 parameter.device
                 for part in model_state.model
