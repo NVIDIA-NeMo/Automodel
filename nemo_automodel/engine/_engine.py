@@ -261,6 +261,19 @@ class Engine(nn.Module):
         """Return whether the current microstep completes the optimizer window."""
         return self._micro_step + 1 == self._gradient_accumulation_steps
 
+    def reset_accumulation(self) -> None:
+        """Abandon the current accumulation window after a failed microstep.
+
+        A microstep that raises (e.g. an OOM between forward and backward) can
+        leave an open gradient-sync context and a nonzero microstep counter,
+        which would poison every later window. Callers recovering from such a
+        failure reset here and clear gradients before retrying.
+        """
+        self._close_backward_context()
+        self._micro_step = 0
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
+
     def get_global_grad_norm(self) -> torch.Tensor | float | None:
         """Return the global gradient norm measured at the latest optimizer step."""
         return self._global_grad_norm

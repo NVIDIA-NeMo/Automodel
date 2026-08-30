@@ -351,3 +351,20 @@ def test_optimizer_boundary_runs_model_post_step_hooks(monkeypatch) -> None:
 
     assert module.gate_updates == 1
     assert precomputed == [module]
+
+
+def test_reset_accumulation_recovers_a_failed_window():
+    module = _Scale()
+    engine = Engine(module, optimizer=torch.optim.SGD(module.parameters(), lr=0.1), gradient_accumulation_steps=2)
+
+    engine(torch.tensor(2.0))  # opens the sync context; backward never runs
+    with pytest.raises(RuntimeError, match="before starting another training forward"):
+        engine(torch.tensor(2.0))
+
+    engine.reset_accumulation()
+
+    # A fresh window runs cleanly end to end.
+    engine.set_gradient_accumulation_steps(1)
+    engine.backward(engine(torch.tensor(2.0)))
+    engine.step()
+    assert module.weight.grad is None
