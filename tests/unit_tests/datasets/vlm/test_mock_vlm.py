@@ -255,6 +255,55 @@ def test_pretokenized_wrapper_truncate_mm_token_type_ids():
     assert sample["mm_token_type_ids"].shape[0] <= ml
 
 
+def test_pretokenized_qwen_defers_text_tensor_conversion():
+    """Qwen token-count validation should see lists, not scalar tensors."""
+    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
+
+    class _ConvertibleBatch(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.convert_calls = []
+
+        def convert_to_tensors(self, tensor_type):
+            self.convert_calls.append(tensor_type)
+            for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
+                self[key] = torch.tensor(self[key], dtype=torch.long)
+            return self
+
+    class Qwen3VLProcessor(_StubProcessor):
+        def __init__(self):
+            self.calls = []
+            self.result = None
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            seq_len = 64
+            self.result = _ConvertibleBatch(
+                input_ids=[list(range(1, seq_len + 1))],
+                attention_mask=[[1] * seq_len],
+                mm_token_type_ids=[[0] * seq_len],
+            )
+            return self.result
+
+    processor = Qwen3VLProcessor()
+    wrapper = PreTokenizedDatasetWrapper(
+        build_mock_vlm_dataset(num_samples=1, seed=0),
+        processor,
+        max_length=32,
+        truncate=True,
+    )
+
+    sample = _patched_getitem(wrapper, 0)
+
+    call = processor.calls[0]
+    assert "return_tensors" not in call
+    assert call["text_kwargs"] == {"return_tensors": None}
+    assert call["images_kwargs"] == {"return_tensors": "pt"}
+    assert call["videos_kwargs"] == {"return_tensors": "pt"}
+    assert processor.result.convert_calls == ["pt"]
+    assert isinstance(sample["input_ids"], torch.Tensor)
+
+
 class _MediaTruncationProcessor:
     image_token_id = 99
 
