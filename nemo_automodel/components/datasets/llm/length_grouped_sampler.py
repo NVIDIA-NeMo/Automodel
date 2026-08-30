@@ -132,14 +132,37 @@ class LengthGroupedSampler(Sampler[int]):
         )
 
     @staticmethod
-    def _compute_lengths(dataset: Dataset) -> list[int]:
-        """Compute token lengths for all samples."""
-        # Fast path: access underlying list directly if available
+    def _unwrap_to_list(dataset: Dataset) -> list | None:
+        """Return an inner list that can stand in for ``dataset`` when indexing.
+
+        Datasets that tokenize in ``__getitem__`` (e.g. ``ChatDataset``) keep the
+        raw, untokenized rows in ``self.dataset``, so indexing the inner list
+        yields rows without ``input_ids``.  Wrappers that remap indices (e.g.
+        ``torch.utils.data.Subset``) make ``raw[i]`` a different sample than
+        ``dataset[i]``.  Only substitute the inner list when it is 1:1 with the
+        dataset and already carries tokenized samples.
+
+        Args:
+            dataset: The dataset to unwrap.
+
+        Returns:
+            The inner list when it is a safe stand-in, otherwise ``None``.
+        """
         raw = dataset
         while hasattr(raw, "dataset"):
             raw = raw.dataset
-        if not isinstance(raw, list):
-            raw = None
+        if not isinstance(raw, list) or len(raw) != len(dataset):
+            return None
+        if raw and not (isinstance(raw[0], dict) and "input_ids" in raw[0]):
+            return None
+        return raw
+
+    @staticmethod
+    def _compute_lengths(dataset: Dataset) -> list[int]:
+        """Compute token lengths for all samples."""
+        # Fast path: index the underlying list directly when it is equivalent
+        # to indexing the dataset itself.
+        raw = LengthGroupedSampler._unwrap_to_list(dataset)
 
         n = len(dataset)
         logger.info("Computing token lengths for %d samples...", n)
@@ -160,6 +183,13 @@ class LengthGroupedSampler(Sampler[int]):
                     elapsed,
                     (i + 1) / max(elapsed, 1e-6),
                 )
+
+        if n > 0 and not any(lengths):
+            logger.warning(
+                "LengthGroupedSampler could not determine a token length for any of the %d samples: "
+                "no sample exposes a non-empty `input_ids`. Length grouping will have no effect.",
+                n,
+            )
 
         logger.info("Length computation done in %.1fs", time.monotonic() - t0)
         return lengths
