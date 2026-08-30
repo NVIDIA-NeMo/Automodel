@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 
 def _is_integrated_cuda_device(device: torch.device) -> bool:
-    """Whether *device* is an integrated CUDA GPU sharing host memory."""
+    """Whether CUDA reports *device* as sharing physical memory with the host."""
     if device.type != "cuda":
         return False
     properties = torch.cuda.get_device_properties(device)
@@ -329,12 +329,14 @@ class _HuggingFaceStorageReader(FsspecReader):
                             tensor = torch.frombuffer(
                                 view, dtype=item_md.dtype, count=numel, offset=item_md.offset
                             ).reshape(item_md.shape)
+                            # This view still faults pages from the file mmap.
                             file_backed = True
                         else:
                             tensor = torch.frombuffer(
                                 bytearray(view[item_md.offset : item_md.offset + item_md.length]),
                                 dtype=item_md.dtype,
                             ).reshape(item_md.shape)
+                            # The alignment fallback already owns resident bytes.
                             file_backed = False
                         tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
                         target_tensor = planner.resolve_tensor(req).detach()

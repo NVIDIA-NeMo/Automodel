@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 class LlamaStateDictAdapter(StateDictAdapter):
     """State dict adapter for Llama models.
 
+    Subclassing the common interface makes the adapter checkpoint-compatible;
+    load-path policy remains entirely inside the checkpoint package.
+
     Uses separate projections that match HuggingFace key names exactly, so
     from_hf / to_hf are simple passthroughs (only tied-weight handling in
     from_hf).

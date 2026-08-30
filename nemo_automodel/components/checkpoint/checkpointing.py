@@ -863,6 +863,8 @@ class Checkpointer:
             )
         ):
             t0 = time.monotonic()
+            # Full-state safetensors remain mmap-backed. Prefault only when the
+            # destination shares host memory; CPU and discrete-GPU paths stay unchanged.
             model_cuda_devices = {
                 parameter.device
                 for part in model_state.model
@@ -2673,6 +2675,8 @@ def _load_hf_safetensors_checkpoint(
     def get_tensor(handle, key: str) -> torch.Tensor:
         tensor = handle.get_tensor(key)
         if prefault_mmap:
+            # Fault the mmap pages now, then discard the anonymous copy so the
+            # returned state remains file-backed and reclaimable under pressure.
             prefaulted = tensor.clone()
             del prefaulted
         return tensor
@@ -2681,6 +2685,7 @@ def _load_hf_safetensors_checkpoint(
     if os.path.isfile(model_path):
         if not prefault_mmap:
             return dict(load_file(model_path))
+        # load_file hides per-tensor access; safe_open lets us prefault each view.
         with safe_open(model_path, framework="pt", device="cpu") as f:
             return {key: get_tensor(f, key) for key in f.keys()}
     # Directory: try index first, then glob
