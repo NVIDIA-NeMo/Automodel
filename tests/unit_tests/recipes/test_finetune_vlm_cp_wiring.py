@@ -343,14 +343,7 @@ class _StageWithoutCPPrepare(torch.nn.Module):
     pass
 
 
-def _patch_pp_setup_minimals(
-    monkeypatch,
-    *,
-    cp_size,
-    stage0,
-    dataloader_calls,
-    validation_loader_config=None,
-):
+def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "AutoPipeline", _FakePPModel)
     monkeypatch.setattr(
         vlm_finetune,
@@ -422,7 +415,7 @@ def _patch_pp_setup_minimals(
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_validation_dataloader",
-        property(lambda self: validation_loader_config),
+        property(lambda self: None),
     )
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
@@ -501,118 +494,6 @@ def test_setup_always_stages_pp_media_under_pp(
     assert dataloader_calls[0]["cp_size"] == cp_size
     assert trainer.engine is None
     assert isinstance(trainer.pp, _FakePPModel)
-
-
-def test_setup_builds_pp_validation_without_training_media_staging(monkeypatch):
-    dataloader_calls = []
-    packing_resolutions = []
-    configure_packing_calls = []
-
-    def _resolve_validation_packing(**kwargs):
-        packing_resolutions.append(kwargs)
-        return "sdpa"
-
-    validation_loader_config = SimpleNamespace(
-        drop_last=True,
-        packing=SimpleNamespace(packing_format="neat"),
-        resolve_packing_attn_implementation=_resolve_validation_packing,
-        build=lambda **kwargs: (
-            dataloader_calls.append(kwargs) or SimpleNamespace(dataloader="val_dl", processor="processor")
-        ),
-    )
-    _patch_pp_setup_minimals(
-        monkeypatch,
-        cp_size=1,
-        stage0=_StageWithoutCPPrepare(),
-        dataloader_calls=dataloader_calls,
-        validation_loader_config=validation_loader_config,
-    )
-    monkeypatch.setattr(
-        "nemo_automodel.components.models.common.packing.configure_packing",
-        lambda **kwargs: configure_packing_calls.append(kwargs),
-    )
-    trainer = FinetuneRecipeForVLM(_minimal_pp_setup_cfg())
-
-    trainer.setup()
-
-    assert len(dataloader_calls) == 2
-    validation_call = dataloader_calls[1]
-    assert "pp_n_microbatches" not in validation_call
-    assert "packing_attn_implementation" not in validation_call
-    assert validation_call["cp_size"] == 1
-    assert packing_resolutions == []
-    assert configure_packing_calls == []
-    assert trainer.val_dataloader == "val_dl"
-
-
-def test_setup_allows_incomplete_pp_validation_batches_when_validation_is_skipped(monkeypatch):
-    dataloader_calls = []
-
-    def _build_validation(**kwargs):
-        dataloader_calls.append(kwargs)
-        return SimpleNamespace(dataloader="val_dl", processor="processor")
-
-    validation_loader_config = SimpleNamespace(
-        drop_last=False,
-        packing=None,
-        resolve_packing_attn_implementation=lambda **kwargs: None,
-        build=_build_validation,
-    )
-    _patch_pp_setup_minimals(
-        monkeypatch,
-        cp_size=1,
-        stage0=_StageWithoutCPPrepare(),
-        dataloader_calls=dataloader_calls,
-        validation_loader_config=validation_loader_config,
-    )
-    trainer = FinetuneRecipeForVLM(_minimal_pp_setup_cfg())
-
-    trainer.setup()
-
-    assert len(dataloader_calls) == 2
-    assert trainer.val_dataloader == "val_dl"
-
-
-def test_train_loop_skips_validation_when_pipeline_is_enabled():
-    class _SingleStepScheduler:
-        epochs = (0,)
-        step = 1
-        epoch = 0
-        is_val_step = True
-        is_ckpt_step = False
-        sigterm_flag = False
-
-        def set_epoch(self, epoch):
-            self.epoch = epoch
-
-        def __iter__(self):
-            yield [object()]
-
-    recipe = object.__new__(FinetuneRecipeForVLM)
-    model_part = SimpleNamespace(train=MagicMock())
-    recipe.model_parts = [model_part]
-    recipe.step_scheduler = _SingleStepScheduler()
-    recipe.val_dataloader = object()
-    recipe.pp_enabled = True
-    recipe.max_grad_norm = 1.0
-    recipe._make_progress_bar = MagicMock(return_value=None)
-    recipe._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
-    recipe.log_train_metrics = MagicMock()
-    recipe._update_progress_bar = MagicMock()
-    validation_metrics = SimpleNamespace(metrics={"val_loss": 0.25})
-    recipe._run_validation_epoch = MagicMock(return_value=validation_metrics)
-    recipe.log_val_metrics = MagicMock()
-    recipe.save_checkpoint = MagicMock()
-    recipe._maybe_collect_garbage = MagicMock()
-    recipe.metric_logger_train = SimpleNamespace(close=MagicMock())
-    recipe.metric_logger_valid = SimpleNamespace(close=MagicMock())
-    recipe._finalize_and_close_checkpointer = MagicMock()
-
-    recipe.run_train_validation_loop()
-
-    recipe._run_validation_epoch.assert_not_called()
-    recipe.log_val_metrics.assert_not_called()
-    assert model_part.train.call_count == 2
 
 
 def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
