@@ -35,7 +35,6 @@ from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import Kimi
 from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinear48BStateDictAdapter
 from nemo_automodel.components.models.laguna.state_dict_adapter import LagunaStateDictAdapter
 from nemo_automodel.components.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
-from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.components.models.llava_onevision.state_dict_adapter import LlavaOneVisionStateDictAdapter
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import MiMoV2FlashStateDictAdapter
 from nemo_automodel.components.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
@@ -86,7 +85,6 @@ def _assert_destinations_write_through(
         pytest.param(BagelStateDictAdapter, {}, id="bagel"),
         pytest.param(Ernie4_5StateDictAdapter, {}, id="ernie4_5_dense"),
         pytest.param(Gemma4UnifiedStateDictAdapter, {}, id="gemma4_unified"),
-        pytest.param(LlamaStateDictAdapter, {}, id="llama"),
         pytest.param(LlavaOneVisionStateDictAdapter, {}, id="llava_onevision"),
         pytest.param(MuseGlimmerStateDictAdapter, {"uses_canonical_layout": True}, id="muse_glimmer"),
         pytest.param(Qwen2_5OmniStateDictAdapter, {"_uses_thinker_prefix": True}, id="qwen2_5_omni"),

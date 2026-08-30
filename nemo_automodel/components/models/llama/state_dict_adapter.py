@@ -50,8 +50,6 @@ class LlamaStateDictAdapter(StateDictAdapter):
         hf_state_dict = adapter.to_hf(custom_state_dict)
     """
 
-    _supports_write_through_checkpoint_load = True
-
     def __init__(self, config: LlamaConfig):
         """Initialize adapter with Llama config."""
         self.config = config

@@ -841,11 +841,16 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        # Dense Llama's native state dict already uses the Hugging Face key and tensor layout.
+        # Keep this routing decision checkpoint-owned: the adapter only implements the common
+        # StateDictAdapter interface and does not need a checkpoint-policy capability flag.
+        checkpoint_managed_write_through = model_type == "llama" and isinstance(state_dict_adapter, StateDictAdapter)
         can_load_without_full_copy = (
             isinstance(state_dict_adapter, StateDictAdapter)
             and (
                 state_dict_adapter.supports_write_through_checkpoint_load
                 or state_dict_adapter.supports_checkpoint_load_without_full_copy
+                or checkpoint_managed_write_through
             )
             and not self.config.dequantize_base_checkpoint
         )
