@@ -270,7 +270,7 @@ class AutoPipeline:
         losses: list[torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Run one pipeline schedule step with model-owned input chunking.
+        """Run one forward-and-backward pipeline schedule step with model-owned input chunking.
 
         Args:
             model_input: Tensor of shape [batch, ...] containing the first
@@ -286,19 +286,77 @@ class AutoPipeline:
         Returns:
             The value returned by the underlying PyTorch pipeline schedule.
         """
+        return self._run_schedule(model_input, forward_only=False, target=target, losses=losses, **kwargs)
+
+    def eval(
+        self,
+        model_input: torch.Tensor,
+        *,
+        target: torch.Tensor | None = None,
+        losses: list[torch.Tensor] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run one forward-only pipeline schedule step with model-owned input chunking.
+
+        Same inputs as :meth:`step`, but the schedule runs no backward, so callers
+        that only need a loss (validation) do not build or free a backward graph.
+
+        Args:
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input. Ignored on ranks without the first stage.
+            target: Tensor with a model-defined target layout, or ``None`` on
+                ranks without the last pipeline stage.
+            losses: Mutable list populated with scalar loss tensors, or ``None``
+                on ranks without the last pipeline stage.
+            **kwargs: Keyword schedule inputs. Tensor values may have arbitrary
+                model-defined layouts; model-owned metadata identifies any
+                nonstandard batch axis.
+
+        Returns:
+            The value returned by the underlying PyTorch pipeline schedule.
+        """
+        return self._run_schedule(model_input, forward_only=True, target=target, losses=losses, **kwargs)
+
+    def _run_schedule(
+        self,
+        model_input: torch.Tensor,
+        *,
+        forward_only: bool,
+        target: torch.Tensor | None,
+        losses: list[torch.Tensor] | None,
+        **kwargs: Any,
+    ) -> Any:
+        """Drive the pipeline schedule with the model-owned kwargs chunk spec installed.
+
+        Args:
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input. Ignored on ranks without the first stage.
+            forward_only: Whether to run the schedule's forward-only ``eval`` entry
+                point instead of ``step``.
+            target: Tensor with a model-defined target layout, or ``None`` on
+                ranks without the last pipeline stage.
+            losses: Mutable list populated with scalar loss tensors, or ``None``
+                on ranks without the last pipeline stage.
+            **kwargs: Keyword schedule inputs. Tensor values may have arbitrary
+                model-defined layouts.
+
+        Returns:
+            The value returned by the underlying PyTorch pipeline schedule.
+        """
         schedule = self._info.schedule
         if schedule is None:
             raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
 
+        run = schedule.eval if forward_only else schedule.step
         schedule_args = (model_input,) if self._info.has_first_stage else ()
         kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
         if kwargs_chunk_spec is None:
-            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+            return run(*schedule_args, target=target, losses=losses, **kwargs)
 
         previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
         schedule._kwargs_chunk_spec = kwargs_chunk_spec
         try:
-            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+            return run(*schedule_args, target=target, losses=losses, **kwargs)
         finally:
             schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
 

@@ -833,6 +833,22 @@ class BaseRecipe:
             tensor = tensor.cpu()
         return tensor
 
+    def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group.
+
+        Args:
+            tensor: Scalar tensor on the current device. On the last pipeline stage
+                it holds the value to publish; on every other stage it is only a
+                receive buffer and its contents are overwritten in place.
+
+        Returns:
+            The same tensor, now holding the last stage's value on every rank.
+        """
+        pp_group = self.device_mesh["pp"].get_group()
+        pp_src_rank = dist.get_global_rank(pp_group, dist.get_world_size(pp_group) - 1)
+        dist.broadcast(tensor, src=pp_src_rank, group=pp_group)
+        return tensor
+
     def _make_progress_bar(self, total: int | None = None, initial: int = 0):
         """Create a tqdm progress bar on rank 0; returns None on other ranks.
 
