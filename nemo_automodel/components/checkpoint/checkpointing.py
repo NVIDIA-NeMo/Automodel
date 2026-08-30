@@ -60,6 +60,7 @@ from nemo_automodel.components.checkpoint._backports.filesystem import FileSyste
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
+    _is_integrated_cuda_device,
     _maybe_rename_index_for_diffusers,
     get_fqn_to_dtype_mapping,
     get_fqn_to_file_index_mapping,
@@ -841,16 +842,11 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
-        # Dense Llama's native state dict already uses the Hugging Face key and tensor layout.
-        # Keep this routing decision checkpoint-owned: the adapter only implements the common
-        # StateDictAdapter interface and does not need a checkpoint-policy capability flag.
-        checkpoint_managed_write_through = model_type == "llama" and isinstance(state_dict_adapter, StateDictAdapter)
         can_load_without_full_copy = (
             isinstance(state_dict_adapter, StateDictAdapter)
             and (
                 state_dict_adapter.supports_write_through_checkpoint_load
                 or state_dict_adapter.supports_checkpoint_load_without_full_copy
-                or checkpoint_managed_write_through
             )
             and not self.config.dequantize_base_checkpoint
         )
@@ -867,7 +863,17 @@ class Checkpointer:
             )
         ):
             t0 = time.monotonic()
-            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
+            model_cuda_devices = {
+                parameter.device
+                for part in model_state.model
+                for parameter in part.parameters()
+                if parameter.device.type == "cuda"
+            }
+            prefault_safetensors = any(_is_integrated_cuda_device(device) for device in model_cuda_devices)
+            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(
+                model_path,
+                prefault_safetensors=prefault_safetensors,
+            )
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
@@ -2627,7 +2633,11 @@ def _is_custom_model(module: nn.Module) -> bool:
     )
 
 
-def _load_hf_checkpoint_preserving_dtype(model_path: str) -> dict[str, torch.Tensor] | None:
+def _load_hf_checkpoint_preserving_dtype(
+    model_path: str,
+    *,
+    prefault_safetensors: bool = False,
+) -> dict[str, torch.Tensor] | None:
     """
     Load a HuggingFace checkpoint into a new state dict so tensor dtypes
     match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
@@ -2642,19 +2652,37 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> dict[str, torch.Ten
     if _is_bin_checkpoint(model_path):
         return _load_hf_bin_checkpoint(model_path)
     elif _is_safetensors_checkpoint(model_path):
-        return _load_hf_safetensors_checkpoint(model_path)
+        return _load_hf_safetensors_checkpoint(model_path, prefault_mmap=prefault_safetensors)
     return None
 
 
-def _load_hf_safetensors_checkpoint(model_path: str) -> dict[str, torch.Tensor] | None:
+def _load_hf_safetensors_checkpoint(
+    model_path: str,
+    *,
+    prefault_mmap: bool = False,
+) -> dict[str, torch.Tensor] | None:
     """
     Load a safetensors checkpoint into a state dict.
+
+    On integrated CUDA systems, ``prefault_mmap`` reads every file-backed tensor
+    once before installation. This keeps the returned tensors mmap-backed and
+    reclaimable while avoiding page-by-page migration during the later CUDA copy.
     """
     from safetensors import safe_open
 
+    def get_tensor(handle, key: str) -> torch.Tensor:
+        tensor = handle.get_tensor(key)
+        if prefault_mmap:
+            prefaulted = tensor.clone()
+            del prefaulted
+        return tensor
+
     out: dict[str, torch.Tensor] = {}
     if os.path.isfile(model_path):
-        return dict(load_file(model_path))
+        if not prefault_mmap:
+            return dict(load_file(model_path))
+        with safe_open(model_path, framework="pt", device="cpu") as f:
+            return {key: get_tensor(f, key) for key in f.keys()}
     # Directory: try index first, then glob
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.isfile(index_file):
@@ -2673,12 +2701,12 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> dict[str, torch.Tensor] 
                 available_keys = set(f.keys())
                 for key in keys:
                     if key in available_keys:
-                        out[key] = f.get_tensor(key)
+                        out[key] = get_tensor(f, key)
     else:
         for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    out[key] = f.get_tensor(key)
+                    out[key] = get_tensor(f, key)
     return out if out else None
 
 

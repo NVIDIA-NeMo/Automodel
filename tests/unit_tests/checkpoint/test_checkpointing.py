@@ -75,7 +75,6 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
-from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
@@ -352,6 +351,22 @@ def test_load_indexed_safetensors_opens_each_shard_once(tmp_path):
     assert set(loaded) == set(expected)
     for key, tensor in expected.items():
         torch.testing.assert_close(loaded[key], tensor)
+
+
+def test_prefault_safetensors_reads_tensor_without_replacing_returned_view(tmp_path):
+    checkpoint_path = tmp_path / "model.safetensors"
+    checkpoint_path.touch()
+    tensor = MagicMock(spec=torch.Tensor)
+    safe_handle = MagicMock()
+    safe_handle.__enter__.return_value = safe_handle
+    safe_handle.keys.return_value = ["weight"]
+    safe_handle.get_tensor.return_value = tensor
+
+    with patch("safetensors.safe_open", return_value=safe_handle):
+        loaded = _load_hf_safetensors_checkpoint(str(checkpoint_path), prefault_mmap=True)
+
+    assert loaded == {"weight": tensor}
+    tensor.clone.assert_called_once_with()
 
 
 def test_get_fqn_to_dtype_mapping_reads_safetensors_headers_and_applies_key_mapping(tmp_path):
@@ -1713,39 +1728,6 @@ class TestLoadModelCustomModelGuard:
         assert "disk read" in caplog.text
         assert "adapt" in caplog.text
         assert "install" in caplog.text
-
-    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
-    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
-    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    def test_single_device_llama_uses_checkpoint_managed_write_through(self, mock_load_full, mock_load_hf, mock_is_st):
-        """A compliant Llama adapter uses DCP without owning checkpoint policy."""
-        checkpointer = self._make_checkpointer()
-
-        CustomLlama = type("LlamaForCausalLM", (torch.nn.Module,), {})
-        CustomLlama.__module__ = "nemo_automodel.components.models.llama.model"
-        model = CustomLlama()
-        model.config = SimpleNamespace(model_type="llama", tie_word_embeddings=False)
-        model.layer = torch.nn.Linear(4, 4)
-        model.state_dict_adapter = LlamaStateDictAdapter(model.config)
-
-        assert _is_custom_model(model) is True
-        assert model.state_dict_adapter.supports_write_through_checkpoint_load is False
-        assert model.state_dict_adapter.supports_checkpoint_load_without_full_copy is False
-
-        with (
-            patch("os.path.exists", return_value=True),
-            patch("torch.distributed.is_initialized", return_value=False),
-            patch.dict("os.environ", {"WORLD_SIZE": "1"}),
-            patch.object(checkpointer, "_get_storage_reader", return_value=None),
-            patch.object(
-                checkpointer, "_do_load", side_effect=lambda state_dict, *args, **kwargs: state_dict
-            ) as mock_dcp,
-        ):
-            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
-
-        mock_load_full.assert_not_called()
-        mock_load_hf.assert_not_called()
-        mock_dcp.assert_called_once()
 
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
