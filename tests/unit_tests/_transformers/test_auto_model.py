@@ -320,6 +320,7 @@ class TestUtilityFunctions:
         # Test fallback from highest to lowest priority
         assert _get_next_fallback_attn("flash_attention_3") == "flash_attention_2"
         assert _get_next_fallback_attn("flash_attention_2") == "sdpa"
+        assert _get_next_fallback_attn("kernels-community/flash-attn2") == "sdpa"
         assert _get_next_fallback_attn("sdpa") == "eager"
 
         # Test that eager falls back to itself (lowest priority)

@@ -24,6 +24,7 @@ from torch import nn
 from torch.distributed.fsdp import FSDPModule
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.kernels.config import HubKernelConfig
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
@@ -283,12 +284,14 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", "hub", "tilelang", or "cudnn").
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
             CUDA BF16; CPU execution retains the PyTorch numerical oracle.
+            ``hub`` uses Hub flash attention in native MLA/GQA factories
+            (see ``hub_kernels``).
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
@@ -324,10 +327,13 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+        hub_kernels: Optional Hub kernel repo settings for native ``attn="hub"``.
+            HF models should set ``attn_implementation`` and ``use_kernels`` on
+            ``NeMoAutoModel`` instead.
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
+    attn: Literal["te", "sdpa", "flex", "eager", "hub", "tilelang", "cudnn"] = (
         "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     )
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
@@ -364,6 +370,7 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
+    hub_kernels: HubKernelConfig | None = None
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
     def __post_init__(self) -> None:
@@ -386,6 +393,9 @@ class BackendConfig:
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
+
+        if isinstance(self.hub_kernels, dict):
+            self.hub_kernels = HubKernelConfig(**self.hub_kernels)
 
         if isinstance(self.cuda_graph, dict):
             self.cuda_graph = CudaGraphConfig(**self.cuda_graph)
