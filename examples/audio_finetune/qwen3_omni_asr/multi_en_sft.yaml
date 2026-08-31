@@ -82,7 +82,6 @@ distributed:
 # Full fine-tune: audio tower + language model trainable; only the vision tower
 # stays frozen (we never feed images on these English ASR corpora). No PEFT.
 freeze_config:
-  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: false
   freeze_language_model: false
