@@ -76,13 +76,13 @@ def test_reference_temperature_none_disables_scaling():
     )
 
 
-@pytest.mark.parametrize("temperature", [0.0, -1.0])
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_temperature_raises(temperature):
     with pytest.raises(ValueError, match="temperature must be > 0"):
         GroupedScoreKLLoss(temperature=temperature)
 
 
-@pytest.mark.parametrize("reference_temperature", [0.0, -0.5])
+@pytest.mark.parametrize("reference_temperature", [0.0, -0.5, float("nan"), float("inf")])
 def test_invalid_reference_temperature_raises(reference_temperature):
     with pytest.raises(ValueError, match="reference_temperature must be > 0"):
         GroupedScoreKLLoss(temperature=0.1, reference_temperature=reference_temperature)
@@ -97,12 +97,6 @@ def test_shape_mismatch_raises():
 def test_non_2d_input_raises(shape):
     with pytest.raises(ValueError, match="expects 2-D"):
         GroupedScoreKLLoss(temperature=0.1)(torch.randn(*shape), torch.randn(*shape))
-
-
-def test_flattened_logits_are_rejected():
-    """A missing view(-1, n_passages) leaves [B*P, 1] scores, whose softmax is identically 1."""
-    with pytest.raises(ValueError, match="expects 2-D"):
-        GroupedScoreKLLoss(temperature=0.1)(torch.randn(16, 1).squeeze(-1), torch.randn(16))
 
 
 def test_bfloat16_inputs_give_finite_fp32_loss():

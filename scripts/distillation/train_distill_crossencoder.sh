@@ -23,12 +23,12 @@ if [ "$N_NODES" -gt 1 ]; then
         --nnodes="$N_NODES" \
         --rdzv-backend=c10d \
         --rdzv-endpoint="$MASTER_ADDR:$MASTER_PORT" \
-        examples/retrieval/cross_encoder/distill.py \
+        nemo_automodel/recipes/retrieval/distill_cross_encoder.py \
         "$@"
 else
     echo "Running single-node cross-encoder distillation with torchrun"
     torchrun \
         --nproc-per-node="$GPUS_PER_NODE" \
-        examples/retrieval/cross_encoder/distill.py \
+        nemo_automodel/recipes/retrieval/distill_cross_encoder.py \
         "$@"
 fi

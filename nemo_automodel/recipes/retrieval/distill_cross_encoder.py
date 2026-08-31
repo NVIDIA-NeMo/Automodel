@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 from contextlib import nullcontext
 
 import torch
@@ -50,6 +51,15 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
             "ce": float(self.cfg.get("ce_loss_weight", 0.5)),
             "kd": float(self.cfg.get("kd_loss_weight", 0.5)),
         }
+        # A negative weight would pass the >0 teacher-construction check below while failing the
+        # ==0 skip in the training step, reaching a None teacher. Two zeros are accepted by both
+        # and train on an identically zero loss. NaN fails every comparison, so it has to be
+        # rejected explicitly or it slips through as a NaN loss on the first step.
+        for name, value in self.loss_weights.items():
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name}_loss_weight must be >= 0 and finite, got {value}")
+        if max(self.loss_weights.values()) == 0.0:
+            raise ValueError("ce_loss_weight and kd_loss_weight are both 0.0, which makes the loss constant")
 
         # The top-level VL config, not text_config: only the former is what the scoring head
         # divides by, and the two are set independently.
@@ -170,9 +180,16 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
         )
         with train_ctx, sync_ctx:
             # Both losses need per-query groups; softmax over the flattened [B*P, 1] logits
-            # would be identically 1.0 and silently reduce every loss to zero.
-            student_logits = model(**batch, return_dict=True).logits.view(-1, self.train_n_passages)
-            loss_ce = F.cross_entropy(student_logits, labels)
+            # would be identically 1.0 and silently reduce every loss to zero. Upcast once here:
+            # the backbone emits bf16 logits already divided by config.temperature, so at
+            # temperature 0.02 they sit near magnitude 260 where the bf16 grid spacing is 2, and
+            # both softmaxes below would otherwise inherit that coarseness.
+            student_logits = model(**batch, return_dict=True).logits.view(-1, self.train_n_passages).float()
+
+            # Apply the recipe-level temperature exactly as TrainCrossEncoderRecipe does, so
+            # ce_loss_weight 1.0 reproduces plain SFT for any config rather than only for configs
+            # that leave it at 1.0. KD deliberately does not see this factor: it works on raw scores.
+            loss_ce = F.cross_entropy(student_logits / self.temperature, labels)
 
             # A zero weight is honoured structurally rather than arithmetically: no 8B forward
             # pass for a result that would be multiplied away.
@@ -180,14 +197,13 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
                 loss_kd = student_logits.new_zeros(())
             else:
                 with torch.no_grad():
-                    teacher_logits = self.teacher_model(**batch, return_dict=True).logits.view(
-                        -1, self.train_n_passages
+                    teacher_logits = (
+                        self.teacher_model(**batch, return_dict=True).logits.view(-1, self.train_n_passages).float()
                     )
-                # Recover raw scores before the loss; upcasting here rather than inside the
-                # loss avoids a second bf16 rounding of the product.
+                # Recover raw scores by undoing each model's own internal division.
                 loss_kd = self.kd_loss(
-                    student_logits.float() * self.student_internal_temperature,
-                    teacher_logits.float() * self.teacher_internal_temperature,
+                    student_logits * self.student_internal_temperature,
+                    teacher_logits * self.teacher_internal_temperature,
                 )
 
             # TODO: add a score-level MSE term (Jina's L_score) as a third weighted component.
@@ -221,7 +237,7 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
         return result
 
 
-def main(default_config_path="examples/retrieval/cross_encoder/ministral3_image_text_ranker_distill.yaml"):
+def main(default_config_path="examples/retrieval/cross_encoder/ministral3_vl_ranker_distill.yaml"):
     """Entry point: load config, build the cross-encoder distillation recipe, and train."""
     cfg = parse_args_and_load_config(default_config_path)
     recipe = DistillCrossEncoderRecipe(cfg)

@@ -32,13 +32,16 @@ from nemo_automodel.recipes.retrieval.distill_cross_encoder import DistillCrossE
 from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncoderRecipe
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-CONFIG_PATH = REPO_ROOT / "examples" / "retrieval" / "cross_encoder" / "ministral3_image_text_ranker_distill.yaml"
+CONFIG_PATH = REPO_ROOT / "examples" / "retrieval" / "cross_encoder" / "ministral3_vl_ranker_distill.yaml"
 
 _HIDDEN = 6
 _N_PASSAGES = 4
 _N_QUERIES = 3
 _STUDENT_TEMP = 0.02
 _KD_TEMP = 0.1
+# Deliberately not 1.0: a unit value would neutralize the recipe-level division and hide any
+# divergence between the distillation CE and TrainCrossEncoderRecipe.
+_RECIPE_TEMP = 0.5
 
 
 class _StubCrossEncoder(nn.Module):
@@ -93,6 +96,7 @@ def _make_recipe(
     recipe.model_parts = [_StubCrossEncoder(scale=0.5)]
     recipe.teacher_model = _StubCrossEncoder(scale=-0.8, temperature=teacher_temperature) if with_teacher else None
     recipe.train_n_passages = _N_PASSAGES
+    recipe.temperature = _RECIPE_TEMP
     recipe.student_internal_temperature = _STUDENT_TEMP
     recipe.teacher_internal_temperature = teacher_temperature
     recipe.loss_weights = {"ce": ce_weight, "kd": kd_weight}
@@ -241,6 +245,24 @@ def test_zero_kd_weight_skips_the_teacher_forward():
 
     assert recipe.teacher_model.seen_batches == []
     assert recipe._loss_component_buffer[0]["loss_kd"].item() == 0.0
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [
+        {"ce_loss_weight": 1.0, "kd_loss_weight": -0.5},
+        {"ce_loss_weight": 0.0, "kd_loss_weight": 0.0},
+        {"ce_loss_weight": 1.0, "kd_loss_weight": float("nan")},
+        {"ce_loss_weight": float("inf"), "kd_loss_weight": 0.5},
+    ],
+)
+def test_invalid_loss_weights_raise(weights):
+    """A negative weight reaches a None teacher; two zeros make the loss constant."""
+    recipe = object.__new__(DistillCrossEncoderRecipe)
+    recipe.cfg = SimpleNamespace(get=lambda key, default=None: weights.get(key, default))
+
+    with patch.object(TrainCrossEncoderRecipe, "setup", lambda self: None), pytest.raises(ValueError):
+        recipe.setup()
 
 
 # ---------------------------------------------------------------------------

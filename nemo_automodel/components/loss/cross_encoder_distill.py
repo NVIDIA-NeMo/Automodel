@@ -1,6 +1,20 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -25,10 +39,16 @@ class GroupedScoreKLLoss(nn.Module):
 
     def __init__(self, temperature: float, reference_temperature: float | None = None) -> None:
         super().__init__()
-        if temperature <= 0:
-            raise ValueError(f"temperature must be > 0, got {temperature}")
-        if reference_temperature is not None and reference_temperature <= 0:
-            raise ValueError(f"reference_temperature must be > 0 when provided, got {reference_temperature}")
+        # isfinite first: NaN fails every comparison, so a bare `<= 0` check would accept it and
+        # only surface as a NaN loss once training is under way.
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError(f"temperature must be > 0 and finite, got {temperature}")
+        if reference_temperature is not None and (
+            not math.isfinite(reference_temperature) or reference_temperature <= 0
+        ):
+            raise ValueError(
+                f"reference_temperature must be > 0 and finite when provided, got {reference_temperature}"
+            )
         self.temperature = float(temperature)
         self.reference_temperature = None if reference_temperature is None else float(reference_temperature)
 
