@@ -85,25 +85,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def config_has_quantization(config) -> bool:
-    """True if ``config`` or one of its sub-configs carries a ``quantization_config``.
-
-    Composite models (VLMs such as Kimi-K2.5) keep the quantization metadata on the
-    language sub-config (``text_config``), not at the top level, so a top-level
-    ``hasattr`` check alone misses them.
-    """
-    if config is None:
-        return False
-    if getattr(config, "quantization_config", None) is not None:
-        return True
-    sub_names = getattr(config, "sub_configs", None) or ()
-    for name in (*sub_names, "text_config", "language_config", "llm_config"):
-        sub = getattr(config, name, None)
-        if sub is not None and sub is not config and getattr(sub, "quantization_config", None) is not None:
-            return True
-    return False
-
-
 def _ensure_tied_lm_heads(model) -> None:
     """Re-apply local tied LM-head aliases on model parts that own both tensors."""
     model_parts = model.parts if hasattr(model, "parts") else [model]
@@ -571,7 +552,9 @@ def apply_model_infrastructure(
     # Handle checkpointer config updates if checkpointer is provided
     if checkpointer is not None:
         if checkpointer.config.dequantize_base_checkpoint is None:
-            checkpointer.config.dequantize_base_checkpoint = config_has_quantization(getattr(model, "config", None))
+            checkpointer.config.dequantize_base_checkpoint = hasattr(
+                getattr(model, "config", None), "quantization_config"
+            )
 
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device

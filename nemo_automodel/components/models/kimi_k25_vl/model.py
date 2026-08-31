@@ -117,6 +117,10 @@ class KimiK25VLConfig(PretrainedConfig):
         if text_config is None:
             text_config = DeepseekV3Config()
         elif isinstance(text_config, dict):
+            text_config = text_config.copy()
+            quantization_config = text_config.pop("quantization_config", None)
+            if quantization_config is not None:
+                kwargs.setdefault("quantization_config", quantization_config)
             text_config = DeepseekV3Config(**text_config)
         self.text_config = text_config
 
