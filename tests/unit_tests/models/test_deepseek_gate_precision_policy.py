@@ -41,6 +41,8 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3ForCausalLM
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32ForCausalLM
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import Gate
 
 _DEEPSEEK_MODEL_CASES = (
     (
@@ -142,6 +144,62 @@ def _v32_config() -> DeepseekV32Config:
     )
 
 
+def _router_config(**overrides) -> MoEConfig:
+    """Tiny grouped router matching the DeepSeek policy (n_expert_groups > 1)."""
+    base = dict(
+        dim=64,
+        inter_dim=128,
+        moe_inter_dim=64,
+        n_routed_experts=8,
+        n_shared_experts=1,
+        n_activated_experts=2,
+        n_expert_groups=2,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=1e-3,
+        aux_loss_coeff=0,
+        score_func="sigmoid",
+        route_scale=2.5,
+        norm_topk_prob=True,
+        router_weights_fp32=True,
+        dtype=torch.bfloat16,
+    )
+    base.update(overrides)
+    return MoEConfig(**base)
+
+
+def _run_gate(moe_config, gate_precision):
+    torch.manual_seed(0)
+    gate = Gate(moe_config, gate_precision=gate_precision)
+    gate.weight.data.normal_(std=0.02)
+    x = torch.randn(16, moe_config.dim, dtype=torch.bfloat16)
+    token_mask = torch.ones(16, dtype=torch.bool)
+    return gate, gate(x, token_mask, None)
+
+
+def test_gate_hands_fp32_weights_to_expert_compute():
+    """Out stage: with the DeepSeek policy, bf16 in still yields fp32 weights."""
+    gate, (weights, indices, _) = _run_gate(_router_config(), torch.float32)
+
+    assert gate.score_dtype is torch.float32
+    assert weights.dtype is torch.float32
+    assert indices.shape == (16, 2)
+
+
+def test_gate_without_policy_downcasts_weights():
+    """The bug this PR fixes: type_as(x) hands bf16 weights to expert compute."""
+    _, (weights, _, _) = _run_gate(_router_config(router_weights_fp32=False), None)
+
+    assert weights.dtype is torch.bfloat16
+
+
+def test_explicit_gate_precision_also_moves_scoring():
+    """Score has no separate knob: overriding Proj to bf16 takes Score with it."""
+    gate, _ = _run_gate(_router_config(), torch.bfloat16)
+
+    assert gate.score_dtype is torch.bfloat16
+
+
 _DEEPSEEK_MOE_CONFIG_CASES = (
     pytest.param(DeepseekV3ForCausalLM, _v3_config, id="v3"),
     pytest.param(DeepseekV32ForCausalLM, _v32_config, id="v32"),
@@ -162,3 +220,18 @@ def test_deepseek_selected_router_weights_are_overridable(model_cls, config_fn):
         moe_overrides={"router_weights_fp32": False},
     )
     assert model.model.moe_config.router_weights_fp32 is False
+
+
+def test_kimi_k2_routes_to_the_deepseek_v3_construction_path():
+    """Kimi K2 is config only: it inherits V3's router precision policy.
+
+    If Kimi K2 ever gains its own ForCausalLM, it will also need its own copy of
+    the fp32 gate_precision default and router_weights_fp32, the same way V3.2
+    does. This test fails at that moment.
+    """
+    from nemo_automodel._transformers.registry import ModelRegistry, resolve_custom_config_cls
+    from nemo_automodel.components.models.kimi_k2.config import KimiK2Config
+
+    assert resolve_custom_config_cls("kimi_k2") is KimiK2Config
+    assert issubclass(KimiK2Config, DeepseekV3Config)
+    assert ModelRegistry.get_model_cls_from_model_arch("DeepseekV3ForCausalLM") is DeepseekV3ForCausalLM
