@@ -2851,3 +2851,170 @@ def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch)
     assert captured["cu_seqlens"] is None
     assert model.scale.grad is not None
     assert len(loss_buffer) == 1
+
+
+def test_forward_backward_step_routes_global_mtp_inputs_and_targets_through_cp_pp(monkeypatch):
+    """PP gets embeddings/positions and loss targets from one pre-CP global shift."""
+    from nemo_automodel.components.models.common.mtp import (
+        MTPConfig,
+        prepare_mtp_context_parallel_inputs,
+    )
+
+    captured = {}
+    local_indices = torch.tensor([0, 1, 4, 5])
+
+    class _MTPModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+            self.prepared_before_shard = False
+            self.supports = SimpleNamespace(
+                mtp_enabled=True,
+                supports_mtp_cp=True,
+                supports_mtp_cp_pp=False,
+            )
+
+        def prepare_mtp_inputs_for_cp(self, batch, *, ignore_index=-100):
+            self.prepared_before_shard = True
+            return prepare_mtp_context_parallel_inputs(
+                batch,
+                num_depths=self.mtp_config.num_layers,
+                ignore_index=ignore_index,
+            )
+
+    model = _MTPModel()
+
+    class _FakeContextParallelSharder:
+        def __init__(self, resolved_model, device_mesh, batch, **kwargs):
+            del device_mesh
+            assert resolved_model is model
+            assert model.prepared_before_shard
+            assert kwargs["num_chunks"] == 1
+            assert batch["input_ids"].shape == (1, 6)
+
+        def shard(self, batch):
+            local_batch = dict(batch)
+            for key in ("input_ids", "labels", "position_ids"):
+                local_batch[key] = local_batch[key].index_select(1, local_indices)
+            local_batch.pop("seq_lens")
+            local_batch.pop("seq_lens_padded")
+            return nullcontext, local_batch
+
+        def shard_token_tensor(self, tensor, seq_dim=1, fill=None):
+            del fill
+            return tensor.index_select(seq_dim, local_indices)
+
+    class _FakeSchedule:
+        def __init__(self):
+            self._loss_fn = SimpleNamespace(cu_seqlens=None)
+
+        def step(self, *args, target=None, losses=None, **kwargs):
+            captured["args"] = tuple(t.detach().clone() for t in args)
+            captured["target"] = target.detach().clone()
+            captured["kwargs"] = kwargs
+            losses.append(torch.tensor(1.0))
+
+    schedule = _FakeSchedule()
+    pp = SimpleNamespace(
+        pp_batch_size=1,
+        pp_microbatch_size=1,
+        info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=schedule),
+        update_seq_len=lambda seq_len: captured.__setitem__("seq_len", seq_len),
+    )
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    object.__setattr__(
+        recipe,
+        "cfg",
+        SimpleNamespace(mtp=SimpleNamespace(ignore_index=-100, scaling_factor=1.0)),
+    )
+    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu")))
+    object.__setattr__(recipe, "device_mesh", object())
+    object.__setattr__(recipe, "pp_enabled", True)
+    object.__setattr__(recipe, "pp", pp)
+    object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "model_parts", [model])
+    object.__setattr__(recipe, "_get_cp_group_size", lambda: 2)
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ContextParallelSharder", _FakeContextParallelSharder)
+
+    batch = {
+        "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
+        "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
+        "position_ids": torch.tensor([[0, 1, 2, 0, 1, 2]]),
+        "seq_lens": torch.tensor([[3, 3, -1000]]),
+        "seq_lens_padded": torch.tensor([[3, 3, -1000]]),
+    }
+
+    with pytest.raises(NotImplementedError, match="supports_mtp_cp_pp=False"):
+        recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=[],
+            num_label_tokens=4,
+            num_batches=1,
+            is_train=True,
+        )
+
+    model.supports.supports_mtp_cp_pp = True
+    model.prepared_before_shard = False
+    loss_buffer = []
+    recipe._forward_backward_step(
+        idx=0,
+        batch=batch,
+        loss_buffer=loss_buffer,
+        num_label_tokens=4,
+        num_batches=1,
+        is_train=True,
+    )
+
+    assert captured["seq_len"] == 4
+    assert captured["args"][0].tolist() == [[10, 11, 21, 22]]
+    assert captured["target"].tolist() == [[11, 12, 22, -100]]
+    assert captured["kwargs"]["mtp_per_depth_input_ids"][0].tolist() == [[11, 12, 22, 0]]
+    assert captured["kwargs"]["mtp_per_depth_position_ids"][0].tolist() == [[1, 2, 2, 0]]
+    assert captured["kwargs"]["mtp_per_depth_targets"][0].tolist() == [[12, -100, -100, -100]]
+    assert len(loss_buffer) == 1
+
+    class _FakeIdentitySharder:
+        def __init__(self, resolved_model, device_mesh, batch, **kwargs):
+            del device_mesh, batch
+            assert resolved_model is model
+            assert model.prepared_before_shard
+            assert kwargs["num_chunks"] == 1
+
+        def shard(self, unsharded_batch):
+            local_batch = dict(unsharded_batch)
+            local_batch.pop("seq_lens")
+            local_batch.pop("seq_lens_padded")
+            return nullcontext, local_batch
+
+        def shard_token_tensor(self, tensor, seq_dim=1, fill=None):
+            del seq_dim, fill
+            return tensor
+
+    # An opted-in model uses the same precomputed PP contract at CP1. This
+    # keeps CP1 and CP2 target construction identical before only the CP slice
+    # differs.
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ContextParallelSharder", _FakeIdentitySharder)
+    object.__setattr__(recipe, "_get_cp_group_size", lambda: 1)
+    model.prepared_before_shard = False
+    captured.clear()
+    loss_buffer = []
+    recipe._forward_backward_step(
+        idx=0,
+        batch=batch,
+        loss_buffer=loss_buffer,
+        num_label_tokens=4,
+        num_batches=1,
+        is_train=True,
+    )
+
+    assert model.prepared_before_shard
+    assert captured["seq_len"] == 6
+    assert captured["args"][0].tolist() == [[10, 11, 12, 20, 21, 22]]
+    assert captured["target"].tolist() == [[11, 12, -100, 21, 22, -100]]
+    assert captured["kwargs"]["mtp_per_depth_input_ids"][0].tolist() == [[11, 12, 0, 21, 22, 0]]
+    assert captured["kwargs"]["mtp_per_depth_position_ids"][0].tolist() == [[1, 2, 0, 1, 2, 0]]
+    assert captured["kwargs"]["mtp_per_depth_targets"][0].tolist() == [[12, -100, -100, 22, -100, -100]]
+    assert len(loss_buffer) == 1

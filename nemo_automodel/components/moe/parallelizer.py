@@ -338,6 +338,10 @@ def _iter_moe_blocks(model_wrapper: nn.Module, backbone: nn.Module):
     mtp_module = getattr(model_wrapper, "mtp", None)
     if mtp_module is not None and hasattr(mtp_module, "layers"):
         yield from mtp_module.layers.children()
+    else:
+        mtp_layers = getattr(backbone, "mtp_layers", None)
+        if mtp_layers is not None:
+            yield from mtp_layers.children()
 
 
 def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):
@@ -780,9 +784,10 @@ def apply_fsdp(
     # which skips AC on these blocks for the same reason). Bulk backbone experts keep the
     # configured reshard_after_forward.
     mtp_module = getattr(model, "mtp", None)
-    mtp_block_ids = set()
-    if mtp_module is not None and hasattr(mtp_module, "layers"):
-        mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
+    mtp_layers = getattr(mtp_module, "layers", None)
+    if mtp_layers is None:
+        mtp_layers = getattr(_model, "mtp_layers", None)
+    mtp_block_ids = {id(block) for block in mtp_layers.children()} if mtp_layers is not None else set()
 
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)

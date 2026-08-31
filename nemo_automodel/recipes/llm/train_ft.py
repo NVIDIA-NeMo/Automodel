@@ -1036,13 +1036,25 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for k, v in batch.items()
         }
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
-        mtp_cp_enabled = not self.pp_enabled and self._get_cp_group_size() > 1 and model.supports.mtp_enabled
+        cp_enabled = self._get_cp_group_size() > 1
+        mtp_enabled = model is not None and model.supports.mtp_enabled
+        # Models that support the combined MTP+CP+PP path use the same global
+        # packed-boundary shift for PP at CP1 as well. Keeping one fixed PP
+        # output/loss contract avoids deriving MTP inputs or targets from a
+        # rank-local CP shard and makes CP1/CP2 directly comparable.
+        mtp_pp_precompute_enabled = self.pp_enabled and mtp_enabled and model.supports.supports_mtp_cp_pp
+        mtp_global_inputs_enabled = mtp_enabled and (cp_enabled or mtp_pp_precompute_enabled)
         mtp_cp_inputs = None
-        if mtp_cp_enabled:
-            if not model.supports.supports_mtp_cp:
+        if mtp_global_inputs_enabled:
+            if cp_enabled and not model.supports.supports_mtp_cp:
                 raise NotImplementedError(
                     f"{type(model).__name__} declares supports_mtp_cp=False; "
                     "MTP target preparation for context parallelism is unavailable"
+                )
+            if cp_enabled and self.pp_enabled and not model.supports.supports_mtp_cp_pp:
+                raise NotImplementedError(
+                    f"{type(model).__name__} declares supports_mtp_cp_pp=False; "
+                    "MTP target preparation for combined context and pipeline parallelism is unavailable"
                 )
             mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
                 batch,
@@ -1064,10 +1076,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batch["mtp_per_depth_position_ids"] = tuple(
                 cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.position_ids
             )
-            mtp_per_depth_targets = tuple(
+            sharded_mtp_targets = tuple(
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
+            if self.pp_enabled:
+                # The final PP stage returns these exact per-microbatch targets
+                # alongside its MTP states. PipelineCausalLMLoss strips that
+                # non-differentiable tail before computing the auxiliary loss.
+                batch["mtp_per_depth_targets"] = sharded_mtp_targets
+            else:
+                mtp_per_depth_targets = sharded_mtp_targets
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
