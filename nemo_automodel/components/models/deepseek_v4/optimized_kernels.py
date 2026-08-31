@@ -214,6 +214,8 @@ def build_dsv4_sparse_topk_indices(
     n_pooled: int = 0,
     vanilla_key_len: int | None = None,
     q_positions: torch.Tensor | None = None,
+    vision_token_types: torch.Tensor | None = None,
+    max_image_tokens: int = 0,
 ) -> torch.Tensor:
     """Build Miles-style top-k key indices for DSV4 local-window + compressed KV attention."""
     vanilla_key_len = seq_len if vanilla_key_len is None else vanilla_key_len
@@ -226,9 +228,39 @@ def build_dsv4_sparse_topk_indices(
         q_pos = q_positions.to(device=device, dtype=torch.long)
         if q_pos.shape[0] == 1 and batch_size > 1:
             q_pos = q_pos.expand(batch_size, -1)
-    offsets = torch.arange(window, device=device, dtype=torch.long)
-    k_pos = (q_pos.unsqueeze(-1) - window_size + 1).clamp(min=0) + offsets.view(1, 1, window)
-    topk = torch.where(k_pos > q_pos.unsqueeze(-1), torch.full_like(k_pos, -1), k_pos)
+    if vision_token_types is not None and max_image_tokens > 0:
+        if vision_token_types.dim() == 1:
+            vision_token_types = vision_token_types.unsqueeze(0)
+        vision_token_types = vision_token_types.to(device=device)
+        if vision_token_types.shape != (batch_size, seq_len):
+            raise ValueError(
+                f"vision_token_types must have shape {(batch_size, seq_len)}, got {tuple(vision_token_types.shape)}"
+            )
+
+        # Exact training-time counterpart of the released inference dump's
+        # get_image_visible/get_window_topk_idxs_visible.  Image queries keep
+        # the normal left sliding window and additionally see the complete
+        # [IMAGE_START, IMAGE_END] span in both directions.  Text queries keep
+        # the ordinary causal window.  Visual CP/THD is rejected by the model,
+        # so query and key positions are local contiguous sequence positions.
+        idx = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+        is_start = vision_token_types == 0
+        is_end = vision_token_types == 4
+        valid = (is_start.cumsum(1) > is_end.cumsum(1)) | is_end
+        starts = torch.where(is_start, idx, 0).cummax(1).values
+        left = ((idx - starts) * valid).clamp(max=max_image_tokens - 1)
+        ends = torch.where(is_end, idx, seq_len).flip(1).cummin(1).values.flip(1)
+        right = ((ends - idx) * valid).clamp(max=max_image_tokens)
+
+        width = min(seq_len, window_size + max_image_tokens)
+        left_add = (left - (window_size - 1)).clamp(min=0)
+        window_starts = (idx - (window_size - 1) - left_add).clamp(min=0)
+        topk = window_starts.unsqueeze(-1) + torch.arange(width, device=device, dtype=torch.long)
+        topk = torch.where(topk > (idx + right).unsqueeze(-1), torch.full_like(topk, -1), topk)
+    else:
+        offsets = torch.arange(window, device=device, dtype=torch.long)
+        k_pos = (q_pos.unsqueeze(-1) - window_size + 1).clamp(min=0) + offsets.view(1, 1, window)
+        topk = torch.where(k_pos > q_pos.unsqueeze(-1), torch.full_like(k_pos, -1), k_pos)
 
     if n_pooled > 0:
         if compressed_topk is not None:
