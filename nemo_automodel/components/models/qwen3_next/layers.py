@@ -18,7 +18,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
-from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
+from transformers.models.qwen3_next.modeling_qwen3_next import (
+    Qwen3NextGatedDeltaNet,
+    torch_chunk_gated_delta_rule,
+    torch_recurrent_gated_delta_rule,
+)
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -99,6 +103,36 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
     def __init__(self, config: Qwen3NextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         _install_ssm_gate(self)
+        self._bind_kernels()
+
+    def _bind_kernels(self) -> None:
+        """Restore the kernel callables HF dropped as instance attributes in 5.15.
+
+        transformers <=5.12 set ``causal_conv1d_fn`` / ``causal_conv1d_update`` /
+        ``chunk_gated_delta_rule`` / ``recurrent_gated_delta_rule`` on the module and
+        left ``causal_conv1d_fn`` as ``None`` when the kernel package was absent.
+        5.15 moved them to decorated module-level fallbacks, so ``forward`` below --
+        which calls them with the kernel package's own signature (``x=``,
+        ``seq_idx=``) -- raised AttributeError. Rebind the installed kernels, and
+        keep ``None`` when causal_conv1d is missing so the pure-torch conv branch in
+        ``forward`` is taken rather than a signature-incompatible fallback.
+        """
+        try:
+            from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+        except ImportError:
+            causal_conv1d_fn = None
+            causal_conv1d_update = None
+
+        try:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+        except ImportError:
+            chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+            fused_recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
+
+        self.causal_conv1d_fn = causal_conv1d_fn
+        self.causal_conv1d_update = causal_conv1d_update
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule
+        self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
         """Compute the decay gate ``g`` in fp32, via the holder when it exists."""
