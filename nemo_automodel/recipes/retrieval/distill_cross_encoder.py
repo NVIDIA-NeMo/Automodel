@@ -195,9 +195,16 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
             if self.loss_weights["kd"] == 0.0:
                 loss_kd = student_logits.new_zeros(())
             else:
+                # force_dummy_vision keeps every rank issuing the vision tower's all-gather on
+                # text-only batches. The student gets that for free from run_dummy_vision because
+                # it is in train mode; the teacher is in eval mode, and _build_teacher sets
+                # reshard_after_forward=True, so it re-gathers every forward and would otherwise
+                # deadlock as soon as one rank has images and another does not.
                 with torch.no_grad():
                     teacher_logits = (
-                        self.teacher_model(**batch, return_dict=True).logits.view(-1, self.train_n_passages).float()
+                        self.teacher_model(**batch, return_dict=True, force_dummy_vision=True)
+                        .logits.view(-1, self.train_n_passages)
+                        .float()
                     )
                 # Recover raw scores by undoing each model's own internal division.
                 loss_kd = self.kd_loss(

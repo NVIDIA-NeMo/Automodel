@@ -343,10 +343,16 @@ class Mistral3BidirectionalModel(Mistral3Model):
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         run_dummy_vision: bool | None = None,
+        force_dummy_vision: bool = False,
         **kwargs,
     ):
-        """Keep dummy and real vision calls inside the same FSDP root forward."""
-        if self.training and run_dummy_vision is not False and pixel_values is None:
+        """Keep dummy and real vision calls inside the same FSDP root forward.
+
+        ``run_dummy_vision`` only ever applies in training mode. A frozen FSDP teacher runs in
+        eval mode yet still needs the vision tower's all-gather issued on every rank, so
+        ``force_dummy_vision`` opts into the same path regardless of ``self.training``.
+        """
+        if pixel_values is None and (force_dummy_vision or (self.training and run_dummy_vision is not False)):
             if inputs_embeds is None:
                 inputs_embeds = self.get_input_embeddings()(input_ids)
                 input_ids = None
@@ -482,6 +488,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         run_dummy_vision: bool | None = None,
+        force_dummy_vision: bool = False,
         **kwargs,
     ) -> SequenceClassifierOutputWithPast | tuple[torch.Tensor, ...]:
         """Score each multimodal question-document sequence.
@@ -506,6 +513,8 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
             return_dict: Whether to return a structured model output.
             run_dummy_vision: Whether text-only training batches should run the
                 zero-weighted dummy vision path for distributed gradient coverage.
+            force_dummy_vision: Run that same path for text-only batches even in eval mode,
+                which a frozen FSDP teacher needs to keep its all-gathers aligned across ranks.
             **kwargs: Additional arguments forwarded to ``Mistral3BidirectionalModel``.
 
         Returns:
@@ -530,6 +539,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             run_dummy_vision=run_dummy_vision,
+            force_dummy_vision=force_dummy_vision,
             **kwargs,
         )
         pooled_hidden_states = pool(
