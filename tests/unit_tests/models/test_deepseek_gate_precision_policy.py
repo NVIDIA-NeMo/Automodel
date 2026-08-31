@@ -222,6 +222,13 @@ def test_deepseek_selected_router_weights_are_overridable(model_cls, config_fn):
     assert model.model.moe_config.router_weights_fp32 is False
 
 
+@pytest.mark.parametrize(("model_cls", "config_fn"), _DEEPSEEK_MOE_CONFIG_CASES)
+def test_deepseek_router_param_stays_in_model_dtype(model_cls, config_fn):
+    """Param stage: HF stores the router weight in model dtype and casts at use."""
+    model = model_cls(config_fn(), backend=_backend())
+    assert model.model.moe_config.gate_dtype is None
+
+
 def test_kimi_k2_routes_to_the_deepseek_v3_construction_path():
     """Kimi K2 is config only: it inherits V3's router precision policy.
 
