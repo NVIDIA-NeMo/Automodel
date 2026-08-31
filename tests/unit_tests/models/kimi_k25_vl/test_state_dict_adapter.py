@@ -319,7 +319,16 @@ class TestKimiK25VLStateDictAdapterFromHF:
 
         result = adapter.from_hf(hf_state_dict)
 
-        assert "lm_head.weight" in result
+        assert "model.language_model.lm_head.weight" in result
+        assert "lm_head.weight" not in result
+
+    def test_lm_head_round_trip(self, adapter):
+        """to_hf(from_hf(x)) returns the HF lm_head key unchanged."""
+        hf_state_dict = {"language_model.lm_head.weight": torch.randn(2, 3)}
+        native = adapter.from_hf(hf_state_dict)
+        back = adapter.to_hf(native)
+        assert "language_model.lm_head.weight" in back
+        assert torch.equal(back["language_model.lm_head.weight"].float(), native["model.language_model.lm_head.weight"].float())
 
     def test_from_hf_dtype_conversion(self, adapter):
         """Test from_hf converts tensors to target dtype."""

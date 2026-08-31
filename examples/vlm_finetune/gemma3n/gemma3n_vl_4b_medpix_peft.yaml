@@ -103,7 +103,6 @@ peft:
   use_triton: True
 
 freeze_config:
-  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
