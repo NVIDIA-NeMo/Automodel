@@ -207,7 +207,13 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         # (which drops padding entirely) or there is no padding to begin with.
         # Outside packing the original behavior is preserved.
         if not is_packed:
-            hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+            # transformers 5.15 dropped apply_mask_to_padding_states' shape guards, so it
+            # now multiplies by ``attention_mask[:, :, None]`` unconditionally. The helper
+            # documents a 2D padding mask; the 4D packed causal mask (materialized at
+            # cp_size<=1) broadcasts to 5D and raises. Only pass a 2D mask, matching the
+            # pre-5.15 behavior of skipping it for anything else.
+            if attention_mask is None or attention_mask.dim() == 2:
+                hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         if use_precomputed_states:
             conv_state = cache_params.layers[self.layer_idx].conv_states
