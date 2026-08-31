@@ -759,6 +759,21 @@ class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
         )
 
 
+class HyV4ParallelizationStrategy(DefaultParallelizationStrategy):
+    """HY V4 keeps reference-sensitive iHC, sink, and router state in fp32."""
+
+    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
+        from nemo_automodel.components.models.hy_v4.fsdp import fully_shard_hy_v4
+
+        return super().parallelize(
+            model,
+            device_mesh,
+            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+            fully_shard_fn=fully_shard_hy_v4,
+            **kwargs,
+        )
+
+
 class WanParallelizationStrategy(ParallelizationStrategy):
     """Parallelization strategy for Wan-style transformer modules used in Diffusers.
 
@@ -1037,6 +1052,7 @@ class QwenImageEditParallelizationStrategy(DefaultParallelizationStrategy):
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
     "DeepseekV4ForCausalLM": DeepseekV4ParallelizationStrategy(),
+    "HyV4ForCausalLM": HyV4ParallelizationStrategy(),
     "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),

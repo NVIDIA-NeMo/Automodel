@@ -130,6 +130,16 @@ def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     return getattr(inner_config, "model_type", None) == "deepseek_v4"
 
 
+def _is_hy_v4_model(model: torch.nn.Module) -> bool:
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) == "hy_v4":
+        return True
+
+    inner_model = getattr(model, "model", None)
+    inner_config = getattr(inner_model, "config", None)
+    return getattr(inner_config, "model_type", None) == "hy_v4"
+
+
 def _get_cp_stream() -> torch.cuda.Stream:
     global _CP_STREAM
     if _CP_STREAM is None:
@@ -698,6 +708,10 @@ def apply_fsdp(
         from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 
         fully_shard_impl = fully_shard_deepseek_v4
+    elif _is_hy_v4_model(model):
+        from nemo_automodel.components.models.hy_v4.fsdp import fully_shard_hy_v4
+
+        fully_shard_impl = fully_shard_hy_v4
 
     fully_shard_default = functools.partial(
         fully_shard_impl,

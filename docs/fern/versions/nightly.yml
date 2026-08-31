@@ -196,6 +196,8 @@ navigation:
             path: ../../model-coverage/llm/parasail-ai/gritlm.mdx
           - page: "Hy3-preview"
             path: ../../model-coverage/llm/tencent/hy3.mdx
+          - page: "Hy4-preview"
+            path: ../../model-coverage/llm/tencent/hy4.mdx
           - page: "Hy-MT2"
             path: ../../model-coverage/llm/tencent/hy-mt2.mdx
           - page: "MiMo-V2-Flash"
