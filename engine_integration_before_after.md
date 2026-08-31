@@ -129,10 +129,6 @@ RL framework (molt / veRL)                          ── owns: batch prep, los
 │     AM-internal consumers of the adapter: none; the per-gate RouterReplay handle
 │     underneath IS AM-internal (gates call replay_selection in their forward)
 │
-├── _HybridEPManager.dispatch/combine               components/moe/megatron/token_dispatcher.py (in main)
-│     reached only through the MoE layer forward — callers never see it
-│     owns: per-rank token-count equalization + 4-token alignment inside dispatch
-│
 ├── pack_vlm_samples / merge_media_values / collaters   components/datasets/vlm/ — STATELESS fns
 │     in : per-sample dicts (input_ids, labels, media) + get_rope_index
 │     out: one THD-packed physical batch (cu_seqlens, positions, media side channels)
@@ -143,6 +139,11 @@ RL framework (molt / veRL)                          ── owns: batch prep, los
       out: [(hf_name, tensor), ...] for vLLM refit streaming
       owns: custom-layout → HF key/shape mapping; caller owns the gather and the refit protocol
 ```
+
+Not in the tree on purpose: `_HybridEPManager.dispatch/combine` (HybridEP token
+equalization, #3641). It is reached only through the MoE layer's own forward — no RL
+framework ever sees or calls it, which is exactly the fix: the kernel constraint moved
+from caller-visible padding code into invisible dispatcher plumbing.
 
 The ownership rule behind every node: a component owns exactly the knowledge that is
 private to AM (model layout, gate structure, kernel constraints, wrapper conventions);
