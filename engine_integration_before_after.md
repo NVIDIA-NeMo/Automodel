@@ -95,6 +95,60 @@ Branch `huiyingl/automodel-engine-v2` updates veRL's AutoModel backend (upstream
 
 ## Part 3 — AM side: the Engine and the modules serving RL
 
+### Class hierarchy — inputs, outputs, ownership
+
+```
+RL framework (molt / veRL)                          ── owns: batch prep, losses, window timing
+│
+├── Engine (nn.Module)                              engine/_engine.py — STATEFUL
+│     construct(module, optimizer, lr_scheduler?, mesh_context?, max_grad_norm, gas, defer_fsdp_grad_sync)
+│     forward(**model_inputs)      → whatever the model returns (logits may be a vocab-sharded DTensor)
+│     backward(loss, scale_wrt_gas) → None          (loss: scalar; scale_wrt_gas=False when caller pre-normalized)
+│     step()                        → None          (non-boundary: count; boundary: finalize+clip+update+zero+sched)
+│     zero_grad() / get_global_grad_norm() / set_gradient_accumulation_steps(n)
+│     is_gradient_accumulation_boundary() / reset_accumulation()
+│     owns: accumulation window state machine, deferred-FSDP sync, MoE aux-loss scaling,
+│           summed-reducer compensation, gradient finalize (EP/TP factors), clip,
+│           non-finite-norm update skip, optimizer + scheduler advance
+│     does NOT own: loss math, collation/packing/CP prep, pipeline scheduling
+│
+├── token_log_probs / token_entropy                 components/loss/vocab_parallel.py — STATELESS fns
+│     in : logits Tensor|DTensor [.., vocab], targets int64 [..] (global ids), temperature
+│     out: fp32 [..] selected-token log-probs / entropy, replicated on every TP rank
+│     owns: the TP vocab-shard layout contract (Shard(-1), even chunks) and the
+│           no-gather reduction; caller owns target construction and temperature semantics
+│     AM-internal consumers: none (RL-only; SFT losses consume log-probs inside fused CE)
+│
+├── RouterReplayAdapter                             components/moe/router_replay.py — per-model instance
+│     construct(model)              → binds one handle per MoE gate, keyed by decoder layer_idx
+│     replay(routes int [tokens, global_layers, topk] | None) → context manager
+│           -1 row = keep live routing; context must span forward AND backward (AC recompute)
+│     owns: gate discovery, layer-id → route-slice mapping, sentinel/trailing fallback,
+│           handle state restore on exit/exception
+│     caller owns: recording routes, storing them with old_log_probs, packed token-order alignment
+│     AM-internal consumers of the adapter: none; the per-gate RouterReplay handle
+│     underneath IS AM-internal (gates call replay_selection in their forward)
+│
+├── _HybridEPManager.dispatch/combine               components/moe/megatron/token_dispatcher.py (in main)
+│     reached only through the MoE layer forward — callers never see it
+│     owns: per-rank token-count equalization + 4-token alignment inside dispatch
+│
+├── pack_vlm_samples / merge_media_values / collaters   components/datasets/vlm/ — STATELESS fns
+│     in : per-sample dicts (input_ids, labels, media) + get_rope_index
+│     out: one THD-packed physical batch (cu_seqlens, positions, media side channels)
+│     owns: physical boxing/media merge; caller owns sample selection and restore semantics
+│
+└── state_dict_adapter.convert_single_tensor_to_hf     per model family — STATELESS method
+      in : (fqn, full_tensor, exclude_key_regex, quantization)
+      out: [(hf_name, tensor), ...] for vLLM refit streaming
+      owns: custom-layout → HF key/shape mapping; caller owns the gather and the refit protocol
+```
+
+The ownership rule behind every node: a component owns exactly the knowledge that is
+private to AM (model layout, gate structure, kernel constraints, wrapper conventions);
+everything expressible in the RL framework's own terms (losses, advantages, when a window
+opens, what a sample means) stays with the caller.
+
 ### `nemo_automodel/engine/_engine.py` — Engine (core, new)
 
 Wraps an **already-distributed** eager model. Public surface: `forward` / `backward(loss)` / `step()` / `zero_grad()` / `get_global_grad_norm()` / `set_gradient_accumulation_steps()`.
