@@ -1741,9 +1741,10 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
         tp_axis_name="tp",
         ep_axis_name="ep",
         activation_checkpointing=True,
+        reapply_trainability=lambda _model: calls.append("trainability"),
     )
 
-    assert calls == ["tp", "tie", "cp", "ep", "ac", "fsdp"]
+    assert calls == ["tp", "tie", "cp", "ep", "ac", "trainability", "fsdp"]
     assert model._nemo_moe_tp_requires_replica_sync is True
     assert model._nemo_moe_tp_requires_pretrained_weights is True
     P._resolve_moe_tp_plan.assert_called_once_with(

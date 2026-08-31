@@ -32,7 +32,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
-from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -105,6 +105,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
+        freeze_config = self.cfg.get("freeze_config", None)
+        if freeze_config is None and self.peft_config is not None:
+            # Preserve the pre-freeze_config behavior for existing PEFT sequence
+            # classification recipes; new configs declare this selector directly.
+            freeze_config = FreezeConfig(unfreeze_modules=[ModuleSelector(glob="*classifier")])
         # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
         model = build_model(
             cfg_model=self.cfg.model,
@@ -114,7 +119,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
-            unfreeze_modules=["classifier"] if self.peft_config is not None else None,
+            cfg_freeze=freeze_config,
         )
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
@@ -230,9 +235,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits, labels.view(-1))
+            with self._autocast_context():
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                loss = self.loss_fn(logits, labels.view(-1))
             losses.append(loss.detach().clone())
 
             # Collect predictions for accuracy calculation
@@ -339,9 +345,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits, labels.view(-1))
+            with self._autocast_context():
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                loss = self.loss_fn(logits, labels.view(-1))
             total_loss += loss.detach()
 
             # Collect predictions for accuracy
