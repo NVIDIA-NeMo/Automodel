@@ -3039,7 +3039,7 @@ def _make_pp_validation_recipe(monkeypatch, *, allreduce_calls, broadcast_calls,
     """
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.pp_enabled = True
-    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
     recipe.model_parts = [SimpleNamespace(eval=MagicMock())]
     recipe.step_scheduler = SimpleNamespace(step=4, epoch=0)
     recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
@@ -3092,7 +3092,7 @@ def test_vlm_pp_validation_reports_mean_loss_per_supervised_token(monkeypatch):
     # Loss spans CP because it is reassembled from CP shards; the token count was
     # measured pre-shard on every CP rank, so summing it over CP would inflate it.
     assert allreduce_calls == [(5.0, True), (5, False)]
-    assert broadcast_calls == [pytest.approx(1.0)]
+    assert broadcast_calls == [pytest.approx(1.0), 5]
 
 
 @pytest.mark.parametrize(
@@ -3102,23 +3102,25 @@ def test_vlm_pp_validation_reports_mean_loss_per_supervised_token(monkeypatch):
         [{"labels": torch.tensor([[-100, -100]])}],
     ],
 )
-def test_vlm_pp_validation_rejects_zero_global_denominator(monkeypatch, batches):
-    """A validation pass with no supervised token must fail loudly, not divide by zero."""
+def test_vlm_pp_validation_handles_zero_global_denominator_like_llm(monkeypatch, batches):
+    """PP validation follows LLM's finite zero-loss behavior when no labels are supervised."""
     allreduce_calls = []
+    broadcast_calls = []
     step_calls = []
     recipe = _make_pp_validation_recipe(
         monkeypatch,
         allreduce_calls=allreduce_calls,
-        broadcast_calls=[],
+        broadcast_calls=broadcast_calls,
         step_calls=step_calls,
         losses=[0.0],
     )
 
-    with pytest.raises(ValueError, match="no supervised label tokens.*drop_last=true"):
-        recipe._run_validation_epoch(batches)
+    metrics = recipe._run_validation_epoch(batches)
 
-    # Both reductions run before the guard, so every rank raises together.
-    assert len(allreduce_calls) == 2
+    assert metrics.metrics["val_loss"] == 0.0
+    assert metrics.metrics["num_label_tokens"] == 0
+    assert allreduce_calls == [(0.0, True), (0, False)]
+    assert broadcast_calls == [0.0, 0]
 
 
 def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):

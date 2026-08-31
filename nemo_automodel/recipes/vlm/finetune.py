@@ -1302,9 +1302,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         Returns:
             MetricsSample whose ``val_loss`` is the mean loss per supervised label
             token, matching the non-PP path's metric.
-
-        Raises:
-            ValueError: If no supervised label token survives DP aggregation.
         """
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
@@ -1312,54 +1309,51 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
+
             for batch in val_dataloader:
                 loss_buffer = []
-                # Count on the unsharded batch: `_forward_backward_step` may hand CP
-                # only a slice of the sequence, but the denominator must stay global.
-                total_num_label_tokens += int((batch["labels"] != -100).sum().item())
+                num_label_tokens = (batch["labels"] != -100).sum().item()
                 self._forward_backward_step(
                     0,
                     batch,
                     loss_buffer=loss_buffer,
-                    num_label_tokens=None,  # normalized once below, over the whole pass.
+                    num_label_tokens=None,  # we will normalize outside.
                     num_batches=1,
                     is_train=False,
                 )
-                total_loss += torch.sum(torch.stack(loss_buffer))
+
+                total_loss += torch.sum(torch.stack(loss_buffer)).item()
+                total_num_label_tokens += num_label_tokens
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
-        # Every CP rank counted the full sequence above while `total_loss` is
-        # reassembled from CP-sharded sums, so the token count must not span CP.
-        total_num_label_tokens = int(
-            self._dp_allreduce(
-                torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
-            ).item()
-        )
-        if total_num_label_tokens <= 0:
-            raise ValueError(
-                "VLM validation produced no supervised label tokens after DP aggregation. "
-                "With pipeline parallelism, validation_dataloader.drop_last=true may have removed every batch "
-                "because each DP shard is smaller than the local batch size; otherwise verify that labels are not "
-                "all masked."
-            )
+        total_num_label_tokens = self._dp_allreduce(
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+        ).item()
+        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
-        # PP loss microbatches are unnormalized sums, so divide once here to get the
-        # same mean-per-token metric the non-PP path reports.
-        val_loss = (total_loss / total_num_label_tokens).float().to(self.dist_env.device)
-        # Only the last stage owns a loss; the rest pass a receive buffer. The token
-        # count needs no broadcast: every PP rank sees the same batches and reduces
-        # over the same DP group, so it already agrees.
-        val_loss = self._broadcast_from_last_pp_stage(val_loss)
+        # For PP, send val_loss and num_label_tokens from last stage to main rank
+        if self.pp_enabled:
+            val_loss = val_loss.to(self.dist_env.device)
+            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
+            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+            val_loss = self._broadcast_from_last_pp_stage(val_loss)
+            pp_num_tokens = self._broadcast_from_last_pp_stage(pp_num_tokens)
+            if self.dist_env.is_main:
+                total_num_label_tokens = pp_num_tokens.item()
+
+        val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
+
+        metrics = {
+            "val_loss": val_loss,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "num_label_tokens": total_num_label_tokens,
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+        }
 
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "val_loss": val_loss.item(),
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_num_label_tokens,
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            },
+            metrics=metrics,
         )
 
     def log_val_metrics(self, log_data):
