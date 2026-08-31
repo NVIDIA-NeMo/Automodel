@@ -32,7 +32,7 @@ from nemo_automodel.recipes.retrieval.distill_cross_encoder import DistillCrossE
 from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncoderRecipe
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-CONFIG_PATH = REPO_ROOT / "examples" / "retrieval" / "cross_encoder" / "ministral3_vl_ranker_distill.yaml"
+CONFIG_PATH = REPO_ROOT / "examples" / "retrieval" / "distillation" / "ministral3_vl_ranker_distill.yaml"
 
 _HIDDEN = 6
 _N_PASSAGES = 4

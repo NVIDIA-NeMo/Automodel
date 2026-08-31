@@ -13,7 +13,7 @@ python3 submit_nemo_run.py \
     --num_nodes 8 \
     --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ronaya/model_checkpoints \
     --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
-    --yaml_config examples/retrieval/cross_encoder/ministral3_vl_ranker_distill.yaml \
+    --yaml_config examples/retrieval/distillation/ministral3_vl_ranker_distill.yaml \
     --train_script ./scripts/distillation/train_distill_crossencoder.sh \
     --more_train_args " \
         --model.pretrained_model_name_or_path ${STUDENT_CKPT} \
@@ -48,7 +48,7 @@ python3 submit_nemo_run.py \
     --num_nodes 8 \
     --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ronaya/model_checkpoints \
     --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
-    --yaml_config examples/retrieval/cross_encoder/ministral3_vl_ranker_distill.yaml \
+    --yaml_config examples/retrieval/distillation/ministral3_vl_ranker_distill.yaml \
     --train_script ./scripts/distillation/train_distill_crossencoder.sh \
     --more_train_args " \
         --model.pretrained_model_name_or_path ${STUDENT_CKPT} \

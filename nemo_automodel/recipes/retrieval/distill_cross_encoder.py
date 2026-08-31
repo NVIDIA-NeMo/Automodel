@@ -191,8 +191,7 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
             # that leave it at 1.0. KD deliberately does not see this factor: it works on raw scores.
             loss_ce = F.cross_entropy(student_logits / self.temperature, labels)
 
-            # A zero weight is honoured structurally rather than arithmetically: no 8B forward
-            # pass for a result that would be multiplied away.
+            # Skip the teacher when KD weight is 0 so we don't pay for an unused forward.
             if self.loss_weights["kd"] == 0.0:
                 loss_kd = student_logits.new_zeros(())
             else:
@@ -207,8 +206,8 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
                 )
 
             # TODO: add a score-level MSE term (Jina's L_score) as a third weighted component.
-            # Group-wise KL is invariant to a per-group additive shift and CE only anchors the
-            # positive, so neither term transfers the teacher's absolute score scale.
+            # KL matches ranking within a group, not the teacher's actual score values.
+            # CE only pushes the labeled positive to the top. Neither copies the teacher's scale.
             loss = self.loss_weights["ce"] * loss_ce + self.loss_weights["kd"] * loss_kd
 
             loss_buffer.append(loss.clone().detach())
@@ -237,7 +236,7 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
         return result
 
 
-def main(default_config_path="examples/retrieval/cross_encoder/ministral3_vl_ranker_distill.yaml"):
+def main(default_config_path="examples/retrieval/distillation/ministral3_vl_ranker_distill.yaml"):
     """Entry point: load config, build the cross-encoder distillation recipe, and train."""
     cfg = parse_args_and_load_config(default_config_path)
     recipe = DistillCrossEncoderRecipe(cfg)
