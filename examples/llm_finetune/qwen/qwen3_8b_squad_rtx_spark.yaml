@@ -1,0 +1,115 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# RTX Spark has 64 GB of unified host/GPU memory. Start the container with
+# --memory=64g --memory-swap=64g so host and GPU allocations share that budget.
+#
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen3_8b_squad_rtx_spark.yaml --nproc-per-node 1
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 1
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 10  # will run every x number of gradient steps
+  num_epochs: 1
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+  # TE packed THD backward requests ragged LSE, unsupported by cuDNN on SM12x.
+  # HF FlashAttention-2 keeps packed training on the supported RTX Spark path.
+  force_hf: true
+  attn_implementation: flash_attention_2
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: '*_proj'
+  dim: 8
+  alpha: 32
+  use_triton: True
+
+compile:
+  enabled: false
+  mode: "default"
+  fullgraph: false
+  dynamic: false
+  backend: null
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  # Full recomputation bounds activations inside the shared 64 GB UMA budget.
+  activation_checkpointing: true
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.te_parallel_ce.TEParallelCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 128
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+  fused: True
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:20:00"
+  nproc_per_node: 1
+  cluster_tag: gb10
