@@ -117,7 +117,10 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # through ``self._compute_gate(a)`` so A_log/dt_bias stay fp32 under FSDP.
         from transformers.models.qwen3_next.modeling_qwen3_next import apply_mask_to_padding_states
 
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        # transformers 5.15 dropped this helper's shape guards; it documents a 2D padding
+        # mask and a 4D packed causal mask would broadcast to 5D and raise.
+        if attention_mask is None or attention_mask.dim() == 2:
+            hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         batch_size, seq_len, _ = hidden_states.shape
 
