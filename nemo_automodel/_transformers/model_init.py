@@ -768,14 +768,13 @@ def _has_safetensors(model_dir: str) -> bool:
     return False
 
 
-def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
+def _stream_load_bnb_weights(model, model_dir, device, torch_dtype, *, disable_mmap: bool = False):
     """Load safetensor shards one-at-a-time, quantizing BnB Params4bit on the fly.
 
     Peak memory ≈ (accumulated quantized weights) + (one bf16 weight tensor)
     instead of (full bf16 model) with standard HF loading.
     """
     import bitsandbytes as bnb
-    from safetensors import safe_open
 
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
     if os.path.exists(index_path):
@@ -800,6 +799,40 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
     loaded_keys: set[str] = set()
     device = torch.device(device) if not isinstance(device, torch.device) else device
 
+    def consume_tensor(key: str, tensor: torch.Tensor) -> None:
+        if key not in param_map:
+            logger.debug("Skipping key not in model: %s", key)
+            del tensor
+            return
+
+        mod, attr, old_param = param_map[key]
+
+        if isinstance(old_param, bnb.nn.Params4bit):
+            if torch_dtype is not None:
+                tensor = tensor.to(dtype=torch_dtype)
+            new_param = bnb.nn.Params4bit(
+                data=tensor,
+                requires_grad=False,
+                compress_statistics=old_param.compress_statistics,
+                quant_type=old_param.quant_type,
+                quant_storage=old_param.quant_storage,
+                module=mod if isinstance(mod, bnb.nn.Linear4bit) else None,
+                bnb_quantized=False,
+            )
+            del tensor
+            new_param._quantize(device)
+            mod._parameters[attr] = new_param
+        else:
+            target_dtype = torch_dtype if torch_dtype is not None else tensor.dtype
+            materialized = tensor.to(device=device, dtype=target_dtype)
+            del tensor
+            if isinstance(old_param, torch.nn.Parameter):
+                mod._parameters[attr] = torch.nn.Parameter(materialized, requires_grad=old_param.requires_grad)
+            else:
+                mod._buffers[attr] = materialized
+
+        loaded_keys.add(key)
+
     for shard_idx, shard_file in enumerate(shard_files):
         shard_path = os.path.join(model_dir, shard_file)
         logger.info(
@@ -809,42 +842,26 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
             shard_file,
         )
 
-        with safe_open(shard_path, framework="pt") as f:
-            for key in f.keys():
-                tensor = f.get_tensor(key)
+        if disable_mmap:
+            from safetensors.torch import load as load_safetensors_bytes
 
-                if key not in param_map:
-                    logger.debug("Skipping key not in model: %s", key)
-                    del tensor
-                    continue
+            # On UMA systems, CUDA faults over file-backed checkpoint pages can
+            # dominate load time. Read only the active shard into anonymous
+            # memory before tensor deserialization.
+            with open(shard_path, "rb") as f:
+                shard_tensors = load_safetensors_bytes(f.read())
+            try:
+                for key, tensor in shard_tensors.items():
+                    consume_tensor(key, tensor)
+            finally:
+                shard_tensors.clear()
+                del shard_tensors
+        else:
+            from safetensors import safe_open
 
-                mod, attr, old_param = param_map[key]
-
-                if isinstance(old_param, bnb.nn.Params4bit):
-                    if torch_dtype is not None:
-                        tensor = tensor.to(dtype=torch_dtype)
-                    new_param = bnb.nn.Params4bit(
-                        data=tensor,
-                        requires_grad=False,
-                        compress_statistics=old_param.compress_statistics,
-                        quant_type=old_param.quant_type,
-                        quant_storage=old_param.quant_storage,
-                        module=mod if isinstance(mod, bnb.nn.Linear4bit) else None,
-                        bnb_quantized=False,
-                    )
-                    del tensor
-                    new_param._quantize(device)
-                    mod._parameters[attr] = new_param
-                else:
-                    target_dtype = torch_dtype if torch_dtype is not None else tensor.dtype
-                    materialized = tensor.to(device=device, dtype=target_dtype)
-                    del tensor
-                    if isinstance(old_param, torch.nn.Parameter):
-                        mod._parameters[attr] = torch.nn.Parameter(materialized, requires_grad=old_param.requires_grad)
-                    else:
-                        mod._buffers[attr] = materialized
-
-                loaded_keys.add(key)
+            with safe_open(shard_path, framework="pt") as f:
+                for key in f.keys():
+                    consume_tensor(key, f.get_tensor(key))
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -879,6 +896,22 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
         len(loaded_keys),
         len(param_map) - len(loaded_keys),
     )
+
+
+def _get_bnb_modules_to_not_convert(model, quantization_config):
+    """Mirror HF BnB's default skip-list semantics before streaming replacement."""
+    from transformers.quantizers.base import get_keys_to_not_convert
+
+    skip_modules = getattr(quantization_config, "llm_int8_skip_modules", None)
+    keep_in_fp32_modules = getattr(model, "_keep_in_fp32_modules", None)
+
+    modules_to_not_convert = get_keys_to_not_convert(model) if skip_modules is None else []
+    if skip_modules is not None:
+        modules_to_not_convert.extend(skip_modules)
+    if keep_in_fp32_modules is not None:
+        modules_to_not_convert.extend(keep_in_fp32_modules)
+
+    return list(set(modules_to_not_convert))
 
 
 def _streaming_bnb_supported(cls, hf_config) -> bool:
@@ -944,6 +977,7 @@ def _init_model_bnb_streaming(
     device = torch.cuda.current_device()
 
     # 1. Download weights if needed
+    disable_mmap = bool(kwargs.pop("disable_mmap", False))
     _download_model_weights(hf_config, pretrained_model_name_or_path)
 
     # 2. Resolve to local directory & verify safetensors
@@ -961,9 +995,7 @@ def _init_model_bnb_streaming(
         )
 
     # 4. Replace nn.Linear → bnb.nn.Linear4bit (still on meta, no memory)
-    modules_to_not_convert = getattr(quantization_config, "llm_int8_skip_modules", None)
-    if modules_to_not_convert is None:
-        modules_to_not_convert = getattr(model, "_keep_in_fp32_modules", None)
+    modules_to_not_convert = _get_bnb_modules_to_not_convert(model, quantization_config)
     model = replace_with_bnb_linear(
         model,
         modules_to_not_convert=modules_to_not_convert,
@@ -971,7 +1003,7 @@ def _init_model_bnb_streaming(
     )
 
     # 5. Stream-load weights, quantizing each tensor on the fly
-    _stream_load_bnb_weights(model, model_dir, device, torch_dtype)
+    _stream_load_bnb_weights(model, model_dir, device, torch_dtype, disable_mmap=disable_mmap)
 
     # 6. Store quantization_config on the model (HF convention)
     model.config.quantization_config = quantization_config

@@ -80,4 +80,8 @@ def test_rtx_spark_llama_70b_preserves_streaming_qlora_settings():
     assert config["quantization"]["load_in_4bit"] is True
     assert config["quantization"]["load_in_8bit"] is False
     assert config["quantization"]["bnb_4bit_quant_type"] == "nf4"
+    assert config["model"]["disable_mmap"] is True
+    assert config["step_scheduler"]["global_batch_size"] == 1
+    assert config["step_scheduler"]["local_batch_size"] == 1
+    assert config["packed_sequence"]["packed_sequence_size"] == 1024
     assert config["distributed"]["activation_checkpointing"] is True

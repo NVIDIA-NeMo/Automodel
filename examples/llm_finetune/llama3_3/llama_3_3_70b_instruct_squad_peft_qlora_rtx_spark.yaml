@@ -23,7 +23,7 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 32
+  global_batch_size: 1
   local_batch_size: 1
   ckpt_every_steps: 100
   val_every_steps: 600
@@ -42,6 +42,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
   torch_dtype: bfloat16
+  # Avoid mmap-backed page migration; the streaming loader still loads one shard at a time.
+  disable_mmap: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
