@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-import nemo_automodel.components.models.kimi_k3.model as kimi_k3_model
+import nemo_automodel.components.models.kimi_k3.situ as kimi_k3_situ
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.models.kimi_k3.model import KimiK3MoE, _build_moe_config
@@ -75,15 +75,15 @@ def _torch_backend(**overrides) -> BackendConfig:
 @pytest.fixture
 def restore_situ_cores():
     """Snapshot and restore the module-level SiTU cores around a test."""
-    orig_fwd = kimi_k3_model._situ_fwd_core
-    orig_bwd = kimi_k3_model._situ_bwd_core
-    orig_attn_res = kimi_k3_model._attn_res_core
-    orig_flag = kimi_k3_model._SITU_CORES_COMPILED
+    orig_fwd = kimi_k3_situ._situ_fwd_core
+    orig_bwd = kimi_k3_situ._situ_bwd_core
+    orig_attn_res = kimi_k3_situ._attn_res_core
+    orig_flag = kimi_k3_situ._SITU_CORES_COMPILED
     yield
-    kimi_k3_model._situ_fwd_core = orig_fwd
-    kimi_k3_model._situ_bwd_core = orig_bwd
-    kimi_k3_model._attn_res_core = orig_attn_res
-    kimi_k3_model._SITU_CORES_COMPILED = orig_flag
+    kimi_k3_situ._situ_fwd_core = orig_fwd
+    kimi_k3_situ._situ_bwd_core = orig_bwd
+    kimi_k3_situ._attn_res_core = orig_attn_res
+    kimi_k3_situ._SITU_CORES_COMPILED = orig_flag
 
 
 def test_compile_situ_defaults_to_false():
@@ -91,35 +91,35 @@ def test_compile_situ_defaults_to_false():
 
 
 def test_default_backend_leaves_cores_eager(restore_situ_cores):
-    orig_fwd = kimi_k3_model._situ_fwd_core
-    orig_bwd = kimi_k3_model._situ_bwd_core
+    orig_fwd = kimi_k3_situ._situ_fwd_core
+    orig_bwd = kimi_k3_situ._situ_bwd_core
 
-    orig_attn_res = kimi_k3_model._attn_res_core
+    orig_attn_res = kimi_k3_situ._attn_res_core
 
     _build_moe(_torch_backend())
 
-    assert kimi_k3_model._situ_fwd_core is orig_fwd
-    assert kimi_k3_model._situ_bwd_core is orig_bwd
-    assert kimi_k3_model._attn_res_core is orig_attn_res
-    assert kimi_k3_model._SITU_CORES_COMPILED is False
+    assert kimi_k3_situ._situ_fwd_core is orig_fwd
+    assert kimi_k3_situ._situ_bwd_core is orig_bwd
+    assert kimi_k3_situ._attn_res_core is orig_attn_res
+    assert kimi_k3_situ._SITU_CORES_COMPILED is False
 
 
 def test_compile_situ_wraps_cores_once(restore_situ_cores):
-    orig_fwd = kimi_k3_model._situ_fwd_core
-    orig_bwd = kimi_k3_model._situ_bwd_core
+    orig_fwd = kimi_k3_situ._situ_fwd_core
+    orig_bwd = kimi_k3_situ._situ_bwd_core
 
-    orig_attn_res = kimi_k3_model._attn_res_core
+    orig_attn_res = kimi_k3_situ._attn_res_core
 
     _build_moe(_torch_backend(compile_situ=True))
 
-    assert kimi_k3_model._SITU_CORES_COMPILED is True
-    assert kimi_k3_model._situ_fwd_core is not orig_fwd
-    assert kimi_k3_model._situ_bwd_core is not orig_bwd
-    assert kimi_k3_model._attn_res_core is not orig_attn_res
+    assert kimi_k3_situ._SITU_CORES_COMPILED is True
+    assert kimi_k3_situ._situ_fwd_core is not orig_fwd
+    assert kimi_k3_situ._situ_bwd_core is not orig_bwd
+    assert kimi_k3_situ._attn_res_core is not orig_attn_res
 
     # A second layer/model construction must not re-wrap the shared cores.
-    compiled_fwd = kimi_k3_model._situ_fwd_core
-    compiled_bwd = kimi_k3_model._situ_bwd_core
+    compiled_fwd = kimi_k3_situ._situ_fwd_core
+    compiled_bwd = kimi_k3_situ._situ_bwd_core
     _build_moe(_torch_backend(compile_situ=True))
-    assert kimi_k3_model._situ_fwd_core is compiled_fwd
-    assert kimi_k3_model._situ_bwd_core is compiled_bwd
+    assert kimi_k3_situ._situ_fwd_core is compiled_fwd
+    assert kimi_k3_situ._situ_bwd_core is compiled_bwd

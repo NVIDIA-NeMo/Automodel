@@ -15,8 +15,9 @@
 import pytest
 import torch
 
-import nemo_automodel.components.moe.experts as experts_mod
-from nemo_automodel.components.moe.experts import (
+import nemo_automodel.components.moe.experts as _experts_unused  # noqa: F401
+import nemo_automodel.components.moe.optimized_ops as experts_mod
+from nemo_automodel.components.moe.optimized_ops import (
     _RW_CHUNK_THRESHOLD,
     _apply_router_weight_fp32,
     _RouterWeightMulFunction,

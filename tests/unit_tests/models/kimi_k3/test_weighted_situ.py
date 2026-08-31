@@ -15,8 +15,8 @@
 import pytest
 import torch
 
-import nemo_automodel.components.models.kimi_k3.model as kimi_k3_model
-from nemo_automodel.components.models.kimi_k3.model import (
+import nemo_automodel.components.models.kimi_k3.situ as kimi_k3_model
+from nemo_automodel.components.models.kimi_k3.situ import (
     _SITU_CHUNK_THRESHOLD,
     _weighted_situ,
     _WeightedSiTUFunction,
