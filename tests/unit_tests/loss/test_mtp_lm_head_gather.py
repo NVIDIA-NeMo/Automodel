@@ -31,6 +31,7 @@ DTensor LM head where the OOM occurred.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -274,6 +275,102 @@ def test_pipeline_loss_fused_ce_with_mtp_tuple_raises():
 
     with pytest.raises(ValueError, match="FusedLinearCrossEntropy is not supported with MTP"):
         loss_mod((logits, mtp_h), labels)
+
+
+def test_pipeline_loss_fused_ce_with_declared_mtp_hidden_tuple():
+    """A model may explicitly declare that its MTP tuple starts with hidden
+    states, allowing the main and auxiliary losses to share fused linear CE."""
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    model = _TinyModel()
+    model._pp_fused_linear_ce_mtp_supported = True
+    loss_mod = PipelineCausalLMLoss(FusedLinearCrossEntropy(), model, scaling_factor=SF)
+
+    hidden = torch.randn(B, S, H)
+    mtp_h = torch.randn(B, S, H)
+    seq_idx = torch.arange(S, dtype=torch.int32).unsqueeze(0).expand(B, -1)
+    labels = torch.randint(0, V, (B, S))
+    captured_main = {}
+    captured_mtp = {}
+
+    def fake_main(loss_fn, **kwargs):
+        captured_main.update(kwargs)
+        return hidden.new_tensor(2.0)
+
+    def fake_mtp(loss_fn, **kwargs):
+        captured_mtp.update(kwargs)
+        return hidden.new_tensor(3.0)
+
+    with (
+        mock.patch.object(_mtp, "calculate_loss", side_effect=fake_main),
+        mock.patch.object(_mtp, "calculate_mtp_loss", side_effect=fake_mtp),
+    ):
+        loss = loss_mod((hidden, mtp_h, seq_idx), labels)
+
+    torch.testing.assert_close(loss, hidden.new_tensor(5.0))
+    assert captured_main["hidden_states"] is hidden
+    assert captured_main["logits"] is None
+    assert len(captured_mtp["mtp_per_depth_h"]) == 1
+    assert captured_mtp["mtp_per_depth_h"][0] is mtp_h
+    assert captured_mtp["mtp_per_depth_logits"] is None
+    assert captured_mtp["seq_idx"] is seq_idx
+
+
+def test_pipeline_loss_prefers_precomputed_cp_targets_over_local_label_shift():
+    """An opted-in model's PP tail carries targets shifted before CP split."""
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    model = _TinyModel()
+    model._pp_fused_linear_ce_mtp_supported = True
+    model._pp_mtp_targets_in_output = True
+    model.mtp_config = SimpleNamespace(num_layers=1, loss_scaling_factor=SF)
+    loss_mod = PipelineCausalLMLoss(FusedLinearCrossEntropy(), model, scaling_factor=SF)
+
+    hidden = torch.randn(B, S, H)
+    mtp_h = torch.randn(B, S, H)
+    seq_idx = torch.arange(S, dtype=torch.int32).unsqueeze(0).expand(B, -1)
+    labels = torch.randint(0, V, (B, S))
+    mtp_targets = torch.full_like(labels, IGN)
+    mtp_targets[:, :-1] = labels[:, 1:]
+    captured_mtp = {}
+
+    def fake_main(loss_fn, **kwargs):
+        del loss_fn, kwargs
+        return hidden.new_tensor(2.0)
+
+    def fake_mtp(loss_fn, **kwargs):
+        del loss_fn
+        captured_mtp.update(kwargs)
+        return hidden.new_tensor(3.0)
+
+    with (
+        mock.patch.object(_mtp, "calculate_loss", side_effect=fake_main),
+        mock.patch.object(_mtp, "calculate_mtp_loss", side_effect=fake_mtp),
+    ):
+        loss = loss_mod((hidden, mtp_h, seq_idx, mtp_targets), labels)
+
+    torch.testing.assert_close(loss, hidden.new_tensor(5.0))
+    assert len(captured_mtp["mtp_per_depth_targets"]) == 1
+    assert captured_mtp["mtp_per_depth_targets"][0] is mtp_targets
+    assert captured_mtp["seq_idx"] is None
+    assert captured_mtp["cu_seqlens"] is None
+
+
+def test_pipeline_loss_rejects_missing_declared_mtp_target_tail():
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    model = _TinyModel()
+    model._pp_fused_linear_ce_mtp_supported = True
+    model._pp_mtp_targets_in_output = True
+    model.mtp_config = SimpleNamespace(num_layers=1, loss_scaling_factor=SF)
+    loss_mod = PipelineCausalLMLoss(FusedLinearCrossEntropy(), model, scaling_factor=SF)
+
+    hidden = torch.randn(B, S, H)
+    mtp_h = torch.randn(B, S, H)
+    seq_idx = torch.arange(S, dtype=torch.int32).unsqueeze(0).expand(B, -1)
+    labels = torch.randint(0, V, (B, S))
+    with pytest.raises(ValueError, match="target tensors"):
+        loss_mod((hidden, mtp_h, seq_idx), labels)
 
 
 def test_non_fused_path_does_not_gather_lm_head():

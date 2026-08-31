@@ -310,6 +310,10 @@ def calculate_mtp_loss(
 class PipelineCausalLMLoss(nn.Module):
     """Pipeline schedule loss that can add MTP auxiliary CE on the last stage.
 
+    Models declaring ``_pp_mtp_targets_in_output`` append globally shifted,
+    CP-local MTP targets after the normal output tuple. The loss strips that
+    tail first and uses it instead of shifting rank-local labels.
+
     Per-microbatch ``seq_idx`` is read from a trailing element of the
     last-stage output tuple — the model appends an ``[B, S] int32`` tail
     when MTP is enabled. This binds each microbatch's seq_idx to its loss
@@ -335,13 +339,33 @@ class PipelineCausalLMLoss(nn.Module):
         # Legacy THD-pack fallback used when the model has no seq_idx tail.
         self.cu_seqlens: torch.Tensor | None = None
 
+    def _extract_mtp_target_tail(self, output) -> tuple[tuple[torch.Tensor, ...] | None, object]:
+        """Strip a model-declared tail of authoritative per-depth targets."""
+        if not getattr(self.model, "_pp_mtp_targets_in_output", False):
+            return None, output
+
+        mtp_config = getattr(self.model, "mtp_config", None)
+        num_depths = int(getattr(mtp_config, "num_layers", 0) or 0)
+        if num_depths == 0:
+            return None, output
+        if not isinstance(output, tuple) or len(output) <= num_depths:
+            raise ValueError(f"Pipeline MTP output must end with {num_depths} precomputed target tensors.")
+
+        targets = output[-num_depths:]
+        if not all(
+            isinstance(target, torch.Tensor) and target.dtype == torch.long and target.dim() == 2 for target in targets
+        ):
+            raise ValueError(f"Pipeline MTP output must end with {num_depths} int64 [batch, sequence] target tensors.")
+        return tuple(targets), output[:-num_depths]
+
     @staticmethod
     def _extract_seq_idx_tail(output) -> tuple[torch.Tensor | None, object]:
         """Detect and strip a trailing per-microbatch seq_idx from output.
 
         Convention: with MTP enabled the last-stage output is
-        ``(logits, *mtp_per_depth_h, seq_idx)`` with an ``[B, S] int32``
-        tail — dtype alone discriminates.
+        ``(primary_output, *mtp_per_depth_h, seq_idx)`` with an ``[B, S] int32``
+        tail — dtype alone discriminates. ``primary_output`` is logits for a
+        logit-based loss and hidden states for a fused linear CE loss.
         """
         if isinstance(output, tuple) and len(output) > 0:
             last = output[-1]
@@ -357,20 +381,29 @@ class PipelineCausalLMLoss(nn.Module):
         Args:
             output: bare hidden states ``[B, S, H]`` (FusedLinearCrossEntropy
                 path), a HF output with logits ``[B, S, V]``, or an MTP tuple
-                ``(logits, *mtp_per_depth_h[, seq_idx])`` with ``seq_idx``
-                ``[B, S]`` int32. A tuple with FusedLinearCrossEntropy raises.
+                ``(primary_output, *mtp_per_depth_h[, seq_idx][, *mtp_targets])``
+                with ``seq_idx`` ``[B, S]`` int32 and authoritative targets
+                ``[B, S]`` int64. For models declaring
+                ``_pp_fused_linear_ce_mtp_supported``, ``primary_output`` is
+                hidden states under FusedLinearCrossEntropy; otherwise it is
+                logits.
             labels: target token ids ``[B, S]`` int64.
 
         Returns:
             Scalar loss tensor.
         """
+        mtp_per_depth_targets, output = self._extract_mtp_target_tail(output)
         seq_idx_mb, output = self._extract_seq_idx_tail(output)
 
         if isinstance(output, tuple):
             if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                raise ValueError("FusedLinearCrossEntropy is not supported with MTP under pipeline parallelism")
-            logits = output[0]
-            hidden_states = None
+                if not getattr(self.model, "_pp_fused_linear_ce_mtp_supported", False):
+                    raise ValueError("FusedLinearCrossEntropy is not supported with MTP under pipeline parallelism")
+                logits = None
+                hidden_states = output[0]
+            else:
+                logits = output[0]
+                hidden_states = None
             mtp_per_depth_h = None
             mtp_per_depth_logits = None
             if len(output) > 1:
@@ -415,12 +448,13 @@ class PipelineCausalLMLoss(nn.Module):
                 self.loss_fn,
                 mtp_per_depth_h=mtp_per_depth_h,
                 mtp_per_depth_logits=mtp_per_depth_logits,
+                mtp_per_depth_targets=mtp_per_depth_targets,
                 labels=labels,
                 model=self.model,
                 scaling_factor=scaling_factor,
                 ignore_index=self.ignore_index,
-                cu_seqlens=self.cu_seqlens,
-                seq_idx=seq_idx_mb,
+                cu_seqlens=None if mtp_per_depth_targets is not None else self.cu_seqlens,
+                seq_idx=None if mtp_per_depth_targets is not None else seq_idx_mb,
                 lm_weight=shared_lm_weight,
                 grad_reduce_group=self.grad_reduce_group,
             )

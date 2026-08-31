@@ -646,6 +646,27 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+def test_apply_ep_parallelizes_inner_decoder_mtp_experts(monkeypatch):
+    """Native decoders may register MTP blocks directly beside their layers."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+
+    backbone_block = DummyBlock(mlp=DummyMoE())
+    mtp_block = DummyBlock(mlp=DummyMoE())
+    model = DummyModel([backbone_block])
+    model.mtp_layers = LayerContainer([mtp_block])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_ep(model, ep_mesh)
+
+    assert [call.kwargs["module"] for call in parallelize_module_mock.call_args_list] == [
+        backbone_block.mlp.experts,
+        mtp_block.mlp.experts,
+    ]
+
+
 def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
     """Diffusion Gemma exposes the MoE branch as block.moe, not block.mlp."""
     P = _import_parallelizer_with_stubs(monkeypatch)

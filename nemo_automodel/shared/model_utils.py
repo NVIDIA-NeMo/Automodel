@@ -46,6 +46,10 @@ def iter_transformer_and_mtp_blocks(model: nn.Module) -> Iterator[tuple[nn.Modul
             yield layers, layer_id, block
 
     mtp_layers = getattr(getattr(model, "mtp", None), "layers", None)
+    if mtp_layers is None:
+        # Some native architectures keep checkpoint-compatible MTP blocks
+        # directly on the inner decoder.
+        mtp_layers = getattr(text_model, "mtp_layers", None)
     if mtp_layers is not None:
         for layer_id, block in mtp_layers.named_children():
             yield mtp_layers, layer_id, block
