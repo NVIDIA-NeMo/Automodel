@@ -152,8 +152,8 @@ def build_eagle3_dataloader(
     shuffle_seed: int | None = 42,
     mask_reasoning_content: bool = False,
     packed_sequence_size: int = 0,
-    mask_generation_prompt: bool = False,
     dp_mesh=None,
+    mask_generation_prompt: bool = False,
 ) -> DataLoader:
     """Build a dataloader backed by the repo's chat formatting utilities.
 

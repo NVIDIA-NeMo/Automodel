@@ -397,11 +397,11 @@ def _format_example(
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
-    mask_generation_prompt: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
     truncate_history: bool = False,
     trim_incomplete_last_turn: bool = False,
+    mask_generation_prompt: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``.
 
@@ -440,11 +440,11 @@ def _format_example_impl(
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
-    mask_generation_prompt: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
     truncate_history: bool = False,
     trim_incomplete_last_turn: bool = False,
+    mask_generation_prompt: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``."""
     raw_tools = example.get("tools")
@@ -678,10 +678,10 @@ def make_agent_chat_dataset(
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
-    mask_generation_prompt: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
     truncate_history: bool = False,
+    mask_generation_prompt: bool = False,
 ) -> LazyMappedDataset:
     """Load a multi-turn function-calling SFT dataset.
 
@@ -869,15 +869,15 @@ class AgentChatConfig:
     """Truncation strategy forwarded to the tokenizer."""
     mask_reasoning_content: bool = False
     """If True, exclude assistant ``reasoning_content`` tokens from the loss."""
-    mask_generation_prompt: bool = False
-    """If True, exclude the template-supplied prefix of each assistant turn (role header and any
-    empty reasoning block such as ``<think></think>``) from the loss."""
     train_on_last_turn_only: bool = False
     """If True, supervise only the final assistant turn of each dialogue."""
     drop_history_reasoning_content: bool = False
     """If True, strip ``reasoning_content`` from all but the final assistant turn."""
     truncate_history: bool = False
     """If True, drop oldest exchanges until the dialogue fits ``seq_length``."""
+    mask_generation_prompt: bool = False
+    """If True, exclude the template-supplied prefix of each assistant turn (role header and any
+    empty reasoning block such as ``<think></think>``) from the loss."""
 
     def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> LazyMappedDataset:
         """Build the agent chat :class:`LazyMappedDataset` from this :class:`AgentChatConfig` and a runtime tokenizer."""

@@ -24,6 +24,7 @@ that the helpers correctly
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Dict, List
 
 import pytest
@@ -35,7 +36,6 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     _package_tokenized_example,
     _pad_to_seq_length,
     _perturbed_assistant_message,
-    _sentinel_text,
     _tokenize_chat,
     _warned_add_pad_token,
     _warned_generation_prompt,
@@ -1873,8 +1873,8 @@ def test_mask_generation_prompt_reuses_multiturn_prefix_renders():
     plain_prefix_renders = [n for n, gen, original in calls if not gen and original and n < len(messages)]
     # Each proper prefix (1, 2, 3 messages) is rendered once and shared by both builders.
     assert sorted(plain_prefix_renders) == [1, 2, 3]
-    # Plus one bound render per assistant turn (the turn with its text swapped out).
-    assert sorted(n for n, gen, original in calls if not gen and not original) == [2, 4]
+    # Plus two bound renders per assistant turn (the turn with its text swapped for each sentinel).
+    assert sorted(n for n, gen, original in calls if not gen and not original) == [2, 2, 4, 4]
 
     # truncation=True on a sample that fits is not a truncation: the prefix renders are still
     # shared and the full conversation is not rendered again as an untruncated reference.
@@ -1981,10 +1981,6 @@ def test_mask_generation_prompt_bound_caps_offset_zero_anchor():
 
 
 def test_perturbed_assistant_message_swaps_generated_text_and_drops_tool_calls():
-    assert _sentinel_text("The answer") == "0"
-    assert _sentinel_text("  0.5 kg") == "1"
-    assert _sentinel_text("") == "0"
-
     message = {
         "role": "assistant",
         "name": "bot",
@@ -1993,23 +1989,77 @@ def test_perturbed_assistant_message_swaps_generated_text_and_drops_tool_calls()
         "tool_calls": _TOOL_CALL,
         "tool_responses": [{"name": "get_weather", "response": "sunny"}],
     }
-    perturbed = _perturbed_assistant_message(message)
+    perturbed = _perturbed_assistant_message(message, "1")
     assert perturbed == {
         "role": "assistant",
         "name": "bot",
         "content": "1",
-        "reasoning_content": "0",
+        "reasoning_content": "1",
         "tool_responses": message["tool_responses"],  # environment text, not model output
     }
     assert message["tool_calls"] is _TOOL_CALL  # the original is untouched
 
     parts = {"role": "assistant", "content": [{"type": "image"}, {"type": "text", "text": "0 apples"}]}
-    assert _perturbed_assistant_message(parts)["content"] == [{"type": "image"}, {"type": "text", "text": "1"}]
-    assert _perturbed_assistant_message({"role": "assistant", "content": None, "reasoning": "r"}) == {
+    assert _perturbed_assistant_message(parts, "1")["content"] == [{"type": "image"}, {"type": "text", "text": "1"}]
+    assert _perturbed_assistant_message({"role": "assistant", "content": None, "reasoning": "r"}, "0") == {
         "role": "assistant",
         "content": "0",
         "reasoning": "0",
     }
+
+
+class _StubTokenizerChatNoGenGemmaLikeNormalizing(_StubTokenizerChatNoGenGemmaLike):
+    """Gemma-like stub whose vocabulary folds full-width digits onto ASCII (NFKC-style
+    normalization), so two texts that differ as characters can share a token id."""
+
+    chat_template = "<dummy gemma-like normalizing template>"
+
+    def _id_for_token(self, tok: str) -> int:
+        return super()._id_for_token(unicodedata.normalize("NFKC", tok))
+
+
+def test_mask_generation_prompt_bound_is_token_level_under_normalization():
+    # The answer starts with a full-width zero that the tokenizer normalizes onto the same
+    # id as the ASCII "0" sentinel. A character-level sentinel would share the first content
+    # token with the real render and let the bound reach it; the token-level bound uses a
+    # second sentinel that cannot also collide, so the header-less continuation turn keeps
+    # every generated token supervised.
+    tok = _StubTokenizerChatNoGenGemmaLikeNormalizing()
+    text = "０ degrees in Paris"
+    messages = [
+        {"role": "user", "content": "How cold is it?"},
+        {"role": "assistant", "content": "", "tool_calls": _TOOL_CALL},
+        {"role": "tool", "tool_call_id": "c1", "content": "0"},
+        {"role": "assistant", "content": text},
+    ]
+    assert tok._id_for_token("０") == tok._id_for_token("0")
+
+    default = _format(tok, messages)
+    masked = _format(tok, messages, mask_generation_prompt=True)
+    assert masked["input_ids"] == default["input_ids"]
+    body = ["<tool_call>", "get_weather", "</tool_call>", "0", "degrees", "in", "Paris", "<eot>"]
+    assert _decode(tok, default) == ["<assistant>", *body]
+    assert _decode(tok, masked) == body
+
+
+def test_mask_generation_prompt_fails_closed_when_sentinel_renders_do_not_diverge():
+    # A tokenizer that maps every single-character text onto one UNK id renders both sentinels
+    # identically, so nothing about the generated-text boundary is proven: the bound is zero and
+    # even the real header stays in the loss rather than risking assistant content.
+    class _UnkSingleChars(_StubTokenizerChatNoGenThinking):
+        chat_template = "<dummy unk template>"
+
+        def _id_for_token(self, tok: str) -> int:
+            if len(tok) == 1:
+                return 0  # UNK
+            return super()._id_for_token(tok)
+
+    tok = _UnkSingleChars()
+    default = _format(tok, _NO_REASONING)
+    masked = _format(tok, _NO_REASONING, mask_generation_prompt=True)
+    assert masked["input_ids"] == default["input_ids"]
+    assert masked["loss_mask"] == default["loss_mask"]
+    assert _decode(tok, default) == ["<assistant>", "<think>", "</think>", "final", "answer", "<eos>"]
 
 
 class _StubTokenizerChatGenSymmetricTurns(_StubTokenizerChatNoGen):

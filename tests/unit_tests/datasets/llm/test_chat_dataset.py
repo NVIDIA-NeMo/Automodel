@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import json
 
 import pytest
@@ -637,3 +638,28 @@ def test_chat_dataset_config_forwards_mask_generation_prompt(monkeypatch):
     tcd.ChatDatasetConfig(path_or_dataset_id="ignored", mask_generation_prompt=True).build(tokenizer=object())
     assert captured["mask_generation_prompt"] is True
     assert tcd.ChatDatasetConfig(path_or_dataset_id="ignored").mask_generation_prompt is False
+
+
+def test_chat_dataset_config_positional_layout_is_unchanged():
+    # The dataclass is not keyword-only, so the new field must come after every pre-existing
+    # one: a positional construction written against the old layout keeps its meaning.
+    cfg = tcd.ChatDatasetConfig(
+        "ignored",  # path_or_dataset_id
+        "train",  # split
+        None,  # name
+        64,  # seq_length
+        "do_not_pad",  # padding
+        "do_not_truncate",  # truncation
+        None,  # start_of_turn_token
+        None,  # chat_template
+        None,  # shuffle_seed
+        False,  # mask_reasoning_content
+        True,  # mask_history
+        True,  # unshifted
+        True,  # skip_invalid_samples
+    )
+    assert cfg.mask_history is True
+    assert cfg.unshifted is True
+    assert cfg.skip_invalid_samples is True
+    assert cfg.mask_generation_prompt is False
+    assert [f.name for f in dataclasses.fields(tcd.ChatDatasetConfig)][-1] == "mask_generation_prompt"

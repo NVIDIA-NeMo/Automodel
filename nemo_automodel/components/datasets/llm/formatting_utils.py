@@ -267,42 +267,68 @@ def _truncation_window_offset(
     )
 
 
-def _sentinel_text(original: Any) -> str:
-    """Return a short text whose first character differs from ``original``'s.
-
-    Rendering an assistant message with its generated text swapped for this
-    sentinel diverges from the real render at (or before) the first token of
-    that text, which is what makes the diff a bound on the template's own prefix.
-    """
-    first = next((char for char in str(original) if not char.isspace()), "")
-    return "1" if first == "0" else "0"
+_SENTINEL_TEXTS = ("0", "1")
+"""Two replacement texts for :func:`_generation_prefix_bound`. Their renders are compared
+token by token, so what matters is that they tokenize differently, not how they read."""
 
 
-def _perturbed_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of an assistant message whose model-generated text is replaced.
+def _perturbed_assistant_message(message: dict[str, Any], sentinel: str) -> dict[str, Any]:
+    """Return a copy of an assistant message whose model-generated text is replaced by ``sentinel``.
 
-    Every field the model would produce is swapped for a sentinel that differs
-    from the first character on: ``content`` (string or text parts) and any
-    reasoning field. ``tool_calls`` are dropped rather than rewritten, because
-    their serialization starts with boilerplate (``{"name": "``) the model
-    nevertheless generates; dropping them makes the render diverge at the call
-    marker instead.
+    Every field the model would produce is swapped: ``content`` (string or text
+    parts) and any reasoning field. ``tool_calls`` are dropped rather than
+    rewritten, because their serialization starts with boilerplate
+    (``{"name": "``) the model nevertheless generates; dropping them makes the
+    render diverge at the call marker instead.
     """
     perturbed = {k: v for k, v in message.items() if k != "tool_calls"}
     content = message.get("content")
     if isinstance(content, list):
         perturbed["content"] = [
-            {**part, "text": _sentinel_text(part.get("text", ""))}
-            if isinstance(part, dict) and "text" in part
-            else part
-            for part in content
+            {**part, "text": sentinel} if isinstance(part, dict) and "text" in part else part for part in content
         ]
     else:
-        perturbed["content"] = _sentinel_text(content or "")
+        perturbed["content"] = sentinel
     for key in ("reasoning_content", "reasoning"):
         if message.get(key):
-            perturbed[key] = _sentinel_text(message[key])
+            perturbed[key] = sentinel
     return perturbed
+
+
+def _generation_prefix_bound(
+    tokenizer: "PreTrainedTokenizer",
+    prefix: list[dict[str, Any]],
+    message: dict[str, Any],
+    conversation_ids: list[int],
+    turn: list[int],
+    **render_kwargs: Any,
+) -> int:
+    """Return how many leading tokens of ``turn`` provably do not depend on ``message``.
+
+    The turn is rendered again with its generated text swapped for each of
+    :data:`_SENTINEL_TEXTS`. Tokens that all renders share with the real turn
+    come from the template, so they may be masked as the generation prompt;
+    the bound is the shortest such run. The proof is token-level: character
+    differences are not enough, since normalization or an UNK mapping can map
+    the real text and a sentinel onto the same token id. Requiring two
+    sentinel renders that differ from each other at the bound guarantees the
+    real first token can coincide with at most one of them. When the sentinel
+    renders do not diverge at all, or a render already differs inside the
+    conversation prefix, nothing is proven and the bound is ``0`` (nothing is
+    masked).
+    """
+    tails: list[list[int]] = []
+    bound = len(turn)
+    for sentinel in _SENTINEL_TEXTS:
+        ids = _tokenize_chat(tokenizer, prefix + [_perturbed_assistant_message(message, sentinel)], **render_kwargs)
+        if ids[: len(conversation_ids)] != conversation_ids:
+            return 0
+        tail = ids[len(conversation_ids) :]
+        tails.append(tail)
+        bound = min(bound, _common_prefix_length(tail, turn))
+    if tails[0] == tails[1]:
+        return 0
+    return min(bound, _common_prefix_length(tails[0], tails[1]))
 
 
 def _common_prefix_length(left: list[int], right: list[int]) -> int:
@@ -489,11 +515,14 @@ def _build_generation_prompt_mask(
     prepends a thinking system block, GLM appends ``/nothink``), and a turn
     that continues a previous one (after a tool response) has no header, so
     the prompt's added tokens can contain earlier turns whose text repeats the
-    current one. Every anchor is therefore capped by a structural bound: the
-    turn is rendered once more with its generated text replaced by a sentinel
-    (:func:`_perturbed_assistant_message`), and only tokens the two renders
-    share, the part of the turn that does not depend on the message, may be
-    marked. Assistant content can never be reached, whichever anchor won.
+    current one. Every anchor is therefore capped by a structural bound
+    (:func:`_generation_prefix_bound`): the turn is rendered again with its
+    generated text replaced by two different sentinels, and only tokens every
+    render shares, the part of the turn that provably does not depend on the
+    message, may be marked. The check is on token ids, so a tokenizer that
+    normalizes a sentinel onto the real text's first token cannot widen it, and
+    it fails closed (marks nothing) when the sentinel renders do not diverge.
+    Assistant content can never be reached, whichever anchor won.
 
     Truncation is handled like :func:`_build_reasoning_mask`: spans are located
     in the untruncated render and mapped back through the retained window,
@@ -502,7 +531,7 @@ def _build_generation_prompt_mask(
     once per process), as is a leading assistant turn whose template cannot
     render an empty conversation; any other render error propagates. Positions are computed from unpadded
     (left-aligned) ids, like :func:`_build_multiturn_assistant_mask`, whose
-    prefix renders are reused through ``prefix_cache``. Up to three extra
+    prefix renders are reused through ``prefix_cache``. Up to four extra
     ``apply_chat_template`` renders per assistant turn are the price, which is
     why this is opt-in.
     """
@@ -589,13 +618,9 @@ def _build_generation_prompt_mask(
         if best[1] == 0:
             continue
 
-        # The tokens of the turn that do not depend on the message, i.e. the template's own
-        # prefix: no anchor may mark anything past them. A render that already differs
-        # inside the conversation prefix proves nothing and marks nothing.
-        perturbed_ids = _tokenize_chat(tokenizer, prefix + [_perturbed_assistant_message(message)], **render_kwargs)
-        bound = 0
-        if perturbed_ids[:start] == reference_full_ids[:start]:
-            bound = _common_prefix_length(perturbed_ids[start:], turn)
+        # The tokens of the turn that provably do not depend on the message, i.e. the
+        # template's own prefix: no anchor may mark anything past them.
+        bound = _generation_prefix_bound(tokenizer, prefix, message, reference_full_ids[:start], turn, **render_kwargs)
 
         first = start - reference_offset
         for pos in range(max(first, 0), min(first + min(best[1], bound), len(generation_prompt_mask))):

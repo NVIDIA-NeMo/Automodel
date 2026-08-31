@@ -345,15 +345,15 @@ class ChatDatasetConfig:
     """If set, shuffles Hub/Parquet data before applying a split slice."""
     mask_reasoning_content: bool = False
     """If ``True``, exclude rendered reasoning traces from the loss mask."""
-    mask_generation_prompt: bool = False
-    """If ``True``, exclude the template-supplied prefix of each assistant turn (role header and any
-    empty reasoning block such as ``<think></think>``) from the loss mask."""
     mask_history: bool = False
     """If ``True``, supervise only the final assistant turn."""
     unshifted: bool = False
     """Passed through to ``format_chat_template``."""
     skip_invalid_samples: bool = False
     """If ``True``, skip malformed JSONL lines when reading local files."""
+    mask_generation_prompt: bool = False
+    """If ``True``, exclude the template-supplied prefix of each assistant turn (role header and any
+    empty reasoning block such as ``<think></think>``) from the loss mask."""
 
     def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "ChatDataset":
         """Build a :class:`ChatDataset` from this :class:`ChatDatasetConfig` and a runtime tokenizer."""

@@ -35,6 +35,10 @@ recipe_args:
   log_every_steps: 10
   max_grad_norm: 1.0
   # mask_reasoning_content: true   # exclude <think>...</think> reasoning traces from loss
+  # mask_generation_prompt: true   # exclude the template-supplied turn prefix (role header and the
+  #                                # empty <think>\n\n</think>\n\n block Qwen3 inserts) from loss.
+  #                                # With cached_target_path the cache must have been produced with
+  #                                # precompute_eagle3 --mask-generation-prompt, or training refuses to start.
 
   # Sequence packing (EAGLE-3, colocated backend only). > 0 packs variable-length
   # samples into rows of this width with per-document block-causal attention,

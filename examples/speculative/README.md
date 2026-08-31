@@ -247,6 +247,33 @@ Offline cache is produced by `precompute_eagle3.py`
 then consumed through `cached_target_path`. DSpark also supports a text-only offline cache through `precompute_dspark.py`
 for HF-loadable single-process text targets.
 
+The loss-mask options live under `recipe_args` in the speculative recipes (not under a
+`dataset:` block): `mask_reasoning_content` drops rendered reasoning traces from the loss, and
+`mask_generation_prompt` drops the prefix of each assistant turn that the chat template's
+generation prompt supplies at inference (the role header and any empty reasoning block such as the
+`<think>\n\n</think>\n\n` Qwen3 inserts). Both default to `false`. The offline cache stores the
+loss mask, so a cache is tied to the options it was produced with: the producer takes the same two
+flags, records them in the manifest, and the cached trainer refuses to start when the recipe
+setting differs from the manifest. To train with `mask_generation_prompt` on a cache, pass the
+flag at both ends:
+
+```bash
+python -m nemo_automodel.components.speculative.precompute_eagle3 \
+  --target-model Qwen/Qwen3-8B \
+  --input-data ./cache/dataset/perfectblend-qwen3-8b-regen-messages \
+  --output-dir ./cache/eagle3_qwen3_8b_maskgen \
+  --mask-generation-prompt
+```
+
+```yaml
+recipe_args:
+  cached_target_path: ./cache/eagle3_qwen3_8b_maskgen
+  mask_generation_prompt: true
+```
+
+The online backends (`colocated`, `remote`) need only the `recipe_args` key; see the commented
+line in `eagle3/qwen3_eagle3_perfectblend.yaml`.
+
 For DSpark targets too large to fit on one node (DeepSeek-V4-Flash, GLM-5.2), a
 **distributed** precompute (`precompute_dspark_dist.py`) loads the target frozen
 through the same expert-parallel and FSDP2 path as online training and writes the
