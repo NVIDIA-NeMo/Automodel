@@ -2113,16 +2113,27 @@ def _kv_sharing_survives_checkpoint_replay(model: nn.Module) -> bool:
 
     ``checkpoint_wrapper`` replays a whole decoder block during backward with the
     arguments the forward saw. Unlike HF's ``GradientCheckpointingLayer.__call__``
-    it cannot drop ``past_key_values`` from that replay, so a model whose shared
-    layers read an accumulating ``Cache`` calls ``Cache.update()`` twice and the
-    recomputed K/V no longer matches the forward. That surfaces as a
-    ``CheckpointError`` about changed tensor metadata (observed on native HF
-    ``Gemma3nForCausalLM`` with ``use_cache=True``), so KV-shared models stay on
-    ``apply_submodule_checkpointing`` by default.
+    it cannot drop ``past_key_values`` from that replay, so every layer that
+    writes to a cache writes to it a second time. A KV-shared model then needs
+    both halves to hold:
 
-    A model whose shared-K/V store is replay-safe -- a pass-through holder rather
-    than an accumulating cache -- opts in by setting the class attribute
-    ``kv_sharing_survives_checkpoint_replay = True``.
+    * the layers that populate the cache -- the *non*-shared ones, which are what
+      call ``Cache.update()`` -- must not accumulate on the replay, or the
+      recomputed K/V stops matching the forward;
+    * the shared layers must still read the K/V their source layer produced.
+
+    Neither holds for a model backed by an accumulating ``Cache``: the second
+    ``Cache.update()`` grows the entry and backward dies with a
+    ``CheckpointError`` about changed tensor metadata (observed on native HF
+    ``Gemma3nForCausalLM`` with ``use_cache=True``). KV-shared models therefore
+    stay on ``apply_submodule_checkpointing``, which leaves attention unwrapped,
+    by default.
+
+    A model that satisfies both halves opts in by setting the class attribute
+    ``kv_sharing_survives_checkpoint_replay = True``. Gemma4 E2B/E4B qualify: a
+    pass-through holder stands in for the cache, and the shared layers read a
+    separate store that the replay does not disturb (see
+    ``gemma4_moe/model.py``).
 
     Args:
         model: The model about to be checkpointed.
