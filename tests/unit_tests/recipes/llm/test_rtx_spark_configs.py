@@ -37,6 +37,7 @@ def test_rtx_spark_configs_target_single_gpu_gb10(relative_path):
     assert Path(relative_path).stem.endswith("_rtx_spark")
     assert config["ci"]["cluster_tag"] == "gb10"
     assert config["ci"]["nproc_per_node"] == 1
+    assert config["ci"]["nodes"] == 1
     assert config["distributed"]["strategy"] == "fsdp2"
     assert config["distributed"]["tp_size"] == 1
     assert config["distributed"]["cp_size"] == 1

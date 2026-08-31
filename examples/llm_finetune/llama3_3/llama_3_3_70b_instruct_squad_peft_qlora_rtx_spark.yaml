@@ -112,3 +112,4 @@ ci:
   time: "00:30:00"
   nproc_per_node: 1
   cluster_tag: gb10
+  nodes: 1
