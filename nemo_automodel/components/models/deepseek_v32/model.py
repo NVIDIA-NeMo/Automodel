@@ -135,6 +135,9 @@ class DeepseekV32Model(DeepseekV3Model):
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
+            # Same policy as V3: HF returns topk_weights gathered from the fp32
+            # scores with no cast back. V3.2 builds its own moe_defaults, so the
+            # V3 line does not reach it and the default is repeated here.
             router_weights_fp32=True,
             dtype=model_dtype,
         )
@@ -216,6 +219,10 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
 
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
+        # This __init__ calls nn.Module.__init__ directly rather than super(), so
+        # DeepseekV3ForCausalLM's gate_precision default never runs for V3.2 and is
+        # repeated here. replace() rather than in-place: the caller's BackendConfig
+        # may be shared with other models, which must not inherit this default.
         resolved_backend = backend or BackendConfig()
         if resolved_backend.gate_precision is None:
             resolved_backend = replace(resolved_backend, gate_precision=torch.float32)

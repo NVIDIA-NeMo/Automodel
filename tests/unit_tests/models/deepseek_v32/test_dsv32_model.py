@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import replace
 import importlib.util
 import sys
 import types
+from dataclasses import replace
 from unittest.mock import patch
 
 import torch

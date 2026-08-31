@@ -159,6 +159,10 @@ class DeepseekV3Model(nn.Module):
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
+            # HF gathers topk_weights from the fp32 scores and returns them with
+            # no cast back, so expert compute sees fp32. Without this, Gate.forward
+            # applies weights.type_as(x) and hands over bf16. Set in moe_defaults,
+            # above the moe_overrides update, so a caller override still wins.
             router_weights_fp32=True,
             dtype=model_dtype,
         )
@@ -306,9 +310,11 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
-        # The HF DeepSeek-V3 reference computes router scoring in fp32; routing is highly
-        # precision-sensitive (small bf16 errors flip expert selection) and the gate is tiny,
-        # so default to fp32 gate compute unless the user explicitly overrides it.
+        # HF's DeepseekV3TopkRouter runs the router projection in fp32, so default
+        # gate_precision to fp32. Scoring is already fp32 via Gate's score_dtype
+        # default - this covers the projection only.
+        # replace() rather than in-place: the caller's BackendConfig may be shared
+        # with other models, which must not inherit a model-owned default.
         resolved_backend = backend or BackendConfig()
         if resolved_backend.gate_precision is None:
             resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
