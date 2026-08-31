@@ -56,6 +56,7 @@ def test_rtx_spark_8b_packed_recipes_use_supported_attention(relative_path, mode
     assert config["model"]["pretrained_model_name_or_path"] == model_name
     assert config["model"]["force_hf"] is True
     assert config["model"]["attn_implementation"] == "flash_attention_2"
+    assert config["model"]["disable_mmap"] is True
     assert config["step_scheduler"]["global_batch_size"] == 1
     assert config["step_scheduler"]["local_batch_size"] == 1
     assert config["packed_sequence"]["packed_sequence_size"] == 128

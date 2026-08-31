@@ -44,6 +44,9 @@ model:
   # HF FlashAttention-2 keeps packed training on the supported RTX Spark path.
   force_hf: true
   attn_implementation: flash_attention_2
+  # Avoid slow file-backed mmap page migration during HF's CPU-to-CUDA move.
+  # An 8B BF16 checkpoint can be materialized safely inside the 64 GB UMA cap.
+  disable_mmap: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
