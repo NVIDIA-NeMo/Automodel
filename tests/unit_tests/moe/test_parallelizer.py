@@ -1986,6 +1986,35 @@ def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
     assert _find_call_by_first_arg(fully_shard_mock, block) is None
 
 
+def test_apply_fsdp_uses_hy_v4_wrapper_only_for_hy_v4(monkeypatch):
+    """HY V4 gets its typed wrapper without changing generic MoE FSDP."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+
+    hy_v4_fsdp_stub = types.ModuleType("nemo_automodel.components.models.hy_v4.fsdp")
+    hy_v4_fully_shard_mock = MagicMock()
+    hy_v4_fsdp_stub.fully_shard_hy_v4 = hy_v4_fully_shard_mock
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models.hy_v4.fsdp", hy_v4_fsdp_stub)
+
+    block = DummyBlock(mlp=DummyMoE())
+    model = DummyModel([block])
+    model.config = types.SimpleNamespace(model_type="hy_v4")
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        lm_head_precision=None,
+    )
+
+    assert _find_call_by_first_arg(hy_v4_fully_shard_mock, block) is not None
+    assert _find_call_by_first_arg(fully_shard_mock, block) is None
+
+
 def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
     """Test that parallelize_model passes lm_head_precision to apply_fsdp."""
     P = _import_parallelizer_with_stubs(monkeypatch)

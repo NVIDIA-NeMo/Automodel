@@ -229,6 +229,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "HYV4ForCausalLM",
+            ("nemo_automodel.components.models.hy_v4.model", "HyV4ForCausalLM"),
+        ),
+        (
             "HYV3ForCausalLM",
             ("nemo_automodel.components.models.hy_v3.model", "HYV3ForCausalLM"),
         ),
@@ -344,6 +348,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
     "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
+    "hy_v4": ("nemo_automodel.components.models.hy_v4.config", "HyV4Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),

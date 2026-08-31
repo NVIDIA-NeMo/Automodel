@@ -1,0 +1,58 @@
+---
+title: "Hy4-preview"
+description: "Tencent HY4-preview sparse-MoE language model"
+slug: model-coverage/large-language-models/tencent/hy4-preview
+---
+
+[Hy4-preview](https://huggingface.co/tencent/Hy4-preview) is Tencent's approximately 780B-parameter sparse Mixture-of-Experts language model. Its 78-layer backbone combines independent Hyper-Connections (iHC), Multi-head Latent Attention, a learned attention sink, Dynamic Sparse Attention with IndexShare, 256 routed experts plus one shared expert, and one checkpoint-native multi-token-prediction layer.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `HYV4ForCausalLM` |
+| **Parameters** | Approximately 780B including MTP |
+| **HF Org** | [tencent](https://huggingface.co/tencent) |
+
+</Info>
+
+## Available Models
+
+- **Hy4-preview**: 78 backbone layers, top-8 routing over 256 experts, one shared expert, and one MTP layer
+
+## Architectures
+
+- `HYV4ForCausalLM`
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| Hy4-preview | [`tencent/Hy4-preview`](https://huggingface.co/tencent/Hy4-preview) |
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| [hy4_preview_tulu3_4k_cudnn.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v4/hy4_preview_tulu3_4k_cudnn.yaml) | Full-parameter Tulu 3 SFT with packed THD 4K sequences, FSDP2, PP4, EP64, HybridEP, activation checkpointing, and `reshard_after_forward=true` |
+
+## Supported Execution Path
+
+HY4-preview currently supports packed THD training through the cuDNN DSA/FlashMLA kernel path. FSDP2, pipeline parallelism, context parallelism, expert parallelism, activation checkpointing, MTP loss, backward, and optimizer updates are supported. The recipe above uses PP4 and EP64; packed CP is available when pipeline parallelism is disabled.
+
+Tensor parallelism and combined MTP+CP+PP execution are not supported. Transformer Engine fused RoPE and non-cuDNN/non-packed attention paths are also not supported; the implementation follows the checkpoint's default interleaved RoPE and a pinned vLLM forward reference.
+
+## Run the Recipe
+
+Install AutoModel from source, then launch the recipe with the 256-rank topology declared in its `ci` and `distributed` sections:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/hy_v4/hy4_preview_tulu3_4k_cudnn.yaml
+```
+
+See the [Installation Guide](/get-started/installation), [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft), and [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
+
+## Hugging Face Model Cards
+
+- [tencent/Hy4-preview](https://huggingface.co/tencent/Hy4-preview)
