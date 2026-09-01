@@ -15,9 +15,11 @@
 # Full-size Kimi-K3 (93 layers / 896 experts, 2.78T total / 104B active)
 # throughput benchmark on 64 nodes x 4 GB200 (256 GPUs): EP32 x PP8, DP32.
 #
-# Measured with this exact configuration: ~441 tok/s/GPU, i.e. ~12.2% MFU on
+# Measured with this exact configuration: ~496 tok/s/GPU, i.e. ~13.7% MFU on
 # the basis  MFU = tok/s/GPU * 6 * 104e9 / 2.25e15  (GB200 bf16 dense peak).
-# Wall-clock cross-check: 4096 rows x 1024 tok = 4.19M tokens/step at ~37 s.
+# Wall-clock cross-check: 4096 rows x 1024 tok = 4.19M tokens/step at ~33 s.
+# (Without compile_norm and benchmark_static_routing this measures ~441-458
+# tok/s/GPU = 12.2-12.7% MFU.)
 #
 # Benchmark regime notes:
 # - Random init + fake_balanced_gate (uniform static routing): the standard
@@ -26,8 +28,12 @@
 #   deterministic and comparable across clusters.
 # - prewarm avoids the step-0 lazy-NCCL-init OOM (pp_microbatch_size=2) and
 #   the fla/cuBLAS cold-start stall; compile_situ fuses the fp32 SiTU and
-#   attention-residual chains; enable_fsdp2_prefetch overlaps FSDP
-#   all-gathers that are otherwise fully exposed.
+#   attention-residual chains; compile_norm fuses the fp32 RMSNorm chain (the
+#   remaining per-token launch tax at this scale); benchmark_static_routing
+#   removes per-microbatch host syncs on routing metadata (only sound with
+#   fake_balanced_gate, enforced at config validation);
+#   enable_fsdp2_prefetch overlaps FSDP all-gathers that are otherwise
+#   fully exposed.
 #
 #   To run on 64 GB200 NVL72 nodes:
 #   automodel examples/llm_benchmark/kimi/kimi_k3_gb200.yaml --nnodes 64 --nproc-per-node 4
@@ -82,6 +88,8 @@ model:
     fake_balanced_gate: true   # benchmark only — see header
     fake_gate_noise: 0.0
     compile_situ: true
+    compile_norm: true
+    benchmark_static_routing: true   # requires fake_balanced_gate, noise 0.0
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
@@ -111,21 +119,15 @@ loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock.MockUnpackedDatasetConfig
-  num_sentences: 49216
-  mean_len: 1024.0
-  std_len: 0.0
-  max_sentence_len: 1024
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
   vocab_size: 10000
-  seed: 0
-
-packed_sequence:
-  packed_sequence_size: 0
+  seq_len: 1024
+  num_samples: 1000000
 
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: true
+  _target_: torch.utils.data.DataLoader
+  batch_size: null  # Dataset already yields batches
+  num_workers: 0
 
 optimizer:
   _target_: torch.optim.AdamW
