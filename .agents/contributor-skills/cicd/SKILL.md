@@ -31,19 +31,21 @@ include:
 2. **Changelog**: bullet list of user-visible changes.
 3. **Pre-checks**: confirm linting, tests, and sign-off.
 
-PR title format: `[{areas}] {type}: {description}`
-(e.g., `[model] feat: Add Qwen3 VLM support`)
+PR title format: Conventional Commits — `type(scope)?: description`
+(e.g. `feat(model): add Qwen3 VLM support`). The `Validate PR title` check
+enforces this. Bracket-prefixed titles such as `[model] feat: ...` fail
+validation.
 
 See `CONTRIBUTING.md` for the full PR workflow, area/type labels, and DCO
 requirements.
 
 ### Branch Naming
 
-Use descriptive branch names prefixed with your username or a category:
+Use `<github-handle>/<type>/<short-desc>`:
 
 ```
-username/feat_add_qwen2_recipe
-fix/gradient_clip_nan
+jdoe/feat/add-qwen2-recipe
+jdoe/fix/gradient-clip-nan
 ```
 
 ## How CI Is Triggered
