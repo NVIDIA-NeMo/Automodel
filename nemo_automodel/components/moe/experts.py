@@ -368,8 +368,6 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     return (flat_value + expanded_bias).view(shape).to(value.dtype)
 
 
-
-
 class GroupedExperts(nn.Module):
     """
     Sparse MoE implementation using all-gather/reduce-scatter primitives.
