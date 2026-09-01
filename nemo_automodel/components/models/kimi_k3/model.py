@@ -55,7 +55,9 @@ from nemo_automodel.components.models.kimi_k3.cp import (
 )
 from nemo_automodel.components.models.kimi_k3.situ import (
     _apply_attn_res,
+    _compile_norm_core,
     _compile_situ_cores,
+    _rms_norm,
     _weighted_situ,
 )
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
@@ -228,6 +230,12 @@ def _pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch_size: i
     return output.reshape(batch_size, seq_len, *hidden_states.shape[1:])
 
 
+# One cached upper-triangular mask per (dtype, device), grown on demand and
+# sliced per call, so repeated microbatches skip rebuilding the [S, S] mask on
+# the hot path while the cache stays bounded to a single largest-size entry.
+_CAUSAL_MASK_CACHE: dict[tuple[torch.dtype, torch.device], torch.Tensor] = {}
+
+
 def _make_causal_mask(
     inputs_embeds: torch.Tensor,
     packed_context: "KimiPackedContext | None",
@@ -254,10 +262,14 @@ def _make_causal_mask(
             q_global_start=0,
             dtype=dtype,
         )
-    min_value = torch.finfo(dtype).min
-    mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
-    mask = torch.triu(mask, diagonal=1)
-    return mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+    cache_key = (dtype, inputs_embeds.device)
+    mask = _CAUSAL_MASK_CACHE.get(cache_key)
+    if mask is None or mask.shape[0] < seq_len:
+        min_value = torch.finfo(dtype).min
+        mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
+        mask = torch.triu(mask, diagonal=1)
+        _CAUSAL_MASK_CACHE[cache_key] = mask
+    return mask[None, None, :seq_len, :seq_len].expand(batch_size, 1, -1, -1)
 
 
 def _packed_context_from_inputs(
@@ -303,11 +315,7 @@ class KimiRMSNorm(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return _rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
     def reset_parameters(self) -> None:
         nn.init.ones_(self.weight)
@@ -1048,6 +1056,8 @@ class KimiK3MoE(MoE):
             self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
         if backend.compile_situ:
             _compile_situ_cores()
+        if backend.compile_norm:
+            _compile_norm_core()
         expert_activation = partial(
             _weighted_situ,
             beta=config.activation_situ_beta or 1.0,
@@ -1489,7 +1499,11 @@ class KimiK3TextModel(nn.Module):
         Returns:
             Binary padding mask tensor of shape [batch, sequence], or None when no KDA mask is needed.
         """
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+        if attention_mask is None:
+            # Both branches below return None for this input; returning early skips
+            # a per-microbatch device-to-host sync on cache_position[0].
+            return None
+        if cache_position[0] > 0 or torch.all(attention_mask == 1):
             return None
         return attention_mask
 
