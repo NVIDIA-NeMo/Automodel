@@ -773,6 +773,8 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype, *, disable_m
 
     Peak memory ≈ (accumulated quantized weights) + (one bf16 weight tensor)
     instead of (full bf16 model) with standard HF loading.
+    When disable_mmap=True, one tensor at a time is cloned to anonymous CPU
+    memory before CUDA transfer to avoid UMA page-migration stalls.
     """
     import bitsandbytes as bnb
 
@@ -800,6 +802,16 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype, *, disable_m
     device = torch.device(device) if not isinstance(device, torch.device) else device
 
     def consume_tensor(key: str, tensor: torch.Tensor) -> None:
+        """Install one checkpoint tensor into the target model.
+
+        Args:
+            key: Fully-qualified state-dict key. The key determines the tensor's rank and axis semantics.
+            tensor: Tensor from the active safetensors shard. This function takes ownership and may cast,
+                quantize, move, or install it as a parameter/buffer.
+
+        Returns:
+            None.
+        """
         if key not in param_map:
             logger.debug("Skipping key not in model: %s", key)
             del tensor
@@ -842,26 +854,19 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype, *, disable_m
             shard_file,
         )
 
-        if disable_mmap:
-            from safetensors.torch import load as load_safetensors_bytes
+        from safetensors import safe_open
 
-            # On UMA systems, CUDA faults over file-backed checkpoint pages can
-            # dominate load time. Read only the active shard into anonymous
-            # memory before tensor deserialization.
-            with open(shard_path, "rb") as f:
-                shard_tensors = load_safetensors_bytes(f.read())
-            try:
-                for key, tensor in shard_tensors.items():
+        with safe_open(shard_path, framework="pt") as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+                if disable_mmap and key in param_map:
+                    # Avoid full-shard materialization while detaching the next
+                    # CUDA/quantization copy from mmap-backed checkpoint pages.
+                    tensor = tensor.clone()
+                try:
                     consume_tensor(key, tensor)
-            finally:
-                shard_tensors.clear()
-                del shard_tensors
-        else:
-            from safetensors import safe_open
-
-            with safe_open(shard_path, framework="pt") as f:
-                for key in f.keys():
-                    consume_tensor(key, f.get_tensor(key))
+                finally:
+                    del tensor
 
         gc.collect()
         torch.cuda.empty_cache()

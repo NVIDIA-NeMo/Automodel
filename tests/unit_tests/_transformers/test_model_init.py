@@ -891,7 +891,7 @@ class TestStreamLoadBnbWeights:
         assert model.lin.weight.device.type == "cpu"
         assert model.lin.bias.device.type == "cpu"
 
-    def test_disable_mmap_reads_safetensors_bytes(self, tmp_path):
+    def test_disable_mmap_stages_one_tensor_from_safe_open(self, tmp_path):
         with torch.device("meta"):
             model = _TinyModelOnMeta()
 
@@ -901,17 +901,29 @@ class TestStreamLoadBnbWeights:
                 "lin.weight": torch.randn(8, 4),
                 "lin.bias": torch.randn(8),
                 "running_scale": torch.zeros(8),
+                "unused.extra": torch.ones(3, 3),
             },
         )
 
+        original_clone = torch.Tensor.clone
+        cloned_shapes = []
+
+        def record_clone(tensor, *args, **kwargs):
+            cloned_shapes.append(tuple(tensor.shape))
+            return original_clone(tensor, *args, **kwargs)
+
         with (
-            patch("safetensors.safe_open", side_effect=AssertionError("safe_open should not be used")),
+            patch("safetensors.torch.load", side_effect=AssertionError("full-file load should not be used")),
             patch("safetensors.torch.load_file", side_effect=AssertionError("load_file should not be used")),
+            patch.object(torch.Tensor, "clone", record_clone),
         ):
             _stream_load_bnb_weights(model, str(tmp_path), torch.device("cpu"), torch.float32, disable_mmap=True)
 
         assert model.lin.weight.device.type == "cpu"
         assert model.running_scale.device.type == "cpu"
+        assert cloned_shapes.count((8, 4)) == 1
+        assert cloned_shapes.count((8,)) == 2
+        assert (3, 3) not in cloned_shapes
 
 
 class TestBnbModulesToNotConvert:

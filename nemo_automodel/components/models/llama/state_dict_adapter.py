@@ -82,6 +82,16 @@ class LlamaStateDictAdapter(StateDictAdapter):
         return dict(state_dict)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Return one Llama tensor under its unchanged HF state-dict key.
+
+        Args:
+            fqn: Fully-qualified HF state-dict key. The key determines the tensor's rank and axis order.
+            tensor: Tensor/value to export. This passthrough does not copy or transform it.
+            **kwargs: Optional controls, including ``exclude_key_regex`` to skip matching keys.
+
+        Returns:
+            A single ``(fqn, tensor)`` tuple, or an empty list when filtered. The returned tensor aliases the input.
+        """
         exclude_key_regex = kwargs.get("exclude_key_regex")
         if exclude_key_regex is not None and re.search(exclude_key_regex, fqn):
             return []
