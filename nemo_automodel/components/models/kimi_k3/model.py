@@ -57,7 +57,7 @@ from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3St
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import Gate, MoE
+from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -1052,7 +1052,13 @@ class KimiK3MoE(MoE):
         self.dim = moe_config.dim
         self.n_routed_experts = moe_config.n_routed_experts
         self.n_activated_experts = moe_config.n_activated_experts
-        self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        if backend.fake_balanced_gate:
+            # Mirror the base MoE: with random-init weights the learned gate's
+            # near-equal scores make topk pick experts [0..topk) for every token,
+            # collapsing all traffic onto each EP group's first rank.
+            self.gate = FakeBalancedGate(moe_config, noise=backend.fake_gate_noise)
+        else:
+            self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
         expert_activation = partial(
             _weighted_situ,
             beta=config.activation_situ_beta or 1.0,

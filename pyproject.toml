@@ -126,12 +126,14 @@ cuda = [
     "tile-kernels==1.0.0",
     # tilelang 0.1.11 does not cap its TVM ffi dependency, but 0.1.12 is
     # incompatible with its bundled TVM. Keep pip installs on the known-good ffi.
-    # NOTE: flash-attn-4 declares apache-tvm-ffi>=0.1.12,<0.2, but it never imports
-    # tvm-ffi -- flash_attn.cute imports only cutlass, torch and quack. The ffi that is
-    # actually loaded comes via quack-kernels, which accepts >=0.1.6,<0.2. So FA4 and
-    # tilelang are NOT mutually exclusive: this cap holds and both work in one image.
-    # Do not "resolve" FA4's declared bound by upgrading past 0.1.11 -- that
-    # double-registers TVM FFI TypeAttrs and SIGABRTs the tilelang kernels.
+    # flash-attn-4 declares apache-tvm-ffi>=0.1.12,<0.2 but is installed --no-deps
+    # (docker/Dockerfile), so that bound is never resolved; the ffi actually present comes
+    # via quack-kernels (>=0.1.6,<0.2), which this cap pins to 0.1.11. FA4 does import
+    # tvm_ffi (flash_attn/cute/cache_utils.py, eagerly via flash_attn.cute.__init__), so it
+    # runs against an ffi older than it declares -- checked only as far as the symbols it
+    # references (tvm_ffi.Function, tvm_ffi.__version__), both present in 0.1.11.
+    # Do not lift this cap to satisfy FA4: 0.1.12 double-registers TVM FFI TypeAttrs and
+    # SIGABRTs the tilelang kernels.
     "apache-tvm-ffi<=0.1.11",
 ]
 cuda_source = [
@@ -139,11 +141,10 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-# ffpa-attn 0.2.2 hard-pins nvidia-cutlass-dsl==4.6.0, which is unsatisfiable alongside
-# quack-kernels/flash_attn.cute at 4.6.2. FA4 takes priority, so the pin is overridden to
-# 4.6.2 (see override-dependencies) and ffpa-attn runs against a newer cutlass-dsl than it
-# declares. Drop the override once ffpa-attn ships a build against 4.6.2.
-ffpa = ["ffpa-attn>=0.2.2"]
+# ffpa-attn 0.2.3 is the first release that pins nvidia-cutlass-dsl==4.6.2 and
+# quack-kernels==0.6.4, i.e. the same cutlass-dsl flash_attn.cute (FA4) needs. 0.2.2 hard-pinned
+# 4.6.0/0.6.1 and was unsatisfiable alongside FA4, so do not relax this floor.
+ffpa = ["ffpa-attn>=0.2.3", "nvidia-cutlass-dsl==4.6.2"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]
@@ -299,15 +300,6 @@ constraint-dependencies = [
 ]
 override-dependencies = [
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
-    # ffpa-attn 0.2.2 hard-pins nvidia-cutlass-dsl==4.6.0 and quack-kernels==0.6.1; FA4
-    # needs 4.6.2/0.6.4 and takes priority, so both are forced across the resolution.
-    # ffpa-attn then runs against newer versions than it declares; revisit on its next release.
-    # Keep the cu13 extra: an override replaces the whole requirement, and dropping it strips
-    # the cutlass-dsl cu13 libs that nvidia-cudnn-frontend pulls in via its cutedsl extra.
-    # NOTE: no closing square bracket may appear in comments inside this block --
-    # update_pyproject_pytorch.sh deletes the block with a sed range ending at the first one.
-    "nvidia-cutlass-dsl[cu13]==4.6.2",
-    "quack-kernels==0.6.4; sys_platform == 'linux'",
     # leptonai pins 7.0.0, which caps Starlette below its security-fixed 1.x releases
     "prometheus-fastapi-instrumentator>=8.1.0",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin

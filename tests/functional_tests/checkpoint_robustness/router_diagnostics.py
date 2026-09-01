@@ -1,0 +1,744 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Opt-in routed-MoE diagnostics for checkpoint cross-framework parity."""
+
+from __future__ import annotations
+
+import json
+from contextlib import contextmanager
+from pathlib import Path
+from types import MethodType
+from typing import Iterator
+
+import torch
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor
+
+from tests.functional_tests.checkpoint_robustness.parity_metrics import _compute_parity_metrics_with_token_kl
+
+_SUPPORTED_MODEL_FAMILY = "glm4_moe_lite"
+
+
+def _rank0() -> bool:
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def _layer_index(module_name: str) -> int:
+    parts = module_name.split(".")
+    for part_index, part in enumerate(parts[:-1]):
+        if part == "layers":
+            return int(parts[part_index + 1])
+    raise ValueError(f"Could not determine transformer layer index from module name {module_name!r}")
+
+
+def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return one rank-local tensor without changing its layout.
+
+    Args:
+        tensor: Tensor or DTensor of arbitrary shape. A DTensor may use any placement accepted by ``to_local``.
+
+    Returns:
+        Rank-local tensor with the input's local shape and axis order.
+    """
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
+def _model_family(model: torch.nn.Module) -> str:
+    """Return and validate the model family supported by router diagnostics."""
+    model_family = getattr(getattr(model, "config", None), "model_type", None)
+    if model_family != _SUPPORTED_MODEL_FAMILY:
+        raise ValueError(
+            "capture_router_diagnostics currently supports only model_type="
+            f"{_SUPPORTED_MODEL_FAMILY!r}, got {model_family!r}"
+        )
+    return model_family
+
+
+def _persist_capture(
+    path: Path,
+    framework: str,
+    model_family: str,
+    captures: dict[int, dict[str, object]],
+) -> None:
+    """Persist router tensors captured for each transformer layer.
+
+    Args:
+        path: Destination path for the serialized capture.
+        framework: Framework label stored in the capture metadata.
+        model_family: Validated checkpoint model-family label.
+        captures: Per-layer mappings containing router logits of shape [tokens, experts], correction bias of shape
+            [experts], and selected indices of shape [tokens, top_k]. Arbitrary leading token dimensions are retained
+            until comparison.
+    """
+    if not captures:
+        raise RuntimeError(f"No {framework} GLM router calls were captured")
+    for layer_index, layer in captures.items():
+        for field in ("router_logits", "correction_bias"):
+            tensor = _local_tensor(layer[field])
+            if not bool(torch.isfinite(tensor).all()):
+                raise ValueError(
+                    f"{framework} router capture contains non-finite {field} values in layer {layer_index}"
+                )
+    payload = {
+        "schema_version": 1,
+        "framework": framework,
+        "model_family": model_family,
+        "layers": {
+            layer_index: {
+                "router_logits": _local_tensor(layer["router_logits"]).to(device="cpu", dtype=torch.float32),
+                "correction_bias": _local_tensor(layer["correction_bias"]).to(device="cpu", dtype=torch.float32),
+                "indices": _local_tensor(layer["indices"]).to(device="cpu", dtype=torch.int64),
+                "score_func": layer["score_func"],
+                "n_groups": layer["n_groups"],
+            }
+            for layer_index, layer in captures.items()
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(".tmp")
+    torch.save(payload, temporary_path)
+    temporary_path.replace(path)
+
+
+@contextmanager
+def capture_glm_hf_routers(model: torch.nn.Module, output_path: Path) -> Iterator[None]:
+    """Capture GLM router inputs and actual selections during one vanilla-HF forward.
+
+    Args:
+        model: Loaded vanilla-HF GLM model.
+        output_path: Cross-process capture path owned by the robustness artifact directory.
+
+    Yields:
+        Control to exactly one model forward.
+    """
+    model_family = _model_family(model)
+    matched_modules = [
+        (module, _layer_index(module_name))
+        for module_name, module in model.named_modules()
+        if module.__class__.__name__ == "Glm4MoeLiteMoE"
+    ]
+    if not matched_modules:
+        raise ValueError("No vanilla-HF Glm4MoeLiteMoE router modules were found")
+    if not _rank0():
+        yield
+        return
+
+    captures: dict[int, dict[str, object]] = {}
+    patched_modules: list[tuple[torch.nn.Module, bool, object | None]] = []
+    completed = False
+    try:
+        for module, layer_index in matched_modules:
+            original_route = module.route_tokens_to_experts
+            had_instance_override = "route_tokens_to_experts" in module.__dict__
+            original_instance_value = module.__dict__.get("route_tokens_to_experts")
+
+            def capture_route(self, router_logits, *args, _original=original_route, _layer=layer_index, **kwargs):
+                result = _original(router_logits, *args, **kwargs)
+                indices, _weights = result
+                correction_bias = self.gate.e_score_correction_bias
+                if correction_bias is None:
+                    correction_bias = torch.zeros(router_logits.shape[-1], device=router_logits.device)
+                captures[_layer] = {
+                    "router_logits": router_logits.detach(),
+                    "correction_bias": correction_bias.detach(),
+                    "indices": indices.detach(),
+                    "score_func": "sigmoid",
+                    "n_groups": int(getattr(self.config, "n_group", 1)),
+                }
+                return result
+
+            module.route_tokens_to_experts = MethodType(capture_route, module)
+            patched_modules.append((module, had_instance_override, original_instance_value))
+        yield
+        completed = True
+    finally:
+        for module, had_instance_override, original_instance_value in patched_modules:
+            if had_instance_override:
+                module.route_tokens_to_experts = original_instance_value
+            else:
+                delattr(module, "route_tokens_to_experts")
+        if completed:
+            _persist_capture(output_path, "hf", model_family, captures)
+
+
+@contextmanager
+def capture_glm_automodel_routers(model: torch.nn.Module, output_path: Path) -> Iterator[None]:
+    """Capture GLM router inputs and actual selections during one AutoModel forward.
+
+    Args:
+        model: Constructed GLM AutoModel module.
+        output_path: Cross-process capture path owned by the robustness artifact directory.
+
+    Yields:
+        Control to exactly one model forward.
+    """
+    from nemo_automodel.components.moe.layers import Gate
+
+    model_family = _model_family(model)
+    matched_gates = [
+        (module, _layer_index(module_name)) for module_name, module in model.named_modules() if isinstance(module, Gate)
+    ]
+    if not matched_gates:
+        raise ValueError("No learned AutoModel Gate router modules were found")
+    if not _rank0():
+        yield
+        return
+
+    captures: dict[int, dict[str, object]] = {}
+    patched_methods: list[tuple[torch.nn.Module, str, bool, object | None]] = []
+    completed = False
+    try:
+        for gate, layer_index in matched_gates:
+            target = gate.routing_core if gate.use_routing_core else gate
+            method_name = "forward" if gate.use_routing_core else "_route_scores"
+            original_route = getattr(target, method_name)
+            had_instance_override = method_name in target.__dict__
+            original_instance_value = target.__dict__.get(method_name)
+
+            def capture_route(
+                self,
+                router_logits,
+                *args,
+                _original=original_route,
+                _gate=gate,
+                _layer=layer_index,
+                **kwargs,
+            ):
+                result = _original(router_logits, *args, **kwargs)
+                _weights, indices, _original_scores = result
+                correction_bias = _gate._local_score_correction_bias()
+                if correction_bias is None:
+                    correction_bias = torch.zeros(router_logits.shape[-1], device=router_logits.device)
+                captures[_layer] = {
+                    "router_logits": router_logits.detach(),
+                    "correction_bias": correction_bias.detach(),
+                    "indices": indices.detach(),
+                    "score_func": _gate.score_func,
+                    "n_groups": _gate.n_groups,
+                }
+                return result
+
+            setattr(target, method_name, MethodType(capture_route, target))
+            patched_methods.append((target, method_name, had_instance_override, original_instance_value))
+        yield
+        completed = True
+    finally:
+        for target, method_name, had_instance_override, original_instance_value in patched_methods:
+            if had_instance_override:
+                setattr(target, method_name, original_instance_value)
+            else:
+                delattr(target, method_name)
+        if completed:
+            _persist_capture(output_path, "automodel", model_family, captures)
+
+
+def _quantiles(values: torch.Tensor) -> dict[str, float] | None:
+    """Summarize scalar samples without preserving their input layout.
+
+    Args:
+        values: Tensor of arbitrary shape containing scalar samples.
+
+    Returns:
+        Selected scalar quantiles, or ``None`` when ``values`` is empty.
+    """
+    if values.numel() == 0:
+        return None
+    values = values.float()
+    quantiles = torch.quantile(values, torch.tensor([0.0, 0.05, 0.5, 0.95, 1.0]))
+    return {
+        "min": quantiles[0].item(),
+        "p05": quantiles[1].item(),
+        "median": quantiles[2].item(),
+        "p95": quantiles[3].item(),
+        "max": quantiles[4].item(),
+    }
+
+
+def _kl_summary(values: torch.Tensor) -> dict[str, int | float] | None:
+    """Summarize flattened per-token KL values.
+
+    Args:
+        values: Tensor of shape [tokens] containing finite per-token KL divergences.
+
+    Returns:
+        Token count and aggregate KL statistics, or ``None`` when ``values`` is empty.
+    """
+    if values.numel() == 0:
+        return None
+    return {
+        "token_count": values.numel(),
+        "mean_kl": values.mean().item(),
+        "p95_kl": torch.quantile(values, 0.95).item(),
+        "max_kl": values.max().item(),
+    }
+
+
+def _route_flip_mask(reference_indices: torch.Tensor, candidate_indices: torch.Tensor) -> torch.Tensor:
+    """Return tokens whose selected expert sets differ.
+
+    Args:
+        reference_indices: Reference expert indices of shape [..., top_k].
+        candidate_indices: Candidate expert indices of shape [..., top_k], matching ``reference_indices``.
+
+    Returns:
+        Boolean tensor of shape [...], with the ``top_k`` axis removed.
+    """
+    return (reference_indices.sort(dim=-1).values != candidate_indices.sort(dim=-1).values).any(dim=-1)
+
+
+def _flip_pair_bias_directions(
+    hf_indices: torch.Tensor,
+    automodel_indices: torch.Tensor,
+    correction_bias: torch.Tensor,
+    route_flip_mask: torch.Tensor,
+) -> dict[str, int | float | None]:
+    """Summarize whether expert replacements systematically follow correction bias.
+
+    A one-sided correction-bias implementation error favors higher- or lower-bias
+    experts. Symmetric arithmetic noise should split added-versus-dropped expert
+    pairs around 50%; exact bias ties contribute one half to that sign statistic.
+
+    Args:
+        hf_indices: Vanilla-HF selected expert indices of shape [tokens, top_k].
+        automodel_indices: AutoModel selected expert indices of shape [tokens, top_k].
+        correction_bias: Vanilla-HF correction bias tensor of shape [experts].
+        route_flip_mask: Boolean tensor of shape [tokens] selecting tokens with different expert sets.
+
+    Returns:
+        Correction-bias pair counts and the fraction favoring experts added by AutoModel.
+    """
+    flipped_hf_indices = hf_indices[route_flip_mask]
+    flipped_automodel_indices = automodel_indices[route_flip_mask]
+    if flipped_hf_indices.numel() == 0:
+        return _bias_direction_summary(0, 0, 0)
+
+    dropped_mask = ~(flipped_hf_indices.unsqueeze(-1) == flipped_automodel_indices.unsqueeze(-2)).any(dim=-1)
+    added_mask = ~(flipped_automodel_indices.unsqueeze(-1) == flipped_hf_indices.unsqueeze(-2)).any(dim=-1)
+    pair_mask = dropped_mask.unsqueeze(-1) & added_mask.unsqueeze(-2)
+    dropped_bias = correction_bias[flipped_hf_indices].unsqueeze(-1)
+    added_bias = correction_bias[flipped_automodel_indices].unsqueeze(-2)
+    bias_delta = added_bias - dropped_bias
+    greater_count = int(((bias_delta > 0) & pair_mask).sum().item())
+    equal_count = int(((bias_delta == 0) & pair_mask).sum().item())
+    less_count = int(((bias_delta < 0) & pair_mask).sum().item())
+    return _bias_direction_summary(greater_count, equal_count, less_count)
+
+
+def _bias_direction_summary(
+    greater_count: int,
+    equal_count: int,
+    less_count: int,
+) -> dict[str, int | float | None]:
+    """Build one correction-bias direction summary from pair counts."""
+    pair_count = greater_count + equal_count + less_count
+    greater_fraction = (greater_count + 0.5 * equal_count) / pair_count if pair_count else None
+    return {
+        "pair_count": pair_count,
+        "added_bias_greater_count": greater_count,
+        "added_bias_equal_count": equal_count,
+        "added_bias_less_count": less_count,
+        "added_bias_greater_fraction_with_ties_split": greater_fraction,
+        "absolute_deviation_from_half": None if greater_fraction is None else abs(greater_fraction - 0.5),
+    }
+
+
+def _combine_bias_direction_counts(counts: list[dict[str, int | float | None]]) -> dict[str, int | float | None]:
+    """Combine per-layer correction-bias sign-test counts."""
+    greater_count = sum(int(layer["added_bias_greater_count"]) for layer in counts)
+    equal_count = sum(int(layer["added_bias_equal_count"]) for layer in counts)
+    less_count = sum(int(layer["added_bias_less_count"]) for layer in counts)
+    return _bias_direction_summary(greater_count, equal_count, less_count)
+
+
+def compare_glm_router_captures(
+    *,
+    hf_path: Path,
+    automodel_path: Path,
+    report_path: Path,
+    reference_logits: torch.Tensor,
+    candidate_logits: torch.Tensor,
+) -> dict[str, object]:
+    """Compare paired GLM captures and persist evidence for near-tie route flips.
+
+    Args:
+        hf_path: Router capture from the vanilla-HF source forward.
+        automodel_path: Router capture from the AutoModel source forward.
+        report_path: JSON report path.
+        reference_logits: Vanilla-HF final logits of shape [..., vocab], with arbitrary leading token dimensions.
+        candidate_logits: AutoModel final logits of shape [..., vocab], matching ``reference_logits`` exactly.
+
+    Returns:
+        Machine-readable aggregate and per-layer router diagnostics.
+    """
+    hf_capture = torch.load(hf_path, map_location="cpu", weights_only=True)
+    automodel_capture = torch.load(automodel_path, map_location="cpu", weights_only=True)
+    model_family = hf_capture.get("model_family")
+    if model_family != automodel_capture.get("model_family"):
+        raise ValueError(
+            "HF and AutoModel router capture families differ: "
+            f"{model_family!r} != {automodel_capture.get('model_family')!r}"
+        )
+    if model_family != _SUPPORTED_MODEL_FAMILY:
+        raise ValueError(f"Unsupported router capture model family {model_family!r}")
+    hf_layers = hf_capture["layers"]
+    automodel_layers = automodel_capture["layers"]
+    if set(hf_layers) != set(automodel_layers):
+        raise ValueError(
+            f"HF and AutoModel router layer sets differ: {sorted(hf_layers)} != {sorted(automodel_layers)}"
+        )
+
+    layer_metrics: dict[int, dict[str, object]] = {}
+    all_hf_margins = []
+    all_flip_margins = []
+    all_flip_score_deltas = []
+    total_layer_tokens = 0
+    total_route_flips = 0
+    total_explained_flips = 0
+    total_router_values = 0
+    logit_abs_sum = 0.0
+    logit_abs_max = 0.0
+    score_abs_sum = 0.0
+    score_abs_max = 0.0
+    logit_dot = 0.0
+    hf_logit_square_sum = 0.0
+    automodel_logit_square_sum = 0.0
+    bias_abs_max = 0.0
+    examples: list[dict[str, object]] = []
+    flipped_layer_counts: torch.Tensor | None = None
+    early_layer_indices = sorted(hf_layers)[:5]
+    early_layer_token_count = 0
+    early_route_flip_count = 0
+    early_large_margin_flip_count = 0
+    early_bias_direction_counts: list[dict[str, int | float | None]] = []
+    all_bias_direction_counts: list[dict[str, int | float | None]] = []
+
+    for layer_index in sorted(hf_layers):
+        hf_layer = hf_layers[layer_index]
+        automodel_layer = automodel_layers[layer_index]
+        if hf_layer["score_func"] != "sigmoid" or automodel_layer["score_func"] != "sigmoid":
+            raise ValueError("GLM router diagnostics currently require sigmoid routing")
+        if hf_layer["n_groups"] != 1 or automodel_layer["n_groups"] != 1:
+            raise ValueError("GLM router boundary diagnostics currently require n_groups=1")
+
+        raw_hf_logits = hf_layer["router_logits"]
+        raw_automodel_logits = automodel_layer["router_logits"]
+        raw_hf_indices = hf_layer["indices"]
+        raw_automodel_indices = automodel_layer["indices"]
+        if raw_hf_logits.shape != raw_automodel_logits.shape or raw_hf_indices.shape != raw_automodel_indices.shape:
+            raise ValueError(
+                f"Router capture shape mismatch in layer {layer_index}: logits "
+                f"{tuple(raw_hf_logits.shape)} != {tuple(raw_automodel_logits.shape)} or indices "
+                f"{tuple(raw_hf_indices.shape)} != {tuple(raw_automodel_indices.shape)}"
+            )
+        hf_logits = raw_hf_logits.reshape(-1, raw_hf_logits.shape[-1]).float()
+        automodel_logits = raw_automodel_logits.reshape(-1, raw_automodel_logits.shape[-1]).float()
+        hf_indices = raw_hf_indices.reshape(-1, raw_hf_indices.shape[-1]).long()
+        automodel_indices = raw_automodel_indices.reshape(-1, raw_automodel_indices.shape[-1]).long()
+
+        hf_bias = hf_layer["correction_bias"].float()
+        automodel_bias = automodel_layer["correction_bias"].float()
+        for framework, field, tensor in (
+            ("HF", "router_logits", hf_logits),
+            ("AutoModel", "router_logits", automodel_logits),
+            ("HF", "correction_bias", hf_bias),
+            ("AutoModel", "correction_bias", automodel_bias),
+        ):
+            if not bool(torch.isfinite(tensor).all()):
+                raise ValueError(f"{framework} router capture has non-finite {field} values in layer {layer_index}")
+        hf_scores = hf_logits.sigmoid() + hf_bias
+        automodel_scores = automodel_logits.sigmoid() + automodel_bias
+        topk = hf_indices.shape[-1]
+        if hf_scores.shape[-1] <= topk:
+            raise ValueError(f"Layer {layer_index} needs at least topk+1 router scores for boundary diagnostics")
+
+        route_flip_mask = _route_flip_mask(hf_indices, automodel_indices)
+        if flipped_layer_counts is None:
+            flipped_layer_counts = torch.zeros_like(route_flip_mask, dtype=torch.int64)
+        elif flipped_layer_counts.shape != route_flip_mask.shape:
+            raise ValueError("Router layers contain different token counts")
+        flipped_layer_counts += route_flip_mask
+        score_delta_per_token = (hf_scores - automodel_scores).abs().amax(dim=-1)
+        top_values = hf_scores.topk(topk + 1, dim=-1).values
+        hf_boundary_margin = top_values[:, topk - 1] - top_values[:, topk]
+        explained_flip_mask = route_flip_mask & (hf_boundary_margin <= 2 * score_delta_per_token)
+        large_margin_flip_mask = route_flip_mask & ~explained_flip_mask
+        bias_direction = _flip_pair_bias_directions(hf_indices, automodel_indices, hf_bias, route_flip_mask)
+
+        logit_delta = (hf_logits - automodel_logits).abs()
+        score_delta = (hf_scores - automodel_scores).abs()
+        layer_logit_dot = torch.sum(hf_logits.double() * automodel_logits.double()).item()
+        layer_hf_square_sum = torch.sum(hf_logits.double().square()).item()
+        layer_automodel_square_sum = torch.sum(automodel_logits.double().square()).item()
+        layer_cosine_denominator = (layer_hf_square_sum * layer_automodel_square_sum) ** 0.5
+        layer_flip_count = int(route_flip_mask.sum().item())
+        layer_explained_count = int(explained_flip_mask.sum().item())
+        layer_large_margin_flip_count = int(large_margin_flip_mask.sum().item())
+        layer_logit_abs_max = logit_delta.max().item()
+        layer_logit_cosine = (
+            (1.0 if layer_logit_abs_max == 0.0 else 0.0)
+            if layer_cosine_denominator == 0.0
+            else layer_logit_dot / layer_cosine_denominator
+        )
+
+        layer_metrics[layer_index] = {
+            "token_count": hf_logits.shape[0],
+            "route_flip_token_count": layer_flip_count,
+            "route_flip_token_fraction": layer_flip_count / hf_logits.shape[0],
+            "router_logit_mean_abs_diff": logit_delta.mean().item(),
+            "router_logit_max_abs_diff": layer_logit_abs_max,
+            "router_logit_cosine": layer_logit_cosine,
+            "routing_score_mean_abs_diff": score_delta.mean().item(),
+            "routing_score_max_abs_diff": score_delta.max().item(),
+            "correction_bias_max_abs_diff": (hf_bias - automodel_bias).abs().max().item(),
+            "hf_topk_boundary_margin": _quantiles(hf_boundary_margin),
+            "flipped_hf_topk_boundary_margin": _quantiles(hf_boundary_margin[route_flip_mask]),
+            "flipped_max_routing_score_diff": _quantiles(score_delta_per_token[route_flip_mask]),
+            "flips_within_score_perturbation_bound_fraction": (
+                layer_explained_count / layer_flip_count if layer_flip_count else None
+            ),
+            "flips_above_score_perturbation_bound_count": layer_large_margin_flip_count,
+            "flips_above_score_perturbation_bound_fraction": (
+                layer_large_margin_flip_count / layer_flip_count if layer_flip_count else None
+            ),
+            "correction_bias_direction_sign_test": bias_direction,
+        }
+
+        all_bias_direction_counts.append(bias_direction)
+        if layer_index in early_layer_indices:
+            early_layer_token_count += hf_logits.shape[0]
+            early_route_flip_count += layer_flip_count
+            early_large_margin_flip_count += layer_large_margin_flip_count
+            early_bias_direction_counts.append(bias_direction)
+
+        if len(examples) < 12:
+            for token_index in route_flip_mask.nonzero(as_tuple=False).flatten().tolist():
+                examples.append(
+                    {
+                        "layer": layer_index,
+                        "flattened_token_index": token_index,
+                        "hf_experts": hf_indices[token_index].tolist(),
+                        "automodel_experts": automodel_indices[token_index].tolist(),
+                        "hf_topk_boundary_margin": hf_boundary_margin[token_index].item(),
+                        "max_routing_score_diff": score_delta_per_token[token_index].item(),
+                    }
+                )
+                if len(examples) == 12:
+                    break
+
+        all_hf_margins.append(hf_boundary_margin)
+        all_flip_margins.append(hf_boundary_margin[route_flip_mask])
+        all_flip_score_deltas.append(score_delta_per_token[route_flip_mask])
+        total_layer_tokens += hf_logits.shape[0]
+        total_route_flips += layer_flip_count
+        total_explained_flips += layer_explained_count
+        total_router_values += hf_logits.numel()
+        logit_abs_sum += logit_delta.sum().item()
+        logit_abs_max = max(logit_abs_max, layer_logit_abs_max)
+        score_abs_sum += score_delta.sum().item()
+        score_abs_max = max(score_abs_max, score_delta.max().item())
+        logit_dot += layer_logit_dot
+        hf_logit_square_sum += layer_hf_square_sum
+        automodel_logit_square_sum += layer_automodel_square_sum
+        bias_abs_max = max(bias_abs_max, (hf_bias - automodel_bias).abs().max().item())
+
+    cosine_denominator = (hf_logit_square_sum * automodel_logit_square_sum) ** 0.5
+    router_logit_cosine = (
+        (1.0 if logit_abs_max == 0.0 else 0.0) if cosine_denominator == 0.0 else logit_dot / cosine_denominator
+    )
+    assert flipped_layer_counts is not None
+    _metrics, per_token_kl = _compute_parity_metrics_with_token_kl(reference_logits, candidate_logits)
+    if per_token_kl.shape != flipped_layer_counts.shape:
+        raise ValueError(
+            f"Router capture has {flipped_layer_counts.numel()} tokens, but final logits have {per_token_kl.numel()}"
+        )
+    natural_agreement_mask = flipped_layer_counts == 0
+    routed_tail_mask = ~natural_agreement_mask
+    token_kl_by_flipped_layer_count = {
+        int(flip_count): _kl_summary(per_token_kl[flipped_layer_counts == flip_count])
+        for flip_count in torch.unique(flipped_layer_counts).tolist()
+    }
+    report: dict[str, object] = {
+        "schema_version": 2,
+        "model_family": model_family,
+        "comparison": "hf_source_vs_automodel_source",
+        "layer_count": len(layer_metrics),
+        "layer_token_count": total_layer_tokens,
+        "route_flip_token_count": total_route_flips,
+        "route_flip_token_fraction": total_route_flips / total_layer_tokens,
+        "router_logit_mean_abs_diff": logit_abs_sum / total_router_values,
+        "router_logit_max_abs_diff": logit_abs_max,
+        "router_logit_cosine": router_logit_cosine,
+        "routing_score_mean_abs_diff": score_abs_sum / total_router_values,
+        "routing_score_max_abs_diff": score_abs_max,
+        "correction_bias_max_abs_diff": bias_abs_max,
+        "hf_topk_boundary_margin": _quantiles(torch.cat(all_hf_margins)),
+        "flipped_hf_topk_boundary_margin": _quantiles(torch.cat(all_flip_margins)),
+        "flipped_max_routing_score_diff": _quantiles(torch.cat(all_flip_score_deltas)),
+        "flips_within_score_perturbation_bound_fraction": (
+            total_explained_flips / total_route_flips if total_route_flips else None
+        ),
+        "flips_above_score_perturbation_bound_count": total_route_flips - total_explained_flips,
+        "flips_above_score_perturbation_bound_fraction": (
+            (total_route_flips - total_explained_flips) / total_route_flips if total_route_flips else None
+        ),
+        "correction_bias_direction_sign_test": _combine_bias_direction_counts(all_bias_direction_counts),
+        "early_layer_summary": {
+            "layer_indices": early_layer_indices,
+            "layer_token_count": early_layer_token_count,
+            "route_flip_token_count": early_route_flip_count,
+            "route_flip_token_fraction": early_route_flip_count / early_layer_token_count,
+            "flips_above_score_perturbation_bound_count": early_large_margin_flip_count,
+            "flips_above_score_perturbation_bound_fraction": (
+                early_large_margin_flip_count / early_route_flip_count if early_route_flip_count else None
+            ),
+            "correction_bias_direction_sign_test": _combine_bias_direction_counts(early_bias_direction_counts),
+        },
+        "final_token_kl": {
+            "all_tokens": _kl_summary(per_token_kl),
+            "natural_agreement_floor_no_flipped_layers": _kl_summary(per_token_kl[natural_agreement_mask]),
+            "routed_tail_one_or_more_flipped_layers": _kl_summary(per_token_kl[routed_tail_mask]),
+            "by_flipped_layer_count": token_kl_by_flipped_layer_count,
+        },
+        "layer_metrics": layer_metrics,
+        "examples": examples,
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_report_path = report_path.with_suffix(".tmp")
+    temporary_report_path.write_text(json.dumps(report, allow_nan=False, indent=2, sort_keys=True) + "\n")
+    temporary_report_path.replace(report_path)
+    early_summary = report["early_layer_summary"]
+    final_token_kl = report["final_token_kl"]
+    concise_summary = {
+        "early_layer_indices": early_summary["layer_indices"],
+        "early_route_flip_token_fraction": early_summary["route_flip_token_fraction"],
+        "early_large_margin_flip_fraction": early_summary["flips_above_score_perturbation_bound_fraction"],
+        "early_added_bias_greater_fraction_with_ties_split": early_summary["correction_bias_direction_sign_test"][
+            "added_bias_greater_fraction_with_ties_split"
+        ],
+        "early_bias_direction_absolute_deviation_from_half": early_summary["correction_bias_direction_sign_test"][
+            "absolute_deviation_from_half"
+        ],
+        "natural_agreement_floor_mean_kl": (final_token_kl["natural_agreement_floor_no_flipped_layers"] or {}).get(
+            "mean_kl"
+        ),
+        "routed_tail_mean_kl": (final_token_kl["routed_tail_one_or_more_flipped_layers"] or {}).get("mean_kl"),
+        "report_path": str(report_path),
+    }
+    print(f"CHECKPOINT_ROUTER_DIAGNOSTICS {json.dumps(concise_summary, allow_nan=False, sort_keys=True)}")
+    return report
+
+
+def summarize_glm_router_shape_captures(
+    *,
+    base_path: Path,
+    standalone_path: Path,
+    reference_logits: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    sustained_flip_layer_count: int = 11,
+) -> dict[str, object]:
+    """Summarize vanilla-HF route changes caused only by sequence shape.
+
+    Args:
+        base_path: Router capture from the full vanilla-HF forward.
+        standalone_path: Router capture from the shorter standalone vanilla-HF forward.
+        reference_logits: Full-forward prefix logits of shape [..., vocab], with arbitrary leading token dimensions.
+        candidate_logits: Standalone-forward logits of shape [..., vocab], matching ``reference_logits`` exactly.
+        sustained_flip_layer_count: Minimum number of flipped router layers used to classify a token as sustained.
+
+    Returns:
+        Aggregate and per-layer route changes plus per-token KL summaries.
+    """
+    base_capture = torch.load(base_path, map_location="cpu", weights_only=True)
+    standalone_capture = torch.load(standalone_path, map_location="cpu", weights_only=True)
+    model_family = base_capture.get("model_family")
+    if model_family != standalone_capture.get("model_family"):
+        raise ValueError(
+            "Base and standalone HF router capture families differ: "
+            f"{model_family!r} != {standalone_capture.get('model_family')!r}"
+        )
+    if model_family != _SUPPORTED_MODEL_FAMILY:
+        raise ValueError(f"Unsupported router capture model family {model_family!r}")
+    base_layers = base_capture["layers"]
+    standalone_layers = standalone_capture["layers"]
+    if set(base_layers) != set(standalone_layers):
+        raise ValueError(
+            f"Base and standalone HF router layer sets differ: {sorted(base_layers)} != {sorted(standalone_layers)}"
+        )
+    if sustained_flip_layer_count <= 0:
+        raise ValueError("sustained_flip_layer_count must be positive")
+
+    flipped_layer_counts: torch.Tensor | None = None
+    layer_metrics: dict[int, dict[str, int | float]] = {}
+    total_layer_tokens = 0
+    total_route_flips = 0
+    early_layer_indices = sorted(base_layers)[:5]
+    early_layer_tokens = 0
+    early_route_flips = 0
+    for layer_index in sorted(base_layers):
+        base_indices = base_layers[layer_index]["indices"].reshape(-1, base_layers[layer_index]["indices"].shape[-1])
+        standalone_indices = standalone_layers[layer_index]["indices"].reshape(
+            -1, standalone_layers[layer_index]["indices"].shape[-1]
+        )
+        if base_indices.shape[0] < standalone_indices.shape[0] or base_indices.shape[1] != standalone_indices.shape[1]:
+            raise ValueError(f"HF shape router capture mismatch in layer {layer_index}")
+        base_prefix_indices = base_indices[: standalone_indices.shape[0]]
+        route_flip_mask = _route_flip_mask(base_prefix_indices, standalone_indices)
+        if flipped_layer_counts is None:
+            flipped_layer_counts = torch.zeros_like(route_flip_mask, dtype=torch.int64)
+        elif flipped_layer_counts.shape != route_flip_mask.shape:
+            raise ValueError("HF shape router layers contain different token counts")
+        flipped_layer_counts += route_flip_mask
+        flip_count = int(route_flip_mask.sum().item())
+        token_count = route_flip_mask.numel()
+        layer_metrics[layer_index] = {
+            "token_count": token_count,
+            "route_flip_token_count": flip_count,
+            "route_flip_token_fraction": flip_count / token_count,
+        }
+        total_layer_tokens += token_count
+        total_route_flips += flip_count
+        if layer_index in early_layer_indices:
+            early_layer_tokens += token_count
+            early_route_flips += flip_count
+
+    assert flipped_layer_counts is not None
+    _metrics, per_token_kl = _compute_parity_metrics_with_token_kl(reference_logits, candidate_logits)
+    if per_token_kl.shape != flipped_layer_counts.shape:
+        raise ValueError(
+            f"HF shape router capture has {flipped_layer_counts.numel()} tokens, "
+            f"but final logits have {per_token_kl.numel()}"
+        )
+    any_flip_mask = flipped_layer_counts > 0
+    sustained_flip_mask = flipped_layer_counts >= sustained_flip_layer_count
+    return {
+        "layer_count": len(layer_metrics),
+        "route_flip_layer_token_count": total_route_flips,
+        "route_flip_layer_token_fraction": total_route_flips / total_layer_tokens,
+        "tokens_with_any_flip_count": int(any_flip_mask.sum().item()),
+        "tokens_with_any_flip_fraction": any_flip_mask.float().mean().item(),
+        "sustained_flip_layer_count": sustained_flip_layer_count,
+        "tokens_with_sustained_flips_count": int(sustained_flip_mask.sum().item()),
+        "tokens_with_sustained_flips_fraction": sustained_flip_mask.float().mean().item(),
+        "sustained_flip_final_token_kl": _kl_summary(per_token_kl[sustained_flip_mask]),
+        "no_sustained_flip_final_token_kl": _kl_summary(per_token_kl[~sustained_flip_mask]),
+        "early_layer_summary": {
+            "layer_indices": early_layer_indices,
+            "route_flip_token_count": early_route_flips,
+            "route_flip_token_fraction": early_route_flips / early_layer_tokens,
+        },
+        "layer_metrics": layer_metrics,
+    }

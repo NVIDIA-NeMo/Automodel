@@ -25,13 +25,6 @@ override-dependencies = [
     "transformer-engine-cu13; sys_platform == 'never'",
     "transformer-engine-torch; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
-    # ffpa-attn 0.2.2 hard-pins nvidia-cutlass-dsl==4.6.0 and quack-kernels==0.6.1; FA4
-    # (flash_attn.cute) needs 4.6.2 and takes priority. Keep the cu13 extra: an override
-    # replaces the whole requirement, and dropping it strips the cutlass-dsl cu13 libs that
-    # nvidia-cudnn-frontend pulls in via its cutedsl extra. Mirrors the pyproject.toml
-    # override block, which this file replaces wholesale via update_pyproject_pytorch.sh.
-    "nvidia-cutlass-dsl[cu13]==4.6.2",
-    "quack-kernels==0.6.4; sys_platform == 'linux'",
     # leptonai pins 7.0.0, which caps Starlette below its security-fixed 1.x releases
     "prometheus-fastapi-instrumentator>=8.1.0",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin

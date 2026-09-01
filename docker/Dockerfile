@@ -216,12 +216,11 @@ WORKDIR /opt/Automodel
 # before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
 ARG INSTALL_FA4=true
-# The FA4 wheel is installed --no-deps (above). flash_attn.cute's declared dependency list
-# is wider than what it imports: at this ref the cute package imports only cutlass, torch
-# and quack (compile_utils.make_fake_tensor) -- never apache-tvm-ffi, einops or
-# torch-c-dlpack-ext. Installing its declared apache-tvm-ffi>=0.1.12 would cross tilelang's
-# <=0.1.11 cap and break backend.attn="tilelang" for no runtime benefit, so it is left
-# alone; the tvm-ffi that does get loaded comes via quack-kernels, which accepts 0.1.11.
+# The FA4 wheel is installed --no-deps (above), so flash_attn.cute's declared
+# apache-tvm-ffi>=0.1.12 is never resolved -- installing it would cross tilelang's
+# <=0.1.11 cap and break backend.attn="tilelang" for no runtime benefit. FA4 does import
+# tvm_ffi (flash_attn/cute/cache_utils.py), but only for symbols 0.1.11 already provides,
+# and that ffi arrives via quack-kernels; see the apache-tvm-ffi note in pyproject.toml.
 # cutlass-dsl is the one FA4 genuinely needs, and 4.6.2 matches what the venv resolves to
 # (quack-kernels 0.6.4 pins it there too), so system and venv agree on one version.
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
