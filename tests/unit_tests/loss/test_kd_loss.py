@@ -16,6 +16,7 @@ Unit tests for :pyclass:`nemo_automodel.components.loss.kd_loss.KDLoss` and its
 tensor-parallel helpers.
 """
 
+import sys
 from typing import Optional
 
 import pytest
@@ -666,3 +667,45 @@ def _run_two_process_tp_kl(rank: int, init_file: str) -> None:
 
 def test_kl_forward_tp_two_process_matches_full_vocab(tmp_path):
     mp.spawn(_run_two_process_tp_kl, args=(str(tmp_path / "tp_kl"),), nprocs=2, join=True)
+
+
+def _run_two_process_tp_kd_gradient(rank: int, init_file: str) -> None:
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        torch.manual_seed(29)
+        teacher_logits = torch.randn(6, 16)
+        student_logits = torch.randn(6, 16)
+        local_teacher = teacher_logits.chunk(2, dim=-1)[rank].contiguous()
+        local_student = student_logits.chunk(2, dim=-1)[rank].contiguous().requires_grad_()
+        labels = torch.tensor([0, 1, -100, 3, 4, 5])
+
+        actual = KDLoss(tp_group=torch.distributed.group.WORLD)(local_student, local_teacher, labels)
+        actual.backward()
+
+        full_student = student_logits.detach().requires_grad_()
+        teacher_logprob = F.log_softmax(teacher_logits, dim=-1)
+        student_logprob = F.log_softmax(full_student, dim=-1)
+        expected = F.kl_div(student_logprob, teacher_logprob, reduction="none", log_target=True).sum(-1)
+        expected = expected[labels != -100].mean()
+        expected.backward()
+
+        torch.testing.assert_close(
+            local_student.grad,
+            full_student.grad.chunk(2, dim=-1)[rank],
+            atol=1e-6,
+            rtol=1e-5,
+        )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="the CPU Gloo backend does not support multi-process tests on Windows"
+)
+def test_kd_loss_tp_two_process_matches_full_vocab_gradient(tmp_path):
+    mp.spawn(_run_two_process_tp_kd_gradient, args=(str(tmp_path / "tp_kd_gradient"),), nprocs=2, join=True)

@@ -104,7 +104,11 @@ def _kl_forward_tp(
 
     # --- Per-token KL: local vocabulary contribution then global reduce ---
     kl_local = _forward_kl_from_log_probs(teacher_log_prob, student_log_prob)
-    kl_local = dist_nn_func.all_reduce(kl_local, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    # Every rank computes the same global KL value, so its backward pass must
+    # retain the local vocabulary gradient instead of reducing that gradient a
+    # second time through the autograd-aware collective.
+    with torch.no_grad():
+        torch.distributed.all_reduce(kl_local, op=torch.distributed.ReduceOp.SUM, group=tp_group)
 
     return kl_local
 
