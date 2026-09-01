@@ -1,0 +1,156 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-size Kimi-K3 (93 layers / 896 experts, 2.78T total / 104B active)
+# throughput benchmark at 2k-token rows on 64 nodes x 4 GB200 (256 GPUs):
+# EP32 x PP8, DP32, GBS 4096.
+#
+# Measured with this exact configuration: ~616 tok/s/GPU, i.e. ~17.1% MFU on
+# the basis  MFU = tok/s/GPU * 6 * 104e9 / 2.25e15  (GB200 bf16 dense peak).
+# Wall-clock cross-check: 4096 rows x 2048 tok = 8.39M tokens/step at ~53 s.
+# Peak memory 139.6 GiB per GPU (44 GiB headroom on 184 GiB HBM).
+#
+# Why 2k rows beat the 1k config (13.7% MFU) by 3.4pp: at this scale the
+# workload is launch-bound, so doubling tokens per row halves the per-token
+# kernel-launch tax, and K3's KDA linear attention does not penalize longer
+# rows. The PP bubble at this point is 9.9% (64 microbatches).
+#
+# This shape REQUIRES distributed.pipeline.pp_recv_buffer_pool: without it,
+# torch pre-allocates recv buffers for all 64 microbatches x both directions
+# (~52 GiB on middle stages at 2k) and the run OOMs during step 1. The ring
+# pool sizes buffers to the 1F1B in-flight depth instead, saving ~45 GiB.
+#
+# compile_norm is left off here: this file documents the measured champion
+# configuration; the 2k x compile_norm stack is pending measurement.
+#
+# Other benchmark regime notes match examples/llm_benchmark/kimi/kimi_k3_gb200.yaml.
+#
+#   To run on 64 GB200 NVL72 nodes:
+#   automodel examples/llm_benchmark/kimi/kimi_k3_gb200_2k.yaml --nnodes 64 --nproc-per-node 4
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+benchmark:
+  warmup_steps: 3
+  peak_tflops: 2250   # GB200 bf16 dense peak
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 64
+
+step_scheduler:
+  global_batch_size: 4096
+  local_batch_size: 128
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  max_steps: 12
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.kimi_k3.config.KimiK3TextConfig
+    architectures: [KimiK3ForCausalLM]
+    dtype: bfloat16
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  kda_mode: chunk
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: eager
+    linear: torch
+    rms_norm: torch_fp32
+    experts: te
+    dispatcher: hybridep
+    dispatcher_num_sms: 32
+    rope_fusion: false
+    fake_balanced_gate: true   # benchmark only — see kimi_k3_gb200.yaml header
+    fake_gate_noise: 0.0
+    compile_situ: true
+    compile_norm: false   # champion 2k measurement predates it; stack pending
+    benchmark_static_routing: true   # requires fake_balanced_gate, noise 0.0
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 8
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  enable_fsdp2_prefetch: true
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 2
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    pp_recv_buffer_pool: true   # required for this shape — see header
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  vocab_size: 10000
+  seq_len: 2048
+  num_samples: 1000000
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null  # Dataset already yields batches
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+prewarm:
+  comm_groups: true
+  fla_gdn_autotune: true
+  cublas_backward: true
+
+wandb:
+  enable: false
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  recipe_owner: huiyingl
+  nodes: 64
+  cluster_tag: gb200
+  time: "01:00:00"
