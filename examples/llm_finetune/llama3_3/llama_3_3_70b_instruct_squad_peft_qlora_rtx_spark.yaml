@@ -26,7 +26,10 @@ step_scheduler:
   global_batch_size: 1
   local_batch_size: 1
   ckpt_every_steps: 100
-  val_every_steps: 600
+  # Checkpoint cadence otherwise forces validation before save. On 64 GB UMA,
+  # keep this recipe's default path focused on train + checkpoint; eval is opt-in.
+  validate_on_checkpoint: false
+  val_every_steps: null
   max_steps: 500
 
 dist_env:

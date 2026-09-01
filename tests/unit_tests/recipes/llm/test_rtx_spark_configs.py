@@ -83,5 +83,7 @@ def test_rtx_spark_llama_70b_preserves_streaming_qlora_settings():
     assert config["model"]["disable_mmap"] is True
     assert config["step_scheduler"]["global_batch_size"] == 1
     assert config["step_scheduler"]["local_batch_size"] == 1
+    assert config["step_scheduler"]["validate_on_checkpoint"] is False
+    assert config["step_scheduler"]["val_every_steps"] is None
     assert config["packed_sequence"]["packed_sequence_size"] == 1024
     assert config["distributed"]["activation_checkpointing"] is True

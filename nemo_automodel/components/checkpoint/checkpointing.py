@@ -865,12 +865,7 @@ class Checkpointer:
             t0 = time.monotonic()
             # Full-state safetensors remain mmap-backed. Prefault only when the
             # destination shares host memory; CPU and discrete-GPU paths stay unchanged.
-            # RTX Spark regression matrix for refactors here:
-            # - llama3_1_8b_squad_peft_rtx_spark.yaml: 64 GB UMA end-to-end guard; set force_hf=false
-            #   for a custom-loader-only smoke test because SM12x cannot run TE packed backward.
-            # - qwen3_8b_squad_rtx_spark.yaml: HF/FA2 packed-training baseline on GB10.
-            # - llama_3_3_70b_instruct_squad_peft_qlora_rtx_spark.yaml: 4-bit streaming guard;
-            #   never full-materialize the 70B checkpoint.
+            # UMA regression guard: do not reintroduce full checkpoint materialization here.
             model_cuda_devices = {
                 parameter.device
                 for part in model_state.model
