@@ -53,6 +53,11 @@ from nemo_automodel.components.models.kimi_k3.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
+from nemo_automodel.components.models.kimi_k3.situ import (
+    _apply_attn_res,
+    _compile_situ_cores,
+    _weighted_situ,
+)
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
@@ -973,24 +978,6 @@ class KimiDeltaAttention(nn.Module):
                 self.o_norm.reset_parameters()
 
 
-def _weighted_situ(
-    gate_up: torch.Tensor,
-    routing_weights: torch.Tensor,
-    *,
-    beta: float,
-    linear_beta: float | None,
-) -> torch.Tensor:
-    """Apply SiTU and routing weights to ``[tokens, 2 * intermediate]`` projections."""
-    input_dtype = gate_up.dtype
-    gate, up = gate_up.chunk(2, dim=-1)
-    gate = gate.float()
-    up = up.float()
-    activated = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-    if linear_beta is not None:
-        up = linear_beta * torch.tanh(up / linear_beta)
-    return (activated * up * routing_weights.float()).to(input_dtype)
-
-
 class KimiK3Gate(Gate):
     """K3's fp32 sigmoid router with correction-bias-only expert selection."""
 
@@ -1059,6 +1046,8 @@ class KimiK3MoE(MoE):
             self.gate = FakeBalancedGate(moe_config, noise=backend.fake_gate_noise)
         else:
             self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        if backend.compile_situ:
+            _compile_situ_cores()
         expert_activation = partial(
             _weighted_situ,
             beta=config.activation_situ_beta or 1.0,
@@ -1185,22 +1174,6 @@ class KimiK3MoE(MoE):
                 self.routed_expert_norm.reset_parameters()
         if self.shared_experts is not None:
             self.shared_experts.init_weights(buffer_device, init_std)
-
-
-def _apply_attn_res(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    projection: nn.Linear,
-    norm: KimiRMSNorm,
-) -> torch.Tensor:
-    """Mix ``[tokens, hidden]`` with prior ``[tokens, blocks, hidden]`` residuals."""
-    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    values_fp32 = values.float()
-    variance = values_fp32.pow(2).mean(-1, keepdim=True)
-    keys = values_fp32 * torch.rsqrt(variance + norm.variance_epsilon)
-    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
-    probabilities = (keys * score_weight).sum(-1).softmax(-1).unsqueeze(1)
-    return torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
 
 
 class KimiDecoderLayer(nn.Module):
