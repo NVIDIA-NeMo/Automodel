@@ -610,7 +610,9 @@ from nemo_automodel.components.training.utils import clip_grad_norm
 # Call these after backward on every pipeline rank.
 scale_grads_by_divisor(ap.info.stages, divisor=8)
 
-# Use the PP-aware clipping helper across the local model parts.
+# Use the PP-aware clipping helper across the local model parts. For MoE
+# models with expert parallelism, also pass moe_mesh/ep_axis_name so expert
+# gradient norms are reduced across the EP axis.
 grad_norm = clip_grad_norm(
     1.0,
     ap.parts,
@@ -618,6 +620,8 @@ grad_norm = clip_grad_norm(
     pp_enabled=True,
     device_mesh=world_mesh,
     pp_axis_name="pp",
+    moe_mesh=moe_mesh,
+    ep_axis_name="ep" if moe_mesh is not None and "ep" in (moe_mesh.mesh_dim_names or ()) else None,
 )
 ```
 
