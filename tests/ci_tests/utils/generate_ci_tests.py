@@ -74,12 +74,16 @@ AUTO_DISCOVER_SCOPES = {
     },
 }
 
+MODEL_VERIFICATION_CARD_SUFFIX = "_verification_card.yaml"
+
 
 def _discover_via_glob(automodel_dir: str, examples_subpath: str) -> list[Path]:
     """Discover every recipe YAML under examples/<examples_subpath>/."""
     automodel_path = Path(automodel_dir)
     return sorted(
-        p.relative_to(automodel_path) for p in (automodel_path / "examples" / examples_subpath).rglob("*.yaml")
+        p.relative_to(automodel_path)
+        for p in (automodel_path / "examples" / examples_subpath).rglob("*.yaml")
+        if not p.name.endswith(MODEL_VERIFICATION_CARD_SUFFIX)
     )
 
 
