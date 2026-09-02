@@ -14,8 +14,9 @@
 
 import sys
 
-import mlflow
 import pytest
+
+mlflow = pytest.importorskip("mlflow")
 import torch
 import torch.distributed as dist
 

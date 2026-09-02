@@ -34,10 +34,18 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-import mlflow
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_MLFLOW, mlflow = safe_import(
+    "mlflow",
+    msg="mlflow is not installed. To enable MLflow experiment tracking, run: uv add nemo-automodel[mlflow]. For the full MLflow stack: uv add nemo-automodel[mlflow-full]",
+)
 import torch
 import torch.nn as nn
-import wandb
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoConfig
@@ -1494,14 +1502,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main or log_data is None:
             return
 
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             if val_name == "default":
                 wandb.log(log_data.metrics, step=log_data.step)
             else:
                 metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
                 wandb.log(metrics, step=log_data.step)
 
-        if mlflow.active_run() is not None:
+        if _HAS_MLFLOW and mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
         if self.comet_logger is not None:
@@ -1554,22 +1562,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-            if mlflow.active_run() is not None:
+            if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # Log MoE load balance metrics (already collected/reduced on all ranks)
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 self._log_moe_metrics(self.step_scheduler.step, wandb.log)
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
                 )
-            if mlflow.active_run() is not None:
+            if _HAS_MLFLOW and mlflow.active_run() is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: mlflow.log_metrics(to_float_metrics(m), step=step)
                 )
