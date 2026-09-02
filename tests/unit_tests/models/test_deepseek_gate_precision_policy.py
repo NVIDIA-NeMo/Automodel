@@ -15,7 +15,8 @@
 """DeepSeek V3 and V3.2 must share one router precision policy.
 
 V3.2 skips DeepseekV3ForCausalLM.__init__, so a default installed there does
-not reach it. Parametrizing over both classes keeps the two construction
+not reach it. V3.2 skips DeepseekV3ForCausalLM.__init__, so a default installed there does
+not reach it. Parametrizing over V3, V3.2, and Kimi K2 keeps the construction
 paths from drifting apart silently.
 """
 
@@ -41,6 +42,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3ForCausalLM
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32ForCausalLM
+from nemo_automodel.components.models.kimi_k2.config import KimiK2Config
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import Gate
 
@@ -108,40 +110,53 @@ def test_deepseek_preserves_score_correction_bias_in_fp32(model_cls):
     assert "e_score_correction_bias" in model_cls._keep_in_fp32_modules_strict
 
 
-# The selected-weight policy lives on the MoEConfig the inner model builds, so these
-# cases construct for real. first_k_dense_replace >= num_hidden_layers keeps every
-# layer dense: no Gate or expert weights are allocated, but moe_config still is.
+# These cases construct for real: layer 0 is dense (first_k_dense_replace=1) and
+# layer 1 is MoE, so a Gate exists and every stage can be asserted on the router
+# the model actually built. Expert dims are tiny; n_group=2 keeps grouped routing on.
 _COMMON = dict(
     vocab_size=100,
     hidden_size=64,
     num_attention_heads=4,
-    num_hidden_layers=1,
+    num_hidden_layers=2,
     first_k_dense_replace=1,
     intermediate_size=128,
     qk_rope_head_dim=16,
     v_head_dim=16,
     qk_nope_head_dim=16,
+    torch_dtype="bfloat16",
+)
+
+_MOE = dict(
+    moe_intermediate_size=64,
+    n_routed_experts=8,
+    n_shared_experts=1,
+    num_experts_per_tok=2,
+    n_group=2,
+    topk_group=1,
 )
 
 
 def _v3_config() -> DeepseekV3Config:
-    return DeepseekV3Config(**_COMMON)
+    return DeepseekV3Config(**_COMMON, **_MOE)
 
 
 def _v32_config() -> DeepseekV32Config:
     return DeepseekV32Config(
         **_COMMON,
-        moe_intermediate_size=64,
+        **_MOE,
         qk_head_dim=32,
         kv_lora_rank=32,
         q_lora_rank=64,
-        n_routed_experts=4,
-        n_shared_experts=1,
-        num_experts_per_tok=2,
         index_n_heads=4,
         index_head_dim=32,
         index_topk=16,
     )
+
+
+def _kimi_k2_config() -> KimiK2Config:
+    # Kimi K2 checkpoints are config only on the V3 path: KimiK2Config subclasses
+    # DeepseekV3Config and the architecture resolves to DeepseekV3ForCausalLM.
+    return KimiK2Config(**_COMMON, **_MOE)
 
 
 def _router_config(**overrides) -> MoEConfig:
@@ -203,6 +218,7 @@ def test_explicit_gate_precision_also_moves_scoring():
 _DEEPSEEK_MOE_CONFIG_CASES = (
     pytest.param(DeepseekV3ForCausalLM, _v3_config, id="v3"),
     pytest.param(DeepseekV32ForCausalLM, _v32_config, id="v32"),
+    pytest.param(DeepseekV3ForCausalLM, _kimi_k2_config, id="kimi_k2"),
 )
 
 
@@ -229,6 +245,77 @@ def test_deepseek_router_param_stays_in_model_dtype(model_cls, config_fn):
     assert model.model.moe_config.gate_dtype is None
 
 
+@pytest.mark.parametrize(("model_cls", "config_fn"), _DEEPSEEK_MOE_CONFIG_CASES)
+def test_deepseek_router_stages_on_constructed_model(model_cls, config_fn):
+    """Param / Proj / Score / Out asserted on the Gate the model actually built."""
+    model = model_cls(config_fn(), backend=_backend())
+    gate = model.model.layers["1"].mlp.gate
+    assert isinstance(gate, Gate)
+
+    assert gate.weight.dtype is torch.bfloat16  # Param: model dtype, cast at use
+    assert gate.e_score_correction_bias.dtype is torch.float32
+    assert gate.gate_precision is torch.float32  # Proj
+    assert gate.score_dtype is torch.float32  # Score
+    assert gate.router_weights_fp32 is True
+
+    torch.manual_seed(0)
+    gate.weight.data.normal_(std=0.02)
+    x = torch.randn(16, model.model.moe_config.dim, dtype=torch.bfloat16)
+    weights, indices, _ = gate(x, torch.ones(16, dtype=torch.bool), None)
+    assert weights.dtype is torch.float32  # Out
+    assert indices.shape == (16, model.model.moe_config.n_activated_experts)
+
+
+def test_deepseek_gate_matches_hf_reference_router_grouped():
+    """Proj/Score/Out parity vs the pinned HF reference, grouped routing (n_group=2).
+
+    The reference splits the router across two objects: DeepseekV3TopkRouter does
+    the fp32 projection and returns logits only, while DeepseekV3MoE.route_tokens_to_experts
+    does sigmoid/bias/group-mask/top-k/norm/scale. Automodel's Gate does all of it,
+    so the comparison drives both.
+    """
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
+
+    cfg = _router_config()
+    gate = Gate(cfg, gate_precision=torch.float32).eval()
+    torch.manual_seed(0)
+    gate.weight.data.normal_(std=0.02)
+    gate.e_score_correction_bias.uniform_(-0.1, 0.1)  # nonzero: exercise the biased top-k path
+
+    hf_cfg = DeepseekV3Config(
+        hidden_size=cfg.dim,
+        n_routed_experts=cfg.n_routed_experts,
+        num_experts_per_tok=cfg.n_activated_experts,
+        n_group=cfg.n_expert_groups,
+        topk_group=cfg.n_limited_groups,
+        routed_scaling_factor=cfg.route_scale,
+        norm_topk_prob=cfg.norm_topk_prob,
+        moe_intermediate_size=cfg.moe_inter_dim,
+        n_shared_experts=cfg.n_shared_experts,
+    )
+    hf_moe = DeepseekV3MoE(hf_cfg).eval()  # experts are allocated but never run
+    with torch.no_grad():
+        hf_moe.gate.weight.copy_(gate.weight)  # bf16 -> fp32 is exact
+        hf_moe.gate.e_score_correction_bias.copy_(gate.e_score_correction_bias)
+
+    x = torch.randn(64, cfg.dim, dtype=torch.bfloat16)
+    w_am, i_am, _ = gate(x, torch.ones(64, dtype=torch.bool), None)
+
+    with torch.no_grad():
+        router_logits = hf_moe.gate(x)
+        i_hf, w_hf = hf_moe.route_tokens_to_experts(router_logits)
+
+    assert router_logits.dtype is torch.float32  # Proj: reference projects in fp32
+    assert w_hf.dtype is torch.float32  # Out: reference never casts back
+    assert w_am.dtype is torch.float32  # Out: this PR's default matches it
+
+    # Automodel's top-k is sorted, the reference's is sorted=False; compare as sets
+    # by sorting each side's indices and applying the same permutation to the weights.
+    o_am, o_hf = i_am.argsort(dim=1), i_hf.argsort(dim=1)
+    assert torch.equal(i_am.gather(1, o_am), i_hf.gather(1, o_hf))
+    assert torch.equal(w_am.gather(1, o_am), w_hf.gather(1, o_hf))
+
+
 def test_kimi_k2_routes_to_the_deepseek_v3_construction_path():
     """Kimi K2 is config only: it inherits V3's router precision policy.
 
@@ -237,7 +324,6 @@ def test_kimi_k2_routes_to_the_deepseek_v3_construction_path():
     does. This test fails at that moment.
     """
     from nemo_automodel._transformers.registry import ModelRegistry, resolve_custom_config_cls
-    from nemo_automodel.components.models.kimi_k2.config import KimiK2Config
 
     assert resolve_custom_config_cls("kimi_k2") is KimiK2Config
     assert issubclass(KimiK2Config, DeepseekV3Config)
