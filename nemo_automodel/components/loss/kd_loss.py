@@ -66,6 +66,42 @@ def _forward_kl_from_log_probs(
     return (teacher_prob * log_ratio).sum(dim=-1)
 
 
+class _AllReduceForwardPassThroughBackward(torch.autograd.Function):
+    """All-reduce a tensor in forward while preserving its local gradient."""
+
+    @staticmethod
+    def forward(ctx, input_tensor: torch.Tensor, group: torch.distributed.ProcessGroup) -> torch.Tensor:
+        """Reduce a clone of the input tensor without mutating its autograd value.
+
+        Args:
+            ctx: Autograd context, unused by this operation.
+            input_tensor: Tensor of shape ``[...]`` containing local per-token KL values.
+            group: Process group over which to sum the local values.
+
+        Returns:
+            Tensor of shape ``[...]`` containing the forward all-reduced values.
+        """
+        output = input_tensor.clone()
+        torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: torch.Tensor | None) -> tuple[torch.Tensor | None, None]:
+        """Pass the output gradient through without a second distributed reduction.
+
+        Args:
+            ctx: Autograd context, unused by this operation.
+            grad_outputs: One-element tuple containing a tensor of shape ``[...]``
+                with the gradient of the all-reduced output, or ``None`` when the
+                output is unused.
+
+        Returns:
+            Tuple containing the local input gradient (or ``None`` when the output
+            is unused) and ``None`` for the process group.
+        """
+        return grad_outputs[0], None
+
+
 def _kl_forward_tp(
     t_logits: torch.Tensor,
     s_logits: torch.Tensor,
@@ -107,8 +143,7 @@ def _kl_forward_tp(
     # Every rank computes the same global KL value, so its backward pass must
     # retain the local vocabulary gradient instead of reducing that gradient a
     # second time through the autograd-aware collective.
-    with torch.no_grad():
-        torch.distributed.all_reduce(kl_local, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    kl_local = _AllReduceForwardPassThroughBackward.apply(kl_local, tp_group)
 
     return kl_local
 

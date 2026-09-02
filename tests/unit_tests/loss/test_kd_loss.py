@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.loss.kd_loss import (
     KDLoss,
+    _AllReduceForwardPassThroughBackward,
     _infer_tp_group_from_dtensor,
     _kl_forward_chunked,
     _kl_forward_tp,
@@ -639,6 +640,17 @@ def test_kd_loss_tp_path_with_temperature(trivial_pg):
     assert torch.allclose(loss_no_tp, loss_tp, atol=1e-5), (
         f"Non-TP loss {loss_no_tp.item():.6f} != TP loss {loss_tp.item():.6f}"
     )
+
+
+def test_tp_kl_reduction_does_not_mutate_saved_autograd_value(trivial_pg):
+    """The TP reduction must not mutate a tensor saved by an upstream autograd op."""
+    source = torch.randn(6, requires_grad=True)
+    local_kl = source.exp()
+
+    reduced_kl = _AllReduceForwardPassThroughBackward.apply(local_kl, trivial_pg)
+    reduced_kl.sum().backward()
+
+    torch.testing.assert_close(source.grad, local_kl.detach())
 
 
 def _run_two_process_tp_kl(rank: int, init_file: str) -> None:
