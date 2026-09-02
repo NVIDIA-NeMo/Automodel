@@ -2848,7 +2848,6 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     )
     loader_config = SimpleNamespace(
         packing=None,
-        resolve_packing_attn_implementation=lambda **kwargs: None,
         build=lambda **kwargs: SimpleNamespace(dataloader="dl", processor="proc"),
     )
     monkeypatch.setattr(
@@ -3418,24 +3417,37 @@ def _patches_for_packing(neat_pack_side_effect):
     processor = MagicMock()
     processor.tokenizer.pad_token_id = 0
     processor.chat_template = "{{ x }}"
-    return processor, [
-        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
-        patch("torch.utils.data.distributed.DistributedSampler"),
-        patch(
-            "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
-            return_value=MagicMock(),
-        ),
-        patch(
-            "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
-            side_effect=neat_pack_side_effect,
-        ),
-        patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", return_value=MagicMock()),
-        patch("nemo_automodel.components.models.common.packing.configure_packing"),
-        patch(
-            "nemo_automodel.components.models.common.packing.get_attn_implementation",
-            return_value="sdpa",
-        ),
-    ]
+    packing_contract = SimpleNamespace(
+        packed_mask_type="document_ids",
+        requires_packed_sequence_metadata=True,
+    )
+    stateful_dataloader = MagicMock(return_value=MagicMock())
+    return (
+        processor,
+        packing_contract,
+        stateful_dataloader,
+        [
+            patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+            patch("torch.utils.data.distributed.DistributedSampler"),
+            patch(
+                "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
+                side_effect=neat_pack_side_effect,
+            ),
+            patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", stateful_dataloader),
+            patch(
+                "nemo_automodel.components.models.common.packing.configure_packing",
+                return_value=packing_contract,
+            ),
+            patch(
+                "nemo_automodel.components.models.common.packing.get_attn_implementation",
+                return_value="sdpa",
+            ),
+        ],
+    )
 
 
 def test_build_dataloader_forwards_get_rope_index_to_packing():
@@ -3451,7 +3463,7 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
         captured.update(kwargs)
         return MagicMock()
 
-    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+    _, _, _, ctx_managers = _patches_for_packing(fake_neat_pack)
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3466,6 +3478,7 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
             1,
             cfg_ps=_make_packing_cfg(pack_size=64),
             get_rope_index=sentinel,
+            model=object(),
         )
 
     assert captured.get("get_rope_index") is sentinel, (
@@ -3485,7 +3498,7 @@ def test_build_dataloader_default_get_rope_index_is_none():
         captured.update(kwargs)
         return MagicMock()
 
-    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+    _, _, _, ctx_managers = _patches_for_packing(fake_neat_pack)
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3499,10 +3512,61 @@ def test_build_dataloader_default_get_rope_index_is_none():
             42,
             1,
             cfg_ps=_make_packing_cfg(pack_size=64),
+            model=object(),
         )
 
     assert "get_rope_index" in captured, "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
     assert captured["get_rope_index"] is None
+
+
+def test_build_dataloader_forwards_structural_packing_contract_to_collator():
+    """The recipe forwards configure_packing's structural result without a backend string."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    _, packing_contract, stateful_dataloader, ctx_managers = _patches_for_packing(lambda *args, **kwargs: [{}])
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        build_dataloader(
+            _make_dataset_cfg(),
+            _vlm_dataloader_cfg(),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+            model=object(),
+        )
+
+    collate_fn = stateful_dataloader.call_args.kwargs["collate_fn"]
+    assert collate_fn.keywords["packing"] is packing_contract
+    assert "attn_implementation" not in collate_fn.keywords
+
+
+def test_deprecated_build_dataloader_requires_model_for_packing():
+    """The legacy helper must not silently invent a backend-only data contract."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    _, _, _, ctx_managers = _patches_for_packing(lambda *args, **kwargs: [{}])
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        with pytest.raises(ValueError, match="require the built model"):
+            build_dataloader(
+                _make_dataset_cfg(),
+                _vlm_dataloader_cfg(),
+                "test/model",
+                None,
+                None,
+                42,
+                1,
+                cfg_ps=_make_packing_cfg(pack_size=64),
+            )
 
 
 def _run_build_dataloader_capturing_wrapper(dataset_cfg):
@@ -3512,7 +3576,7 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     wrapper_mock = MagicMock(return_value=MagicMock())
-    _, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
+    _, _, _, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3533,6 +3597,7 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
             42,
             1,
             cfg_ps=_make_packing_cfg(pack_size=64),
+            model=object(),
         )
     return wrapper_mock
 

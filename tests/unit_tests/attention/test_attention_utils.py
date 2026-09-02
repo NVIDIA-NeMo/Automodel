@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -616,6 +616,27 @@ class TestFA4Backend:
         assert attn_kwargs["max_seqlen_q"] == 11
         assert attn_kwargs["max_seqlen_kv"] == 11
 
+    def test_fa4_varlen_requires_max_seqlen(self):
+        q = k = v = torch.randn(1, 4, 2, 8)
+
+        with pytest.raises(ValueError, match="requires max_seqlen"):
+            preprocess_args_and_kwargs_for_attn(
+                q,
+                k,
+                v,
+                None,
+                "fa4",
+                cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+            )
+
+    def test_fa4_indexed_mask_requires_dataset_metadata(self):
+        """Attention consumes packed metadata instead of rebuilding dataset semantics."""
+        q = k = v = torch.randn(1, 4, 2, 8)
+        document_ids = torch.tensor([[1, 1, 2, 2]])
+
+        with pytest.raises(ValueError, match="dataset-provided"):
+            preprocess_args_and_kwargs_for_attn(q, k, v, document_ids, "fa4")
+
     def test_fa4_packed_bshd_forward_backward_matches_document_sdpa(self):
         """The production packed adapter preserves output and gradient boundaries."""
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
@@ -643,7 +664,10 @@ class TestFA4Backend:
                     "n_videos": 0,
                 },
             ],
-            attn_implementation="fa4",
+            packing=SimpleNamespace(
+                packed_mask_type="document_ids",
+                requires_packed_sequence_metadata=True,
+            ),
         )
         attention_mask = collated["attention_mask"]
         q = torch.randn(2, 6, 2, 8, requires_grad=True)
@@ -669,7 +693,7 @@ class TestFA4Backend:
             "fa4",
             cu_seqlens=collated["cu_seqlens"],
             max_seqlen=collated["max_seqlen"],
-            _fa4_unpad_indices=collated["_fa4_unpad_indices"],
+            packed_token_indices=collated["packed_token_indices"],
         )
         output = fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
 

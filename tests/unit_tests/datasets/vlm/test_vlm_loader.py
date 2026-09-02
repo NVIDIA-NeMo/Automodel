@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 from transformers import ProcessorMixin
@@ -284,17 +285,21 @@ def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
         shuffle=False,
     )
 
+    packing = SimpleNamespace(
+        packed_mask_type="block_causal",
+        requires_packed_sequence_metadata=False,
+    )
     result = config.build(
         pretrained_model_name_or_path="unused",
         dp_rank=0,
         dp_world_size=1,
         batch_size=2,
-        packing_attn_implementation="sdpa",
+        packing_contract=packing,
         cp_size=32,
     )
 
     assert result.dataloader.collate_fn.func is neat_packed_vlm_collater
-    assert result.dataloader.collate_fn.keywords["attn_implementation"] == "sdpa"
+    assert result.dataloader.collate_fn.keywords["packing"] is packing
     assert result.dataloader.collate_fn.keywords["materialize_4d_mask"] is False
 
 

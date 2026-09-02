@@ -428,6 +428,10 @@ def _pad_position_ids(position_ids: torch.Tensor, seq_dim: int, pad_len: int) ->
 
 def _global_doc_ids_from_batch(batch: dict, seq_len: int, device: torch.device) -> torch.Tensor:
     """Resolve the global document-id map for a batch about to be CP-sharded."""
+    packed_seq_ids = batch.get("_packed_seq_ids")
+    if packed_seq_ids is not None:
+        return doc_ids_from_attention_mask(packed_seq_ids)
+
     attention_mask = batch.get("attention_mask")
     if attention_mask is not None and attention_mask.ndim == 2:
         return doc_ids_from_attention_mask(attention_mask)
@@ -479,7 +483,16 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
     # The 4D/indexed mask no longer matches the sharded sequence; document
     # boundaries travel through the document-id map instead.
     batch.pop("attention_mask", None)
-    for key in ("seq_lens", "seq_lens_padded", "cu_seqlens", "cu_seqlens_padded", "max_seqlen", "qkv_format"):
+    for key in (
+        "_packed_seq_ids",
+        "packed_token_indices",
+        "seq_lens",
+        "seq_lens_padded",
+        "cu_seqlens",
+        "cu_seqlens_padded",
+        "max_seqlen",
+        "qkv_format",
+    ):
         batch.pop(key, None)
 
     if "position_ids" not in batch:

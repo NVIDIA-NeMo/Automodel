@@ -12,10 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared packed-sequence metadata helpers."""
+"""Dataset-owned packed-sequence construction contracts and helpers."""
+
+from typing import Literal, Protocol, TypedDict
 
 import torch
 import torch.nn.functional as F
+
+PackedMaskType = Literal["block_causal", "document_ids"]
+
+
+class PackedSequenceContract(Protocol):
+    """Structural model contract consumed while collating packed data."""
+
+    @property
+    def packed_mask_type(self) -> PackedMaskType:
+        """Packed attention-mask representation required by the model."""
+        ...
+
+    @property
+    def requires_packed_sequence_metadata(self) -> bool:
+        """Whether the model consumes flat token indices and cumulative lengths."""
+        ...
+
+
+class PackedSequenceMetadata(TypedDict):
+    """Batch-major metadata that remains valid after microbatch splitting."""
+
+    packed_token_indices: torch.Tensor
+    cu_seqlens: torch.Tensor
+    max_seqlen: int
 
 
 def get_seqlens_in_batch(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -75,3 +101,49 @@ def get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     max_seqlen_in_batch = int(seqlens_in_batch.max().item())
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
     return indices, cu_seqlens, max_seqlen_in_batch
+
+
+def build_packed_sequence_metadata(attention_mask: torch.Tensor) -> PackedSequenceMetadata:
+    """Build batch-major metadata for a padded indexed packing mask.
+
+    Args:
+        attention_mask: Integer tensor of shape [batch, sequence] containing
+            1-based document IDs and zero-valued padding.
+
+    Returns:
+        Metadata containing row-local ``packed_token_indices`` of shape
+        [batch, sequence] with ``-1`` at padding, per-row ``cu_seqlens`` of
+        shape [batch, max_documents + 1] with ``-1`` at unused entries, and
+        the largest document length. The leading batch axis lets pipeline
+        schedules split these tensors without invalidating their offsets.
+    """
+    if attention_mask.ndim != 2:
+        raise ValueError(f"attention_mask must have shape [batch, sequence], got {tuple(attention_mask.shape)}")
+    if attention_mask.numel() == 0 or not bool(attention_mask.bool().any().item()):
+        raise ValueError("attention_mask must contain at least one valid token")
+
+    batch_size, sequence_length = attention_mask.shape
+    max_documents = max(1, int(attention_mask.max().item()))
+    indices = torch.arange(sequence_length, device=attention_mask.device).expand(batch_size, -1).clone()
+    indices.masked_fill_(~attention_mask.bool(), -1)
+    cu_seqlens = torch.full(
+        (batch_size, max_documents + 1),
+        -1,
+        dtype=torch.int32,
+        device=attention_mask.device,
+    )
+    max_seqlen = 0
+    for row_idx in range(batch_size):
+        row_mask = attention_mask[row_idx : row_idx + 1]
+        if not bool(row_mask.bool().any().item()):
+            cu_seqlens[row_idx, 0] = 0
+            continue
+        _, row_cu_seqlens, row_max_seqlen = get_unpad_data(row_mask)
+        cu_seqlens[row_idx, : row_cu_seqlens.numel()] = row_cu_seqlens
+        max_seqlen = max(max_seqlen, row_max_seqlen)
+
+    return {
+        "packed_token_indices": indices,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+    }

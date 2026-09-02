@@ -57,6 +57,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
+from nemo_automodel.components.datasets.packing import get_unpad_data
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -701,7 +702,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        attn_implementation = None
+        packing_contract = None
         if (
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
             and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
@@ -709,7 +710,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
             attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
-            configure_packing(attn_implementation=attn_implementation)
+            packing_contract = configure_packing(
+                attn_implementation,
+                model=self.model_parts[0],
+                unpad_data=get_unpad_data,
+            )
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config):
@@ -735,7 +740,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
                         else self.cfg.get("distributed.cp_size", 1)
                     ),
-                    attn_implementation=attn_implementation,
+                    packing_contract=packing_contract,
                     collate_wrapper=collate_wrapper,
                 )
 
@@ -1098,8 +1103,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
                 # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
                 # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
-                # one pack/microbatch per step; the seq_idx tail handles differing per-microbatch boundaries.
-                cu_seqlens = batch_filtered.get("cu_seqlens")
+                # one pack/microbatch per step; batch-major NEAT metadata instead travels with each
+                # microbatch and its model-provided seq_idx tail.
+                cu_seqlens = None if "packed_token_indices" in batch_filtered else batch_filtered.get("cu_seqlens")
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
                     cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
                 pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None

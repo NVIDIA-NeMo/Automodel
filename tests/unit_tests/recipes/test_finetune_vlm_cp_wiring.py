@@ -488,7 +488,6 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
 
     loader_config = SimpleNamespace(
         packing=None,
-        resolve_packing_attn_implementation=lambda **kwargs: None,
         build=_build_dataloader,
     )
     monkeypatch.setattr(
@@ -574,6 +573,7 @@ def test_setup_always_stages_pp_media_under_pp(
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
     assert dataloader_calls[0]["cp_size"] == cp_size
+    assert dataloader_calls[0]["packing_contract"] is None
 
 
 # -----------------------------------------------------------------------------

@@ -14,56 +14,16 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from nemo_automodel.components.datasets.packing import get_unpad_data
 from nemo_automodel.components.models.common.packing import (
     _passthrough_create_causal_mask,
     _patch_preprocess_mask_arguments_for_packing,
     apply_attn_implementation_to_backend,
     configure_packing,
+    flatten_packed_sequence_metadata,
     get_attn_implementation,
-    get_seqlens_in_batch,
-    get_unpad_data,
+    get_packing_capabilities,
 )
-
-# ---------------------------------------------------------------------------
-# get_seqlens_in_batch
-# ---------------------------------------------------------------------------
-
-
-class TestGetSeqlensInBatch:
-    def test_single_sequence(self):
-        mask = torch.tensor([[1, 1, 1, 0, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-    def test_packed_sequences(self):
-        mask = torch.tensor([[1, 1, 2, 2, 2, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert sorted(result.tolist()) == [2, 3]
-
-    def test_no_padding(self):
-        mask = torch.tensor([[1, 1, 1]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-
-# ---------------------------------------------------------------------------
-# get_unpad_data
-# ---------------------------------------------------------------------------
-
-
-class TestGetUnpadData:
-    def test_basic(self):
-        mask = torch.tensor([[1, 1, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert cu_seqlens.tolist() == [0, 2]
-
-    def test_packed(self):
-        mask = torch.tensor([[1, 1, 2, 2, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert indices.tolist() == [0, 1, 2, 3]
-
 
 # ---------------------------------------------------------------------------
 # _passthrough_create_causal_mask
@@ -192,6 +152,28 @@ class TestGetAttnImplementation:
 
 
 class TestConfigurePacking:
+    def test_model_semantics_select_document_ids_and_explicit_metadata(self):
+        model = SimpleNamespace(
+            packed_mask_type="document_ids",
+            requires_packed_sequence_metadata=True,
+        )
+
+        capabilities = get_packing_capabilities("sdpa", model=model)
+
+        assert capabilities.packed_mask_type == "document_ids"
+        assert capabilities.requires_packed_sequence_metadata is True
+
+    def test_batch_major_metadata_flattens_after_microbatch_splitting(self):
+        indices, cu_seqlens = flatten_packed_sequence_metadata(
+            torch.tensor([[0, 1, 2, -1]]),
+            torch.tensor([[0, 1, 3]], dtype=torch.int32),
+            batch_size=1,
+            sequence_length=4,
+        )
+
+        assert indices.tolist() == [0, 1, 2]
+        assert cu_seqlens.tolist() == [0, 1, 3]
+
     @pytest.mark.parametrize("attn_implementation", ["sdpa", "eager"])
     def test_noop_for_unsupported_backends(self, attn_implementation, monkeypatch):
         """configure_packing should not install flash-attn shims for unsupported backends."""
@@ -215,7 +197,7 @@ class TestConfigurePacking:
         original_preprocess = masking_utils._preprocess_mask_arguments
         original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
         try:
-            configure_packing(attn_implementation)
+            configure_packing(attn_implementation, unpad_data=get_unpad_data)
             assert fa_utils._get_unpad_data is get_unpad_data
         finally:
             fa_utils._get_unpad_data = original
@@ -279,7 +261,7 @@ class TestConfigurePacking:
             return args
 
         try:
-            configure_packing("flash_attention_2")
+            configure_packing("flash_attention_2", unpad_data=get_unpad_data)
             mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
             probe_mask = torch.zeros(1, 1, 1, 1, dtype=torch.bool)
             expected_template = original_preprocess(*build_args(probe_mask, torch.arange(5)))
@@ -315,7 +297,7 @@ class TestConfigurePacking:
         original_preprocess = masking_utils._preprocess_mask_arguments
         original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
         try:
-            configure_packing("flash_attention_2")
+            configure_packing("flash_attention_2", unpad_data=get_unpad_data)
             mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
             result = modeling_qwen3.create_causal_mask(
                 config=SimpleNamespace(_attn_implementation="flash_attention_2"),
@@ -373,7 +355,7 @@ class TestConfigurePacking:
         fake_mod_name = "transformers.models.qwen3_vl.modeling_qwen3_vl"
         sys.modules[fake_mod_name] = fake_mod
         try:
-            configure_packing("flash_attention_2")
+            configure_packing("flash_attention_2", unpad_data=get_unpad_data)
             assert fake_mod.create_causal_mask is _passthrough_create_causal_mask
         finally:
             fa_utils._get_unpad_data = original_unpad
@@ -395,7 +377,7 @@ class TestConfigurePackingFA3FA4:
 
         original = fa_utils._get_unpad_data
         try:
-            configure_packing(impl)
+            configure_packing(impl, unpad_data=get_unpad_data)
             assert fa_utils._get_unpad_data is get_unpad_data
         finally:
             fa_utils._get_unpad_data = original

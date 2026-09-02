@@ -213,6 +213,8 @@ class Qwen3_5MoeBlock(Block):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                attn_kwargs.get("packed_token_indices"),
+                attn_kwargs.get("cu_seqlens"),
             )
 
         if packed_gdn_metadata is not None:
@@ -772,6 +774,8 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                attn_kwargs.get("packed_token_indices"),
+                attn_kwargs.get("cu_seqlens"),
             )
 
         # --- Decoder layers (Qwen3Next Block, unmodified) ---
@@ -822,6 +826,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Text-only Qwen3.5-MoE causal language model."""
 
+    requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_keep_self_forward: bool = True
 
@@ -1139,6 +1144,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     # through this packed attention contract.
     _packed_cp_attn_backends = ("sdpa",)
 
+    requires_packed_sequence_metadata = True
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True

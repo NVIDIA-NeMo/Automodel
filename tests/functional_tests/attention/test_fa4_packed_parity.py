@@ -22,7 +22,7 @@ from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.shared.packed_sequence import get_unpad_data
+from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
 
 
 def _packed_sdpa_reference(
@@ -79,7 +79,7 @@ def test_native_fa4_packed_forward_backward_matches_sdpa() -> None:
         [[1] * 32 + [2] * 48 + [0] * 16, [1] * 24 + [2] * 24 + [3] * 48],
         device=device,
     )
-    indices, cu_seqlens, max_seqlen = get_unpad_data(attention_mask)
+    packing_metadata = build_packed_sequence_metadata(attention_mask)
 
     torch.manual_seed(1234)
     q = torch.randn(2, 96, 4, head_dim, device=device, dtype=dtype, requires_grad=True)
@@ -102,9 +102,7 @@ def test_native_fa4_packed_forward_backward_matches_sdpa() -> None:
         v,
         attention_mask,
         "fa4",
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        _fa4_unpad_indices=indices,
+        **packing_metadata,
     )
     output = fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
     reference = _packed_sdpa_reference(q_ref, k_ref, v_ref, attention_mask, scale=scale)
