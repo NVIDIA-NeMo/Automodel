@@ -188,8 +188,6 @@ RUN mkdir -p /wheels && \
 # (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
 ARG FLASH_ATTN_REF=ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820
 ARG INSTALL_FA3=true
-# FA4 on by default: it is the only attention backend that reaches the Blackwell
-# CuTe kernels (backend.attn="fa4"). Coexists with tilelang -- see the final stage.
 ARG INSTALL_FA4=true
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
@@ -216,13 +214,6 @@ WORKDIR /opt/Automodel
 # before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
 ARG INSTALL_FA4=true
-# The FA4 wheel is installed --no-deps (above), so flash_attn.cute's declared
-# apache-tvm-ffi>=0.1.12 is never resolved -- installing it would cross tilelang's
-# <=0.1.11 cap and break backend.attn="tilelang" for no runtime benefit. FA4 does import
-# tvm_ffi (flash_attn/cute/cache_utils.py), but only for symbols 0.1.11 already provides,
-# and that ffi arrives via quack-kernels; see the apache-tvm-ffi note in pyproject.toml.
-# cutlass-dsl is the one FA4 genuinely needs, and 4.6.2 matches what the venv resolves to
-# (quack-kernels 0.6.4 pins it there too), so system and venv agree on one version.
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     if [ "$INSTALL_FA4" = "true" ]; then \
         pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" && \
