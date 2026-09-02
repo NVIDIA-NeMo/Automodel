@@ -17,7 +17,12 @@
 import pytest
 import torch
 
+from nemo_automodel._transformers.retrieval import CrossEncoderModel
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.models.llama_bidirectional.model import (
+    LlamaBidirectionalConfig,
+    LlamaBidirectionalForSequenceClassification,
+)
 from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncoderRecipe, accuracy, batch_mrr
 
 # ---------------------------------------------------------------------------
@@ -49,6 +54,36 @@ def test_recipe_rejects_two_non_unit_temperatures():
         match="Set either top-level temperature or model.temperature to 1.0",
     ):
         TrainCrossEncoderRecipe(config)
+
+
+def test_recipe_rejects_checkpoint_temperature_when_model_override_is_omitted(tmp_path):
+    checkpoint_config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=32,
+        num_labels=1,
+        temperature=0.02,
+    )
+    LlamaBidirectionalForSequenceClassification(checkpoint_config).save_pretrained(tmp_path)
+    model = CrossEncoderModel.build(model_name_or_path=str(tmp_path))
+    recipe = TrainCrossEncoderRecipe(
+        ConfigNode(
+            {
+                "temperature": 0.3,
+                "model": {"pretrained_model_name_or_path": str(tmp_path)},
+            }
+        )
+    )
+
+    assert model.config.temperature == 0.02
+    with pytest.raises(
+        ValueError,
+        match="Set either top-level temperature or model.temperature to 1.0",
+    ):
+        recipe._validate_model_config(model.config)
 
 
 # ---------------------------------------------------------------------------

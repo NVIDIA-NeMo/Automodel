@@ -23,7 +23,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers import ProcessorMixin
+from transformers import PretrainedConfig, ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -281,6 +281,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self.temperature = self.cfg.get("temperature", 1.0)
 
+    def _validate_model_config(self, model_config: PretrainedConfig) -> None:
+        """Validate the effective model configuration before building dependent components."""
+        del model_config
+
     def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
         """Build optimizer parameter groups for trainable model parameters."""
         model = self.model_parts[0]
@@ -373,6 +377,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 **kwargs,
             )
 
+        self._validate_model_config(_unwrap_model_for_attrs(model).config)
         self.model_parts = [model]
         self.pp = None
 

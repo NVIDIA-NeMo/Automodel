@@ -17,6 +17,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
+from transformers import PretrainedConfig
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
@@ -46,6 +47,24 @@ def batch_mrr(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1.0 / rank.float()).sum()
 
 
+def _validate_temperature_sources(recipe_temperature: float, model_temperature: float) -> None:
+    """Reject simultaneous recipe-level and model-level temperature scaling.
+
+    Args:
+        recipe_temperature: Temperature applied by the cross-encoder recipe.
+        model_temperature: Temperature applied by the loaded model.
+
+    Raises:
+        ValueError: If both temperatures are non-unit.
+    """
+    if recipe_temperature != 1.0 and model_temperature != 1.0:
+        raise ValueError(
+            "Cross-encoder temperature scaling is configured twice: "
+            f"top-level temperature={recipe_temperature!r} and effective model.temperature={model_temperature!r}. "
+            "Set either top-level temperature or model.temperature to 1.0."
+        )
+
+
 class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
     def __init__(self, cfg: ConfigNode | RecipeConfig) -> None:
         """Initialize the cross-encoder recipe and validate its temperature settings.
@@ -58,12 +77,12 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
         """
         super().__init__(cfg)
         model_temperature = self.cfg.get("model.temperature", 1.0)
-        if self.temperature != 1.0 and model_temperature != 1.0:
-            raise ValueError(
-                "Cross-encoder temperature scaling is configured twice: "
-                f"top-level temperature={self.temperature!r} and model.temperature={model_temperature!r}. "
-                "Set either top-level temperature or model.temperature to 1.0."
-            )
+        _validate_temperature_sources(self.temperature, model_temperature)
+
+    def _validate_model_config(self, model_config: PretrainedConfig) -> None:
+        """Validate the effective temperature loaded with the model configuration."""
+        model_temperature = getattr(model_config, "temperature", 1.0)
+        _validate_temperature_sources(self.temperature, model_temperature)
 
     def _run_train_optim_step(self, batches, max_grad_norm=None):
         self._acc_buffer = []
@@ -133,8 +152,8 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
 
             # Listwise softmax over each query's candidates, scaled by the recipe-level
             # temperature as the bi-encoder path does. Backbones that scale inside
-            # forward apply model.temperature there; recipe initialization rejects
-            # configurations where both temperatures are non-unit.
+            # forward apply model.temperature there; recipe validation rejects configurations
+            # where both temperatures are non-unit.
             #
             # Up-cast to fp32 BEFORE the division. The backbone emits bf16 logits, and
             # dividing by a small temperature magnifies them (10x at temperature=0.1),
