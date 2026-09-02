@@ -61,6 +61,7 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
+    GREEDY_TEMPERATURE_EPS,
     Qwen3DFlashDecoderLayer,
     Qwen3DFlashDraftModel,
     assert_target_supports_rollback,
@@ -270,10 +271,13 @@ class CandidateSelector(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Trace one coherent path through the per-position candidate lists.
 
-        Greedy (``temperature == 0``) follows the best successor at each step;
-        otherwise the step is sampled from the softmax over the candidate scores,
-        and the returned per-step distribution is the draft proposal ``q`` that
-        :func:`dflash2_rejection_sample` needs to stay lossless.
+        Below ``GREEDY_TEMPERATURE_EPS`` (matching ``sample``'s own greedy
+        threshold -- dividing by a positive-but-tiny temperature blows the scores
+        up enough that the softmax can turn to NaN) this follows the best
+        successor at each step; otherwise the step is sampled from the softmax
+        over the candidate scores, and the returned per-step distribution is the
+        draft proposal ``q`` that :func:`dflash2_rejection_sample` needs to stay
+        lossless.
 
         Args:
             hidden: Tensor of shape [batch, draft, hidden]; the draft hidden states
@@ -282,7 +286,8 @@ class CandidateSelector(nn.Module):
                 positions.
             anchor_ids: Long tensor of shape [batch]; the last verified token, i.e.
                 the predecessor of draft position 0.
-            temperature: Sampling temperature; ``0`` selects greedily.
+            temperature: Sampling temperature; below ``GREEDY_TEMPERATURE_EPS``
+                selects greedily.
 
         Returns:
             Tuple ``(path, candidate_ids, draft_probs)``: ``path`` is a Long tensor
@@ -290,7 +295,7 @@ class CandidateSelector(nn.Module):
             ``candidate_ids`` a Long tensor of shape [batch, draft, candidates] with
             the scored candidates; ``draft_probs`` a Tensor of shape
             [batch, draft, candidates] with the per-position proposal distribution
-            over those candidates, or ``None`` when ``temperature == 0``.
+            over those candidates, or ``None`` when decoding greedily.
         """
         unary, candidate_ids = torch.topk(logits, self.top_k, dim=-1)
         gate_hidden = self.hidden_projection(hidden)
@@ -302,7 +307,7 @@ class CandidateSelector(nn.Module):
             scores = unary[:, position] + torch.einsum(
                 "br,bkr->bk", gate, F.embedding(candidate_ids[:, position], self.successor_codebook)
             )
-            if temperature > 0:
+            if temperature >= GREEDY_TEMPERATURE_EPS:
                 probs = torch.softmax(scores.float() / temperature, dim=-1)
                 choice = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 prob_rows.append(probs)
@@ -550,9 +555,10 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
 
         Each cycle drafts one block in a single draft forward, walks the selector
         over the per-position candidates to pick a coherent path, and verifies the
-        whole block with one target forward. ``temperature == 0`` accepts the
-        longest exact-match prefix; ``temperature > 0`` accepts via rejection
-        sampling, so the emitted tokens follow the target's own distribution.
+        whole block with one target forward. Below ``GREEDY_TEMPERATURE_EPS`` this
+        accepts the longest exact-match prefix, matching ``sample``'s own greedy
+        threshold; above it, it accepts via rejection sampling, so the emitted
+        tokens follow the target's own distribution.
 
         Args:
             target: The frozen verifier; must expose ``model.embed_tokens``,
@@ -635,7 +641,7 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
                 use_cache=True,
                 output_hidden_states=True,
             )
-            if temperature > 0:
+            if temperature >= GREEDY_TEMPERATURE_EPS:
                 target_probs = sampling_probs(output.logits, temperature, top_p, top_k)
                 acceptance_length, bonus = dflash2_rejection_sample(
                     draft_tokens, target_probs, draft_probs, candidate_ids

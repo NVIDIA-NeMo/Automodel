@@ -22,7 +22,7 @@ import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
-from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
+from nemo_automodel.components.speculative.dflash.draft_qwen3 import GREEDY_TEMPERATURE_EPS, Qwen3DFlashDraftModel
 from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import (
     CandidateSelector,
     GroupedDynamicCausalConv,
@@ -342,6 +342,29 @@ def test_selector_walk_samples_within_candidates_and_returns_a_proposal():
     assert draft_probs.shape == (1, 3, TOP_K)
     torch.testing.assert_close(draft_probs.sum(-1), torch.ones(1, 3))
     assert bool((candidate_ids == path.unsqueeze(-1)).any(dim=-1).all())
+
+
+def test_selector_walk_below_greedy_eps_matches_zero_temperature():
+    """A tiny positive temperature must still take the greedy branch.
+
+    Dividing scores by a temperature below ``GREEDY_TEMPERATURE_EPS`` can blow
+    the softmax up to NaN, so the walk gates on the same threshold ``sample``
+    uses rather than on ``temperature > 0``.
+    """
+    torch.manual_seed(0)
+    selector = CandidateSelector(vocab_size=VOCAB, hidden_size=HIDDEN, rank=16, top_k=TOP_K)
+    hidden = torch.randn(1, 3, HIDDEN)
+    logits = torch.randn(1, 3, VOCAB)
+    anchor_ids = torch.tensor([7])
+
+    tiny_path, tiny_candidate_ids, tiny_probs = selector.walk(
+        hidden, logits, anchor_ids, temperature=GREEDY_TEMPERATURE_EPS / 10
+    )
+    zero_path, zero_candidate_ids, zero_probs = selector.walk(hidden, logits, anchor_ids, temperature=0.0)
+
+    assert tiny_probs is None and zero_probs is None
+    torch.testing.assert_close(tiny_path, zero_path)
+    torch.testing.assert_close(tiny_candidate_ids, zero_candidate_ids)
 
 
 def test_selector_rejects_a_top_k_larger_than_the_vocabulary():

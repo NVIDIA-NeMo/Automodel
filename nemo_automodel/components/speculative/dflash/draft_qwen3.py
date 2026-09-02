@@ -49,6 +49,13 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from nemo_automodel.components.speculative.dflash.target import resolve_text_config
 
+# Below this, ``sample`` decodes greedily instead of dividing by ``temperature``:
+# a division by a positive-but-tiny temperature blows the logits up enough that
+# the softmax it feeds can turn to NaN. Callers that branch between greedy and
+# distributional decoding on their own (e.g. DFlash 2's rejection-sampling path)
+# must gate on this same threshold, not on ``temperature > 0``.
+GREEDY_TEMPERATURE_EPS = 1e-5
+
 
 def resolve_output_head(target: nn.Module) -> nn.Module:
     """Return the target's output projection.
@@ -147,7 +154,7 @@ def sample(
         Long tensor of shape [...]; the sampled token id per position.
     """
     validate_sampling(temperature, top_p, top_k)
-    if temperature < 1e-5:
+    if temperature < GREEDY_TEMPERATURE_EPS:
         return torch.argmax(logits, dim=-1)
     probs = sampling_probs(logits, temperature, top_p, top_k)
     shape = probs.shape[:-1]
