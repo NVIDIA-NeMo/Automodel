@@ -1844,7 +1844,7 @@ wheels = [
 
 [[package]]
 name = "ffpa-attn"
-version = "0.2.3"
+version = "0.2.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -1858,7 +1858,7 @@ dependencies = [
     { name = "torch", marker = "sys_platform == 'never'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/81/61/6b56635c40fd009b450eeb66c4b5021aaf5e61c055993078fec039845f05/ffpa_attn-0.2.3-py3-none-any.whl", hash = "sha256:d083f772433e9e6fb0f925b03b129d9d2830a310a86c7b5a0e28ecba277a89aa", size = 519417, upload-time = "2026-08-28T18:25:53.975Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/7e/6ed94bf44c3fbbbe43433692ec89cd8d5a99416d9f0a283fe810674ffea9/ffpa_attn-0.2.4-py3-none-any.whl", hash = "sha256:f1df2da0c72f7c9599a72301044be9034ecc75a58c81b01dc53a9c6b74124bde", size = 518958, upload-time = "2026-09-02T03:33:51.237Z" },
 ]
 
 [[package]]
@@ -4268,7 +4268,7 @@ requires-dist = [
     { name = "deep-ep", marker = "extra == 'moe'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=42144303752422ade37f24bca9e2dde12df70e09" },
     { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
     { name = "diffusers", marker = "extra == 'diffusion'", specifier = ">=0.39.0" },
-    { name = "ffpa-attn", marker = "extra == 'ffpa'", specifier = ">=0.2.3" },
+    { name = "ffpa-attn", marker = "extra == 'ffpa'", specifier = ">=0.2.4" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
     { name = "flash-linear-attention", marker = "extra == 'fla'", specifier = ">=0.4.2" },
     { name = "flashoptim", specifier = ">=0.1.3" },
