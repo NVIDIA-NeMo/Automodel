@@ -50,7 +50,6 @@ The model is auto-discovered by ``ModelRegistry`` via the ``ModelClass`` export.
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -77,8 +76,8 @@ class Qwen3RerankerConfig(Qwen3Config):
 
     def __init__(
         self,
-        yes_token_id: Optional[int] = None,
-        no_token_id: Optional[int] = None,
+        yes_token_id: int | None = None,
+        no_token_id: int | None = None,
         **kwargs,
     ) -> None:
         self.yes_token_id = yes_token_id
@@ -226,11 +225,11 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
     @can_return_tuple
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
         **kwargs,
     ) -> SequenceClassifierOutputWithPast:
         if attention_mask is None:
