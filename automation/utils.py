@@ -86,6 +86,18 @@ eval_datasets["RERANK_MMTEB_RETRIEVAL_QUICK"] = [
     ),
 ]
 
+eval_datasets["LONG_EMBED"] = [
+    ("LONG_EMBED", " --max_length 32768 --batch_size 1 "),
+]
+
+eval_datasets["RERANK_LONG_EMBED"] = [
+    (
+        "LONG_EMBED",
+        " --eval_type mteb --max_length 32768 --batch_size 1 "
+        "--embedding_results /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/embedding_predictions_31_gabriel_08-26-034305 ",
+    ),
+]
+
 eval_datasets["RTEB_QUICK"] = [
     ("RTEB_QUICK", " --max_length 4096 "),
 ]
@@ -105,7 +117,8 @@ eval_datasets["RTEB"] = [
 eval_datasets["RERANK_RTEB"] = [
     (
         "RTEB",
-        " --eval_type mteb --max_length 8192 ",
+        " --eval_type mteb --max_length 8192 "
+        "--embedding_results /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/embedding_predictions_31_gabriel_08-26-034305 ",
     ),
 ]
 
