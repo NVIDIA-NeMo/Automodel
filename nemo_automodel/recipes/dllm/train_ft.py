@@ -38,9 +38,15 @@ import logging
 import time
 from contextlib import nullcontext
 
-import mlflow
+try:
+    import mlflow
+except ImportError:
+    mlflow = None  # type: ignore[assignment]
 import torch
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None  # type: ignore[assignment]
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config

@@ -84,8 +84,16 @@ class WandbConfig:
         Returns:
             Initialised ``wandb.Run``.
         """
-        import wandb
-        from wandb import Settings
+        try:
+            import wandb
+            from wandb import Settings
+        except ImportError as e:
+            raise ImportError(
+                "wandb is not installed. To enable W&B experiment tracking, run:\n"
+                "  pip install nemo-automodel[wandb]\n"
+                "or to install all tracking backends:\n"
+                "  pip install nemo-automodel[tracking]"
+            ) from e
 
         named = {k: v for k, v in asdict(self).items() if k != "extra" and v is not None}
         # ``extra`` (e.g. mode/dir) is forwarded verbatim; named fields win on collision.
@@ -157,7 +165,14 @@ class MLflowConfig:
         try:
             import mlflow
         except ImportError as e:
-            raise ImportError("MLflow is not installed. Please install it with: uv add mlflow") from e
+            raise ImportError(
+                "mlflow is not installed. To enable MLflow experiment tracking, run:\n"
+                "  pip install nemo-automodel[mlflow]\n"
+                "For the full MLflow stack (UI, SQL backend, pyarrow):\n"
+                "  pip install nemo-automodel[mlflow-full]\n"
+                "or to install all tracking backends:\n"
+                "  pip install nemo-automodel[tracking]"
+            ) from e
 
         if self.tracking_uri is not None:
             mlflow.set_tracking_uri(self.tracking_uri)

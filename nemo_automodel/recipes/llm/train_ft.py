@@ -34,10 +34,16 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-import mlflow
+try:
+    import mlflow
+except ImportError:
+    mlflow = None  # type: ignore[assignment]
 import torch
 import torch.nn as nn
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None  # type: ignore[assignment]
 from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoConfig

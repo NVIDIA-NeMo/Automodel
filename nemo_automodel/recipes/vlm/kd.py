@@ -46,7 +46,10 @@ from contextlib import nullcontext
 from typing import Any
 
 import torch
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None  # type: ignore[assignment]
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer

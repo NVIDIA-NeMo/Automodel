@@ -31,10 +31,16 @@ import time
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Protocol
 
-import mlflow
+try:
+    import mlflow
+except ImportError:
+    mlflow = None  # type: ignore[assignment]
 import torch
 import torch.nn as nn
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None  # type: ignore[assignment]
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers.processing_utils import ProcessorMixin

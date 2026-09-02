@@ -44,7 +44,10 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None  # type: ignore[assignment]
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
@@ -981,7 +984,13 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # ------------------------------------------------------------------
     def _build_wandb(self):
         assert self.cfg.get("wandb", None) is not None
-        from wandb import Settings
+        try:
+            from wandb import Settings
+        except ImportError as e:
+            raise ImportError(
+                "wandb is not installed. To enable W&B experiment tracking, run:\n"
+                "  pip install nemo-automodel[wandb]"
+            ) from e
 
         kwargs = self.cfg.wandb.to_dict()
         if kwargs.get("name", "") == "":
