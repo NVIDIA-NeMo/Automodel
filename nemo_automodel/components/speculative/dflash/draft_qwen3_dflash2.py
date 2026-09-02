@@ -64,7 +64,7 @@ from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDecoderLayer,
     Qwen3DFlashDraftModel,
     assert_target_supports_rollback,
-    extract_context_feature,
+    forward_target_with_context_feature,
     sample,
 )
 
@@ -551,7 +551,8 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
 
         Args:
             target: The frozen verifier; must expose ``model.embed_tokens``,
-                ``lm_head``, and an HF-style forward with ``output_hidden_states``.
+                ``lm_head``, a resolvable decoder-block stack, and an HF-style
+                forward returning logits.
             input_ids: Long tensor of shape [1, prompt].
             max_new_tokens: Maximum number of tokens to generate.
             stop_token_ids: Token ids that end generation, or ``None``.
@@ -581,17 +582,17 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
         past_key_values_draft = DynamicCache(config=self.config)
 
         # Prefill the target on the prompt.
-        output = target(
+        output, target_hidden = forward_target_with_context_feature(
+            target,
             input_ids,
+            self.target_layer_ids,
             position_ids=position_ids[:, :num_input_tokens],
             past_key_values=past_key_values_target,
             use_cache=True,
             logits_to_keep=1,
-            output_hidden_states=True,
         )
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
-        target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
 
         start = num_input_tokens
         while start < max_length:
@@ -614,12 +615,13 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
             )
             block_output_ids[:, 1:] = draft_tokens
 
-            output = target(
+            output, target_hidden = forward_target_with_context_feature(
+                target,
                 block_output_ids,
+                self.target_layer_ids,
                 position_ids=block_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
-                output_hidden_states=True,
             )
             if temperature > 0:
                 target_probs = torch.softmax(output.logits.float() / temperature, dim=-1)
@@ -634,9 +636,7 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
             output_ids[:, start + acceptance_length + 1] = bonus
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[
-                :, : acceptance_length + 1, :
-            ]
+            target_hidden = target_hidden[:, : acceptance_length + 1, :]
             if stop_token_ids is not None and any(
                 stop_id in output_ids[:, num_input_tokens:] for stop_id in stop_token_ids
             ):

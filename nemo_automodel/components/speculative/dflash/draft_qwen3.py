@@ -29,7 +29,7 @@ mask that enforces this is built by the trainer wrapper in
 
 from __future__ import annotations
 
-from typing import Callable, Tuple
+from typing import Any, Callable, Tuple
 
 import torch
 from torch import nn
@@ -47,7 +47,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 
-from nemo_automodel.components.speculative.dflash.target import resolve_text_config
+from nemo_automodel.components.speculative.dflash.target import resolve_text_config, resolve_transformer_layers
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -222,6 +222,15 @@ class Qwen3DFlashAttention(nn.Module):
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        if self.config._attn_implementation == "flex_attention":
+            # PyTorch's AUTO backend selects a separate flex-decoding lowering
+            # for rank-local query lengths below 128. Some dynamic speech
+            # batches have no valid decoding autotune choice, while other ranks
+            # select the regular FlexAttention kernel and proceed. Force the
+            # regular kernel so every rank supports the same dynamic shapes.
+            kernel_options = dict(kwargs.get("kernel_options") or {})
+            kernel_options.setdefault("FORCE_USE_FLEX_ATTENTION", True)
+            kwargs["kernel_options"] = kernel_options
         attn_output, attn_weights = attn_fn(
             self,
             q,
@@ -339,10 +348,71 @@ def extract_context_feature(hidden_states: list[torch.Tensor], layer_ids: list[i
 
     ``hidden_states`` follows HF's ``output_hidden_states`` convention where
     index 0 is the embedding output, so layer ``i``'s output is at index
-    ``i + 1``.
+    ``i + 1``. The final tuple entry may already include the model-level final
+    norm, so selecting the final decoder block through this compatibility helper
+    is rejected; generation uses forward hooks instead.
     """
+    final_block_id = len(hidden_states) - 2
+    if final_block_id in layer_ids:
+        raise ValueError(
+            "The final decoder block cannot be recovered pre-norm from output_hidden_states; "
+            "capture it with forward_target_with_context_feature instead."
+        )
     offset = 1
     return torch.cat([hidden_states[layer_id + offset] for layer_id in layer_ids], dim=-1)
+
+
+def forward_target_with_context_feature(
+    target: nn.Module,
+    input_ids: torch.LongTensor,
+    layer_ids: list[int],
+    **forward_kwargs: Any,
+) -> tuple[Any, torch.Tensor]:
+    """Run a target forward and capture raw decoder-block outputs.
+
+    Hugging Face replaces the final decoder block's entry in
+    ``output_hidden_states`` with the model-level normalized state. Forward
+    hooks preserve one feature contract for every configured block, including
+    the final one: its raw residual output before that separate normalization.
+
+    Args:
+        target: Frozen target language model.
+        input_ids: Target token IDs with shape ``[batch, sequence]``.
+        layer_ids: Decoder-block IDs to concatenate in the requested order.
+        **forward_kwargs: Additional keyword arguments for the target forward.
+
+    Returns:
+        Pair of the target model output and concatenated pre-final-norm context
+        features with shape ``[batch, sequence, selected_layers * hidden]``.
+
+    Raises:
+        ValueError: If a configured decoder-block ID is out of bounds.
+        RuntimeError: If a configured decoder block does not run.
+    """
+    layers = resolve_transformer_layers(target)
+    for layer_id in layer_ids:
+        if layer_id < 0 or layer_id >= len(layers):
+            raise ValueError(f"target layer id {layer_id} is out of bounds for model with {len(layers)} layers")
+    captured: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(layer_id: int):
+        def hook(_module, _inputs, outputs):
+            captured[layer_id] = outputs[0] if isinstance(outputs, tuple) else outputs
+
+        return hook
+
+    try:
+        for layer_id in layer_ids:
+            handles.append(layers[layer_id].register_forward_hook(make_hook(layer_id)))
+        output = target(input_ids, **forward_kwargs)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    if len(captured) != len(layer_ids):
+        raise RuntimeError(f"Expected {len(layer_ids)} captured layers but got {len(captured)}: {sorted(captured)}")
+    return output, torch.cat([captured[layer_id] for layer_id in layer_ids], dim=-1)
 
 
 class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
@@ -489,17 +559,17 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         past_key_values_draft = DynamicCache(config=self.config)
 
         # Prefill the target on the prompt.
-        output = target(
+        output, target_hidden = forward_target_with_context_feature(
+            target,
             input_ids,
+            self.target_layer_ids,
             position_ids=position_ids[:, :num_input_tokens],
             past_key_values=past_key_values_target,
             use_cache=True,
             logits_to_keep=1,
-            output_hidden_states=True,
         )
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
-        target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
 
         start = num_input_tokens
         while start < max_length:
@@ -518,12 +588,13 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
 
-            output = target(
+            output, target_hidden = forward_target_with_context_feature(
+                target,
                 block_output_ids,
+                self.target_layer_ids,
                 position_ids=block_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
-                output_hidden_states=True,
             )
             posterior = sample(output.logits, temperature)
             acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
@@ -531,9 +602,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[
-                :, : acceptance_length + 1, :
-            ]
+            target_hidden = target_hidden[:, : acceptance_length + 1, :]
             if stop_token_ids is not None and any(
                 stop_id in output_ids[:, num_input_tokens:] for stop_id in stop_token_ids
             ):

@@ -113,8 +113,11 @@ and `val_accept_len`; adding a top-level `wandb:` block uploads all of them.
 | `draft_num_hidden_layers` | draft stack depth (paper: 5) |
 | `block_size` | tokens drafted in parallel per block (paper: 16) |
 | `num_anchors` | blocks sampled per sequence per step |
+| `max_total_anchors` | caps sampled anchor blocks across the local micro-batch to bound memory use |
 | `loss_decay_gamma` | block-position decay; `null` disables it |
 | `loss_type` | `dflash` (fixed anchor) or `variable_prefix` |
+| `use_fused_linear_ce` | chunks the LM-head projection and cross-entropy instead of materializing all logits; supports `loss_type: dflash` only |
+| `linear_ce_chunk_size` | positions projected per fused CE chunk; smaller values reduce peak memory further |
 | `target_layer_ids` | target feature layers fed to the draft (defaults to an even spread) |
 | `mask_token_id` | reserved token id filling non-anchor block positions (required) |
 | `attention_backend` | `flex_attention` (GPU main path) or `sdpa` (portable fallback) |

@@ -21,10 +21,13 @@ attributes each helper reads are populated -- mirroring the EAGLE recipe tests.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
@@ -38,6 +41,109 @@ _VOCAB = 64
 _HIDDEN = 32
 _MASK_ID = _VOCAB - 1
 _TARGET_LAYER_IDS = [1, 3, 5]
+
+
+_DDP_BASE_BATCHES = (
+    (
+        ([[1.0, 0.0], [0.0, 1.0]], [1.0, -1.0]),
+        ([[2.0, 1.0]], [0.5]),
+    ),
+    (
+        ([[1.0, 1.0]], [0.0]),
+        ([[0.0, 2.0], [2.0, 0.0], [1.0, -1.0]], [1.5, -0.5, 0.25]),
+    ),
+)
+_DDP_SELECTOR_BATCHES = (
+    (
+        ([[0.5, 1.0]], [0.25]),
+        ([[1.5, -0.5], [0.25, 2.0]], [0.75, -1.0]),
+    ),
+    (
+        ([[1.0, 0.5], [-1.0, 1.0]], [0.0, 1.25]),
+        ([], []),
+    ),
+)
+
+
+def _weighted_mse_term(prediction: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a local mean and count, preserving a zero gradient for an empty set.
+
+    Args:
+        prediction: Tensor of shape ``[rows, 1]`` containing model outputs.
+        target: Tensor of shape ``[rows]`` containing regression targets.
+
+    Returns:
+        Scalar local-mean loss and scalar row-count tensors.
+    """
+    count = torch.tensor(float(target.numel()), dtype=prediction.dtype)
+    if target.numel() == 0:
+        return prediction.sum() * 0.0, count
+    return (prediction.squeeze(-1) - target).square().mean(), count
+
+
+def _ddp_batch(spec, rank: int, micro_step: int) -> tuple[torch.Tensor, torch.Tensor]:
+    inputs, targets = spec[rank][micro_step]
+    return torch.tensor(inputs, dtype=torch.float32).reshape(-1, 2), torch.tensor(targets, dtype=torch.float32)
+
+
+def _run_two_rank_weighted_loss_gradient_parity(rank: int, init_file: str) -> None:
+    """Exercise real DDP/no_sync with uneven base and selector denominators."""
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.manual_seed(17)
+        module = torch.nn.Linear(2, 1)
+        ddp = torch.nn.parallel.DistributedDataParallel(module)
+        initial_state = {name: value.detach().clone() for name, value in ddp.module.state_dict().items()}
+        selector_coefficient = 0.3
+
+        for micro_step in range(2):
+            base_x, base_y = _ddp_batch(_DDP_BASE_BATCHES, rank, micro_step)
+            selector_x, selector_y = _ddp_batch(_DDP_SELECTOR_BATCHES, rank, micro_step)
+            all_x = torch.cat((base_x, selector_x))
+            sync_context = ddp.no_sync() if micro_step == 0 else nullcontext()
+            with sync_context:
+                prediction = ddp(all_x)
+                base_prediction = prediction[: base_x.shape[0]]
+                selector_prediction = prediction[base_x.shape[0] :]
+                base_loss, base_weight = _weighted_mse_term(base_prediction, base_y)
+                selector_loss, selector_weight = _weighted_mse_term(selector_prediction, selector_y)
+                normalized_base, _ = train_dflash._normalize_ddp_loss(base_loss, base_weight, True)
+                normalized_selector, _ = train_dflash._normalize_ddp_loss(
+                    selector_coefficient * selector_loss, selector_weight, True
+                )
+                ((normalized_base + normalized_selector) / 2).backward()
+
+        reference = torch.nn.Linear(2, 1)
+        reference.load_state_dict(initial_state)
+        reference_loss = torch.zeros(())
+        for micro_step in range(2):
+            for spec, coefficient in (
+                (_DDP_BASE_BATCHES, 1.0),
+                (_DDP_SELECTOR_BATCHES, selector_coefficient),
+            ):
+                xs, ys = zip(*(_ddp_batch(spec, other_rank, micro_step) for other_rank in range(2)))
+                all_x = torch.cat(xs)
+                all_y = torch.cat(ys)
+                if all_y.numel() > 0:
+                    reference_loss = (
+                        reference_loss + coefficient * (reference(all_x).squeeze(-1) - all_y).square().mean() / 2
+                    )
+        reference_loss.backward()
+
+        for (name, parameter), reference_parameter in zip(ddp.module.named_parameters(), reference.parameters()):
+            torch.testing.assert_close(
+                parameter.grad, reference_parameter.grad, msg=lambda message: f"{name}: {message}"
+            )
+    finally:
+        dist.destroy_process_group()
 
 
 def _dflash_draft():
@@ -73,6 +179,27 @@ def _bare_dflash_recipe():
     # Resolved by setup(), which these tests bypass.
     recipe.draft_sliding_window = None
     return recipe
+
+
+def test_build_trainer_module_wires_fused_ce_and_anchor_budget():
+    recipe = _bare_dflash_recipe()
+
+    module = recipe._build_trainer_module(
+        "sdpa",
+        {
+            "num_anchors": 512,
+            "max_total_anchors": 512,
+            "use_fused_linear_ce": True,
+            "linear_ce_chunk_size": 256,
+            "loss_decay_gamma": 4.0,
+        },
+    )
+
+    assert module.num_anchors == 512
+    assert module.max_total_anchors == 512
+    assert module.use_fused_linear_ce is True
+    assert module.loss_fn.chunk_size == 256
+    assert module.loss_decay_gamma == 4.0
 
 
 def _ckpt_self(ckpt_every_steps, save_every_epoch, global_step, total_optim_steps=None):
@@ -392,12 +519,52 @@ def test_all_ranks_have_valid_ddp_min_reduces_across_ranks(monkeypatch):
     monkeypatch.setattr(train_dflash.dist, "is_initialized", lambda: True)
 
     # Another rank skipped -> the collective drives the flag to 0 -> all skip.
-    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: t.fill_(0))
+    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None, group=None: t.fill_(0))
     assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is False
 
     # Every rank valid -> MIN leaves the 1 in place -> all run the backward.
-    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: None)
+    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None, group=None: None)
     assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True
+
+
+def test_normalize_ddp_loss_scales_gradient_by_global_weight(monkeypatch):
+    monkeypatch.setattr(train_dflash.dist, "is_available", lambda: True)
+    monkeypatch.setattr(train_dflash.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(train_dflash.dist, "get_world_size", lambda group=None: 2)
+
+    def fake_all_reduce(stats, op=None, group=None):
+        # Local numerator/weight are 6/2; the other rank contributes 20/8.
+        stats.add_(torch.tensor([20.0, 8.0]))
+
+    monkeypatch.setattr(train_dflash.dist, "all_reduce", fake_all_reduce)
+    loss = torch.tensor(3.0, requires_grad=True)
+
+    scaled_loss, global_loss = train_dflash._normalize_ddp_loss(
+        loss, torch.tensor(2.0), is_ddp=True, process_group="draft-dp"
+    )
+    scaled_loss.backward()
+
+    assert loss.grad.item() == pytest.approx(0.4)
+    assert global_loss.item() == pytest.approx(2.6)
+
+
+def test_normalize_ddp_loss_is_noop_without_ddp():
+    loss = torch.tensor(3.0, requires_grad=True)
+
+    scaled_loss, logged_loss = train_dflash._normalize_ddp_loss(loss, torch.tensor(2.0), is_ddp=False)
+
+    assert scaled_loss is loss
+    assert logged_loss.item() == 3.0
+
+
+def test_two_rank_ddp_weighted_loss_matches_global_reference(tmp_path):
+    """Real DDP accumulation matches global per-term means with uneven rank work."""
+    mp.spawn(
+        _run_two_rank_weighted_loss_gradient_parity,
+        args=(str(tmp_path / "dflash_weighted_loss"),),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_all_reduce_sum_uses_additive_distributed_statistics(monkeypatch):

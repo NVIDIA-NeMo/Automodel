@@ -105,6 +105,8 @@ class JetSpecTrainerModule(DFlashTrainerModule):
         num_anchors: int = 512,
         kd_temperature: float = 1.0,
         kd_chunk_size: int = 0,
+        *,
+        max_total_anchors: int | None = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -115,6 +117,7 @@ class JetSpecTrainerModule(DFlashTrainerModule):
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=None,
+            max_total_anchors=max_total_anchors,
         )
         # Forward KL(P_target || Q_draft) with Hinton T^2 scaling and uniform
         # weighting over active draft positions (paper Eq. 9, no depth weighting in

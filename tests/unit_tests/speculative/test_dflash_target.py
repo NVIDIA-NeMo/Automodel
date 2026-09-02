@@ -36,12 +36,30 @@ _HIDDEN = 16
 _LAYERS = 4
 
 
+class _AddConstant(nn.Module):
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.value = value
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Add a scalar without changing tensor layout.
+
+        Args:
+            inputs: Tensor with arbitrary shape.
+
+        Returns:
+            Tensor with the same shape as ``inputs``.
+        """
+        return inputs + self.value
+
+
 class _FakeHFBackbone(nn.Module):
     """HuggingFace-style backbone: ``ModuleList`` layers, explicit HF flags."""
 
     def __init__(self, embed: nn.Embedding) -> None:
         super().__init__()
         self.layers = nn.ModuleList([nn.Linear(_HIDDEN, _HIDDEN) for _ in range(_LAYERS)])
+        self.norm = _AddConstant(10.0)
         self._embed = embed
 
     def forward(
@@ -50,7 +68,7 @@ class _FakeHFBackbone(nn.Module):
         h = self._embed(input_ids)
         for layer in self.layers:
             h = layer(h)
-        return (h,)
+        return (self.norm(h),)
 
 
 class _FakeHFCausalLM(nn.Module):
@@ -160,6 +178,21 @@ def test_generate_batch_concatenates_selected_layers():
     # DFlash does NOT shift the supervision tensors (unlike EAGLE-3)
     assert torch.equal(out.input_ids, input_ids)
     assert torch.equal(out.loss_mask, loss)
+
+
+def test_generate_batch_captures_final_block_before_model_norm():
+    model = _FakeHFCausalLM()
+    model.model.layers = nn.ModuleList([_AddConstant(float(index + 1)) for index in range(_LAYERS)])
+    target = HFDFlashTargetModel(model, target_layer_ids=[_LAYERS - 1])
+    input_ids, attention_mask, loss_mask = _batch(batch=2, seq=8)
+
+    out = target.generate_batch(input_ids, attention_mask, loss_mask)
+
+    expected_pre_norm = model.get_input_embeddings()(input_ids)
+    for index in range(_LAYERS):
+        expected_pre_norm = expected_pre_norm + float(index + 1)
+    assert torch.equal(out.hidden_states, expected_pre_norm)
+    assert not torch.equal(out.hidden_states, model.model.norm(expected_pre_norm))
 
 
 def test_generate_batch_drops_hf_flags_for_custom_backbone():
