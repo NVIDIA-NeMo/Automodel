@@ -24,6 +24,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 
 try:
@@ -727,7 +728,9 @@ class GroupedExperts(nn.Module):
                 )
 
             if self.config.apply_router_weight_after_down:
-                output2 = output2.float() * permuted_probs.float()
+                # Chunked custom-autograd multiply (saves the raw inputs only);
+                # the fp32 output feeds the fp32 scatter_add unchanged.
+                output2 = _apply_router_weight_fp32(output2, permuted_probs, torch.float32)
                 scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
                 y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2.float())
             else:
@@ -1105,7 +1108,9 @@ class GroupedExpertsDeepEP(nn.Module):
         if self.config.apply_router_weight_after_down:
             # HybridEP/DeepEP combine expects the expert activation dtype. Keep
             # the multiply in fp32, then cast each routed expert output back.
-            output2 = (output2.float() * permuted_probs.float()).to(compute_dtype)
+            # Chunked custom-autograd path: saves the raw inputs only, instead
+            # of the full-size fp32 intermediates autograd would keep alive.
+            output2 = _apply_router_weight_fp32(output2, permuted_probs, compute_dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
