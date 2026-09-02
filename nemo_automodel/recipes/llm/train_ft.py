@@ -701,10 +701,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
             and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
         ):
-            from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+            from nemo_automodel.components.models.common.packing import (
+                get_attn_implementation,
+                validate_flash_packing_support,
+            )
 
             attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
-            configure_packing(attn_implementation=attn_implementation)
+            validate_flash_packing_support(attn_implementation=attn_implementation, model=self.model_parts[0])
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config):
