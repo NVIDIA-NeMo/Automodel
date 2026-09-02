@@ -1,0 +1,151 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""MXFP4 (fp4 e2m1 + e8m0 block scales) pack/unpack utilities for MoE expert weights.
+
+The packed layout matches the DeepSeek V4 Flash routed-expert checkpoint format:
+two e2m1 values per int8 byte (low nibble at even column index, high nibble at the
+following odd column) with one ``float8_e8m0fnu`` scale per 32 contiguous columns.
+``MXFP4GroupedMM`` provides a grouped GEMM over packed weights that re-dequantizes
+in backward instead of saving the dequantized tensor, so frozen expert weights stay
+packed at steady state during LoRA training.
+"""
+
+import torch
+
+MXFP4_BLOCK_SIZE = 32
+
+# FP4 e2m1 value table: low 3 bits -> magnitude, MSB -> sign.
+# Layout: [positive values for codes 0-7, negative values for codes 8-15].
+_FP4_E2M1_TABLE = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+# Midpoints between consecutive positive e2m1 magnitudes, used to round to nearest.
+_FP4_E2M1_MIDPOINTS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32)
+
+# Per-byte expansion of the two packed e2m1 nibbles: row ``b`` holds
+# ``(value(low nibble), value(high nibble))``. A single gather over this 256-row
+# table decodes both fp4 values per byte with one int64 index tensor (half the
+# gathers of indexing the 16-entry table twice).
+_FP4_BYTE_TABLE = torch.stack(
+    [
+        _FP4_E2M1_TABLE[torch.arange(256) & 0x0F],
+        _FP4_E2M1_TABLE[(torch.arange(256) >> 4) & 0x0F],
+    ],
+    dim=-1,
+)  # [256, 2]
+
+
+def dequantize_mxfp4(packed: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Unpack fp4 e2m1 packed-int8 values and apply the per-32-column e8m0 scale.
+
+    Args:
+        packed: int8 tensor of shape ``[..., K // 2]`` holding two e2m1 values per byte.
+        scales: ``float8_e8m0fnu`` tensor of shape ``[..., K // 32]``.
+        dtype: Output dtype.
+
+    Returns:
+        Dequantized tensor of shape ``[..., K]`` in ``dtype``.
+    """
+    packed_u8 = packed.contiguous().view(torch.uint8)
+    # Single gather over the 256-row byte table yields both e2m1 values per byte,
+    # interleaved (low, high) so column indices match the original layout.
+    pairs = _FP4_BYTE_TABLE.to(packed_u8.device)[packed_u8.long()]  # [..., K // 2, 2]
+    fp4_vals = pairs.flatten(-2)  # [..., K]
+
+    # float8_e8m0fnu casts straight to its 2^(e - 127) value (OCP MX spec: byte 0x00
+    # decodes to 2^-127, not zero). No all-zero-block special case is needed -- such a
+    # block's fp4 codes are already 0, so the product is 0 regardless of the scale.
+    scale_f32 = scales.to(torch.float32)  # [..., K // 32]
+
+    # Stay blocked and broadcast the per-32-column scale instead of materializing a
+    # full [..., K] scale tensor (cheaper, and fuses better under torch.compile).
+    blocked = fp4_vals.view(*fp4_vals.shape[:-1], scale_f32.shape[-1], MXFP4_BLOCK_SIZE)
+    return (blocked * scale_f32.unsqueeze(-1)).flatten(-2).to(dtype)
+
+
+def quantize_mxfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize along the last dim to the packed mxfp4 layout used by ``dequantize_mxfp4``.
+
+    Block scales are computed as ``2^(floor(log2(amax)) - 2)`` so that values that are
+    already exactly representable (e.g. a dequantized fp4 checkpoint) round-trip
+    value-exactly.
+
+    Args:
+        weight: Floating-point tensor of shape ``[..., K]`` with ``K`` divisible by 32.
+
+    Returns:
+        Tuple of (int8 packed tensor ``[..., K // 2]``, ``float8_e8m0fnu`` scales ``[..., K // 32]``).
+    """
+    k = weight.shape[-1]
+    assert k % MXFP4_BLOCK_SIZE == 0, f"last dim {k} must be divisible by {MXFP4_BLOCK_SIZE}"
+
+    w = weight.float()
+    blocks = w.view(*w.shape[:-1], k // MXFP4_BLOCK_SIZE, MXFP4_BLOCK_SIZE)
+    amax = blocks.abs().amax(dim=-1)
+
+    # e2m1 max magnitude is 6 = 1.5 * 2^2, so the shared block exponent is
+    # floor(log2(amax)) - 2. frexp gives floor(log2(amax)) == exponent - 1 exactly,
+    # avoiding log2 round-off near powers of two (the common case for a dequantized-fp4
+    # checkpoint); frexp(0).exponent == 0 also removes the need for a zero guard.
+    exp_field = torch.frexp(amax).exponent - 3  # (exponent - 1) - 2
+    scale_bytes = (exp_field + 127).clamp(1, 254).to(torch.uint8)
+    scales = scale_bytes.view(torch.float8_e8m0fnu)
+    scale = scales.to(torch.float32)  # exact power of two; same decode as dequantize_mxfp4
+
+    # Round each scaled magnitude to the nearest e2m1 magnitude code. bucketize rounds
+    # half away from zero rather than to-nearest-even (PTX cvt / OCP recommendation);
+    # irrelevant for the exact-round-trip path, where scaled values land exactly on
+    # codes and never on a midpoint tie.
+    scaled = blocks.abs() / scale.unsqueeze(-1)
+    midpoints = _FP4_E2M1_MIDPOINTS.to(w.device)
+    codes = torch.bucketize(scaled, midpoints).to(torch.uint8)
+    codes = codes | torch.where(blocks < 0, torch.full_like(codes, 0x08), torch.zeros_like(codes))
+    codes = codes.reshape(*w.shape[:-1], k)
+
+    packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).view(torch.int8)
+    return packed.contiguous(), scales.contiguous()
+
+
+class MXFP4GroupedMM(torch.autograd.Function):
+    """Grouped GEMM over mxfp4-packed frozen weights with dequantization on the fly.
+
+    Saves only the packed weights for backward and re-dequantizes there, so the
+    bf16 weight tensor is a transient in both passes instead of being kept alive
+    by autograd. Weights are stored as ``[E, N, K]`` packed along ``K``, which is
+    the natural dequantization output and the operand the backward GEMM needs
+    directly (``grad_x = grad_out @ W``). The forward needs ``[E, K, N]``, which
+    ``torch._grouped_mm`` consumes as a transposed view (cuBLAS transB) — no
+    contiguous copy required.
+
+    No weight gradient is produced — the base weights are frozen under LoRA.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+        w_t = dequantize_mxfp4(packed, scales, x.dtype)  # [E, N, K]
+        # Pass the transposed view directly; torch._grouped_mm handles the
+        # strided mat2 (transB), avoiding a full bf16 weight copy per forward.
+        out = torch._grouped_mm(x, w_t.transpose(-2, -1), offs=offs)
+        ctx.save_for_backward(packed, scales, offs)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        packed, scales, offs = ctx.saved_tensors
+        w_t = dequantize_mxfp4(packed, scales, grad_out.dtype)  # [E, N, K] == W^T
+        grad_x = torch._grouped_mm(grad_out.contiguous(), w_t, offs=offs)
+        return grad_x, None, None, None
