@@ -87,9 +87,7 @@ dependencies = [
     "torch>=2.6.0",
     "torchdata",
     "transformers==5.12.1",
-    "wandb>=0.28.0",
     "torchao",
-    "mlflow",
     "flashoptim>=0.1.3",
     # 0.6.4 pins nvidia-cutlass-dsl==4.6.2, matching what flash_attn.cute requires at the
     # pinned FLASH_ATTN_REF. Both import `cutlass`, so they have to agree. (0.6.1 pinned 4.6.0.)
@@ -104,7 +102,7 @@ diffusion = [
     "torchvision",
 ]
 diffusion_kernels = [
-    "nemo_automodel[diffusion]",
+    "nemo-automodel[diffusion]",
     "kernels",
 ]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
@@ -153,8 +151,8 @@ delta-databricks = [
     "databricks-sql-connector>=4.4.0",  # Minimum connector compatible with patched Thrift 0.24.0
 ]
 moe = [
-    "nemo_automodel[cuda]",
-    "nemo_automodel[fla]",
+    "nemo-automodel[cuda]",
+    "nemo-automodel[fla]",
     "deep_ep",
 ]
 vlm = [
@@ -190,18 +188,36 @@ diffusion-media = [
     "opencv-python-headless==4.10.0.84",  # cv2: diffusion preprocessing entry point (also in vlm-media)
 ]
 media = [
-    "nemo_automodel[vlm-media]",
-    "nemo_automodel[diffusion-media]",
+    "nemo-automodel[vlm-media]",
+    "nemo-automodel[diffusion-media]",
+]
+mlflow = [
+    # mlflow-skinny: same Python tracking API, no server/UI/pyarrow/scipy/etc.
+    # Avoids the mlflow vs mlflow-skinny mutual-exclusion conflict that breaks
+    # environments using sagemaker-mlflow, kedro-mlflow, and managed ML platforms.
+    "mlflow-skinny",
+]
+mlflow-full = [
+    # Full mlflow stack: tracking server, UI, SQL backend, pyarrow, etc.
+    # Use when you need the MLflow UI or sql:// artifact stores.
+    "mlflow",
+]
+wandb = ["wandb>=0.28.0"]
+tracking = [
+    # Convenience meta-extra: installs both experiment-tracking backends.
+    "nemo-automodel[mlflow]",
+    "nemo-automodel[wandb]",
 ]
 all = [
-    "nemo_automodel[cli]",
-    "nemo_automodel[cuda]",
-    "nemo_automodel[delta-databricks]",
-    "nemo_automodel[diffusion]",
-    "nemo_automodel[extra]",
-    "nemo_automodel[fla]",
-    "nemo_automodel[s3]",
-    "nemo_automodel[vlm]",
+    "nemo-automodel[cli]",
+    "nemo-automodel[cuda]",
+    "nemo-automodel[delta-databricks]",
+    "nemo-automodel[diffusion]",
+    "nemo-automodel[extra]",
+    "nemo-automodel[fla]",
+    "nemo-automodel[s3]",
+    "nemo-automodel[tracking]",
+    "nemo-automodel[vlm]",
 ]
 
 [project.urls]
@@ -571,6 +587,8 @@ allowed-unresolved-imports = [
     "lmdb",
     "mamba_ssm.**",
     "megatron.**",
+    "mlflow",
+    "mlflow.**",
     "nemo_automodel.components.datasets.llm.megatron.helpers_cpp",
     "nemo_run",
     "pynvml",
@@ -582,6 +600,8 @@ allowed-unresolved-imports = [
     "transformers.tokenization_utils",
     "uccl",
     "uccl.**",
+    "wandb",
+    "wandb.**",
 ]
 
 [tool.ty.rules]

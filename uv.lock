@@ -4046,7 +4046,6 @@ dependencies = [
     { name = "flashoptim" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extra = ["audio", "hf-hub", "sentencepiece"] },
-    { name = "mlflow" },
     { name = "pybind11" },
     { name = "pyyaml" },
     { name = "quack-kernels", marker = "sys_platform == 'linux'" },
@@ -4057,7 +4056,6 @@ dependencies = [
     { name = "torchao" },
     { name = "torchdata" },
     { name = "transformers" },
-    { name = "wandb" },
 ]
 
 [package.optional-dependencies]
@@ -4074,6 +4072,7 @@ all = [
     { name = "imageio" },
     { name = "mamba-ssm" },
     { name = "mistral-common" },
+    { name = "mlflow-skinny" },
     { name = "nemo-run" },
     { name = "numba", version = "0.53.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
     { name = "numba", version = "0.62.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
@@ -4095,6 +4094,7 @@ all = [
     { name = "torchvision", version = "0.25.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
     { name = "torchvision", version = "0.25.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
     { name = "transformer-engine", extra = ["pytorch"] },
+    { name = "wandb" },
 ]
 cli = [
     { name = "nemo-run" },
@@ -4163,6 +4163,12 @@ media = [
     { name = "qwen-omni-utils" },
     { name = "qwen-vl-utils" },
 ]
+mlflow = [
+    { name = "mlflow-skinny" },
+]
+mlflow-full = [
+    { name = "mlflow" },
+]
 moe = [
     { name = "apache-tvm-ffi" },
     { name = "causal-conv1d" },
@@ -4182,6 +4188,10 @@ msc = [
 s3 = [
     { name = "boto3" },
 ]
+tracking = [
+    { name = "mlflow-skinny" },
+    { name = "wandb" },
+]
 vlm = [
     { name = "backoff" },
     { name = "mistral-common" },
@@ -4200,6 +4210,9 @@ vlm-media = [
     { name = "opencv-python-headless" },
     { name = "qwen-omni-utils" },
     { name = "qwen-vl-utils" },
+]
+wandb = [
+    { name = "wandb" },
 ]
 
 [package.dev-dependencies]
@@ -4275,7 +4288,8 @@ requires-dist = [
     { name = "megatron-fsdp", git = "https://github.com/yuhezhang-ai/Megatron-LM.git?subdirectory=megatron%2Fcore%2Fdistributed%2Ffsdp%2Fsrc&rev=455389c480af6b3acdca74c7830c68b3274eb083" },
     { name = "mistral-common", marker = "extra == 'vlm'", specifier = ">=1.11.0" },
     { name = "mistral-common", extras = ["audio", "hf-hub", "sentencepiece"] },
-    { name = "mlflow" },
+    { name = "mlflow", marker = "extra == 'mlflow-full'" },
+    { name = "mlflow-skinny", marker = "extra == 'mlflow'" },
     { name = "multi-storage-client", marker = "extra == 'msc'", specifier = ">=0.13" },
     { name = "nemo-automodel", extras = ["cli"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'all'" },
@@ -4287,9 +4301,12 @@ requires-dist = [
     { name = "nemo-automodel", extras = ["extra"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'moe'" },
+    { name = "nemo-automodel", extras = ["mlflow"], marker = "extra == 'tracking'" },
     { name = "nemo-automodel", extras = ["s3"], marker = "extra == 'all'" },
+    { name = "nemo-automodel", extras = ["tracking"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm-media"], marker = "extra == 'media'" },
+    { name = "nemo-automodel", extras = ["wandb"], marker = "extra == 'tracking'" },
     { name = "nemo-run", marker = "extra == 'cli'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
@@ -4324,9 +4341,9 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cu130" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = ">=2.14.1" },
     { name = "transformers", specifier = "==5.12.1" },
-    { name = "wandb", specifier = ">=0.28.0" },
+    { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.28.0" },
 ]
-provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "ffpa", "fla", "delta-databricks", "moe", "vlm", "cli", "s3", "msc", "vlm-media", "diffusion-media", "media", "all"]
+provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "ffpa", "fla", "delta-databricks", "moe", "vlm", "cli", "s3", "msc", "vlm-media", "diffusion-media", "media", "mlflow", "mlflow-full", "wandb", "tracking", "all"]
 
 [package.metadata.requires-dev]
 build = [
