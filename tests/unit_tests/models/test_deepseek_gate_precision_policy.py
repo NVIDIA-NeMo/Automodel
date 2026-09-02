@@ -266,7 +266,18 @@ def test_deepseek_router_stages_on_constructed_model(model_cls, config_fn):
     assert indices.shape == (16, model.model.moe_config.n_activated_experts)
 
 
-def test_deepseek_gate_matches_hf_reference_router_grouped():
+# Released DeepSeek-V3 (rev e815299) stores e_score_correction_bias in F32 in all
+# 59 routers, with a large positive per-layer mean (2.23 to 8.04) and a small
+# per-expert spread (std 0.0018 to 0.0236). A zero-centered bias never exercises
+# that regime, so parity is checked in both.
+_BIAS_REGIMES = (
+    pytest.param(0.0, 0.1, id="zero_centered"),
+    pytest.param(4.95, 0.002, id="v3_like"),
+)
+
+
+@pytest.mark.parametrize(("bias_mean", "bias_std"), _BIAS_REGIMES)
+def test_deepseek_gate_matches_hf_reference_router_grouped(bias_mean, bias_std):
     """Proj/Score/Out parity vs the pinned HF reference, grouped routing (n_group=2).
 
     The reference splits the router across two objects: DeepseekV3TopkRouter does
@@ -274,13 +285,16 @@ def test_deepseek_gate_matches_hf_reference_router_grouped():
     does sigmoid/bias/group-mask/top-k/norm/scale. Automodel's Gate does all of it,
     so the comparison drives both.
     """
+    # Imported here, not at module scope: modeling_deepseek_v3 pulls in the whole
+    # transformers.generation stack, which would couple the other tests in this
+    # file to dependencies none of them need.
     from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
 
     cfg = _router_config()
     gate = Gate(cfg, gate_precision=torch.float32).eval()
     torch.manual_seed(0)
     gate.weight.data.normal_(std=0.02)
-    gate.e_score_correction_bias.uniform_(-0.1, 0.1)  # nonzero: exercise the biased top-k path
+    gate.e_score_correction_bias.normal_(mean=bias_mean, std=bias_std)
 
     hf_cfg = DeepseekV3Config(
         hidden_size=cfg.dim,
