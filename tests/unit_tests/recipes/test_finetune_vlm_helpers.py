@@ -45,6 +45,7 @@ from nemo_automodel.recipes.vlm.finetune import (
     _get_model_name,
     build_model,
 )
+from tests.unit_tests.recipes.engine_stub import RecipeEngineStub as _RecipeEngineStub
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
@@ -379,6 +380,7 @@ class _TensorModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.supports = SimpleNamespace(mtp_enabled=False)
 
     def forward(self, **batch):
         return torch.zeros((), requires_grad=True)
@@ -395,6 +397,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     recipe.model_parts = [model]  # Now uses model_parts instead of model
     recipe.pp_enabled = False  # Pipeline parallelism disabled
     recipe.optimizer = [_DummyOptimizer()]  # Now a list
+    recipe.engine = _RecipeEngineStub(model, optimizer=recipe.optimizer[0], grad_norm=2.5)
     # ``is_remote_logging_step`` is read by ``_forward_backward_step`` when the
     # composite (gemma4 joint drafter) attaches drafter logits; default False
     # so non-drafter test paths skip the log line.
@@ -426,39 +429,18 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
         "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
     )
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
-        lambda model, is_last, defer_fsdp_grad_sync=True: nullcontext(),
-    )
-
     calculate_mock = MagicMock(side_effect=fake_calculate_loss)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_loss", calculate_mock)
-
-    grad_clip_mock = MagicMock(return_value=2.5)
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
-        grad_clip_mock,
-    )
-
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.prepare_for_grad_accumulation",
-        lambda model_parts, pp_enabled: None,
-    )
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
-        lambda model_parts, pp_enabled: None,
-    )
 
     metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
 
     assert isinstance(metrics, MetricsSample)
     assert logits_seen["value"].requires_grad
-    grad_clip_mock.assert_called_once()
     assert calculate_mock.call_args.kwargs["num_label_tokens"] == 1
     assert metrics.metrics["grad_norm"] == 2.5
-    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0)
     assert recipe.optimizer[0].step_called
     assert recipe.optimizer[0].zero_grad_called
+    assert recipe.engine.gradient_accumulation_steps == len(batches)
 
 
 @pytest.mark.cuda(False)
@@ -469,6 +451,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     recipe.mesh_context = SimpleNamespace(cp_size=2)
     recipe.processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=7))
     recipe.model_parts = [_TensorModel()]
+    recipe.engine = _RecipeEngineStub(recipe.model_parts[0])
     recipe.pp_enabled = False
     recipe.magi = SimpleNamespace(enabled=False)
     recipe.distributed_config = None
@@ -483,7 +466,6 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
         return SimpleNamespace(shard=lambda actual: (nullcontext, actual))
 
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", make_thd_batch)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.calculate_loss",
         lambda *args, **kwargs: torch.tensor(1.0, requires_grad=True),
@@ -1548,31 +1530,15 @@ class _MockAutoPipeline:
     def __init__(self, has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=True):
         self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
         self.info = self._info
-        self.step_batches = []
 
     def update_seq_len(self, seq_len: int) -> None:
         # Dynamic seq-len hook is a no-op in tests; AutoPipeline exposes this for
         # variable-length VLM batches.
         return None
 
-    def step(self, model_input, *, target=None, losses=None, **kwargs):
-        """Record and forward an AutoPipeline step.
-
-        Args:
-            model_input: Tensor of shape [batch, ...] containing the first
-                pipeline stage's input.
-            target: Optional tensor of shape [batch, sequence] containing loss
-                targets.
-            losses: Optional mutable list populated with scalar loss tensors.
-            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
-                model-defined layouts.
-
-        Returns:
-            The value returned by the schedule mock.
-        """
-        self.step_batches.append(dict(kwargs))
-        schedule_args = (model_input,) if self.info.has_first_stage else ()
-        return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+    def step(self, model_input, **kwargs):
+        args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.step(*args, **kwargs)
 
 
 def _create_pp_recipe(model=None):
@@ -1695,7 +1661,9 @@ class TestForwardBackwardStepPP:
 
         # Verify schedule.step was called
         pp_recipe.pp.info.schedule.step.assert_called_once()
-        assert pp_recipe.pp.step_batches == [{}]
+        schedule_call = pp_recipe.pp.info.schedule.step.call_args
+        assert len(schedule_call.args) == 1
+        assert set(schedule_call.kwargs) == {"target", "losses"}
 
         # Verify loss was computed
         assert len(loss_buffer) == 1
@@ -1725,9 +1693,10 @@ class TestForwardBackwardStepPP:
             is_train=True,
         )
 
-        assert len(pp_recipe.pp.step_batches) == 1
-        assert pp_recipe.pp.step_batches[0].keys() == {"position_ids"}
-        assert torch.equal(pp_recipe.pp.step_batches[0]["position_ids"], position_ids)
+        schedule_call = pp_recipe.pp.info.schedule.step.call_args
+        assert len(schedule_call.args) == 1
+        assert set(schedule_call.kwargs) == {"target", "losses", "position_ids"}
+        assert torch.equal(schedule_call.kwargs["position_ids"], position_ids)
 
     def test_pp_vlm_chunking_videos_uses_video_grid_and_counts(self, pp_recipe, monkeypatch):
         """Video tensors are chunked by per-sample video counts before schedule.step."""
@@ -2267,6 +2236,7 @@ def _create_non_pp_recipe(model, device="cpu"):
     recipe.__dict__["distributed_config"] = None
     recipe.__dict__["cp_vision_frame_sharding"] = CpVisionFrameShardingConfig(enabled=True)
     recipe.__dict__["model_parts"] = [model]
+    recipe.__dict__["engine"] = _RecipeEngineStub(model)
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
     # ``is_remote_logging_step`` is read by ``_forward_backward_step`` to
     # gate the joint-drafter loss-log line; default False so non-drafter
@@ -2412,10 +2382,6 @@ class TestForwardBackwardStepNonPP:
             "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
             lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
-            lambda model, is_last, defer_fsdp_grad_sync=True: nullcontext(),
-        )
 
         batch = {
             "labels": torch.randint(0, 50, (2, 5)),
@@ -2459,10 +2425,6 @@ class TestForwardBackwardStepNonPP:
             "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
             lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
-            lambda model, is_last, defer_fsdp_grad_sync=True: nullcontext(),
-        )
 
         batch = {
             "labels": torch.randint(0, 50, (2, 5)),
@@ -2501,10 +2463,6 @@ class TestForwardBackwardStepNonPP:
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
             lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
-        )
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
-            lambda model, is_last, defer_fsdp_grad_sync=True: nullcontext(),
         )
 
         batch = {
@@ -2862,7 +2820,7 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
-        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[], grad_acc_steps=1),
     )
     monkeypatch.setattr("nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build", lambda self, *a, **k: [])
     monkeypatch.setattr(
@@ -2921,6 +2879,96 @@ def _minimal_vlm_cfg(
     if prewarm is not None:
         cfg["prewarm"] = prewarm
     return ConfigNode(cfg)
+
+
+def _patch_vlm_distributed_setup(
+    monkeypatch,
+    *,
+    pp_enabled: bool,
+    scale_grads_in_schedule: bool = False,
+):
+    mesh_context = SimpleNamespace(
+        pp_enabled=pp_enabled,
+        device_mesh=None,
+        moe_mesh=None,
+        cp_size=1,
+        pp_size=2 if pp_enabled else 1,
+    )
+    pipeline_config = (
+        SimpleNamespace(
+            scale_grads_in_schedule=scale_grads_in_schedule,
+            pp_batch_size=1,
+            pp_microbatch_size=1,
+            patch_stage_backward_maybe_with_nosync=False,
+            loss_fn=None,
+        )
+        if pp_enabled
+        else None
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.create_distributed_setup_from_config",
+        lambda cfg, world_size: SimpleNamespace(
+            mesh_context=mesh_context,
+            strategy_config=None,
+            pipeline_config=pipeline_config,
+            moe_parallel_config=None,
+            activation_checkpointing=False,
+        ),
+    )
+
+
+def test_vlm_setup_rejects_pipeline_schedule_gradient_scaling(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    _patch_vlm_distributed_setup(monkeypatch, pp_enabled=True, scale_grads_in_schedule=True)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    with pytest.raises(ValueError, match="scale_grads_in_schedule=False"):
+        trainer.setup()
+
+
+@pytest.mark.parametrize("local_batch_size", [1, 2])
+def test_vlm_setup_supports_magi_pipeline_only_with_unit_local_batch(monkeypatch, local_batch_size):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+    cfg.step_scheduler.local_batch_size = local_batch_size
+    cfg.step_scheduler.global_batch_size = local_batch_size
+    cfg.distributed.pipeline = ConfigNode({"pp_microbatch_size": 1})
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    _patch_vlm_distributed_setup(monkeypatch, pp_enabled=True)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.setup_magi",
+        lambda *args, **kwargs: SimpleNamespace(enabled=True),
+    )
+
+    if local_batch_size == 2:
+        with pytest.raises(ValueError, match="Magi pipeline training requires"):
+            FinetuneRecipeForVLM(cfg).setup()
+        return
+
+    class DummyAutoPipeline(SimpleNamespace):
+        pass
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.AutoPipeline", DummyAutoPipeline)
+    model = DummyModel()
+    pipeline = DummyAutoPipeline(
+        parts=[model],
+        pp_batch_size=1,
+        pp_microbatch_size=1,
+        scale_grads_in_schedule=False,
+        info=SimpleNamespace(
+            has_first_stage=True,
+            has_last_stage=False,
+            stages=[SimpleNamespace(is_first=True, is_last=False)],
+            schedule=MagicMock(),
+        ),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *args, **kwargs: pipeline)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert trainer.pp is pipeline
+    assert trainer.engine is None
 
 
 def test_vlm_setup_applies_prewarm_config(monkeypatch):

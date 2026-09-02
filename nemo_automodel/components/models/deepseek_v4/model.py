@@ -893,7 +893,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             shard_batch=partial(
                 make_dsv4_contiguous_shard_cp_batch_and_ctx,
                 pad_multiple=dsv4_cp_local_seq_multiple(self.config),
-                sync_packed_length=self.backend.dispatcher == "hybridep",
             ),
             local_token_global_indices=contiguous_local_indices,
         )

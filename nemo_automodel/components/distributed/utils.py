@@ -247,17 +247,17 @@ def get_sync_ctx(model, is_optim_step, defer_fsdp_grad_sync: bool):
     Returns:
         A context manager that synchronizes the model.
     """
-    # Use `no_sync` on DDP models when we are *not* on the final micro-batch for
-    # this gradient update (i.e., when `is_grad` is False). This avoids an
-    # all-reduce for every micro-batch and greatly improves throughput.
+    # Use `no_sync` on wrappers that expose it when we are not on the final
+    # microbatch. This covers DDP and optional wrappers such as MegatronFSDP
+    # without importing their optional packages here.
     sync_ctx = nullcontext()
     if isinstance(model, dist.fsdp._fully_shard._fully_shard.FSDPModule):
         if defer_fsdp_grad_sync:
             model.set_requires_gradient_sync(is_optim_step)
         else:
             model.set_requires_gradient_sync(True)
-    elif isinstance(model, torch.nn.parallel.DistributedDataParallel) and not is_optim_step:
-        sync_ctx = model.no_sync()
+    elif not is_optim_step and callable(no_sync := getattr(model, "no_sync", None)):
+        sync_ctx = no_sync()
     return sync_ctx
 
 

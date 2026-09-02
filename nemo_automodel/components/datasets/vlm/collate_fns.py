@@ -56,7 +56,7 @@ from nemo_automodel.components.datasets.vlm.fake_image import (  # noqa: F401
     mask_fake_vision_tokens_batch,
 )
 from nemo_automodel.components.datasets.vlm.samplers import _smart_resize_image
-from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
+from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens, merge_media_values
 
 # ---------------------------------------------------------------------------
 # Patch BaseVideoProcessor.fetch_videos to use decord (decord2) instead of
@@ -1362,22 +1362,6 @@ def default_collate_fn(
     return batch
 
 
-def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
-    """Merge fixed-shape patch tensors or preserve variable-resolution media lists."""
-    if not values:
-        raise ValueError("Media merge requires at least one value.")
-    if all(isinstance(value, torch.Tensor) for value in values):
-        return torch.cat(values, dim=0).to(torch.bfloat16)
-    if all(isinstance(value, (list, tuple)) for value in values):
-        return [
-            item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item for value in values for item in value
-        ]
-    raise TypeError(
-        "VLM media values must be consistently tensors or variable-resolution lists, "
-        f"got {[type(value).__name__ for value in values]}."
-    )
-
-
 def pad_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -1434,8 +1418,8 @@ def pad_collate_fn(
         "attention_mask": torch.stack(padded_attention_mask),
     }
 
-    # Pad sequence-length tensors that mirror input_ids (e.g. mm_token_type_ids)
-    for seq_key in ("mm_token_type_ids",):
+    # Pad sequence-length tensors that mirror input_ids.
+    for seq_key in ("mm_token_type_ids", "token_type_ids"):
         if any(seq_key in ex for ex in examples):
             padded = []
             for ex in examples:
@@ -1465,7 +1449,7 @@ def pad_collate_fn(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [ex[key] for ex in examples if key in ex and ex[key] is not None]
         if tensors:
-            batch[key] = _merge_media_values(tensors)
+            batch[key] = merge_media_values(tensors, field_name=key)
 
     # Per-sample image counts from image_grid_thw shapes (before concat)
     image_grid_per_sample = [
@@ -1621,7 +1605,7 @@ def neat_packed_vlm_collater(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = _merge_media_values(tensors)
+            result[key] = merge_media_values(tensors, field_name=key)
 
     for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
@@ -1670,8 +1654,9 @@ def packed_sequence_thd_vlm_collater(
             (default -1000); filtered downstream in ``process_input_for_thd``.
 
     Returns:
-        Dict with ``input_ids``/``labels`` ``[batch, seq]``, ``position_ids``
-        ``[batch, seq]`` or ``[3, batch, seq]``, ``seq_lens``/``seq_lens_padded``
+        Dict with ``input_ids``/``labels`` ``[batch, seq]``, optional token-type
+        fields ``[batch, seq]``, ``position_ids`` ``[batch, seq]`` or
+        ``[3, batch, seq]``, ``seq_lens``/``seq_lens_padded``
         ``[batch, max_packs]``, ``qkv_format='thd'``, and concatenated media tensors.
     """
     if not batch:
@@ -1757,10 +1742,18 @@ def packed_sequence_thd_vlm_collater(
         "qkv_format": "thd",
     }
 
+    for key in ("mm_token_type_ids", "token_type_ids"):
+        if any(key in item and item[key] is not None for item in batch):
+            values = [
+                item[key] if item.get(key) is not None else torch.zeros_like(torch.as_tensor(item["input_ids"]))
+                for item in batch
+            ]
+            result[key] = torch.stack([_pad_seq(value, 0, max_len) for value in values])
+
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = _merge_media_values(tensors)
+            result[key] = merge_media_values(tensors, field_name=key)
 
     for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]

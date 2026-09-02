@@ -22,6 +22,7 @@ from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     _compute_mrope_position_ids,
     _shift_sample,
     neat_pack_dataset_vlm,
+    pack_vlm_samples,
 )
 
 
@@ -105,7 +106,7 @@ class TestBuildPackedVlmSample:
                 "labels": torch.tensor([105, 106]),
             },
         ]
-        result = _build_packed_vlm_sample(samples, pack_size=8, padding_idx=0)
+        result = _build_packed_vlm_sample(samples, padding_idx=0)
 
         # No pre-padding: length = sum of samples (3 + 2 = 5)
         assert result["input_ids"].shape == (5,)
@@ -128,7 +129,7 @@ class TestBuildPackedVlmSample:
                 "image_grid_thw": torch.tensor([[1, 224, 224]]),
             },
         ]
-        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+        result = _build_packed_vlm_sample(samples, padding_idx=0)
 
         assert result["pixel_values"].shape[0] == 3  # 2 + 1
         assert result["image_grid_thw"].shape[0] == 3
@@ -149,7 +150,7 @@ class TestBuildPackedVlmSample:
             },
         ]
 
-        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+        result = _build_packed_vlm_sample(samples, padding_idx=0)
 
         assert isinstance(result["pixel_values"], list)
         assert [tuple(value.shape) for value in result["pixel_values"]] == [(3, 8, 12), (3, 16, 8)]
@@ -167,7 +168,7 @@ class TestBuildPackedVlmSample:
                 "mm_token_type_ids": torch.tensor([1, 1]),
             },
         ]
-        result = _build_packed_vlm_sample(samples, pack_size=8, padding_idx=0)
+        result = _build_packed_vlm_sample(samples, padding_idx=0)
         assert result["mm_token_type_ids"].tolist() == [0, 1, 0, 1, 1]
 
     def test_sequence_alignment_pads_each_document_and_preserves_real_lengths(self):
@@ -178,7 +179,6 @@ class TestBuildPackedVlmSample:
 
         result = _build_packed_vlm_sample(
             samples,
-            pack_size=8,
             padding_idx=0,
             sequence_alignment=4,
         )
@@ -188,6 +188,45 @@ class TestBuildPackedVlmSample:
         assert result["seq_lens"] == [3, 2]
         assert result["seq_lens_padded"] == [4, 4]
         assert result["position_ids"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+
+
+def test_pack_vlm_samples_applies_shift_alignment_and_media_merge():
+    samples = [
+        _make_vlm_sample(4, has_image=True),
+        _make_vlm_sample(3),
+    ]
+
+    result = pack_vlm_samples(samples, padding_idx=0, sequence_alignment=4)
+
+    assert result["input_ids"].tolist() == [1, 2, 3, 0, 1, 2, 0, 0]
+    assert result["labels"].tolist() == [102, 103, 104, -100, 102, 103, -100, -100]
+    assert result["seq_lens"] == [3, 2]
+    assert result["seq_lens_padded"] == [4, 4]
+    assert result["n_images"] == 2
+
+
+def test_pack_vlm_samples_builds_and_shifts_mrope_positions():
+    def get_rope_index(input_ids, attention_mask=None):
+        seq_len = input_ids.shape[1]
+        positions = torch.arange(seq_len).expand(3, 1, seq_len)
+        return positions, torch.zeros(1)
+
+    result = pack_vlm_samples(
+        [_make_vlm_sample(4)],
+        padding_idx=0,
+        get_rope_index=get_rope_index,
+    )
+
+    assert result["position_ids"].shape == (3, 3)
+    assert result["position_ids"][0].tolist() == [0, 1, 2]
+
+    with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
+        pack_vlm_samples(
+            [_make_vlm_sample(4)],
+            padding_idx=0,
+            get_rope_index=get_rope_index,
+            sequence_alignment=2,
+        )
 
 
 class TestNeatPackDatasetVlm:
@@ -436,7 +475,7 @@ class TestMRoPESupport:
                 ),
             },
         ]
-        result = _build_packed_vlm_sample(samples, pack_size=7, padding_idx=0, has_mrope=True)
+        result = _build_packed_vlm_sample(samples, padding_idx=0, has_mrope=True)
 
         # No pre-padding: [3, 5] (3+2 tokens)
         assert result["position_ids"].shape == (3, 5)

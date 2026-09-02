@@ -53,6 +53,7 @@ from nemo_automodel.components.datasets.vlm.samplers import (
     _smart_resize_image,
     _smart_resize_video,
 )
+from nemo_automodel.components.datasets.vlm.utils import merge_media_values
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,8 @@ MEDIA_KEYS = (
     "video_grid_thw",
     "second_per_grid_ts",
 )
+
+_TOKEN_TYPE_KEYS = ("mm_token_type_ids", "token_type_ids")
 
 # ---------------------------------------------------------------------------
 # Visual-token-balanced greedy knapsack
@@ -345,9 +348,10 @@ def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
     out["labels"] = sample["labels"][1:]
     out["attention_mask"] = sample["attention_mask"][:-1]
 
-    if (mm_ttids := sample.get("mm_token_type_ids")) is not None:
-        mm_ttids = torch.as_tensor(mm_ttids)
-        out["mm_token_type_ids"] = mm_ttids[0, :-1] if mm_ttids.ndim == 2 else mm_ttids[:-1]
+    for key in _TOKEN_TYPE_KEYS:
+        if (token_types := sample.get(key)) is not None:
+            token_types = torch.as_tensor(token_types)
+            out[key] = token_types[0, :-1] if token_types.ndim == 2 else token_types[:-1]
 
     if has_mrope and "position_ids" in sample and sample["position_ids"] is not None:
         out["position_ids"] = sample["position_ids"][:, :-1]
@@ -367,7 +371,6 @@ def _aligned_length(length: int, alignment: int) -> int:
 
 def _build_packed_vlm_sample(
     samples: list[dict],
-    pack_size: int,
     padding_idx: int,
     has_mrope: bool = False,
     sequence_alignment: int = 1,
@@ -379,7 +382,10 @@ def _build_packed_vlm_sample(
     all_input_ids: list[int] = []
     all_labels: list[int] = []
     all_attention_mask: list[int] = []
-    all_mm_token_type_ids: list[int] = []
+    all_token_type_ids: dict[str, list[int]] = {key: [] for key in _TOKEN_TYPE_KEYS}
+    present_token_type_keys = tuple(
+        key for key in _TOKEN_TYPE_KEYS if any(sample.get(key) is not None for sample in samples)
+    )
     all_position_ids_1d: list[int] = []
     mrope_position_ids_list: list[torch.Tensor] = []
     seq_lens: list[int] = []
@@ -411,12 +417,13 @@ def _build_packed_vlm_sample(
         all_labels.extend(labs + [-100] * pad)
         all_attention_mask.extend([seq_idx] * padded_seq_len)
 
-        mm_ttids = sample.get("mm_token_type_ids")
-        if mm_ttids is not None:
-            mm_ttids = mm_ttids.tolist() if isinstance(mm_ttids, torch.Tensor) else list(mm_ttids)
-            all_mm_token_type_ids.extend(mm_ttids + [0] * pad)
-        else:
-            all_mm_token_type_ids.extend([0] * padded_seq_len)
+        for key in present_token_type_keys:
+            token_types = sample.get(key)
+            if token_types is None:
+                all_token_type_ids[key].extend([0] * padded_seq_len)
+                continue
+            token_types = torch.as_tensor(token_types).reshape(-1).tolist()
+            all_token_type_ids[key].extend(token_types + [0] * pad)
 
         if has_mrope and "position_ids" in sample:
             mrope_position_ids_list.append(sample["position_ids"])
@@ -443,26 +450,22 @@ def _build_packed_vlm_sample(
         "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
         "labels": torch.tensor(all_labels, dtype=torch.long),
         "attention_mask": torch.tensor(all_attention_mask, dtype=torch.long),
-        "mm_token_type_ids": torch.tensor(all_mm_token_type_ids, dtype=torch.long),
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
         "n_images": n_images,
         "n_videos": n_videos,
     }
+    for key in present_token_type_keys:
+        packed[key] = torch.tensor(all_token_type_ids[key], dtype=torch.long)
 
     if has_mrope and mrope_position_ids_list:
         packed["position_ids"] = torch.cat(mrope_position_ids_list, dim=1)
     else:
         packed["position_ids"] = torch.tensor(all_position_ids_1d, dtype=torch.long)
 
-    if pixel_values_list and all(isinstance(value, torch.Tensor) for value in pixel_values_list):
-        packed["pixel_values"] = torch.cat(pixel_values_list, dim=0)
-    elif pixel_values_list and all(isinstance(value, (list, tuple)) for value in pixel_values_list):
-        packed["pixel_values"] = [item for value in pixel_values_list for item in value]
-    elif pixel_values_list:
-        raise TypeError("Packed VLM pixel_values must be consistently tensors or variable-resolution lists.")
-    else:
-        packed["pixel_values"] = None
+    packed["pixel_values"] = (
+        merge_media_values(pixel_values_list, field_name="pixel_values") if pixel_values_list else None
+    )
     packed["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0) if image_grid_thw_list else None
     packed["image_position_ids"] = torch.cat(image_position_ids_list, dim=0) if image_position_ids_list else None
     packed["pixel_values_videos"] = torch.cat(pixel_values_videos_list, dim=0) if pixel_values_videos_list else None
@@ -470,6 +473,43 @@ def _build_packed_vlm_sample(
     packed["second_per_grid_ts"] = torch.cat(second_per_grid_ts_list, dim=0) if second_per_grid_ts_list else None
 
     return packed
+
+
+def pack_vlm_samples(
+    samples: Sequence[dict[str, object]],
+    *,
+    padding_idx: int,
+    get_rope_index: Callable[..., object] | None = None,
+    sequence_alignment: int = 1,
+) -> dict[str, object]:
+    """Shift and concatenate pretokenized VLM samples into one packed sample.
+
+    Args:
+        samples: Processor outputs before the autoregressive input/label shift.
+        padding_idx: Token ID used for per-document alignment padding.
+        get_rope_index: Optional model callback that builds multi-axis position IDs.
+        sequence_alignment: Alignment applied independently to every shifted sample.
+
+    Returns:
+        One packed sample containing token, position, sequence, and media fields.
+    """
+    has_mrope = get_rope_index is not None
+    shifted_samples = []
+    for sample in samples:
+        prepared = dict(sample)
+        if get_rope_index is not None:
+            position_ids = _compute_mrope_position_ids(prepared, get_rope_index)
+            if position_ids is None:
+                raise ValueError("get_rope_index must accept input_ids and return VLM position_ids")
+            prepared["position_ids"] = position_ids
+        shifted_samples.append(_shift_sample(prepared, has_mrope=has_mrope))
+
+    return _build_packed_vlm_sample(
+        shifted_samples,
+        padding_idx,
+        has_mrope=has_mrope,
+        sequence_alignment=sequence_alignment,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -555,8 +595,7 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
             raise ValueError(f"sequence_alignment must be at least 1, got {sequence_alignment}.")
         self.sequence_alignment = sequence_alignment
         self.get_rope_index = get_rope_index
-        self.has_mrope = get_rope_index is not None
-        if self.has_mrope and self.sequence_alignment > 1:
+        if get_rope_index is not None and self.sequence_alignment > 1:
             raise NotImplementedError("Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented.")
         self.max_retries = max_retries
 
@@ -566,18 +605,11 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
     def __getitem__(self, pack_idx: int) -> dict:
         """Materialize one pack: tokenize + shift + concat all samples in the bin."""
         bin_indices = self.bins[pack_idx]
-        shifted_samples: list[dict] = []
+        samples: list[dict] = []
 
         for sample_idx in bin_indices:
             sample = self.inner[sample_idx]  # tokenize + load media
-
-            if self.has_mrope and self.get_rope_index is not None:
-                mrope_pos = _compute_mrope_position_ids(sample, self.get_rope_index)
-                if mrope_pos is not None:
-                    sample["position_ids"] = mrope_pos
-
-            shifted = _shift_sample(sample, has_mrope=self.has_mrope)
-            seq_len = shifted["input_ids"].shape[0]
+            seq_len = len(sample["input_ids"]) - 1
             aligned_seq_len = _aligned_length(seq_len, self.sequence_alignment)
 
             # The aligned length is the actual capacity consumed by THD CP.
@@ -592,16 +624,16 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
                 )
                 continue
 
-            shifted_samples.append(shifted)
+            samples.append(sample)
 
         # Truncate if total exceeds pack_size (estimation was wrong)
         total = 0
         kept: list[dict] = []
-        for s in shifted_samples:
-            slen = s["input_ids"].shape[0]
+        for sample in samples:
+            slen = len(sample["input_ids"]) - 1
             aligned_slen = _aligned_length(slen, self.sequence_alignment)
             if total + aligned_slen <= self.pack_size:
-                kept.append(s)
+                kept.append(sample)
                 total += aligned_slen
             else:
                 logger.debug(
@@ -615,13 +647,18 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
 
         if not kept:
             # Fallback: return a padding-only pack
-            kept = [{"input_ids": torch.tensor([], dtype=torch.long), "labels": torch.tensor([], dtype=torch.long)}]
+            kept = [
+                {
+                    "input_ids": torch.tensor([self.padding_idx], dtype=torch.long),
+                    "labels": torch.tensor([self.padding_idx], dtype=torch.long),
+                    "attention_mask": torch.ones(1, dtype=torch.long),
+                }
+            ]
 
-        return _build_packed_vlm_sample(
+        return pack_vlm_samples(
             kept,
-            self.pack_size,
-            self.padding_idx,
-            has_mrope=self.has_mrope,
+            padding_idx=self.padding_idx,
+            get_rope_index=self.get_rope_index,
             sequence_alignment=self.sequence_alignment,
         )
 

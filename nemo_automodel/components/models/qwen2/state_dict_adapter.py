@@ -74,3 +74,17 @@ class Qwen2StateDictAdapter:
         if exclude_key_regex is not None:
             return {k: v for k, v in state_dict.items() if not re.search(exclude_key_regex, k)}
         return dict(state_dict)
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Return one already-HuggingFace-format tensor.
+
+        Args:
+            fqn: Fully qualified HuggingFace parameter or buffer name.
+            tensor: Tensor with arbitrary parameter shape, dtype, and device.
+            **kwargs: Conversion options accepted by :meth:`to_hf`.
+
+        Returns:
+            The unchanged name and tensor, or an empty list when the name is
+            excluded by ``exclude_key_regex``.
+        """
+        return list(self.to_hf({fqn: tensor}, **kwargs).items())

@@ -32,6 +32,7 @@ TEST_FOLDER = "parallelism"
 GEMMA4_PP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_PP2_Parity.sh"
 GEMMA4_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_TP2_Parity.sh"
 PP_GRAD_ACCUM_PARITY_FILENAME = "L2_Parallelism_PP_Grad_Accum_Parity.sh"
+MEGATRON_FSDP_PER_TOKEN_LOSS_FILENAME = "L2_Parallelism_MegatronFSDP_Per_Token_Loss.sh"
 DEEPSEEK_V4_PP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_PP2_Parity.sh"
 DEEPSEEK_V4_EP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_EP2_Parity.sh"
 QWEN3_5_MOE_PP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_PP2_Parity.sh"
@@ -47,6 +48,9 @@ class TestParallelismParity:
 
     def test_pp_grad_accum_parity(self):
         run_test_script(TEST_FOLDER, PP_GRAD_ACCUM_PARITY_FILENAME)
+
+    def test_megatron_fsdp_per_token_loss(self):
+        run_test_script(TEST_FOLDER, MEGATRON_FSDP_PER_TOKEN_LOSS_FILENAME)
 
     def test_deepseek_v4_pp2_parity(self):
         run_test_script(TEST_FOLDER, DEEPSEEK_V4_PP2_PARITY_FILENAME)

@@ -528,8 +528,8 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
         chunk_size: dispatch solver chunk size.
 
     Returns:
-        (new_batch, key): ``new_batch`` has dispatched ``input_ids``/``position_ids``/
-        ``labels`` (each ``[1, local_S]``); ``key`` is the dist-attn runtime key.
+        ``(new_batch, key, local_indices)`` where ``local_indices`` maps the
+        local token stream to the global input.
     """
     from magi_attention.api import dispatch, get_position_ids, magi_attn_varlen_key
     from magi_attention.api.functools import compute_pad_size
@@ -567,6 +567,9 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
 
     local_input = dispatch(input_ids.squeeze(0), key=key).unsqueeze(0)  # [1, local_S]
     position_ids = get_position_ids(key).unsqueeze(0).to(device)  # [1, local_S]
+    local_indices = dispatch(
+        torch.arange(seqlen, device=device, dtype=torch.long), key=key, pad_value=seqlen
+    ).unsqueeze(0)
 
     _set_cp_group_on_attention(model.module if hasattr(model, "module") else model, cp_group)
 
@@ -579,7 +582,7 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
         new_batch["labels"] = dispatch(batch["labels"].squeeze(0), key=key, pad_value=-100).unsqueeze(0)
     # Remove anything that no longer matches the dispatched layout.
     new_batch.pop("attention_mask", None)
-    return new_batch, key
+    return new_batch, key, local_indices
 
 
 def _packed_cp_doc_seqlens(batch: dict, total_len: int) -> list:
@@ -625,8 +628,8 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - 
     into the global loss (like TE-CP).
 
     Returns:
-        (new_batch, key): ``new_batch`` has the local ``input_ids``/``position_ids``
-        and local ``labels``; ``key`` is the dist-attn runtime key.
+        ``(new_batch, key, local_indices)`` where ``local_indices`` maps the
+        local token stream to the global input.
     """
     from magi_attention.api import dispatch, get_position_ids
 
@@ -643,12 +646,16 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - 
     )
     local_input = dispatch(input_ids, key=key)
     local_pos = get_position_ids(key).to(local_input.device)
+    total_len = input_ids.numel()
+    local_indices = dispatch(
+        torch.arange(total_len, device=input_ids.device, dtype=torch.long), key=key, pad_value=total_len
+    )
     # Shard labels the same way as the input (like TE-CP): each rank computes the
     # loss on its own shard and the recipe's cross-CP reduction sums the shards
     # into the global loss. (Undispatching logits to global instead would make
     # every CP rank compute the full loss redundantly -> the reduction would
     # double-count it by a factor of cp_size.)
-    local_labels = dispatch(batch["labels"].reshape(-1), key=key)
+    local_labels = dispatch(batch["labels"].reshape(-1), key=key, pad_value=-100)
     new_batch = {
         "input_ids": local_input,
         "position_ids": local_pos,
@@ -659,7 +666,7 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - 
         # magi dispatch permutation.
         "qkv_format": "thd",
     }
-    return new_batch, key
+    return new_batch, key, local_indices
 
 
 def _iter_language_model_attention(model):
@@ -750,10 +757,10 @@ class MagiState:
 
         Returns ``(train_ctx, batch, local_indices)``. magi does its own CP, so
         ``train_ctx`` is always ``nullcontext`` (no torch-native DTensor CP
-        context). ``local_indices`` is the global stream position of every
-        local token on the paths that dispatch the sequence (magi's
-        ``get_position_ids``), None otherwise; the framework installs it on
-        the magi ContextParallelSharder for the token-tensor verbs.
+        context). ``local_indices`` is the explicitly dispatched global stream
+        index of every local token on paths that dispatch the sequence, None
+        otherwise; the framework installs it on the magi
+        ContextParallelSharder for the token-tensor verbs.
         """
         # cp=1 prefix-tree mask: the datasets layer cannot import this module (component
         # independence), so the collate attaches the tree structure and the spec is built
@@ -761,6 +768,11 @@ class MagiState:
         # (a spec or None) is self-clearing, so a stale spec never leaks into the next
         # batch; plain batches omit "prefix_tree".
         prefix_tree = batch.pop("prefix_tree", None)
+        if prefix_tree is not None and self.cp_size > 1:
+            raise NotImplementedError(
+                "The prefix-tree attention mask currently requires cp_size=1; "
+                "distributed prefix-tree dispatch is not wired yet."
+            )
         if prefix_tree is not None and self.hf_dispatch:
             # The prefix-tree mask is handed to the attn_func out-of-band (the HF
             # attention interface has a fixed signature and cannot receive a custom
@@ -779,17 +791,24 @@ class MagiState:
         set_active_attn_spec(spec)
         local_indices = None
         if self.hf_dispatch:
+            if is_thd:
+                raise NotImplementedError(
+                    "The HF magi backend does not support packed THD batches because its fixed "
+                    "attention interface cannot preserve packed document boundaries; use the custom-model "
+                    "magi backend (model.backend.attn='magi')."
+                )
             # HF path: dispatch the (single causal) sequence across the CP group.
-            batch, _ = magi_prepare_batch(model, batch, self.cp_group)
-            # The dispatched position_ids ARE magi's get_position_ids(key): the
-            # global stream position of every local token.
-            local_indices = batch["position_ids"]
+            batch, _, local_indices = magi_prepare_batch(model, batch, self.cp_group)
         elif self.custom and self.cp_size > 1 and is_thd:
             # Custom-model CP packed path: build the *global* THD layout (no TE
             # sharding) then dispatch it with magi's own load-balancing solver.
             batch = make_cp_batch_for_te(None, batch, qkv_format="thd", padding_token_id=pad_id, num_chunks=1)
-            batch, _ = magi_prepare_packed_cp(model, batch, self.cp_group)
-            local_indices = batch["position_ids"]
+            batch, _, local_indices = magi_prepare_packed_cp(model, batch, self.cp_group)
+        elif self.custom and self.cp_size > 1:
+            # A plain causal custom-model batch uses the same dist key and
+            # dispatch as the HF path. The custom attention callable reads the
+            # key from the active CP group instead of the stamped modules.
+            batch, _, local_indices = magi_prepare_batch(model, batch, self.cp_group)
         elif is_thd:
             # cp=1 packing: THD conversion (no sharding) so the batch carries
             # cu_seqlens -> the magi attn_func builds the per-document mask.
@@ -851,6 +870,11 @@ class MagiState:
         """
         del cp_mesh
         local_indices = None
+        if self.custom:
+            # Engine callers do not have to run recipe-level setup_magi first.
+            # Refreshing this process-local handle also makes the active group
+            # explicit for every outer PP accumulation batch.
+            set_active_cp_group(self.cp_group)
         if self.domain == "vlm":
             _, batch = self.prepare_vlm_batch(model, batch)
         else:

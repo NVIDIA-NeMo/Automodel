@@ -39,21 +39,76 @@ _VLM_MEDIA_KEYS = (
 
 
 def chunk_vlm_media(
-    pixel_values: torch.Tensor,
-    image_grid: torch.Tensor,
+    pixel_values: torch.Tensor | list[torch.Tensor],
+    image_grid: torch.Tensor | None,
     batch_size: int,
     n_microbatches: int,
     n_images_per_sample: torch.Tensor | None = None,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+) -> tuple[list[torch.Tensor | list[torch.Tensor]], list[torch.Tensor] | None]:
     """Split VLM pixel values and media metadata into PP microbatch chunks.
 
-    Handles four layouts:
+    Handles five layouts:
     1. ``[N, C, H, W]`` with ``N == batch_size`` -- one full image per sample.
     2. ``[N, max_patches, D]`` with ``N == batch_size`` -- padded patches per image.
     3. Flat patches ``[total_patches, D]`` with per-sample media counts from
        ``n_images_per_sample``.
     4. Flat patches with ``n_images == batch_size`` -- legacy one-image-per-sample.
+    5. Variable-resolution media lists, split at sample boundaries using
+       ``n_images_per_sample`` (or one media item per sample when counts are absent).
+
+    Args:
+        pixel_values: Tensor of shape [media, channels, height, width], [media, patches, hidden], or
+            [patches, hidden], or a list of ``media`` tensors with arbitrary processor-defined shapes.
+        image_grid: Optional tensor of shape [media, grid_dims]. It may be ``None`` only for
+            variable-resolution media lists.
+        batch_size: Number of text samples represented by the media.
+        n_microbatches: Number of pipeline microbatches to materialize.
+        n_images_per_sample: Optional integer tensor of shape [batch] mapping samples to media entries.
+
+    Returns:
+        A pair containing the media chunks and optional grid chunks in pipeline-microbatch order. Tensor chunks
+        are views of ``pixel_values``; list chunks retain references to the original media tensors.
     """
+    if isinstance(pixel_values, list):
+        if n_images_per_sample is None:
+            if len(pixel_values) != batch_size:
+                raise ValueError(
+                    "VLM PP chunking requires n_images_per_sample for variable-resolution media "
+                    f"when len(pixel_values)={len(pixel_values)} differs from batch_size={batch_size}."
+                )
+            media_counts = torch.ones(batch_size, dtype=torch.long)
+        else:
+            media_counts = n_images_per_sample.to(dtype=torch.long, device="cpu")
+
+        total_media = int(media_counts.sum().item())
+        if total_media != len(pixel_values):
+            raise ValueError(
+                "VLM PP chunking cannot align variable-resolution media with sample counts: "
+                f"len(pixel_values)={len(pixel_values)}, sum(n_images_per_sample)={total_media}."
+            )
+        if image_grid is not None and image_grid.shape[0] != total_media:
+            raise ValueError(
+                "VLM PP chunking cannot align image_grid with variable-resolution media: "
+                f"image_grid.shape[0]={image_grid.shape[0]}, len(pixel_values)={total_media}."
+            )
+
+        media_offsets = torch.cat((torch.zeros(1, dtype=torch.long), media_counts.cumsum(dim=0)))
+        samples_per_mb = -(-batch_size // n_microbatches)
+        pixel_values_chunks: list[torch.Tensor | list[torch.Tensor]] = []
+        image_grid_chunks: list[torch.Tensor] | None = [] if image_grid is not None else None
+        for mb_idx in range(n_microbatches):
+            sample_start = min(mb_idx * samples_per_mb, batch_size)
+            sample_end = min(sample_start + samples_per_mb, batch_size)
+            media_start = int(media_offsets[sample_start].item())
+            media_end = int(media_offsets[sample_end].item())
+            pixel_values_chunks.append(pixel_values[media_start:media_end])
+            if image_grid_chunks is not None:
+                image_grid_chunks.append(image_grid[media_start:media_end])
+        return pixel_values_chunks, image_grid_chunks
+
+    if image_grid is None:
+        raise ValueError("VLM PP media prep requires image-grid metadata with tensor pixel_values.")
+
     n_images = image_grid.shape[0]
     pixel_values_chunks: list[torch.Tensor] = []
     image_grid_chunks: list[torch.Tensor] = []
@@ -230,6 +285,17 @@ def prepare_vlm_media_for_pp(
     The returned batch no longer carries raw media tensors that PyTorch PP would
     chunk by row incorrectly; instead it carries ``VLM_PP_MEDIA_KEY`` with
     per-microbatch media chunks.
+
+    Args:
+        batch: Mutable processor batch containing ``input_ids`` of shape [batch, sequence] and optional media
+            tensors or variable-resolution media lists accepted by :func:`chunk_vlm_media`. This mapping is
+            mutated in place: raw media fields are removed and replaced by pre-chunked PP storage.
+        batch_size: Number of text samples in ``batch``.
+        n_microbatches: Number of pipeline microbatches to materialize.
+
+    Returns:
+        The mutated ``batch`` mapping. ``VLM_PP_MEDIA_KEY`` maps media field names to lists in pipeline-microbatch
+        order; each entry is either a tensor chunk or a list of variable-resolution media tensors.
     """
     if n_microbatches < 1:
         raise ValueError(f"n_microbatches must be >= 1, got {n_microbatches}")
@@ -251,9 +317,9 @@ def prepare_vlm_media_for_pp(
     n_videos_per_sample = batch.pop("n_videos_per_sample", None)
 
     image_grid = _select_image_grid(image_grid_hws, image_grid_thw, image_sizes, image_position_ids)
-    pp_media: dict[str, list[torch.Tensor]] = {}
+    pp_media: dict[str, list[Any]] = {}
 
-    if pixel_values is not None and image_grid is None:
+    if isinstance(pixel_values, torch.Tensor) and image_grid is None:
         step3_media = chunk_step3_media(
             pixel_values,
             batch_size=batch_size,
@@ -264,10 +330,10 @@ def prepare_vlm_media_for_pp(
         )
         pp_media.update(step3_media)
 
-    if pixel_values_videos is not None and video_grid_thw is None:
+    if isinstance(pixel_values_videos, torch.Tensor) and video_grid_thw is None:
         raise ValueError("VLM PP media prep requires video_grid_thw with pixel_values_videos.")
 
-    if pixel_values is not None and image_grid is not None:
+    if pixel_values is not None and (image_grid is not None or isinstance(pixel_values, list)):
         pixel_values_chunks, image_grid_chunks = chunk_vlm_media(
             pixel_values,
             image_grid,
@@ -276,9 +342,10 @@ def prepare_vlm_media_for_pp(
             n_images_per_sample=n_images_per_sample,
         )
         pp_media["pixel_values"] = pixel_values_chunks
-        pp_media["image_grid_hws"] = image_grid_chunks
+        if image_grid_chunks is not None:
+            pp_media["image_grid_hws"] = image_grid_chunks
 
-    if pixel_values_videos is not None and video_grid_thw is not None:
+    if pixel_values_videos is not None and (video_grid_thw is not None or isinstance(pixel_values_videos, list)):
         pixel_values_videos_chunks, video_grid_thw_chunks = chunk_vlm_media(
             pixel_values_videos,
             video_grid_thw,
@@ -287,7 +354,8 @@ def prepare_vlm_media_for_pp(
             n_images_per_sample=n_videos_per_sample,
         )
         pp_media["pixel_values_videos"] = pixel_values_videos_chunks
-        pp_media["video_grid_thw"] = video_grid_thw_chunks
+        if video_grid_thw_chunks is not None:
+            pp_media["video_grid_thw"] = video_grid_thw_chunks
 
     if pp_media:
         batch[VLM_PP_MEDIA_KEY] = pp_media

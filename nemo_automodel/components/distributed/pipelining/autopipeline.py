@@ -14,7 +14,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Callable, Literal
 
 import torch
 import torch.nn as nn
@@ -218,24 +218,8 @@ class AutoPipeline:
         self._pp_current_seq_len = seq_len
         logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
 
-    def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
-        """Build pipeline microbatch chunking metadata for keyword inputs.
-
-        PyTorch's default schedule chunking splits every tensor kwarg on dim 0.
-        Most AutoModel batch tensors are batch-major and should keep that
-        default, but some model-owned input layouts place batch on another axis.
-        The canonical local model part can declare those exceptions by implementing
-        ``get_pipeline_kwargs_chunk_dims(kwargs) -> dict[str, int]``.
-
-        Args:
-            kwargs: Mapping passed to the pipeline schedule. Tensor values may
-                have arbitrary model-defined layouts; the model hook identifies
-                any nonstandard batch axis.
-
-        Returns:
-            A chunk-spec mapping with the same nested structure as ``kwargs``,
-            or ``None`` when PyTorch's default chunking applies.
-        """
+    def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, object]) -> dict[str, object] | None:
+        """Build schedule chunking metadata for model-owned keyword layouts."""
         model_parts = self._info.model_parts
         if not model_parts:
             raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
@@ -248,7 +232,6 @@ class AutoPipeline:
         for key in custom_chunk_dims:
             if key not in kwargs:
                 raise ValueError(f"Model PP chunk hook returned unknown kwarg: {key}")
-
         if not custom_chunk_dims:
             return None
 
@@ -262,45 +245,56 @@ class AutoPipeline:
             kwargs_chunk_spec[key] = TensorChunkSpec(split_dim)
         return kwargs_chunk_spec
 
+    def _run_schedule(
+        self,
+        method_name: Literal["step", "eval"],
+        model_input: torch.Tensor,
+        *,
+        target: torch.Tensor | None,
+        losses: list[torch.Tensor] | None,
+        kwargs: dict[str, object],
+    ) -> object:
+        """Run one schedule method with first-stage and model-owned chunking rules."""
+        schedule = self._info.schedule
+        if schedule is None:
+            raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule")
+        method = getattr(schedule, method_name, None)
+        if not callable(method):
+            raise NotImplementedError(f"The configured pipeline schedule does not support {method_name}()")
+
+        schedule_args = (model_input,) if self._info.has_first_stage else ()
+        kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
+        if kwargs_chunk_spec is None:
+            return method(*schedule_args, target=target, losses=losses, **kwargs)
+
+        previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
+        schedule._kwargs_chunk_spec = kwargs_chunk_spec
+        try:
+            return method(*schedule_args, target=target, losses=losses, **kwargs)
+        finally:
+            schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
+
     def step(
         self,
         model_input: torch.Tensor,
         *,
         target: torch.Tensor | None = None,
         losses: list[torch.Tensor] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        """Run one pipeline schedule step with model-owned input chunking.
+        **kwargs: object,
+    ) -> object:
+        """Run a training schedule step with model-owned input chunking."""
+        return self._run_schedule("step", model_input, target=target, losses=losses, kwargs=kwargs)
 
-        Args:
-            model_input: Tensor of shape [batch, ...] containing the first
-                pipeline stage's input. Ignored on ranks without the first stage.
-            target: Tensor with a model-defined target layout, or ``None`` on
-                ranks without the last pipeline stage.
-            losses: Mutable list populated with scalar loss tensors, or ``None``
-                on ranks without the last pipeline stage.
-            **kwargs: Keyword schedule inputs. Tensor values may have arbitrary
-                model-defined layouts; model-owned metadata identifies any
-                nonstandard batch axis.
-
-        Returns:
-            The value returned by the underlying PyTorch pipeline schedule.
-        """
-        schedule = self._info.schedule
-        if schedule is None:
-            raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
-
-        schedule_args = (model_input,) if self._info.has_first_stage else ()
-        kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
-        if kwargs_chunk_spec is None:
-            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
-
-        previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
-        schedule._kwargs_chunk_spec = kwargs_chunk_spec
-        try:
-            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
-        finally:
-            schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
+    def eval(
+        self,
+        model_input: torch.Tensor,
+        *,
+        target: torch.Tensor | None = None,
+        losses: list[torch.Tensor] | None = None,
+        **kwargs: object,
+    ) -> object:
+        """Run a forward-only schedule step with model-owned input chunking."""
+        return self._run_schedule("eval", model_input, target=target, losses=losses, kwargs=kwargs)
 
     @property
     def parts(self) -> list[nn.Module]:

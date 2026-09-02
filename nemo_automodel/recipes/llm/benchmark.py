@@ -308,8 +308,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Calculate gradient accumulation steps
         dp_size = self._get_dp_group_size()
-        ga_steps = global_batch_size // (local_batch_size * dp_size)
-        assert ga_steps > 0, "Global batch size must be divisible by local batch size * dp_size"
+        optimizer_microbatch_size = local_batch_size * dp_size
+        if global_batch_size < optimizer_microbatch_size or global_batch_size % optimizer_microbatch_size != 0:
+            raise ValueError(
+                f"global_batch_size ({global_batch_size}) must be a positive multiple of "
+                f"local_batch_size * dp_size ({optimizer_microbatch_size})"
+            )
+        ga_steps = global_batch_size // optimizer_microbatch_size
 
         if rank == 0:
             logger.info(f"Running {steps} iterations with {warmup_steps} warmup steps")
@@ -334,49 +339,59 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if rank == 0:
                 logger.info(f"Rank {rank} | Iteration {i}")
 
-            # Zero gradients
-            for opt in self.optimizer:
-                opt.zero_grad()
-
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
-                # Gradient accumulation loop
-                num_label_tokens = 0
+                # Materialize the optimizer window: num_label_tokens must be
+                # all-reduced before the first forward.
+                batches = [next(dataloader_iter) for _ in range(ga_steps)]
+                num_label_tokens = sum((batch["labels"] != -100).sum().item() for batch in batches)
+                num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
+                num_label_tokens = self._dp_allreduce(num_label_tokens_tensor).item()
                 loss_buffer = []
-                prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+                if self.pp_enabled:
+                    self._set_moe_aux_loss_backward_scale(
+                        num_batches=ga_steps,
+                        num_label_tokens=num_label_tokens,
+                    )
+                    prepare_for_grad_accumulation(self.model_parts, pp_enabled=True)
+                else:
+                    self.engine.set_gradient_accumulation_steps(ga_steps)
 
-                for ga_step_idx in range(ga_steps):
-                    if ga_step_idx == ga_steps - 1:
-                        prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+                for ga_step_idx, batch in enumerate(batches):
+                    if self.pp_enabled and ga_step_idx == ga_steps - 1:
+                        prepare_for_final_backward(self.model_parts, pp_enabled=True)
 
-                    # Get batch from dataloader
-                    batch = next(dataloader_iter)
                     torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
-
-                    # Accumulate label tokens locally
-                    num_label_tokens += (batch["labels"] != -100).sum().item()
 
                     with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
                         self._forward_backward_step(
                             ga_step_idx,
                             batch,
                             loss_buffer=loss_buffer,
-                            num_label_tokens=None,
+                            num_label_tokens=num_label_tokens,
                             num_batches=ga_steps,
                             is_train=True,
                         )
 
                     torch.cuda.nvtx.range_pop()
 
-                    if ga_step_idx == 0:
+                    if self.pp_enabled and ga_step_idx == 0:
                         prepare_after_first_microbatch()
 
-                # Optimizer step
-                with self.timers("optimizer", log_level=2):
-                    for opt in self.optimizer:
-                        opt.step()
-                    logger.debug("Optimizer step")
+                    if not self.pp_enabled:
+                        if self.engine.is_gradient_accumulation_boundary():
+                            self.checkpointer.maybe_wait_for_staging()
+                        with self.timers("optimizer", log_level=2):
+                            self.engine.step()
+
+                if self.pp_enabled:
+                    with self.timers("optimizer", log_level=2):
+                        self._step_pipeline_optimizer(
+                            num_label_tokens=num_label_tokens,
+                            max_grad_norm=self.max_grad_norm,
+                        )
+                        logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
@@ -384,24 +399,18 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self.partial_cuda_graph_manager.capture()
                 self._partial_cuda_graph_capture_pending = False
 
-            # Synchronize num_label_tokens across DP ranks
-            num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
-            num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
-            num_label_tokens = num_label_tokens_tensor.item()
-
             # Calculate loss - following exact train_ft.py:1059-1071 pattern
             reporting_loss = torch.sum(torch.stack(loss_buffer))
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
 
             if self.pp_enabled:
+                reporting_loss = (
+                    reporting_loss.to(torch.float32) / num_label_tokens
+                    if num_label_tokens > 0
+                    else reporting_loss.to(torch.float32) * 0.0
+                )
                 reporting_loss = reporting_loss.to(self.dist_env.device)
-                # Send loss to first rank if pp group rank is 0
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-                if self.dist_env.rank == src_rank:
-                    torch.distributed.send(reporting_loss, dst=0)
-                elif self.dist_env.is_main:
-                    torch.distributed.recv(reporting_loss, src=src_rank)
+                reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
 
             reporting_loss = reporting_loss.cpu().item()
 

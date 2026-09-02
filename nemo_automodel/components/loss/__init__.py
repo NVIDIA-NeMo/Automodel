@@ -23,6 +23,10 @@ from nemo_automodel.components.loss.loss import (
     build_loss_config,
     build_loss_module,
 )
+from nemo_automodel.components.loss.vocab_parallel import (
+    token_entropy,
+    token_log_probs,
+)
 
 __all__ = [
     "LOSS_CONFIG_REGISTRY",
@@ -34,4 +38,6 @@ __all__ = [
     "TEParallelCEConfig",
     "build_loss_config",
     "build_loss_module",
+    "token_entropy",
+    "token_log_probs",
 ]

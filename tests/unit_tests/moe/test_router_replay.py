@@ -16,11 +16,13 @@
 
 import pytest
 import torch
+from torch import nn
 
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import Gate
 from nemo_automodel.components.moe.router_replay import (
     RouterReplay,
+    RouterReplayAdapter,
     RouterReplayMode,
     replay_selection,
 )
@@ -78,6 +80,59 @@ def make_gate(score_func="softmax", enable_routing_replay=True, **overrides):
 def run(gate, x):
     token_mask = torch.ones(x.shape[0], dtype=torch.bool)
     return gate(x, token_mask, None)
+
+
+class _AdapterGate(nn.Module):
+    """Small gate exposing the structural contract used by RouterReplayAdapter."""
+
+    def __init__(self, *, topk=2, num_experts=8):
+        super().__init__()
+        self.topk = topk
+        self.n_experts = num_experts
+        self.router_replay = None
+
+    def forward(self, live_indices: torch.Tensor) -> torch.Tensor:
+        """Apply the gate's optional replay selection.
+
+        Args:
+            live_indices: Naturally selected expert ids with shape
+                ``[tokens, topk]``.
+
+        Returns:
+            Expert ids with shape ``[tokens, topk]`` after replay fallback.
+        """
+        return replay_selection(self.router_replay, live_indices)
+
+
+class _AdapterBlock(nn.Module):
+    def __init__(self, layer_idx, *, routed):
+        super().__init__()
+        self.layer_idx = layer_idx
+        if routed:
+            self.gate = _AdapterGate()
+        else:
+            self.mlp = nn.Identity()
+
+
+class _AdapterDecoder(nn.Module):
+    def __init__(self, num_layers, routed_layers):
+        super().__init__()
+        self.layers = nn.ModuleDict(
+            {
+                str(layer_idx): _AdapterBlock(layer_idx, routed=layer_idx in routed_layers)
+                for layer_idx in range(num_layers)
+            }
+        )
+
+
+class _AdapterModel(nn.Module):
+    def __init__(self, num_layers=5, routed_layers=(1, 3)):
+        super().__init__()
+        self.model = _AdapterDecoder(num_layers, set(routed_layers))
+
+
+def _adapter_gate(model, layer_idx):
+    return model.model.layers[str(layer_idx)].gate
 
 
 # --------------------------------------------------------------------------- #
@@ -235,6 +290,235 @@ def test_multilayer_distribute_and_collect():
         replayed = [run(g, x)[1] for g, x in zip(gates, new_xs)]
     for rep, rec in zip(replayed, recorded):
         assert torch.equal(rep, rec)
+
+
+# --------------------------------------------------------------------------- #
+# Model-scoped adapter: global mapping and scoped lifecycle
+# --------------------------------------------------------------------------- #
+
+
+def test_adapter_maps_sparse_global_layers_and_applies_token_fallback():
+    model = _AdapterModel(num_layers=5, routed_layers=(1, 3))
+    adapter = RouterReplayAdapter(model)
+    assert adapter.layer_ids == (1, 3)
+
+    batch, sequence, num_layers, topk = 2, 2, 5, 2
+    layer_one = torch.tensor(
+        [
+            [[1, 2], [-1, -1]],
+            [[-1, -1], [5, 6]],
+        ],
+        dtype=torch.int16,
+    )
+    layer_three = torch.tensor(
+        [
+            [[7, 0], [6, 1]],
+            [[5, 2], [4, 3]],
+        ],
+        dtype=torch.int16,
+    )
+    prepared = torch.full((batch, sequence, num_layers, topk), -1, dtype=torch.int16)
+    prepared[:, :, 1] = layer_one
+    prepared[:, :, 3] = layer_three
+
+    live_one = torch.tensor([[0, 7], [0, 1], [3, 2], [7, 0]])
+    live_three = torch.tensor([[1, 2], [2, 3], [3, 4], [4, 5]])
+    gate_one = _adapter_gate(model, 1)
+    gate_three = _adapter_gate(model, 3)
+
+    with adapter.replay(prepared):
+        expected_one_target = layer_one.reshape(-1, topk).long()
+        expected_three_target = layer_three.reshape(-1, topk).long()
+        assert torch.equal(gate_one.router_replay.target_indices, expected_one_target)
+        assert torch.equal(gate_three.router_replay.target_indices, expected_three_target)
+        keep_live = (expected_one_target == -1).any(dim=-1, keepdim=True)
+        assert torch.equal(gate_one(live_one), torch.where(keep_live, live_one, expected_one_target))
+        assert torch.equal(gate_three(live_three), expected_three_target)
+
+    assert gate_one.router_replay.mode is None
+    assert gate_one.router_replay.target_indices is None
+    assert gate_three.router_replay.mode is None
+    assert gate_three.router_replay.target_indices is None
+
+
+def test_replay_minus_one_row_fallback_casts_int16_target():
+    replay = RouterReplay(register=False)
+    replay.mode = RouterReplayMode.REPLAY
+    replay.target_indices = torch.tensor([[-1, -1], [3, 4]], dtype=torch.int16)
+    live = torch.tensor([[1, 2], [5, 6]], dtype=torch.long)
+
+    result = replay.apply(live)
+
+    assert result.dtype == torch.long
+    assert torch.equal(result, torch.tensor([[1, 2], [3, 4]]))
+
+
+def test_replay_rejects_nonintegral_targets_before_casting():
+    replay = RouterReplay(register=False)
+    replay.mode = RouterReplayMode.REPLAY
+    replay.target_indices = torch.tensor([[1.9, -1.0]])
+
+    with pytest.raises(TypeError, match="signed integer dtype"):
+        replay.apply(torch.tensor([[4, 5]]))
+
+
+def test_adapter_finds_decoder_below_module_wrapper():
+    class Wrapper(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+    model = _AdapterModel(num_layers=3, routed_layers=(1,))
+    adapter = RouterReplayAdapter(Wrapper(model))
+
+    assert adapter.layer_ids == (1,)
+    assert isinstance(_adapter_gate(model, 1).router_replay, RouterReplay)
+
+
+def test_adapter_rejects_partial_moe_router_cuda_graph_before_installing_handle():
+    model = _AdapterModel(num_layers=3, routed_layers=(1,))
+    gate = _adapter_gate(model, 1)
+    gate.use_routing_core = True
+
+    with pytest.raises(RuntimeError, match="partial MoE router CUDA graphs"):
+        RouterReplayAdapter(model)
+
+    assert gate.router_replay is None
+
+
+def test_adapter_replays_real_gate_and_preserves_router_gradient():
+    class EngineGateModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _AdapterDecoder(1, {0})
+            self.model.layers["0"].gate = make_gate()
+            self.selected_indices = None
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            """Return one selected-router weight for a padded token batch.
+
+            Args:
+                input_ids: Token ids with shape ``[batch, sequence]``.
+
+            Returns:
+                First selected probability with shape ``[batch, sequence]``.
+            """
+            hidden = torch.nn.functional.one_hot(input_ids.reshape(-1) % 16, num_classes=16).to(torch.float32)
+            weights, indices, _aux = run(self.model.layers["0"].gate, hidden)
+            self.selected_indices = indices.detach().clone()
+            return weights[..., 0].reshape_as(input_ids)
+
+    model = EngineGateModel()
+    adapter = RouterReplayAdapter(model)
+    input_ids = torch.tensor([[1, 2, 3]])
+    hidden = torch.nn.functional.one_hot(input_ids.reshape(-1) % 16, num_classes=16).to(torch.float32)
+    with torch.no_grad():
+        _weights, live_indices, _aux = run(model.model.layers["0"].gate, hidden)
+    target = ((live_indices + 1) % 8).reshape(1, 3, 1, 2).to(torch.int16)
+    assert not torch.equal(live_indices, target.reshape(-1, 2))
+    with adapter.replay(target):
+        output = model(input_ids)
+        output.sum().backward()
+
+    torch.testing.assert_close(model.selected_indices, target.reshape(-1, 2).long())
+    gate_grad = model.model.layers["0"].gate.weight.grad
+    assert gate_grad is not None
+    assert torch.count_nonzero(gate_grad) > 0
+
+
+def test_adapter_auto_installs_model_scoped_handles_and_restores_on_error():
+    stale_global = RouterReplay()
+    stale_target = torch.tensor([[6, 7]])
+    stale_global.mode = RouterReplayMode.RECORD
+    stale_global.target_indices = stale_target
+
+    model_a = _AdapterModel(num_layers=3, routed_layers=(1,))
+    model_b = _AdapterModel(num_layers=3, routed_layers=(1,))
+    assert _adapter_gate(model_a, 1).router_replay is None
+    assert _adapter_gate(model_b, 1).router_replay is None
+    adapter_a = RouterReplayAdapter(model_a)
+    RouterReplayAdapter(model_b)
+    replay_a = _adapter_gate(model_a, 1).router_replay
+    replay_b = _adapter_gate(model_b, 1).router_replay
+
+    assert isinstance(replay_a, RouterReplay)
+    assert isinstance(replay_b, RouterReplay)
+    assert RouterReplay.instances() == [stale_global]
+
+    previous_a_target = torch.tensor([[4, 5]])
+    previous_b_target = torch.tensor([[2, 3]])
+    replay_a.mode = RouterReplayMode.RECORD
+    replay_a.target_indices = previous_a_target
+    replay_b.mode = RouterReplayMode.RECORD
+    replay_b.target_indices = previous_b_target
+    routes = torch.tensor([[[[-1, -1], [1, 2], [-1, -1]]]], dtype=torch.int16)
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        with adapter_a.replay(routes):
+            assert replay_a.mode is RouterReplayMode.REPLAY
+            assert replay_a.target_indices is not previous_a_target
+            assert replay_b.mode is RouterReplayMode.RECORD
+            assert replay_b.target_indices is previous_b_target
+            assert stale_global.mode is RouterReplayMode.RECORD
+            assert stale_global.target_indices is stale_target
+            raise RuntimeError("forward failed")
+
+    assert replay_a.mode is RouterReplayMode.RECORD
+    assert replay_a.target_indices is previous_a_target
+    assert replay_b.mode is RouterReplayMode.RECORD
+    assert replay_b.target_indices is previous_b_target
+    assert stale_global.mode is RouterReplayMode.RECORD
+    assert stale_global.target_indices is stale_target
+
+
+def test_adapter_keeps_trailing_unrecorded_tokens_on_live_routing():
+    model = _AdapterModel(num_layers=3, routed_layers=(1,))
+    adapter = RouterReplayAdapter(model)
+    gate = _adapter_gate(model, 1)
+    routes = torch.tensor(
+        [
+            [[-1, -1], [1, 2], [-1, -1]],
+            [[-1, -1], [3, 4], [-1, -1]],
+        ],
+        dtype=torch.int16,
+    )
+    live = torch.tensor([[6, 7], [4, 5], [7, 6], [5, 4]])
+
+    with adapter.replay(routes):
+        replayed = gate(live)
+
+    assert torch.equal(replayed[:2], torch.tensor([[1, 2], [3, 4]]))
+    assert torch.equal(replayed[2:], live[2:])
+    assert gate.router_replay.mode is None
+    assert gate.router_replay.target_indices is None
+
+
+@pytest.mark.parametrize(
+    ("routes", "error", "match"),
+    [
+        (torch.zeros(2, 4, dtype=torch.int16), ValueError, "token axes"),
+        (torch.zeros(1, 3, 2), TypeError, "signed integer dtype"),
+        (torch.zeros(1, 3, 2, dtype=torch.uint8), TypeError, "signed integer dtype"),
+        ([], TypeError, "Tensor or None"),
+    ],
+)
+def test_adapter_replay_rejects_invalid_routes(routes, error, match):
+    adapter = RouterReplayAdapter(_AdapterModel())
+    with pytest.raises(error, match=match):
+        adapter.replay(routes)
+
+
+@pytest.mark.parametrize(
+    ("routes", "match"),
+    [
+        (torch.zeros(2, 3, 2, dtype=torch.int16), "requires layer 3"),
+        (torch.zeros(2, 4, 1, dtype=torch.int16), "topk 1"),
+    ],
+)
+def test_adapter_rejects_invalid_prepared_layout(routes, match):
+    adapter = RouterReplayAdapter(_AdapterModel(num_layers=5, routed_layers=(3,)))
+    with pytest.raises(ValueError, match=match):
+        adapter.replay(routes)
 
 
 # --------------------------------------------------------------------------- #

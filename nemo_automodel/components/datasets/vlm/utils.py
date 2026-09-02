@@ -14,9 +14,10 @@
 
 import io
 import logging
-from typing import Iterable
+from typing import Any, Iterable
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,51 @@ except ImportError:
 
 
 _lmdb_env_cache: dict[str, "lmdb.Environment"] = {}
+
+
+def merge_media_values(values: list[Any], *, field_name: str) -> torch.Tensor | list[Any]:
+    """Merge media values while preserving the explicit ragged-list contract.
+
+    Four-dimensional ``pixel_values`` use ``[media, channels, height, width]``.
+    Some processors emit a different image resolution for each sample, so pad
+    those tensors on the right and bottom to the largest spatial extent before
+    concatenating their media axes. Other tensor fields retain their processor-
+    defined layout and must already be concatenable.
+
+    Args:
+        values: Non-empty per-sample media values. Tensor ``pixel_values``
+            use ``[media, channels, height, width]``; other tensor fields use
+            ``[media, ...]``. List or tuple items retain their processor-defined
+            layout.
+        field_name: Processor field being merged.
+
+    Returns:
+        One BF16 tensor on the input device, concatenated on its media axis.
+        Four-dimensional ``pixel_values`` have shape
+        ``[sum_media, channels, max_height, max_width]``; other tensor fields
+        have shape ``[sum_media, ...]``. Processors that explicitly represent
+        variable-resolution media as lists produce one flattened list whose
+        tensor items are converted to BF16 on their original devices.
+    """
+    if not values:
+        raise ValueError("Media merge requires at least one value.")
+    if all(isinstance(value, torch.Tensor) for value in values):
+        tensors = values
+        if field_name == "pixel_values" and all(value.ndim == 4 for value in tensors):
+            max_height = max(value.shape[-2] for value in tensors)
+            max_width = max(value.shape[-1] for value in tensors)
+            tensors = [
+                F.pad(value, (0, max_width - value.shape[-1], 0, max_height - value.shape[-2])) for value in tensors
+            ]
+        return torch.cat(tensors, dim=0).to(torch.bfloat16)
+    if all(isinstance(value, (list, tuple)) for value in values):
+        return [
+            item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item for value in values for item in value
+        ]
+    raise TypeError(
+        "VLM media values must be consistently tensors or variable-resolution lists, "
+        f"got {[type(value).__name__ for value in values]}."
+    )
 
 
 def _resolve_lmdb_image(path):

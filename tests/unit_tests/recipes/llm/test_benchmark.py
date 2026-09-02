@@ -134,6 +134,24 @@ def mock_recipe(mock_config, monkeypatch):
             intermediate_size=3072,
         )
         recipe.optimizer = [MagicMock()]
+        engine_state = {"micro_step": 0}
+
+        def is_gradient_accumulation_boundary():
+            return engine_state["micro_step"] + 1 == 8
+
+        def engine_step():
+            engine_state["micro_step"] += 1
+            if engine_state["micro_step"] == 8:
+                recipe.optimizer[0].step()
+                recipe.optimizer[0].zero_grad(set_to_none=True)
+                engine_state["micro_step"] = 0
+
+        recipe.engine = SimpleNamespace(
+            is_gradient_accumulation_boundary=MagicMock(side_effect=is_gradient_accumulation_boundary),
+            step=MagicMock(side_effect=engine_step),
+            set_gradient_accumulation_steps=MagicMock(),
+        )
+        recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=MagicMock())
         recipe.dataloader = MagicMock()
         recipe.val_dataloader = None
         recipe.pp_enabled = False
@@ -155,6 +173,26 @@ def mock_recipe(mock_config, monkeypatch):
         recipe._dp_allreduce = MagicMock(side_effect=lambda x, include_cp=False: x)
         recipe.device_mesh = None
         return recipe
+
+
+def _configure_one_iteration(recipe, batches):
+    """Trim the benchmark fixture to one two-microbatch optimizer window."""
+    recipe.cfg.step_scheduler.local_batch_size = 2
+    recipe.cfg.step_scheduler.global_batch_size = 4
+    recipe._get_dp_group_size = MagicMock(return_value=1)
+    recipe._bench_steps = 1
+    recipe._bench_warmup_steps = 0
+    recipe.dataloader.__iter__ = MagicMock(return_value=iter(batches))
+    recipe.timers._get_global_min_max_time = MagicMock(
+        return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
+    )
+    timer = MagicMock()
+    timer.active_time.return_value = 1.0
+    recipe.timers._timers = {
+        "setup": timer,
+        "iteration": timer,
+        "iteration_warmup": timer,
+    }
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
@@ -422,6 +460,72 @@ class TestBenchmarkingRecipeRunBenchmark:
             expected_ga_steps = 8
             # Verify forward_backward_step was called expected_ga_steps times per iteration
             assert mock_recipe._forward_backward_step.call_count == 30 * expected_ga_steps
+            assert (
+                mock_recipe.engine.set_gradient_accumulation_steps.call_args_list == [((expected_ga_steps,), {})] * 30
+            )
+
+    def test_run_benchmark_normalizes_each_microbatch_by_global_window_tokens(self, mock_recipe, capsys):
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, -100]])},
+            {"input_ids": torch.tensor([[4, 5, 6]]), "labels": torch.tensor([[4, -100, -100]])},
+        ]
+        _configure_one_iteration(mock_recipe, batches)
+        denominators = []
+        numerators = [3.0, 6.0]
+
+        def forward_backward_step(index, batch, *, loss_buffer, num_label_tokens, **kwargs):
+            del batch, kwargs
+            denominators.append(num_label_tokens)
+            loss_buffer.append(torch.tensor(numerators[index] / num_label_tokens))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=forward_backward_step)
+
+        with patch("torch.distributed.barrier"):
+            mock_recipe.run_benchmark()
+
+        assert denominators == [3, 3]
+        mock_recipe.engine.set_gradient_accumulation_steps.assert_called_once_with(2)
+        assert "num_label_tokens=3 | loss=3.0000" in capsys.readouterr().out
+
+    def test_run_benchmark_pipeline_uses_training_optimizer_lifecycle(self, mock_recipe, monkeypatch, capsys):
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, -100]])},
+            {"input_ids": torch.tensor([[4, 5, 6]]), "labels": torch.tensor([[4, -100, -100]])},
+        ]
+        _configure_one_iteration(mock_recipe, batches)
+        mock_recipe.pp_enabled = True
+        mock_recipe.pp = SimpleNamespace(pp_batch_size=2, pp_microbatch_size=1)
+        mock_recipe.max_grad_norm = 0.75
+        mock_recipe._broadcast_from_last_pp_stage = MagicMock(side_effect=lambda tensor: tensor)
+        mock_recipe._step_pipeline_optimizer = MagicMock(return_value=torch.tensor(1.0))
+        prepare = MagicMock()
+        prepare_final = MagicMock()
+        prepare_after_first = MagicMock()
+        monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.prepare_for_grad_accumulation", prepare)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.prepare_for_final_backward", prepare_final)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.prepare_after_first_microbatch", prepare_after_first)
+        denominators = []
+
+        def forward_backward_step(index, batch, *, loss_buffer, num_label_tokens, **kwargs):
+            del batch, kwargs
+            denominators.append(num_label_tokens)
+            loss_buffer.append(torch.tensor([3.0, 6.0][index]))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=forward_backward_step)
+
+        with patch("torch.distributed.barrier"):
+            mock_recipe.run_benchmark()
+
+        assert denominators == [3, 3]
+        prepare.assert_called_once_with(mock_recipe.model_parts, pp_enabled=True)
+        prepare_final.assert_called_once_with(mock_recipe.model_parts, pp_enabled=True)
+        prepare_after_first.assert_called_once_with()
+        mock_recipe._step_pipeline_optimizer.assert_called_once_with(
+            num_label_tokens=3,
+            max_grad_norm=0.75,
+        )
+        mock_recipe._broadcast_from_last_pp_stage.assert_called_once()
+        assert "num_label_tokens=3 | loss=3.0000" in capsys.readouterr().out
 
     def test_run_benchmark_zero_grads_per_iteration(self, mock_recipe):
         """Test that gradients are zeroed at the start of each iteration."""
@@ -555,7 +659,7 @@ class TestBenchmarkingRecipeHelpers:
     """Test helper methods and edge cases."""
 
     def test_benchmark_with_invalid_ga_config(self, mock_recipe):
-        """Test that invalid gradient accumulation config raises assertion."""
+        """Test that invalid gradient accumulation config raises a clear error."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
         # Set invalid batch sizes that will cause assertion error
         # global_batch_size=16, local_batch_size=4, dp_size=8
@@ -563,7 +667,7 @@ class TestBenchmarkingRecipeHelpers:
         mock_recipe.cfg.step_scheduler.local_batch_size = 4
         mock_recipe.cfg.step_scheduler.global_batch_size = 16
 
-        with pytest.raises(AssertionError, match="Global batch size must be divisible"):
+        with pytest.raises(ValueError, match="global_batch_size.*positive multiple"):
             mock_recipe.run_benchmark()
 
     def test_init_requires_benchmark_section(self):

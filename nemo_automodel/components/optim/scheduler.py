@@ -246,7 +246,7 @@ class OptimizerParamScheduler:
 
         return min_lr + coeff * delta_lr
 
-    def step(self, increment: int) -> None:
+    def step(self, increment: int = 1) -> None:
         """
         Set lr for all parameters groups.
 

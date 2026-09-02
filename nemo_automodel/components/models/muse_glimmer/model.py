@@ -803,7 +803,17 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         *,
         num_chunks: int = 1,
     ) -> dict[str, Any]:
-        """Select native MuseGlimmer CP preparation for BSHD or packed TE THD."""
+        """Select native MuseGlimmer CP preparation for BSHD or packed TE THD.
+
+        Args:
+            batch: Mapping whose packed VLM ``input_ids`` and derived vision
+                mask have shape [batch, sequence].
+            num_chunks: Number of pipeline microbatch token streams.
+
+        Returns:
+            Model-input updates. For packed VLM, the global vision mask remains
+            [batch, sequence].
+        """
         del num_chunks
         if batch.get("qkv_format") == "thd":
             max_real_seqlen = self._validate_thd_documents(batch)

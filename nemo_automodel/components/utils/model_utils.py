@@ -829,12 +829,24 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
         This function modifies attn_kwargs in-place. If you need to preserve the original
         dictionary, pass a copy.
     """
+    # Media tensors are indexed by media item, not by the placeholder THD batch
+    # dimension, so squeezing dim 0 would drop a single item.
+    media_keys = {
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "image_position_ids",
+        "second_per_grid_ts",
+    }
     if input_ids is not None:
         input_ids = input_ids.squeeze(0)
     position_ids = position_ids.squeeze(0)
     if isinstance(padding_mask, torch.Tensor):
         padding_mask = padding_mask.squeeze(0)
     for key, value in attn_kwargs.items():
+        if key in media_keys:
+            continue
         if isinstance(value, torch.Tensor):
             attn_kwargs[key] = value.squeeze(0)
         if key in ["cu_seqlens", "cu_seqlens_padded"]:

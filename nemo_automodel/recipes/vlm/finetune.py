@@ -28,7 +28,7 @@ except ImportError:
 import logging
 import pathlib
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Protocol
 
 import mlflow
@@ -57,7 +57,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 )
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
@@ -82,6 +82,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.engine import Engine
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -459,6 +460,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
+        if self.pp_enabled and getattr(self.pipeline_config, "scale_grads_in_schedule", False):
+            raise ValueError(
+                "Pipeline VLM finetuning applies external global-token normalization and requires "
+                "distributed.pipeline.scale_grads_in_schedule=False"
+            )
+
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
         # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
@@ -487,13 +494,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
             pp_batch_size = self.cfg.get("step_scheduler.local_batch_size", 1)
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
-            )
+            if self.magi.enabled:
+                if pp_batch_size != 1 or pp_microbatch_size != 1:
+                    raise ValueError(
+                        "Magi pipeline training requires local_batch_size=1 and pp_microbatch_size=1; "
+                        "use outer gradient accumulation for larger optimizer windows"
+                    )
+            elif pp_batch_size // pp_microbatch_size < self.mesh_context.pp_size:
+                raise ValueError(
+                    f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} "
+                    f"must be >= pp_size {self.mesh_context.pp_size}"
+                )
 
-            assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
-                "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
-            )
+            if isinstance(self.distributed_config, MegatronFSDPConfig):
+                raise ValueError("MegatronFSDPConfig is not supported when pipeline parallelism is enabled")
 
             # Update pipeline_config runtime fields
             self.pipeline_config.pp_batch_size = pp_batch_size
@@ -554,6 +568,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
             self.loss_fn = MaskedCrossEntropy()
+        if getattr(self.loss_fn, "reduction", None) != "sum":
+            raise ValueError("Global-token-normalized VLM finetuning requires a loss with reduction='sum'")
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -658,6 +674,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
             if self.cfg.lr_scheduler is not None
             else None
         )
+
+        self.engine = None
+        if not self.pp_enabled:
+            self.engine = Engine(
+                self.model_parts[0],
+                optimizer=self.optimizer[0],
+                lr_scheduler=self.lr_scheduler[0] if self.lr_scheduler is not None else None,
+                mesh_context=self.mesh_context,
+                max_grad_norm=self.max_grad_norm,
+                gradient_accumulation_steps=self.step_scheduler.grad_acc_steps,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
 
         # Log model, parameter counts, norms, optimizer and scheduler
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
@@ -943,27 +971,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
             loss_buffer.append(local_loss.clone().detach())
         else:
             model = self.model_parts[0]
-            sync_ctx = (
-                get_sync_ctx(
-                    model,
-                    idx == num_batches - 1,
-                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-                )
-                if is_train
-                else nullcontext()
-            )
-            with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
+            with self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
+                    out = self.engine(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
                         raise ValueError(
                             "FusedLinearCrossEntropy requires the model to output hidden states. "
                             "Set `model.text_config.output_hidden_states=True` in the config."
                         )
                 else:
-                    out = model(**batch)
+                    out = self.engine(**batch)
 
                 grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
                 shared_lm_weight = (
@@ -1030,7 +1049,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
-                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+                    self.engine.backward(
+                        local_loss * self._get_dp_group_size(include_cp=True),
+                        scale_wrt_gas=False,
+                    )
 
     def _configure_pipeline_loss_fn(self):
         if self.pp is None or not self.pp.info.has_last_stage:
@@ -1050,6 +1072,48 @@ class FinetuneRecipeForVLM(BaseRecipe):
             grad_reduce_group=self._get_dp_group(include_cp=True),
         )
 
+    def _step_pipeline_optimizer(self, *, num_label_tokens: int, max_grad_norm: float | None) -> torch.Tensor | float:
+        """Finalize pipeline gradients and perform one complete optimizer update."""
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm=max_grad_norm,
+            model_parts=self.model_parts,
+            norm_type=2.0,
+            pp_enabled=True,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name="pp",
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+        )
+
+        self.checkpointer.maybe_wait_for_staging()
+        for optimizer in self.optimizer:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+            for model_part in self.model_parts:
+                model_part.update_moe_gate_bias()
+
+        if self.lr_scheduler is not None:
+            for scheduler in self.lr_scheduler:
+                scheduler.step(1)
+
+        fp8_config = self.cfg.get("fp8", None)
+        if (
+            fp8_config is not None
+            and fp8_config.get("enabled", False)
+            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
+            and self.device_mesh is not None
+            and self.device_mesh["dp_shard"].size() > 1
+        ):
+            precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
+
+        return grad_norm
+
     def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
@@ -1063,8 +1127,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
         num_batches = len(batches)
-        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
-
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
@@ -1074,60 +1136,34 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+        if self.pp_enabled:
+            self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=True)
+        else:
+            self.engine.set_gradient_accumulation_steps(num_batches)
 
         for i, batch in enumerate(batches):
-            if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+            if self.pp_enabled and i == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=True)
 
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
 
-            if i == 0:
+            if self.pp_enabled and i == 0:
                 prepare_after_first_microbatch()
+            if not self.pp_enabled:
+                if i == num_batches - 1:
+                    self.checkpointer.maybe_wait_for_staging()
+                self.engine.step()
 
-        grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm=max_grad_norm,
-            model_parts=self.model_parts,
-            norm_type=2.0,
-            pp_enabled=self.pp_enabled,
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-            pp_axis_name="pp" if self.pp_enabled else None,
-            foreach=True,
-            num_label_tokens=num_label_tokens,
-            dp_group_size=self._get_dp_group_size(include_cp=True),
-            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
-        )
-
-        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
-        # self.model.finish_grad_sync()
-
-        self.checkpointer.maybe_wait_for_staging()
-        for opt in self.optimizer:
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-
-        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
-            for mp in self.model_parts:
-                mp.update_moe_gate_bias()
-
-        if self.lr_scheduler is not None:
-            for scheduler in self.lr_scheduler:
-                scheduler.step(1)
-
-        # Precompute FP8 scales
-        fp8_config = self.cfg.get("fp8", None)
-        if (
-            fp8_config is not None
-            and fp8_config.get("enabled", False)
-            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
-            and self.device_mesh is not None
-            and self.device_mesh["dp_shard"].size() > 1
-        ):
-            precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
+        if self.pp_enabled:
+            grad_norm = self._step_pipeline_optimizer(
+                num_label_tokens=num_label_tokens,
+                max_grad_norm=max_grad_norm,
+            )
+        else:
+            grad_norm = self.engine.get_global_grad_norm()
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.install_optimized_model_weights()

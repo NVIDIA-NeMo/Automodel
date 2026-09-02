@@ -12,26 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the VLM-CP wiring in ``recipes/vlm/finetune.py``.
+"""Tests for VLM context-parallel wiring in ``recipes/vlm/finetune.py``.
 
-These reproduce the ``_forward_backward_step``-style and
-``_run_validation_epoch``-style batch handling without instantiating the
-full recipe — exercising the code shape that gets shipped:
-
-  - Invoke the sharder-only ``prepare_model_inputs_for_cp`` directly through
-    ``ContextParallelSharder`` construction (a plain method call; nothing consumed, so input_ids
-    and multimodal inputs stay in the batch for the model's own forward)
-  - PP gating: the sharder-only hook is invoked on every stage (all PP-capable
-    VLMs are sunk — they embed + shard in their own forward); media is dropped on
-    non-first stages so those stage forwards see only text inputs
-  - Validation: count labels after ``ContextParallelSharder.shard`` and inside train_ctx
-  - Validation: position_ids ``.to(self.dist_env.device)`` (not model.device)
+The VLM recipe owns context-parallel sharding and executes pipeline schedules
+directly. These tests cover pipeline media staging setup, vision-frame context
+publication, and the validation handoff plus epoch-level DP aggregation.
 """
 
 from __future__ import annotations
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -39,7 +31,21 @@ import torch
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+
+
+class _UnsupportedVisionModel:
+    supports_cp_vision_frame_sharding = False
+
+
+class _SupportedVisionModel:
+    supports_cp_vision_frame_sharding = True
+
+
+class _PackedCPModel:
+    def __init__(self, *, supported):
+        self.supports_cp_with_sequence_packing = supported
 
 
 def _identity_cp_shard(sharder, batch):
@@ -108,19 +114,6 @@ class _FakeCPMesh:
     def __getitem__(self, key):
         assert key == "cp"
         return SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group")
-
-
-class _UnsupportedVisionModel:
-    supports_cp_vision_frame_sharding = False
-
-
-class _SupportedVisionModel:
-    supports_cp_vision_frame_sharding = True
-
-
-class _PackedCPModel:
-    def __init__(self, *, supported):
-        self.supports_cp_with_sequence_packing = supported
 
 
 def test_cp_vision_frame_sharding_rejects_model_without_capability():
@@ -240,82 +233,6 @@ class _PPSpy(SimpleNamespace):
         return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
 
-def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monkeypatch):
-    """Sunk model on the FIRST PP stage under CP: the sharder-only hook is invoked
-    (consumes nothing), so input_ids stays full-length, update_seq_len sees the
-    full seq_len, and the full-length input_ids is fed to the pipeline schedule
-    (the model embeds + shards inside its own forward)."""
-    labels = torch.arange(12, dtype=torch.long).reshape(2, 6)
-    model = _SunkSpyVLM()
-    schedule = _ScheduleSpy()
-    seq_lens = []
-    first_stage = SimpleNamespace(is_first=True, inputs_meta=None)
-    recipe = object.__new__(FinetuneRecipeForVLM)
-    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
-    recipe.device_mesh = _FakeCPMesh()
-    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
-    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
-    recipe.model_parts = [model]
-    recipe.pp_enabled = True
-    recipe.pp = _PPSpy(
-        pp_microbatch_size=2,
-        info=SimpleNamespace(
-            has_first_stage=True,
-            has_last_stage=True,
-            stages=[first_stage, SimpleNamespace(is_first=False, inputs_meta=None)],
-            schedule=schedule,
-        ),
-        update_seq_len=seq_lens.append,
-    )
-    batch = {
-        "input_ids": torch.ones(2, 6, dtype=torch.long),
-        "pixel_values": torch.zeros(2, 3, 4, 4),
-        "labels": labels,
-    }
-    seen_cp_batch = {}
-
-    def _shard(sharder, cp_batch):
-        """Capture the global model-input mapping before CP transport.
-
-        Args:
-            sharder: Sharder configured by the VLM recipe.
-            cp_batch: Mutable model-input mapping whose tensor values have
-                global batch and sequence extents.
-
-        Returns:
-            The null context factory and the same input mapping.
-        """
-        del sharder
-        seen_cp_batch.update(cp_batch)
-        return nullcontext, cp_batch
-
-    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _shard)
-    monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
-    monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
-
-    loss_buffer = []
-    FinetuneRecipeForVLM._forward_backward_step(
-        recipe,
-        0,
-        batch,
-        loss_buffer=loss_buffer,
-        num_label_tokens=labels.numel(),
-        num_batches=1,
-    )
-
-    assert len(model.calls) == 1
-    # Sharder-only: input_ids stays full, no inputs_embeds injected.
-    assert "input_ids" in seen_cp_batch
-    assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
-    assert "inputs_embeds" not in seen_cp_batch
-    assert seq_lens == [6]
-    assert [set(call.keys()) for call in recipe.pp.step_batches] == [{"pixel_values"}]
-    assert len(schedule.calls) == 1
-    assert tuple(schedule.calls[0]["model_input"].shape) == (2, 6)
-    assert torch.equal(schedule.calls[0]["target"], labels)
-    assert torch.equal(loss_buffer[0], torch.tensor(1.25))
-
-
 class _SunkSpyVLM:
     """Sunk VLM: sharder-only CP hook (embeds/shards in forward, consumes nothing)."""
 
@@ -410,10 +327,11 @@ class _FakePPModel:
         self.parts = [stage0]
         self.pp_batch_size = 4
         self.pp_microbatch_size = 2
-        self.info = SimpleNamespace(has_last_stage=False, stages=[], schedule=None)
+        self.scale_grads_in_schedule = False
+        self.info = SimpleNamespace(has_first_stage=True, has_last_stage=False, stages=[], schedule=None)
 
 
-class _StageWithCPPreembedInForward:
+class _StageWithCPPreembedInForward(torch.nn.Module):
     # Sunk VLM (minimax/qwen3_5/qwen3_5_moe/step3p7): embeds + shards per
     # microbatch inside forward and pulls media from the PP side channel, so
     # media MUST still be staged for PP under CP.
@@ -421,7 +339,7 @@ class _StageWithCPPreembedInForward:
         return {}
 
 
-class _StageWithoutCPPrepare:
+class _StageWithoutCPPrepare(torch.nn.Module):
     pass
 
 
@@ -437,7 +355,7 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "StatefulRNG", lambda *args, **kwargs: "rng")
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
-        property(lambda self: SimpleNamespace(build=lambda: "loss_fn")),
+        property(lambda self: SimpleNamespace(build=lambda: MaskedCrossEntropy(reduction="sum"))),
     )
     monkeypatch.setattr(vlm_finetune, "_supports_logits_to_keep", lambda model: True)
     monkeypatch.setattr(
@@ -452,7 +370,7 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
                 pp_size=2,
             ),
             strategy_config=SimpleNamespace(),
-            pipeline_config=SimpleNamespace(),
+            pipeline_config=SimpleNamespace(scale_grads_in_schedule=False),
             moe_parallel_config=None,
             activation_checkpointing=False,
         ),
@@ -574,74 +492,14 @@ def test_setup_always_stages_pp_media_under_pp(
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
     assert dataloader_calls[0]["cp_size"] == cp_size
-
-
-# -----------------------------------------------------------------------------
-# val-side wiring (the bug-fix territory)
-# -----------------------------------------------------------------------------
-
-
-class _ShardLabelsOnEnter:
-    def __init__(self, labels, local_labels):
-        self.labels = labels
-        self.local_labels = local_labels
-
-    def __enter__(self):
-        self.labels.resize_(self.local_labels.shape)
-        self.labels.copy_(self.local_labels)
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-
-def test_val_counts_label_tokens_inside_cp_context_after_labels_are_sharded():
-    """Validation must count label tokens after CP has exposed the local shard."""
-    labels = torch.tensor([[1, 2, -100, 4]])
-    batch = {"labels": labels}
-    local_labels = torch.tensor([[1, -100]])
-
-    def train_ctx():
-        return _ShardLabelsOnEnter(labels, local_labels)
-
-    labels = batch.pop("labels")
-    pre_context_count = (labels != -100).sum().item()
-    with train_ctx():
-        local_num_label_tokens = (labels != -100).sum().item()
-
-    assert pre_context_count == 3
-    assert local_num_label_tokens == 1
-
-
-def test_val_pos_ids_uses_dist_env_device_not_model_device():
-    """Reproduce the bug fix at finetune.py:1281 — val must use
-    ``self.dist_env.device``, not ``self.model_parts[0].device`` which
-    AttributeErrors on FSDP-wrapped models."""
-
-    class _FSDPWrapped:
-        # Intentionally has NO ``.device`` attribute (mirrors real FSDP wrapper).
-        def __getattr__(self, name):
-            if name == "device":
-                raise AttributeError("'FSDPWrapped' object has no attribute 'device'")
-            raise AttributeError(name)
-
-    model = _FSDPWrapped()
-    dist_env = SimpleNamespace(device=torch.device("cpu"))
-
-    # The fixed line:
-    pos = torch.arange(0, 4).unsqueeze(0).to(dist_env.device)
-    assert pos.device.type == "cpu"
-
-    # The buggy line would have raised:
-    with pytest.raises(AttributeError, match="no attribute 'device'"):
-        _ = torch.arange(0, 4).unsqueeze(0).to(model.device)
+    assert trainer.engine is None
+    assert isinstance(trainer.pp, _FakePPModel)
 
 
 def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
     """``total_loss`` is all-reduced with include_cp=True, but ``total_tokens``
     (measured pre-CP-shard) must NOT include CP — otherwise val_loss is scaled
     down by cp_size. Guards the fix at finetune.py:_run_validation_epoch."""
-    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
-
     # No-op replacements for the heavy collaborators.
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
     monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
@@ -687,55 +545,4 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
     assert loss_call[1] is True, "total_loss must include CP ranks"
     assert tokens_call[1] is False, "total_tokens must NOT be summed over CP ranks"
     # val_loss = (2.0 * 3 tokens) / 3 tokens == 2.0
-    assert result.metrics["val_loss"] == pytest.approx(2.0)
-
-
-def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
-    """With CP active and a model exposing prepare_model_inputs_for_cp, the
-    validation loop must invoke the model's sharder-only CP hook before sharding.
-    Guards finetune.py:_run_validation_epoch CP pre-embed branch."""
-    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
-
-    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
-    monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
-    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
-
-    pre_embed_calls = []
-
-    class _Model(torch.nn.Module):
-        def eval(self):
-            return self
-
-        def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):  # sharder-only hook
-            pre_embed_calls.append(set(batch))
-            return {}
-
-        def forward(self, **batch):
-            return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
-
-    class _DM(dict):
-        mesh_dim_names = ["cp"]
-
-    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.model_parts = [_Model()]
-    recipe.loss_fn = object()
-    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group"))
-    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
-    recipe.pp_enabled = False
-    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
-    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
-    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
-    recipe._maybe_add_drafter_loss = lambda *, out, base_loss, labels, model, num_label_tokens: base_loss
-    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
-
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "pixel_values": torch.randn(1, 3, 8, 8),
-        "labels": torch.tensor([[1, 2, -100, 4]]),
-    }
-
-    result = recipe._run_validation_epoch([batch])
-
-    assert pre_embed_calls, "the CP hook (prepare_model_inputs_for_cp) must run when CP is active"
     assert result.metrics["val_loss"] == pytest.approx(2.0)

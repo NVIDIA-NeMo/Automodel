@@ -95,7 +95,7 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
     recipe.partial_cuda_graph_manager = manager
     recipe._partial_cuda_graph_capture_pending = True
     recipe._enable_qat_if_delayed = lambda _step: None
-    recipe._run_train_optim_step = lambda batches, _norm: (
+    recipe._run_train_optim_step = lambda batches, max_grad_norm=None: (
         events.append(("train-step", tuple(batches))) or SimpleNamespace(metrics={"loss": 1.0})
     )
     recipe._collect_moe_load_balance = lambda: None
