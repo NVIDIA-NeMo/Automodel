@@ -308,6 +308,14 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
+        dispatcher_hybridep_permute_fusion: Fuse HybridEP token permutation into dispatch and
+            unpermutation into combine. Has no effect for other dispatcher backends.
+        dispatcher_hybridep_num_sms_preprocessing: Optional number of SMs used by HybridEP
+            routing-metadata preprocessing.
+        dispatcher_hybridep_num_blocks_permute: Optional number of dispatch permutation
+            blocks. ``None`` preserves HybridEP's default.
+        dispatcher_hybridep_num_blocks_unpermute: Optional number of combine
+            unpermutation blocks. ``None`` preserves HybridEP's default.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -352,6 +360,10 @@ class BackendConfig:
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
+    dispatcher_hybridep_permute_fusion: bool = False
+    dispatcher_hybridep_num_sms_preprocessing: int | None = None
+    dispatcher_hybridep_num_blocks_permute: int | None = None
+    dispatcher_hybridep_num_blocks_unpermute: int | None = None
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):

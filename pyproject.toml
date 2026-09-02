@@ -309,7 +309,7 @@ prerelease = "allow"
 
 [tool.uv.sources]
 megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }
-deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "42144303752422ade37f24bca9e2dde12df70e09" }
+deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "58397eac493b075b0baea5861ac6e9793d8d7a21" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
@@ -368,7 +368,7 @@ nv_grouped_gemm = ["setuptools"]
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+4214430"
+version = "v1.2.1+58397ea"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
