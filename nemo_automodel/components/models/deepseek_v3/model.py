@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Union
 
 import torch
@@ -306,12 +306,13 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
-        self.backend = backend or BackendConfig()
         # The HF DeepSeek-V3 reference computes router scoring in fp32; routing is highly
         # precision-sensitive (small bf16 errors flip expert selection) and the gate is tiny,
         # so default to fp32 gate compute unless the user explicitly overrides it.
-        if self.backend.gate_precision is None:
-            self.backend.gate_precision = torch.float32
+        resolved_backend = backend or BackendConfig()
+        if resolved_backend.gate_precision is None:
+            resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
+        self.backend = resolved_backend
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = DeepseekV3Model(
             config,
