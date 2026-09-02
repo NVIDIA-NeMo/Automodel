@@ -12,11 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for accuracy() and batch_mrr() from train_cross_encoder."""
+"""Unit tests for the cross-encoder training recipe."""
 
+import pytest
 import torch
 
-from nemo_automodel.recipes.retrieval.train_cross_encoder import accuracy, batch_mrr
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncoderRecipe, accuracy, batch_mrr
+
+# ---------------------------------------------------------------------------
+# temperature configuration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"temperature": 0.3},
+        {"model": {"temperature": 0.02}},
+        {"temperature": 0.3, "model": {"temperature": 1.0}},
+        {"temperature": 1.0, "model": {"temperature": 0.02}},
+    ],
+)
+def test_recipe_allows_at_most_one_non_unit_temperature(config):
+    recipe = TrainCrossEncoderRecipe(ConfigNode(config))
+
+    assert recipe.temperature == config.get("temperature", 1.0)
+
+
+def test_recipe_rejects_two_non_unit_temperatures():
+    config = ConfigNode({"temperature": 0.3, "model": {"temperature": 0.02}})
+
+    with pytest.raises(
+        ValueError,
+        match="Set either top-level temperature or model.temperature to 1.0",
+    ):
+        TrainCrossEncoderRecipe(config)
+
 
 # ---------------------------------------------------------------------------
 # accuracy

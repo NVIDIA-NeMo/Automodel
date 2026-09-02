@@ -19,9 +19,11 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.rng import ScopedRNG
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe, _get_autocast_ctx
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -45,6 +47,24 @@ def batch_mrr(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
+    def __init__(self, cfg: ConfigNode | RecipeConfig) -> None:
+        """Initialize the cross-encoder recipe and validate its temperature settings.
+
+        Args:
+            cfg: Raw or typed recipe configuration.
+
+        Raises:
+            ValueError: If both the model and recipe apply non-unit temperature scaling.
+        """
+        super().__init__(cfg)
+        model_temperature = self.cfg.get("model.temperature", 1.0)
+        if self.temperature != 1.0 and model_temperature != 1.0:
+            raise ValueError(
+                "Cross-encoder temperature scaling is configured twice: "
+                f"top-level temperature={self.temperature!r} and model.temperature={model_temperature!r}. "
+                "Set either top-level temperature or model.temperature to 1.0."
+            )
+
     def _run_train_optim_step(self, batches, max_grad_norm=None):
         self._acc_buffer = []
         result = super()._run_train_optim_step(batches, max_grad_norm)
@@ -113,8 +133,8 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
 
             # Listwise softmax over each query's candidates, scaled by the recipe-level
             # temperature as the bi-encoder path does. Backbones that scale inside
-            # forward (LlamaBidirectionalForSequenceClassification) apply model.temperature
-            # there; the two compose, and both default to 1.0.
+            # forward apply model.temperature there; recipe initialization rejects
+            # configurations where both temperatures are non-unit.
             #
             # Up-cast to fp32 BEFORE the division. The backbone emits bf16 logits, and
             # dividing by a small temperature magnifies them (10x at temperature=0.1),
