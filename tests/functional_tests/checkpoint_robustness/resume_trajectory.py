@@ -310,7 +310,12 @@ def _resume_plan_from_config(cfg: object, *, continuation_steps: int = 3) -> _Re
 def _configure_uninterrupted_run(cfg: object, plan: _ResumePlan) -> None:
     """Extend Phase 1 while preserving its original LR schedule and checkpoint boundary."""
     cfg.step_scheduler.max_steps = plan.final_max_steps
+    # ``max_steps`` is only a cap: a finite dataloader can stop earlier when the
+    # configured epochs are exhausted. Allow one epoch per requested step so a
+    # non-empty dataloader always reaches the shared checkpoint and continuation.
+    cfg.step_scheduler.num_epochs = plan.final_max_steps
     cfg.step_scheduler.ckpt_every_steps = plan.boundary_step
+    cfg.step_scheduler.save_checkpoint_every_epoch = False
     cfg.checkpoint.save_consolidated = "final"
     if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
         cfg.lr_scheduler.lr_decay_steps = plan.boundary_step
@@ -319,12 +324,19 @@ def _configure_uninterrupted_run(cfg: object, plan: _ResumePlan) -> None:
 def _configure_resumed_run(cfg: object, plan: _ResumePlan, checkpoint_path: Path) -> None:
     """Restore the boundary checkpoint into an output directory separate from the reference branch."""
     cfg.step_scheduler.max_steps = plan.final_max_steps
+    cfg.step_scheduler.num_epochs = plan.final_max_steps
     cfg.step_scheduler.ckpt_every_steps = plan.boundary_step
+    cfg.step_scheduler.save_checkpoint_every_epoch = False
     if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
         cfg.lr_scheduler.lr_decay_steps = plan.boundary_step
     cfg.checkpoint.restore_from = str(checkpoint_path)
     cfg.checkpoint.checkpoint_dir = str(plan.resume_checkpoint_dir)
     cfg.checkpoint.save_consolidated = False
+
+
+def _disable_checkpoint_saves_after_restore(trainer: object) -> None:
+    """Disable new checkpoint writes after the resume checkpoint has loaded."""
+    trainer.checkpointer.config.enabled = False
 
 
 def _checkpoint_for_completed_steps(plan: _ResumePlan, completed_steps: int) -> Path:
@@ -632,14 +644,27 @@ def _report_training_reproducibility(
 
 
 def _optimizer_step_summary(optimizers: object) -> list[dict[str, int]]:
-    """Summarize per-parameter optimizer step counters without persisting optimizer tensors."""
+    """Summarize per-parameter optimizer step counters without persisting optimizer tensors.
+
+    Adam initializes parameter state lazily. Treat an absent Adam/AdamW state entry as
+    effective step zero so the pre-save representation matches a checkpoint that
+    materializes explicit zero state for serialization.
+    """
     if not isinstance(optimizers, (list, tuple)):
         optimizers = [optimizers]
     summaries: list[dict[str, int]] = []
     for optimizer in optimizers:
         counter: Counter[str] = Counter()
-        for state in optimizer.state.values():
+        if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+            states = (
+                optimizer.state.get(parameter, {}) for group in optimizer.param_groups for parameter in group["params"]
+            )
+        else:
+            states = optimizer.state.values()
+        for state in states:
             step = state.get("step") if isinstance(state, dict) else None
+            if step is None and isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                step = 0.0
             if isinstance(step, torch.Tensor):
                 step = step.item()
             if step is not None:

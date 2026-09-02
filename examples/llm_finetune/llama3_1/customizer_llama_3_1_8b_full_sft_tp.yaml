@@ -80,5 +80,4 @@ loss_fn:
 ci:
   time: "00:30:00"
   checkpoint_robustness:
-    hf_kl_threshold: 1e-2
     tokenizer_name: meta-llama/Llama-3.1-8B-Instruct

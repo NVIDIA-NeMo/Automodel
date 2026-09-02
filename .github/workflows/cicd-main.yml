@@ -35,11 +35,20 @@ env:
   container-registry-gb200: us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/automodel
 
 jobs:
+  ephemeral-runner-routing:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    with:
+      lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
+      legacy_label: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
+      run_id: ${{ github.run_id }}
+      run_attempt: ${{ github.run_attempt }}
+
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
+    needs: [ephemeral-runner-routing]
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
     with:
       default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
-      non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
+      non_nvidia_runner_prefix: ${{ needs.ephemeral-runner-routing.outputs.runner_label }}
       default_test_data_path: ${{ vars.DEFAULT_TEST_DATA_PATH }}
       non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
       sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
@@ -473,9 +482,15 @@ jobs:
             timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          # Merged with hf_transformer_llm + data. The matrix gets `max-parallel: 10`;
+          # as 13 separate entries the last three could not start until a wave-1 job
+          # freed a runner. These are the three cheapest suites (3.6 + 5.2 + 6.0 =
+          # 14.8 min median), well under the 16.6 min L2_HF_Transformer_Finetune that
+          # sets the stage floor. A 40-minute timeout leaves more than 2x headroom
+          # over the measured merged runtime while bounding timeout retries.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer
-            timeout: 20
+            test-folder: hf_transformer,hf_transformer_llm,data
+            timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_Finetune
@@ -483,19 +498,9 @@ jobs:
             timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          - test-name: L2_HF_Transformer_LLM
-            test-folder: hf_transformer_llm
-            timeout: 40
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
-            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
             timeout: 60
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
-            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          - test-name: L2_Datasets
-            test-folder: data
-            timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Context_Parallel
@@ -513,16 +518,13 @@ jobs:
             timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          - test-name: L2_MoE
-            test-folder: moe
-            timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
-            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          - test-name: L2_Parallelism
-            test-folder: parallelism
-            # Each parity test runs the proxy twice (1-rank baseline + 2-rank
-            # parallel), so the budget is roughly double a single smoke test.
-            timeout: 40
+          # moe + parallelism merged (2.8 + 5.8 = 8.6 min median) to fit `max-parallel: 10`.
+          # Each parity test in `parallelism` runs the proxy twice (1-rank baseline +
+          # 2-rank parallel), so the budget is roughly double a single smoke test.
+          # A 30-minute timeout leaves more than 2x measured-runtime headroom.
+          - test-name: L2_Distributed
+            test-folder: moe,parallelism
+            timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
@@ -578,34 +580,29 @@ jobs:
             test-folder: hf_peft
             timeout: 30
             is-optional: "true"
+          # Merged with hf_transformer_llm + data, mirroring cicd-e2e-tests
+          # (2.4 + 3.8 + 4.3 = 10.5 min median, under the 13.2 min L2_Context_Parallel
+          # floor). Leaves this matrix at 9 entries, one slot of headroom.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer
-            timeout: 20
+            test-folder: hf_transformer,hf_transformer_llm,data
+            timeout: 40
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
-            timeout: 40
-          - test-name: L2_HF_Transformer_LLM
-            test-folder: hf_transformer_llm
             timeout: 40
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
             timeout: 60
             is-optional: "true"
-          - test-name: L2_Datasets
-            test-folder: data
-            timeout: 20
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
             timeout: 20
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20
-          - test-name: L2_MoE
-            test-folder: moe
-            timeout: 20
-          - test-name: L2_Parallelism
-            test-folder: parallelism
-            timeout: 40
+          # moe + parallelism merged (2.1 + 4.1 = 6.2 min median), mirroring cicd-e2e-tests.
+          - test-name: L2_Distributed
+            test-folder: moe,parallelism
+            timeout: 30
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
     name: gb200_${{ matrix.test-name }}

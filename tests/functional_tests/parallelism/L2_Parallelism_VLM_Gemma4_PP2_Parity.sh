@@ -55,7 +55,7 @@ COMMON_ARGS=(
     --validation_dataset.split validation
     --validation_dataset.limit_dataset_samples 8
     --step_scheduler.max_steps 6
-    --step_scheduler.global_batch_size 2
+    --step_scheduler.global_batch_size 4
     --step_scheduler.local_batch_size 2
 )
 
@@ -80,14 +80,22 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --distributed.pipeline.pp_microbatch_size 1 \
     2>&1 | tee "$LOG_FILE"
 
-# Guard against the `_precompute_stage_shapes` bug from PR #2983.
+# Guard against the `_precompute_stage_shapes` bug from PR #2983. Assert the
+# static path positively as well: if the precompute is skipped outright, the
+# fallback log line disappears too and the negative grep alone would pass.
 if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
     echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"
+    exit 1
+fi
+if ! grep -q "Precomputed pipeline stage shapes" "$LOG_FILE"; then
+    echo "ERROR: pipeline stage shapes were never precomputed; static metadata did not run"
     exit 1
 fi
 
 # The gradient-norm bound is looser than the loss bound because the single-rank
 # baseline runs unwrapped while the pp2 run goes through FSDP2 in bf16.
+# global_batch_size is twice local_batch_size, so each step accumulates two
+# micro-batches -- the case PR #3530 fixed.
 python tests/functional_tests/parallelism/compare_parallel_parity.py \
     "$RUN_DIR/baseline/training.jsonl" \
     "$RUN_DIR/pp2/training.jsonl" \

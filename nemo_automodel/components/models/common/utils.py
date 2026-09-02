@@ -287,6 +287,8 @@ class BackendConfig:
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
+            For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
+            CUDA BF16; CPU execution retains the PyTorch numerical oracle.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
@@ -322,6 +324,10 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+        compile_situ: torch.compile the fp32 chunk cores of the SiTU expert
+            activation (currently used by Kimi K3), fusing the elementwise fp32
+            chain in both the forward and the backward recompute. Compiled
+            numerics are allclose to eager but not bitwise-identical.
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
@@ -362,6 +368,10 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
+    # When True, torch.compile the fp32 SiTU chunk cores (forward and backward recompute)
+    # of models using the SiTU expert activation (currently Kimi K3). Fuses the hot fp32
+    # elementwise chains; numerics are allclose to eager, not bitwise-identical. Default False.
+    compile_situ: bool = False
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
     def __post_init__(self) -> None:

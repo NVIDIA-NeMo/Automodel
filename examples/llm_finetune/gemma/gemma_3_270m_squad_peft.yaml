@@ -105,7 +105,6 @@ ci:
   known_issue_id: AM-154
   allow_failure: true
   checkpoint_robustness:
-    hf_kl_threshold: 1e-1
     tokenizer_name: google/gemma-3-270m
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
