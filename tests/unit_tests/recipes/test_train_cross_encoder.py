@@ -23,11 +23,46 @@ from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
 )
+from nemo_automodel.components.models.qwen3_reranker.model import (
+    Qwen3RerankerConfig,
+    Qwen3RerankerForCausalReranking,
+)
 from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncoderRecipe, accuracy, batch_mrr
 
 # ---------------------------------------------------------------------------
 # temperature configuration
 # ---------------------------------------------------------------------------
+
+
+def _tiny_llama_cross_encoder(*, temperature: float) -> CrossEncoderModel:
+    config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=32,
+        num_labels=1,
+        temperature=temperature,
+    )
+    return CrossEncoderModel(LlamaBidirectionalForSequenceClassification(config))
+
+
+def _tiny_qwen3_cross_encoder(*, temperature: float) -> CrossEncoderModel:
+    config = Qwen3RerankerConfig(
+        yes_token_id=5,
+        no_token_id=7,
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+        head_dim=8,
+        temperature=temperature,
+    )
+    return CrossEncoderModel(Qwen3RerankerForCausalReranking(config))
 
 
 @pytest.mark.parametrize(
@@ -38,25 +73,55 @@ from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncod
         {"model": {"temperature": 0.02}},
         {"temperature": 0.3, "model": {"temperature": 1.0}},
         {"temperature": 1.0, "model": {"temperature": 0.02}},
+        {"temperature": 0.3, "model": {"temperature": 0.02}},
+        {"temperature": 0.3, "model": {"temperature": None}},
     ],
 )
-def test_recipe_allows_at_most_one_non_unit_temperature(config):
+def test_recipe_defers_temperature_validation_until_model_is_built(config):
     recipe = TrainCrossEncoderRecipe(ConfigNode(config))
 
     assert recipe.temperature == config.get("temperature", 1.0)
 
 
-def test_recipe_rejects_two_non_unit_temperatures():
+def test_recipe_rejects_two_active_non_unit_temperatures():
     config = ConfigNode({"temperature": 0.3, "model": {"temperature": 0.02}})
+    recipe = TrainCrossEncoderRecipe(config)
+    model = _tiny_llama_cross_encoder(temperature=0.02)
 
+    assert model.effective_score_temperature == 0.02
     with pytest.raises(
         ValueError,
         match="Set either top-level temperature or model.temperature to 1.0",
     ):
-        TrainCrossEncoderRecipe(config)
+        recipe._validate_model(model)
 
 
-def test_recipe_rejects_checkpoint_temperature_when_model_override_is_omitted(tmp_path):
+def test_recipe_allows_configured_temperature_when_qwen3_does_not_apply_it():
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 0.3, "model": {"temperature": 0.02}}))
+    model = _tiny_qwen3_cross_encoder(temperature=0.02)
+
+    assert model.effective_score_temperature == 1.0
+    recipe._validate_model(model)
+
+
+def test_recipe_allows_null_override_when_loaded_model_uses_unit_temperature():
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 0.3, "model": {"temperature": None}}))
+    model = _tiny_llama_cross_encoder(temperature=1.0)
+
+    assert model.effective_score_temperature == 1.0
+    recipe._validate_model(model)
+
+
+def test_recipe_allows_active_model_temperature_when_recipe_temperature_is_unit():
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 1.0, "model": {"temperature": 0.02}}))
+    model = _tiny_llama_cross_encoder(temperature=0.02)
+
+    assert model.effective_score_temperature == 0.02
+    recipe._validate_model(model)
+
+
+@pytest.mark.parametrize("explicit_null", [False, True], ids=["omitted", "null"])
+def test_recipe_rejects_checkpoint_temperature_when_model_override_is_absent(tmp_path, explicit_null):
     checkpoint_config = LlamaBidirectionalConfig(
         vocab_size=32,
         hidden_size=16,
@@ -68,22 +133,28 @@ def test_recipe_rejects_checkpoint_temperature_when_model_override_is_omitted(tm
         temperature=0.02,
     )
     LlamaBidirectionalForSequenceClassification(checkpoint_config).save_pretrained(tmp_path)
-    model = CrossEncoderModel.build(model_name_or_path=str(tmp_path))
+    model_build_kwargs = {"temperature": None} if explicit_null else {}
+    recipe_model_config = {"pretrained_model_name_or_path": str(tmp_path)}
+    if explicit_null:
+        recipe_model_config["temperature"] = None
+
+    model = CrossEncoderModel.build(model_name_or_path=str(tmp_path), **model_build_kwargs)
     recipe = TrainCrossEncoderRecipe(
         ConfigNode(
             {
                 "temperature": 0.3,
-                "model": {"pretrained_model_name_or_path": str(tmp_path)},
+                "model": recipe_model_config,
             }
         )
     )
 
     assert model.config.temperature == 0.02
+    assert model.effective_score_temperature == 0.02
     with pytest.raises(
         ValueError,
         match="Set either top-level temperature or model.temperature to 1.0",
     ):
-        recipe._validate_model_config(model.config)
+        recipe._validate_model(model)
 
 
 # ---------------------------------------------------------------------------

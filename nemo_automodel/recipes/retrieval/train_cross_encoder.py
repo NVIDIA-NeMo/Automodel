@@ -14,17 +14,16 @@
 
 import logging
 from contextlib import nullcontext
+from typing import cast
 
 import torch
 import torch.nn.functional as F
-from transformers import PretrainedConfig
 
+from nemo_automodel._transformers.retrieval import CrossEncoderModel
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe, _get_autocast_ctx
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -66,23 +65,10 @@ def _validate_temperature_sources(recipe_temperature: float, model_temperature: 
 
 
 class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
-    def __init__(self, cfg: ConfigNode | RecipeConfig) -> None:
-        """Initialize the cross-encoder recipe and validate its temperature settings.
-
-        Args:
-            cfg: Raw or typed recipe configuration.
-
-        Raises:
-            ValueError: If both the model and recipe apply non-unit temperature scaling.
-        """
-        super().__init__(cfg)
-        model_temperature = self.cfg.get("model.temperature", 1.0)
-        _validate_temperature_sources(self.temperature, model_temperature)
-
-    def _validate_model_config(self, model_config: PretrainedConfig) -> None:
-        """Validate the effective temperature loaded with the model configuration."""
-        model_temperature = getattr(model_config, "temperature", 1.0)
-        _validate_temperature_sources(self.temperature, model_temperature)
+    def _validate_model(self, model: torch.nn.Module) -> None:
+        """Validate the effective temperature applied by the constructed model."""
+        cross_encoder = cast(CrossEncoderModel, model)
+        _validate_temperature_sources(self.temperature, cross_encoder.effective_score_temperature)
 
     def _run_train_optim_step(self, batches, max_grad_norm=None):
         self._acc_buffer = []
