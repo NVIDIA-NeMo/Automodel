@@ -17,7 +17,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 from datasets import Dataset, concatenate_datasets
 
@@ -105,7 +105,7 @@ def _resolve_doc_to_example(doc: Any) -> dict:
 
 
 def load_datasets(
-    data_dir_list: Union[List[str], str], concatenate: bool = True, extra_columns: Optional[tuple[str, ...]] = None
+    data_dir_list: Union[List[str], str], concatenate: bool = True, extra_columns: tuple[str, ...] | None = None
 ):
     """
     Load retrieval datasets from JSON/JSONL files.
@@ -569,12 +569,12 @@ def make_context_aware_retrieval_dataset(
     data_type: str = "train",
     n_passages: int = 8,
     validation_fraction: float = 0.0,
-    validation_group_key: Optional[str] = None,
-    reasoning_column: Optional[str] = None,
-    global_query_column: Optional[str] = None,
+    validation_group_key: str | None = None,
+    reasoning_column: str | None = None,
+    global_query_column: str | None = None,
     seed: int = 42,
     do_shuffle: bool = False,
-    max_train_samples: Optional[int] = None,
+    max_train_samples: int | None = None,
     train_data_select_offset: int = 0,
 ):
     """Inline retrieval dataset that also carries per-query context columns.
