@@ -119,21 +119,15 @@ loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock.MockUnpackedDatasetConfig
-  num_sentences: 49216
-  mean_len: 1024.0
-  std_len: 0.0
-  max_sentence_len: 1024
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
   vocab_size: 10000
-  seed: 0
-
-packed_sequence:
-  packed_sequence_size: 0
+  seq_len: 1024
+  num_samples: 1000000
 
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: true
+  _target_: torch.utils.data.DataLoader
+  batch_size: null  # Dataset already yields batches
+  num_workers: 0
 
 optimizer:
   _target_: torch.optim.AdamW
