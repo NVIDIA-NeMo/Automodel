@@ -14,8 +14,14 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
+from torch import nn
 
+from nemo_automodel.components.distributed.blockdiag_cp import exchange as blockdiag_exchange
+from nemo_automodel.components.distributed.blockdiag_cp import state as blockdiag_state
+from nemo_automodel.components.distributed.blockdiag_cp.state import BlockdiagCpModelState
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.laguna import model as laguna_model_module
 from nemo_automodel.components.models.laguna.config import LagunaConfig
 from nemo_automodel.components.models.laguna.model import LagunaForCausalLM
 from nemo_automodel.components.moe.layers import MoE
@@ -31,6 +37,75 @@ def _backend() -> BackendConfig:
         dispatcher="torch",
         enable_hf_state_dict_adapter=True,
     )
+
+
+def _te_backend() -> BackendConfig:
+    return BackendConfig(
+        attn="te",
+        linear="torch",
+        rms_norm="torch_fp32",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=True,
+    )
+
+
+def _sdpa_backend() -> BackendConfig:
+    backend = _backend()
+    backend.attn = "sdpa"
+    return backend
+
+
+class _IdentityGather:
+    @staticmethod
+    def apply(tensor, group, seq_dim):
+        del group, seq_dim
+        return tensor
+
+
+class _ReferencePackedAttention(nn.Module):
+    """Independent CPU reference for TE's causal variable-length THD attention."""
+
+    def __init__(self, scale: float, attention_dropout: float) -> None:
+        super().__init__()
+        self.scale = scale
+        self.attention_dropout = attention_dropout
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs) -> torch.Tensor:
+        cu_seqlens = kwargs["cu_seqlens_q"].tolist()
+        left_window, right_window = kwargs.get("window_size", (-1, 0))
+        outputs = []
+        for start, end in zip(cu_seqlens, cu_seqlens[1:]):
+            query_doc = query[start:end].transpose(0, 1).unsqueeze(0)
+            key_doc = key[start:end].transpose(0, 1).unsqueeze(0)
+            value_doc = value[start:end].transpose(0, 1).unsqueeze(0)
+            attention_mask = None
+            is_causal = True
+            if left_window >= 0:
+                positions = torch.arange(end - start)
+                query_positions = positions[:, None]
+                key_positions = positions[None, :]
+                attention_mask = (key_positions >= query_positions - left_window) & (
+                    key_positions <= query_positions + right_window
+                )
+                is_causal = False
+            output = F.scaled_dot_product_attention(
+                query_doc,
+                key_doc,
+                value_doc,
+                attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+                enable_gqa=True,
+                scale=self.scale,
+            )
+            outputs.append(output.squeeze(0).transpose(0, 1))
+        return torch.cat(outputs)
+
+
+def _reference_te_factory(**kwargs):
+    attention = _ReferencePackedAttention(kwargs["softmax_scale"], kwargs["attention_dropout"])
+    return attention, attention.__call__
 
 
 def _tiny_config() -> LagunaConfig:
@@ -157,3 +232,132 @@ def test_laguna_attention_uses_per_layer_head_counts_and_per_head_gate():
     assert layer0_attn.g_proj.weight.shape == (2, 16)
     assert layer1_attn.q_proj.weight.shape == (16, 16)
     assert layer1_attn.g_proj.weight.shape == (4, 16)
+
+
+def test_laguna_packed_thd_matches_per_document_logits_and_gradients(monkeypatch):
+    """THD must preserve Laguna document boundaries, RoPE, gating, and backward."""
+    monkeypatch.setattr(laguna_model_module, "initialize_attn_module_and_func", _reference_te_factory)
+    torch.manual_seed(1234)
+    reference_model = LagunaForCausalLM(_dense_tiny_config(), backend=_te_backend()).to(torch.float32).train()
+    packed_model = LagunaForCausalLM(_dense_tiny_config(), backend=_te_backend()).to(torch.float32).train()
+    packed_model.load_state_dict(reference_model.state_dict())
+
+    input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
+    position_ids = torch.tensor([0, 1, 2, 0, 1, 2, 3, 4])
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+    reference_logits = torch.cat(
+        [
+            reference_model(
+                input_ids[:3].unsqueeze(0),
+                position_ids=position_ids[:3].unsqueeze(0),
+            ).logits,
+            reference_model(
+                input_ids[3:].unsqueeze(0),
+                position_ids=position_ids[3:].unsqueeze(0),
+            ).logits,
+        ],
+        dim=1,
+    )
+    reference_logits.square().sum().backward()
+
+    packed_logits = packed_model(
+        input_ids.unsqueeze(0),
+        position_ids=position_ids.unsqueeze(0),
+        qkv_format="thd",
+        cu_seqlens=cu_seqlens.unsqueeze(0),
+        max_seqlen=torch.tensor([5], dtype=torch.int32),
+    ).logits
+    packed_logits.square().sum().backward()
+
+    torch.testing.assert_close(packed_logits, reference_logits, atol=1e-5, rtol=1e-5)
+    reference_params = dict(reference_model.named_parameters())
+    for name, packed_param in packed_model.named_parameters():
+        reference_grad = reference_params[name].grad
+        assert reference_grad is not None, name
+        assert packed_param.grad is not None, name
+        torch.testing.assert_close(packed_param.grad, reference_grad, atol=2e-5, rtol=2e-4)
+
+    capabilities = packed_model.ModelCapabilities()
+    assert capabilities.supports_cp is True
+    assert capabilities.supports_thd is True
+
+
+def test_laguna_blockdiag_thd_matches_per_document_sliding_attention(monkeypatch):
+    """The production THD+CP dispatch must preserve Laguna's sliding window."""
+    monkeypatch.setattr(blockdiag_exchange, "_AllGatherSeqDiff", _IdentityGather)
+    torch.manual_seed(4321)
+    reference_model = LagunaForCausalLM(_dense_tiny_config(), backend=_sdpa_backend()).to(torch.float32).train()
+    packed_model = LagunaForCausalLM(_dense_tiny_config(), backend=_sdpa_backend()).to(torch.float32).train()
+    packed_model.load_state_dict(reference_model.state_dict())
+
+    input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
+    position_ids = torch.tensor([0, 1, 2, 0, 1, 2, 3, 4])
+    reference_logits = torch.cat(
+        [
+            reference_model(input_ids[:3].unsqueeze(0), position_ids=position_ids[:3].unsqueeze(0)).logits,
+            reference_model(input_ids[3:].unsqueeze(0), position_ids=position_ids[3:].unsqueeze(0)).logits,
+        ],
+        dim=1,
+    )
+    reference_logits.square().sum().backward()
+
+    step_state = {
+        "group": None,
+        "doc_ids": torch.tensor([[1, 1, 1, 2, 2, 2, 2, 2]]),
+        "row_offset": 0,
+        "seq_dim": 2,
+        "attn_backend": "dense",
+        "kv_exchange": "allgather",
+        "model_state": BlockdiagCpModelState(
+            group=None,
+            packed_cu_seqlens=torch.tensor([0, 3, 8]),
+            packed_cu_seqlens_cpu=torch.tensor([0, 3, 8]),
+        ),
+    }
+    token = blockdiag_state._CP_BLOCKDIAG_STATE.set(step_state)
+    try:
+        packed_logits = packed_model(
+            input_ids.unsqueeze(0),
+            position_ids=position_ids.unsqueeze(0),
+            qkv_format="thd",
+        ).logits
+        packed_logits.square().sum().backward()
+    finally:
+        blockdiag_state._CP_BLOCKDIAG_STATE.reset(token)
+
+    torch.testing.assert_close(packed_logits, reference_logits, atol=1e-5, rtol=1e-5)
+    reference_params = dict(reference_model.named_parameters())
+    for name, packed_param in packed_model.named_parameters():
+        torch.testing.assert_close(packed_param.grad, reference_params[name].grad, atol=2e-5, rtol=2e-4)
+
+
+def test_laguna_reports_sdpa_cp_and_packing_support():
+    from nemo_automodel._transformers.capabilities import ModelSupports
+
+    model = LagunaForCausalLM(_dense_tiny_config(), backend=_sdpa_backend())
+    supports = ModelSupports(model, None)
+
+    assert supports.supports_cp is True
+    assert supports.supports_sequence_packing is True
+
+
+def test_laguna_te_thd_uses_framework_input_sharder():
+    model = LagunaForCausalLM(_dense_tiny_config(), backend=_sdpa_backend())
+    model.backend.attn = "te"
+
+    prepared = model.prepare_model_inputs_for_cp({"qkv_format": "thd"})
+
+    assert prepared == {}
+
+
+def test_laguna_packed_thd_rejects_non_te_attention():
+    model = LagunaForCausalLM(_dense_tiny_config(), backend=_backend()).eval()
+
+    with pytest.raises(ValueError, match="requires backend.attn='te'"):
+        model(
+            torch.tensor([[1, 2, 3, 4]]),
+            position_ids=torch.tensor([[0, 1, 0, 1]]),
+            qkv_format="thd",
+            cu_seqlens=torch.tensor([[0, 2, 4]], dtype=torch.int32),
+            max_seqlen=torch.tensor([2], dtype=torch.int32),
+        )
