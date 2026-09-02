@@ -380,7 +380,7 @@ NeMo AutoModel achieves great training performance on NVIDIA GPUs. Below are hig
 | GPT-OSS 20B | 8 | 4096 | 279 | 13,058 | TE + DeepEP + FlexAttn |
 | Qwen3 MoE 30B | 8 | 4096 | 212 | 11,842 | TE + DeepEP |
 
-For complete benchmark results including configuration details, see the [Performance Summary](docs/performance-summary.md).
+For complete benchmark results including configuration details, see the [Performance Summary](docs/performance-summary.mdx).
 
 <!--
 ## Mesh‑Aware Checkpointing

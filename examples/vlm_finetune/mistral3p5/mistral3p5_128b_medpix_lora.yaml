@@ -77,7 +77,6 @@ distributed:
     scale_grads_in_schedule: false
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
 

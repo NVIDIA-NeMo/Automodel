@@ -14,6 +14,7 @@
 
 
 import importlib
+import importlib.metadata
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -489,9 +490,15 @@ class _LazyArchMapping:
         self._extra[key] = value
 
     def register(self, key: str, value: Type[nn.Module], exist_ok: bool = False) -> None:
-        """Register a model class under the given architecture name."""
-        if not exist_ok and key in self._extra:
+        """Register a model class under the given architecture name.
+
+        Conflicts, including built-in architectures, require ``exist_ok=True``.
+        """
+        if not exist_ok and (key in self._auto_map or key in self._extra):
             raise ValueError(f"Duplicated model implementation for {key}")
+
+        self._auto_map.pop(key, None)
+        self._loaded.pop(key, None)
         self._extra[key] = value
 
     def has_tag(self, key: str, tag: str) -> bool:
@@ -521,6 +528,19 @@ class _ModelRegistry:
         if self.model_arch_name_to_cls is None:
             self.model_arch_name_to_cls = _LazyArchMapping(MODEL_ARCH_MAPPING)
         self._retrieval_archs = self.model_arch_name_to_cls.keys_with_tag("retrieval")
+        self._discover_entry_points()
+
+    def _discover_entry_points(self) -> None:
+        """Register architecture entry points without importing their modules."""
+        mapping = self.model_arch_name_to_cls
+        for ep in importlib.metadata.entry_points(group="nemo_automodel.architectures"):
+            if ep.name in mapping.keys():
+                logger.warning("Architecture %s is already registered; skipping entry point %s", ep.name, ep.value)
+                continue
+            module_path, _, class_name = ep.value.rpartition(":")
+            if not module_path or not class_name:
+                raise ValueError(f"Entry point {ep.name!r} value must be module.path:ClassName, got {ep.value!r}")
+            mapping._auto_map[ep.name] = (module_path, class_name)
 
     @property
     def supported_models(self):
@@ -568,6 +588,21 @@ class _ModelRegistry:
 @lru_cache
 def get_registry():
     return _ModelRegistry()
+
+
+def register_architecture(arch_name: str, model_cls: type[nn.Module], *, exist_ok: bool = False) -> None:
+    """Register a custom model class for an architecture name.
+
+    Args:
+        arch_name: Architecture name (e.g. ``"LlavaExampleNemotronForCausalLM"``).
+        model_cls: The model class (not a string path; the class object itself).
+        exist_ok: If True, replace an existing registration.
+
+    Raises:
+        ValueError: If *arch_name* is already a built-in or registered to a
+            different class and *exist_ok* is False.
+    """
+    ModelRegistry.register(arch_name, model_cls, exist_ok=exist_ok)
 
 
 ModelRegistry = get_registry()
