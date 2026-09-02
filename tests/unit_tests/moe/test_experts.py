@@ -844,6 +844,68 @@ class TestGroupedExpertsDeepEP:
         assert stabilized.dtype == torch.bfloat16
         assert _stabilize_empty_routing_probs_dtype(nonempty_probs, torch.bfloat16) is nonempty_probs
 
+    @pytest.mark.parametrize("expert_bias", [False, True], ids=["no-bias", "bias"])
+    def test_zero_local_tokens_preserve_dispatch_and_parameter_gradients(self, expert_bias):
+        """The zero-token fallback preserves its empty shape and explicit parameter gradients."""
+        config = MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=0,
+            n_activated_experts=1,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=4,
+            inter_dim=8,
+            moe_inter_dim=8,
+            norm_topk_prob=False,
+            expert_bias=expert_bias,
+            expert_activation="swiglu",
+            dtype=torch.float32,
+        )
+        experts = GroupedExpertsDeepEP(config)
+        with torch.no_grad():
+            experts.init_weights(torch.device("cpu"))
+        experts.ep_size = 1
+        experts.n_routed_experts = config.n_routed_experts
+
+        # Production weights are DTensors after parallelization.  A plain CPU
+        # unit test can exercise the same forward path with identity to_local.
+        for parameter in experts.parameters():
+            parameter.to_local = lambda parameter=parameter: parameter
+
+        class EmptyRankDispatcher:
+            def token_permutation2(self, hidden_states, num_local_tokens, token_probs, token_indices):
+                del num_local_tokens, token_indices
+                return (
+                    hidden_states[:0],
+                    torch.zeros(config.n_routed_experts, dtype=torch.long),
+                    token_probs.reshape(-1)[:0],
+                )
+
+            def token_unpermutation(self, hidden_states):
+                return hidden_states
+
+        experts.token_dispatcher = EmptyRankDispatcher()
+        x = torch.randn(3, config.dim, requires_grad=True)
+        weights = torch.rand(3, config.n_activated_experts, requires_grad=True)
+        indices = torch.zeros(3, config.n_activated_experts, dtype=torch.long)
+        token_mask = torch.ones(3, dtype=torch.bool)
+
+        output = experts(x, token_mask, weights, indices)
+        assert output.shape == (0, config.dim)
+        assert torch.isfinite(output).all()
+        output.sum().backward()
+
+        assert x.grad is not None
+        assert weights.grad is not None
+        for parameter in experts.parameters():
+            assert parameter.grad is not None
+            assert torch.count_nonzero(parameter.grad) == 0
+
     def test_grouped_experts_deepep_token_dispatcher_init(self, moe_config):
         """Test token dispatcher initialization."""
         experts = GroupedExpertsDeepEP(moe_config)
