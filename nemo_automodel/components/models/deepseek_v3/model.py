@@ -159,6 +159,7 @@ class DeepseekV3Model(nn.Module):
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
