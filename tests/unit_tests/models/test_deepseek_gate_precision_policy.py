@@ -15,10 +15,10 @@
 """DeepSeek V3 and V3.2 must share one router precision policy.
 
 V3.2 skips DeepseekV3ForCausalLM.__init__, so a default installed there does
-not reach it. V3.2 skips DeepseekV3ForCausalLM.__init__, so a default installed there does
 not reach it. Parametrizing over V3, V3.2, and Kimi K2 keeps the construction
 paths from drifting apart silently.
 """
+
 
 import importlib.util
 import sys
@@ -266,19 +266,34 @@ def test_deepseek_router_stages_on_constructed_model(model_cls, config_fn):
     assert indices.shape == (16, model.model.moe_config.n_activated_experts)
 
 
-# Released DeepSeek-V3 (rev e815299) stores e_score_correction_bias in F32 in all
-# 59 routers, with a large positive per-layer mean (2.23 to 8.04) and a small
-# per-expert spread (std 0.0018 to 0.0236). A zero-centered bias never exercises
-# that regime, so parity is checked in both.
-_BIAS_REGIMES = (
-    pytest.param(0.0, 0.1, id="zero_centered"),
-    pytest.param(4.95, 0.002, id="v3_like"),
+# Released DeepSeek-V3 (rev e815299) stores gate.weight in BF16 and
+# e_score_correction_bias in F32 in all 59 routers, with a large positive
+# per-layer bias mean (2.23 to 8.04) and a small per-expert spread
+# (std 0.0018 to 0.0236). Cases are (bias_mean, bias_std, router_overrides,
+# weight_atol): the first two use the tiny 8-expert grouped router, the third
+# matches the released V3 routing shape (256 experts, top-8, 8 groups limited
+# to 4) at a reduced hidden dim so it stays a CPU test.
+#
+# weight_atol is None where the weights must match bitwise. At top-2 the norm
+# denominator is a two-element sum, and a + b == b + a exactly, so the reference's
+# unsorted top-k cannot reorder it. Only v3_shape sums 8 elements, where order
+# does change the result.
+_PARITY_CASES = (
+    pytest.param(0.0, 0.1, {}, None, id="zero_centered"),
+    pytest.param(4.95, 0.002, {}, None, id="v3_like_bias"),
+    pytest.param(
+        4.95,
+        0.002,
+        dict(n_routed_experts=256, n_activated_experts=8, n_expert_groups=8, n_limited_groups=4),
+        1e-7,
+        id="v3_shape",
+    ),
 )
 
 
-@pytest.mark.parametrize(("bias_mean", "bias_std"), _BIAS_REGIMES)
-def test_deepseek_gate_matches_hf_reference_router_grouped(bias_mean, bias_std):
-    """Proj/Score/Out parity vs the pinned HF reference, grouped routing (n_group=2).
+@pytest.mark.parametrize(("bias_mean", "bias_std", "router_overrides", "weight_atol"), _PARITY_CASES)
+def test_deepseek_gate_matches_hf_reference_router_grouped(bias_mean, bias_std, router_overrides, weight_atol):
+    """Proj/Score/Out parity vs the pinned HF reference, grouped routing.
 
     The reference splits the router across two objects: DeepseekV3TopkRouter does
     the fp32 projection and returns logits only, while DeepseekV3MoE.route_tokens_to_experts
@@ -290,7 +305,7 @@ def test_deepseek_gate_matches_hf_reference_router_grouped(bias_mean, bias_std):
     # file to dependencies none of them need.
     from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
 
-    cfg = _router_config()
+    cfg = _router_config(**router_overrides)
     gate = Gate(cfg, gate_precision=torch.float32).eval()
     torch.manual_seed(0)
     gate.weight.data.normal_(std=0.02)
@@ -327,7 +342,12 @@ def test_deepseek_gate_matches_hf_reference_router_grouped(bias_mean, bias_std):
     # by sorting each side's indices and applying the same permutation to the weights.
     o_am, o_hf = i_am.argsort(dim=1), i_hf.argsort(dim=1)
     assert torch.equal(i_am.gather(1, o_am), i_hf.gather(1, o_hf))
-    assert torch.equal(w_am.gather(1, o_am), w_hf.gather(1, o_hf))
+    w_am_sorted, w_hf_sorted = w_am.gather(1, o_am), w_hf.gather(1, o_hf)
+    if weight_atol is None:
+        assert torch.equal(w_am_sorted, w_hf_sorted)
+    else:
+        # Measured max delta 5.96e-08, two fp32 ulp at these magnitudes (~0.31).
+        assert torch.allclose(w_am_sorted, w_hf_sorted, atol=weight_atol, rtol=0)
 
 
 def test_kimi_k2_routes_to_the_deepseek_v3_construction_path():
