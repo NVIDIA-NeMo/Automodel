@@ -58,7 +58,7 @@ def encoder_ar_loss(
     encoder_logits: torch.Tensor,
     input_ids: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
-    num_tokens: int | None = None,
+    num_examples: int | None = None,
 ) -> torch.Tensor:
     """Autoregressive next-token CE on the encoder's causal logits.
 
@@ -70,11 +70,12 @@ def encoder_ar_loss(
         encoder_logits: Encoder logits over the clean sequence, ``[B, S, V]``.
         input_ids: Clean token IDs, ``[B, S]``.
         valid_mask: Boolean non-pad mask ``[B, S]``. If ``None``, all positions count.
-        num_tokens: Optional global denominator (summed across grad-acc microbatches);
-            defaults to the local valid next-token count.
+        num_examples: Optional global count of examples with at least one valid
+            next-token target, summed across data replicas and gradient-accumulation
+            microbatches. Defaults to the local nonempty-example count.
 
     Returns:
-        Scalar AR loss (mean CE over valid next-token positions).
+        Scalar contribution to the mean of per-example AR losses.
     """
     logits = encoder_logits[:, :-1, :]
     targets = input_ids[:, 1:]
@@ -83,9 +84,11 @@ def encoder_ar_loss(
         mask = (valid_mask[:, :-1] & valid_mask[:, 1:]).to(nll.dtype)
     else:
         mask = torch.ones_like(nll)
-    loss = (nll * mask).sum()
-    denom = num_tokens if num_tokens is not None else int(mask.sum().item())
-    return loss / max(denom, 1)
+    token_counts = mask.sum(dim=1)
+    per_example = (nll * mask).sum(dim=1) / token_counts.clamp_min(1)
+    nonempty = token_counts > 0
+    denom = num_examples if num_examples is not None else int(nonempty.sum().item())
+    return (per_example * nonempty).sum() / max(denom, 1)
 
 
 class DLLMLossOutput(NamedTuple):

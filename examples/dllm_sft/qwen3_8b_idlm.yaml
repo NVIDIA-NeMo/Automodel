@@ -53,7 +53,7 @@ model:
   _target_: transformers.AutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-8B
   trust_remote_code: true
-  dtype: bfloat16
+  dtype: float32
   # I-DLM feeds a custom [x_t | x_0] block-diffusion mask; sdpa honours it.
   # Use flex_attention to avoid materialising the dense 2L x 2L mask at scale.
   attn_implementation: sdpa
@@ -74,7 +74,7 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true   # 8B full FT at seq 4096; trade compute for memory
   mp_policy:
-    param_dtype: bfloat16
+    param_dtype: float32
     reduce_dtype: float32
     output_dtype: float32
   autocast_dtype: bfloat16

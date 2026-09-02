@@ -76,7 +76,7 @@ wandb:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Base
-  torch_dtype: float32     # fp32 master weights; compute stays bf16 via mp_policy
+  torch_dtype: float32     # fp32 master weights; compute stays bf16 via autocast
   trust_remote_code: true
 
 checkpoint:
@@ -94,7 +94,7 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true   # 8B full FT; trade compute for memory
   mp_policy:
-    param_dtype: bfloat16
+    param_dtype: float32
     reduce_dtype: float32
     output_dtype: float32
   autocast_dtype: bfloat16

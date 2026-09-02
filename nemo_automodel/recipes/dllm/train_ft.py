@@ -50,6 +50,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loggers.mlflow_utils import to_float_metrics
 from nemo_automodel.components.loss.dllm_loss import encoder_ar_loss
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.models.diffusion_gemma.attention_mask import build_block_diffusion_training_mask
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
@@ -859,6 +860,11 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         tok = getattr(self, "tokenizer", None)
         pad_id = getattr(tok, "pad_token_id", None) if tok is not None else None
         self._pad_token_id = int(pad_id) if pad_id is not None else 0
+        self._fused_encoder_loss = FusedLinearCrossEntropy(
+            ignore_index=-100,
+            logit_softcapping=getattr(model, "final_logit_softcapping", 0) or 0,
+            reduction="sum",
+        )
 
         # Freeze the router on the live model (the config flag also freezes it in
         # __init__, but freezing here is idempotent and covers from_config paths).
@@ -880,6 +886,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         device = self.dist_env.device
         num_diffusion = 0
         num_ar = 0
+        num_ar_examples = 0
         for microbatch_idx, batch in enumerate(batches):
             clean = batch["_clean_input_ids"].to(device)
             noisy = batch["_noisy_input_ids"].to(device)
@@ -906,9 +913,17 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             # that full_valid (prompt+response+EOS, excluding only global pad), so
             # the AR denominator counts the same positions the AR loss scores.
             ar = attn.to(dtype=torch.bool) if attn is not None else loss_mask.bool()
-            num_ar += int((ar[:, :-1] & ar[:, 1:]).sum().item())
+            ar_token_counts = (ar[:, :-1] & ar[:, 1:]).sum(dim=1)
+            num_ar += int(ar_token_counts.sum().item())
+            num_ar_examples += int((ar_token_counts > 0).sum().item())
+        # CP ranks hold disjoint token shards of the same examples, so the
+        # denominator is reduced over data replicas only (not multiplied by
+        # CP). Backward's include_cp scaling combines those local numerators.
         num_diffusion = self._dp_allreduce(torch.tensor(num_diffusion, dtype=torch.long)).item()
         num_ar = self._dp_allreduce(torch.tensor(num_ar, dtype=torch.long)).item()
+        num_ar_examples = self._dp_allreduce(torch.tensor(num_ar_examples, dtype=torch.long)).item()
+        for batch in batches:
+            batch["_num_ar_examples"] = max(num_ar_examples, 1)
         # Guard a degenerate all-pad step against divide-by-zero in the loss.
         return max(num_diffusion, 1), max(num_ar, 1)
 
@@ -1106,6 +1121,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         # one-canvas selection). Pop before the to-device sweep, which can't handle
         # the nested decoder-mask dict.
         cached_window = batch.pop("_window", None)
+        num_ar_examples = batch.pop("_num_ar_examples", None)
         batch = {
             k: (
                 {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
@@ -1167,9 +1183,23 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         loss_mask = window["loss_mask"]
         p_mask = window["p_mask"]
 
+        # Align the next-token AR targets before CP changes the encoder layout.
+        # The model-owned sharder extends these with ignored dummy canvas slots.
+        encoder_labels = torch.full_like(clean_input_ids, -100)
+        ar_pairs = ar_full_loss_mask[:, :-1] & ar_full_loss_mask[:, 1:]
+        ar_token_counts = ar_pairs.sum(dim=1)
+        encoder_labels[:, :-1] = torch.where(ar_pairs, clean_input_ids[:, 1:], -100)
+        batch["encoder_labels"] = encoder_labels
+
         model = self.model_parts[0]
-        cp_sharder = ContextParallelSharder(None, self.device_mesh, batch)
+        cp_sharder = ContextParallelSharder(model, self.device_mesh, batch)
         train_ctx, batch = cp_sharder.shard(batch)
+        encoder_labels = batch.pop("encoder_labels")
+        if "cp_canvas_indices" in batch:
+            target_ids = cp_sharder.shard_token_tensor(target_ids, fill=self._pad_token_id)
+            noise_mask = cp_sharder.shard_token_tensor(noise_mask, fill=False)
+            loss_mask = cp_sharder.shard_token_tensor(loss_mask, fill=False)
+            p_mask = cp_sharder.shard_token_tensor(p_mask, fill=1.0)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
         sync_ctx = (
             get_sync_ctx(
@@ -1190,6 +1220,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             out = model(**batch)
             logits = getattr(out, "logits", out)
             encoder_logits = getattr(out, "encoder_logits", None)
+            encoder_hidden_states = getattr(out, "encoder_hidden_states", None)
             del out
 
             loss_result = self.dllm_loss_fn(
@@ -1206,25 +1237,31 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             microbatch_loss = loss_result.total_loss
             dllm_loss = loss_result.dllm_loss.detach().clone()
 
-            # Co-trained autoregressive encoder loss: next-token CE over the clean
-            # sequence, added at encoder_loss_weight, only when training (encoder_logits
-            # is produced by the forward only then). The SCOPE matches Google (full_valid:
-            # prompt + canvas + EOS-fill, via attention_mask); the REDUCTION does NOT —
-            # we use token-normalization (Σ CE / Σ tokens over the global count) whereas
-            # Google takes a per-example mean (Σ_b CE_b / N_b, then mean over B).
-            # Token-norm weights long examples more; it is kept deliberately (#4 decision)
-            # for consistency with the diffusion loss's global-token normalization and the
-            # recipe's `* dp_group_size` backward scaling.
+            # Co-trained autoregressive encoder loss: mean each example's valid
+            # next-token CE first, then average those means over the global batch.
+            # Under CP each rank supplies its local numerator while dividing by the
+            # replicated full-sequence count; include_cp backward scaling combines
+            # the disjoint token shards into the same objective as non-CP.
             if is_train and encoder_logits is not None and self._encoder_loss_weight > 0.0:
-                # Normalize by the GLOBAL supervised-token count (num_ar_tokens),
-                # exactly like the diffusion loss uses num_diffusion_tokens, so the
-                # recipe's `* dp_group_size` backward scaling is correct for both
-                # terms (a local mean here would be over-scaled by dp_group_size).
+                if num_ar_examples is None:
+                    raise RuntimeError("AR example denominator was not computed before the forward pass")
                 ar_loss = encoder_ar_loss(
                     encoder_logits,
                     clean_input_ids,
                     valid_mask=ar_full_loss_mask,
-                    num_tokens=num_ar_tokens,
+                    num_examples=num_ar_examples,
+                )
+                microbatch_loss = microbatch_loss + self._encoder_loss_weight * ar_loss
+            elif is_train and encoder_hidden_states is not None and self._encoder_loss_weight > 0.0:
+                if num_ar_examples is None:
+                    raise RuntimeError("AR example denominator was not computed before the forward pass")
+                ar_loss = self._fused_encoder_loss(
+                    encoder_hidden_states,
+                    encoder_labels,
+                    model.lm_head.weight,
+                    label_token_counts=ar_token_counts,
+                    num_label_examples=num_ar_examples,
+                    grad_reduce_group=self._get_dp_group(include_cp=True),
                 )
                 microbatch_loss = microbatch_loss + self._encoder_loss_weight * ar_loss
 

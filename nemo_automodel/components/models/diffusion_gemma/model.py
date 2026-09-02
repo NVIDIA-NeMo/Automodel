@@ -78,12 +78,14 @@ class DiffusionGemmaOutput:
 
     ``logits`` are the canvas-only (response) denoising logits ``[B, canvas_len, V]``.
     ``encoder_logits`` are the causal encoder's next-token logits over the clean
-    full sequence ``[B, S, V]`` for the co-trained AR loss — ``None`` outside
-    training (and when the AR loss is unused).
+    full sequence ``[B, S, V]`` on the non-CP compatibility path.
+    ``encoder_hidden_states`` are the local TE-CP encoder shard used by fused
+    linear CE, which avoids materializing the long-sequence vocabulary logits.
     """
 
     logits: "torch.Tensor"
     encoder_logits: "torch.Tensor | None" = None
+    encoder_hidden_states: "torch.Tensor | None" = None
 
 
 def _make_causal_additive_mask(
@@ -182,22 +184,27 @@ class DiffusionGemmaBackbone(nn.Module):
         dtype = inputs_embeds.dtype
         device = inputs_embeds.device
 
-        full_mask = _make_causal_additive_mask(
-            seq_len,
-            padding_mask=padding_mask,
-            sliding_window=None,
-            batch_size=batch_size,
-            device=device,
-            dtype=dtype,
-        )
-        sliding_mask = _make_causal_additive_mask(
-            seq_len,
-            padding_mask=padding_mask,
-            sliding_window=self.config.sliding_window,
-            batch_size=batch_size,
-            device=device,
-            dtype=dtype,
-        )
+        # TE encodes causality/windowing in the kernel. Never materialize an
+        # O(S^2) mask for the 100K--256K encoder stream.
+        if self.backend.attn == "te":
+            full_mask = sliding_mask = None
+        else:
+            full_mask = _make_causal_additive_mask(
+                seq_len,
+                padding_mask=padding_mask,
+                sliding_window=None,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+            )
+            sliding_mask = _make_causal_additive_mask(
+                seq_len,
+                padding_mask=padding_mask,
+                sliding_window=self.config.sliding_window,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+            )
         masks = {"full_attention": full_mask, "sliding_attention": sliding_mask}
         position_embeddings = self._position_embeddings(inputs_embeds, position_ids)
 
@@ -226,6 +233,9 @@ class DiffusionGemmaBackbone(nn.Module):
         decoder_padding_mask: torch.Tensor | None = None,
         self_conditioning_logits: torch.Tensor | None = None,
         self_conditioning_mask: torch.Tensor | None = None,
+        cp_encoder_indices: torch.Tensor | None = None,
+        cp_canvas_indices: torch.Tensor | None = None,
+        cp_encoder_length: int | None = None,
     ) -> torch.Tensor:
         """Bidirectional pass over the noised canvas with cross-attention to the
         encoder KV cache. Returns the final (normed) hidden states.
@@ -257,6 +267,9 @@ class DiffusionGemmaBackbone(nn.Module):
                 attention_mask=decoder_masks[layer.attention_type],
                 encoder_kv=encoder_kv[i],
                 padding_mask=decoder_padding_mask,
+                cp_encoder_indices=cp_encoder_indices,
+                cp_canvas_indices=cp_canvas_indices,
+                cp_encoder_length=cp_encoder_length,
             )
         return self.norm(hidden_states)
 
@@ -275,6 +288,9 @@ class DiffusionGemmaBackbone(nn.Module):
         decoder_padding_mask: torch.Tensor | None = None,
         self_conditioning_logits: torch.Tensor | None = None,
         self_conditioning_mask: torch.Tensor | None = None,
+        cp_encoder_indices: torch.Tensor | None = None,
+        cp_canvas_indices: torch.Tensor | None = None,
+        cp_encoder_length: int | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]] | torch.Tensor:
         """Dispatch encode/decode through ``nn.Module.__call__`` for FSDP hooks.
 
@@ -311,6 +327,9 @@ class DiffusionGemmaBackbone(nn.Module):
                 decoder_padding_mask=decoder_padding_mask,
                 self_conditioning_logits=self_conditioning_logits,
                 self_conditioning_mask=self_conditioning_mask,
+                cp_encoder_indices=cp_encoder_indices,
+                cp_canvas_indices=cp_canvas_indices,
+                cp_encoder_length=cp_encoder_length,
             )
         raise ValueError(f"Unsupported DiffusionGemmaBackbone.forward mode: {mode!r}")
 
@@ -348,13 +367,14 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     def get_capabilities(cls, config: "DiffusionGemmaConfig") -> "ModelCapabilities":
         """Parallelism support for the DiffusionGemma block-diffusion MoE.
 
-        Single variant: FSDP2 + Expert Parallelism are supported (validated at
-        EP=8). TP is unsupported for the custom MoE; CP/PP are not supported for
-        this encoder-decoder block-diffusion path.
+        FSDP2 + Expert Parallelism are supported (validated at EP=8). TP is
+        unsupported for the custom MoE. CP uses Transformer Engine's native
+        transport with independent encoder/canvas sequence layouts; PP remains
+        unsupported.
         """
         return ModelCapabilities(
             supports_tp=False,
-            supports_cp=False,
+            supports_cp=True,
             supports_pp=False,
             supports_ep=True,
         )
@@ -469,6 +489,15 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
                 elif isinstance(param, torch.Tensor):
                     param.requires_grad_(False)
 
+    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
+        """Select the mixed encoder/canvas Transformer Engine CP layout."""
+        del num_chunks
+        if self.backend.attn != "te":
+            raise ValueError("DiffusionGemma context parallelism requires backend.attn='te'.")
+        from .cp import diffusion_gemma_cp_sharder
+
+        return {"cp_sharder": diffusion_gemma_cp_sharder()}
+
     @torch.no_grad()
     def initialize_weights(
         self,
@@ -518,6 +547,10 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         decoder_attention_mask: dict | None = None,
         decoder_padding_mask: torch.Tensor | None = None,
         do_self_conditioning: torch.Tensor | bool | None = None,
+        cp_encoder_indices: torch.Tensor | None = None,
+        cp_canvas_indices: torch.Tensor | None = None,
+        cp_encoder_length: int | None = None,
+        cp_canvas_padded_length: int | None = None,
         **kwargs: Any,
     ) -> "DiffusionGemmaOutput":
         """Training forward — single shared stack run twice + two-pass self-cond.
@@ -557,9 +590,11 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
 
         Returns:
             ``DiffusionGemmaOutput`` with canvas-only ``logits``
-            (``[B, canvas_len, V]``, softcapped) and, during training,
-            ``encoder_logits`` (``[B, S, V]``) for the co-trained AR loss.
+            (``[B, canvas_len, V]``, softcapped) and, during training, either
+            ``encoder_logits`` (non-CP) or local ``encoder_hidden_states``
+            (TE CP) for the co-trained AR loss.
         """
+        del cp_canvas_padded_length
         if input_ids is None:
             raise ValueError("DiffusionGemmaForBlockDiffusion training forward requires input_ids (clean sequence).")
         if canvas_ids is None:
@@ -591,6 +626,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         #    full-sequence lm_head over the large vocab is memory-heavy, so it is
         #    skipped outside training.
         encoder_logits = None
+        encoder_hidden_states = None
         if self.training:
             encoder_kv, encoder_hidden = self.model(
                 mode="encode",
@@ -599,7 +635,12 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
                 padding_mask=encoder_padding_mask,
                 return_hidden=True,
             )
-            encoder_logits = self._softcap_logits(encoder_hidden)
+            if cp_encoder_indices is None:
+                encoder_logits = self._softcap_logits(encoder_hidden)
+            else:
+                # The recipe consumes this local hidden shard with fused linear
+                # CE, avoiding a [100K, vocab] logits allocation.
+                encoder_hidden_states = encoder_hidden
         else:
             encoder_kv = self.model(
                 mode="encode",
@@ -640,6 +681,9 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
                     decoder_masks=decoder_attention_mask,
                     decoder_padding_mask=decoder_padding_mask,
                     self_conditioning_logits=None,
+                    cp_encoder_indices=cp_encoder_indices,
+                    cp_canvas_indices=cp_canvas_indices,
+                    cp_encoder_length=cp_encoder_length,
                 )
                 sc_logits = self._softcap_logits(pass1_hidden).detach()
 
@@ -652,10 +696,17 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
             decoder_padding_mask=decoder_padding_mask,
             self_conditioning_logits=sc_logits,
             self_conditioning_mask=sc_mask,
+            cp_encoder_indices=cp_encoder_indices,
+            cp_canvas_indices=cp_canvas_indices,
+            cp_encoder_length=cp_encoder_length,
         )
         logits = self._softcap_logits(hidden_states)
 
-        return DiffusionGemmaOutput(logits=logits, encoder_logits=encoder_logits)
+        return DiffusionGemmaOutput(
+            logits=logits,
+            encoder_logits=encoder_logits,
+            encoder_hidden_states=encoder_hidden_states,
+        )
 
 
 ModelClass = DiffusionGemmaForBlockDiffusion

@@ -26,6 +26,7 @@ from nemo_automodel.components.loss.dllm_loss import (
     MDLMCrossEntropyLoss,
     SCDDLoss,
     _compute_per_token_nll,
+    encoder_ar_loss,
     scdd_schedule,
 )
 
@@ -34,6 +35,65 @@ from nemo_automodel.components.loss.dllm_loss import (
 # ---------------------------------------------------------------------------
 
 B, L, V = 2, 8, 32  # batch, seq_len, vocab
+
+
+def test_encoder_ar_loss_is_mean_of_unequal_length_example_means():
+    """AR reduction gives each nonempty example equal weight, not each token."""
+    torch.manual_seed(7)
+    logits = torch.randn(3, 6, 11)
+    input_ids = torch.randint(0, 11, (3, 6))
+    valid_mask = torch.tensor(
+        [
+            [True, True, True, True, True, True],
+            [True, True, True, False, False, False],
+            [True, True, False, False, False, False],
+        ]
+    )
+
+    nll = F.cross_entropy(
+        logits[:, :-1].reshape(-1, logits.shape[-1]), input_ids[:, 1:].reshape(-1), reduction="none"
+    ).reshape(3, 5)
+    pair_mask = valid_mask[:, :-1] & valid_mask[:, 1:]
+    token_counts = pair_mask.sum(dim=1)
+    expected = ((nll * pair_mask).sum(dim=1) / token_counts).mean()
+    token_global_mean = (nll * pair_mask).sum() / token_counts.sum()
+
+    actual = encoder_ar_loss(logits, input_ids, valid_mask, num_examples=3)
+
+    torch.testing.assert_close(actual, expected)
+    assert not torch.isclose(actual, token_global_mean)
+
+
+def test_encoder_ar_loss_matches_reference_gradient_across_microbatches():
+    """Global example denominator preserves the reference loss and gradient."""
+    torch.manual_seed(11)
+    input_ids = torch.randint(0, 13, (3, 6))
+    valid_mask = torch.tensor(
+        [
+            [True, True, True, True, True, True],
+            [True, True, True, False, False, False],
+            [True, False, False, False, False, False],
+        ]
+    )
+    actual_logits = torch.randn(3, 6, 13, requires_grad=True)
+    reference_logits = actual_logits.detach().clone().requires_grad_(True)
+
+    actual = encoder_ar_loss(actual_logits[:2], input_ids[:2], valid_mask[:2], num_examples=2)
+    actual = actual + encoder_ar_loss(actual_logits[2:], input_ids[2:], valid_mask[2:], num_examples=2)
+
+    nll = F.cross_entropy(
+        reference_logits[:, :-1].reshape(-1, 13), input_ids[:, 1:].reshape(-1), reduction="none"
+    ).reshape(3, 5)
+    pair_mask = valid_mask[:, :-1] & valid_mask[:, 1:]
+    counts = pair_mask.sum(dim=1)
+    nonempty = counts > 0
+    expected = (((nll * pair_mask).sum(dim=1) / counts.clamp_min(1)) * nonempty).sum() / nonempty.sum()
+
+    actual.backward()
+    expected.backward()
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_logits.grad, reference_logits.grad)
 
 
 @pytest.fixture
@@ -1166,9 +1226,7 @@ class TestSCDDLossChunking:
 
     def _run(self, chunk_size, logits, x0, z_t, loss_mask, p_mask):
         logits = logits.clone().requires_grad_(True)
-        loss_fn = SCDDLoss(
-            mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.15, chunk_size=chunk_size
-        )
+        loss_fn = SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.15, chunk_size=chunk_size)
         out = loss_fn(
             logits=logits,
             target_ids=x0,

@@ -100,6 +100,29 @@ def test_construct_and_forward_shape():
     assert torch.isfinite(out.logits).all()
 
 
+def test_te_attention_qkv_share_bf16_autocast_dtype_with_fp32_parameters():
+    model, _ = _tiny_model()
+    attention = model.model.layers["0"].self_attn
+
+    class RecordingAttention(torch.nn.Module):
+        cp_group = None
+        attention_type = "self"
+
+        def forward(self, query, key, value, **_kwargs):
+            assert query.dtype == key.dtype == value.dtype == torch.bfloat16
+            return query
+
+    attention.attn_module = RecordingAttention()
+    hidden_states = torch.randn(1, 8, 32, dtype=torch.float32)
+    cos = torch.ones(1, 8, attention.head_dim, dtype=torch.float32)
+    sin = torch.zeros_like(cos)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output, _ = attention(hidden_states, (cos, sin), attention_mask=None)
+
+    assert output.dtype == torch.bfloat16
+
+
 def test_tie_weights_restores_lm_head_alias():
     model, _ = _tiny_model()
     model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())

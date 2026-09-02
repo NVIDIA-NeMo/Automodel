@@ -39,6 +39,7 @@ the pieces the reference implementation cannot provide:
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaTextConfig
@@ -57,6 +58,7 @@ from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
     DiffusionGemmaTextRotaryEmbedding as DiffusionGemmaTextRotaryEmbedding,
 )
 
+from nemo_automodel.components.attention.utils import initialize_attn_module_and_func
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4MoE
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -108,7 +110,7 @@ class DiffusionGemmaAttention(nn.Module):
     KV cache during the causal pass.
     """
 
-    def __init__(self, config: DiffusionGemmaTextConfig, layer_idx: int):
+    def __init__(self, config: DiffusionGemmaTextConfig, layer_idx: int, backend: BackendConfig):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -123,6 +125,7 @@ class DiffusionGemmaAttention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads // num_key_value_heads
         self.scaling = 1.0
         self.attention_dropout = config.attention_dropout
+        self.backend = backend
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -142,6 +145,61 @@ class DiffusionGemmaAttention(nn.Module):
         self.k_norm = DiffusionGemmaRMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = DiffusionGemmaRMSNorm(dim=self.head_dim, eps=config.rms_norm_eps, with_scale=False)
 
+        self.attn_module = None
+        if backend.attn == "te":
+            self.attn_module, _ = initialize_attn_module_and_func(
+                attn_impl="te",
+                num_attention_heads=self.num_attention_heads,
+                num_qk_channels=self.head_dim,
+                num_v_channels=self.head_dim,
+                softmax_scale=self.scaling,
+                attn_mask_type="causal",
+                qkv_format="bshd",
+                num_gqa_groups=self.num_key_value_heads,
+                attention_dropout=self.attention_dropout,
+            )
+
+    def _set_cp_transport(self, comm_type: str) -> None:
+        module = self.attn_module
+        if module is None or getattr(module, "cp_group", None) is None:
+            return
+        if getattr(module, "cp_comm_type", None) == comm_type:
+            return
+        module.set_context_parallel_group(
+            module.cp_group,
+            getattr(module, "cp_global_ranks", None),
+            getattr(module, "cp_stream", None),
+            cp_comm_type=comm_type,
+        )
+
+    def _set_attention_type(self, attention_type: str) -> None:
+        """Switch the shared TE DPA between encoder self- and decoder cross-attention."""
+        module = self.attn_module
+        if module is None or getattr(module, "attention_type", None) == attention_type:
+            return
+        if hasattr(module, "fast_setattr"):
+            module.fast_setattr("attention_type", attention_type)
+        else:
+            module.attention_type = attention_type
+        for backend_name in ("flash_attention", "fused_attention", "unfused_attention"):
+            backend = getattr(module, backend_name, None)
+            if backend is not None:
+                backend.attention_type = attention_type
+
+    def _gather_canvas(self, tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """Differentiably gather BSHD canvas K/V and restore global order."""
+        group = getattr(self.attn_module, "cp_group", None)
+        if group is None or not dist.is_initialized() or dist.get_world_size(group) == 1:
+            return tensor
+        from torch.distributed.nn.functional import all_gather
+
+        parts = list(all_gather(tensor.contiguous(), group=group))
+        index_parts = [torch.empty_like(indices) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(index_parts, indices.contiguous(), group=group)
+        gathered = torch.cat(parts, dim=1)
+        order = torch.argsort(torch.cat(index_parts).to(gathered.device))
+        return gathered.index_select(1, order)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -149,6 +207,9 @@ class DiffusionGemmaAttention(nn.Module):
         attention_mask: torch.Tensor | None,
         encoder_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         padding_mask: torch.Tensor | None = None,
+        cp_encoder_indices: torch.Tensor | None = None,
+        cp_canvas_indices: torch.Tensor | None = None,
+        cp_encoder_length: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -157,37 +218,89 @@ class DiffusionGemmaAttention(nn.Module):
         query_states = self.q_proj(hidden_states).view(hidden_shape)
         query_states = self.q_norm(query_states)
         query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2)
-        query_states = query_states.transpose(1, 2)
 
         key_states = self.k_proj(hidden_states).view(hidden_shape)
         value_states = self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
 
         key_states = self.k_norm(key_states)
         key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2)
-        key_states = key_states.transpose(1, 2)
 
         value_states = self.v_norm(value_states)
-        value_states = value_states.transpose(1, 2)
+
+        use_te = self.attn_module is not None
+        if use_te:
+            # FP32-resident parameters make RoPE's cos/sin FP32 even under BF16
+            # autocast, so the rotary multiply promotes Q/K while V remains BF16.
+            # TE requires one QKV dtype; restore the projected compute dtype at
+            # its boundary without changing the FP32 parameter/master storage.
+            query_states = query_states.to(value_states.dtype)
+            key_states = key_states.to(value_states.dtype)
+        if not use_te:
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
 
         # Freshly computed canvas/clean K/V before any cross-attention concat.
         # The causal pass returns these to populate the read-only encoder KV
         # cache; the bidirectional pass prepends them as ``encoder_kv``.
         layer_kv = (key_states, value_states)
 
-        if encoder_kv is not None:
+        if encoder_kv is not None and use_te and cp_encoder_indices is not None:
+            if cp_canvas_indices is None or cp_encoder_length is None:
+                raise ValueError("DiffusionGemma TE CP decode requires canvas indices and encoder length.")
+            # The encoder cache is already partitioned as [encoder ; canvas-pad].
+            # Replace local canvas-pad slots with the actual per-layer canvas K/V.
+            full_key = self._gather_canvas(key_states, cp_canvas_indices)
+            full_value = self._gather_canvas(value_states, cp_canvas_indices)
             enc_key, enc_value = encoder_kv
-            key_states = torch.cat([enc_key, key_states], dim=2)
-            value_states = torch.cat([enc_value, value_states], dim=2)
+            replace = (cp_encoder_indices >= cp_encoder_length) & (
+                cp_encoder_indices < cp_encoder_length + full_key.shape[1]
+            )
+            destinations = replace.nonzero(as_tuple=False).flatten()
+            sources = cp_encoder_indices[replace] - cp_encoder_length
+            key_states = enc_key.index_copy(1, destinations, full_key.index_select(1, sources))
+            value_states = enc_value.index_copy(1, destinations, full_value.index_select(1, sources))
+        elif encoder_kv is not None:
+            enc_key, enc_value = encoder_kv
+            seq_dim = 1 if use_te else 2
+            key_states = torch.cat([enc_key, key_states], dim=seq_dim)
+            value_states = torch.cat([enc_value, value_states], dim=seq_dim)
 
-        attn_output = eager_attention_forward(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            scaling=self.scaling,
-            dropout=self.attention_dropout if self.training else 0.0,
-        )
+        if use_te:
+            if encoder_kv is None:
+                self._set_attention_type("self")
+                self._set_cp_transport("all_gather" if self.is_sliding else "p2p")
+                attn_output = self.attn_module(
+                    query_states,
+                    key_states,
+                    value_states,
+                    qkv_format="bshd",
+                    attn_mask_type="causal",
+                    window_size=(self.sliding_window - 1, 0) if self.is_sliding else (-1, 0),
+                )
+            else:
+                self._set_attention_type("cross")
+                self._set_cp_transport("p2p")
+                attn_output = self.attn_module(
+                    query_states,
+                    key_states,
+                    value_states,
+                    qkv_format="bshd",
+                    attn_mask_type="no_mask",
+                    window_size=(-1, -1),
+                    core_attention_bias_type="post_scale_bias",
+                    core_attention_bias=attention_mask,
+                )
+        else:
+            attn_output = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                scaling=self.scaling,
+                dropout=self.attention_dropout if self.training else 0.0,
+            )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, layer_kv
@@ -255,7 +368,7 @@ class DiffusionGemmaMoEDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.attention_type = config.layer_types[layer_idx]
 
-        self.self_attn = DiffusionGemmaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = DiffusionGemmaAttention(config=config, layer_idx=layer_idx, backend=backend)
         # ``DiffusionGemmaMLP`` is the reference's ``DiffusionGemmaText4MLP`` (takes layer_idx).
         self.mlp = DiffusionGemmaMLP(config, layer_idx)
 
@@ -280,6 +393,9 @@ class DiffusionGemmaMoEDecoderLayer(nn.Module):
         attention_mask: torch.Tensor | None,
         encoder_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         padding_mask: torch.Tensor | None = None,
+        cp_encoder_indices: torch.Tensor | None = None,
+        cp_canvas_indices: torch.Tensor | None = None,
+        cp_encoder_length: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -288,6 +404,9 @@ class DiffusionGemmaMoEDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             encoder_kv=encoder_kv,
+            cp_encoder_indices=cp_encoder_indices,
+            cp_canvas_indices=cp_canvas_indices,
+            cp_encoder_length=cp_encoder_length,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
