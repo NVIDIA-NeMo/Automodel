@@ -166,6 +166,34 @@ def is_gated_activation(activation: str) -> bool:
     return activation in ("swiglu", "swigluoai", "quick_geglu", "geglu")
 
 
+def _resolve_m_splits(
+    tokens_per_expert: torch.Tensor | list | tuple,
+    static_routing: bool,
+    cached_m_splits: list | None,
+) -> list:
+    """Resolve the per-expert split sizes for TE's grouped GEMM.
+
+    Args:
+        tokens_per_expert: Per-local-expert token counts of shape [num_local_experts]
+            (CUDA tensor from the flex dispatcher, or an already-materialized sequence).
+        static_routing: Benchmark-only static-routing mode (see
+            ``BackendConfig.benchmark_static_routing``) under which the counts are
+            constant for every microbatch.
+        cached_m_splits: The first microbatch's split list, or None before it is known.
+
+    Returns:
+        The split sizes as a Python list. Under static routing with a warm cache the
+        cached list is returned as-is — skipping the per-call device-to-host
+        ``.tolist()`` sync (and its repeat under activation-checkpoint recompute);
+        otherwise the counts are materialized from ``tokens_per_expert``.
+    """
+    if static_routing and cached_m_splits is not None:
+        return cached_m_splits
+    if isinstance(tokens_per_expert, torch.Tensor):
+        return tokens_per_expert.tolist()
+    return list(tokens_per_expert)
+
+
 def _permute_tokens_for_grouped_mm(
     indices: torch.Tensor,
     weights: torch.Tensor,
@@ -923,7 +951,7 @@ class GroupedExpertsDeepEP(nn.Module):
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
         # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): routing
         # metadata is identical per microbatch, so host copies of it can be cached.
-        self.static_routing = backend is not None and getattr(backend, "benchmark_static_routing", False)
+        self.static_routing = backend is not None and backend.benchmark_static_routing
         self._static_tokens_per_expert_cpu: torch.Tensor | None = None
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
@@ -1220,7 +1248,7 @@ class GroupedExpertsTE(nn.Module):
         # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): the
         # per-microbatch tokens_per_expert.tolist() host sync is replaced by a cached
         # first-microbatch copy, since forced-balanced routing makes it constant.
-        self.static_routing = backend is not None and getattr(backend, "benchmark_static_routing", False)
+        self.static_routing = backend is not None and backend.benchmark_static_routing
         self._static_m_splits: list | None = None
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
@@ -1589,14 +1617,7 @@ class GroupedExpertsTE(nn.Module):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        if self.static_routing and self._static_m_splits is not None:
-            # Static routing: reuse the first microbatch's split list instead of paying a
-            # device-to-host .tolist() sync per microbatch (and per checkpoint recompute).
-            m_splits = self._static_m_splits
-        elif isinstance(tokens_per_expert, torch.Tensor):
-            m_splits = tokens_per_expert.tolist()
-        else:
-            m_splits = list(tokens_per_expert)
+        m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
         if self.static_routing and self._static_m_splits is None:
             self._static_m_splits = m_splits
 
