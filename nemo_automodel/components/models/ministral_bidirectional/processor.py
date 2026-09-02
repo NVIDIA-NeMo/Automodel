@@ -400,7 +400,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         Returns:
             The formatted question-passage text.
         """
-        return f"question: {question}\n\npassage: {text}"
+        return f"query: {question}\n\npassage: {text}"
 
     def process_queries_documents_crossencoder(
         self,

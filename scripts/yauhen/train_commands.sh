@@ -74,7 +74,7 @@ python3 submit_nemo_run.py \
 
 python3 submit_nemo_run.py \
     --cluster draco \
-    --experiment_name ministral3_1b_reranker_image_text_768k_export_refit \
+    --experiment_name ministral3_1b_reranker_image_text_768k_export_refit_v2 \
     --num_nodes 8 \
     --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
     --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
@@ -87,19 +87,17 @@ python3 submit_nemo_run.py \
     " \
     --eval_script ./scripts/yauhen/eval_reranker.sh \
     --eval_datasets RERANK_VISION_EVAL RERANK_TEXT_EVAL \
-    --results_dir_name eval_ranker_results_top50 \
+    --results_dir_name eval_ranker_results_31_1B \
     --more_eval_args " \
-        --embedding_results embedding_results/ensemble_eagle_top_models_lines_2_101_weights_25_75_image.json \
         --multimodal True \
         --model_type mistral3_vl \
         --batch_size 8 \
         --max_length 10240 \
         --topk_candidates 50 \
-        --log_json True \
         --log_wandb False \
-        --skip_existing_results True \
     " \
     --num_training_rounds 1
+
 
 # Eval
 python3 submit_nemo_run.py \
@@ -112,18 +110,16 @@ python3 submit_nemo_run.py \
     --train_script "" \
     --eval_script ./scripts/yauhen/eval_reranker.sh \
     --eval_datasets RERANK_VISION_EVAL RERANK_TEXT_EVAL \
-    --results_dir_name eval_ranker_results_top50 \
+    --results_dir_name eval_ranker_results_31_1B \
     --more_eval_args " \
-        --model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/ministral3_1b_reranker_image_text_768k_08-21-153847/LATEST/model/consolidated \
-        --embedding_results embedding_results/ensemble_eagle_top_models_lines_2_101_weights_25_75_image.json \
+        --model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/ministral3_1b_reranker_stage2_from_125136_text_768k_frozenvision_lr1e6_08-27-195326 \
         --multimodal True \
         --model_type mistral3_vl \
         --batch_size 8 \
         --max_length 10240 \
         --topk_candidates 50 \
-        --log_json True \
         --log_wandb False \
-        --skip_existing_results True \
     " \
     --num_training_rounds 0
 
+# RERANK_VISION_EVAL RERANK_TEXT_EVAL RERANK_TEXT_PLUS_VISION_EVAL RERANK_RTEB_QUICK

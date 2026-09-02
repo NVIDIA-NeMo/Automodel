@@ -31,7 +31,7 @@ seed: 42
 step_scheduler:
   global_batch_size: 256
   local_batch_size: 4
-  ckpt_every_steps: 500
+  ckpt_every_steps: 1000
   val_every_steps: 500
   num_epochs: 1
   log_remote_every_steps: 10
@@ -207,6 +207,7 @@ checkpoint:
   checkpoint_dir: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/ministral3_1b_reranker_image_text_768k
   model_save_format: safetensors
   save_consolidated: final
+  max_recent_checkpoints: 2
 
 distributed:
   strategy: fsdp2
