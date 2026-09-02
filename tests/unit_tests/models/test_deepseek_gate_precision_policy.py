@@ -14,9 +14,12 @@
 
 """DeepSeek V3 and V3.2 must share one router precision policy.
 
-V3.2 skips DeepseekV3ForCausalLM.__init__, so a default installed there does
-not reach it. Parametrizing over V3, V3.2, and Kimi K2 keeps the construction
-paths from drifting apart silently.
+The policy has three parts: the dtype of the router projection
+(``gate_precision``), the dtype of the selected routing weights handed to
+expert compute (``router_weights_fp32``), and the fp32 score-correction
+bias. V3.2 skips ``DeepseekV3ForCausalLM.__init__``, so a default installed
+there does not reach it. Parametrizing every part over both classes keeps
+the two construction paths from drifting apart silently.
 """
 
 import importlib.util
