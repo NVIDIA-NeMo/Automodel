@@ -233,6 +233,7 @@ class KimiK3DFlashDraftModel(nn.Module):
         if softcap is not None and float(softcap) <= 0:
             raise ValueError(f"final_logit_softcapping must be > 0 when set, got {softcap}.")
         self.final_logit_softcapping = None if softcap is None else float(softcap)
+        self.input_embedding_scale = float(dflash_config.get("input_embedding_scale", 1.0))
 
     def forward(
         self,
