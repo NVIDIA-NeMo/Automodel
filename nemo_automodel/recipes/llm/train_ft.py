@@ -53,49 +53,62 @@ from nemo_automodel._transformers.infrastructure import (
     instantiate_infrastructure,
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.config import ConfigNode, parse_args_and_load_config
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
-from nemo_automodel.components.datasets.loader import DataloaderConfig
-from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
-from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.mesh import MeshContext
-from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
-from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.loggers.mlflow_utils import (
+from nemo_automodel.components.datasets import DataloaderConfig
+from nemo_automodel.components.distributed import (
+    AutoPipeline,
+    ContextParallelSharder,
+    DistributedSetup,
+    FirstRankPerNode,
+    FSDP2Config,
+    MagiState,
+    MegatronFSDPConfig,
+    MeshContext,
+    dp_eval_sample_shard,
+    get_sync_ctx,
+    initialize_distributed,
+    setup_magi,
+)
+from nemo_automodel.components.loggers import (
+    MetricsSample,
+    build_metric_logger,
     end_mlflow_active_run_as_killed,
+    setup_logging,
+    suppress_wandb_log_messages,
     to_float_metrics,
 )
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
+from nemo_automodel.components.loss import (
+    FusedLinearCrossEntropy,
+    MaskedCrossEntropy,
+    calculate_loss,
+    calculate_mtp_loss,
+)
+from nemo_automodel.components.loss import get_lm_head_weight as _get_lm_head_weight
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.utils import (
+from nemo_automodel.components.training import (
+    ScopedRNG,
+    StatefulRNG,
     count_tail_padding,
     get_expert_tp_replication_factor,
+    get_final_hidden_states,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.compile_utils import (
-    build_compile_config,
-)
-from nemo_automodel.components.utils.flops_utils import calculate_mfu
-from nemo_automodel.components.utils.model_utils import (
+from nemo_automodel.components.utils import (
     FreezeConfig,
-    _supports_logits_to_keep,
-    _supports_seq_lens,
+    build_compile_config,
+    calculate_mfu,
     filter_forward_kwargs,
     resolve_trust_remote_code,
+)
+from nemo_automodel.components.utils import (
+    supports_logits_to_keep as _supports_logits_to_keep,
+)
+from nemo_automodel.components.utils import (
+    supports_seq_lens as _supports_seq_lens,
 )
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -375,7 +388,7 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
         )
         return None
 
-    from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
+    from nemo_automodel.components.datasets import add_causal_masks_to_batch
 
     def wrapper(base_collate_fn):
         def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
@@ -793,7 +806,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         neftune_cfg = self.cfg.get("neftune", None)
         self.neftune = None
         if neftune_cfg is not None:
-            from nemo_automodel.components.training.neftune import NEFTune
+            from nemo_automodel.components.training import NEFTune
 
             noise_alpha = neftune_cfg.get("noise_alpha", 5.0) if hasattr(neftune_cfg, "get") else neftune_cfg
             self.neftune = NEFTune(noise_alpha=float(noise_alpha))

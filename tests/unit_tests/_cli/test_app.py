@@ -230,7 +230,7 @@ def test_main_dispatches_to_interactive(monkeypatch, recipe_yaml):
             return 0
 
     monkeypatch.setattr(
-        "nemo_automodel.components.launcher.interactive.InteractiveLauncher",
+        "nemo_automodel.components.launcher.InteractiveLauncher",
         FakeInteractiveLauncher,
     )
     result = module.main()
@@ -250,7 +250,7 @@ def test_main_dispatches_to_nemo_run(monkeypatch, nemo_run_yaml):
             return 0
 
     monkeypatch.setattr(
-        "nemo_automodel.components.launcher.nemo_run.launcher.NemoRunLauncher",
+        "nemo_automodel.components.launcher.NemoRunLauncher",
         FakeNemoRunLauncher,
     )
     result = module.main()
@@ -286,7 +286,7 @@ def test_main_resolves_skypilot_env_vars(monkeypatch, tmp_path):
             return 0
 
     monkeypatch.setattr(
-        "nemo_automodel.components.launcher.skypilot.launcher.SkyPilotLauncher",
+        "nemo_automodel.components.launcher.SkyPilotLauncher",
         FakeSkyPilotLauncher,
     )
     result = module.main()
@@ -310,7 +310,7 @@ def test_main_passes_extra_args(monkeypatch, recipe_yaml):
             return 0
 
     monkeypatch.setattr(
-        "nemo_automodel.components.launcher.interactive.InteractiveLauncher",
+        "nemo_automodel.components.launcher.InteractiveLauncher",
         FakeInteractiveLauncher,
     )
     module.main()

@@ -18,14 +18,14 @@ import pathlib
 
 import torch
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.training.timers import Timers
-from nemo_automodel.components.training.utils import (
+from nemo_automodel.components.config import parse_args_and_load_config
+from nemo_automodel.components.training import (
+    Timers,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
-from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
+from nemo_automodel.components.utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
@@ -193,7 +193,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 total_params = self.pp.total_params_before_pp
             else:
                 # No PP - model is not sharded, calculate directly
-                from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+                from nemo_automodel.components.utils import print_trainable_parameters
 
                 lora_params, total_params = print_trainable_parameters(self.model_parts[0])
             frozen_params = total_params - lora_params
@@ -246,7 +246,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         ``mtp_config.use_repeated_layer``, and the per-sublayer ``block_type`` from
         ``mtp.layers``. Returns 0.0 when the model has no enabled MTP head.
         """
-        from nemo_automodel.components.utils.flops_utils import _nemotronh_mtp_flops
+        from nemo_automodel.components.utils import nemotronh_mtp_flops as _nemotronh_mtp_flops
 
         for mp in self.model_parts:
             mtp_cfg = getattr(mp, "mtp_config", None)

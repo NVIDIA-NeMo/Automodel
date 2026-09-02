@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint import StateDictAdapter
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     forced_gated_delta_net_fp32_dtype_mapping,
     upcast_gated_delta_net_fp32_state_tensor,

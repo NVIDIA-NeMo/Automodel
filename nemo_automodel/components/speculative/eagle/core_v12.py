@@ -22,8 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.listmle import listmle_loss
-from nemo_automodel.components.loss.soft_ce import masked_soft_cross_entropy
+from nemo_automodel.components.loss import listmle_loss, masked_soft_cross_entropy
 
 
 @dataclass

@@ -46,18 +46,24 @@ import torch
 import torch.distributed as dist
 import wandb
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
-from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
+from nemo_automodel.components.config import parse_args_and_load_config  # noqa: E402
+from nemo_automodel.components.loggers import (  # noqa: E402
+    MetricsSample,
+    build_metric_logger,
+    setup_logging,  # noqa: E402
+    suppress_wandb_log_messages,  # noqa: E402
+)
 from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
 from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa: E402
     build_bagel_from_hf_backbones,
     initialize_bagel_non_backbone_weights,
     load_bagel_hf_backbone_weights,
 )
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noqa: E402
-from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
+from nemo_automodel.components.training import (  # noqa: E402
+    ScopedRNG,
+    StatefulRNG,
+    StepScheduler,  # noqa: E402
+)
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
 from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
@@ -317,7 +323,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 instantiate_infrastructure,
             )
             from nemo_automodel.components.quantization.fp8 import build_fp8_config
-            from nemo_automodel.components.utils.compile_utils import build_compile_config
+            from nemo_automodel.components.utils import build_compile_config
 
             model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
                 distributed_config=self.distributed_config,
@@ -371,7 +377,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         torch.cuda.reset_peak_memory_stats()
 
         # -- distributed bringup ------------------------------------------
-        from nemo_automodel.components.distributed.init_utils import initialize_distributed
+        from nemo_automodel.components.distributed import initialize_distributed
 
         cfg_dist_env = self.cfg.get("dist_env", {})
         backend = cfg_dist_env.get("backend", "nccl")
@@ -505,7 +511,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                     raise ValueError(
                         "ema.implementation='sharded_model' currently requires model.init_mode='hf_backbones'."
                     )
-                from nemo_automodel.components.training.ema import ShardedModelEMAManager
+                from nemo_automodel.components.training import ShardedModelEMAManager
 
                 ema_model = self._build_hf_backbone_bagel_model(
                     artifact_path=artifact_path,
@@ -526,7 +532,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                     len(self.ema),
                 )
             else:
-                from nemo_automodel.components.training.ema import EMAManager
+                from nemo_automodel.components.training import EMAManager
 
                 self.ema = EMAManager(self.model, decay=float(ema_decay))
                 logger.info(
@@ -616,7 +622,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         # enabled in the YAML.
         self.checkpointer = None
         if ckpt_enabled:
-            from nemo_automodel.components.checkpoint.checkpointing import (
+            from nemo_automodel.components.checkpoint import (
                 Checkpointer,
                 CheckpointingConfig,
             )

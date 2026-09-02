@@ -502,6 +502,100 @@ def _import_parallelizer_with_stubs(monkeypatch):
         parallel_styles_stub,
     )
 
+    public_exports = {
+        "MambaContextParallel": (
+            "nemo_automodel.components.distributed.context_parallel.mamba",
+            "MambaContextParallel",
+        ),
+        "PARALLELIZE_FUNCTIONS": (
+            "nemo_automodel.components.distributed.optimized_tp_plans",
+            "PARALLELIZE_FUNCTIONS",
+        ),
+        "SELECTIVE_AC_WRAPPER_FLAG": (
+            "nemo_automodel.components.distributed.activation_checkpointing",
+            "SELECTIVE_AC_WRAPPER_FLAG",
+        ),
+        "apply_submodule_checkpointing": (
+            "nemo_automodel.components.distributed.activation_checkpointing",
+            "apply_submodule_checkpointing",
+        ),
+        "configure_fsdp_unused_param_reduction": (
+            "nemo_automodel.components.distributed.parallelizer_utils",
+            "configure_fsdp_unused_param_reduction",
+        ),
+        "ensure_fsdp_ops_sac_ignored": (
+            "nemo_automodel.components.distributed.activation_checkpointing",
+            "ensure_fsdp_ops_sac_ignored",
+        ),
+        "ensure_profiler_ops_sac_ignored": (
+            "nemo_automodel.components.distributed.activation_checkpointing",
+            "ensure_profiler_ops_sac_ignored",
+        ),
+        "fully_shard_by_dtype": (
+            "nemo_automodel.components.distributed.parallelizer_utils",
+            "fully_shard_by_dtype",
+        ),
+        "get_class_qualname": (
+            "nemo_automodel.components.distributed.optimized_tp_plans",
+            "_get_class_qualname",
+        ),
+        "get_fsdp_dp_mesh": ("nemo_automodel.components.distributed.mesh_utils", "get_fsdp_dp_mesh"),
+        "get_internal_fsdp_mp_policy": (
+            "nemo_automodel.components.distributed.parallelizer_utils",
+            "get_internal_fsdp_mp_policy",
+        ),
+        "get_model_layer_groups": (
+            "nemo_automodel.components.distributed.parallelizer",
+            "get_model_layer_groups",
+        ),
+        "get_parallel_plan": (
+            "nemo_automodel.components.distributed.parallelizer",
+            "_get_parallel_plan",
+        ),
+        "get_submesh": ("nemo_automodel.components.distributed.mesh_utils", "get_submesh"),
+        "get_text_module": (
+            "nemo_automodel.components.distributed.pipelining.hf_utils",
+            "get_text_module",
+        ),
+        "make_selective_checkpoint_context_fn": (
+            "nemo_automodel.components.distributed.activation_checkpointing",
+            "make_selective_checkpoint_context_fn",
+        ),
+        "normalize_activation_checkpointing_scope": (
+            "nemo_automodel.components.distributed.config",
+            "normalize_activation_checkpointing_scope",
+        ),
+        "reject_unsupported_mtp_cp": (
+            "nemo_automodel.components.distributed.parallelizer_utils",
+            "reject_unsupported_mtp_cp",
+        ),
+        "reject_unsupported_mtp_cp_pp": (
+            "nemo_automodel.components.distributed.parallelizer_utils",
+            "reject_unsupported_mtp_cp_pp",
+        ),
+        "sdpa_backend_snapshot_context_fn": (
+            "nemo_automodel.components.distributed.activation_checkpointing",
+            "sdpa_backend_snapshot_context_fn",
+        ),
+        "transformer_engine_attention_backend_snapshot_context_fn": (
+            "nemo_automodel.components.distributed.activation_checkpointing",
+            "transformer_engine_attention_backend_snapshot_context_fn",
+        ),
+        "translate_to_lora": (
+            "nemo_automodel.components.distributed.parallel_styles",
+            "translate_to_lora",
+        ),
+    }
+
+    def get_public_export(name):
+        try:
+            module_name, attribute = public_exports[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+        return getattr(importlib.import_module(module_name), attribute)
+
+    distributed_stub.__getattr__ = get_public_export
+
     return importlib.import_module("nemo_automodel.components.moe.parallelizer")
 
 
@@ -935,7 +1029,7 @@ def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_
     fully_shard_mock = MagicMock()
     monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
     shared_sharder_mock = MagicMock()
-    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_by_dtype", shared_sharder_mock)
+    monkeypatch.setattr(P, "fully_shard_by_dtype", shared_sharder_mock)
 
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])

@@ -31,7 +31,7 @@ from nemo_automodel._transformers.capabilities import (
 )
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 
-_PARALLELIZE_PATH = "nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS"
+_PARALLELIZE_PATH = "nemo_automodel.components.distributed.PARALLELIZE_FUNCTIONS"
 
 
 # ---------------------------------------------------------------------------

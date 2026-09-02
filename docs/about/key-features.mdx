@@ -131,7 +131,7 @@ Components are modular, self-contained building blocks that recipes assemble:
 | `loss/` | Cross-entropy, linear cross-entropy, KD loss |
 | `launcher/` | Interactive, SkyPilot, and NeMo-Run job launch; Slurm uses the root-level `slurm.sub` script |
 
-Each component can be used independently and has no cross-module imports.
+Every component consumer—including recipes and other components—imports symbols from the target component's package API. The package's `__all__` defines that public interface.
 
 ### The `automodel` CLI
 

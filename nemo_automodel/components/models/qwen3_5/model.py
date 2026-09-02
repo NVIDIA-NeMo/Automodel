@@ -38,15 +38,13 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model as HFQwen3_5Model,
 )
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
+from nemo_automodel.components.distributed import (
     ContextParallelSharder,
+    cp_vision_frame_sharding_active,
+    maybe_distribute_visual,
     round_robin_local_indices,
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
-)
-from nemo_automodel.components.distributed.cp_vision_frame_shard import (
-    cp_vision_frame_sharding_active,
-    maybe_distribute_visual,
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -65,7 +63,7 @@ from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareG
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.components.utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import Qwen3_5DenseStateDictAdapter
@@ -381,7 +379,7 @@ class Qwen3_5DenseBlock(Block):
             )
 
         linear_attn_mask = attention_mask
-        from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+        from nemo_automodel.components.distributed import current_blockdiag_cp_state
 
         if current_blockdiag_cp_state() is not None:
             packed_gdn_metadata = None
@@ -1188,7 +1186,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         # splice runs in-forward under an active CP ring context it must suspend the
         # ring dispatcher, or torch's load-balanced ring SDPA all-gathers the vision
         # Q/K/V and rejects the non-causal attention. No-op when CP is inactive.
-        from nemo_automodel.components.distributed.context_parallel.utils import (
+        from nemo_automodel.components.distributed import (
             cp_dispatcher_suspended,  # noqa: PLC0415
         )
 

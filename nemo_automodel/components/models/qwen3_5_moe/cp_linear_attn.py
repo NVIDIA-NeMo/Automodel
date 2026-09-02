@@ -373,7 +373,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 indices=indices,
             )
 
-        from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+        from nemo_automodel.components.distributed import current_blockdiag_cp_state
 
         return self._forward_with_cp(
             hidden_states,

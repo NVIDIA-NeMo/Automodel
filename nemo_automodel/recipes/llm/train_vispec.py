@@ -41,13 +41,15 @@ from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.checkpoint.checkpointing import load_hf_safetensors_state_dict
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
-from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
-from nemo_automodel.components.datasets.vlm.utils import set_image_pixel_bounds
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.checkpoint import load_hf_safetensors_state_dict
+from nemo_automodel.components.config import parse_args_and_load_config
+from nemo_automodel.components.datasets import (
+    build_dspark_vlm_dataloader,
+    build_eagle3_dataloader,
+    set_image_pixel_bounds,
+)
+from nemo_automodel.components.distributed import initialize_distributed
+from nemo_automodel.components.loggers import setup_logging
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule, FeatureNoiseConfig
 from nemo_automodel.components.speculative.eagle.registry import (
     resolve_vispec_draft_spec,
@@ -57,7 +59,7 @@ from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTarget
 from nemo_automodel.components.speculative.eagle.vispec_core import VispecTrainerModule
 from nemo_automodel.components.speculative.eagle.vispec_draft import apply_vispec_draft_architecture
 from nemo_automodel.components.speculative.eagle.vispec_target import HFVispecTargetModel
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.components.utils import print_trainable_parameters
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
     apply_draft_fp8,

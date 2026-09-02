@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
+from nemo_automodel.components.distributed import (
     ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
@@ -45,7 +45,7 @@ from nemo_automodel.components.models.step3p7.state_dict_adapter import Step3p7S
 from nemo_automodel.components.models.step3p7.vision_encoder import StepRoboticsVisionEncoder
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.components.utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.getLogger(__name__)

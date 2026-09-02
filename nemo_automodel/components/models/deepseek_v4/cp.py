@@ -447,7 +447,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     """
     import contextlib
 
-    from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+    from nemo_automodel.components.distributed import (  # noqa: PLC0415
         ShardLayout,
         convert_attention_mask_to_padding_mask,
         shard_batch_contiguous,

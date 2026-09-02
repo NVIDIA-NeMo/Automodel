@@ -51,7 +51,7 @@ from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
-from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+from nemo_automodel.components.loss import DFlashDecayLoss
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 

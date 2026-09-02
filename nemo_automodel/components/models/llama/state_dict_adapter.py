@@ -25,7 +25,7 @@ from typing import Any
 
 from transformers import LlamaConfig
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint import StateDictAdapter
 
 logger = logging.getLogger(__name__)
 

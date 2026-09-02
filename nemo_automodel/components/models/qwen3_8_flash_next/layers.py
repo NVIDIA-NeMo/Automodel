@@ -29,8 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
-from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelState
+from nemo_automodel.components.distributed import BlockdiagCpModelState, unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet

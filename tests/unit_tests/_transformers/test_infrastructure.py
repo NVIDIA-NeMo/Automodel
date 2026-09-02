@@ -1028,11 +1028,11 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
         patch(f"{_INFRA_MODULE}._uses_te_attention", return_value=False),
         patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
         patch(
-            "nemo_automodel.components.distributed.context_parallel.utils.attach_context_parallel_hooks",
+            "nemo_automodel.components.distributed.attach_context_parallel_hooks",
             side_effect=lambda mp: attached.__setitem__("ctx", attached["ctx"] + 1),
         ),
         patch(
-            "nemo_automodel.components.distributed.context_parallel.utils.attach_cp_sdpa_hooks",
+            "nemo_automodel.components.distributed.attach_cp_sdpa_hooks",
             side_effect=lambda mp, cp_mesh: attached.__setitem__("attn", attached["attn"] + 1),
         ),
     ):
@@ -1079,11 +1079,11 @@ def test_apply_model_infrastructure_configures_dense_thd_te_and_bshd_sdpa_cp():
         patch(f"{_INFRA_MODULE}._uses_thd_only_te_attention", return_value=True),
         patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
         patch(
-            "nemo_automodel.components.distributed.context_parallel.utils.attach_te_context_parallel",
+            "nemo_automodel.components.distributed.attach_te_context_parallel",
             return_value=1,
         ) as attach_te,
         patch(
-            "nemo_automodel.components.distributed.context_parallel.utils.attach_context_parallel_hooks",
+            "nemo_automodel.components.distributed.attach_context_parallel_hooks",
         ) as attach_sdpa,
     ):
         mock_ckpt = MockCheckpointer.return_value
@@ -1130,11 +1130,11 @@ def test_apply_model_infrastructure_configures_dense_thd_te_for_tp_without_cp():
         patch(f"{_INFRA_MODULE}._uses_thd_only_te_attention", return_value=True),
         patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
         patch(
-            "nemo_automodel.components.distributed.context_parallel.utils.attach_te_context_parallel",
+            "nemo_automodel.components.distributed.attach_te_context_parallel",
             return_value=1,
         ) as attach_te,
         patch(
-            "nemo_automodel.components.distributed.context_parallel.utils.attach_context_parallel_hooks",
+            "nemo_automodel.components.distributed.attach_context_parallel_hooks",
         ) as attach_sdpa,
     ):
         mock_ckpt = MockCheckpointer.return_value

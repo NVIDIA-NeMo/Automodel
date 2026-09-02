@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
+from nemo_automodel.components.distributed import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import (
     cudnn_sparse_attention,

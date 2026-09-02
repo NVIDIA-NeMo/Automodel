@@ -31,7 +31,7 @@ Applies the same regex rename HF does via ``_checkpoint_conversion_mapping``:
 import re
 from typing import Any
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint import StateDictAdapter
 
 _HF_TO_NEMO_RULES = [
     (re.compile(r"^visual\."), "model.visual."),

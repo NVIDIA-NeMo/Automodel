@@ -52,7 +52,7 @@ import sys
 from pathlib import Path
 
 from nemo_automodel.cli.utils import load_yaml, resolve_recipe_name
-from nemo_automodel.components.config.loader import resolve_yaml_env_vars
+from nemo_automodel.components.config import resolve_yaml_env_vars
 
 # When launched via external torchrun each worker imports this module.
 # Suppress non-rank-0 CLI output before setup_logging installs RankFilter.
@@ -134,7 +134,7 @@ def main():
 
     if skypilot_config := config.pop("skypilot", None):
         logger.info("Launching job via SkyPilot")
-        from nemo_automodel.components.launcher.skypilot.launcher import SkyPilotLauncher
+        from nemo_automodel.components.launcher import SkyPilotLauncher
 
         return SkyPilotLauncher().launch(
             config,
@@ -146,14 +146,14 @@ def main():
 
     elif nemo_run_config := config.pop("nemo_run", None):
         logger.info("Launching job via NeMo-Run")
-        from nemo_automodel.components.launcher.nemo_run.launcher import NemoRunLauncher
+        from nemo_automodel.components.launcher import NemoRunLauncher
 
         return NemoRunLauncher().launch(config, config_path, recipe_target, nemo_run_config, extra)
 
     else:
         logger.info("Launching job interactively (local)")
-        from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-        from nemo_automodel.components.launcher.interactive import InteractiveLauncher
+        from nemo_automodel.components.config import parse_args_and_load_config
+        from nemo_automodel.components.launcher import InteractiveLauncher
 
         cfg = parse_args_and_load_config(str(config_path), argv=extra)
         return InteractiveLauncher().launch(cfg, config_path, recipe_target, args.nproc_per_node, extra)

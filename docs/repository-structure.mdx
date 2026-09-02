@@ -21,7 +21,7 @@ The AutoModel source code is available under the [`nemo_automodel`](https://gith
 
 ### Components Directory
 The `components/` directory contains isolated modules used in training loops.
-Each component is designed to be dependency-light and reusable without cross-module imports.
+Each component is designed to be dependency-light and reusable. Every consumer, including recipes and other components, uses the target component's exported package API.
 
 #### Directory Structure
 The following directory listing shows all components along with explanations of their contents.
@@ -50,7 +50,7 @@ $ tree -L 1 nemo_automodel/components/
 
 #### Key Features
 - Each component can be used independently in other projects.
-- Each component has its own dependencies, without cross-module imports.
+- Recipes, framework code, and other components import only symbols exported by the target component's package API.
 - Unit tests are colocated with the component they cover.
 
 ### Recipes Directory

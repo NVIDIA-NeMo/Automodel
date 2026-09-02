@@ -40,22 +40,18 @@ except ImportError:
     # < v5
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
-from nemo_automodel.components.checkpoint.checkpointing import (
+from nemo_automodel.components.checkpoint import (
+    find_latest_checkpoint,
     load_torch_ckpt,
+    resolve_restore_from_to_checkpoint_dir,
     save_config,
     save_losses,
 )
-from nemo_automodel.components.checkpoint.utils import (
-    find_latest_checkpoint,
-    resolve_restore_from_to_checkpoint_dir,
-)
-from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
-from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.config import ConfigNode, config_to_yaml_str
+from nemo_automodel.components.distributed import get_flat_mesh
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-from nemo_automodel.components.training.garbage_collection import GarbageCollection
-from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.optim import OptimizerParamScheduler
+from nemo_automodel.components.training import GarbageCollection, StatefulRNG, StepScheduler
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 logger = logging.getLogger(__name__)

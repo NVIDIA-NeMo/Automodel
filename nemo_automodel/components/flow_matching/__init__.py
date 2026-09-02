@@ -30,6 +30,10 @@ _LAZY_ATTRS = {
     "FluxAdapter": (".adapters", "FluxAdapter"),
     "HunyuanAdapter": (".adapters", "HunyuanAdapter"),
     "SimpleAdapter": (".adapters", "SimpleAdapter"),
+    "enable_hunyuan_flash_varlen_mask_optimization": (
+        ".adapters.hunyuan",
+        "enable_hunyuan_flash_varlen_mask_optimization",
+    ),
 }
 
 __all__ = sorted(_LAZY_ATTRS.keys())

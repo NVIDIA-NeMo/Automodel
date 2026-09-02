@@ -24,16 +24,18 @@ first, then pass the resulting world size here.
 import logging
 from typing import Any, Dict
 
-from nemo_automodel.components.distributed.config import (
+from nemo_automodel.components.distributed import (
+    CpVisionFrameShardingConfig,
     DistributedSetup,
     MoEParallelizerConfig,
     MultimodalDistributedConfig,
     MultimodalVisionConfig,
-    _resolve_strategy_config,
+    ParallelismSizes,
+    PipelineConfig,
 )
-from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
-from nemo_automodel.components.distributed.mesh import ParallelismSizes
-from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
+from nemo_automodel.components.distributed import (
+    resolve_strategy_config as _resolve_strategy_config,
+)
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -353,7 +355,7 @@ def create_distributed_setup_from_config(
     Returns:
         A :class:`DistributedSetup` with device meshes and policy configs attached.
     """
-    from nemo_automodel.components.distributed.init_utils import get_world_size_safe
+    from nemo_automodel.components.distributed import get_world_size_safe
 
     if world_size is None:
         world_size = get_world_size_safe()
@@ -401,7 +403,7 @@ def shard_optimizers_for_megatron_fsdp(model, optimizers, distributed_config, *,
     ``maybe_shard_optimizer`` assert rather than silently skip under Megatron-FSDP.
     No-op unless ``distributed_config`` is a MegatronFSDPConfig running distributed.
     """
-    from nemo_automodel.components.distributed.megatron_fsdp import maybe_shard_optimizer
+    from nemo_automodel.components.distributed import maybe_shard_optimizer
 
     parts = list(getattr(model, "parts", [model]))
     return [maybe_shard_optimizer(part, opt, distributed_config, allow=allow) for part, opt in zip(parts, optimizers)]
