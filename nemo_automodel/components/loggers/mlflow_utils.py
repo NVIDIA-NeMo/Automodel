@@ -178,5 +178,5 @@ def _install_mlflow_failure_hook() -> None:
                 mlflow.end_run(status="FAILED")
         prev_excepthook(exc_type, exc_val, exc_tb)
 
-    hook._mlflow_failure_hook = True  # type: ignore[attr-defined]
+    setattr(hook, "_mlflow_failure_hook", True)
     sys.excepthook = hook
