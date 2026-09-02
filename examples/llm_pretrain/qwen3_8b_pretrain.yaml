@@ -1,0 +1,160 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full Qwen3-8B random-initialized pretraining baseline on one 8-GPU node.
+# The architecture matches the official Qwen/Qwen3-8B config, but pretrained
+# weights are not downloaded or loaded. Run with:
+#   automodel examples/llm_pretrain/qwen3_8b_pretrain.yaml --nproc-per-node 8
+# Observed on 8x H100 with Transformers 5.12.1: validation loss 8.1326 after
+# step 5 and 3.9838 after step 10, 35.35 GiB peak memory per GPU, and roughly
+# 15.7k aggregate tokens/second after warmup.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  max_steps: 10
+  val_every_steps: 5
+  ckpt_every_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.Qwen3Config
+    architectures: [Qwen3ForCausalLM]
+    vocab_size: 151936
+    hidden_size: 4096
+    intermediate_size: 12288
+    num_hidden_layers: 36
+    num_attention_heads: 32
+    num_key_value_heads: 8
+    head_dim: 128
+    max_position_embeddings: 40960
+    max_window_layers: 36
+    hidden_act: silu
+    rms_norm_eps: 1.0e-6
+    initializer_range: 0.02
+    rope_theta: 1000000.0
+    rope_scaling: null
+    sliding_window: null
+    use_sliding_window: false
+    attention_bias: false
+    attention_dropout: 0.0
+    tie_word_embeddings: false
+    bos_token_id: 151643
+    eos_token_id: 151645
+    use_cache: false
+  torch_dtype: bfloat16
+  load_base_model: false
+  force_hf: false
+  use_liger_kernel: false
+  attn_implementation: sdpa
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 2
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+clip_grad_norm:
+  max_norm: 1.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_pretraining.MockPretrainingDatasetConfig
+  # Samples are already tokenized, so do not infer a tokenizer from a model ID.
+  # Replace this block with a production pretraining dataset for a corpus run.
+  tokenizer: null
+  vocab_size: 151936
+  eod_token_id: 151645
+  seq_length: 2048
+  num_samples: 80
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 1
+  num_workers: 0
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_pretraining.MockPretrainingDatasetConfig
+  tokenizer: null
+  vocab_size: 151936
+  eod_token_id: 151645
+  seq_length: 2048
+  num_samples: 8
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 1
+  num_workers: 0
+  shuffle: false
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 2
+  init_lr: 0.0
+  min_lr: 3.0e-5
+
+ci:
+  recipe_owner: akoumpa
+  nodes: 1
+  time: "00:20:00"
+  nproc_per_node: 8
+  cluster_tag: h100
+  env_vars:
+    REQUIRE_FINITE_METRICS: "true"
