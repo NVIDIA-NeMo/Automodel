@@ -67,7 +67,7 @@ def resolve_recipe_name(raw: str) -> str:
 def load_yaml(file_path):
     """Load and return a YAML file as a dict."""
     try:
-        with open(file_path, "r") as file:
+        with open(file_path, "r", encoding="utf-8") as file:
             return yaml.safe_load(file)
     except FileNotFoundError as e:
         logger.error("File '%s' was not found.", file_path)
