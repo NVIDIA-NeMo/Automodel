@@ -6,7 +6,7 @@ in one forward pass, and every accepted token is a step the target never had to
 run autoregressively. The faster and more accurate the draft, the higher the
 acceptance length and the larger the inference speedup.
 
-AutoModel trains the draft. You then serve the draft and target together in an
+NeMo AutoModel trains the draft. You then serve the draft and target together in an
 inference engine (SGLang or vLLM). The training code lives in
 `nemo_automodel/components/speculative/`, the recipes in
 `nemo_automodel/recipes/llm/`, and ready-to-run configs in this folder.
@@ -112,7 +112,7 @@ Override any config key inline:
 automodel examples/speculative/eagle3/llama_eagle3_perfectblend.yaml --nproc-per-node 8 --recipe_args.micro_batch_size=2
 ```
 
-Run DFlash **DLLM SFT** configs under `../dllm_sft/` with the standard AutoModel
+Run DFlash **DLLM SFT** configs under `../dllm_sft/` with the standard NeMo AutoModel
 SFT entry script:
 
 ```bash
@@ -202,9 +202,9 @@ base draft is frozen and only `lora_A`/`lora_B` adapters train. Checkpoints are
 adapter-only (`adapter_model.safetensors` through the standard PEFT checkpoint
 path). This is for adapting an existing draft to a new domain or dataset:
 point `recipe_args.draft_weights_path` at the consolidated safetensors export
-of a trained draft to warm-start the base weights (adapters over a randomly
+of a trained draft to warm-start the base weights. Adapters over a randomly
 initialized draft are pointless. `draft_weights_path` also works without
-`peft:` for full-FT continued training). With a compressed draft vocab the
+`peft:` for full-FT continued training. With a compressed draft vocab the
 base run's token mapping must be reused through `selected_token_ids_path` (the
 frozen `lm_head` rows are tied to it). A differing mapping fails fast at
 load. The final checkpoint of a LoRA run also exports the merged
@@ -518,7 +518,7 @@ vLLM.
 ## Config Reference (EAGLE-Style Schema)
 
 EAGLE-1/2/3/3.1, P-EAGLE, and the LLM DFlash recipe share one schema. The DFlash
-**DLLM SFT** configs under `../dllm_sft/` use the standard AutoModel SFT schema
+**DLLM SFT** configs under `../dllm_sft/` use the standard NeMo AutoModel SFT schema
 (`step_scheduler` / `model._target_` / `dataset._target_` / `dllm` / `dflash`
 blocks) instead.
 
@@ -545,8 +545,8 @@ block-weighted `val_accept_len`. Domino also reports final-head and base-head
 loss, base accuracy, and base acceptance length. DFlash 2 reports its two loss
 terms (`val_base_loss`, `val_selector_loss`), the backbone's own top-1 accuracy
 and acceptance length (`val_base_accuracy`, `val_base_accept_len`), and
-`val_candidate_recall` -- how often the true token is in the top-k candidate
-list, the ceiling the selector can reach. The reductions sum raw token and block
+`val_candidate_recall` (how often the true token is in the top-k candidate
+list, the ceiling the selector can reach). The reductions sum raw token and block
 statistics across ranks before division, so uneven valid-token counts do not
 bias the result.
 

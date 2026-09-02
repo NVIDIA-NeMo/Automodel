@@ -34,8 +34,8 @@ only the head and the objective differ.
 | Domino | a serial GRU correction head that refines each block position on the previous ones | `TrainDominoRecipe` | `qwen3_domino.yaml` |
 | JetSpec | causal in-block attention plus forward-KL distillation against the target distribution | `TrainJetSpecRecipe` | `jetspec/` |
 
-DFlash 2 keeps drafting in one pass — the convolution and the selector add
-parameters inside the stack rather than an autoregressive correction — so it has
+DFlash 2 keeps drafting in one pass. The convolution and the selector add
+parameters inside the stack rather than an autoregressive correction, so it has
 its own draft class whose checkpoint layout matches the published DFlash 2
 drafters.
 
@@ -43,8 +43,8 @@ drafters.
 
 Only block positions `1..block_size-1` are supervised (position 0 is the clean
 anchor). Their cross-entropy is weighted by a position decay
-`w_k = exp(-(k-1)/loss_decay_gamma)`, so early positions — the ones a verifier
-reaches first — dominate the loss.
+`w_k = exp(-(k-1)/loss_decay_gamma)`, so early positions (the ones a verifier
+reaches first) dominate the loss.
 
 Paper `loss_decay_gamma` values track the block size: 7 for `block_size` 16, 5
 for 10, and 4 for 8.
@@ -76,9 +76,10 @@ id.
 not reuse `pad`: it is frequently aliased to `eos`, which conflates the mask
 signal with real content and quietly erodes acceptance. The inference runtime
 must fill block slots with the same id.
+
 </Note>
 
-## Run it
+## Run It
 
 Example configs live under `examples/speculative/dflash/`.
 
@@ -88,7 +89,7 @@ torchrun --standalone --nproc_per_node=2 \
   -c examples/speculative/dflash/qwen3_dflash.yaml
 ```
 
-Swap the module and config to train a variant — for example
+Swap the module and config to train a variant. For example,
 `-m nemo_automodel.recipes.llm.train_dflash2 -c examples/speculative/dflash/qwen3_dflash2.yaml`.
 
 Multi-GPU wraps the draft in DDP and replicates the frozen target. Set
@@ -105,11 +106,11 @@ Training logs `train/loss`, `train/accuracy`, and `train/accept_len`. Setting
 `recipe_args.val_data_path` adds globally reduced `val_loss`, `val_accuracy`,
 and `val_accept_len`; adding a top-level `wandb:` block uploads all of them.
 
-## Key config fields
+## Key Config Fields
 
 | Field | Meaning |
 |-------|---------|
-| `target_model_name_or_path` | frozen target (e.g. `Qwen/Qwen3-8B`) |
+| `target_model_name_or_path` | frozen target (e.g., `Qwen/Qwen3-8B`) |
 | `draft_num_hidden_layers` | draft stack depth (paper: 5) |
 | `block_size` | tokens drafted in parallel per block (paper: 16) |
 | `num_anchors` | blocks sampled per sequence per step |
@@ -127,8 +128,8 @@ and `val_accept_len`; adding a top-level `wandb:` block uploads all of them.
 | `selector_rank` / `selector_top_k` / `selector_loss_weight` | DFlash 2 path-selector width, candidates scored per position, and objective weight |
 
 `spec_generate` accepts `temperature`, `top_p`, and `top_k`. The truncation
-applies to the *target's* distribution -- the one rejection sampling verifies
-against -- so sampled decoding stays lossless with respect to whatever sampling
+applies to the *target's* distribution (the one rejection sampling verifies
+against), so sampled decoding stays lossless with respect to whatever sampling
 the target would have used on its own. The DFlash 2 evaluations quote acceptance
 lengths at temperature 1.0, top-p 0.95, top-k 20.
 
