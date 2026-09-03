@@ -58,7 +58,10 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.utils import can_return_tuple, logging
 
-from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -193,6 +196,18 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
     # and untied layouts load. Declared explicitly because the registry requires every
     # lm_head-bearing class to state its support rather than defaulting silently.
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
+    # Declared rather than inherited so the alias this class relies on is stated where the
+    # policy is: scoring reads the yes/no rows of lm_head, so which tensor lm_head.weight
+    # aliases is load-bearing here, not incidental.
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    def __init__(self, config: Qwen3RerankerConfig) -> None:
+        # Before super().__init__, on the original config, so an unsupported tie_word_embeddings
+        # fails at construction rather than after the weights have loaded. BOTH accepts either
+        # setting, so this never fires for this class today -- it is here so that narrowing the
+        # policy later cannot silently produce a model with a randomly-initialised head.
+        reject_unsupported_tie_word_embeddings(type(self), config)
+        super().__init__(config)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
