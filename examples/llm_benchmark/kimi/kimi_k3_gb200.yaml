@@ -21,6 +21,16 @@
 # (Without compile_norm and benchmark_static_routing this measures ~441-458
 # tok/s/GPU = 12.2-12.7% MFU.)
 #
+# Measurement provenance: these numbers were taken before #3792 aligned the
+# KimiK3TextConfig defaults with the released checkpoint. from_config then
+# built a 56-head MLA / 18432-wide dense FFN model (~101.5B active matmul
+# params instead of 104.0B), so on the checkpoint-aligned shape this file
+# builds today expect ~2% fewer tok/s at about the same MFU; a re-measurement
+# on the aligned shape will replace the figures above. With #3792 the recipe
+# itself prints MFU on the config-derived basis (run it through
+# nemo_automodel/recipes/llm/benchmark.py --config <this file> to get the
+# per-iteration MFU and the Average MFU summary).
+#
 # Benchmark regime notes:
 # - Random init + fake_balanced_gate (uniform static routing): the standard
 #   upper-bound yardstick; a random-init learned gate routes degenerately.
