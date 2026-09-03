@@ -328,6 +328,18 @@ class BackendConfig:
             activation (currently used by Kimi K3), fusing the elementwise fp32
             chain in both the forward and the backward recompute. Compiled
             numerics are allclose to eager but not bitwise-identical.
+        compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
+            (currently Kimi K3), fusing cast/pow/mean/rsqrt/mul into one kernel.
+            Same lazy once-per-process pattern as ``compile_situ``; numerics are
+            allclose to eager but not bitwise-identical.
+        benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
+            with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
+            permuted token counts) is identical for every microbatch. Skips the
+            per-microbatch device-to-host reads of that metadata (`.tolist()` /
+            `count_nonzero` / dispatcher size checks) by caching the first
+            microbatch's values, removing recurring host-sync stalls on the hot
+            path. Never enable with a learned gate: cached metadata would go
+            stale and silently corrupt expert dispatch.
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
@@ -372,9 +384,27 @@ class BackendConfig:
     # of models using the SiTU expert activation (currently Kimi K3). Fuses the hot fp32
     # elementwise chains; numerics are allclose to eager, not bitwise-identical. Default False.
     compile_situ: bool = False
+    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3),
+    # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
+    # not bitwise-identical. Default False.
+    compile_norm: bool = False
+    # Benchmark-only: cache per-microbatch routing metadata (tokens per expert, permuted
+    # token counts) after the first microbatch to remove recurring device-to-host syncs.
+    # Valid ONLY with fake_balanced_gate=True and fake_gate_noise=0.0 (enforced in
+    # __post_init__), where that metadata is constant by construction. Default False.
+    benchmark_static_routing: bool = False
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
     def __post_init__(self) -> None:
+        # benchmark_static_routing caches routing metadata across microbatches, which is
+        # only sound when routing is constant by construction (forced balance, no noise).
+        if self.benchmark_static_routing and not (self.fake_balanced_gate and self.fake_gate_noise == 0.0):
+            raise ValueError(
+                "benchmark_static_routing=True requires fake_balanced_gate=True and "
+                "fake_gate_noise=0.0; with a learned or noisy gate the cached routing "
+                "metadata would go stale and corrupt expert dispatch."
+            )
+
         # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
         # instead assumes contiguous [0, seq_len) positions, so combining the two
         # silently produces incorrect phases for packed, offset, or per-example
