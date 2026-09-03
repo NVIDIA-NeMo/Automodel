@@ -6,15 +6,18 @@ position: 1
 
 ## Introduction
 
-Reranking models use cross-encoders to score a query-document pair jointly. They are typically used after an embedding model has produced an initial candidate set. NeMo AutoModel supports optimized bidirectional Llama rerankers and falls back to Hugging Face `AutoModelForSequenceClassification` for other architectures.
+Reranking models use cross-encoders to score a query-document pair jointly. They are typically used after an embedding model has produced an initial candidate set. NeMo AutoModel supports optimized bidirectional Llama rerankers and a causal Qwen3 reranker that scores with a yes/no decision at the final token, and falls back to Hugging Face `AutoModelForSequenceClassification` for other architectures.
 
 For first-stage dense retrieval, see [Embedding Models](/model-coverage/embedding-models/overview).
 
-## Optimized Backbones (Bidirectional Attention)
+## Optimized Backbones
 
 | Owner | Model | Architecture | Wrapper Class | Tasks |
 |---|---|---|---|---|
 | NVIDIA | [llama-nemotron-rerank-1b-v2](/model-coverage/reranking-models/nvidia/llama-bidirectional) | `LlamaBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Reranking |
+| Qwen | [Qwen3-Reranker-4B](https://huggingface.co/Qwen/Qwen3-Reranker-4B) | `Qwen3RerankerForCausalReranking` | `NeMoAutoModelCrossEncoder` | Reranking |
+
+The Llama backbones convert to bidirectional attention. `Qwen3RerankerForCausalReranking` stays causal: it reuses the pretrained `lm_head` and scores a pair as `logit("yes") - logit("no")` at the final non-padding token, adding no parameters. Its checkpoints serialize as a plain `Qwen3ForCausalLM`, so they load in stock Transformers and vLLM without custom code.
 
 ## Hugging Face Auto Backbones
 

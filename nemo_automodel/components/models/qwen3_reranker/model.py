@@ -58,6 +58,8 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.utils import can_return_tuple, logging
 
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+
 logger = logging.get_logger(__name__)
 
 
@@ -186,6 +188,11 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
     """
 
     config_class = Qwen3RerankerConfig
+    # The published Qwen3-Reranker checkpoints set tie_word_embeddings=True, and the class
+    # reuses the backbone's lm_head rather than adding a head of its own, so both the tied
+    # and untied layouts load. Declared explicitly because the registry requires every
+    # lm_head-bearing class to state its support rather than defaulting silently.
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -221,6 +228,19 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
                 f"no_token_id={model.config.no_token_id}"
             )
         return model
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        """Alias ``lm_head`` to the input embeddings when the config asks for it.
+
+        Declared model-locally rather than inherited: transformers v5 does not reliably tie a
+        custom model from the dict-shaped ``_tied_weights_keys`` alone, so the config flag is
+        honoured explicitly (mirroring ``Qwen2ForCausalLM``). This matters here because
+        scoring reads the yes/no rows of ``lm_head``; if the tie silently failed to apply, the
+        head would drift from the embeddings it is supposed to share and the published
+        checkpoint's scores would not reproduce.
+        """
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     @can_return_tuple
     def forward(

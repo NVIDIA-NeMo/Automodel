@@ -34,6 +34,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.qwen3_reranker.model import (
     Qwen3RerankerConfig,
     Qwen3RerankerForCausalReranking,
@@ -241,3 +242,53 @@ def test_round_trip_preserves_no_weights_beyond_the_backbone(tmp_path):
     reloaded = AutoModelForCausalLM.from_pretrained(tmp_path)
 
     assert set(reloaded.state_dict()) == set(model.state_dict())
+
+
+def test_supports_tied_embeddings():
+    """The published checkpoints set tie_word_embeddings=True, so the tie must actually apply.
+
+    Scoring reads the yes/no rows of ``lm_head``; a tie that silently failed would leave the
+    head drifting from the embeddings it is meant to share, and the published checkpoint's
+    scores would not reproduce.
+    """
+    config = Qwen3RerankerConfig(
+        yes_token_id=YES_ID,
+        no_token_id=NO_ID,
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+        head_dim=8,
+        tie_word_embeddings=True,
+    )
+    model = Qwen3RerankerForCausalReranking(config)
+
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+
+
+def test_declares_tie_support_both():
+    """Registered lm_head-bearing classes must state their policy rather than default to one."""
+    assert Qwen3RerankerForCausalReranking.tie_word_embeddings_support is TieSupport.BOTH
+
+
+def test_untied_config_leaves_the_head_independent():
+    """BOTH means both layouts work, so the untied case must not alias."""
+    config = Qwen3RerankerConfig(
+        yes_token_id=YES_ID,
+        no_token_id=NO_ID,
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+        head_dim=8,
+        tie_word_embeddings=False,
+    )
+    model = Qwen3RerankerForCausalReranking(config)
+
+    assert model.lm_head.weight is not model.model.embed_tokens.weight
