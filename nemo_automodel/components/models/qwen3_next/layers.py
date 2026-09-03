@@ -34,6 +34,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -117,20 +118,19 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         keep ``None`` when causal_conv1d is missing so the pure-torch conv branch in
         ``forward`` is taken rather than a signature-incompatible fallback.
         """
-        try:
-            from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-        except ImportError:
-            causal_conv1d_fn = None
-            causal_conv1d_update = None
+        has_conv1d, causal_conv1d_fn = safe_import_from("causal_conv1d", "causal_conv1d_fn")
+        _, causal_conv1d_update = safe_import_from("causal_conv1d", "causal_conv1d_update")
+        _, chunk_gated_delta_rule = safe_import_from(
+            "fla.ops.gated_delta_rule", "chunk_gated_delta_rule", alt=torch_chunk_gated_delta_rule
+        )
+        _, fused_recurrent_gated_delta_rule = safe_import_from(
+            "fla.ops.gated_delta_rule", "fused_recurrent_gated_delta_rule", alt=torch_recurrent_gated_delta_rule
+        )
 
-        try:
-            from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-        except ImportError:
-            chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-            fused_recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
-
-        self.causal_conv1d_fn = causal_conv1d_fn
-        self.causal_conv1d_update = causal_conv1d_update
+        # safe_import_from returns an UnavailableMeta placeholder rather than None
+        # when causal_conv1d is missing, so key the pure-torch branch off the flag.
+        self.causal_conv1d_fn = causal_conv1d_fn if has_conv1d else None
+        self.causal_conv1d_update = causal_conv1d_update if has_conv1d else None
         self.chunk_gated_delta_rule = chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
 
