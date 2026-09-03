@@ -211,9 +211,26 @@ class ChunkedCrossEntropy(nn.Module):
 
             seq_len = logits.shape[0]
             num_chunks = (seq_len + self.chunk_len - 1) // self.chunk_len
-            loss = 0.0
-            for logits_chunk, targets_chunk in zip(logits.chunk(num_chunks, dim=0), labels.chunk(num_chunks, dim=0)):
-                loss += compute_loss(logits_chunk, targets_chunk, self.ignore_index, self.reduction)
+            logit_chunks = logits.chunk(num_chunks, dim=0)
+            target_chunks = labels.chunk(num_chunks, dim=0)
+
+            if self.reduction == "none":
+                # Per-token losses: chunks must be concatenated. Accumulating them
+                # adds the chunks together instead, yielding chunk_len values.
+                loss = torch.cat(
+                    [
+                        compute_loss(logits_chunk, targets_chunk, self.ignore_index, "none")
+                        for logits_chunk, targets_chunk in zip(logit_chunks, target_chunks)
+                    ]
+                )
+            else:
+                # "mean": a mean of per-chunk means cannot be summed -- that returns
+                # num_chunks x the loss. Accumulate the sum and divide once by the
+                # non-ignored token count, which matches F.cross_entropy exactly.
+                loss = 0.0
+                for logits_chunk, targets_chunk in zip(logit_chunks, target_chunks):
+                    loss = loss + compute_loss(logits_chunk, targets_chunk, self.ignore_index, "sum")
+                loss = loss / (labels != self.ignore_index).sum()
         if num_label_tokens is not None:
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
             loss = loss / num_label_tokens  # pragma: no cover
