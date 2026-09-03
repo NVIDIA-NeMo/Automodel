@@ -252,6 +252,13 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     """
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    # Same fp32 keep-list as NemotronHForCausalLM: ``cast_model_to_dtype`` reads these
+    # attributes from the *outermost* module, so without them the wrapper-level cast in
+    # ``initialize_weights`` turns the router's ``e_score_correction_bias`` buffers into
+    # bf16. The checkpoint stores them in fp32 (values ~3.97 +- 0.024, none bf16-exact) and
+    # the bf16 rounding (ulp 0.0156 at 4.0) is larger than the sigmoid routing margins, so
+    # top-k expert selection diverged from the HF reference on ~85% of tokens.
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
     # CP submesh, installed by the MoE parallelizer's apply_cp when context
     # parallelism is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
@@ -396,9 +403,16 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # WAR for transformers issue 38358
         if hasattr(self.vision_model, "model") and hasattr(self.vision_model.model, "_init_weights"):
             self.vision_model.model._initialize_weights = self.vision_model.model._init_weights
-        # Make preprocessor external (required by RADIO)
+        # Make preprocessor external (required by RADIO): the image processor already
+        # normalizes pixel values, so the model-side input conditioner must become an
+        # Identity -- exactly what the checkpoint's own NemotronH_Omni_Reasoning_V3.__init__
+        # does. Legacy checkpoints expose it under `radio_model`; the transformers-native
+        # RadioModel exposes it directly. Leaving it active normalizes twice and corrupts
+        # the vision features (RADIO output cosine ~0.32 vs the HF reference).
         if hasattr(self.vision_model, "radio_model"):
             self.vision_model.radio_model.make_preprocessor_external()
+        elif hasattr(self.vision_model, "make_preprocessor_external"):
+            self.vision_model.make_preprocessor_external()
 
         # 3D patch projector for temporally-packed video frames. Only present when the
         # checkpoint ships a `patch_generator.video_embedder` weight (i.e. v3+).
