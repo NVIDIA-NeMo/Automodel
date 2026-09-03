@@ -267,9 +267,10 @@ def _truncation_window_offset(
     )
 
 
-_SENTINEL_TEXTS = ("0", "1")
-"""Two replacement texts for :func:`_generation_prefix_bound`. Their renders are compared
-token by token, so what matters is that they tokenize differently, not how they read."""
+_SENTINEL_TEXTS = ("", "0", "1")
+"""Replacement texts for :func:`_generation_prefix_bound`. The empty text renders the turn
+with no generated text at all, which is what fixes the content boundary; the two others are
+compared token by token, so what matters is that they tokenize differently, not how they read."""
 
 
 def _perturbed_assistant_message(message: dict[str, Any], sentinel: str) -> dict[str, Any]:
@@ -306,29 +307,57 @@ def _generation_prefix_bound(
     """Return how many leading tokens of ``turn`` provably do not depend on ``message``.
 
     The turn is rendered again with its generated text swapped for each of
-    :data:`_SENTINEL_TEXTS`. Tokens that all renders share with the real turn
-    come from the template, so they may be masked as the generation prompt;
-    the bound is the shortest such run. The proof is token-level: character
-    differences are not enough, since normalization or an UNK mapping can map
-    the real text and a sentinel onto the same token id. Requiring two
-    sentinel renders that differ from each other at the bound guarantees the
-    real first token can coincide with at most one of them. When the sentinel
-    renders do not diverge at all, or a render already differs inside the
-    conversation prefix, nothing is proven and the bound is ``0`` (nothing is
-    masked).
+    :data:`_SENTINEL_TEXTS`, and only tokens every render shares with the real
+    turn, at the same position, may be masked as the generation prompt. The
+    content boundary comes from the render with the generated text removed
+    entirely: whatever the template emits before the first token that render
+    lacks is present with no message text at all, so it cannot be owned by the
+    content. That render alone is not enough, because a template's closing
+    token can coincide with the real text's first token, so two non-empty
+    sentinels must also agree up to the bound and diverge from each other
+    afterwards; checking token ids rather than characters keeps normalization
+    or an UNK mapping from folding a sentinel onto the real text. A prefix
+    token the tokenizer emits for every non-empty value (a word-start marker,
+    say) is absent from the empty render and therefore never masked. When the
+    non-empty sentinel renders do not diverge, or any render already differs
+    inside the conversation prefix, nothing is proven and the bound is ``0``
+    (nothing is masked).
+
+    Removing the text can also merge the template's own characters into one
+    token: Qwen3-Thinking renders a reasoning turn as ``<think>\\n`` + text,
+    and with no text the ``\\n`` fuses with the ``\\n</think>`` that follows
+    into a single ``\\n\\n`` token. Both renders agree on every character up
+    to that token, and the empty render's token there is template text only,
+    so when the real turn's token is a strict prefix of it (compared through
+    ``convert_ids_to_tokens``) that token is template text as well and the
+    empty bound moves past it. The non-empty sentinels still cap the result.
     """
     tails: list[list[int]] = []
-    bound = len(turn)
     for sentinel in _SENTINEL_TEXTS:
         ids = _tokenize_chat(tokenizer, prefix + [_perturbed_assistant_message(message, sentinel)], **render_kwargs)
         if ids[: len(conversation_ids)] != conversation_ids:
             return 0
-        tail = ids[len(conversation_ids) :]
-        tails.append(tail)
-        bound = min(bound, _common_prefix_length(tail, turn))
-    if tails[0] == tails[1]:
+        tails.append(ids[len(conversation_ids) :])
+    empty, sentinels = tails[0], tails[1:]
+    if sentinels[0] == sentinels[1]:
         return 0
-    return min(bound, _common_prefix_length(tails[0], tails[1]))
+    bound = min(_common_prefix_length(tail, turn) for tail in sentinels)
+    bound = min(bound, _common_prefix_length(*sentinels))
+    empty_bound = _common_prefix_length(empty, turn)
+    if empty_bound < min(bound, len(empty)) and _is_strict_token_prefix(
+        tokenizer, turn[empty_bound], empty[empty_bound]
+    ):
+        empty_bound += 1
+    return min(bound, empty_bound)
+
+
+def _is_strict_token_prefix(tokenizer: "PreTrainedTokenizer", short_id: int, long_id: int) -> bool:
+    """Return whether the string of token ``short_id`` is a strict prefix of that of ``long_id``."""
+    convert = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if convert is None:
+        return False
+    short, long = convert(short_id), convert(long_id)
+    return isinstance(short, str) and isinstance(long, str) and len(short) < len(long) and long.startswith(short)
 
 
 def _common_prefix_length(left: list[int], right: list[int]) -> int:
@@ -517,12 +546,14 @@ def _build_generation_prompt_mask(
     the prompt's added tokens can contain earlier turns whose text repeats the
     current one. Every anchor is therefore capped by a structural bound
     (:func:`_generation_prefix_bound`): the turn is rendered again with its
-    generated text replaced by two different sentinels, and only tokens every
-    render shares, the part of the turn that provably does not depend on the
-    message, may be marked. The check is on token ids, so a tokenizer that
-    normalizes a sentinel onto the real text's first token cannot widen it, and
-    it fails closed (marks nothing) when the sentinel renders do not diverge.
-    Assistant content can never be reached, whichever anchor won.
+    generated text removed and with it replaced by two different sentinels, and
+    only tokens every render shares, the part of the turn that provably does
+    not depend on the message, may be marked. The empty render fixes the
+    content boundary (a token the tokenizer emits for any value is absent from
+    it), the check is on token ids, so a tokenizer that normalizes a sentinel
+    onto the real text's first token cannot widen it, and it fails closed
+    (marks nothing) when the sentinel renders do not diverge. Assistant content
+    can never be reached, whichever anchor won.
 
     Truncation is handled like :func:`_build_reasoning_mask`: spans are located
     in the untruncated render and mapped back through the retained window,
@@ -531,7 +562,7 @@ def _build_generation_prompt_mask(
     once per process), as is a leading assistant turn whose template cannot
     render an empty conversation; any other render error propagates. Positions are computed from unpadded
     (left-aligned) ids, like :func:`_build_multiturn_assistant_mask`, whose
-    prefix renders are reused through ``prefix_cache``. Up to four extra
+    prefix renders are reused through ``prefix_cache``. Up to five extra
     ``apply_chat_template`` renders per assistant turn are the price, which is
     why this is opt-in.
     """

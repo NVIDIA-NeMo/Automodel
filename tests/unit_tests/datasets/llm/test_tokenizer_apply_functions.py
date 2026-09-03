@@ -1873,8 +1873,9 @@ def test_mask_generation_prompt_reuses_multiturn_prefix_renders():
     plain_prefix_renders = [n for n, gen, original in calls if not gen and original and n < len(messages)]
     # Each proper prefix (1, 2, 3 messages) is rendered once and shared by both builders.
     assert sorted(plain_prefix_renders) == [1, 2, 3]
-    # Plus two bound renders per assistant turn (the turn with its text swapped for each sentinel).
-    assert sorted(n for n, gen, original in calls if not gen and not original) == [2, 2, 4, 4]
+    # Plus three bound renders per assistant turn (the turn with its text removed and swapped
+    # for each of the two sentinels).
+    assert sorted(n for n, gen, original in calls if not gen and not original) == [2, 2, 2, 4, 4, 4]
 
     # truncation=True on a sample that fits is not a truncation: the prefix renders are still
     # shared and the full conversation is not rendered again as an untruncated reference.
@@ -2040,6 +2041,139 @@ def test_mask_generation_prompt_bound_is_token_level_under_normalization():
     body = ["<tool_call>", "get_weather", "</tool_call>", "0", "degrees", "in", "Paris", "<eot>"]
     assert _decode(tok, default) == ["<assistant>", *body]
     assert _decode(tok, masked) == body
+
+
+class _StubTokenizerChatNoGenGemmaLikeWordStart(_StubTokenizerChatNoGenGemmaLike):
+    """Gemma-like stub whose tokenizer opens every non-empty message text with a
+    ``<word_start>`` token: a content-owned prefix that is the same for any value, so every
+    sentinel render shares its first content token with the real render."""
+
+    chat_template = "<dummy gemma-like word-start template>"
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        ids: List[int] = [self._start_of_turn_token_id]
+        thinking = kwargs.get("add_generation_prompt") and kwargs.get("enable_thinking", False)
+        if thinking:
+            ids.append(self._id_for_token("<think_system>"))
+        prev = None
+        for msg in messages:
+            role = msg["role"]
+            content = str(msg.get("content") or "")
+            if role == "tool":
+                ids.append(self._id_for_token("<tool_response>"))
+                ids.extend(self._id_for_token(tok) for tok in content.split())
+                ids.append(self._id_for_token("</tool_response>"))
+                prev = role
+                continue
+            if not (role == "assistant" and prev == "tool"):
+                ids.append(self._id_for_token(f"<{role}>"))
+            for call in msg.get("tool_calls") or []:
+                ids.append(self._id_for_token("<tool_call>"))
+                ids.append(self._id_for_token(call["function"]["name"]))
+                ids.append(self._id_for_token("</tool_call>"))
+            if content:
+                ids.append(self._id_for_token("<word_start>"))
+                ids.extend(self._id_for_token(tok) for tok in content.split())
+            if not msg.get("tool_calls"):
+                ids.append(self._id_for_token("<eot>"))
+            prev = role
+        if kwargs.get("add_generation_prompt"):
+            if prev != "tool":
+                ids.append(self._id_for_token("<assistant>"))
+            elif thinking:
+                ids.append(self._id_for_token("<think>"))
+        if kwargs.get("return_dict", False):
+            return {"input_ids": ids}
+        return ids
+
+
+def test_mask_generation_prompt_bound_excludes_content_owned_prefix_token():
+    # Every sentinel render shares a content-owned first token with the real render (the
+    # tokenizer opens any value with the same token), so two diverging sentinels alone would
+    # still prove nothing about that token. The bound is also capped by the render with the
+    # generated text removed entirely, which has no such token: the header-less continuation
+    # turn keeps every generated token, including <word_start>, supervised.
+    tok = _StubTokenizerChatNoGenGemmaLikeWordStart()
+    text = "The weather in Paris is sunny."
+    messages = [
+        {"role": "user", "content": text},
+        {"role": "assistant", "content": "", "tool_calls": _TOOL_CALL},
+        {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        {"role": "assistant", "content": text},
+    ]
+
+    default = _format(tok, messages)
+    masked = _format(tok, messages, mask_generation_prompt=True)
+    assert masked["input_ids"] == default["input_ids"]
+    body = ["<tool_call>", "get_weather", "</tool_call>", "<word_start>", *text.split(), "<eot>"]
+    assert _decode(tok, default) == ["<assistant>", *body]
+    assert _decode(tok, masked) == body
+
+
+class _StubTokenizerChatNoGenQwen3ThinkingLike(_StubTokenizerChatNoGen):
+    """Qwen3-Thinking style: a reasoning turn renders ``<assistant> <think> \\n reasoning \\n
+    </think> \\n\\n content EOS`` and the generation prompt is ``<assistant> <think> \\n``. The
+    tokenizer keeps ``\\n`` and ``\\n\\n`` as distinct ids, so a turn with no reasoning text
+    fuses the ``\\n`` after ``<think>`` with the one before ``</think>`` into ``\\n\\n``."""
+
+    chat_template = "<dummy qwen3-thinking-like template>"
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        ids: List[int] = [self._start_of_turn_token_id]
+        for msg in messages:
+            ids.append(self._id_for_token(f"<{msg['role']}>"))
+            if msg["role"] == "assistant":
+                reasoning = str(msg.get("reasoning_content") or "").split()
+                ids.append(self._id_for_token("<think>"))
+                if reasoning:
+                    ids.append(self._id_for_token("\n"))
+                    ids.extend(self._id_for_token(tok) for tok in reasoning)
+                    ids.append(self._id_for_token("\n"))
+                else:
+                    ids.append(self._id_for_token("\n\n"))
+                ids.append(self._id_for_token("</think>"))
+                ids.append(self._id_for_token("\n\n"))
+                ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+                ids.append(self.eos_token_id)
+            else:
+                ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+        if kwargs.get("add_generation_prompt"):
+            ids.extend(self._id_for_token(tok) for tok in ("<assistant>", "<think>", "\n"))
+        if kwargs.get("return_dict", False):
+            return {"input_ids": ids}
+        return ids
+
+    def convert_ids_to_tokens(self, token_id: int) -> str:
+        return {v: k for k, v in self._vocab.items()}.get(token_id, "<eos>")
+
+
+_QWEN3_THINKING_REASONING = [
+    {"role": "user", "content": "How many legs does a spider have?"},
+    {"role": "assistant", "reasoning_content": "count them", "content": "eight"},
+]
+
+
+def test_mask_generation_prompt_empty_render_bound_extends_over_merged_template_token():
+    # With the reasoning text removed the template's "\n" after <think> fuses with the "\n"
+    # before </think> into one "\n\n" token, so the empty render diverges from the real turn one
+    # token early. The real token's string is a strict prefix of the merged one, which proves it
+    # is template text: the whole generation prompt (<assistant> <think> \n) leaves the loss.
+    tok = _StubTokenizerChatNoGenQwen3ThinkingLike()
+    default = _format(tok, _QWEN3_THINKING_REASONING)
+    masked = _format(tok, _QWEN3_THINKING_REASONING, mask_generation_prompt=True)
+    assert masked["input_ids"] == default["input_ids"]
+    body = ["count", "them", "\n", "</think>", "\n\n", "eight", "<eos>"]
+    assert _decode(tok, default) == ["<assistant>", "<think>", "\n", *body]
+    assert _decode(tok, masked) == body
+
+
+def test_mask_generation_prompt_empty_render_bound_stays_conservative_without_token_strings():
+    # The same template on a tokenizer that cannot report token strings: the merged token cannot
+    # be proven to be template text, so the "\n" after <think> keeps its supervision.
+    tok = _StubTokenizerChatNoGenQwen3ThinkingLike()
+    tok.convert_ids_to_tokens = None
+    masked = _format(tok, _QWEN3_THINKING_REASONING, mask_generation_prompt=True)
+    assert _decode(tok, masked) == ["\n", "count", "them", "\n", "</think>", "\n\n", "eight", "<eos>"]
 
 
 def test_mask_generation_prompt_fails_closed_when_sentinel_renders_do_not_diverge():
