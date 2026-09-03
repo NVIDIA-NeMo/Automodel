@@ -1,0 +1,359 @@
+---
+title: "Nemotron 3.5 Super VL"
+description: ""
+position: 15
+---
+**A step-by-step guide for fine-tuning Nemotron 3.5 Super VL (67B hybrid Mamba+Attention MoE VLM)
+to extract structured receipt data from scanned images using
+[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel). Full SFT on 8 nodes, then
+inference and evaluation on the CORD-v2 validation split.**
+
+---
+
+## What is Nemotron 3.5 Super VL?
+
+Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`,
+architecture `NemotronH_Omni_Reasoning_V3`) is the 67B member of the Nemotron 3.5 family.
+It reuses the NemotronOmni wrapper, vision tower and state-dict adapter of the 33B
+NemotronOmni; only the LLM backbone scale differs.
+
+Key architectural details:
+- **LLM backbone**: NemotronV3 hybrid, 88 layers (40 Mamba2, 8 attention, 40 MoE), hidden dim 4096
+- **MoE**: 512 routed experts per MoE layer, top-22 routing plus 1 shared expert
+- **Vision encoder**: RADIO v2.5-H (ViT-Huge), 512x512 tiles, 256 vision tokens per tile
+- **Audio**: this vision-pretrained checkpoint ships no `sound_config`, so no audio tower is built
+- **MTP**: the checkpoint ships one multi-token-prediction head; the recipe below keeps it off (`num_nextn_predict_layers: 0`)
+- **Parameters**: 120.7B trainable with the vision tower frozen (99.31% of the model); ~227 GB in bf16
+
+## Fine-Tune for Receipt Field Extraction
+
+As in the [NemotronOmni guide](/guides/vlm/nemotron-omni), we fine-tune on **CORD-v2**
+(Consolidated Receipt Dataset) to extract structured fields from scanned receipts:
+
+| Field | Example |
+|-------|---------|
+| `menu` | Item names, quantities, prices |
+| `sub_total` | Subtotal, tax, discount |
+| `total` | Total price, cash paid, change |
+
+The **base model** produces free-form descriptions. After fine-tuning, it outputs
+**structured XML-like token sequences** matching the receipt fields.
+
+## Guide Overview
+
+| Step | Description |
+|------|-------------|
+| **Step 0** | Environment setup |
+| **Step 1** | Explore the CORD-v2 dataset |
+| **Step 2** | Training configuration |
+| **Step 3** | Launch fine-tuning (8 nodes) |
+| **Step 4** | Run inference and evaluation on the fine-tuned model |
+| **Step 5** | Results |
+
+## Hardware Requirements
+
+- **8 nodes x 8 H100 80 GB** (512 experts sharded with
+  `ep_size=32`; `cp_size=8` so the 8-sample global batch is one sample per data-parallel rank)
+- **SFT memory**: ~31.8 GiB per GPU (fp32 master weights, bf16 Adam moments, activation checkpointing).
+  On 4 nodes the same recipe runs at ~63.5 GiB per GPU and repeatedly ran out of memory on the step
+  right after a validation-time checkpoint save, so the guide uses 8 nodes. (`checkpoint.cpu_offload: true`
+  is not an option for this model yet: the RADIO state-dict export concatenates sharded tensors and fails
+  on CPU-staged DTensors.)
+- **Training time**: ~26 min on 8x8 H100 for 400 steps (4 epochs of the 800 training samples), including four
+  validation passes with checkpoint saves and the final consolidated export (~1 min); about 32 min wall clock
+  with model loading
+
+---
+
+## Step 0 — Set Up the Environment
+
+```bash
+# Inside the NeMo AutoModel container (26.04+):
+cd /opt/Automodel
+uv pip install --python /opt/venv/bin/python ".[vlm-media]"
+
+# Or from a source checkout:
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras
+```
+
+<Note>
+Nemotron 3.5 Super VL requires `mamba_ssm` and `causal_conv1d` (the `cuda` extra, pre-built in the
+NeMo AutoModel container), Transformer Engine (`attn: te`, `linear: te`) and DeepEP for
+expert dispatch. The checkpoint is ~227 GB in bf16 (63 safetensors shards); download it into
+`$HF_HOME` before launching so that all 64 ranks read from the shared cache.
+</Note>
+
+---
+
+## Step 1 — Explore the CORD-v2 Dataset
+
+[CORD-v2](https://huggingface.co/datasets/naver-clova-ix/cord-v2) contains scanned
+receipts with structured ground-truth JSON labels.
+
+```python
+import json
+from datasets import load_dataset
+
+dataset = load_dataset("naver-clova-ix/cord-v2")
+
+print(f"Train      : {len(dataset['train'])} samples")
+print(f"Validation : {len(dataset['validation'])} samples")
+print(f"Test       : {len(dataset['test'])} samples")
+
+ex = dataset["train"][0]
+gt = json.loads(ex["ground_truth"])["gt_parse"]
+print(f"\nGround-truth keys: {list(gt.keys())}")
+```
+
+Expected output:
+```
+Train      : 800 samples
+Validation : 100 samples
+Test       : 100 samples
+
+Ground-truth keys: ['menu', 'sub_total', 'total']
+```
+
+### Target Format: JSON-to-Token Conversion
+
+NeMo Automodel converts structured JSON into an XML-like **token sequence** using
+the `json2token()` function. This is the format the model is trained to produce:
+
+```
+<s_total><s_total_price>45,500</s_total_price><s_changeprice>4,500</s_changeprice>
+<s_cashprice>50,000</s_cashprice></s_total><s_menu><s_price>16,500</s_price>
+<s_nm>REAL GANACHE</s_nm><s_cnt>1</s_cnt><sep/><s_price>13,000</s_price>
+<s_nm>EGG TART</s_nm><s_cnt>1</s_cnt></s_menu>
+```
+
+---
+
+## Step 2 — Training Configuration
+
+**Config file**: `examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml`
+
+```yaml
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 400
+  val_every_steps: 100
+  max_steps: 400
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  trust_remote_code: true
+  num_nextn_predict_layers: 0
+  torch_dtype: torch.bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/nemotron_3_5_super_vl_cord_v2
+  model_save_format: safetensors
+  save_consolidated: final
+
+distributed:
+  strategy: fsdp2
+  cp_size: 8            # dp 8 on 64 GPUs -> one sample per rank per step
+  ep_size: 32           # 512 MoE experts across 32 GPUs
+  activation_checkpointing: true
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
+  split: train
+
+dataloader:
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
+    max_length: 4096
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 5.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+```
+
+Compared with the 33B NemotronOmni recipe: `ep_size` grows from 8 to 32 (512 experts),
+`cp_size=8` on 64 GPUs maps the 8-sample global batch to one sample per rank, the optimizer keeps **fp32 master weights** with
+bf16 Adam moments, and the learning rate is lowered to 5e-5 for full-parameter SFT of a 67B.
+
+### Collate function
+
+Nemotron 3.5 Super VL uses the same InternVL-style image handling as NemotronOmni: each
+`<image>` token is expanded to 256 vision embeddings per tile during the forward pass.
+The collate function extracts the images from the conversation, applies the chat template
+(which adds the `<think></think>` prefix for the assistant turn), runs the processor, and
+builds the training labels.
+
+---
+
+## Step 3 — Launch Fine-Tuning
+
+On a Slurm cluster (one task per GPU, 8 nodes):
+
+```bash
+srun --nodes=8 --ntasks-per-node=8 --gpus-per-node=8 \
+    python examples/vlm_finetune/finetune.py \
+    -c examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml
+```
+
+or with the launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 8`.
+W&B logging is opt-in: add `--wandb.enable=true --wandb.entity=<entity> --wandb.project=<project>` to either command.
+
+### Training log — Full SFT
+
+```
+Trainable parameters: 120,668,687,360
+Trainable parameters percentage: 99.31%
+
+step    0 | loss 0.5063 | grad_norm  6.40 | lr 5.00e-05 | mem 31.83 GiB
+step   10 | loss 0.1666 | grad_norm  2.93 | lr 5.00e-05 | mem 31.83 GiB
+step   50 | loss 0.0911 | grad_norm  1.13 | lr 5.00e-05 | mem 31.83 GiB
+step  100 | loss 0.0581 | grad_norm  1.33 | lr 5.00e-05 | mem 31.83 GiB
+step  200 | loss 0.0279 | grad_norm  0.96 | lr 5.00e-05 | mem 31.83 GiB
+step  300 | loss 0.0669 | grad_norm  1.18 | lr 5.00e-05 | mem 31.83 GiB
+step  399 | loss 0.0046 | grad_norm  0.26 | lr 5.00e-05 | mem 31.83 GiB
+
+Validation:
+  step  99 | val_loss 0.0610  <-- LOWEST_VAL
+  step 199 | val_loss 0.0676
+  step 299 | val_loss 0.0726
+  step 399 | val_loss 0.0755
+```
+
+As with the 33B model, training loss keeps falling through epoch 4 while validation loss is lowest
+after the first epoch and then drifts up slowly — the 800-receipt training set is small enough for a
+67B to start memorizing it.
+
+### Checkpoints saved
+
+```
+vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/
+  epoch_0_step_99/             # sharded weights + optimizer state (~1.4 TB each) + model/consolidate.sh
+  epoch_1_step_199/
+  epoch_2_step_299/
+  epoch_3_step_399/
+    model/
+      consolidate.sh
+      consolidated/            # inline HF export (save_consolidated: final), ~227 GB bf16
+        config.json
+        model.safetensors.index.json
+        model-00001-of-00063.safetensors
+        ...
+    optim/
+    rng/
+    dataloader/
+  LATEST -> epoch_3_step_399
+  LOWEST_VAL -> epoch_0_step_99
+  training.jsonl
+  validation.jsonl
+```
+
+Every validation step also writes a checkpoint so that `LOWEST_VAL` can be tracked; with fp32
+master weights and Adam moments each sharded checkpoint of this model is ~1.4 TB, so budget
+~6 TB for the run (or raise `val_every_steps`). Intermediate checkpoints stay sharded; run their
+`model/consolidate.sh` to get an HF export of `LOWEST_VAL`.
+
+---
+
+## Step 4 — Run Inference and Evaluation
+
+`examples/vlm_finetune/nemotron_3_5_super_vl/eval_cord_v2.py` loads the consolidated HF export
+across all visible GPUs (`device_map="auto"`; the bf16 weights need ~227 GB), greedy-decodes
+CORD-v2 validation receipts with the training prompt (`<image>\nDescribe this image.`,
+`enable_thinking=False`), and scores each prediction against
+`json2token(gt_parse, sort_json_key=True)`:
+
+- **exact match** — prediction identical to the ground-truth token sequence
+- **similarity** — normalized sequence similarity (difflib ratio; 1.0 = identical)
+
+```bash
+# LOWEST_VAL is an intermediate checkpoint, so export it first (the final step is exported inline)
+bash vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidate.sh
+
+python examples/vlm_finetune/nemotron_3_5_super_vl/eval_cord_v2.py \
+    --checkpoint vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidated \
+    --split validation --num-samples 20 \
+    --wandb-entity <entity> --wandb-project <project>   # optional: logs the metrics + a per-sample table
+```
+
+Passing the base checkpoint id instead of the fine-tuned export scores the un-tuned model the same way.
+
+**Resources** — one node with 8x H100 (bf16 weights spread over the GPUs).
+**Runtime** — ~2-4 min to load the 227 GB export, then ~26 s per receipt (greedy, up to 1024 new
+tokens); 20 samples take about 13 min. The un-tuned base model is slower (~55 s per sample) because
+its free-form descriptions run to the token limit.
+
+---
+
+## Step 5 — Results
+
+### Evaluation on the first 20 CORD-v2 validation samples
+
+| Model | Exact match | Mean similarity | Structured output |
+|---|---|---|---|
+| Base (`NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`) | 0/20 | 0.048 | 0/20 (free-form description of the photo) |
+| Full SFT, step 99 (`LOWEST_VAL`, val loss 0.061) | **8/20** | **0.956** (median 0.995; 17/20 above 0.9) | 20/20 |
+| Full SFT, step 399 (`LATEST`, lr=5e-5, 400 steps) | 6/20 | 0.889 (median 0.985; 15/20 above 0.9) | 20/20 |
+
+The checkpoint with the lowest validation loss also decodes best, so evaluate `LOWEST_VAL` (run its
+`model/consolidate.sh` first; the final step is the only one exported inline).
+
+The base model answers `Describe this image.` with prose ("This is a photograph of a receipt from a
+restaurant, likely a pizzeria ..."). After fine-tuning every prediction is a well-formed
+`<s_total>...</s_total><s_menu>...</s_menu>` sequence; the remaining errors are field-level (a
+dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or OCR digits.
+
+### Sample predictions (fine-tuned, step 99 / `LOWEST_VAL`)
+
+| Sample | Ground-truth menu items | Prediction vs. ground truth | Similarity |
+|--------|-------------------------|-----------------------------|------------|
+| 1 | `REAL GANACHE, EGG TART, PIZZA TOAST` | Exact match | 1.00 |
+| 2 | `Kopi Susu Kolonel` | Exact match | 1.00 |
+| 3 | `S-Ovaltine 50%` | Missing `<s_vatyn>`; items nested in an extra `<s_sub>` block | 0.91 |
+| 4 | `70%, Less Ice, M-Caramel Black Tea` | Missing `<s_tax_price>` | 0.96 |
+| 5 | `Sedang, BBQ Chicken` | Same fields, one value differs | 1.00 |
+| 6 | `LE MINERAL` | Extra `<s_unitprice>` field | 0.84 |
+| 7 | `POTATO SAUSAGE BREAD, OREO GREEN TEA SPREAD, ...` | Exact match | 1.00 |
+| 8 | `Choco Devil` | Missing `<s_cnt>` and `<s_discountprice>` | 0.88 |
+
+### Summary
+
+| | Full SFT |
+|---|---|
+| Trainable params | 120.7B (99.31%) |
+| Learning rate | 5e-5 |
+| GPU memory | ~31.8 GiB / GPU (64 GPUs) |
+| Training time (8x8 H100) | ~26 min (~32 min wall clock with model loading) |
+| Best val loss | 0.061 (step 99) |
+| Final train loss | 0.0046 (step 399; mean of last 10 steps 0.029) |
+| Checkpoint size (consolidated bf16) | ~227 GB |
+| Exact matches (20 val) | 8/20 at step 99 (`LOWEST_VAL`, mean similarity 0.96); 6/20 at step 399 (0.89) |

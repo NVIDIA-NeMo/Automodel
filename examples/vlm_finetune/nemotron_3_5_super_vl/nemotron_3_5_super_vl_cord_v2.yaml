@@ -1,0 +1,144 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nemotron 3.5 Super VL (67B hybrid Mamba+Attention MoE VLM, architectures =
+# NemotronH_Omni_Reasoning_V3) full SFT on CORD-v2 receipt field extraction.
+# Same task/format as the NemotronOmni (33B) CORD-v2 guide: the model learns to
+# emit the json2token() XML-like field sequence for a scanned receipt.
+#
+# Sizing: 8 nodes x 8 H100 like the MedPix recipe (~32 GiB/GPU): 512 experts -> ep_size 32,
+# global_batch_size 8 with cp_size 8 gives dp=8 -> one sample per rank per step; 400 steps =
+# 4 epochs of the 800-sample train split. (On 4 nodes the fp32-master optimizer state alone
+# pushes each GPU to ~63 GiB and the run can OOM around checkpoint saves.) The final
+# checkpoint is exported as consolidated HuggingFace safetensors (save_consolidated: final)
+# for the inference/eval step (see examples/vlm_finetune/nemotron_3_5_super_vl/eval_cord_v2.py).
+#
+# Run (8 nodes):
+#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 8
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 400
+  val_every_steps: 100
+  max_steps: 400
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  trust_remote_code: true
+  num_nextn_predict_layers: 0
+  torch_dtype: torch.bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/nemotron_3_5_super_vl_cord_v2
+  model_save_format: safetensors
+  save_consolidated: final
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  # cp_size 8 -> dp 8 on 64 GPUs -> one 1-sample microbatch per rank per optimizer step.
+  cp_size: 8
+  pp_size: 1
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
+    max_length: 4096
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
+    max_length: 4096
+
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: huiyingl_workspace
+  name: nemotron_3_5_super_vl_cord_v2
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  # Full-parameter SFT of a 67B: lower than the 33B guide's 1e-4, scaled for the
+  # 8-sample global batch.
+  lr: 5.0e-5
+  weight_decay: 0.01
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 8
+  time: "02:00:00"
+  max_steps: 2
