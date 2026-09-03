@@ -75,12 +75,25 @@ def test_attention_mask_none_returns_original():
     assert result is mask
 
 
-def test_no_padding_side_attr_defaults_to_right():
-    tok = SimpleNamespace()  # no padding_side attribute
+def test_layout_is_read_from_attention_mask_not_the_attribute():
+    # The offset comes from the attention mask's leading zero run, not from
+    # tokenizer.padding_side. Data prep pins the tokenizer to right padding
+    # (_pin_padding_side_right), so the attribute routinely disagrees with how
+    # these ids were actually laid out; trusting it is what let left-padded
+    # examples through with an all-ones attention mask.
+    tok = SimpleNamespace()  # no padding_side attribute at all
     mask = [0, 1, 1, 0, 0]
-    attn = [0, 0, 1, 1, 1]
+    attn = [0, 0, 1, 1, 1]  # ...but the data says: 2 leading pads
     result = _maybe_shift_mask_for_left_padding(mask, tok, attn)
-    assert result is mask, "Missing padding_side should default to right (no-op)"
+    assert result == [0, 0, 0, 1, 1]
+
+
+def test_right_padded_attention_mask_is_noop_regardless_of_attribute():
+    tok = _make_tokenizer("left")  # attribute lies; the mask is right-padded
+    mask = [0, 1, 1, 0, 0]
+    attn = [1, 1, 1, 0, 0]
+    result = _maybe_shift_mask_for_left_padding(mask, tok, attn)
+    assert result is mask
 
 
 def test_all_padding_shifts_entire_mask():
