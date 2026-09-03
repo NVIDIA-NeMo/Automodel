@@ -28,6 +28,7 @@ from nemo_automodel.components.datasets.loader import (
     _DATASET_CONFIGS,
     CollatorConfig,
     DataloaderConfig,
+    NeatPackingConfig,
     ParallelAwareDataloader,
     ThdPackingConfig,
     _resolve_target,
@@ -280,6 +281,15 @@ def test_packing_config_warns_for_ignored_legacy_field():
         config = make_packing_config("thd", {"packed_sequence_size": 8, "split_across_pack": False})
 
     assert isinstance(config, ThdPackingConfig)
+
+
+def test_neat_packing_requires_contract():
+    config = NeatPackingConfig(packed_sequence_size=8)
+
+    with pytest.raises(TypeError, match="packing_contract"):
+        config.build([])
+    with pytest.raises(ValueError, match="PackedSequenceContract"):
+        config.build([], packing_contract=None)
 
 
 def test_megatron_loader_preserves_schedule_and_sampler_config():

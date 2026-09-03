@@ -31,7 +31,7 @@ from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from dataclasses import dataclass, field, fields, is_dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast, runtime_checkable
 
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from torch.utils.data.sampler import Sampler
@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CollateFn = Callable[[list[object]], object]
+PackingContractT = TypeVar("PackingContractT", contravariant=True)
 
 
 class PlainDatasetConfig(Protocol):
@@ -138,7 +139,7 @@ def _shard_iterable_dataset(dataset: Any, *, dp_rank: int, dp_world_size: int) -
 
 
 @dataclass
-class PackingConfig:
+class PackingConfig(Generic[PackingContractT]):
     """Base config for sequence packing; ``None`` (no config) means no packing.
 
     Subclasses (:class:`ThdPackingConfig` / :class:`NeatPackingConfig`) pick the packing strategy and the
@@ -185,14 +186,14 @@ class PackingConfig:
         supports_seq_lens: bool = True,
         pad_token_id: int = 0,
         cp_size: int = 1,
-        packing_contract: PackedSequenceContract | None = None,
+        packing_contract: PackingContractT,
     ) -> tuple[object, CollateFn | None]:
         """Pack ``dataset`` and return ``(dataset, collate_fn)``."""
         raise NotImplementedError
 
 
 @dataclass
-class ThdPackingConfig(PackingConfig):
+class ThdPackingConfig(PackingConfig[None]):
     """THD (flattened, ``seq_lens``-based) packing; pairs with ``packed_sequence_thd_collater``.
 
     Requires a model whose forward accepts ``seq_lens`` — packing is skipped (with a warning) otherwise.
@@ -207,7 +208,7 @@ class ThdPackingConfig(PackingConfig):
         supports_seq_lens: bool = True,
         pad_token_id: int = 0,
         cp_size: int = 1,
-        packing_contract: PackedSequenceContract | None = None,
+        packing_contract: None = None,
     ) -> tuple[object, CollateFn | None]:
         """Pack with THD; returns ``(dataset, None)`` if the model does not accept ``seq_lens``."""
         del packing_contract
@@ -233,7 +234,7 @@ class ThdPackingConfig(PackingConfig):
 
 
 @dataclass
-class NeatPackingConfig(PackingConfig):
+class NeatPackingConfig(PackingConfig[PackedSequenceContract]):
     """NEAT (bin-packed) packing paired with ``neat_packed_collater``."""
 
     drop_long_samples: bool = True
@@ -247,10 +248,12 @@ class NeatPackingConfig(PackingConfig):
         supports_seq_lens: bool = True,
         pad_token_id: int = 0,
         cp_size: int = 1,
-        packing_contract: PackedSequenceContract | None = None,
+        packing_contract: PackedSequenceContract,
     ) -> tuple[object, CollateFn]:
         """Pack with NEAT and configure the collator for the selected attention implementation."""
         del supports_seq_lens, cp_size
+        if packing_contract is None:
+            raise ValueError("NEAT packing requires a PackedSequenceContract")
         from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
         from nemo_automodel.components.datasets.utils import neat_packed_collater
 
@@ -269,7 +272,7 @@ class NeatPackingConfig(PackingConfig):
         return dataset, partial(neat_packed_collater, packing=packing_contract)
 
 
-_PACKING_CONFIGS: dict[str, type[PackingConfig]] = {
+_PACKING_CONFIGS: dict[str, type[PackingConfig[Any]]] = {
     "thd": ThdPackingConfig,
     "neat": NeatPackingConfig,
 }
@@ -296,7 +299,7 @@ def _resolve_target(target: Any, registry: dict[str, Any]) -> Any:
     return getattr(importlib.import_module(module_path), attr)
 
 
-def make_packing_config(target: str | None, kwargs: dict[str, object] | None = None) -> PackingConfig | None:
+def make_packing_config(target: str | None, kwargs: dict[str, object] | None = None) -> PackingConfig[Any] | None:
     """Resolve a packing-config ``target`` and construct it from ``kwargs`` (``target=None`` → no packing).
 
     ``target`` is either a built-in strategy key (``"thd"`` / ``"neat"``) or a dotted import path to
@@ -580,7 +583,7 @@ class DataloaderConfig:
     """
 
     dataset_config: DatasetConfig
-    packing: PackingConfig | None = None
+    packing: PackingConfig[Any] | None = None
     batch_sampler_config: BatchSamplerConfig | None = None
     dataset_build_schedule: DatasetBuildSchedule | None = None
     shuffle: bool | None = None

@@ -249,6 +249,8 @@ class VlmDataloaderConfig:
         if self.packing is not None:
             if self.pretokenization is None:
                 raise ValueError("VLM neat packing requires pretokenization")
+            if self.packing.packing_format != "thd" and packing_contract is None:
+                raise ValueError("NEAT packing requires a PackedSequenceContract")
             tokenizer = getattr(processor, "tokenizer", None)
             padding_idx = getattr(tokenizer, "pad_token_id", 0) or 0
             dataset = self.packing.build(
@@ -267,6 +269,7 @@ class VlmDataloaderConfig:
                     max_length=self.packing.collate_max_length,
                 )
             else:
+                assert packing_contract is not None
                 materialize_4d_mask = cp_size <= 1
                 if not materialize_4d_mask:
                     logger.info(

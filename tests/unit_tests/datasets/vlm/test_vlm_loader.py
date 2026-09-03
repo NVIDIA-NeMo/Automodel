@@ -273,6 +273,26 @@ def test_vlm_dataloader_selects_thd_collater(monkeypatch):
     assert packing_kwargs["cp_size"] == 4
 
 
+def test_vlm_dataloader_neat_packing_requires_contract(monkeypatch):
+    processor = DummyProcessor()
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+        pretokenization=PreTokenizedDatasetWrapperConfig(),
+        packing=NeatPackConfig(),
+        shuffle=False,
+    )
+
+    with pytest.raises(ValueError, match="PackedSequenceContract"):
+        config.build(
+            pretrained_model_name_or_path="unused",
+            dp_rank=0,
+            dp_world_size=1,
+            batch_size=2,
+        )
+
+
 def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
     processor = DummyProcessor()
     monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)

@@ -509,7 +509,7 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
 def neat_packed_collater(
     batch: list[dict],
     *,
-    packing: PackedSequenceContract | None = None,
+    packing: PackedSequenceContract,
 ) -> dict:
     """Collater for neat-packed LLM sequences.
 
@@ -536,7 +536,7 @@ def neat_packed_collater(
     labels = batchify(torch.stack([torch.as_tensor(x["labels"]) for x in batch]))
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
-    packed_mask_type = packing.packed_mask_type if packing is not None else "block_causal"
+    packed_mask_type = packing.packed_mask_type
 
     if packed_mask_type == "document_ids":
         mask_out = attention_mask
@@ -551,9 +551,9 @@ def neat_packed_collater(
         "position_ids": position_ids,
         "attention_mask": mask_out,
     }
-    if packing is not None and packing.requires_packed_sequence_metadata:
+    if packing.requires_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
-    if attention_mask.max() > 1 or (packing is not None and packing.requires_packed_sequence_metadata):
+    if attention_mask.max() > 1 or packing.requires_packed_sequence_metadata:
         result["_packed_seq_ids"] = attention_mask
     return result
 

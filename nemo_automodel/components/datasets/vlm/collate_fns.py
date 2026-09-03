@@ -1510,7 +1510,8 @@ def neat_packed_vlm_collater(
     batch: list[dict],
     padding_idx: int = 0,
     max_length: int | None = None,
-    packing: PackedSequenceContract | None = None,
+    *,
+    packing: PackedSequenceContract,
     materialize_4d_mask: bool = True,
 ) -> dict:
     """Collater for neat-packed VLM sequences.
@@ -1548,7 +1549,7 @@ def neat_packed_vlm_collater(
         return {}
 
     LABEL_PAD = -100
-    packed_mask_type = packing.packed_mask_type if packing is not None else "block_causal"
+    packed_mask_type = packing.packed_mask_type
     if packed_mask_type not in ("block_causal", "document_ids"):
         raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
 
@@ -1613,7 +1614,7 @@ def neat_packed_vlm_collater(
         "attention_mask": attention_mask_out,
         "mm_token_type_ids": mm_token_type_ids,
     }
-    if packing is not None and packing.requires_packed_sequence_metadata:
+    if packing.requires_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
 
     # Store indexed attention mask for loss functions that need per-sample
@@ -1621,11 +1622,7 @@ def neat_packed_vlm_collater(
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
     # ``attention_mask_out`` is already converted to 4D, so keep a copy.
     has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
-    if (
-        has_multiple_docs
-        or not materialize_4d_mask
-        or (packing is not None and packing.requires_packed_sequence_metadata)
-    ):
+    if has_multiple_docs or not materialize_4d_mask or packing.requires_packed_sequence_metadata:
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)

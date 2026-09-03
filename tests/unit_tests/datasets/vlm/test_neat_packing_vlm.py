@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -330,6 +332,10 @@ class TestNeatPackDatasetVlm:
 
 
 class TestNeatPackedVlmCollater:
+    def test_requires_packing_contract(self):
+        with pytest.raises(TypeError, match="packing"):
+            neat_packed_vlm_collater([])
+
     def test_collater(self):
         batch = [
             {
@@ -353,7 +359,13 @@ class TestNeatPackedVlmCollater:
                 "image_grid_thw": torch.tensor([[1, 224, 224], [1, 224, 224]]),
             },
         ]
-        result = neat_packed_vlm_collater(batch)
+        result = neat_packed_vlm_collater(
+            batch,
+            packing=SimpleNamespace(
+                packed_mask_type="block_causal",
+                requires_packed_sequence_metadata=False,
+            ),
+        )
 
         assert result["input_ids"].shape == (2, 4)
         assert result["labels"].shape == (2, 4)
@@ -501,7 +513,13 @@ class TestMRoPESupport:
                 "n_videos": 0,
             },
         ]
-        result = neat_packed_vlm_collater(batch)
+        result = neat_packed_vlm_collater(
+            batch,
+            packing=SimpleNamespace(
+                packed_mask_type="block_causal",
+                requires_packed_sequence_metadata=False,
+            ),
+        )
 
         # position_ids should be [3, B=2, S=4]
         assert result["position_ids"].shape == (3, 2, 4)
