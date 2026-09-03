@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -200,6 +201,49 @@ def test_sparse_visual_window_indices_match_released_reference(types):
     expected = torch.where(expected > (idx + right).unsqueeze(-1), -1, expected)
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("provide_metadata", [False, True])
+def test_text_only_vision_forward_keeps_sparse_attention_fast_path(provide_metadata):
+    config = _vision_config(
+        hidden_size=16,
+        moe_intermediate_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        qk_rope_head_dim=4,
+        q_lora_rank=8,
+        o_lora_rank=8,
+        o_groups=2,
+        n_shared_experts=0,
+        max_position_embeddings=32,
+        hc_mult=2,
+        compress_ratios=[0],
+        sliding_window=4,
+    )
+    backend = BackendConfig(
+        attn="sdpa",
+        linear="torch",
+        rms_norm="torch",
+        rope_fusion=False,
+        enable_hf_state_dict_adapter=False,
+        dispatcher="torch",
+        experts="torch_mm",
+    )
+    model = DeepseekV4ForCausalLM(config, backend=backend).eval()
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    input_ids = torch.arange(8).unsqueeze(0)
+    kwargs = {"attention_mask": torch.ones_like(input_ids)}
+    if provide_metadata:
+        kwargs["vision_token_types"] = torch.full_like(input_ids, -1)
+
+    layer = model.model.layers["0"]
+    with patch.object(layer, "forward", wraps=layer.forward) as layer_forward, torch.inference_mode():
+        output = model(input_ids, **kwargs)
+
+    assert output.logits.shape[:2] == input_ids.shape
+    assert layer_forward.call_args.kwargs["vision_token_types"] is None
 
 
 def _moe_config() -> MoEConfig:

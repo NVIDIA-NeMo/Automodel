@@ -856,6 +856,8 @@ class DeepseekV4Model(nn.Module):
             if vision_token_types is not None and vision_token_types.dim() == 1:
                 vision_token_types = vision_token_types.unsqueeze(0)
             has_visual_tokens = vision_token_types is not None and bool((vision_token_types >= 0).any().item())
+            if not has_visual_tokens:
+                vision_token_types = None
             if inputs_embeds is None:
                 if (input_ids < 0).any():
                     raise ValueError("DeepSeek-V4 input_ids cannot be negative")
@@ -993,6 +995,9 @@ class DeepseekV4Model(nn.Module):
                     "multi-axis visual-span masking is not supported"
                 )
             attention_mask_4d = apply_deepseek_v4_image_visibility(attention_mask_4d, vision_token_types)
+        else:
+            # Keep text-only batches on the original causal sparse-attention width.
+            vision_token_types = None
 
         # ``input_ids`` is only meaningful for hash-routing layers, which live
         # on stage 0 (num_hash_layers <= layers per stage 0).  Mid-stages pass
