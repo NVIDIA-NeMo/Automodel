@@ -21,6 +21,15 @@
 # Wall-clock cross-check: 4096 rows x 2048 tok = 8.39M tokens/step at ~53 s.
 # Peak memory 139.6 GiB per GPU (44 GiB headroom on 184 GiB HBM).
 #
+# Measurement provenance: taken before #3792 aligned the KimiK3TextConfig
+# defaults with the released checkpoint (from_config then built a 56-head MLA
+# / 18432-wide dense FFN model, ~101.5B active matmul params instead of
+# 104.0B). On the checkpoint-aligned shape this file builds today expect ~2%
+# fewer tok/s at about the same MFU and ~1 GiB more per GPU; a re-measurement
+# on the aligned shape will replace the figures above. Run the file through
+# nemo_automodel/recipes/llm/benchmark.py --config <this file> for the
+# recipe's own per-iteration MFU and Average MFU summary.
+#
 # Why 2k rows beat the 1k config (13.7% MFU) by 3.4pp: at this scale the
 # workload is launch-bound, so doubling tokens per row halves the per-token
 # kernel-launch tax, and K3's KDA linear attention does not penalize longer
