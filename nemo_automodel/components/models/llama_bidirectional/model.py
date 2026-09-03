@@ -213,6 +213,11 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    @property
+    def effective_score_temperature(self) -> float:
+        """Return the temperature applied to score logits by this model."""
+        return float(self.config.temperature)
+
     # TODO: remove this once we upgrade to transformers 5.9.x
     @torch.no_grad()
     def _init_weights(self, module):

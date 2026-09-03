@@ -18,7 +18,7 @@ import inspect
 import os
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional, Protocol, runtime_checkable
 
 import torch
 import torch.nn as nn
@@ -53,6 +53,12 @@ logger = logging.get_logger(__name__)
 
 _BI_ENCODER_DEFAULT_POOLING = "avg"
 _BI_ENCODER_DEFAULT_L2_NORMALIZE = True
+
+
+@runtime_checkable
+class _EffectiveScoreTemperatureProvider(Protocol):
+    @property
+    def effective_score_temperature(self) -> float: ...
 
 
 def _canonicalize_bi_encoder_pooling(pooling: str) -> str:
@@ -900,6 +906,18 @@ class CrossEncoderModel(nn.Module):
     def __init__(self, model: PreTrainedModel):
         super().__init__()
         _init_encoder_common(self, model)
+
+    @property
+    def effective_score_temperature(self) -> float:
+        """Return the model-side temperature applied to score logits.
+
+        Returns:
+            The divisor applied inside the scoring backbone, or ``1.0`` when
+            the backbone returns unscaled scores.
+        """
+        if not isinstance(self.model, _EffectiveScoreTemperatureProvider):
+            return 1.0
+        return float(self.model.effective_score_temperature)
 
     @classmethod
     def build(

@@ -1504,6 +1504,7 @@ def test_mistral3_vlm_crossencoder_scores_vision_inputs_and_backpropagates():
     config.vision_config._attn_implementation = "eager"
     model = Mistral3VLBidirectionalForSequenceClassification(config)
 
+    assert model.effective_score_temperature == 0.5
     model.eval()
     text_only_input_ids = torch.tensor([[1, 2, 3, 4]])
     modified_input_ids = text_only_input_ids.clone()

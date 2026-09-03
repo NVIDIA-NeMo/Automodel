@@ -79,12 +79,47 @@ eval_datasets["MMTEB_RETRIEVAL_QUICK"] = [
     ("MMTEB_RETRIEVAL_QUICK", " --max_length 4096 "),
 ]
 
+eval_datasets["RERANK_MMTEB_RETRIEVAL_QUICK"] = [
+    (
+        "MMTEB_RETRIEVAL_QUICK",
+        " --eval_type mteb --max_length 8192 ",
+    ),
+]
+
+eval_datasets["LONG_EMBED"] = [
+    ("LONG_EMBED", " --max_length 32768 --batch_size 1 "),
+]
+
+eval_datasets["RERANK_LONG_EMBED"] = [
+    (
+        "LONG_EMBED",
+        " --eval_type mteb --max_length 32768 --batch_size 1 "
+        "--embedding_results /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/embedding_predictions_31_gabriel_08-26-034305 ",
+    ),
+]
+
 eval_datasets["RTEB_QUICK"] = [
     ("RTEB_QUICK", " --max_length 4096 "),
 ]
 
+eval_datasets["RERANK_RTEB_QUICK"] = [
+    (
+        "RTEB_QUICK",
+        " --eval_type mteb --max_length 8192 "
+        "--embedding_results /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/embedding_predictions_31_gabriel_08-26-034305 ",
+    ),
+]
+
 eval_datasets["RTEB"] = [
     ("RTEB", " --max_length 4096 "),
+]
+
+eval_datasets["RERANK_RTEB"] = [
+    (
+        "RTEB",
+        " --eval_type mteb --max_length 8192 "
+        "--embedding_results /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/embedding_predictions_31_gabriel_08-26-034305 ",
+    ),
 ]
 
 eval_datasets["vidore_v3_complex_ocr"] = [
@@ -114,18 +149,23 @@ eval_datasets["VISION_EVAL"] = [
 ]
 
 eval_datasets["RERANK_VISION_EVAL"] = [
-    ("dc10k", " --dataset_mapping VISION_EVAL --corpus_modalities image "),
+    (
+        "dc10k "
+        "vidore_v3_military_technical_reports "
+        "vidore_v3_education_computer_science_en "
+        "vidore_v3_energy_reports_fr "
+        "vidore_v3_luxury_financial_reports_fr",
+        " --dataset_mapping VISION_EVAL --corpus_modalities image --eval_type beir_reranker_eval "
+        "--embedding_results embedding_results/gabriel_31_1B_08-26-034305_image.json ",
+    ),
     (
         "earnings_v2 "
         "vidore_v3_finance_bank_reports_en "
-        "vidore_v3_military_technical_reports "
-        "vidore_v3_education_computer_science_en "
         "vidore_v3_healthcare_fda_en "
         "vidore_v3_hr_european_reports_en "
-        "vidore_v3_energy_reports_fr "
-        "vidore_v3_education_physics_fr "
-        "vidore_v3_luxury_financial_reports_fr",
-        " --dataset_mapping VISION_EVAL --corpus_modalities image ",
+        "vidore_v3_education_physics_fr",
+        " --dataset_mapping VISION_EVAL --corpus_modalities image --eval_type beir_reranker_eval "
+        "--embedding_results embedding_results/gabriel_31_1B_08-26-034305_image.json ",
     ),
 ]
 
@@ -140,11 +180,27 @@ eval_datasets["MIRACL_VISION"] = [
     ),
 ]
 
-eval_datasets["CHINESE_KOREAN_VIDORE"] = [
+eval_datasets["CHINESE_KOREAN_VIDORE_VISION"] = [
     (
         "kovidore_v2_cybersecurity kovidore_v2_economic kovidore_v2_energy kovidore_v2_hr "
         "zhvidore_v1_ocr",
-        " --eval_type beir_embedding_eval ",
+        " --eval_type beir_embedding_eval --dataset_mapping CHINESE_KOREAN_VIDORE --corpus_modalities image ",
+    ),
+]
+
+eval_datasets["CHINESE_KOREAN_VIDORE_TEXT"] = [
+    (
+        "kovidore_v2_cybersecurity kovidore_v2_economic kovidore_v2_energy kovidore_v2_hr "
+        "zhvidore_v1_ocr",
+        " --eval_type beir_embedding_eval --dataset_mapping CHINESE_KOREAN_VIDORE --corpus_modalities text complex_ocr ",
+    ),
+]
+
+eval_datasets["CHINESE_KOREAN_VIDORE_TEXT_PLUS_VISION"] = [
+    (
+        "kovidore_v2_cybersecurity kovidore_v2_economic kovidore_v2_energy kovidore_v2_hr "
+        "zhvidore_v1_ocr",
+        " --eval_type beir_embedding_eval --dataset_mapping CHINESE_KOREAN_VIDORE --corpus_modalities image text complex_ocr ",
     ),
 ]
 
@@ -174,7 +230,16 @@ eval_datasets["TEXT_EVAL"] = [
 
 eval_datasets["RERANK_TEXT_EVAL"] = [
     (
-        "bo767_text earnings_text fiqa nq_sample35 hotpotqa_sample35 techqa_beir "
+        "dc10k_complex_ocr earnings_v2_complex_ocr "
+        "vidore_v3_finance_bank_reports_en_complex_ocr "
+        "vidore_v3_military_technical_reports_complex_ocr "
+        "vidore_v3_education_computer_science_en_complex_ocr "
+        "vidore_v3_healthcare_fda_en_complex_ocr "
+        "vidore_v3_hr_european_reports_en_complex_ocr "
+        "vidore_v3_energy_reports_fr_complex_ocr "
+        "vidore_v3_education_physics_fr_complex_ocr "
+        "vidore_v3_luxury_financial_reports_fr_complex_ocr "
+        "fiqa nq_sample35 hotpotqa_sample35 techqa_beir "
         "miracl_ar_sample miracl_de_sample miracl_en_sample miracl_es_sample "
         "miracl_fi_sample miracl_fr_sample miracl_ja_sample miracl_ko_sample "
         "miracl_ru_sample miracl_th_sample miracl_zh_sample "
@@ -183,8 +248,9 @@ eval_datasets["RERANK_TEXT_EVAL"] = [
         "test-context-vi-question-ar test-context-zh-question-en "
         "test-context-es-question-vi "
         "mldr_en_sample_bge_400query mldr_it_full mldr_pt_full mldr_ja_full mldr_de_full",
-        " --dataset_mapping small_textqa_eval_20250508 "
-        "--corpus_modalities text --use_text_in_document True ",
+        " --dataset_mapping TEXT_EVAL "
+        "--corpus_modalities text --use_text_in_document True --eval_type beir_reranker_eval "
+        "--embedding_results embedding_results/gabriel_31_1B_08-26-034305_text.json ",
     ),
 ]
 
@@ -198,6 +264,29 @@ eval_datasets["TEXT_PLUS_VISION_EVAL"] = [
         "vidore_v3_luxury_financial_reports_fr ",
         " --eval_type beir_embedding_eval --corpus_modalities image text complex_ocr ",
     )
+]
+
+eval_datasets["RERANK_TEXT_PLUS_VISION_EVAL"] = [
+    (
+        "dc10k "
+        "vidore_v3_military_technical_reports "
+        "vidore_v3_education_computer_science_en "
+        "vidore_v3_energy_reports_fr "
+        "vidore_v3_luxury_financial_reports_fr",
+        " --dataset_mapping TEXT_PLUS_VISION_EVAL "
+        "--corpus_modalities image text complex_ocr --use_text_in_document True --eval_type beir_reranker_eval "
+        "--embedding_results embedding_results/gabriel_31_1B_08-26-034305_image_text_complex_ocr.json ",
+    ),
+    (
+        "earnings_v2 "
+        "vidore_v3_finance_bank_reports_en "
+        "vidore_v3_healthcare_fda_en "
+        "vidore_v3_hr_european_reports_en "
+        "vidore_v3_education_physics_fr",
+        " --dataset_mapping TEXT_PLUS_VISION_EVAL "
+        "--corpus_modalities image text complex_ocr --use_text_in_document True --eval_type beir_reranker_eval "
+        "--embedding_results embedding_results/gabriel_31_1B_08-26-034305_image_text_complex_ocr.json ",
+    ),
 ]
 
 def get_script(

@@ -152,6 +152,7 @@ checkpoint:
   checkpoint_dir: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/ministral3_1b_gabriel_stage_1_epoch_1
   model_save_format: safetensors
   save_consolidated: final
+  max_recent_checkpoints: 2
   #restore_from: /lustre/fsw/portfolios/datascience/users/gmoreira/model_checkpoints/ministral3_3b_vl/ministral3_3b_fp8_ac_all_fsdp2_lr2e6-20260713/epoch_0_step_1856
 
 distributed:

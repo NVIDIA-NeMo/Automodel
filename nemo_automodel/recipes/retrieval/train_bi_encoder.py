@@ -281,6 +281,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self.temperature = self.cfg.get("temperature", 1.0)
 
+    def _validate_model(self, model: torch.nn.Module) -> None:
+        """Validate the constructed model before building dependent components."""
+        del model
+
     def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
         """Build optimizer parameter groups for trainable model parameters."""
         model = self.model_parts[0]
@@ -373,6 +377,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 **kwargs,
             )
 
+        self._validate_model(_unwrap_model_for_attrs(model))
         self.model_parts = [model]
         self.pp = None
 
@@ -508,8 +513,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
                     # Poll per step; the StepScheduler iterators stop on the flag.
                     if self.step_scheduler.sigterm_received:
-                        logger.info("Preemption signal received at step %d; stopping cleanly.",
-                                    self.step_scheduler.step)
+                        logger.info(
+                            "Preemption signal received at step %d; stopping cleanly.", self.step_scheduler.step
+                        )
         finally:
             if pbar is not None:
                 pbar.close()

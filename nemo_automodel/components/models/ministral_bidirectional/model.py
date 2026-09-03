@@ -421,6 +421,11 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
         supports_pp: bool = False
         supports_ep: bool = False
 
+    @property
+    def effective_score_temperature(self) -> float:
+        """Return the temperature applied to score logits by this model."""
+        return float(self.config.temperature)
+
     @classmethod
     def from_pretrained(
         cls,
