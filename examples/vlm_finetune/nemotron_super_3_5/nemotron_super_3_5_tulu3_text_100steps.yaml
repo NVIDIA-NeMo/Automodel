@@ -21,9 +21,7 @@
 # vision tower included) with the vision/audio towers frozen and a text-only
 # dataset (make_tulu3_dataset emits conversations with no image entries), so
 # only the "Nemotron Super" LLM half is ever exercised in the forward/backward
-# pass. Companion baseline to the MedPix VLM run
-# (nemotron_super_3_5_medpix_100steps.yaml) in this same directory, isolating
-# LLM-only convergence.
+# pass, isolating LLM-only convergence.
 #
 # Run:
 #   automodel examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_tulu3_text_100steps.yaml --nproc-per-node 8
