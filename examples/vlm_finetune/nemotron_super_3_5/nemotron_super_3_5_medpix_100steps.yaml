@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nemotron Super 3.5 (vision-pretrained checkpoint, architectures =
+# Nemotron 3.5 Super VL (vision-pretrained checkpoint, architectures =
 # NemotronH_Omni_Reasoning_V3) VLM fine-tuning on MedPix-VQA. Exercises the
 # full omni forward pass: RADIO v2.5-H vision tower -> vision projector ->
 # "Nemotron Super" NemotronH hybrid Mamba+Attention MoE LLM backbone. This

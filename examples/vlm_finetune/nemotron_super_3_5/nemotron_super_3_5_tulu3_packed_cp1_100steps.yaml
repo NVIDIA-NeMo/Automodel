@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nemotron Super 3.5 packed-sequence CP parity baseline: cp_size=1.
+# Nemotron 3.5 Super VL packed-sequence CP parity baseline: cp_size=1.
 # Text-only Tulu-3, packed to 8192-token THD rows (real tokens, not padding),
 # on a single 8-GPU node. Companion recipe
 # nemotron_super_3_5_tulu3_packed_cp8_100steps.yaml is identical except
