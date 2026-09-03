@@ -217,7 +217,14 @@ def build_dsv4_sparse_topk_indices(
     vision_token_types: torch.Tensor | None = None,
     max_image_tokens: int = 0,
 ) -> torch.Tensor:
-    """Build Miles-style top-k key indices for DSV4 local-window + compressed KV attention."""
+    """Build Miles-style top-k key indices for DSV4 local-window + compressed KV attention.
+
+    Args:
+        vision_token_types: Optional pseudo-token types with shape ``[batch, sequence]``. Text positions
+            contain ``-1``; image spans contain ``IMAGE_START``, ``IMAGE``, and ``IMAGE_END`` token types.
+            When provided with ``max_image_tokens > 0``, image queries additionally see the full image span.
+        max_image_tokens: Maximum number of tokens in an image span. ``0`` disables visual windowing.
+    """
     vanilla_key_len = seq_len if vanilla_key_len is None else vanilla_key_len
     window = min(vanilla_key_len, window_size)
     if q_positions is None:
