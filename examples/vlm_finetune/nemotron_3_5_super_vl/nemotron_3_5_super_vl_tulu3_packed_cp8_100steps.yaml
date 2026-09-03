@@ -12,18 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nemotron 3.5 Super VL packed-sequence CP parity test: cp_size=8.
-# Identical to nemotron_super_3_5_tulu3_packed_cp1_100steps.yaml except
-# cp_size=8 / ep_size=1 -- the 8192-token packed row is sharded to 1024
-# tokens/rank. With shuffle=false both runs consume identical data per
-# optimizer step, so their loss curves must overlap; that overlap is the
-# CP-correctness check for the packed THD path through the NemotronH
-# hybrid Mamba+Attention MoE backbone.
+# Nemotron 3.5 Super VL packed-sequence SFT with context parallelism: cp_size=8.
+# Text-only Tulu-3 packed into 8192-token THD rows (real tokens, no fake images);
+# each row is sharded to 1024 tokens/rank through the packed THD path of the
+# NemotronH hybrid Mamba+Attention MoE backbone. 512 experts -> ep_size 32.
 #
-# world = tp1 * cp8 * pp1 = 8 (dp=1); ep1 | dp*cp = 1 * 8 = 8.
+# world = tp1 * cp8 * pp1 * dp4 = 32 (4 nodes x 8 GPUs); ep32 = dp*cp.
 #
-# Run:
-#   automodel examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_tulu3_packed_cp8_100steps.yaml --nproc-per-node 8
+# Run (4 nodes):
+#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml --nproc-per-node 8 --nnodes 4
 
 recipe: FinetuneRecipeForVLM
 
@@ -137,7 +134,7 @@ wandb:
   enable: true
   entity: Nemo-automodel
   project: huiyingl_workspace
-  name: nemotron_super_3_5_tulu3_packed_cp8_100steps
+  name: nemotron_3_5_super_vl_tulu3_packed_cp8_100steps
 
 ci:
   recipe_owner: HuiyingLi

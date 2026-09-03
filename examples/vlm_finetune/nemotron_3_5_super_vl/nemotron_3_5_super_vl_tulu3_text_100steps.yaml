@@ -22,11 +22,11 @@
 # dataset (make_tulu3_dataset emits conversations with no image entries), so
 # only the "Nemotron Super" LLM half is ever exercised in the forward/backward
 # pass. Companion baseline to the MedPix VLM run
-# (nemotron_super_3_5_medpix_100steps.yaml) in this same directory, isolating
+# (nemotron_3_5_super_vl_medpix_100steps.yaml) in this same directory, isolating
 # LLM-only convergence.
 #
 # Run:
-#   automodel examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_tulu3_text_100steps.yaml --nproc-per-node 8
+#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 
@@ -119,7 +119,7 @@ wandb:
   enable: true
   entity: Nemo-automodel
   project: huiyingl_workspace
-  name: nemotron_super_3_5_tulu3_text_100steps
+  name: nemotron_3_5_super_vl_tulu3_text_100steps
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam

@@ -19,10 +19,10 @@
 # checkpoint ships no sound_config (vision-pretrained stage), so the audio
 # tower is absent -- freeze_audio_tower is a no-op here but kept for parity
 # with the other nemotron_omni recipes. Companion to the text-only Tulu-3
-# run (nemotron_super_3_5_tulu3_text_100steps.yaml) in this same directory.
+# run (nemotron_3_5_super_vl_tulu3_text_100steps.yaml) in this same directory.
 #
 # Run:
-#   automodel examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_medpix_100steps.yaml --nproc-per-node 8
+#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_medpix_100steps.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 
@@ -115,7 +115,7 @@ wandb:
   enable: true
   entity: Nemo-automodel
   project: huiyingl_workspace
-  name: nemotron_super_3_5_medpix_100steps
+  name: nemotron_3_5_super_vl_medpix_100steps
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
