@@ -223,15 +223,23 @@ def _get_text_backbone(model: PreTrainedModel) -> tuple[nn.Module, object]:
 
 
 def _get_native_text_backbone_is_causal(model: PreTrainedModel) -> bool:
-    """Return the uniform attention policy declared by a model's text backbone."""
+    """Return the effective native attention policy declared by a model's text backbone."""
     text_backbone, text_config = _get_text_backbone(model)
+    native_decoder_policy = _get_config_value(text_config, "is_decoder")
+    if native_decoder_policy is not None and not isinstance(native_decoder_policy, bool):
+        raise ValueError("Native retrieval is_decoder policy must be a boolean.")
+
     native_policies = {
         policy for module in text_backbone.modules() if isinstance((policy := getattr(module, "is_causal", None)), bool)
     }
     if len(native_policies) > 1:
         raise ValueError("Retrieval text backbone exposes inconsistent native is_causal policies.")
+    if native_decoder_policy is True:
+        return True
     if native_policies:
         return next(iter(native_policies))
+    if native_decoder_policy is not None:
+        return native_decoder_policy
 
     native_policy = getattr(text_config, "is_causal", False)
     if not isinstance(native_policy, bool):
@@ -265,8 +273,12 @@ def _set_text_backbone_is_causal(model: PreTrainedModel, is_causal: bool) -> Non
     text_backbone, text_config = _get_text_backbone(model)
     if isinstance(text_config, dict):
         text_config["is_causal"] = is_causal
+        if isinstance(text_config.get("is_decoder"), bool):
+            text_config["is_decoder"] = is_causal
     else:
         text_config.is_causal = is_causal
+        if isinstance(_get_config_value(text_config, "is_decoder"), bool):
+            text_config.is_decoder = is_causal
 
     for module in text_backbone.modules():
         if hasattr(module, "is_causal"):
@@ -302,7 +314,6 @@ def _build_backbone_from_extracted_submodel(
     model_type = getattr(text_config, "model_type", "")
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
     has_supported_target = task_map is not None and task in task_map
-
     # "score" and "embedding" both have a generic fallback below, so a model type that is
     # registered for only one of them must not hard-fail on the other.
     if task_map is not None and not has_supported_target and task not in ("score", "embedding"):

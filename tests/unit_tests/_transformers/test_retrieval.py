@@ -811,16 +811,21 @@ def test_direct_retrieval_wrapper_constructor_applies_causality(encoder_class):
 
 @pytest.mark.parametrize("encoder_class", ["bi", "cross"])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_encoder_only_backbones_receive_causality_policy(encoder_class, is_causal):
+@pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
+def test_encoder_only_backbones_apply_causality_policy(encoder_class, is_causal, attn_implementation):
     from nemo_automodel._transformers import retrieval
 
+    torch.manual_seed(42)
     config = BertConfig(
         vocab_size=32,
         hidden_size=16,
         intermediate_size=32,
         num_hidden_layers=1,
         num_attention_heads=2,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
     )
+    config._attn_implementation = attn_implementation
     if encoder_class == "bi":
         backbone = BertModel(config)
         retrieval.BiEncoderModel(backbone, is_causal=is_causal)
@@ -831,7 +836,45 @@ def test_encoder_only_backbones_receive_causality_policy(encoder_class, is_causa
         text_model = backbone.bert
 
     assert backbone.config.is_causal is is_causal
+    assert backbone.config.is_decoder is is_causal
     assert all(layer.attention.self.is_causal is is_causal for layer in text_model.encoder.layer)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    changed_ids = input_ids.clone()
+    changed_ids[0, -1] = 5
+    attention_mask = torch.ones_like(input_ids)
+    text_model.eval()
+    with torch.no_grad():
+        original = text_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        changed = text_model(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
+
+    if is_causal:
+        torch.testing.assert_close(original[0, 0], changed[0, 0])
+    else:
+        assert not torch.allclose(original[0, 0], changed[0, 0], atol=1e-6)
+
+
+@pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
+def test_cross_encoder_preserves_native_bert_decoder_mode(attn_implementation):
+    from nemo_automodel._transformers import retrieval
+
+    config = BertConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        is_decoder=True,
+    )
+    config._attn_implementation = attn_implementation
+    backbone = BertForSequenceClassification(config)
+
+    encoder = retrieval.CrossEncoderModel(backbone)
+
+    assert encoder.is_causal is True
+    assert backbone.config.is_causal is True
+    assert backbone.config.is_decoder is True
+    assert all(layer.attention.self.is_causal is True for layer in backbone.bert.encoder.layer)
 
 
 def test_explicit_is_causal_rejects_non_boolean_value():
