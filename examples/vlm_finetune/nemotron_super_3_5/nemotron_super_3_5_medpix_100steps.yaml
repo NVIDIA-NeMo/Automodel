@@ -13,20 +13,16 @@
 # limitations under the License.
 
 # Nemotron 3.5 Super VL (vision-pretrained checkpoint, architectures =
-# NemotronH_Omni_Reasoning_V3: a "Nemotron Super" NemotronH hybrid
-# Mamba+Attention MoE LLM backbone + the Nemotron Omni RADIO vision head)
-# text-only SFT on Tulu-3.
-#
-# Loaded through NeMoAutoModelForImageTextToText (the full omni checkpoint --
-# vision tower included) with the vision/audio towers frozen and a text-only
-# dataset (make_tulu3_dataset emits conversations with no image entries), so
-# only the "Nemotron Super" LLM half is ever exercised in the forward/backward
-# pass. Companion baseline to the MedPix VLM run
-# (nemotron_super_3_5_medpix_100steps.yaml) in this same directory, isolating
-# LLM-only convergence.
+# NemotronH_Omni_Reasoning_V3) VLM fine-tuning on MedPix-VQA. Exercises the
+# full omni forward pass: RADIO v2.5-H vision tower -> vision projector ->
+# "Nemotron Super" NemotronH hybrid Mamba+Attention MoE LLM backbone. This
+# checkpoint ships no sound_config (vision-pretrained stage), so the audio
+# tower is absent -- freeze_audio_tower is a no-op here but kept for parity
+# with the other nemotron_omni recipes. Companion to the text-only Tulu-3
+# run (nemotron_super_3_5_tulu3_text_100steps.yaml) in this same directory.
 #
 # Run:
-#   automodel examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_tulu3_text_100steps.yaml --nproc-per-node 8
+#   automodel examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_medpix_100steps.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 
@@ -72,7 +68,7 @@ checkpoint:
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 1
+  cp_size: 2
   pp_size: 1
   ep_size: 32
   sequence_parallel: false
@@ -91,8 +87,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
-  path_or_dataset: allenai/tulu-3-sft-mixture
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
   split: train
 
 dataloader:
@@ -100,44 +96,40 @@ dataloader:
   num_workers: 0
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
-    max_length: 2048
+    max_length: 4096
   drop_last: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
-  path_or_dataset: allenai/tulu-3-sft-mixture
-  split: "train[:128]"
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 1
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
-    max_length: 2048
+    max_length: 4096
 
 wandb:
   enable: true
   entity: Nemo-automodel
   project: huiyingl_workspace
-  name: nemotron_super_3_5_tulu3_text_100steps
+  name: nemotron_super_3_5_medpix_100steps
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   betas: [0.9, 0.95]
   eps: 1e-8
-  lr: 1.0e-5
+  lr: 1.0e-4
   weight_decay: 0.01
   master_weights: true
   store_param_remainders: true
   exp_avg_dtype: torch.bfloat16
   exp_avg_sq_dtype: torch.bfloat16
 
-lr_scheduler:
-  lr_decay_style: cosine
-  min_lr: 1.0e-6
-
 ci:
   recipe_owner: HuiyingLi
-  nodes: 4
+  nodes: 8
   time: "01:00:00"
   max_steps: 2
