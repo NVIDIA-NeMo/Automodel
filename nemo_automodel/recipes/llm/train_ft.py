@@ -76,7 +76,6 @@ from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
-from nemo_automodel.components.models.common.packing import apply_attn_implementation_to_backend
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -209,10 +208,6 @@ def build_model(
             auto-select based on CP / activation checkpointing.
         device_mesh: Pre-created device mesh forwarded when ``distributed_setup`` is not provided.
     """
-    # Honor a native-equivalent attn_implementation before instantiation so the model builds the
-    # backend the config asks for, and the packed mask format (resolved from the same key) agrees.
-    apply_attn_implementation_to_backend(cfg_model)
-
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
             "has_packed_sequence": has_packed_sequence,
@@ -707,9 +702,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
             and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
         ):
-            from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+            from nemo_automodel.components.models.common.packing import (
+                configure_packing,
+                get_model_attn_implementation,
+            )
 
-            attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
+            attn_implementation = get_model_attn_implementation(self.model_parts[0])
             packing_contract = configure_packing(
                 attn_implementation,
                 model=self.model_parts[0],

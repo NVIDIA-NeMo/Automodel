@@ -18,12 +18,12 @@ from nemo_automodel.components.datasets.packing import get_unpad_data
 from nemo_automodel.components.models.common.packing import (
     _passthrough_create_causal_mask,
     _patch_preprocess_mask_arguments_for_packing,
-    apply_attn_implementation_to_backend,
     configure_packing,
     flatten_packed_sequence_metadata,
-    get_attn_implementation,
+    get_model_attn_implementation,
     get_packing_capabilities,
 )
+from nemo_automodel.components.models.common.utils import BackendConfig
 
 # ---------------------------------------------------------------------------
 # _passthrough_create_causal_mask
@@ -76,74 +76,53 @@ class TestPassthroughCreateCausalMask:
 
 
 # ---------------------------------------------------------------------------
-# get_attn_implementation
+# get_model_attn_implementation
 # ---------------------------------------------------------------------------
 
 
 class TestGetAttnImplementation:
     def test_from_backend_config(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        assert get_attn_implementation(cfg) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        assert get_model_attn_implementation(model) == "te"
 
     def test_from_attn_implementation(self):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        assert get_attn_implementation(cfg) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
     def test_default_sdpa(self):
-        assert get_attn_implementation(None) == "sdpa"
+        assert get_model_attn_implementation(torch.nn.Module()) == "sdpa"
 
     def test_backend_takes_precedence(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        cfg.get = MagicMock(return_value="flash_attention_2")
-        assert get_attn_implementation(cfg) == "te"
-
-    def test_built_model_wins_over_stale_config(self):
-        """A packed run force-switches the model to flash; the config keeps saying sdpa."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
-
-    def test_backend_config_wins_over_built_model(self):
-        """Custom models keep naming their backend; ``te`` inits through sdpa."""
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
-        assert get_attn_implementation(cfg, model=model) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        model.config = SimpleNamespace(_attn_implementation="sdpa")
+        assert get_model_attn_implementation(model) == "te"
 
     def test_reads_through_ddp_wrapper(self):
         """DDP holds the model as ``.module`` and does not proxy attribute access."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        inner = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=SimpleNamespace(module=inner)) == "flash_attention_2"
+        inner = torch.nn.Module()
+        inner.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        wrapper = torch.nn.Module()
+        wrapper.module = inner
+        assert get_model_attn_implementation(wrapper) == "flash_attention_2"
 
     def test_kernels_hub_id_maps_back_to_mainline_flash(self):
         """Transformers records a kernels-hub id when only ``kernels`` provides FA2."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="kernels-community/flash-attn2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="kernels-community/flash-attn2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
-    @pytest.mark.parametrize(
-        "model",
-        [
-            SimpleNamespace(),
-            SimpleNamespace(config=SimpleNamespace()),
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation=None)),
-            # A dispatch key naming no layout packing knows about must not select one.
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation="some_future_backend")),
-        ],
-    )
-    def test_falls_back_to_config_when_model_names_no_known_backend(self, model):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "eager"
-        assert get_attn_implementation(cfg, model=model) == "eager"
+    @pytest.mark.parametrize("implementation", ["magi", "some_future_backend"])
+    def test_preserves_live_dispatch_key(self, implementation):
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation=implementation)
+        assert get_model_attn_implementation(model) == implementation
+
+    def test_requires_built_model(self):
+        with pytest.raises(TypeError, match="built torch.nn.Module"):
+            get_model_attn_implementation(SimpleNamespace())
 
 
 # ---------------------------------------------------------------------------
@@ -395,48 +374,3 @@ class TestConfigurePackingFA3FA4:
 
         assert "transformers.models.llama.modeling_llama" in _PACKING_PATCH_MODULES
         assert "transformers.models.qwen3.modeling_qwen3" in _PACKING_PATCH_MODULES
-
-
-# ---------------------------------------------------------------------------
-# attn_implementation -> native backend promotion
-# ---------------------------------------------------------------------------
-
-
-class TestAttnImplementationPromotion:
-    """A native-equivalent attn_implementation must select the custom-model backend.
-
-    Custom models build attention from ``backend.attn``, so ``attn_implementation`` used to be
-    silently ignored on that path -- the model ran ``backend.attn`` regardless.
-    """
-
-    def test_flash_attention_4_promotes_to_fa4(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="sdpa"), attn_implementation="flash_attention_4")
-        assert get_attn_implementation(cfg) == "fa4"
-        apply_attn_implementation_to_backend(cfg)
-        assert cfg.backend.attn == "fa4"
-
-    def test_sdpa_does_not_hijack_te_backend(self):
-        """Recipes pair attn_implementation=sdpa (HF config validation) with backend.attn=te."""
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"), attn_implementation="sdpa")
-        apply_attn_implementation_to_backend(cfg)
-        assert cfg.backend.attn == "te"
-        assert get_attn_implementation(cfg) == "te"
-
-    @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3"])
-    def test_flash_variants_without_native_equivalent_are_left_alone(self, impl):
-        """FA2/FA3 have no custom-model backend; backend.attn still decides."""
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="sdpa"), attn_implementation=impl)
-        apply_attn_implementation_to_backend(cfg)
-        assert cfg.backend.attn == "sdpa"
-        assert get_attn_implementation(cfg) == "sdpa"
-
-    def test_promotion_is_idempotent(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="fa4"), attn_implementation="flash_attention_4")
-        apply_attn_implementation_to_backend(cfg)
-        apply_attn_implementation_to_backend(cfg)
-        assert cfg.backend.attn == "fa4"
-
-    def test_no_backend_block_is_a_noop(self):
-        cfg = SimpleNamespace(attn_implementation="flash_attention_4")
-        apply_attn_implementation_to_backend(cfg)  # must not raise
-        assert not hasattr(cfg, "backend")

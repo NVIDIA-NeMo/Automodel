@@ -3443,7 +3443,7 @@ def _patches_for_packing(neat_pack_side_effect):
                 return_value=packing_contract,
             ),
             patch(
-                "nemo_automodel.components.models.common.packing.get_attn_implementation",
+                "nemo_automodel.components.models.common.packing.get_model_attn_implementation",
                 return_value="sdpa",
             ),
         ],
