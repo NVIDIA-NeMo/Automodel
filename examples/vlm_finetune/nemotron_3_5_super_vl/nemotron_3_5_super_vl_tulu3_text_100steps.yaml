@@ -116,7 +116,7 @@ validation_dataloader:
     max_length: 2048
 
 wandb:
-  enable: true
+  enable: false
   entity: Nemo-automodel
   project: huiyingl_workspace
   name: nemotron_3_5_super_vl_tulu3_text_100steps

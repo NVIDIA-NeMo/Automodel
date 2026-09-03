@@ -131,7 +131,7 @@ lr_scheduler:
   lr_decay_style: constant
 
 wandb:
-  enable: true
+  enable: false
   entity: Nemo-automodel
   project: huiyingl_workspace
   name: nemotron_3_5_super_vl_tulu3_packed_cp8_100steps
