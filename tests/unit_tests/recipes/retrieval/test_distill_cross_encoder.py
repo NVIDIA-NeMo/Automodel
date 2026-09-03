@@ -39,6 +39,7 @@ _N_PASSAGES = 4
 _N_QUERIES = 3
 _STUDENT_TEMP = 0.02
 _KD_TEMP = 0.1
+_VOCAB_SIZE = 131072
 # Deliberately not 1.0: a unit value would neutralize the recipe-level division and hide any
 # divergence between the distillation CE and TrainCrossEncoderRecipe.
 _RECIPE_TEMP = 0.5
@@ -47,12 +48,12 @@ _RECIPE_TEMP = 0.5
 class _StubCrossEncoder(nn.Module):
     """Emits ``[num_pairs, 1]`` logits divided by ``config.temperature``, like the real model."""
 
-    def __init__(self, scale: float, temperature: float = _STUDENT_TEMP):
+    def __init__(self, scale: float, temperature: float = _STUDENT_TEMP, vocab_size: int = _VOCAB_SIZE):
         super().__init__()
         self.score = nn.Linear(_HIDDEN, 1, bias=False)
         with torch.no_grad():
             self.score.weight.fill_(scale)
-        self.config = SimpleNamespace(temperature=temperature)
+        self.config = SimpleNamespace(temperature=temperature, vocab_size=vocab_size)
         self.seen_batches: list[dict] = []
 
     def forward(self, return_dict: bool = False, **batch):
@@ -323,6 +324,7 @@ class _StubCfg:
 def _build_teacher_on(strategy, factory=None):
     recipe = object.__new__(DistillCrossEncoderRecipe)
     recipe.student_internal_temperature = _STUDENT_TEMP
+    recipe.student_vocab_size = _VOCAB_SIZE
     recipe.distributed_setup = DistributedSetup(
         mesh_context=SimpleNamespace(name="student-mesh"),
         strategy_config=strategy,
@@ -335,12 +337,16 @@ def _build_teacher_on(strategy, factory=None):
     return recipe, teacher_config
 
 
-def test_teacher_setup_reshards_after_forward_and_disables_activation_checkpointing():
-    _, teacher_config = _build_teacher_on(FSDP2Config(activation_checkpointing=True, reshard_after_forward=False))
+@pytest.mark.parametrize("reshard_after_forward", [True, False])
+def test_teacher_setup_inherits_reshard_and_disables_activation_checkpointing(reshard_after_forward):
+    """The teacher follows the config's reshard policy; only activation checkpointing is forced off."""
+    _, teacher_config = _build_teacher_on(
+        FSDP2Config(activation_checkpointing=True, reshard_after_forward=reshard_after_forward)
+    )
 
     teacher_setup = teacher_config.kwargs["distributed_setup"]
     assert teacher_config.kwargs["peft_config"] is None
-    assert teacher_setup.strategy_config.reshard_after_forward is True
+    assert teacher_setup.strategy_config.reshard_after_forward is reshard_after_forward
     assert teacher_setup.strategy_config.activation_checkpointing is False
     assert teacher_setup.activation_checkpointing is False
 
@@ -359,7 +365,7 @@ def test_teacher_setup_shares_the_student_mesh_and_leaves_it_unchanged():
 
 
 def test_non_fsdp2_strategy_only_disables_activation_checkpointing():
-    """DDPConfig has no reshard_after_forward field, so replacing it would raise TypeError."""
+    """DDPConfig has no reshard_after_forward field, so the teacher setup must not require one."""
     _, teacher_config = _build_teacher_on(DDPConfig(activation_checkpointing=True))
 
     teacher_setup = teacher_config.kwargs["distributed_setup"]
@@ -384,6 +390,21 @@ def test_teacher_construction_preserves_the_rng_stream():
     actual = torch.rand(4)
 
     assert torch.equal(expected, actual)
+
+
+def test_mismatched_vocab_size_raises():
+    """Both models read one tokenization, so a vocabulary mismatch must fail loudly at setup."""
+    with pytest.raises(ValueError, match="vocab_size"):
+        _build_teacher_on(
+            FSDP2Config(),
+            factory=lambda: _StubCrossEncoder(scale=-0.8, vocab_size=_VOCAB_SIZE + 1),
+        )
+
+
+def test_matching_vocab_size_is_accepted():
+    recipe, _ = _build_teacher_on(FSDP2Config())
+
+    assert recipe.teacher_model is not None
 
 
 def test_differing_internal_temperatures_warn_instead_of_raising(caplog):

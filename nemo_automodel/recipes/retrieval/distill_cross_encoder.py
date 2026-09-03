@@ -24,7 +24,6 @@ import torch.distributed
 import torch.nn.functional as F
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.cross_encoder_distill import GroupedScoreKLLoss
 from nemo_automodel.components.training.rng import ScopedRNG
@@ -65,6 +64,8 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
         # divides by, and the two are set independently.
         student = _unwrap_model_for_attrs(self.model_parts[0])
         self.student_internal_temperature = float(student.config.temperature)
+        # VL configs nest the vocabulary under text_config; text-only ones expose it directly.
+        self.student_vocab_size = int(getattr(student.config, "text_config", student.config).vocab_size)
 
         # The teacher is only ever used to produce KD targets, so a zero KD weight makes it
         # dead weight: skip construction entirely rather than paying for an unused model.
@@ -95,22 +96,21 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
         )
 
     def _build_teacher(self) -> None:
-        """Instantiate the frozen teacher on the student's mesh with a no-backward FSDP policy.
+        """Instantiate the frozen teacher on the student's mesh with activation checkpointing off.
 
         The attribute name ``teacher_model`` is required: ``BaseRecipe`` skips that exact key
         when saving and restoring tracked model state, so any other name would make the
         teacher shadow the student in checkpoints.
         """
-        # The student's config sets reshard_after_forward=false, which keeps parameters
-        # gathered after forward because backward will reshard them. The teacher never runs
-        # backward, so that policy would leave it permanently unsharded on every rank.
-        # Activation checkpointing is read off the strategy config by the FSDP2 manager and
-        # off the setup elsewhere, so it has to be cleared in both places. dataclasses.replace
-        # keeps the student's mesh_context, so both models shard over the same device mesh.
+        # reshard_after_forward is left at the config's value so the YAML controls both models.
+        # Note that a teacher never runs backward, so nothing releases its gathered parameters:
+        # false keeps the whole teacher unsharded for the run, trading memory for one all-gather
+        # per forward. Activation checkpointing is read off the strategy config by the FSDP2
+        # manager and off the setup elsewhere, so it has to be cleared in both places; with no
+        # backward there are no activations to trade compute for. dataclasses.replace keeps the
+        # student's mesh_context, so both models shard over the same device mesh.
         strategy = self.distributed_setup.strategy_config
-        if isinstance(strategy, FSDP2Config):
-            strategy = dataclasses.replace(strategy, reshard_after_forward=True, activation_checkpointing=False)
-        elif strategy is not None:
+        if strategy is not None:
             strategy = dataclasses.replace(strategy, activation_checkpointing=False)
         teacher_setup = dataclasses.replace(
             self.distributed_setup,
@@ -130,6 +130,14 @@ class DistillCrossEncoderRecipe(TrainCrossEncoderRecipe):
             param.requires_grad_(False)
 
         teacher = _unwrap_model_for_attrs(self.teacher_model)
+        # One tokenization feeds both models, so a vocabulary mismatch silently scores different text.
+        teacher_vocab_size = int(getattr(teacher.config, "text_config", teacher.config).vocab_size)
+        if teacher_vocab_size != self.student_vocab_size:
+            raise ValueError(
+                f"Teacher vocab_size {teacher_vocab_size} does not match student {self.student_vocab_size}; "
+                "both models must consume the same tokenized batch."
+            )
+
         self.teacher_internal_temperature = float(teacher.config.temperature)
         if self.teacher_internal_temperature != self.student_internal_temperature:
             logger.warning(

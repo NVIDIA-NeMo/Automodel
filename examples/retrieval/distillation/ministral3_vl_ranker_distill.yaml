@@ -47,7 +47,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/llmservice/users/ronaya/model_checkpoints/Ministral-3-1B-Instruct-2512-BF16_llm_replaced_nemotron_3_embed_1B
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/gmoreira/model_checkpoints/ministral3_1b_vl/ministral3_8bfull_base_lr1e4_distillproj_lr1e3_from_teacher_3b_20260814_125136/epoch_0_step_2047/model/consolidated
   trust_remote_code: true
   num_labels: 1
   temperature: 0.02
@@ -77,9 +77,12 @@ teacher_model:
   torch_dtype: bfloat16
   attn_implementation: flash_attention_2
 
+# Kept on the student checkpoint, which records the same vocabulary, post-processor and image
+# settings as the teacher, so one tokenization serves both. A stock Ministral export records a
+# different post-processor and BOS setting and is not a drop-in substitute.
 tokenizer:
   _target_: nemo_automodel.components.models.ministral_bidirectional.processor.Mistral3BiEncoderProcessor.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/llmservice/users/ronaya/model_checkpoints/Ministral-3-1B-Instruct-2512-BF16_llm_replaced_nemotron_3_embed_1B
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/gmoreira/model_checkpoints/ministral3_1b_vl/ministral3_8bfull_base_lr1e4_distillproj_lr1e3_from_teacher_3b_20260814_125136/epoch_0_step_2047/model/consolidated
   rerank_max_length: 4096
   use_prompt_template: true
   export_as_stock_processor: false
