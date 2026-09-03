@@ -1,0 +1,59 @@
+---
+title: "Nemotron-3.5-Super-Omni"
+description: ""
+slug: model-coverage/omni/nvidia/nemotron-3-5-super-omni
+---
+[NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained)
+pairs a "Nemotron Super" NemotronH (hybrid Mamba-2 + Attention) MoE language
+backbone with a RADIO v2.5-H vision encoder, sharing its `NemotronH_Omni_Reasoning_V3`
+architecture and vision stack with [Nemotron-3-Nano-Omni](/model-coverage/omni/nvidia/nemotron-omni).
+This midtrain checkpoint is vision-pretrained only (`sound_config` is absent, so
+there is no audio encoder / audio inputs are not supported on this checkpoint).
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Multimodal (Text·Image) |
+| **Architecture** | `NemotronH_Omni_Reasoning_V3` |
+| **Parameters** | 67B total (MoE, 512 routed experts) |
+| **HF Org** | [nvidia](https://huggingface.co/nvidia) |
+
+</Info>
+
+## Available Models
+
+- **NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained**: 67B total (MoE), vision-pretrained, no audio encoder
+
+## Architecture
+
+- `NemotronH_Omni_Reasoning_V3` — reuses the same `NemotronOmniForConditionalGeneration`
+  wrapper, vision tower, and state-dict adapter as `NemotronH_Nano_Omni_Reasoning_V3`;
+  only the LLM sub-config scale differs (Super vs. Nano). The `sound_encoder` /
+  `sound_projection` submodules are constructed only when the checkpoint's
+  `sound_config` is present, so this checkpoint loads with audio disabled.
+
+## Example Recipes
+
+| Recipe | Dataset | Description |
+|---|---|---|
+| [nemotron_super_3_5_tulu3_text_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_tulu3_text_100steps.yaml) | Tulu-3 | Full SFT, text-only (vision/audio towers frozen and unused) |
+| [nemotron_super_3_5_medpix_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_medpix_100steps.yaml) | MedPix-VQA | Full SFT — image VQA, exercises the vision tower |
+| [nemotron_super_3_5_tulu3_packed_cp1_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_tulu3_packed_cp1_100steps.yaml) | Tulu-3 (packed, THD) | Context-parallel parity baseline, `cp_size=1`; text-only packs (`inject_fake_images: false`) |
+| [nemotron_super_3_5_tulu3_packed_cp8_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_tulu3_packed_cp8_100steps.yaml) | Tulu-3 (packed, THD) | Context-parallel parity test, `cp_size=8`; text-only packs (`inject_fake_images: false`) |
+
+## Try with NeMo AutoModel
+
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras --extra vlm-media
+```
+
+**2. Run a recipe** from inside the repo (8x H100 example):
+
+```bash
+uv run automodel examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_medpix_100steps.yaml --nproc-per-node 8
+```

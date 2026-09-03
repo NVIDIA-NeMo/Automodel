@@ -1,0 +1,145 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nemotron Super 3.5 packed-sequence CP parity baseline: cp_size=1.
+# Text-only Tulu-3, packed to 8192-token THD rows (real tokens, not padding),
+# on a single 8-GPU node. Companion recipe
+# nemotron_super_3_5_tulu3_packed_cp8_100steps.yaml is identical except
+# cp_size=8 / ep_size=1. With shuffle=false both runs consume identical data
+# per optimizer step, so their loss curves are the CP-correctness check.
+#
+# world = tp1 * cp1 * pp1 = 8 (dp=8); ep8 | dp*cp = 8 * 1 = 8.
+#
+# Run:
+#   automodel examples/vlm_finetune/nemotron_super_3_5/nemotron_super_3_5_tulu3_packed_cp1_100steps.yaml --nproc-per-node 8
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 100000
+  val_every_steps: 100000
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  trust_remote_code: true
+  num_nextn_predict_layers: 0
+  torch_dtype: torch.bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  trust_remote_code: true
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
+  path_or_dataset: allenai/tulu-3-sft-mixture
+  split: train
+  # Truncate over-long samples instead of substituting a random other sample
+  # (keeps every rank of a CP/TP group on identical packs).
+  truncate: true
+  # Tulu-3 is text-only. The VLM pipeline otherwise injects a fake 512x512 image
+  # into every sample (~245 <image> tokens + a vision-tower forward per sample).
+  inject_fake_images: false
+
+# THD packing: real Tulu-3 tokens fill each 8192-token row (8192 divisible by 2*cp for cp up to 8).
+# packing_format: thd (not the "neat" default) is required for this hybrid Mamba+MoE
+# backbone: "neat" packing builds a dense block-causal mask / per-token seq_idx
+# convention meant for plain transformer attention, which nemotron_v3's Mamba mixer
+# does not understand (it reads a document-boundary attention_mask, not a dense mask).
+# "thd" wires qkv_format=thd + real cu_seqlens end to end instead.
+packed_sequence:
+  pretokenize: true
+  packing_format: thd
+  max_length: 8192
+  pack_size: 8192
+  collate_max_length: 8192
+  packing_ratio: 0.9
+  drop_long_samples: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  drop_last: true
+  shuffle: false
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.01
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+lr_scheduler:
+  lr_decay_style: constant
+
+wandb:
+  enable: true
+  entity: Nemo-automodel
+  project: huiyingl_workspace
+  name: nemotron_super_3_5_tulu3_packed_cp1_100steps
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 4
+  time: "01:00:00"
+  max_steps: 2

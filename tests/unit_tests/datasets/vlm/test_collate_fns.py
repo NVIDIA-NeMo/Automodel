@@ -3360,3 +3360,15 @@ def test_thd_vlm_collater_empty_batch():
     from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
 
     assert packed_sequence_thd_vlm_collater([]) == {}
+
+
+def test_merge_media_values_flattens_mixed_tensor_and_list_packs():
+    from nemo_automodel.components.datasets.vlm.collate_fns import _merge_media_values
+
+    stacked = torch.randn(2, 3, 8, 8)  # one pack with uniform images
+    ragged = [torch.randn(3, 12, 4), torch.randn(3, 6, 6)]  # another pack with variable resolution
+    merged = _merge_media_values([stacked, ragged])
+
+    assert isinstance(merged, list)
+    assert [tuple(v.shape) for v in merged] == [(3, 8, 8), (3, 8, 8), (3, 12, 4), (3, 6, 6)]
+    assert all(v.dtype == torch.bfloat16 for v in merged)

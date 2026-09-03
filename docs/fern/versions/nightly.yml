@@ -289,6 +289,8 @@ navigation:
             path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
           - page: "Nemotron-Omni"
             path: ../../model-coverage/omni/nvidia/nemotron-omni.mdx
+          - page: "Nemotron-3.5-Super-Omni"
+            path: ../../model-coverage/omni/nvidia/nemotron-3-5-super-omni.mdx
       - section: "Diffusion Language Models"
         slug: dllm
         contents:
