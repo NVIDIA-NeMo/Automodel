@@ -592,6 +592,11 @@ def test_llama_nemotron_vl_config_builds_composed_subconfigs():
     assert config.get_text_config(decoder=True) is config.llm_config
 
 
+def test_llama_nemotron_vl_model_exposes_text_decoder(tiny_model):
+    """The composite model must expose the retrieval text tower explicitly."""
+    assert tiny_model.get_decoder() is tiny_model.language_model
+
+
 def test_llama_nemotron_vl_config_rejects_unsupported_vision_model():
     vision_config = _tiny_vision_config()
     vision_config["model_type"] = "unsupported_vision"

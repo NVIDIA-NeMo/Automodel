@@ -29,7 +29,7 @@ import inspect
 import logging
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend
@@ -1244,7 +1244,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         detach_distributed_inbatch_negatives: bool = True,
         output_embedding_quantization: Optional[str] = None,
         is_causal: bool | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
 
@@ -1305,14 +1305,14 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
         cls,
         pretrained_model_name_or_path: str,
         is_causal: bool | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> PreTrainedModel:
         """Load a cross-encoder model with a configurable self-attention mode.
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
             is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
-                defaults to non-causal attention.
+                preserves the scoring backbone's native attention mode.
             **kwargs: Forwarded to the shared retrieval loader.
 
         Returns:

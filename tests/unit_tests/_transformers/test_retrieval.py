@@ -307,6 +307,38 @@ def test_retrieval_public_apis_expose_is_causal():
         assert "is_causal" in inspect.signature(callable_).parameters
 
 
+def test_modified_retrieval_public_apis_are_fully_annotated():
+    from nemo_automodel._transformers import auto_model, retrieval
+
+    callables = (
+        retrieval.build_encoder_backbone,
+        retrieval.BiEncoderModel.__init__,
+        retrieval.BiEncoderModel.build,
+        retrieval.BiEncoderModel.save_pretrained,
+        retrieval.BiEncoderModel.encode,
+        retrieval.BiEncoderModel.forward,
+        retrieval.CrossEncoderModel.__init__,
+        retrieval.CrossEncoderModel.build,
+        retrieval.CrossEncoderModel.save_pretrained,
+        retrieval.CrossEncoderModel.forward,
+        auto_model.NeMoAutoModelBiEncoder.from_pretrained,
+        auto_model.NeMoAutoModelCrossEncoder.from_pretrained,
+    )
+    for callable_ in callables:
+        signature = inspect.signature(callable_)
+        assert signature.return_annotation is not inspect.Signature.empty, callable_.__qualname__
+        for parameter in signature.parameters.values():
+            if parameter.name not in {"self", "cls"}:
+                assert parameter.annotation is not inspect.Parameter.empty, f"{callable_.__qualname__}.{parameter.name}"
+
+    for callable_ in (
+        retrieval.BiEncoderModel.encode,
+        retrieval.BiEncoderModel.forward,
+        retrieval.CrossEncoderModel.forward,
+    ):
+        assert inspect.signature(callable_).parameters["input_dict"].annotation is not dict
+
+
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_setting_is_causal_scopes_composite_models_to_text_tower(is_causal):
     from nemo_automodel._transformers import retrieval
@@ -642,7 +674,7 @@ def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
 def test_extract_submodel_llama_embedding_selects_compatible_backbone(
     tmp_path, is_causal, expected_class, expected_model_type
 ):
-    """Extracted Llama uses the legacy retrieval class unless causal attention is requested."""
+    """Extracted Llama retains its registered retrieval class in both attention modes."""
     from nemo_automodel._transformers import retrieval
 
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "llama")
@@ -925,6 +957,8 @@ def test_standard_ministral_score_uses_sequence_classification_model(tmp_path):
     assert type(backbone) is Ministral3ForSequenceClassification
     assert backbone.config.model_type == "ministral3"
     assert backbone.config.num_labels == 1
+    assert backbone.config.is_causal is True
+    assert all(layer.self_attn.is_causal is True for layer in backbone.model.layers)
     _assert_state_dict_equal(source_state_dict, backbone.model.state_dict())
 
     input_ids = torch.randint(0, backbone.config.vocab_size, (2, 4))
@@ -1536,7 +1570,7 @@ def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_support
 def test_extract_submodel_llama_score_selects_compatible_cross_encoder(
     tmp_path, is_causal, expected_class, expected_model_type
 ):
-    """Extracted Llama reranking preserves legacy dispatch unless causal attention is requested."""
+    """Extracted Llama reranking retains its registered retrieval class in both attention modes."""
     from nemo_automodel._transformers import retrieval
 
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "llama")

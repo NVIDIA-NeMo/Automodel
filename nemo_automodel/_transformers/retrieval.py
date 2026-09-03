@@ -16,9 +16,9 @@
 
 import inspect
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable
 
 import torch
 import torch.nn as nn
@@ -32,7 +32,7 @@ from transformers import (
     PreTrainedModel,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
-from transformers.utils import logging
+from transformers.utils import ModelOutput, logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.sentence_transformer_export import (
@@ -174,7 +174,7 @@ def _move_to_extracted_dtype(model: nn.Module, extracted_model: nn.Module) -> nn
     return model
 
 
-def _get_config_value(config: object, attribute: str, default=None):
+def _get_config_value(config: object, attribute: str, default: Any = None) -> Any:
     """Read a stored configuration value without invoking dynamic attribute fallbacks."""
     if isinstance(config, dict):
         return config.get(attribute, default)
@@ -190,8 +190,8 @@ def _get_text_config(config: object) -> object:
     return text_config
 
 
-def _resolve_is_causal(config: object, is_causal: bool | None) -> bool:
-    """Resolve an explicit is_causal value, then a saved value, then the bidirectional default."""
+def _resolve_is_causal(config: object, is_causal: bool | None, *, default: bool = False) -> bool:
+    """Resolve an explicit policy, then a saved policy, then the caller's default."""
     if is_causal is not None:
         if not isinstance(is_causal, bool):
             raise ValueError("Retrieval is_causal must be a boolean.")
@@ -199,7 +199,7 @@ def _resolve_is_causal(config: object, is_causal: bool | None) -> bool:
     saved_policy = _get_config_value(_get_text_config(config), "is_causal")
     if saved_policy is not None and not isinstance(saved_policy, bool):
         raise ValueError("Saved retrieval is_causal policy must be a boolean.")
-    return saved_policy if saved_policy is not None else False
+    return saved_policy if saved_policy is not None else default
 
 
 def _get_text_backbone(model: PreTrainedModel) -> tuple[nn.Module, object]:
@@ -220,6 +220,39 @@ def _get_text_backbone(model: PreTrainedModel) -> tuple[nn.Module, object]:
             "Composite retrieval get_text_config() and get_decoder() must identify the same text backbone."
         )
     return text_backbone, text_config
+
+
+def _get_native_text_backbone_is_causal(model: PreTrainedModel) -> bool:
+    """Return the uniform attention policy declared by a model's text backbone."""
+    text_backbone, text_config = _get_text_backbone(model)
+    native_policies = {
+        policy for module in text_backbone.modules() if isinstance((policy := getattr(module, "is_causal", None)), bool)
+    }
+    if len(native_policies) > 1:
+        raise ValueError("Retrieval text backbone exposes inconsistent native is_causal policies.")
+    if native_policies:
+        return next(iter(native_policies))
+
+    native_policy = getattr(text_config, "is_causal", False)
+    if not isinstance(native_policy, bool):
+        raise ValueError("Native retrieval is_causal policy must be a boolean.")
+    return native_policy
+
+
+def _resolve_text_backbone_is_causal(
+    model: PreTrainedModel,
+    config: object,
+    is_causal: bool | None,
+    *,
+    default: bool | None = None,
+) -> bool:
+    """Resolve explicit and saved policies before consulting a model's native mode."""
+    saved_policy = _get_config_value(_get_text_config(config), "is_causal")
+    if is_causal is not None or saved_policy is not None:
+        return _resolve_is_causal(config, is_causal)
+    if default is not None:
+        return default
+    return _get_native_text_backbone_is_causal(model)
 
 
 def _set_text_backbone_is_causal(model: PreTrainedModel, is_causal: bool) -> None:
@@ -263,7 +296,6 @@ def _build_backbone_from_extracted_submodel(
     pooling: Optional[str],
     num_labels: Optional[int],
     temperature: Optional[float],
-    is_causal: bool,
 ) -> PreTrainedModel:
     """Build a task-specific retrieval backbone from an extracted text submodel."""
     text_config = extracted_model.config
@@ -464,17 +496,16 @@ def build_encoder_backbone(
     temperature: Optional[float] = None,
     is_causal: bool | None = None,
     loaded_config: PretrainedConfig | None = None,
-    **hf_kwargs,
+    **hf_kwargs: Any,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
 
-    Every load path applies the requested attention mode after resolving the
-    task-specific backbone. Text-only models are configured directly. Composite
-    models persist the policy on their nested text config and apply it only to
-    their text tower, leaving vision attention unchanged. Standard model types
-    retain their registered retrieval backbones for bidirectional attention and
-    use stock Hugging Face classes when causal attention is requested. Explicit
-    legacy *_bidirec checkpoints continue to use their registered custom classes.
+    Every load path resolves the task-specific backbone before applying an
+    attention policy. Registered model types retain their retrieval class in both
+    modes; unregistered model types use the corresponding Hugging Face Auto class.
+    Text-only models are configured directly. Composite models persist the policy
+    on their nested text config and apply it only to their text tower, leaving
+    vision attention unchanged.
 
     Args:
         model_name_or_path: Path or HuggingFace Hub identifier.
@@ -487,7 +518,8 @@ def build_encoder_backbone(
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
-        is_causal: Whether the retrieval text backbone uses causal self-attention.
+        is_causal: Whether the retrieval text backbone uses causal self-attention. When omitted, a saved policy is
+            restored; otherwise embedding defaults to bidirectional and scoring preserves the backbone's native mode.
         loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
@@ -506,7 +538,6 @@ def build_encoder_backbone(
             **hf_kwargs,
         )
     model_type = getattr(config, "model_type", "")
-    is_causal = _resolve_is_causal(config, is_causal)
 
     if extract_submodel is not None:
         logger.info(f"Loading {model_name_or_path} with HuggingFace Auto classes to extract {extract_submodel}")
@@ -521,26 +552,31 @@ def build_encoder_backbone(
             **model_load_kwargs,
         )
         extracted_model = _extract_submodel(model, extract_submodel)
+        effective_is_causal = _resolve_text_backbone_is_causal(
+            extracted_model,
+            extracted_model.config,
+            is_causal,
+            default=False if task == "embedding" else None,
+        )
         backbone = _build_backbone_from_extracted_submodel(
             extracted_model,
             task=task,
             pooling=pooling,
             num_labels=num_labels,
             temperature=temperature,
-            is_causal=is_causal,
         )
-        _set_text_backbone_is_causal(backbone, is_causal)
+        _set_text_backbone_is_causal(backbone, effective_is_causal)
         return backbone
 
-    BidirectionalModelClass = _get_supported_backbone_class(model_type, task)
-    if BidirectionalModelClass is not None:
+    backbone_model_class = _get_supported_backbone_class(model_type, task)
+    if backbone_model_class is not None:
         if pooling is not None:
             hf_kwargs["pooling"] = pooling
         if num_labels is not None:
             hf_kwargs["num_labels"] = num_labels
         if temperature is not None:
             hf_kwargs["temperature"] = temperature
-        backbone = BidirectionalModelClass.from_pretrained(
+        backbone = backbone_model_class.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
     else:
@@ -554,7 +590,13 @@ def build_encoder_backbone(
             )
         else:
             backbone = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
-    _set_text_backbone_is_causal(backbone, is_causal)
+    effective_is_causal = _resolve_text_backbone_is_causal(
+        backbone,
+        config,
+        is_causal,
+        default=False if task == "embedding" else None,
+    )
+    _set_text_backbone_is_causal(backbone, effective_is_causal)
     return backbone
 
 
@@ -731,7 +773,7 @@ class BiEncoderModel(nn.Module):
         detach_distributed_inbatch_negatives: bool = True,
         output_embedding_quantization: Optional[str] = None,
         is_causal: bool | None = None,
-    ):
+    ) -> None:
         super().__init__()
         pooling = _canonicalize_bi_encoder_pooling(pooling)
         is_causal = _resolve_is_causal(model.config, is_causal)
@@ -773,7 +815,7 @@ class BiEncoderModel(nn.Module):
         output_embedding_quantization: Optional[str] = None,
         is_causal: bool | None = None,
         trust_remote_code: bool = False,
-        **hf_kwargs,
+        **hf_kwargs: Any,
     ) -> "BiEncoderModel":
         """Build bi-encoder model from a pretrained backbone."""
         effective_task = cls._TASK if cls._TASK is not None else task
@@ -915,17 +957,18 @@ class BiEncoderModel(nn.Module):
         export_config.pooling = self.pooling
         return export_config
 
-    def save_pretrained(self, save_directory: str, **kwargs):
+    def save_pretrained(self, save_directory: str, **kwargs: Any) -> None:
         save_encoder_pretrained(self, save_directory, **kwargs)
 
-    def encode(self, input_dict: dict) -> Optional[torch.Tensor]:
+    def encode(self, input_dict: Mapping[str, Any] | None) -> torch.Tensor | None:
         """Encode inputs and return pooled embeddings.
 
         Args:
-            input_dict: Tokenized inputs (input_ids, attention_mask, etc.)
+            input_dict: Tokenized backbone inputs. input_ids and attention_mask are tensors of shape
+                [batch, sequence]. Optional multimodal tensors follow the wrapped model's forward contract.
 
         Returns:
-            Embeddings [batch_size, hidden_dim], or None if input_dict is empty.
+            Tensor of shape [batch, hidden], or None when input_dict is empty.
         """
         if not input_dict:
             return None
@@ -968,19 +1011,32 @@ class BiEncoderModel(nn.Module):
 
         return embeds.contiguous()
 
-    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
-        """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
+    def forward(
+        self,
+        input_dict: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Encode tokenized inputs while preserving PyTorch module hook semantics.
+
+        Args:
+            input_dict: Tokenized backbone inputs. input_ids and attention_mask are tensors of shape
+                [batch, sequence]. Optional multimodal tensors follow the wrapped model's forward contract.
+            **kwargs: Reserved for the standard nn.Module calling convention.
+
+        Returns:
+            Tensor of shape [batch, hidden], or None when input_dict is empty.
+        """
         return self.encode(input_dict)
 
 
 class CrossEncoderModel(nn.Module):
-    """Cross-encoder model for scoring with a configurable attention mode."""
+    """Cross-encoder scorer that preserves saved or native attention unless explicitly overridden."""
 
     _TASK = "score"
 
-    def __init__(self, model: PreTrainedModel, is_causal: bool | None = None):
+    def __init__(self, model: PreTrainedModel, is_causal: bool | None = None) -> None:
         super().__init__()
-        is_causal = _resolve_is_causal(model.config, is_causal)
+        is_causal = _resolve_text_backbone_is_causal(model, model.config, is_causal)
         _set_text_backbone_is_causal(model, is_causal)
         _init_encoder_common(self, model)
         self.is_causal = is_causal
@@ -1003,9 +1059,9 @@ class CrossEncoderModel(nn.Module):
         model_name_or_path: str,
         is_causal: bool | None = None,
         trust_remote_code: bool = False,
-        **hf_kwargs,
-    ):
-        """Build cross-encoder model from a pretrained backbone."""
+        **hf_kwargs: Any,
+    ) -> "CrossEncoderModel":
+        """Build a cross-encoder while preserving saved or native attention by default."""
         logger.info(f"Building CrossEncoderModel from {model_name_or_path}")
         backbone = build_encoder_backbone(
             model_name_or_path,
@@ -1016,10 +1072,24 @@ class CrossEncoderModel(nn.Module):
         )
         return cls(model=backbone, is_causal=is_causal)
 
-    def save_pretrained(self, save_directory: str, **kwargs):
+    def save_pretrained(self, save_directory: str, **kwargs: Any) -> None:
         save_encoder_pretrained(self, save_directory, **kwargs)
 
-    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
+    def forward(
+        self,
+        input_dict: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ModelOutput:
+        """Score tokenized query-document pairs with the wrapped backbone.
+
+        Args:
+            input_dict: Hugging Face model inputs. Tensor layouts follow the wrapped model's documented
+                forward contract.
+            **kwargs: Keyword-form Hugging Face model inputs with the same tensor layouts.
+
+        Returns:
+            The wrapped model's output. Tensor-bearing fields follow its documented forward contract.
+        """
         inputs = dict(input_dict) if input_dict is not None else dict(kwargs)
         inputs.setdefault("return_dict", True)
         return self.model(**inputs)

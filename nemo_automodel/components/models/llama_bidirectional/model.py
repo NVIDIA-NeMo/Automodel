@@ -23,7 +23,7 @@ module in a new directory (e.g., qwen2_bidirectional/) with its own ModelClass e
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -50,7 +50,7 @@ class LlamaBidirectionalConfig(LlamaConfig):
         pooling: str = "avg",
         temperature: float = 1.0,
         is_causal: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """
         Initialize LlamaBidirectionalConfig.
@@ -84,7 +84,7 @@ class LlamaBidirectionalModel(LlamaModel):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig) -> None:
         """
         Initialize LlamaBidirectionalModel.
 
@@ -92,6 +92,7 @@ class LlamaBidirectionalModel(LlamaModel):
             config: Model configuration
         """
         super().__init__(config)
+        # Transformers mask builders read this per-attention flag; dual-mode parity tests guard that upstream contract.
         is_causal = getattr(config, "is_causal", False)
         for layer in self.layers:
             layer.self_attn.is_causal = is_causal

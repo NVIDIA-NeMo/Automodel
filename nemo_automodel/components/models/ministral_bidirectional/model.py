@@ -43,7 +43,7 @@ class Ministral3BidirectionalConfig(Ministral3Config):
         pooling: str = "avg",
         temperature: float = 1.0,
         is_causal: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         self.pooling = pooling
         self.temperature = temperature
@@ -68,8 +68,9 @@ class Ministral3BidirectionalModel(Ministral3Model):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config) -> None:
+    def __init__(self, config: Ministral3BidirectionalConfig) -> None:
         super().__init__(config)
+        # Transformers mask builders read this per-attention flag; dual-mode parity tests guard that upstream contract.
         is_causal = getattr(config, "is_causal", False)
         for layer in self.layers:
             layer.self_attn.is_causal = is_causal

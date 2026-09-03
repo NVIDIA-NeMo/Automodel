@@ -43,7 +43,7 @@ class LlamaBidirectionalConfig(LlamaConfig):
         pooling: str = "avg",
         temperature: float = 1.0,
         is_causal: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         self.pooling = pooling
         self.temperature = temperature
@@ -278,7 +278,7 @@ class LlamaBidirectionalModel(LlamaModel):
 
     config_class = LlamaBidirectionalConfig
 
-    def __init__(self, config: LlamaBidirectionalConfig):
+    def __init__(self, config: LlamaBidirectionalConfig) -> None:
         super().__init__(config)
         is_causal = getattr(config, "is_causal", False)
         for layer in self.layers:
@@ -513,6 +513,10 @@ class LlamaNemotronVLModel(PreTrainedModel):
                 f"nondeterministic and incorrect image embeddings. "
                 f"Please use transformers <=4.53.x or >=4.56.0."
             )
+
+    def get_decoder(self) -> PreTrainedModel:
+        """Return the language model used as the retrieval text tower."""
+        return self.language_model
 
     def _embed_batch(self, inputs: Dict[str, Any], pool_type: Optional[str] = None):
         """
