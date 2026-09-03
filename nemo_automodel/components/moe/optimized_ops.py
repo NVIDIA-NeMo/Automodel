@@ -14,10 +14,10 @@
 
 """Memory-optimized MoE elementwise ops extracted from ``experts.py``.
 
-Chunked custom-autograd router-weight fp32 multiply: computes the identical
-fp32 math in row chunks and saves only low-precision inputs, removing the
-full-size fp32 intermediates that otherwise pin ~7 GiB blocks per MoE layer
-under activation checkpointing.
+Fused Triton / chunked custom-autograd router-weight fp32 multiply: computes
+the identical fp32 math in registers/row chunks and saves only low-precision
+inputs, removing the full-size fp32 intermediates that otherwise pin ~7 GiB
+blocks per MoE layer under activation checkpointing.
 """
 
 from __future__ import annotations
@@ -26,10 +26,229 @@ from typing import Any
 
 import torch
 
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAVE_TRITON, triton = safe_import("triton")
+_HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
+_TRITON_ROUTER_WEIGHT_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE
+
 _RW_CHUNK_ROWS = 8192
-# Engage the chunked path only for large dispatch tensors, where the memory
+# Engage the optimized path only for large dispatch tensors, where the memory
 # saving matters; below this the backward recompute is a net compute tax.
 _RW_CHUNK_THRESHOLD = 12288
+
+if _TRITON_ROUTER_WEIGHT_AVAILABLE:
+
+    @triton.jit
+    def _router_weight_fwd_kernel(
+        x_ptr,
+        probs_ptr,
+        out_ptr,
+        n_tokens,
+        hidden_dim,
+        stride_x_row,
+        stride_p_row,
+        stride_out_row,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused forward kernel: computes out = (x.float() * prob.float()).to(out_dtype).
+
+        Each program processes one token row across its hidden dimension.
+        The multiply is evaluated in registers in fp32, avoiding full-size fp32
+        HBM allocations.
+        """
+        row_idx = tl.program_id(0).to(tl.int64)
+        if row_idx >= n_tokens:
+            return
+
+        # Load scalar probability for this token
+        prob = tl.load(probs_ptr + row_idx * stride_p_row).to(tl.float32)
+
+        # Base pointers for row
+        x_row = x_ptr + row_idx * stride_x_row
+        out_row = out_ptr + row_idx * stride_out_row
+
+        for col_offset in range(0, hidden_dim, BLOCK_SIZE):
+            cols = col_offset + tl.arange(0, BLOCK_SIZE)
+            mask = cols < hidden_dim
+
+            x_vals = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+            out_vals = x_vals * prob
+            tl.store(out_row + cols, out_vals, mask=mask)
+
+    @triton.jit
+    def _router_weight_bwd_kernel(
+        grad_out_ptr,
+        probs_ptr,
+        x_ptr,
+        grad_x_ptr,
+        grad_p_ptr,
+        n_tokens,
+        hidden_dim,
+        stride_go_row,
+        stride_p_row,
+        stride_x_row,
+        stride_gx_row,
+        stride_gp_row,
+        HAS_GRAD_X: tl.constexpr,
+        HAS_GRAD_P: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused backward kernel: computes grad_x and grad_p with in-register reduction.
+
+        grad_x = (grad_out * prob).to(x.dtype)
+        grad_p = sum(grad_out.float() * x.float(), dim=-1)
+        """
+        row_idx = tl.program_id(0).to(tl.int64)
+        if row_idx >= n_tokens:
+            return
+
+        go_row = grad_out_ptr + row_idx * stride_go_row
+        accum_p = 0.0
+
+        if HAS_GRAD_X:
+            prob = tl.load(probs_ptr + row_idx * stride_p_row).to(tl.float32)
+            gx_row = grad_x_ptr + row_idx * stride_gx_row
+
+        if HAS_GRAD_P:
+            x_row = x_ptr + row_idx * stride_x_row
+
+        for col_offset in range(0, hidden_dim, BLOCK_SIZE):
+            cols = col_offset + tl.arange(0, BLOCK_SIZE)
+            mask = cols < hidden_dim
+
+            go_vals = tl.load(go_row + cols, mask=mask, other=0.0).to(tl.float32)
+
+            if HAS_GRAD_X:
+                gx_vals = go_vals * prob
+                tl.store(gx_row + cols, gx_vals, mask=mask)
+
+            if HAS_GRAD_P:
+                x_vals = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+                accum_p += tl.sum(go_vals * x_vals)
+
+        if HAS_GRAD_P:
+            tl.store(grad_p_ptr + row_idx * stride_gp_row, accum_p)
+
+    class _TritonRouterWeightMulFunction(torch.autograd.Function):
+        """Triton-accelerated fp32 router-weight multiply that saves only raw inputs."""
+
+        @staticmethod
+        def forward(
+            ctx: Any,
+            x: torch.Tensor,
+            probs: torch.Tensor,
+            out_dtype: torch.dtype,
+            save_x: bool,
+        ) -> torch.Tensor:
+            """Multiply expert outputs by routing probabilities in fp32 via Triton.
+
+            Args:
+                ctx: Autograd context.
+                x: Tensor of shape [tokens, hidden] containing expert outputs.
+                probs: Tensor of shape [tokens, 1] containing routing probabilities.
+                out_dtype: Target output dtype.
+                save_x: Whether backward requires x for probs gradient calculation.
+
+            Returns:
+                Tensor of shape [tokens, hidden] and dtype out_dtype.
+            """
+            x = x.contiguous()
+            probs = probs.contiguous()
+            n_tokens, hidden_dim = x.shape
+            out = torch.empty(x.shape, dtype=out_dtype, device=x.device)
+
+            if save_x:
+                ctx.save_for_backward(x, probs)
+            else:
+                ctx.save_for_backward(probs)
+            ctx.save_x = save_x
+            ctx.x_dtype = x.dtype
+            ctx.probs_dtype = probs.dtype
+            ctx.hidden_dim = hidden_dim
+
+            BLOCK_SIZE = min(8192, max(32, triton.next_power_of_2(hidden_dim)))
+            num_warps = 4 if hidden_dim <= 2048 else (8 if hidden_dim <= 8192 else 16)
+
+            _router_weight_fwd_kernel[(n_tokens,)](
+                x,
+                probs,
+                out,
+                n_tokens,
+                hidden_dim,
+                x.stride(0),
+                probs.stride(0),
+                out.stride(0),
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=num_warps,
+            )
+            return out
+
+        @staticmethod
+        def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None]:
+            """Compute fp32 gradients for the router-weight multiply via Triton.
+
+            Args:
+                ctx: Autograd context holding saved inputs.
+                grad_out: Tensor of shape [tokens, hidden] containing upstream gradient.
+
+            Returns:
+                Tuple containing:
+                    - grad_x: Tensor of shape [tokens, hidden] with x's dtype and device,
+                      or None if x does not require gradients.
+                    - grad_probs: Tensor of shape [tokens, 1] with probs's dtype and device,
+                      or None if probs does not require gradients.
+                    - None for out_dtype argument.
+                    - None for save_x argument.
+            """
+            if ctx.save_x:
+                x, probs = ctx.saved_tensors
+            else:
+                (probs,) = ctx.saved_tensors
+                x = None
+
+            grad_out = grad_out.contiguous()
+            has_grad_x = bool(ctx.needs_input_grad[0])
+            has_grad_p = bool(ctx.needs_input_grad[1] and x is not None)
+
+            grad_x = None
+            grad_p = None
+            n_tokens = grad_out.shape[0]
+            hidden_dim = ctx.hidden_dim
+
+            if has_grad_x:
+                grad_x = torch.empty(grad_out.shape, dtype=ctx.x_dtype, device=grad_out.device)
+            if has_grad_p:
+                grad_p = torch.empty(probs.shape, dtype=ctx.probs_dtype, device=grad_out.device)
+
+            if has_grad_x or has_grad_p:
+                BLOCK_SIZE = min(8192, max(32, triton.next_power_of_2(hidden_dim)))
+                num_warps = 4 if hidden_dim <= 2048 else (8 if hidden_dim <= 8192 else 16)
+
+                dummy_tensor = grad_out
+                _router_weight_bwd_kernel[(n_tokens,)](
+                    grad_out,
+                    probs,
+                    x if x is not None else dummy_tensor,
+                    grad_x if grad_x is not None else dummy_tensor,
+                    grad_p if grad_p is not None else dummy_tensor,
+                    n_tokens,
+                    hidden_dim,
+                    grad_out.stride(0),
+                    probs.stride(0),
+                    x.stride(0) if x is not None else 0,
+                    grad_x.stride(0) if grad_x is not None else 0,
+                    grad_p.stride(0) if grad_p is not None else 0,
+                    HAS_GRAD_X=has_grad_x,
+                    HAS_GRAD_P=has_grad_p,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    num_warps=num_warps,
+                )
+
+            return grad_x, grad_p, None, None
+
+else:
+    _TritonRouterWeightMulFunction = None  # type: ignore[assignment, misc]
 
 
 class _RouterWeightMulFunction(torch.autograd.Function):
@@ -58,19 +277,19 @@ class _RouterWeightMulFunction(torch.autograd.Function):
 
         Args:
             ctx: Autograd context.
-            x: Expert outputs of shape [tokens, hidden].
-            probs: Routing probabilities of shape [tokens, 1].
+            x: Tensor of shape [tokens, hidden] containing expert outputs.
+            probs: Tensor of shape [tokens, 1] containing routing probabilities.
             out_dtype: Output dtype (the dispatcher's expected activation
                 dtype, or fp32 for the scatter-add reduction path).
-            save_x: Whether backward needs ``x``. ``x`` is only consumed by
-                the ``probs`` gradient; when ``probs`` carries no grad (e.g.
+            save_x: Whether backward needs x. x is only consumed by
+                the probs gradient; when probs carries no grad (e.g.
                 FakeBalancedGate emits constant weights), saving it would pin
                 a full-size [tokens, hidden] tensor per MoE layer across the
                 activation-checkpointing backward window for nothing. Callers
-                pass ``probs.requires_grad``.
+                pass probs.requires_grad.
 
         Returns:
-            Tensor of shape [tokens, hidden] and dtype ``out_dtype``.
+            Tensor of shape [tokens, hidden] and dtype out_dtype.
         """
         if save_x:
             ctx.save_for_backward(x, probs)
@@ -90,13 +309,16 @@ class _RouterWeightMulFunction(torch.autograd.Function):
 
         Args:
             ctx: Autograd context holding the saved inputs.
-            grad_out: Upstream gradient of shape [tokens, hidden].
+            grad_out: Tensor of shape [tokens, hidden] containing upstream gradient.
 
         Returns:
-            Tuple ``(grad_x, grad_probs, None, None)`` where ``grad_x`` has
-            ``x``'s shape [tokens, hidden] and dtype, and ``grad_probs`` has
-            ``probs``'s shape [tokens, 1] and dtype (``None`` when the
-            respective input requires no gradient).
+            Tuple containing:
+                - grad_x: Tensor of shape [tokens, hidden] with x's dtype and device,
+                  or None when x does not require gradients.
+                - grad_probs: Tensor of shape [tokens, 1] with probs's dtype and device,
+                  or None when probs does not require gradients.
+                - None for out_dtype argument.
+                - None for save_x argument.
         """
         if ctx.save_x:
             x, probs = ctx.saved_tensors
@@ -126,19 +348,20 @@ def _apply_router_weight_fp32(
 ) -> torch.Tensor:
     """Apply routing probabilities to expert outputs with fp32 arithmetic.
 
-    Large 2-D row-aligned inputs go through the chunked custom Function so
-    autograd does not retain full-size fp32 intermediates; every other shape
-    keeps the plain eager multiply (bitwise-identical result).
+    Large 2-D row-aligned inputs go through the fused Triton Function (or chunked
+    fallback Function) so autograd does not retain full-size fp32 intermediates;
+    every other shape keeps the plain eager multiply (bitwise-identical result).
 
     Args:
-        output2: Expert down-projection outputs of shape [tokens, hidden].
-        permuted_probs: Routing probabilities broadcastable against
-            ``output2``, typically of shape [tokens, 1].
-        compute_dtype: Output dtype.
+        output2: Tensor of shape [tokens, hidden] containing expert down-projection
+            outputs on CUDA or CPU.
+        permuted_probs: Tensor of shape [tokens, 1] containing routing probabilities
+            broadcastable against output2.
+        compute_dtype: Output tensor element dtype.
 
     Returns:
-        ``(output2 * permuted_probs)`` computed in fp32 and cast to
-        ``compute_dtype``, with ``output2``'s broadcast shape.
+        Tensor of shape [tokens, hidden] and dtype compute_dtype containing
+        (output2 * permuted_probs) evaluated in fp32.
     """
     if (
         output2.dim() == 2
@@ -147,5 +370,9 @@ def _apply_router_weight_fp32(
         and permuted_probs.shape[1] == 1
         and output2.shape[0] > _RW_CHUNK_THRESHOLD
     ):
+        if _TRITON_ROUTER_WEIGHT_AVAILABLE and output2.is_cuda and _TritonRouterWeightMulFunction is not None:
+            return _TritonRouterWeightMulFunction.apply(
+                output2, permuted_probs, compute_dtype, permuted_probs.requires_grad
+            )
         return _RouterWeightMulFunction.apply(output2, permuted_probs, compute_dtype, permuted_probs.requires_grad)
     return (output2.float() * permuted_probs.float()).to(compute_dtype)
