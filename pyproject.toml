@@ -141,10 +141,11 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-# ffpa-attn 0.2.3 is the first release that pins nvidia-cutlass-dsl==4.6.2 and
-# quack-kernels==0.6.4, i.e. the same cutlass-dsl flash_attn.cute (FA4) needs. 0.2.2 hard-pinned
-# 4.6.0/0.6.1 and was unsatisfiable alongside FA4, so do not relax this floor.
-ffpa = ["ffpa-attn>=0.2.3", "nvidia-cutlass-dsl==4.6.2"]
+# ffpa-attn 0.2.3 first aligned on nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4,
+# i.e. the same cutlass-dsl flash_attn.cute (FA4) needs. 0.2.4 also fixes the persistent
+# CuTe cache callable ABI. 0.2.2 hard-pinned 4.6.0/0.6.1 and was unsatisfiable alongside
+# FA4, so do not relax this floor.
+ffpa = ["ffpa-attn>=0.2.4", "nvidia-cutlass-dsl==4.6.2"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]

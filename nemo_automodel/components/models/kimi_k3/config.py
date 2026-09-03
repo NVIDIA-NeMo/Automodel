@@ -22,7 +22,13 @@ from transformers.configuration_utils import PretrainedConfig
 
 
 class KimiK3TextConfig(PretrainedConfig):
-    """Configuration for the Kimi K3 hybrid KDA/MLA text backbone."""
+    """Configuration for the Kimi K3 hybrid KDA/MLA text backbone.
+
+    Defaults reproduce the released ``moonshotai/Kimi-K3`` checkpoint (``config.json`` text_config;
+    tech report Table 1): 93 layers (69 KDA + 24 gated MLA), 96 attention heads, dense FFN 33792,
+    896 latent-MoE experts (16 active, 2 shared), so ``from_config`` builds the same shape that
+    ``from_pretrained`` loads.
+    """
 
     model_type = "kimi_linear"
     architectures = ["KimiK3ForCausalLM"]
@@ -33,9 +39,9 @@ class KimiK3TextConfig(PretrainedConfig):
         vocab_size: int = 163840,
         hidden_size: int = 7168,
         head_dim: int | None = None,
-        intermediate_size: int = 18432,
+        intermediate_size: int = 33792,
         num_hidden_layers: int = 93,
-        num_attention_heads: int = 56,
+        num_attention_heads: int = 96,
         num_key_value_heads: int | None = None,
         hidden_act: str = "situ",
         initializer_range: float = 0.02,

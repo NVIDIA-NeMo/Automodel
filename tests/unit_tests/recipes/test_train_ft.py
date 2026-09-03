@@ -854,6 +854,41 @@ class _FlagCM(AbstractContextManager):
         return False
 
 
+def test_build_model_passes_freeze_config(monkeypatch):
+    """LLM model construction forwards freeze_config to NeMoAutoModel."""
+    from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForCausalLM.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    freeze_config = ConfigNode(
+        {
+            "unfreeze_modules": [{"path": "layer2"}],
+        }
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
+
+    build_model(
+        cfg_model=CapturingModelConfig(),
+        cfg_peft=None,
+        cfg_freeze=freeze_config,
+        seed=123,
+    )
+
+    # ConfigNode is unwrapped at the recipe boundary; downstream receives a mapping.
+    assert captured_kwargs["freeze_config"] == {"unfreeze_modules": [{"path": "layer2"}]}
+
+
 @requires_cuda
 def test_force_hf_true_disables_meta_init(monkeypatch):
     """When cfg_model.force_hf=True, meta-device init (init_empty_weights) should not be used.
@@ -1107,6 +1142,50 @@ def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     trainer.setup()
 
     assert not hasattr(cfg.model, "torch_dtype")
+
+
+def test_freeze_config_applies_before_optimizer_build(monkeypatch):
+    """The optimizer sees the trainability selected through freeze_config."""
+    from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, parse_freeze_config
+
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    cfg.freeze_config = ConfigNode(
+        {
+            "freeze_modules": [{"glob": "layer*"}],
+            "unfreeze_modules": [{"glob": "*2"}],
+        }
+    )
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+
+    model = DummyModel()
+    freeze_configs = []
+
+    def _build_model(*args, cfg_freeze=None, **kwargs):
+        freeze_configs.append(cfg_freeze)
+        if cfg_freeze is not None:
+            apply_parameter_freezing(model, parse_freeze_config(cfg_freeze.to_dict()))
+        return model
+
+    trainable_at_optimizer_build = []
+
+    def _build_optimizer(model, *args, **kwargs):
+        trainable_at_optimizer_build.extend(
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        )
+        return [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)]
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(build=_build_optimizer)),
+    )
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert freeze_configs[0] is not None
+    assert freeze_configs[0].to_dict() == cfg.freeze_config.to_dict()
+    assert trainable_at_optimizer_build == ["layer2.weight"]
 
 
 def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
