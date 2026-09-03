@@ -1,12 +1,12 @@
 ---
 title: "Reranking Models"
-description: ""
+description: "Reranking model coverage in NeMo AutoModel, including optimized Llama and Qwen3 backbones, Hugging Face Auto fallback, and supported workflows."
 position: 1
 ---
 
 ## Introduction
 
-Reranking models use cross-encoders to score a query-document pair jointly. They are typically used after an embedding model has produced an initial candidate set. NeMo AutoModel supports optimized bidirectional Llama rerankers and a causal Qwen3 reranker that scores with a yes/no decision at the final token, and falls back to Hugging Face `AutoModelForSequenceClassification` for other architectures.
+Reranking models use cross-encoders to score a query-document pair jointly. They are typically used after an embedding model has produced an initial candidate set. NeMo AutoModel supports optimized bidirectional Llama rerankers and a causal Qwen3 reranker that scores with a yes or no decision at the final token, and falls back to Hugging Face `AutoModelForSequenceClassification` for other architectures.
 
 For first-stage dense retrieval, see [Embedding Models](/model-coverage/embedding-models/overview).
 
@@ -33,7 +33,7 @@ This table combines recipe-backed checkpoints with documented model families. Da
 ## Supported Workflows
 
 - **Fine-tuning (Cross-Encoder):** Cross-entropy training on query-document pairs to produce rerankers
-- **LoRA/PEFT:** Parameter-efficient fine-tuning for reranking backbones
+- **LoRA and PEFT:** Parameter-efficient fine-tuning for reranking backbones
 
 ## Dataset
 
