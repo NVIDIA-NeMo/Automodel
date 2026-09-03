@@ -1391,8 +1391,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 image_features = self.model.get_image_features(
                     pixel_values, image_position_ids=image_position_ids, return_dict=True
                 ).pooler_output
-                # transformers >=5.15 splits pooler_output into one tensor per image.
-                image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                # transformers >=5.15 returns one tensor per image; earlier versions
+                # return them already stacked.
+                if not torch.is_tensor(image_features):
+                    image_features = torch.cat(image_features, dim=0)
+                image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
                 if mm_token_type_ids is not None:
                     special_image_mask = mm_token_type_ids == 1
@@ -1592,8 +1595,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             image_features = self.model.get_image_features(
                 pixel_values, image_position_ids=image_position_ids, return_dict=True
             ).pooler_output
-            # transformers >=5.15 splits pooler_output into one tensor per image.
-            image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            # transformers >=5.15 returns one tensor per image; earlier versions
+            # return them already stacked.
+            if not torch.is_tensor(image_features):
+                image_features = torch.cat(image_features, dim=0)
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
 

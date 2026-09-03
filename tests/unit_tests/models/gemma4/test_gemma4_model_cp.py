@@ -258,6 +258,34 @@ def test_forward_moe_cp_pixel_values_are_spliced_in_forward():
     assert out.logits.shape == (1, 4, cfg.text_config.vocab_size)
 
 
+def test_forward_moe_cp_accepts_per_image_pooler_output():
+    """transformers >=5.15 returns pooler_output as one tensor per image rather
+    than a single stacked tensor; both forms must splice to the same embeds."""
+    cfg = _cfg()
+    cfg.image_token_id = 2
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
+    model._cp_enabled = True
+    per_image = [torch.full((1, cfg.text_config.hidden_size), i + 1.0, dtype=torch.bfloat16) for i in range(2)]
+    captured = {}
+
+    def fake_lm(*args, **kwargs):
+        captured["inputs_embeds"] = kwargs.get("inputs_embeds")
+        return SimpleNamespace(last_hidden_state=torch.zeros(1, 4, cfg.text_config.hidden_size, dtype=torch.bfloat16))
+
+    with (
+        mock.patch.object(model.model, "get_image_features", return_value=SimpleNamespace(pooler_output=per_image)),
+        mock.patch.object(model.model.language_model, "forward", side_effect=fake_lm),
+    ):
+        out = model(input_ids=torch.tensor([[1, 2, 3, 2]]), pixel_values=torch.randn(2, 3, 8, 8))
+
+    # The two image rows land at the two image_token_id positions, in order.
+    embeds = captured["inputs_embeds"]
+    assert embeds.shape == (1, 4, cfg.text_config.hidden_size)
+    assert torch.equal(embeds[0, 1], per_image[0][0])
+    assert torch.equal(embeds[0, 3], per_image[1][0])
+    assert out.logits.shape == (1, 4, cfg.text_config.vocab_size)
+
+
 # ---------------------------------------------------------------------------
 # forward: dense CP branches
 # ---------------------------------------------------------------------------
