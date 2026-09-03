@@ -24,14 +24,24 @@ from PIL import Image
 from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
+from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.fsdp import _is_deepseek_v4_module, _iter_dsv4_fp32_modules
+from nemo_automodel.components.models.deepseek_v4.layers import (
+    DeepseekV4Attention,
+    DeepseekV4RotaryEmbedding,
+    build_causal_padding_mask,
+)
 from nemo_automodel.components.models.deepseek_v4.model import (
     DeepseekV4ForCausalLM,
     DeepseekV4VisionGate,
     apply_deepseek_v4_image_visibility,
 )
-from nemo_automodel.components.models.deepseek_v4.optimized_kernels import build_dsv4_sparse_topk_indices
+from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
+    build_dsv4_sparse_topk_indices,
+    dsv4_sparse_attention,
+    is_dsv4_kernel_available,
+)
 from nemo_automodel.components.models.deepseek_v4.processing import (
     ASSISTANT_TOKEN,
     BOS_TOKEN,
@@ -55,6 +65,40 @@ from nemo_automodel.components.models.deepseek_v4.vision import (
     DeepseekV4VisionTransformer,
 )
 from nemo_automodel.components.moe.config import MoEConfig
+
+
+def _can_run_tilelang_sparse_attention() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() >= (8, 9)
+        and is_dsv4_kernel_available("sparse_attn")
+    )
+
+
+def _sparse_attention_torch_module_oracle(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    sinks: torch.Tensor,
+    topk_indices: torch.Tensor,
+    sm_scale: float,
+    *,
+    backend: str,
+) -> torch.Tensor:
+    """Run the Torch sparse-attention oracle behind the module's TileLang dispatch.
+
+    Args:
+        q: Query tensor of shape [batch, sequence, heads, head_dim].
+        kv: Key/value tensor of shape [batch, key_sequence, head_dim].
+        sinks: Attention-sink tensor of shape [heads].
+        topk_indices: Sparse key indices of shape [batch, sequence, selected_keys].
+        sm_scale: Attention score scaling factor.
+        backend: Module-selected backend, ignored by this CPU oracle.
+
+    Returns:
+        Attention output tensor of shape [batch, sequence, heads, head_dim].
+    """
+    del backend
+    return dsv4_sparse_attention(q, kv, sinks, topk_indices, sm_scale, backend="sparse_torch")
 
 
 def _vision_config(**overrides) -> DeepseekV4Config:
@@ -201,6 +245,152 @@ def test_sparse_visual_window_indices_match_released_reference(types):
     expected = torch.where(expected > (idx + right).unsqueeze(-1), -1, expected)
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("device", "dtype", "uses_tilelang"),
+    [
+        pytest.param("cpu", torch.float32, False, id="torch_sparse_oracle"),
+        pytest.param(
+            "cuda",
+            torch.bfloat16,
+            True,
+            id="tilelang",
+            marks=pytest.mark.skipif(
+                not _can_run_tilelang_sparse_attention(),
+                reason="TileLang sparse attention requires CUDA compute capability 8.9 or newer",
+            ),
+        ),
+    ],
+)
+def test_visual_sparse_attention_module_matches_dense_forward_backward(monkeypatch, device, dtype, uses_tilelang):
+    torch.manual_seed(123)
+    if uses_tilelang:
+        hidden_size, num_heads, head_dim, seq_len, window_size = 128, 16, 512, 192, 128
+        image_start, image_end, max_image_tokens = 16, 176, 384
+    else:
+        hidden_size, num_heads, head_dim, seq_len, window_size = 32, 2, 16, 48, 16
+        image_start, image_end, max_image_tokens = 10, 36, 32
+
+    config = _vision_config(
+        hidden_size=hidden_size,
+        moe_intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=num_heads,
+        num_key_value_heads=1,
+        head_dim=head_dim,
+        qk_rope_head_dim=min(64, head_dim // 2),
+        q_lora_rank=hidden_size,
+        o_lora_rank=hidden_size,
+        o_groups=1,
+        n_routed_experts=2,
+        n_shared_experts=0,
+        num_experts_per_tok=1,
+        max_position_embeddings=seq_len,
+        compress_ratios=[0],
+        sliding_window=window_size,
+        attention_dropout=0.0,
+        num_hash_layers=0,
+        hc_mult=1,
+        vision_max_n_token=max_image_tokens,
+        dtype=dtype,
+    )
+    backend_kwargs = {
+        "linear": "torch",
+        "rms_norm": "torch",
+        "rope_fusion": False,
+        "enable_hf_state_dict_adapter": False,
+        "dispatcher": "torch",
+        "experts": "torch",
+    }
+    reference = DeepseekV4Attention(config, layer_idx=0, backend=BackendConfig(attn="sdpa", **backend_kwargs))
+    actual = DeepseekV4Attention(config, layer_idx=0, backend=BackendConfig(attn="tilelang", **backend_kwargs))
+    reference.init_weights(torch.device("cpu"))
+    actual.load_state_dict(reference.state_dict())
+    reference.to(device=device, dtype=dtype).train()
+    actual.to(device=device, dtype=dtype).train()
+    reference.sinks_param.to(dtype=torch.float32)
+    actual.sinks_param.to(dtype=torch.float32)
+
+    hidden_states = torch.randn(1, seq_len, hidden_size, device=device, dtype=dtype)
+    position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+    rotary = DeepseekV4RotaryEmbedding(
+        rope_theta=float(config.rope_theta),
+        head_dim=head_dim,
+        partial_rotary_factor=float(config.qk_rope_head_dim) / float(head_dim),
+        device=torch.device(device),
+    )
+    position_embeddings = rotary(hidden_states, position_ids)
+    attention_mask = build_causal_padding_mask(
+        None,
+        seq_len=seq_len,
+        dtype=dtype,
+        device=torch.device(device),
+        batch_size=1,
+        sliding_window=window_size,
+    )
+    vision_token_types = torch.full((1, seq_len), -1, dtype=torch.long, device=device)
+    vision_token_types[:, image_start] = IMAGE_START
+    vision_token_types[:, image_start + 1 : image_end] = IMAGE
+    vision_token_types[:, image_end] = IMAGE_END
+    attention_mask = apply_deepseek_v4_image_visibility(attention_mask, vision_token_types)
+    assert image_end - image_start >= window_size
+    assert attention_mask[0, 0, image_start, image_end] == 0
+
+    if not uses_tilelang:
+        monkeypatch.setattr(dsv4_layers, "dsv4_sparse_attention", _sparse_attention_torch_module_oracle)
+
+    grad_output = torch.randn(1, seq_len, hidden_size, device=device, dtype=dtype)
+    reference_input = hidden_states.detach().clone().requires_grad_(True)
+    reference_output, _ = reference(
+        reference_input,
+        position_embeddings=position_embeddings,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        vision_token_types=vision_token_types,
+    )
+    reference_output.backward(grad_output)
+
+    actual_input = hidden_states.detach().clone().requires_grad_(True)
+    actual_output, _ = actual(
+        actual_input,
+        position_embeddings=position_embeddings,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        vision_token_types=vision_token_types,
+    )
+    actual_output.backward(grad_output)
+
+    forward_rtol, forward_atol = (2e-2, 2e-2) if uses_tilelang else (1e-5, 1e-6)
+    grad_rtol, grad_atol = (5e-2, 5e-2) if uses_tilelang else (1e-5, 1e-6)
+    torch.testing.assert_close(actual_output, reference_output, rtol=forward_rtol, atol=forward_atol)
+    torch.testing.assert_close(actual_input.grad, reference_input.grad, rtol=grad_rtol, atol=grad_atol)
+    for (actual_name, actual_param), (reference_name, reference_param) in zip(
+        actual.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        assert actual_name == reference_name
+        assert actual_param.grad is not None, actual_name
+        assert reference_param.grad is not None, reference_name
+        if uses_tilelang:
+            gradient_cosine = torch.nn.functional.cosine_similarity(
+                actual_param.grad.float().flatten(), reference_param.grad.float().flatten(), dim=0
+            )
+            assert gradient_cosine > 0.999, f"{actual_name} gradient cosine too low: {gradient_cosine:.6f}"
+            torch.testing.assert_close(
+                actual_param.grad,
+                reference_param.grad,
+                rtol=grad_rtol,
+                atol=0.15,
+                msg=lambda msg: f"{actual_name} gradient mismatch:\n{msg}",
+            )
+        else:
+            torch.testing.assert_close(
+                actual_param.grad,
+                reference_param.grad,
+                rtol=grad_rtol,
+                atol=grad_atol,
+                msg=lambda msg: f"{actual_name} gradient mismatch:\n{msg}",
+            )
 
 
 @pytest.mark.parametrize("provide_metadata", [False, True])
