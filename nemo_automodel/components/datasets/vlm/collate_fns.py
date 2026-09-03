@@ -20,6 +20,7 @@ import torch
 from PIL import Image as PILImage
 
 from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
     PackedSequenceContract,
     build_packed_sequence_metadata,
 )
@@ -1510,8 +1511,7 @@ def neat_packed_vlm_collater(
     batch: list[dict],
     padding_idx: int = 0,
     max_length: int | None = None,
-    *,
-    packing: PackedSequenceContract,
+    packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
     materialize_4d_mask: bool = True,
 ) -> dict:
     """Collater for neat-packed VLM sequences.
@@ -1534,6 +1534,7 @@ def neat_packed_vlm_collater(
             A fixed length avoids recompilation with ``torch.compile``
             and ensures uniform tensor shapes across steps.
         packing: Structural model contract selecting the packed mask representation.
+            Defaults to block-causal masking without packed-sequence metadata.
         materialize_4d_mask: Whether SDPA/eager packing should expand the
             indexed ``[B, S]`` document map into a dense
             ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths

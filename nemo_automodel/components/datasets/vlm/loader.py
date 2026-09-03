@@ -30,7 +30,10 @@ from transformers import AutoProcessor, ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDatasetConfig
-from nemo_automodel.components.datasets.packing import PackedSequenceContract
+from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    PackedSequenceContract,
+)
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     COLLATE_FNS,
     neat_packed_vlm_collater,
@@ -211,7 +214,7 @@ class VlmDataloaderConfig:
         batch_size: int,
         dataset_build_context: AbstractContextManager[object] | None = None,
         get_rope_index: Callable[..., object] | None = None,
-        packing_contract: PackedSequenceContract | None = None,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         pp_n_microbatches: int | None = None,
         cp_size: int = 1,
     ) -> VlmDataloaderBuild:
@@ -225,6 +228,7 @@ class VlmDataloaderConfig:
             dataset_build_context: Optional rank-ordering context used only for processor and source-dataset build.
             get_rope_index: Optional model callback used to create packed multimodal position IDs.
             packing_contract: Structural model contract used for packed-mask construction.
+                Defaults to block-causal masking without packed-sequence metadata.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
                 compact document IDs instead of a dense quadratic attention mask;
@@ -249,8 +253,6 @@ class VlmDataloaderConfig:
         if self.packing is not None:
             if self.pretokenization is None:
                 raise ValueError("VLM neat packing requires pretokenization")
-            if self.packing.packing_format != "thd" and packing_contract is None:
-                raise ValueError("NEAT packing requires a PackedSequenceContract")
             tokenizer = getattr(processor, "tokenizer", None)
             padding_idx = getattr(tokenizer, "pad_token_id", 0) or 0
             dataset = self.packing.build(
@@ -269,7 +271,6 @@ class VlmDataloaderConfig:
                     max_length=self.packing.collate_max_length,
                 )
             else:
-                assert packing_contract is not None
                 materialize_4d_mask = cp_size <= 1
                 if not materialize_4d_mask:
                     logger.info(

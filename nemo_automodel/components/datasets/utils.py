@@ -18,6 +18,7 @@ import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
     PackedSequenceContract,
     build_packed_sequence_metadata,
 )
@@ -509,7 +510,7 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
 def neat_packed_collater(
     batch: list[dict],
     *,
-    packing: PackedSequenceContract,
+    packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
 ) -> dict:
     """Collater for neat-packed LLM sequences.
 
@@ -523,6 +524,7 @@ def neat_packed_collater(
     Args:
         batch: List of sample dicts produced by ``neat_pack_dataset``.
         packing: Structural model contract selecting the packed mask representation.
+            Defaults to block-causal masking without packed-sequence metadata.
 
     Returns:
         Dict with batched tensors ready for model forward. Varlen output adds

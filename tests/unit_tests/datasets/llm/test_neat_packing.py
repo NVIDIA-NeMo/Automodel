@@ -369,10 +369,6 @@ class TestIndexedMaskTo4dBlockCausal:
 
 
 class TestNeatPackedCollater:
-    def test_requires_packing_contract(self):
-        with pytest.raises(TypeError, match="packing"):
-            neat_packed_collater([])
-
     def test_collater_output(self):
         batch = [
             {
@@ -388,19 +384,14 @@ class TestNeatPackedCollater:
                 "position_ids": torch.tensor([0, 1, 2, 3]),
             },
         ]
-        result = neat_packed_collater(
-            batch,
-            packing=SimpleNamespace(
-                packed_mask_type="block_causal",
-                requires_packed_sequence_metadata=False,
-            ),
-        )
+        result = neat_packed_collater(batch)
 
         assert result["input_ids"].shape == (2, 4)
         assert result["labels"].shape == (2, 4)
         assert result["position_ids"].shape == (2, 4)
         assert result["attention_mask"].shape == (2, 1, 4, 4)
         assert result["attention_mask"].dtype == torch.bool
+        assert "packed_token_indices" not in result
 
     def test_sdpa_preserves_indexed_packed_seq_ids(self):
         batch = [

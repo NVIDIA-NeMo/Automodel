@@ -38,6 +38,7 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
@@ -573,7 +574,7 @@ def test_setup_always_stages_pp_media_under_pp(
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
     assert dataloader_calls[0]["cp_size"] == cp_size
-    assert dataloader_calls[0]["packing_contract"] is None
+    assert dataloader_calls[0]["packing_contract"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
 
 
 # -----------------------------------------------------------------------------

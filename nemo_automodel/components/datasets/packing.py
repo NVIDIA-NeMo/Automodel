@@ -14,7 +14,8 @@
 
 """Dataset-owned packed-sequence construction contracts and helpers."""
 
-from typing import Literal, Protocol, TypedDict
+from dataclasses import dataclass
+from typing import Final, Literal, Protocol, TypedDict
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +35,17 @@ class PackedSequenceContract(Protocol):
     def requires_packed_sequence_metadata(self) -> bool:
         """Whether the model consumes flat token indices and cumulative lengths."""
         ...
+
+
+@dataclass(frozen=True)
+class _DefaultPackedSequenceContract:
+    """Block-causal packing defaults for callers without model requirements."""
+
+    packed_mask_type: PackedMaskType = "block_causal"
+    requires_packed_sequence_metadata: bool = False
+
+
+DEFAULT_PACKED_SEQUENCE_CONTRACT: Final[PackedSequenceContract] = _DefaultPackedSequenceContract()
 
 
 class PackedSequenceMetadata(TypedDict):

@@ -31,14 +31,17 @@ from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from dataclasses import dataclass, field, fields, is_dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from torch.utils.data.sampler import Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
-from nemo_automodel.components.datasets.packing import PackedSequenceContract
+from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    PackedSequenceContract,
+)
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase, ProcessorMixin
@@ -46,7 +49,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CollateFn = Callable[[list[object]], object]
-PackingContractT = TypeVar("PackingContractT", contravariant=True)
 
 
 class PlainDatasetConfig(Protocol):
@@ -139,7 +141,7 @@ def _shard_iterable_dataset(dataset: Any, *, dp_rank: int, dp_world_size: int) -
 
 
 @dataclass
-class PackingConfig(Generic[PackingContractT]):
+class PackingConfig:
     """Base config for sequence packing; ``None`` (no config) means no packing.
 
     Subclasses (:class:`ThdPackingConfig` / :class:`NeatPackingConfig`) pick the packing strategy and the
@@ -186,14 +188,14 @@ class PackingConfig(Generic[PackingContractT]):
         supports_seq_lens: bool = True,
         pad_token_id: int = 0,
         cp_size: int = 1,
-        packing_contract: PackingContractT,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
     ) -> tuple[object, CollateFn | None]:
         """Pack ``dataset`` and return ``(dataset, collate_fn)``."""
         raise NotImplementedError
 
 
 @dataclass
-class ThdPackingConfig(PackingConfig[None]):
+class ThdPackingConfig(PackingConfig):
     """THD (flattened, ``seq_lens``-based) packing; pairs with ``packed_sequence_thd_collater``.
 
     Requires a model whose forward accepts ``seq_lens`` — packing is skipped (with a warning) otherwise.
@@ -208,7 +210,7 @@ class ThdPackingConfig(PackingConfig[None]):
         supports_seq_lens: bool = True,
         pad_token_id: int = 0,
         cp_size: int = 1,
-        packing_contract: None = None,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
     ) -> tuple[object, CollateFn | None]:
         """Pack with THD; returns ``(dataset, None)`` if the model does not accept ``seq_lens``."""
         del packing_contract
@@ -234,7 +236,7 @@ class ThdPackingConfig(PackingConfig[None]):
 
 
 @dataclass
-class NeatPackingConfig(PackingConfig[PackedSequenceContract]):
+class NeatPackingConfig(PackingConfig):
     """NEAT (bin-packed) packing paired with ``neat_packed_collater``."""
 
     drop_long_samples: bool = True
@@ -248,12 +250,10 @@ class NeatPackingConfig(PackingConfig[PackedSequenceContract]):
         supports_seq_lens: bool = True,
         pad_token_id: int = 0,
         cp_size: int = 1,
-        packing_contract: PackedSequenceContract,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
     ) -> tuple[object, CollateFn]:
         """Pack with NEAT and configure the collator for the selected attention implementation."""
         del supports_seq_lens, cp_size
-        if packing_contract is None:
-            raise ValueError("NEAT packing requires a PackedSequenceContract")
         from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
         from nemo_automodel.components.datasets.utils import neat_packed_collater
 
@@ -272,7 +272,7 @@ class NeatPackingConfig(PackingConfig[PackedSequenceContract]):
         return dataset, partial(neat_packed_collater, packing=packing_contract)
 
 
-_PACKING_CONFIGS: dict[str, type[PackingConfig[Any]]] = {
+_PACKING_CONFIGS: dict[str, type[PackingConfig]] = {
     "thd": ThdPackingConfig,
     "neat": NeatPackingConfig,
 }
@@ -299,7 +299,7 @@ def _resolve_target(target: Any, registry: dict[str, Any]) -> Any:
     return getattr(importlib.import_module(module_path), attr)
 
 
-def make_packing_config(target: str | None, kwargs: dict[str, object] | None = None) -> PackingConfig[Any] | None:
+def make_packing_config(target: str | None, kwargs: dict[str, object] | None = None) -> PackingConfig | None:
     """Resolve a packing-config ``target`` and construct it from ``kwargs`` (``target=None`` → no packing).
 
     ``target`` is either a built-in strategy key (``"thd"`` / ``"neat"``) or a dotted import path to
@@ -583,7 +583,7 @@ class DataloaderConfig:
     """
 
     dataset_config: DatasetConfig
-    packing: PackingConfig[Any] | None = None
+    packing: PackingConfig | None = None
     batch_sampler_config: BatchSamplerConfig | None = None
     dataset_build_schedule: DatasetBuildSchedule | None = None
     shuffle: bool | None = None
@@ -641,7 +641,7 @@ class DataloaderConfig:
         dataset_build_context: AbstractContextManager[object] | None = None,
         supports_seq_lens: bool = True,
         cp_size: int = 1,
-        packing_contract: PackedSequenceContract | None = None,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         collate_wrapper: Callable[[CollateFn], CollateFn] | None = None,
     ) -> DataLoader:
         """Build the configured dataset, packing, sampler, collator, and stateful dataloader.
@@ -656,6 +656,7 @@ class DataloaderConfig:
             supports_seq_lens: Whether the model forward contract accepts THD ``seq_lens`` metadata.
             cp_size: Context-parallel world size used for packed-sequence divisibility.
             packing_contract: Structural model contract used by NEAT packing.
+                Defaults to block-causal masking without packed-sequence metadata.
             collate_wrapper: Optional recipe-owned wrapper around the resolved collator.
 
         Returns:

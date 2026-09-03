@@ -46,7 +46,7 @@ from nemo_automodel._transformers import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.packing import get_unpad_data
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT, get_unpad_data
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
@@ -375,7 +375,7 @@ def build_dataloader(
 
     from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
-    packing_contract = None
+    packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
     if config.packing is not None and config.packing.packing_format != "thd":
         if model is None:
             raise ValueError("Packed deprecated build_dataloader calls require the built model")
@@ -613,7 +613,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
-        packing_contract = None
+        packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
             packing_contract = configure_packing(
                 get_attn_implementation(self.cfg.model, model=self.model_parts[0]),

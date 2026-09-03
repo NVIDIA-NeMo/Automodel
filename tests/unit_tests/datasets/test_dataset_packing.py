@@ -16,10 +16,16 @@ import pytest
 import torch
 
 from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
     build_packed_sequence_metadata,
     get_seqlens_in_batch,
     get_unpad_data,
 )
+
+
+def test_default_packed_sequence_contract_preserves_block_causal_behavior() -> None:
+    assert DEFAULT_PACKED_SEQUENCE_CONTRACT.packed_mask_type == "block_causal"
+    assert DEFAULT_PACKED_SEQUENCE_CONTRACT.requires_packed_sequence_metadata is False
 
 
 def test_get_seqlens_in_batch_preserves_batch_document_order() -> None:

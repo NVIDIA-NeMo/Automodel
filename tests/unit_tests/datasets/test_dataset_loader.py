@@ -35,6 +35,7 @@ from nemo_automodel.components.datasets.loader import (
     make_collate_fn,
     make_packing_config,
 )
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
@@ -283,13 +284,17 @@ def test_packing_config_warns_for_ignored_legacy_field():
     assert isinstance(config, ThdPackingConfig)
 
 
-def test_neat_packing_requires_contract():
+def test_neat_packing_uses_default_contract(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
+        lambda dataset, **_: dataset,
+    )
     config = NeatPackingConfig(packed_sequence_size=8)
 
-    with pytest.raises(TypeError, match="packing_contract"):
-        config.build([])
-    with pytest.raises(ValueError, match="PackedSequenceContract"):
-        config.build([], packing_contract=None)
+    dataset, collate_fn = config.build([])
+
+    assert dataset == []
+    assert collate_fn.keywords["packing"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
 
 
 def test_megatron_loader_preserves_schedule_and_sampler_config():
