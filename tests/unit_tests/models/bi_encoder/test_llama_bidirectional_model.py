@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaModel as HFLlamaModel
 
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
@@ -91,15 +92,22 @@ def test_llama_bidirectional_config_fields():
     assert isinstance(cfg.temperature, float)
 
 
-def test_llama_bidirectional_model_init_and_mask():
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_llama_bidirectional_model_init_and_mask(is_causal):
+    """Verify initialization and masked forwards in both attention modes."""
     cfg = LlamaBidirectionalConfig(
-        vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        intermediate_size=64,
+        pad_token_id=0,
+        is_causal=is_causal,
     )
     model = LlamaBidirectionalModel(cfg)
     model.eval()
 
-    # All attention layers should be non-causal
-    assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
+    assert all(getattr(layer.self_attn, "is_causal", None) is is_causal for layer in model.layers)
 
     # Forward with padding mask produces valid output
     input_ids = torch.randint(0, cfg.vocab_size, (1, 3))
@@ -173,6 +181,53 @@ def test_bidirectional_attention_is_symmetric():
     assert not torch.allclose(out_base[0, 0], out_modified[0, 0], atol=1e-6), (
         "Bidirectional model: changing last token should affect first token's hidden state"
     )
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_llama_dual_mode_matches_hf_parent(is_causal):
+    """Verify both attention modes match the Hugging Face parent model."""
+    torch.manual_seed(42)
+    config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        is_causal=is_causal,
+    )
+    actual_model = LlamaBidirectionalModel(config).eval()
+    reference_model = HFLlamaModel(config).eval()
+    reference_model.load_state_dict(actual_model.state_dict())
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        actual = actual_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        reference = reference_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-5)
+
+
+def test_causal_attention_blocks_future_token_influence():
+    """Verify causal attention prevents future tokens affecting earlier states."""
+    cfg = LlamaBidirectionalConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        intermediate_size=64,
+        pad_token_id=0,
+        is_causal=True,
+    )
+    model = LlamaBidirectionalModel(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    modified = input_ids.clone()
+    modified[0, -1] = (modified[0, -1] + 1) % cfg.vocab_size
+    with torch.no_grad():
+        original = model(input_ids=input_ids).last_hidden_state
+        changed = model(input_ids=modified).last_hidden_state
+    torch.testing.assert_close(original[0, 0], changed[0, 0])
 
 
 # --- Fakes for classification and encoder tests ---
@@ -318,7 +373,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
     assert v2.shape == (2, 8)
 
 
-def test_encoder_build_and_save(tmp_path, monkeypatch):
+def test_legacy_encoder_build_and_save(tmp_path, monkeypatch):
     # Patch ModelClass.from_pretrained to return FakeLM
     class FakeBidirectionalModel(FakeLM):
         @classmethod
@@ -332,7 +387,7 @@ def test_encoder_build_and_save(tmp_path, monkeypatch):
     # Directory path with config.json to hit config-reading branch
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
 
     model = BiEncoderModel.build(
         model_name_or_path=str(model_dir),
