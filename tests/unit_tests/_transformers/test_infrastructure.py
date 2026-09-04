@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -138,6 +141,19 @@ def test_moe_infrastructure_forwards_fsdp2_tp_sequence_and_offload_settings():
     assert parallelize_fn.keywords["frozen_multimodal_sharding"] == "replicate"
 
 
+def test_pipeline_parallelizer_forwards_trainability_rebind():
+    """Each PP stage receives the same pre-wrapper trainability policy."""
+    from nemo_automodel._transformers.infrastructure import parallelize_for_pp
+
+    model = torch.nn.Linear(2, 2)
+    callback = MagicMock()
+    manager = MagicMock()
+    manager.parallelize.return_value = model
+
+    assert parallelize_for_pp(model, model_wrapper=manager, reapply_trainability=callback) is model
+    manager.parallelize.assert_called_once_with(model, reapply_trainability=callback)
+
+
 # =============================================================================
 # Tests for apply_model_infrastructure: post-shard initialize_model_weights
 # =============================================================================
@@ -148,6 +164,245 @@ class _DummyModel(torch.nn.Module):
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
         self.config = SimpleNamespace()
+
+
+class _TinyTrainabilityModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.base = torch.nn.Linear(1, 1, bias=False)
+        self.extension = torch.nn.Linear(1, 1, bias=False)
+        self.extension.requires_grad_(False)
+        self.model_constant = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+        self.config = SimpleNamespace()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Apply both projections.
+
+        Args:
+            inputs: Tensor of shape [batch, features].
+
+        Returns:
+            Tensor of shape [batch, features].
+        """
+        return self.base(inputs) + self.extension(inputs)
+
+
+class _TinyClassifierModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = torch.nn.Linear(2, 2)
+        self.classifier = torch.nn.Linear(2, 1)
+        self.config = SimpleNamespace()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Apply the backbone and classifier.
+
+        Args:
+            inputs: Tensor of shape [batch, features].
+
+        Returns:
+            Tensor of shape [batch, 1].
+        """
+        return self.classifier(self.backbone(inputs))
+
+
+_GENERIC_FREEZE_CONFIG = {
+    "freeze_modules": [{"glob": "b*"}, {"glob": "ext*"}],
+    "unfreeze_modules": [{"glob": "ext*"}],
+}
+
+
+def _run_freeze_config_ddp(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+        from nemo_automodel.components.distributed.config import DDPConfig
+        from nemo_automodel.components.distributed.ddp import DDPManager
+
+        model = apply_model_infrastructure(
+            model=_TinyTrainabilityModel(),
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=DDPManager(DDPConfig()),
+            freeze_config=_GENERIC_FREEZE_CONFIG,
+        )
+
+        for _ in range(2):
+            model.zero_grad(set_to_none=True)
+            model(torch.tensor([[float(rank + 1)]])).sum().backward()
+
+        assert model.module.base.weight.grad is None
+        assert model.module.extension.weight.grad is not None
+        Path(result_dir, f"rank_{rank}.txt").write_text(
+            str(model.module.extension.weight.grad.item()),
+            encoding="utf-8",
+        )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_freeze_config_applies_before_ddp_reducer_construction(tmp_path: Path):
+    """Configured trainable parameters participate in DDP gradient synchronization."""
+    torch.multiprocessing.spawn(
+        _run_freeze_config_ddp,
+        args=(2, str(tmp_path / "gloo_init"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+    gradients = [float((tmp_path / f"rank_{rank}.txt").read_text(encoding="utf-8")) for rank in range(2)]
+    assert gradients == [1.5, 1.5]
+
+
+def _replace_and_wrap_parameters(model, *_args, **_kwargs):
+    """Simulate parallelization surgery: replace Parameters and change their FQNs.
+
+    Wrapping ``extension`` in a Sequential changes its parameter FQN from
+    ``extension.weight`` to ``extension.0.weight`` and installs a new Parameter
+    object (which defaults to requires_grad=True), mirroring grouped-expert
+    regrouping and wrapper-injecting transforms.
+    """
+    model.base.weight = torch.nn.Parameter(model.base.weight.detach().clone())
+    model.extension = torch.nn.Sequential(model.extension)
+    model.extension[0].weight = torch.nn.Parameter(model.extension[0].weight.detach().clone())
+    if hasattr(model, "lora_weight"):
+        model.lora_weight = torch.nn.Parameter(model.lora_weight.detach().clone())
+        model.vision_adapter.lora_weight = torch.nn.Parameter(model.vision_adapter.lora_weight.detach().clone())
+    model.register_parameter("parallel_parameter", torch.nn.Parameter(torch.ones(1)))
+    return model
+
+
+def _run_trainability_infrastructure(model, freeze_config, peft_config=None):
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+    class _ReplacingWrapper:
+        mp_policy = None
+
+        def parallelize(self, model, reapply_trainability=None):
+            model = _replace_and_wrap_parameters(model)
+            assert reapply_trainability is not None
+            reapply_trainability(model)
+            model.trainability_at_wrapper_construction = {
+                name: param.requires_grad for name, param in model.named_parameters(remove_duplicate=False)
+            }
+            return model
+
+    freeze_kwargs = {"freeze_config": freeze_config} if freeze_config is not None else {}
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._apply_peft_and_lower_precision", return_value=model),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
+        return apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=_ReplacingWrapper(),
+            peft_config=peft_config,
+            **freeze_kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    ("freeze_config", "extension_trainable", "vision_lora_trainable"),
+    [
+        pytest.param(None, False, True, id="no-freeze-config"),
+        pytest.param({"freeze_vision_tower": False}, False, True, id="disabled-legacy-alias"),
+        pytest.param({"freeze_vision_tower": True}, False, False, id="enabled-legacy-alias"),
+        pytest.param(_GENERIC_FREEZE_CONFIG, True, True, id="generic-freeze-config"),
+    ],
+)
+def test_peft_freeze_config_survives_name_changing_parameter_replacement(
+    freeze_config: dict | None, extension_trainable: bool, vision_lora_trainable: bool
+):
+    """Under PEFT, selector overrides rebind after surgery while new non-LoRA parameters freeze."""
+    model = _TinyTrainabilityModel()
+    model.register_parameter("lora_weight", torch.nn.Parameter(torch.ones(1)))
+    model.vision_adapter = torch.nn.Module()
+    model.vision_adapter.register_parameter("lora_weight", torch.nn.Parameter(torch.ones(1)))
+    peft_config = SimpleNamespace(lora_A_init=None, use_triton=False)
+
+    _run_trainability_infrastructure(model, freeze_config, peft_config=peft_config)
+
+    assert not model.base.weight.requires_grad
+    assert model.extension[0].weight.requires_grad is extension_trainable
+    assert model.lora_weight.requires_grad
+    assert model.vision_adapter.lora_weight.requires_grad is vision_lora_trainable
+    assert not model.parallel_parameter.requires_grad
+    assert model.trainability_at_wrapper_construction["extension.0.weight"] is extension_trainable
+    assert model.trainability_at_wrapper_construction["vision_adapter.lora_weight"] is vision_lora_trainable
+    assert not model.trainability_at_wrapper_construction["parallel_parameter"]
+
+
+def test_freeze_config_rebinds_after_name_changing_replacement_under_full_finetuning():
+    """Under full fine-tuning, selectors re-resolve on the post-surgery module hierarchy."""
+    freeze_config = {
+        "freeze_modules": [{"path": "base"}, {"glob": "ext*"}],
+        "unfreeze_modules": [{"path": "extension"}],
+    }
+
+    model = _run_trainability_infrastructure(_TinyTrainabilityModel(), freeze_config)
+
+    assert not model.base.weight.requires_grad
+    # The renamed extension parameter is re-selected through its parent module path.
+    assert model.extension[0].weight.requires_grad
+    # Parameters the policy does not select retain their model-owned trainability.
+    assert not model.model_constant.requires_grad
+    assert model.parallel_parameter.requires_grad
+    assert not model.trainability_at_wrapper_construction["base.weight"]
+    assert model.trainability_at_wrapper_construction["extension.0.weight"]
+    assert not model.trainability_at_wrapper_construction["model_constant"]
+    assert model.trainability_at_wrapper_construction["parallel_parameter"]
+
+
+def test_freeze_config_unfreeze_keeps_parameter_storage_dtype():
+    """Freeze configuration controls requires_grad only; it never casts trainable params."""
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+    model = _TinyClassifierModel()
+    peft_config = SimpleNamespace(lora_A_init=None, use_triton=False)
+    model_wrapper = SimpleNamespace(mp_policy=SimpleNamespace(param_dtype=torch.bfloat16))
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._apply_peft_and_lower_precision", return_value=model),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", return_value=model),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        MockCheckpointer.return_value.config.dequantize_base_checkpoint = False
+        result = apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=model_wrapper,
+            peft_config=peft_config,
+            freeze_config={"unfreeze_modules": [{"path": "classifier"}]},
+        )
+
+    assert not result.backbone.weight.requires_grad
+    # Frozen plain params are cast to the compute dtype to avoid a mixed-dtype seam.
+    assert result.backbone.weight.dtype == torch.bfloat16
+    assert result.classifier.weight.requires_grad
+    # Unfreezing must not turn fp32 resident/master parameters into bf16 storage;
+    # the compute dtype is owned by autocast or the distributed mp policy.
+    assert result.classifier.weight.dtype == torch.float32
 
 
 def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():
@@ -569,7 +824,9 @@ class TestApplyModelInfrastructurePostShardInit:
 # =============================================================================
 
 
-def _run_apply_model_infrastructure_load_before_shard(*, peft_config=None):
+def _run_apply_model_infrastructure_load_before_shard(
+    *, peft_config=None, is_meta_device=True, weights_already_loaded=False
+):
     """Helper that invokes apply_model_infrastructure with load_before_shard=True."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
@@ -588,12 +845,13 @@ def _run_apply_model_infrastructure_load_before_shard(*, peft_config=None):
 
         result = apply_model_infrastructure(
             model=model,
-            is_meta_device=True,
+            is_meta_device=is_meta_device,
             device=torch.device("cpu"),
             load_base_model=True,
             peft_config=peft_config,
             pretrained_model_name_or_path="test/model",
             cache_dir="/tmp/cache",
+            weights_already_loaded=weights_already_loaded,
         )
 
         return result, mock_ckpt, model
@@ -631,6 +889,76 @@ class TestLoadBeforeShardPath:
 
         _, kwargs = mock_ckpt.load_base_model.call_args
         assert "peft_init_method" not in kwargs
+
+    def test_load_before_shard_loads_checkpoint_when_init_left_weights_unloaded(self):
+        """A non-meta model whose init did not load weights must still read the checkpoint.
+
+        ``is_meta_device`` is False for every model built under DDP or MegatronFSDP,
+        including AutoModel's own implementations, whose constructor only creates the
+        architecture. Gating the read on it left those models randomly initialized.
+        """
+        _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard(
+            is_meta_device=False, weights_already_loaded=False
+        )
+
+        mock_ckpt.load_base_model.assert_called_once_with(
+            model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True
+        )
+        # Nothing is on meta, so there are no parameter shells to materialize.
+        mock_ckpt.initialize_model_weights.assert_not_called()
+
+    def test_load_before_shard_skips_checkpoint_when_init_already_loaded_weights(self):
+        """HF's from_pretrained already populated the weights; only re-tie, do not re-read."""
+        _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard(
+            is_meta_device=False, weights_already_loaded=True
+        )
+
+        mock_ckpt.load_base_model.assert_called_once_with(
+            model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=False
+        )
+        mock_ckpt.initialize_model_weights.assert_not_called()
+
+
+def test_load_before_shard_populates_unloaded_model_from_checkpoint(tmp_path):
+    """End-to-end guard on CPU: the model must end up holding the checkpoint's values.
+
+    The mocked tests above pin the call; this one pins the outcome, using the real
+    Checkpointer and a real safetensors checkpoint whose every tensor is 0.5.
+    """
+    from transformers import LlamaConfig
+    from transformers import LlamaForCausalLM as HFLlamaForCausalLM
+
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+    from nemo_automodel.components.models.llama.model import LlamaForCausalLM
+
+    config = LlamaConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=256,
+        max_position_embeddings=128,
+        tie_word_embeddings=False,
+    )
+    reference = HFLlamaForCausalLM(config)
+    with torch.no_grad():
+        for param in reference.parameters():
+            param.fill_(0.5)
+    reference.save_pretrained(tmp_path, safe_serialization=True)
+
+    config.torch_dtype = torch.float32
+    model = apply_model_infrastructure(
+        model=LlamaForCausalLM(config),
+        is_meta_device=False,
+        device=torch.device("cpu"),
+        load_base_model=True,
+        pretrained_model_name_or_path=str(tmp_path),
+        weights_already_loaded=False,
+    )
+
+    for name, param in model.named_parameters():
+        assert torch.equal(param.detach(), torch.full_like(param, 0.5)), f"{name} was not loaded"
 
 
 # =============================================================================

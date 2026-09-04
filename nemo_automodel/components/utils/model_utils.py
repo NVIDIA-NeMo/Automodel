@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import fnmatch
 import inspect
 import logging
 import os
+from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable
 
 from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 HAVE_TORCHAO, torch_ao = safe_import("torchao")
 HAVE_BNB, bnb = safe_import("bitsandbytes")
@@ -308,23 +312,208 @@ def print_trainable_parameters(model: nn.Module, name: str = "Model") -> tuple[i
 
 
 def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):
-    """Helper function to freeze parameters by attribute name and name patterns.
+    """Freeze a legacy model attribute and modules matching name substrings."""
+    if attribute_name is not None and hasattr(model, attribute_name):
+        getattr(model, attribute_name).requires_grad_(False)
 
-    Args:
-        model: The model to apply freezing to.
-        attribute_name: Name of the model attribute to freeze (e.g., 'vision_tower').
-        name_patterns: List of patterns to match in module names.
-    """
-    # Freeze by attribute name
-    if hasattr(model, attribute_name):
-        for param in getattr(model, attribute_name).parameters():
-            param.requires_grad = False
-
-    # Freeze by name patterns
     for name, module in model.named_modules():
         if any(pattern in name.lower() for pattern in name_patterns):
-            for param in module.parameters():
-                param.requires_grad = False
+            module.requires_grad_(False)
+
+
+@dataclass(frozen=True)
+class ModuleSelector:
+    """Select modules by exact canonical path or case-sensitive shell-style glob.
+
+    Exactly one of ``path`` or ``glob`` must be set. Both match against the full
+    canonical module path (activation-checkpoint and ``torch.compile`` wrapper
+    components stripped): ``path`` is an exact match, while ``glob`` uses
+    :func:`fnmatch.fnmatchcase` semantics where ``*`` also crosses ``.``
+    separators. Matching is recursive: a selected module's entire subtree is
+    frozen or unfrozen.
+    """
+
+    path: str | None = None
+    glob: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate that exactly one matching mode is configured."""
+        if (self.path is None) == (self.glob is None):
+            raise ValueError(
+                f"ModuleSelector requires exactly one of `path` or `glob`; got path={self.path!r}, glob={self.glob!r}."
+            )
+        value = self.path if self.path is not None else self.glob
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"ModuleSelector values must be non-empty strings; got {value!r}.")
+
+    def matches(self, module_path: str) -> bool:
+        """Return whether this selector matches a canonical module path.
+
+        Args:
+            module_path: Canonical fully qualified module path.
+
+        Returns:
+            Whether the selector matches ``module_path``.
+        """
+        if self.path is not None:
+            return module_path == self.path
+        assert self.glob is not None
+        return fnmatch.fnmatchcase(module_path, self.glob)
+
+    def describe(self) -> str:
+        """Return the selector in its ``key: value`` configuration form."""
+        key, value = ("path", self.path) if self.path is not None else ("glob", self.glob)
+        return f"{key}: {value}"
+
+
+@dataclass(frozen=True)
+class FreezeConfig:
+    """Typed schema for the ``freeze_config`` recipe section.
+
+    Trainability semantics, in application order:
+
+    1. Full fine-tuning preserves the model's existing trainability state;
+       PEFT establishes a LoRA-trainable, base-frozen baseline.
+    2. ``freeze_modules`` recursively freezes the selected modules.
+    3. ``unfreeze_modules`` recursively unfreezes the selected modules and wins
+       on overlap.
+    4. Framework-required freezes (dead K/V projections, indexer parameters)
+       are applied by the infrastructure afterwards and remain protected.
+    5. The final trainable parameter set is validated before the optimizer is
+       constructed.
+
+    The legacy modality booleans remain supported. ``freeze_vision_tower``
+    defaults to ``True`` only for legacy-only configurations; a configuration
+    that declares ``freeze_modules`` or ``unfreeze_modules`` uses
+    explicit-selector semantics and does not implicitly freeze vision modules.
+    """
+
+    freeze_modules: list[ModuleSelector] | None = None
+    unfreeze_modules: list[ModuleSelector] | None = None
+    freeze_vision_tower: bool | None = None
+    freeze_audio_tower: bool = False
+    freeze_language_model: bool = False
+    freeze_video_embedder: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate selectors and legacy compatibility options."""
+        for field_name in ("freeze_modules", "unfreeze_modules"):
+            selectors = getattr(self, field_name)
+            if selectors is None:
+                continue
+            if not isinstance(selectors, list):
+                raise TypeError(f"FreezeConfig.{field_name} must be a list; got {type(selectors).__name__}.")
+            invalid = [selector for selector in selectors if not isinstance(selector, ModuleSelector)]
+            if invalid:
+                raise TypeError(f"FreezeConfig.{field_name} entries must be ModuleSelector instances; got {invalid!r}.")
+
+        if self.freeze_vision_tower is not None and not isinstance(self.freeze_vision_tower, bool):
+            raise TypeError(
+                f"FreezeConfig.freeze_vision_tower must be a boolean or None; got {self.freeze_vision_tower!r}."
+            )
+        for field_name in ("freeze_audio_tower", "freeze_language_model", "freeze_video_embedder"):
+            value = getattr(self, field_name)
+            if not isinstance(value, bool):
+                raise TypeError(f"FreezeConfig.{field_name} must be a boolean; got {value!r}.")
+
+    def has_generic_selectors(self) -> bool:
+        """Return whether either generic selector field was explicitly declared."""
+        return self.freeze_modules is not None or self.unfreeze_modules is not None
+
+
+_FREEZE_CONFIG_OPTIONS = {
+    "freeze_modules",
+    "unfreeze_modules",
+    "freeze_vision_tower",
+    "freeze_audio_tower",
+    "freeze_language_model",
+    "freeze_video_embedder",
+}
+
+
+def _parse_module_selector(entry: Any, *, field_name: str) -> ModuleSelector:
+    """Parse one ``freeze_modules``/``unfreeze_modules`` entry into a ModuleSelector.
+
+    Args:
+        entry: Mapping with exactly one of ``path`` or ``glob``, or an existing
+            ModuleSelector.
+        field_name: Owning list field name, used in error messages.
+
+    Returns:
+        The validated ModuleSelector.
+
+    Raises:
+        ValueError: If the entry is not a ``{path: ...}`` / ``{glob: ...}``
+            mapping or contains unknown keys.
+    """
+    if isinstance(entry, ModuleSelector):
+        return entry
+    if not isinstance(entry, Mapping):
+        raise ValueError(
+            f"freeze_config.{field_name} entries must be mappings with exactly one of `path` or `glob`, "
+            f"e.g. `- path: vision_tower` or `- glob: '*.audio_encoder'`; got {entry!r}."
+        )
+    unknown = set(entry) - {"path", "glob"}
+    if unknown:
+        raise ValueError(
+            f"freeze_config.{field_name} entry {dict(entry)!r} has unsupported key(s) {sorted(unknown)}; "
+            "use exactly one of `path` or `glob`."
+        )
+    return ModuleSelector(path=entry.get("path"), glob=entry.get("glob"))
+
+
+def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> FreezeConfig | None:
+    """Validate raw ``freeze_config`` YAML data and return a typed FreezeConfig.
+
+    Args:
+        config: A FreezeConfig (returned unchanged), a raw mapping from the
+            recipe config, or None.
+
+    Returns:
+        The validated FreezeConfig, or None when no freeze configuration was
+        provided.
+
+    Raises:
+        TypeError: If ``config`` is neither a mapping nor a FreezeConfig.
+        ValueError: If ``config`` contains unknown options, malformed
+            selectors, or non-boolean legacy options.
+    """
+    if config is None or isinstance(config, FreezeConfig):
+        return config
+    if not isinstance(config, Mapping):
+        raise TypeError(f"freeze_config must be a mapping of freeze options; got {type(config).__name__}: {config!r}.")
+
+    unknown = set(config) - _FREEZE_CONFIG_OPTIONS
+    if unknown:
+        raise ValueError(
+            f"freeze_config has unsupported option(s) {sorted(unknown)}; "
+            f"valid options are {sorted(_FREEZE_CONFIG_OPTIONS)}."
+        )
+
+    def _selectors(field_name: str) -> list[ModuleSelector] | None:
+        if field_name not in config:
+            return None
+        entries = config[field_name]
+        if not isinstance(entries, list):
+            raise ValueError(
+                f"freeze_config.{field_name} must be a list of `path`/`glob` selector mappings; got {entries!r}."
+            )
+        return [_parse_module_selector(entry, field_name=field_name) for entry in entries]
+
+    legacy_booleans = {}
+    for option in ("freeze_vision_tower", "freeze_audio_tower", "freeze_language_model", "freeze_video_embedder"):
+        value = config.get(option, None)
+        if value is None:
+            continue
+        if not isinstance(value, bool):
+            raise ValueError(f"freeze_config.{option} must be a boolean; got {value!r}.")
+        legacy_booleans[option] = value
+
+    return FreezeConfig(
+        freeze_modules=_selectors("freeze_modules"),
+        unfreeze_modules=_selectors("unfreeze_modules"),
+        **legacy_booleans,
+    )
 
 
 def enable_radio_vit_fused_attn(model):
@@ -361,50 +550,113 @@ def enable_radio_vit_fused_attn(model):
         logger.info("Enabled fused_attn on %d RADIO ViT blocks", flipped)
 
 
-def apply_parameter_freezing(model, freeze_config):
-    """Apply parameter freezing based on configuration.
+def _apply_module_selectors(
+    model: nn.Module,
+    selectors: list[ModuleSelector],
+    *,
+    requires_grad: bool,
+    strict: bool,
+    field_name: str,
+) -> None:
+    """Set ``requires_grad`` on every module matched by ``selectors``, recursively.
+
+    Module paths are canonicalized (activation-checkpoint and ``_orig_mod``
+    wrapper components stripped) so selectors keep matching after model surgery
+    that wraps or renames parameter-holding modules.
+
+    Args:
+        model: The model (or pipeline-parallel model part) to modify.
+        selectors: Typed selectors to resolve against the module hierarchy.
+        requires_grad: Trainability to apply to matched modules.
+        strict: When True, raise if a selector matches no parameters. Rebinding
+            after parallelization uses False because sharding may relocate or
+            regroup the selected modules (e.g. pipeline stages hold only a part
+            of the model).
+        field_name: Owning FreezeConfig field name, used in error messages.
+
+    Raises:
+        ValueError: If ``strict`` and a selector matches no parameters.
+    """
+    named_modules = [
+        (canonical_parameter_fqn(name).replace("_orig_mod.", ""), module)
+        for name, module in model.named_modules(remove_duplicate=False)
+        if name
+    ]
+    for selector in selectors:
+        matched_params = 0
+        for name, module in named_modules:
+            if selector.matches(name):
+                matched_params += sum(1 for _ in module.parameters())
+                module.requires_grad_(requires_grad)
+        if strict and matched_params == 0:
+            raise ValueError(
+                f"freeze_config.{field_name} selector `{selector.describe()}` matched no parameters in the model. "
+                "Selectors must match the full canonical module path."
+            )
+
+
+def apply_parameter_freezing(
+    model: nn.Module,
+    freeze_config: FreezeConfig | Mapping[str, Any],
+    *,
+    strict: bool = True,
+) -> None:
+    """Apply parameter freezing based on a typed FreezeConfig.
+
+    Application order: legacy modality booleans and ``freeze_modules`` freeze,
+    then ``unfreeze_modules`` unfreezes and wins on overlap. Framework-required
+    freezes (dead K/V projections, indexer parameters) are applied separately
+    by the infrastructure after this function, before and after sharding.
 
     Args:
         model: The model to apply freezing to.
-        freeze_config: Configuration dict specifying what to freeze.
+        freeze_config: Typed freeze configuration or a raw mapping retained for
+            compatibility with direct callers. Raw mappings are validated and
+            converted to FreezeConfig before use.
+        strict: When True, raise if a ``freeze_modules``/``unfreeze_modules``
+            selector matches no parameters. Set False when rebinding the policy
+            onto a post-parallelization model part.
 
-    freeze_config can contain:
-        - freeze_vision_tower: bool (default True)
+    Legacy modality booleans:
+        - freeze_vision_tower: bool (default True in legacy-only configurations)
         - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
         - freeze_video_embedder: bool (default False)
     """
-    freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
-    freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
-    freeze_language_model = freeze_config.get("freeze_language_model", False)
-    freeze_video_embedder = freeze_config.get("freeze_video_embedder", False)
+    parsed_freeze_config = parse_freeze_config(freeze_config)
+    if parsed_freeze_config is None:
+        return
+    freeze_config = parsed_freeze_config
 
-    # Freeze vision tower
-    if freeze_vision_tower:
-        _freeze_module_by_attribute_and_patterns(model, "vision_tower", ["vision", "visual", "image_encoder"])
-
-    # Freeze audio tower
-    if freeze_audio_tower:
-        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech", "sound"])
-
-    # Freeze language model backbone
-    if freeze_language_model:
-        _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
-
-    # NemotronOmni RADIO: patch_generator.video_embedder is only exercised on
-    # video inputs; on image-only training it sits in the optimizer without
-    # state (no grad → no lazy init), so dcp.load on resume raises
+    # Preserve the legacy attribute and substring matching independently of the
+    # fnmatch semantics used by the generic selectors.
+    freeze_vision_tower = freeze_config.freeze_vision_tower
+    if freeze_vision_tower is None:
+        # Explicit-selector configurations establish trainability solely through
+        # freeze_modules/unfreeze_modules and skip the legacy implicit vision freeze.
+        freeze_vision_tower = not freeze_config.has_generic_selectors()
+    # freeze_video_embedder: NemotronOmni RADIO's patch_generator.video_embedder is only
+    # exercised on video inputs; on image-only training it sits in the optimizer without
+    # state (no grad -> no lazy init), so dcp.load on resume raises
     # "Missing key in checkpoint state_dict: optim.state.<...>.video_embedder.weight.step".
     # Independent of freeze_vision_tower so the image encoder can stay trainable
     # while the video branch is frozen out.
-    if freeze_video_embedder:
-        frozen = 0
-        for name, param in model.named_parameters():
-            if "patch_generator.video_embedder" in name:
-                param.requires_grad_(False)
-                frozen += 1
-        if frozen:
-            logger.info("Froze %d patch_generator.video_embedder params", frozen)
+    legacy_freeze_aliases = (
+        (freeze_vision_tower, "vision_tower", ("vision", "visual", "image_encoder")),
+        (freeze_config.freeze_audio_tower, "audio_tower", ("audio", "audio_encoder", "speech", "sound")),
+        (freeze_config.freeze_language_model, "language_model", ("language", "text", "llm")),
+        (freeze_config.freeze_video_embedder, None, ("patch_generator.video_embedder",)),
+    )
+    for enabled, attribute_name, name_patterns in legacy_freeze_aliases:
+        if enabled:
+            _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns)
+
+    _apply_module_selectors(
+        model, freeze_config.freeze_modules or [], requires_grad=False, strict=strict, field_name="freeze_modules"
+    )
+    _apply_module_selectors(
+        model, freeze_config.unfreeze_modules or [], requires_grad=True, strict=strict, field_name="unfreeze_modules"
+    )
 
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache

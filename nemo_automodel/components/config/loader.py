@@ -839,6 +839,6 @@ def load_yaml_config(path: str | Path) -> "ConfigNode":
     Returns:
         ConfigNode: A configuration node representing the YAML file.
     """
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     return ConfigNode(raw)
