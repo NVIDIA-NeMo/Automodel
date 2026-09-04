@@ -1927,6 +1927,10 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
             "language": ["model.language_model.layers"],
             "vision": ["model.vision_model.transformer.resblocks"],
         },
+        "DeepseekV4ForCausalLM": {
+            "language": ["model.layers"],
+            "vision": ["model.vision.blocks"],
+        },
         # BAGEL (text-to-image + understanding). String-keyed to avoid an
         # import cycle: parallelizer is core distributed code, the BAGEL
         # model lives under components/models/bagel/. Lists both the Qwen2
