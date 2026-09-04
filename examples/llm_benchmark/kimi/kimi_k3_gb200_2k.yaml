@@ -135,6 +135,7 @@ dataset:
   vocab_size: 10000
   seq_len: 2048
   num_samples: 1000000
+  exclude_token_ids: [0]   # KimiK3TextConfig.pad_token_id: the padding row is zero, keep it out of random data
 
 dataloader:
   _target_: torch.utils.data.DataLoader
