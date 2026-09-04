@@ -19,16 +19,20 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import TEFp8Config
 from nemo_automodel.components.models.minimax_m3_vl import msa
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import (
     _build_backward_tasks,
     _chunk_map,
     _cta_row_interval,
     _MSABackwardSchedule,
 )
+from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM, MiniMaxM3TextModel
 from nemo_automodel.components.models.minimax_m3_vl.msa import (
     _MSAFlatAttention,
     _MSAForwardKernels,
@@ -64,6 +68,41 @@ _UNSUPPORTED_RUNTIME_CASES = [
     pytest.param({"key_value_states": torch.zeros(1, 2, 4)}, False, "cross-attention", id="key-value"),
     pytest.param({}, True, "cp_size=1", id="context-parallel"),
 ]
+
+
+def _msa_text_config(*, num_mtp_modules: int = 0) -> MiniMaxM3VLTextConfig:
+    """Build the smallest two-layer config with one dense and one MSA layer."""
+    return MiniMaxM3VLTextConfig(
+        torch_dtype="float32",
+        hidden_size=32,
+        intermediate_size=16,
+        dense_intermediate_size=32,
+        shared_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=64,
+        num_key_value_heads=4,
+        head_dim=128,
+        rotary_dim=64,
+        vocab_size=16,
+        max_position_embeddings=256,
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        n_shared_experts=1,
+        moe_layer_freq=[0, 1],
+        num_mtp_modules=num_mtp_modules,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_index_dim": 16,
+            "sparse_num_index_heads": 4,
+            "sparse_topk_blocks": 16,
+            "sparse_block_size": 128,
+            "sparse_score_type": "max",
+            "sparse_init_block": 0,
+            "sparse_local_block": 1,
+            "sparse_attention_freq": [0, 1],
+            "sparse_disable_index_value": [0, 1],
+        },
+    )
 
 
 def _msa_backend(*, attn: str = "sdpa") -> BackendConfig:
@@ -321,6 +360,118 @@ def test_flat_attention_rejects_deterministic_algorithms() -> None:
             _MSAFlatAttention(0.125)(placeholder, placeholder, placeholder, placeholder, layout=layout)
     finally:
         torch.use_deterministic_algorithms(deterministic_enabled, warn_only=deterministic_warn_only)
+
+
+class _LayoutCaptureLayer(nn.Module):
+    """Record the model-owned metadata at the decoder-layer seam."""
+
+    def __init__(
+        self,
+        captured: list[tuple[_MSAPackedLayout | None, torch.Tensor | None, torch.Tensor | None]],
+    ) -> None:
+        super().__init__()
+        self.captured = captured
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        _msa_layout: _MSAPackedLayout | None = None,
+        **attn_kwargs: object,
+    ) -> torch.Tensor:
+        """Record one layer call without changing hidden states.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden].
+            freqs_cis: Rotary tensor of shape [batch, sequence, rotary_dim].
+            attention_mask: Optional tensor of shape [batch, sequence] or [batch, 1, sequence, sequence].
+            padding_mask: Optional bool tensor of shape [batch, sequence], true for padding.
+            _msa_layout: Optional model-owned layout for the same [batch, sequence] grid.
+            **attn_kwargs: Remaining attention metadata.
+
+        Returns:
+            The input tensor ``x`` unchanged.
+        """
+        del freqs_cis, attn_kwargs
+        self.captured.append((_msa_layout, attention_mask, padding_mask))
+        return x
+
+
+def test_checkpoint_wrapper_transports_packed_layout() -> None:
+    """Activation checkpointing accepts the typed layout layer kwarg."""
+    captured: list[tuple[_MSAPackedLayout | None, torch.Tensor | None, torch.Tensor | None]] = []
+    layer = checkpoint_wrapper(_LayoutCaptureLayer(captured), checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+    hidden = torch.randn(1, 3, 4, requires_grad=True)
+    layout = _MSAPackedLayout.build(torch.ones(1, 3, dtype=torch.int64))
+
+    layer(hidden, freqs_cis=torch.zeros(1, 3, 2), _msa_layout=layout).sum().backward()
+
+    assert hidden.grad is not None
+    assert isinstance(captured[0][0], _MSAPackedLayout)
+
+
+def test_text_model_owns_layout_and_dense_mask_policy() -> None:
+    caller_backend = _msa_backend()
+    public_model = MiniMaxM3SparseForCausalLM(_msa_text_config(), backend=caller_backend).eval()
+    caller_backend.sparse_attn = "generic"
+    assert public_model.backend.sparse_attn == "msa"
+    model = public_model.model
+    packed = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.int64)
+    input_ids = torch.arange(5).unsqueeze(0)
+
+    with pytest.raises(ValueError, match="requires a standard bool attention_mask"):
+        model(input_ids, _packed_seq_ids=packed)
+    public_model.backend.sparse_attn = "generic"
+    with pytest.raises(NotImplementedError, match="BSHD"):
+        public_model(input_ids, qkv_format="thd")
+    public_model._cp_enabled = True
+    with pytest.raises(NotImplementedError, match="cp_size=1"):
+        public_model(input_ids)
+    public_model._cp_enabled = False
+    with pytest.raises(TypeError, match="model-owned"):
+        model(input_ids, _msa_layout=object())
+
+    captured: list[tuple[_MSAPackedLayout | None, torch.Tensor | None, torch.Tensor | None]] = []
+    model.layers = nn.ModuleDict({str(index): _LayoutCaptureLayer(captured) for index in range(2)})
+    model.norm = nn.Identity()
+    attention_mask = _block_causal_mask(packed)
+    output = model(
+        input_ids,
+        attention_mask=attention_mask,
+        padding_mask=torch.ones_like(packed, dtype=torch.bool),
+        _packed_seq_ids=packed,
+    )
+
+    assert output.shape == (1, 5, 32)
+    assert captured[0][0] is None
+    assert isinstance(captured[1][0], _MSAPackedLayout)
+    assert all(torch.equal(item[1], attention_mask) for item in captured)
+    assert all(torch.equal(item[2], packed == 0) for item in captured)
+
+    flex_model = MiniMaxM3TextModel(_msa_text_config(), backend=_msa_backend(attn="flex"))
+    with pytest.raises(NotImplementedError, match="backend.attn='sdpa'"):
+        flex_model(input_ids, attention_mask=attention_mask, _packed_seq_ids=packed)
+
+
+def test_pipeline_stage_without_msa_does_not_receive_layout() -> None:
+    model = MiniMaxM3TextModel(_msa_text_config(), backend=_msa_backend()).eval()
+    captured: list[tuple[_MSAPackedLayout | None, torch.Tensor | None, torch.Tensor | None]] = []
+    model.layers = nn.ModuleDict({"0": _LayoutCaptureLayer(captured)})
+    model.norm = None
+
+    packed = torch.tensor([[1, 1, 2, 2]], dtype=torch.int64)
+    output = model(torch.arange(4).unsqueeze(0), attention_mask=_block_causal_mask(packed), _packed_seq_ids=packed)
+
+    assert output.shape == (1, 4, 32)
+    assert captured[0][0] is None
+
+
+def test_text_model_rejects_msa_with_mtp() -> None:
+    with pytest.raises(NotImplementedError, match="MTP0"):
+        MiniMaxM3TextModel(_msa_text_config(num_mtp_modules=1), backend=_msa_backend())
 
 
 def test_optional_dependency_failures_are_deferred_and_actionable(monkeypatch: pytest.MonkeyPatch) -> None:

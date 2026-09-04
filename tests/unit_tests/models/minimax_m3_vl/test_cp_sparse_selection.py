@@ -27,10 +27,12 @@ import torch
 
 from nemo_automodel.components.models.minimax_m3_vl import layers as layers_module
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
+    MiniMaxM3Indexer,
     _select_sparse_block_indices,
     build_block_sparse_attn_mask,
     select_sparse_blocks,
 )
+from nemo_automodel.components.models.minimax_m3_vl.msa_plan import _MSAPackedLayout
 
 
 def _rand_idx(seqlen, h_idx=4, dim=16, bsz=2, seed=0):
@@ -224,6 +226,66 @@ def test_fixed_width_lse_indices_match_document_local_reference(monkeypatch):
             start_block = int(q_doc_starts[query]) // block_size
             assert set((valid + start_block).tolist()) == reference[(0, head, query)]
             assert (row[valid.numel() :] == -1).all()
+
+
+def test_indexer_flat_projection_matches_project_then_pack(sparse_text_config, backend):
+    """Changing the token axis preserves the indexer's projected values."""
+    indexer = MiniMaxM3Indexer(sparse_text_config, dict(sparse_text_config.sparse_attention_config), backend)
+    layout = _MSAPackedLayout.build(torch.tensor([[1, 1, 0, 2, 2], [7, 7, 7, 0, 0]]))
+    generator = torch.Generator().manual_seed(19)
+    hidden = torch.randn(
+        2,
+        5,
+        sparse_text_config.hidden_size,
+        generator=generator,
+        dtype=indexer.index_q_proj.weight.dtype,
+    )
+    half_dim = indexer.index_head_dim // 2
+    frequencies = torch.cat((torch.ones(2, 5, half_dim), torch.zeros(2, 5, half_dim)), dim=-1)
+
+    full_q, full_k = indexer._project_qk(hidden, freqs_cis=frequencies, cp_size=1, cp_rank=0)
+    flat_q, flat_k = indexer._project_qk(
+        layout.pack(hidden),
+        freqs_cis=layout.pack(frequencies),
+        cp_size=1,
+        cp_rank=0,
+    )
+
+    torch.testing.assert_close(flat_q, layout.pack(full_q), rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(flat_k, layout.pack(full_k), rtol=1e-6, atol=1e-6)
+
+
+def test_indexer_emits_document_local_q2k(sparse_text_config, backend):
+    """The indexer adapts compact documents to canonical local int32 support."""
+    sparse_cfg = dict(
+        sparse_text_config.sparse_attention_config,
+        sparse_block_size=4,
+        sparse_topk_blocks=2,
+        sparse_init_block=0,
+        sparse_local_block=1,
+    )
+    indexer = MiniMaxM3Indexer(sparse_text_config, sparse_cfg, backend)
+    doc_ids = torch.cat(
+        (
+            torch.ones(14, dtype=torch.int64),
+            torch.zeros(1, dtype=torch.int64),
+            torch.full((10,), 2, dtype=torch.int64),
+        )
+    ).unsqueeze(0)
+    layout = _MSAPackedLayout.build(doc_ids)
+    index_q = torch.zeros(24, indexer.num_index_heads, indexer.index_head_dim)
+    index_q[..., 0] = 1
+    index_k = torch.zeros(24, 1, indexer.index_head_dim)
+    index_k[:, 0, 0] = torch.tensor([9.0] * 4 + [2.0] * 4 + [5.0] * 4 + [-1.0] * 2 + [1.0] * 4 + [8.0] * 4 + [-1.0] * 2)
+
+    q2k = indexer._select_msa_blocks(index_q, index_k, layout=layout)
+
+    assert q2k.shape == (indexer.num_index_heads, 24, 2)
+    assert q2k.dtype == torch.int32
+    assert q2k.is_contiguous()
+    assert q2k[:, 0, 0].eq(0).all() and q2k[:, 0, 1].eq(-1).all()
+    assert set(q2k[0, 13].tolist()) == {0, 3}
+    assert set(q2k[0, 23].tolist()) == {1, 2}
 
 
 @pytest.mark.parametrize(

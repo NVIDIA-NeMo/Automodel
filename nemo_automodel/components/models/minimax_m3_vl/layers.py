@@ -14,10 +14,10 @@
 
 """MiniMax M3 VL text-backbone layers.
 
-Stage 1 covers the dense + MoE text path (no sparse-attention index branch and
-no MTP).  Mirrors the canonical sglang reference
-``sglang.srt.models.minimax_m3`` (``MiniMaxM3Attention`` / ``MiniMaxM3MLP`` /
-``MiniMaxM3MoE`` / ``MiniMaxM3DecoderLayer``):
+Covers the dense + MoE text path and the sparse-attention index branch (no MTP).
+Mirrors the canonical sglang reference ``sglang.srt.models.minimax_m3``
+(``MiniMaxM3Attention`` / ``MiniMaxM3MLP`` / ``MiniMaxM3MoE`` /
+``MiniMaxM3DecoderLayer``):
 
 * per-head **Gemma** RMSNorm on Q/K (``qk_norm_type='per_head'``,
   ``use_gemma_norm=True``),
@@ -41,6 +41,14 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.components.models.minimax_m3_vl.msa import (
+    _msa_cp_enabled,
+    _MSAFlatAttention,
+    _reject_unsupported_msa_configuration,
+    _reject_unsupported_msa_runtime,
+    _validate_msa_topology,
+)
+from nemo_automodel.components.models.minimax_m3_vl.msa_plan import _MSAPackedLayout
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 
 
@@ -377,14 +385,14 @@ class MiniMaxM3Indexer(nn.Module):
     Projects hidden states to ``num_index_heads`` index queries and a single
     shared index key (``disable_index_value=True`` for M3, so there is no index
     value/output projection). Per-head Gemma RMSNorm + partial RoPE mirror the
-    main attention. The produced ``idx_q``/``idx_k`` feed
-    :func:`build_block_sparse_attn_bias` to select which key blocks each query
-    attends to.
+    main attention. The produced ``idx_q``/``idx_k`` feed either the generic
+    boolean-mask builder or the model-private document-local MSA selector.
     """
 
     def __init__(self, config: Any, sparse_cfg: dict, backend: BackendConfig):
         super().__init__()
         self.backend = backend
+        self._rope_fusion = backend.rope_fusion
         self.num_index_heads = sparse_cfg["sparse_num_index_heads"]
         self.index_head_dim = sparse_cfg["sparse_index_dim"]
         self.block_size = sparse_cfg["sparse_block_size"]
@@ -403,18 +411,98 @@ class MiniMaxM3Indexer(nn.Module):
         self.index_q_norm = MiniMaxM3RMSNorm(self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma)
         self.index_k_norm = MiniMaxM3RMSNorm(self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma)
 
-    def forward(
-        self, x: torch.Tensor, *, freqs_cis: torch.Tensor, num_q_heads: int, **attn_kwargs: Any
-    ) -> torch.Tensor:
-        bsz, seqlen, _ = x.shape
-        idx_q = self.index_q_norm(self.index_q_proj(x).view(bsz, seqlen, self.num_index_heads, self.index_head_dim))
-        idx_k = self.index_k_norm(self.index_k_proj(x).view(bsz, seqlen, 1, self.index_head_dim))
-        idx_q, idx_k = apply_rotary_emb_qk(
+    def _project_qk(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        cp_size: int,
+        cp_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project, normalize, and rotate the index queries and shared key.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden] for generic BSHD
+                selection, or compact [tokens, hidden] for MSA.
+            freqs_cis: Rotary tensor aligned with ``x``: [batch, sequence,
+                rotary_dim] for non-fused BSHD, its fused-RoPE layout, or the
+                compact token-major layout used by MSA.
+            cp_size: Number of context-parallel ranks represented by the rotary input.
+            cp_rank: Context-parallel rank of ``x``.
+
+        Returns:
+            Post-norm, post-RoPE index queries and shared keys. Their leading
+            token dimensions match ``x``; the final shapes are
+            ``[..., index_heads, index_dim]`` and ``[..., 1, index_dim]``.
+        """
+        token_shape = x.shape[:-1]
+        idx_q = self.index_q_norm(self.index_q_proj(x).view(*token_shape, self.num_index_heads, self.index_head_dim))
+        idx_k = self.index_k_norm(self.index_k_proj(x).view(*token_shape, 1, self.index_head_dim))
+        qkv_format = "thd" if x.dim() == 2 else "bshd"
+        return apply_rotary_emb_qk(
             idx_q,
             idx_k,
             freqs_cis,
-            format="bshd",
-            rope_fusion=self.backend.rope_fusion,
+            format=qkv_format,
+            rope_fusion=self._rope_fusion,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
+
+    @torch.no_grad()
+    def _select_msa_blocks(
+        self,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        *,
+        layout: _MSAPackedLayout,
+    ) -> torch.Tensor:
+        """Return canonical document-local MSA support.
+
+        Args:
+            index_q: Post-RoPE index queries with layout ``[T, Hidx, Didx]``.
+            index_k: Post-RoPE shared index keys with layout ``[T, 1, Didx]``.
+            layout: Opaque packed-document layout for the same compact token axis.
+
+        Returns:
+            Contiguous int32 ``q2k`` with layout ``[Hidx, T, topk]``. Valid
+            entries are document-local key-block ids and unused slots are ``-1``.
+        """
+        aligned_index_k, query_positions, document_starts = layout._selection_inputs(index_k)
+        selected = _select_sparse_block_indices(
+            index_q.unsqueeze(0),
+            aligned_index_k,
+            block_size=self.block_size,
+            topk_blocks=self.topk_blocks,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            score_type=self.score_type,
+            q_positions=query_positions,
+            q_doc_starts=document_starts,
+        )
+        return selected.squeeze(0).to(torch.int32).contiguous()
+
+    def forward(
+        self, x: torch.Tensor, *, freqs_cis: torch.Tensor, num_q_heads: int, **attn_kwargs: Any
+    ) -> torch.Tensor:
+        """Build the generic backend's dense boolean sparse-attention mask.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden] containing decoder-layer
+                input states.
+            freqs_cis: Rotary tensor of shape [batch, sequence, rotary_dim] for
+                non-fused RoPE or [sequence, 1, 1, rotary_dim] for fused RoPE.
+            num_q_heads: Number of heads in the main attention projection.
+            **attn_kwargs: Attention metadata. ``cp_size`` and ``cp_rank`` are
+                scalar context-parallel coordinates; other entries are ignored.
+
+        Returns:
+            Boolean tensor of shape [batch, num_q_heads, sequence, sequence]
+            whose True entries are causal keys retained by block selection.
+        """
+        idx_q, idx_k = self._project_qk(
+            x,
+            freqs_cis=freqs_cis,
             cp_size=attn_kwargs.get("cp_size", 1),
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
@@ -454,6 +542,11 @@ class MiniMaxM3Attention(nn.Module):
     ):
         super().__init__()
         self.backend = backend
+        self._use_msa = is_sparse_attention_layer and backend.sparse_attn == "msa"
+        self._attn_impl = backend.attn
+        self._rope_fusion = backend.rope_fusion
+        if self._use_msa:
+            _reject_unsupported_msa_configuration(backend)
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
@@ -496,14 +589,29 @@ class MiniMaxM3Attention(nn.Module):
         )
 
         softmax_scale = self.head_dim**-0.5
-        self.attn_module, self.attn_func = initialize_attn_module_and_func(
-            attn_impl=backend.attn,
-            num_attention_heads=self.num_heads,
-            num_qk_channels=self.head_dim,
-            num_v_channels=self.head_dim,
-            softmax_scale=softmax_scale,
-            num_gqa_groups=self.num_kv_heads,
-        )
+        if self._use_msa:
+            _validate_msa_topology(
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                num_index_heads=self.indexer.num_index_heads,
+                block_size=self.indexer.block_size,
+                topk_blocks=self.indexer.topk_blocks,
+                attention_dropout=float(getattr(config, "attention_dropout", 0.0) or 0.0),
+            )
+            self._msa_attn = _MSAFlatAttention(softmax_scale)
+            self.attn_module = None
+            self.attn_func = None
+        else:
+            self._msa_attn = None
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl=self._attn_impl,
+                num_attention_heads=self.num_heads,
+                num_qk_channels=self.head_dim,
+                num_v_channels=self.head_dim,
+                softmax_scale=softmax_scale,
+                num_gqa_groups=self.num_kv_heads,
+            )
 
     def forward(
         self,
@@ -511,13 +619,61 @@ class MiniMaxM3Attention(nn.Module):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        _msa_layout: _MSAPackedLayout | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        # padding_mask / position_ids are only consumed by the CP-aware sparse
-        # subclass; drop them here so they never reach the indexer or the attention
-        # backend kwargs (eager path uses freqs_cis, not raw position_ids).
+        """Run dense or index-selected MiniMax M3 self-attention.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden] for BSHD attention or
+                [tokens, hidden] for the generic THD path.
+            freqs_cis: Rotary tensor of shape [batch, sequence, rotary_dim] for
+                non-fused BSHD RoPE, [sequence, 1, 1, rotary_dim] for fused BSHD
+                RoPE, or the corresponding token-major THD rotary tensor.
+            attention_mask: Optional keep mask of shape [batch, sequence] or
+                boolean attention mask of shape [batch, heads_or_one, sequence,
+                sequence]. MSA obtains equivalent padding/document semantics
+                from ``_msa_layout`` instead of forwarding this mask to its kernel.
+            _msa_layout: Model-owned packed layout for the active MSA stage, or
+                ``None`` for generic attention. Its tensors describe the same
+                [batch, sequence] token grid as ``x``.
+            **attn_kwargs: Backend metadata. Generic THD attention may carry an
+                int32 ``cu_seqlens`` tensor of shape [documents + 1].
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden] for BSHD input or [tokens,
+            hidden] for generic THD input. MSA restores compact output to BSHD
+            and writes exact zeros at padding query rows after the output projection.
+
+        Raises:
+            NotImplementedError: If MSA is selected for THD input or a runtime
+                mode rejected by :func:`_reject_unsupported_msa_runtime`.
+            TypeError: If MSA receives an object other than its packed layout.
+            ValueError: If MSA is selected without per-forward document metadata.
+        """
+        if self._use_msa:
+            if x.dim() != 3:
+                raise NotImplementedError(
+                    "MiniMax M3 backend.sparse_attn='msa' supports BSHD input only; "
+                    "use qkv_format='bshd' or set backend.sparse_attn='generic' for THD."
+                )
+            _reject_unsupported_msa_runtime(attn_kwargs, cp_enabled=_msa_cp_enabled(self))
+            if _msa_layout is None:
+                raise ValueError(
+                    "MiniMax M3 backend.sparse_attn='msa' requires the model-owned _msa_layout; "
+                    "call the attention through MiniMaxM3TextModel."
+                )
+            if not isinstance(_msa_layout, _MSAPackedLayout):
+                raise TypeError(f"_msa_layout must be an _MSAPackedLayout, got {type(_msa_layout).__name__}.")
+        elif _msa_layout is not None:
+            raise TypeError("_msa_layout is valid only for an attention layer constructed with sparse_attn='msa'.")
+
         attn_kwargs.pop("padding_mask", None)
         attn_kwargs.pop("position_ids", None)
+        if self._use_msa:
+            # Pack once so no projection or output GEMM runs on padding rows.
+            x = _msa_layout.pack(x)
+            freqs_cis = _msa_layout.pack(freqs_cis)
         if len(x.shape) == 2:
             qkv_format = "thd"
             num_tokens = x.shape[0]
@@ -531,39 +687,48 @@ class MiniMaxM3Attention(nn.Module):
             k = self.k_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
             v = self.v_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        # Per-head QK norm (over head_dim) is applied before RoPE, matching the
-        # sglang reference (``_qk_norm`` then ``rotary_emb``).
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
 
         if self.indexer is not None:
-            if qkv_format != "bshd":
-                raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
-            sparse_keep = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
-            # Preserve the caller's padding mask: padded keys must stay masked
-            # rather than becoming eligible for top-k block selection. Boolean AND
-            # (not additive) so SDPA is bf16-safe -- see build_block_sparse_attn_mask.
-            if attention_mask is not None:
-                sparse_keep = sparse_keep & _padding_mask_to_keep_mask(attention_mask, sparse_keep)
-            attention_mask = sparse_keep
+            if self._use_msa:
+                with torch.no_grad():
+                    idx_q, idx_k = self.indexer._project_qk(
+                        x,
+                        freqs_cis=freqs_cis,
+                        cp_size=1,
+                        cp_rank=0,
+                    )
+                    q2k = self.indexer._select_msa_blocks(idx_q, idx_k, layout=_msa_layout)
+            else:
+                if qkv_format != "bshd":
+                    raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
+                sparse_keep = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
+                if attention_mask is not None:
+                    sparse_keep = sparse_keep & _padding_mask_to_keep_mask(attention_mask, sparse_keep)
+                attention_mask = sparse_keep
 
         q, k = apply_rotary_emb_qk(
             q,
             k,
             freqs_cis,
             format=qkv_format,
-            rope_fusion=self.backend.rope_fusion,
+            rope_fusion=self._rope_fusion,
             cu_seqlens=attn_kwargs.get("cu_seqlens", None),
             cp_size=attn_kwargs.get("cp_size", 1),
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
 
+        if self._use_msa:
+            out = self._msa_attn(q, k, v, q2k, layout=_msa_layout)
+            return _msa_layout.unpack(self.o_proj(out.flatten(1)))
+
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q, k, v, attention_mask, self.backend.attn, **attn_kwargs
+            q, k, v, attention_mask, self._attn_impl, **attn_kwargs
         )
         out = self.attn_func(q, k, v, **_attn_kwargs)
-        out = postprocess_output_for_attn(out, self.backend.attn)
+        out = postprocess_output_for_attn(out, self._attn_impl)
 
         flatten_dim = 2 if qkv_format == "bshd" else 1
         return self.o_proj(out.flatten(flatten_dim))
@@ -648,8 +813,27 @@ class Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        _msa_layout: _MSAPackedLayout | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Run one decoder layer.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden] for BSHD execution or
+                [tokens, hidden] for the generic THD path.
+            freqs_cis: Rotary tensor aligned with ``x`` and accepted by
+                :class:`MiniMaxM3Attention`.
+            attention_mask: Optional tensor of shape [batch, sequence] or
+                [batch, heads_or_one, sequence, sequence].
+            padding_mask: Optional tensor of shape [batch, sequence], with true
+                entries denoting padding for the MoE router.
+            _msa_layout: Model-owned packed layout for the same [batch,
+                sequence] token grid, or ``None`` for a non-MSA layer.
+            **attn_kwargs: Runtime attention metadata.
+
+        Returns:
+            Tensor with the same shape and dtype as ``x``.
+        """
         if attention_mask is not None and padding_mask is None:
             # Derive a per-token [B, T] pad mask (True = pad) for the MoE router.
             # Needed because packed sequences without CP pass a 4-D block-causal mask
@@ -672,6 +856,7 @@ class Block(nn.Module):
             # Consumed by CP-aware sparse attention to mask interior pad keys after
             # gathering CP shards; popped (ignored) by the eager attention forward.
             padding_mask=padding_mask,
+            _msa_layout=_msa_layout,
             **attn_kwargs,
         )
         x = x + attn_out

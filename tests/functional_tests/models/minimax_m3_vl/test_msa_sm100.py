@@ -14,13 +14,23 @@
 
 """SM100 parity gates for MiniMax M3 flat MSA prefill training."""
 
+import copy
+import os
+import subprocess
+import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.minimax_m3_vl import msa
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Attention, MiniMaxM3Indexer
+from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 from nemo_automodel.components.models.minimax_m3_vl.msa import _MSAFlatAttention
 from nemo_automodel.components.models.minimax_m3_vl.msa_plan import _MSAPackedLayout
 from nemo_automodel.shared.import_utils import UnavailableError
@@ -53,7 +63,8 @@ def _msa_sm100_unavailable_reason() -> str | None:
     return None
 
 
-_UNAVAILABLE_REASON = _msa_sm100_unavailable_reason()
+_IS_PP_WORKER = __name__ == "__main__" and "--pp-worker" in sys.argv
+_UNAVAILABLE_REASON = None if _IS_PP_WORKER else _msa_sm100_unavailable_reason()
 pytestmark = pytest.mark.skipif(
     _UNAVAILABLE_REASON is not None,
     reason=_UNAVAILABLE_REASON or "MiniMax M3 MSA functional-test prerequisites are available",
@@ -385,3 +396,398 @@ def test_flat_attention_binds_external_launches_to_tensor_device(monkeypatch: py
 
     assert output.device == tensor_device
     assert torch.cuda.current_device() == original_device
+
+
+def test_nontrivial_top16_support_drives_large_schedule_output_and_gradient() -> None:
+    """Validate truncated top-16 support through the large backward schedule."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    total_tokens = 17 * _BLOCK_SIZE + 1
+    layout = _MSAPackedLayout.build(torch.ones(1, total_tokens, dtype=torch.int64, device=device))
+    config = _fixed_attention_config()
+    with device:
+        indexer = MiniMaxM3Indexer(
+            config,
+            config.sparse_attention_config,
+            _attention_backend("msa"),
+        )
+
+    index_q = torch.zeros(total_tokens, _KV_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device=device)
+    index_q[..., 0] = 1
+    block_scores = torch.tensor(
+        (-90, 90, -80, 80, -70, 70, -60, 60, -50, 50, -40, 40, -30, 30, -20, 20, -10, 0),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    index_k = torch.zeros(total_tokens, 1, _HEAD_DIM, dtype=torch.bfloat16, device=device)
+    index_k[:, 0, 0] = block_scores.repeat_interleave(_BLOCK_SIZE)[:total_tokens]
+
+    support = indexer._select_msa_blocks(index_q, index_k, layout=layout)
+    final_support = support[0, -1]
+    assert final_support.unique().numel() == _TOPK
+    assert 17 in final_support
+    assert 0 not in final_support and 2 not in final_support
+
+    generator = torch.Generator(device=device).manual_seed(20260905)
+    q, k, v = _random_qkv(total_tokens, device=device, seed=20260905)
+    out = _MSAFlatAttention(_SOFTMAX_SCALE)(q, k, v, support, layout=layout)
+    query_rows = torch.arange(total_tokens - 8, total_tokens, dtype=torch.int64, device=device)
+    selected_grad = torch.randn(8, _QUERY_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device=device, generator=generator)
+    grad_out = torch.zeros_like(out).index_copy(0, query_rows, selected_grad)
+    out.backward(grad_out)
+
+    q_reference = q.detach().float().requires_grad_()
+    k_reference = k.detach().float().requires_grad_()
+    v_reference = v.detach().float().requires_grad_()
+    out_reference, _ = _semantic_sparse_attention(
+        q_reference,
+        k_reference,
+        v_reference,
+        support,
+        (total_tokens,),
+        query_rows=query_rows,
+    )
+    out_reference.backward(selected_grad.float())
+
+    _assert_semantic_error(
+        "truncated-top16 out", out.index_select(0, query_rows), out_reference, max_abs=0.025, norm_rel=0.006
+    )
+    _assert_semantic_error("truncated-top16 dQ", q.grad, q_reference.grad, max_abs=0.035, norm_rel=0.007)
+    _assert_semantic_error("truncated-top16 dK", k.grad, k_reference.grad, max_abs=0.075, norm_rel=0.007)
+    _assert_semantic_error("truncated-top16 dV", v.grad, v_reference.grad, max_abs=0.1, norm_rel=0.007)
+
+
+def _fixed_attention_config() -> MiniMaxM3VLTextConfig:
+    """Build a tiny dense-to-MSA model config with the fixed head topology.
+
+    Returns:
+        Configuration accepted by both the layer and PP parity tests.
+    """
+    return MiniMaxM3VLTextConfig(
+        hidden_size=32,
+        intermediate_size=32,
+        dense_intermediate_size=48,
+        shared_intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=_QUERY_HEADS,
+        num_key_value_heads=_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        vocab_size=64,
+        max_position_embeddings=32,
+        rotary_dim=64,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=0,
+        moe_layer_freq=[0, 0],
+        num_mtp_modules=0,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_num_index_heads": _KV_HEADS,
+            "sparse_index_dim": _HEAD_DIM,
+            "sparse_block_size": _BLOCK_SIZE,
+            "sparse_topk_blocks": _TOPK,
+            "sparse_init_block": 0,
+            "sparse_local_block": 1,
+            "sparse_score_type": "max",
+            "sparse_attention_freq": [0, 1],
+            "sparse_disable_index_value": [0, 1],
+        },
+        attention_dropout=0.0,
+    )
+
+
+def _attention_backend(sparse_attn: str) -> BackendConfig:
+    """Build a deterministic torch backend for one sparse attention layer.
+
+    Args:
+        sparse_attn: Either ``"generic"`` or ``"msa"``.
+
+    Returns:
+        Backend configuration using PyTorch projections and SDPA dense math.
+    """
+    return BackendConfig(
+        attn="sdpa",
+        sparse_attn=sparse_attn,
+        linear="torch",
+        rms_norm="torch",
+        rope_fusion=False,
+        experts="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+
+
+def test_real_sparse_layer_checkpoint_parameter_gradient_parity() -> None:
+    """Compare one checkpointed MSA layer backward with a generic peer."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    config = _fixed_attention_config()
+    torch.manual_seed(20260903)
+    with device:
+        msa_attention = MiniMaxM3Attention(
+            config,
+            _attention_backend("msa"),
+            is_sparse_attention_layer=True,
+        )
+        generic_attention = MiniMaxM3Attention(
+            config,
+            _attention_backend("generic"),
+            is_sparse_attention_layer=True,
+        )
+    generic_attention.load_state_dict(msa_attention.state_dict())
+    msa_attention.train()
+    generic_attention.train()
+
+    sequence_length = 16
+    doc_ids = torch.ones(2, sequence_length, dtype=torch.int64, device=device)
+    doc_ids[0, -1] = 0
+    layout = _MSAPackedLayout.build(doc_ids)
+    rotary_dim = 64
+    positions = torch.arange(sequence_length, dtype=torch.float32, device=device).view(1, -1, 1)
+    inv_freq = 10_000 ** (-torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim)
+    angles = positions * inv_freq
+    frequencies = torch.cat((angles.cos(), angles.sin()), dim=-1).expand(2, -1, -1)
+    generator = torch.Generator(device=device).manual_seed(20260904)
+    x = torch.randn(
+        2,
+        sequence_length,
+        config.hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    x_msa = x.detach().requires_grad_()
+    x_generic = x.detach().clone().requires_grad_()
+    token_keep = doc_ids > 0
+    random_grad_out = torch.randn(x.shape, dtype=torch.bfloat16, device=device, generator=generator)
+    grad_out = torch.where(token_keep.unsqueeze(-1), random_grad_out, torch.zeros_like(random_grad_out))
+
+    def checkpoint_layer(hidden: torch.Tensor) -> torch.Tensor:
+        """Run one recomputed MSA attention layer.
+
+        Args:
+            hidden: BF16 tensor of shape [batch, sequence, hidden].
+
+        Returns:
+            BF16 tensor of shape [batch, sequence, hidden].
+        """
+        return msa_attention(
+            hidden,
+            freqs_cis=frequencies,
+            attention_mask=token_keep,
+            _msa_layout=layout,
+        )
+
+    msa_out = checkpoint(checkpoint_layer, x_msa, use_reentrant=False)
+    generic_out = generic_attention(x_generic, freqs_cis=frequencies, attention_mask=token_keep)
+    assert torch.isfinite(msa_out).all() and torch.isfinite(generic_out).all()
+    msa_out.backward(grad_out)
+    generic_out.backward(grad_out)
+
+    assert torch.count_nonzero(msa_out[~token_keep]) == 0
+    assert torch.count_nonzero(x_msa.grad[~token_keep]) == 0
+    assert torch.count_nonzero(x_generic.grad[~token_keep]) == 0
+
+    # Each batch row contains one at-most-one-block document, so both selectors
+    # expose the same support on real rows.
+    _assert_semantic_error(
+        "layer out",
+        layout.pack(msa_out),
+        layout.pack(generic_out),
+        max_abs=0.04,
+        norm_rel=0.008,
+    )
+    _assert_semantic_error(
+        "layer input grad",
+        layout.pack(x_msa.grad),
+        layout.pack(x_generic.grad),
+        max_abs=0.04,
+        norm_rel=0.012,
+    )
+
+    projection_names = ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight")
+    projection_grad_max_abs = {
+        "q_proj.weight": 0.125,
+        "k_proj.weight": 0.5,
+        "v_proj.weight": 0.5,
+        "o_proj.weight": 0.125,
+    }
+    msa_parameters = dict(msa_attention.named_parameters())
+    generic_parameters = dict(generic_attention.named_parameters())
+    for name in projection_names:
+        assert msa_parameters[name].grad is not None
+        assert generic_parameters[name].grad is not None
+        assert torch.isfinite(msa_parameters[name].grad).all()
+        assert torch.count_nonzero(msa_parameters[name].grad) > 0
+        _assert_semantic_error(
+            f"{name} grad",
+            msa_parameters[name].grad,
+            generic_parameters[name].grad,
+            max_abs=projection_grad_max_abs[name],
+            norm_rel=0.015,
+        )
+
+
+def _pp_sm100_unavailable_reason() -> str | None:
+    """Return why the two-rank MSA gate cannot run, or ``None``."""
+    if _UNAVAILABLE_REASON is not None:
+        return _UNAVAILABLE_REASON
+    if torch.cuda.device_count() < 2:
+        return "MiniMax M3 MSA PP parity requires two CUDA GPUs"
+    if any(torch.cuda.get_device_capability(device_index) != (10, 0) for device_index in range(2)):
+        return "MiniMax M3 MSA PP parity requires two SM100 GPUs"
+    return None
+
+
+_PP_UNAVAILABLE_REASON = None if _IS_PP_WORKER else _pp_sm100_unavailable_reason()
+_PP_RESULT_PREFIX = "MINIMAX_M3_MSA_PP_RESULT "
+
+
+def _build_pp_model(device: torch.device) -> torch.nn.Module:
+    """Build the two-layer dense-to-MSA model used by the PP parity gate."""
+    torch.manual_seed(20260906)
+    with device:
+        model = MiniMaxM3SparseForCausalLM(_fixed_attention_config(), backend=_attention_backend("msa"))
+        model.initialize_weights(buffer_device=device, dtype=torch.bfloat16)
+    return model.train()
+
+
+def _run_pp_worker() -> None:
+    """Compare a real two-rank pipeline with its single-process model oracle."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel.components.distributed.pipelining import AutoPipeline
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    if torch.cuda.get_device_capability(device) != (10, 0):
+        raise RuntimeError(f"MiniMax M3 MSA PP parity requires SM100, got {torch.cuda.get_device_name(device)}")
+    msa._require_msa()
+    msa._require_msa_backward()
+
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    try:
+        model = _build_pp_model(device)
+        reference = copy.deepcopy(model)
+
+        def loss_fn(output: torch.Tensor, upstream: torch.Tensor) -> torch.Tensor:
+            """Apply a deterministic upstream gradient to pipeline logits.
+
+            Args:
+                output: BF16 logits of shape [microbatch, sequence, vocab].
+                upstream: BF16 gradient tensor with the same shape as ``output``.
+
+            Returns:
+                FP32 scalar inner-product loss.
+            """
+            return (output.float() * upstream.float()).sum()
+
+        mesh = init_device_mesh("cuda", (2, 1), mesh_dim_names=("pp", "dp"))
+        pipeline = AutoPipeline(
+            world_mesh=mesh,
+            pp_axis_name="pp",
+            dp_axis_names=("dp",),
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            device=device,
+            dtype=torch.bfloat16,
+            pp_seq_len=8,
+        ).build(model, loss_fn=loss_fn)
+
+        generator = torch.Generator().manual_seed(20260907)
+        input_ids = torch.randint(1, 64, (2, 8), generator=generator).to(device)
+        document_ids = torch.tensor(
+            [[1, 1, 1, 1, 2, 2, 2, 2], [7, 7, 7, 9, 9, 9, 9, 9]],
+            device=device,
+        )
+        same_document = document_ids.unsqueeze(-1) == document_ids.unsqueeze(-2)
+        attention_mask = (same_document & torch.ones(8, 8, dtype=torch.bool, device=device).tril()).unsqueeze(1)
+        upstream = torch.randn(2, 8, 64, generator=generator).to(device=device, dtype=torch.bfloat16)
+
+        losses: list[torch.Tensor] | None = [] if pipeline.info.has_last_stage else None
+        output = pipeline.step(
+            input_ids,
+            target=upstream,
+            losses=losses,
+            attention_mask=attention_mask,
+        )
+
+        reference_output = reference(input_ids, attention_mask=attention_mask)
+        reference_loss = loss_fn(reference_output, upstream)
+        reference_loss.backward()
+
+        if pipeline.info.has_last_stage:
+            assert output is not None and losses is not None
+            assert torch.isfinite(output).all()
+            torch.testing.assert_close(output, reference_output, rtol=0.02, atol=0.02)
+            torch.testing.assert_close(torch.stack(losses).sum(), reference_loss, rtol=0.01, atol=0.01)
+        else:
+            assert output is None
+
+        reference_parameters = dict(reference.named_parameters())
+        local_parameters = dict(pipeline.parts[0].named_parameters())
+        assert local_parameters
+        compared_gradients = 0
+        for name, parameter in local_parameters.items():
+            expected = reference_parameters[name]
+            if expected.grad is None:
+                assert parameter.grad is None, f"[rank {rank}] unexpected gradient for {name}"
+                continue
+            assert parameter.grad is not None, f"[rank {rank}] missing gradient for {name}"
+            assert torch.isfinite(parameter.grad).all(), f"[rank {rank}] non-finite gradient for {name}"
+            torch.testing.assert_close(
+                parameter.grad.float(),
+                expected.grad.float(),
+                rtol=0.04,
+                atol=0.02,
+                msg=lambda message: f"[rank {rank}] {name}: {message}",
+            )
+            compared_gradients += 1
+        assert compared_gradients > 0
+
+        if rank == 0:
+            print(_PP_RESULT_PREFIX + "PASS", flush=True)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    _PP_UNAVAILABLE_REASON is not None,
+    reason=_PP_UNAVAILABLE_REASON or "two-rank MiniMax M3 MSA PP prerequisites are available",
+)
+def test_two_rank_dense_to_msa_pipeline_forward_backward_parity() -> None:
+    """Real PP=2 output, loss, and local parameter gradients match one-process execution."""
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    selected_devices = visible_devices.split(",")[:2] if visible_devices else ["0", "1"]
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(selected_devices)
+    repo_root = str(Path(__file__).resolve().parents[4])
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=2",
+        str(Path(__file__).resolve()),
+        "--pp-worker",
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=repo_root,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=900,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout
+    assert _PP_RESULT_PREFIX + "PASS" in completed.stdout, completed.stdout
+
+
+if __name__ == "__main__" and "--pp-worker" in sys.argv:
+    _run_pp_worker()
