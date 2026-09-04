@@ -26,9 +26,12 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import yaml
 from safetensors.torch import save_file
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -4257,3 +4260,73 @@ class TestSyncAsyncSave:
 
         mock_dcp.async_save.assert_called_once()
         mock_dcp.save.assert_not_called()
+
+
+class TestInitializeModelWeightsPaddingIdxDTensor:
+    """Embeddings with padding_idx that are already DTensors must still be initialized.
+
+    #1675 put ``has_padding_idx`` into the skip list to avoid HF's DTensor-unsafe
+    ``weight[padding_idx] = 0``; that skipped the whole random init, so from_config
+    models built with ``nn.Embedding(..., padding_idx)`` (Kimi-K3, Kimi Linear, ...)
+    kept the uninitialized memory ``to_empty()`` handed out. The fix clears
+    padding_idx around ``initialize_weights()`` and zeroes the row on the local shard.
+    """
+
+    @pytest.fixture
+    def single_rank_pg(self):
+        if dist.is_initialized():
+            pytest.skip("a process group is already initialized")
+        dist.init_process_group("gloo", rank=0, world_size=1, store=dist.HashStore())
+        yield
+        dist.destroy_process_group()
+
+    @staticmethod
+    def _model(dtensor: bool = True):
+        class _Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(8, 4, padding_idx=2)
+                self.config = SimpleNamespace(architectures=["FakeForCausalLM"])
+                self.padding_idx_seen_by_init = "unset"
+
+            def initialize_weights(self):
+                # HF's _init_weights would run ``weight[padding_idx] = 0`` here when padding_idx is set.
+                self.padding_idx_seen_by_init = self.embed.padding_idx
+                with torch.no_grad():
+                    self.embed.weight.fill_(1.0)
+
+        model = _Model()
+        if dtensor:
+            mesh = init_device_mesh("cpu", (1,))
+            model.embed.weight = torch.nn.Parameter(distribute_tensor(model.embed.weight.detach(), mesh, [Shard(0)]))
+        return model
+
+    def test_dtensor_embedding_is_initialized_and_padding_row_zeroed(self, single_rank_pg):
+        model = self._model()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.padding_idx_seen_by_init is None  # HF's indexing op was skipped
+        assert model.embed.padding_idx == 2  # and the attribute restored
+        full = model.embed.weight.full_tensor()
+        assert torch.all(full[2] == 0)
+        assert torch.all(full[[0, 1, 3, 4, 5, 6, 7]] == 1)
+
+    def test_padding_idx_restored_when_initialize_weights_raises(self, single_rank_pg):
+        model = self._model()
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("init failed")
+
+        model.initialize_weights = boom
+        with pytest.raises(RuntimeError, match="init failed"):
+            Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+        assert model.embed.padding_idx == 2
+
+    def test_plain_embedding_keeps_padding_idx_during_init(self):
+        model = self._model(dtensor=False)
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.padding_idx_seen_by_init == 2  # regular tensors: HF's own zeroing path is fine
+        assert torch.all(model.embed.weight == 1)

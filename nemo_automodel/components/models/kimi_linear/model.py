@@ -57,6 +57,7 @@ from nemo_automodel.components.moe.experts import GroupedExperts
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -1093,7 +1094,7 @@ class KimiLinear48BModel(nn.Module):
         with buffer_device:
             nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
             if self.padding_idx is not None:
-                self.embed_tokens.weight[self.padding_idx].zero_()
+                zero_embedding_row_(self.embed_tokens.weight, self.padding_idx)
             self.norm.reset_parameters()
         for layer in self.layers.values():
             layer.init_weights(buffer_device, init_std)
