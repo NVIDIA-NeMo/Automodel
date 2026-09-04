@@ -112,67 +112,138 @@ class MiniMaxM3MLP(nn.Module):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
 
 
-# Cap the fp32 indexer-score tensor [B, H_idx, q_chunk, Tk] per chunk. At 128k with
-# cp_size=8 the full [B, H_idx, T_local, T_global] scores would be hundreds of GB
-# (the real long-context OOM, not FlexAttention) -- so select_sparse_blocks chunks
-# the query dim to keep each chunk's scores within this budget. No effect on small
-# (eager / 4k) cases, which fit in a single chunk.
+# Per-chunk cap on the fp32 score tensor; unchunked 128k/cp8 scores would be hundreds of GB.
 _SELECT_SCORE_BUDGET_BYTES = 2 * (1024**3)
 
 
 @torch.no_grad()
-def _select_sparse_blocks_chunk(
+def _select_sparse_block_indices(
     idx_q: torch.Tensor,
     idx_k: torch.Tensor,
-    q_positions: torch.Tensor,
     *,
     block_size: int,
     topk_blocks: int,
     init_blocks: int,
     local_blocks: int,
-    score_type: str,
+    score_type: str = "max",
+    q_positions: torch.Tensor | None = None,
+    q_doc_starts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Block selection for one query chunk (see :func:`select_sparse_blocks`)."""
+    """Select a fixed-width list of document-local key-block ids per query.
+
+    Mirrors the sglang ``minimax_sparse`` selection (``block_size_q=1`` ->
+    per-query-position): the index score for (query ``i``, key ``j``) is
+    ``(idx_q[i] . idx_k[j]) * idx_dim**-0.5`` with causal masking; keys are
+    grouped into blocks of ``block_size`` and reduced per block (``max`` or
+    ``lse``). Each query's candidate blocks are ``[lo, cur]``, where ``lo`` is
+    the first block of its document (``q_doc_starts // block_size``, or 0) and
+    ``cur`` is the block holding its own position. The current block
+    (``local_blocks``) and the first ``init_blocks`` candidates are always kept
+    and the remaining budget is filled with the highest-scoring candidates, up
+    to ``min(topk_blocks, num_candidates)``.
+
+    Queries and keys are decoupled so the same selection serves the eager square
+    case (``Tq == Tk``, ``q_positions`` defaulting to ``arange``), the
+    context-parallel case (local queries against the gathered global key
+    sequence) and the packed MSA case (compact queries against the aligned
+    workspace). The query dim is chunked so the fp32 score tensor stays within
+    ``_SELECT_SCORE_BUDGET_BYTES``; per-query independence makes chunking exact.
+    Every unusable slot carries a score of exactly ``-inf`` (masked keys,
+    non-candidate blocks, and width padding alike) while real candidates are
+    finite and forced blocks are ``+inf``, so ``-inf`` top-k values identify the
+    unused slots.
+
+    Args:
+        idx_q: Tensor of shape [batch, query_tokens, index_heads, index_dim]
+            containing post-RoPE index queries.
+        idx_k: Tensor of shape [batch, key_tokens, 1, index_dim] containing
+            post-RoPE shared index keys.
+        block_size: Number of key rows in one selectable block.
+        topk_blocks: Fixed number of block-id slots returned per query.
+        init_blocks: Number of blocks forced from each query's candidate-range start.
+        local_blocks: A positive value forces the query's current block.
+        score_type: Block reduction, either ``"max"`` or ``"lse"``.
+        q_positions: Optional tensor of shape [query_tokens] containing each
+            query's position on the key axis. ``None`` uses ``arange(query_tokens)``.
+        q_doc_starts: Optional tensor of shape [query_tokens] containing each
+            query document's first row on the key axis. The document floor is
+            exact only when documents start on block-aligned rows. ``None`` means
+            one document beginning at row zero.
+
+    Returns:
+        Tensor of shape [batch, index_heads, query_tokens, topk_blocks] with
+        dtype int64. Valid entries are document-local block ids, i.e. key-axis
+        block ids minus the query's ``lo``; unused slots contain -1 and follow
+        the valid ones. The hard selection is non-differentiable.
+
+    Raises:
+        ValueError: If ``block_size`` or ``topk_blocks`` is not positive,
+            ``score_type`` is not ``"max"`` or ``"lse"``, or a query-coordinate
+            tensor does not contain exactly one entry per query row.
+    """
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+    if topk_blocks <= 0:
+        raise ValueError(f"topk_blocks must be positive, got {topk_blocks}.")
+    if score_type not in ("max", "lse"):
+        raise ValueError(f"score_type must be 'max' or 'lse', got {score_type!r}.")
+
     bsz, tq, h_idx, dim = idx_q.shape
     tk = idx_k.shape[1]
     device = idx_q.device
+    if q_positions is None:
+        q_positions = torch.arange(tq, device=device)
+    q_positions = q_positions.to(device=device, dtype=torch.long)
+    if q_positions.shape != (tq,):
+        raise ValueError(
+            f"q_positions must contain one position per query, got shape {tuple(q_positions.shape)} "
+            f"for {tq} query rows."
+        )
+    if q_doc_starts is None:
+        q_doc_starts = torch.zeros_like(q_positions)
+    q_doc_starts = q_doc_starts.to(device=device, dtype=torch.long)
+    if q_doc_starts.shape != (tq,):
+        raise ValueError(
+            f"q_doc_starts must be one position per query, got {tuple(q_doc_starts.shape)} against "
+            f"q_positions {tuple(q_positions.shape)}"
+        )
+
+    num_blocks = (tk + block_size - 1) // block_size
+    key_pad = num_blocks * block_size - tk
+    blk = torch.arange(num_blocks, device=device)
+    kpos = torch.arange(tk, device=device)
+    k = idx_k.permute(0, 2, 1, 3).float()
     scale = dim**-0.5
     neg_inf = float("-inf")
 
-    q = idx_q.permute(0, 2, 1, 3).float()  # [B, H_idx, Tq, D]
-    k = idx_k.permute(0, 2, 1, 3).float()  # [B, 1, Tk, D]
-    scores = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B, H_idx, Tq, Tk]
+    q_chunk = max(1, min(tq, _SELECT_SCORE_BUDGET_BYTES // max(1, bsz * h_idx * tk * 4)))
+    selected = torch.empty((bsz, h_idx, tq, topk_blocks), dtype=torch.int64, device=device)
+    for start in range(0, tq, q_chunk):
+        end = min(start + q_chunk, tq)
+        pos = q_positions[start:end]
+        lo = q_doc_starts[start:end] // block_size
+        cur = pos // block_size
 
-    # Key-level causal: key j is visible to query i iff j <= global_pos(i).
-    kpos = torch.arange(tk, device=device)
-    causal_key = kpos[None, :] <= q_positions[:, None]  # [Tq, Tk]
-    scores = scores.masked_fill(~causal_key[None, None], neg_inf)
+        q = idx_q[:, start:end].permute(0, 2, 1, 3).float()
+        scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        scores = scores.masked_fill((kpos[None, :] > pos[:, None])[None, None], neg_inf)
+        if key_pad:
+            scores = F.pad(scores, (0, key_pad), value=neg_inf)
+        scores = scores.view(bsz, h_idx, end - start, num_blocks, block_size)
+        block_score = torch.logsumexp(scores, dim=-1) if score_type == "lse" else scores.amax(dim=-1)
 
-    num_blocks = (tk + block_size - 1) // block_size
-    pad = num_blocks * block_size - tk
-    if pad:
-        scores = F.pad(scores, (0, pad), value=neg_inf)
-    scores = scores.view(bsz, h_idx, tq, num_blocks, block_size)
-    if score_type == "lse":
-        block_score = torch.logsumexp(scores, dim=-1)
-    else:  # "max"
-        block_score = scores.amax(dim=-1)  # [B, H_idx, Tq, num_blocks]
-
-    blk = torch.arange(num_blocks, device=device)
-    cur_block = q_positions // block_size  # [Tq]
-    valid_blocks = cur_block + 1  # causal: blocks [0, valid_blocks)
-    causal_block = blk[None, :] < valid_blocks[:, None]  # [Tq, num_blocks]
-    forced = ((blk[None, :] == cur_block[:, None]) & (local_blocks > 0)) | (blk[None, :] < init_blocks)
-    forced = forced & causal_block
-
-    sel = block_score.masked_fill(~causal_block[None, None], neg_inf)
-    sel = sel.masked_fill(forced[None, None], float("inf"))  # force-include init/local blocks
-
-    k_eff = min(topk_blocks, num_blocks)
-    topk_idx = sel.topk(k_eff, dim=-1).indices  # [B, H_idx, Tq, k_eff]
-    block_sel = torch.zeros_like(block_score, dtype=torch.bool).scatter_(-1, topk_idx, True)
-    block_sel = block_sel & causal_block[None, None]  # drop non-causal padding picks
-    return block_sel  # [B, H_idx, Tq, num_blocks]
+        candidate = (blk[None, :] >= lo[:, None]) & (blk[None, :] <= cur[:, None])
+        forced = blk[None, :] < (lo + init_blocks)[:, None]
+        if local_blocks > 0:
+            forced = forced | (blk[None, :] == cur[:, None])
+        forced = forced & candidate
+        block_score = block_score.masked_fill(~candidate[None, None], neg_inf)
+        block_score = block_score.masked_fill(forced[None, None], float("inf"))
+        if num_blocks < topk_blocks:
+            block_score = F.pad(block_score, (0, topk_blocks - num_blocks), value=neg_inf)
+        values, indices = block_score.topk(topk_blocks, dim=-1)
+        selected[:, :, start:end] = torch.where(values == neg_inf, -1, indices - lo[None, None, :, None])
+    return selected
 
 
 @torch.no_grad()
@@ -189,58 +260,43 @@ def select_sparse_blocks(
 ) -> torch.Tensor:
     """Select, per query, which key blocks to attend to (DSA block top-k).
 
-    Mirrors the sglang ``minimax_sparse`` selection (``block_size_q=1`` ->
-    per-query-position): the index score for (query ``i``, key ``j``) is
-    ``(idx_q[i] . idx_k[j]) * idx_dim**-0.5`` with causal masking; keys are
-    grouped into blocks of ``block_size`` and reduced per block (``max`` or
-    ``lse``). For each query, the current block (``local_blocks``) and the first
-    ``init_blocks`` are always kept and the remaining budget is filled with the
-    highest-scoring causal blocks, up to ``min(topk_blocks, valid_blocks)``.
-
-    Queries and keys are decoupled so the same selection serves the eager square
-    case (``Tq == Tk``, ``q_positions`` defaulting to ``arange``) and the
-    context-parallel case (local queries ``Tq`` against the gathered global key
-    sequence ``Tk``, with ``q_positions`` giving each local query's global
-    position). Key block ``b`` spans key indices ``[b*block_size, ...)`` in the
-    (global) key order. The query dim is chunked so the fp32 score tensor stays
-    within ``_SELECT_SCORE_BUDGET_BYTES`` (the long-context memory bottleneck);
-    per-query independence makes chunking exact (concatenated along Tq).
+    The boolean form of :func:`_select_sparse_block_indices` over one document
+    starting at key row zero; it serves the eager square case and context
+    parallelism's local-query/global-key case.
 
     Args:
-        idx_q: ``[B, Tq, H_idx, D]`` index queries (post norm + RoPE).
-        idx_k: ``[B, Tk, 1, D]`` shared index key (post norm + RoPE).
-        q_positions: ``[Tq]`` long global position of each query; defaults to
-            ``arange(Tq)`` (the eager square case).
+        idx_q: Tensor of shape [batch, query_tokens, index_heads, index_dim]
+            containing post-RoPE index queries.
+        idx_k: Tensor of shape [batch, key_tokens, 1, index_dim] containing
+            post-RoPE shared index keys.
+        block_size: Number of key rows in one selectable block.
+        topk_blocks: Maximum number of causal blocks selected per query.
+        init_blocks: Number of leading causal blocks forced into the selection.
+        local_blocks: A positive value forces the query's current block.
+        score_type: Block reduction, either ``"max"`` or ``"lse"``.
+        q_positions: Optional tensor of shape [query_tokens] containing each
+            query's global key-axis position. ``None`` uses
+            ``arange(query_tokens)`` for square eager attention.
 
     Returns:
-        ``[B, H_idx, Tq, num_blocks]`` bool block-selection mask (causal +
-        forced init/local blocks + top-k). Non-differentiable (hard selection).
+        Boolean tensor of shape [batch, index_heads, query_tokens, key_blocks].
+        True entries are the causal blocks selected for attention. The hard
+        selection is non-differentiable.
     """
-    bsz, tq, h_idx, dim = idx_q.shape
-    tk = idx_k.shape[1]
-    device = idx_q.device
-    if q_positions is None:
-        q_positions = torch.arange(tq, device=device)
-    q_positions = q_positions.to(device=device, dtype=torch.long)
-
-    kwargs = dict(
+    selected = _select_sparse_block_indices(
+        idx_q,
+        idx_k,
         block_size=block_size,
         topk_blocks=topk_blocks,
         init_blocks=init_blocks,
         local_blocks=local_blocks,
         score_type=score_type,
+        q_positions=q_positions,
     )
-
-    bytes_per_query = max(1, bsz * h_idx * tk * 4)
-    q_chunk = max(1, min(tq, _SELECT_SCORE_BUDGET_BYTES // bytes_per_query))
-    if q_chunk >= tq:
-        return _select_sparse_blocks_chunk(idx_q, idx_k, q_positions, **kwargs)
-
-    chunks = [
-        _select_sparse_blocks_chunk(idx_q[:, s : s + q_chunk], idx_k, q_positions[s : s + q_chunk], **kwargs)
-        for s in range(0, tq, q_chunk)
-    ]
-    return torch.cat(chunks, dim=2)  # concat along Tq
+    num_blocks = (idx_k.shape[1] + block_size - 1) // block_size
+    # Shift ids by one so the -1 slots land in a disposable column zero.
+    block_sel = torch.zeros((*selected.shape[:-1], num_blocks + 1), dtype=torch.bool, device=selected.device)
+    return block_sel.scatter_(-1, selected + 1, True)[..., 1:]
 
 
 @torch.no_grad()

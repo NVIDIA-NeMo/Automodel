@@ -25,7 +25,9 @@ square selection produces for those query rows. These tests verify that against
 import pytest
 import torch
 
+from nemo_automodel.components.models.minimax_m3_vl import layers as layers_module
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
+    _select_sparse_block_indices,
     build_block_sparse_attn_mask,
     select_sparse_blocks,
 )
@@ -36,6 +38,61 @@ def _rand_idx(seqlen, h_idx=4, dim=16, bsz=2, seed=0):
     idx_q = torch.randn(bsz, seqlen, h_idx, dim, generator=g)
     idx_k = torch.randn(bsz, seqlen, 1, dim, generator=g)
     return idx_q, idx_k
+
+
+def _brute_document_local_selection(
+    idx_q,
+    idx_k,
+    *,
+    block_size,
+    topk,
+    init_blocks,
+    local_blocks,
+    q_positions,
+    q_doc_starts,
+):
+    """Independent per-query LSE reference for fixed-width document-local selection.
+
+    Args:
+        idx_q: Index queries of shape [batch, query_tokens, index_heads, dim].
+        idx_k: Index keys of shape [batch, key_tokens, 1, dim] on the aligned key axis.
+        block_size: Key rows per block.
+        topk: Fixed number of block slots per query.
+        init_blocks: Blocks forced from the query document's first block.
+        local_blocks: A positive value forces the query's current block.
+        q_positions: Key-axis position of each query, shape [query_tokens].
+        q_doc_starts: Key-axis document start of each query, shape [query_tokens].
+    Returns:
+        Dict keyed by ``(batch, index_head, query_row)`` holding the set of
+        selected key-axis block ids.
+    """
+    bsz, tq, h_idx, dim = idx_q.shape
+    tk = idx_k.shape[1]
+    scale = dim**-0.5
+    selected = {}
+    for b in range(bsz):
+        for h in range(h_idx):
+            for qi in range(tq):
+                pos = int(q_positions[qi])
+                lo = int(q_doc_starts[qi]) // block_size
+                cur = pos // block_size
+                scores = {}
+                for blk in range(lo, cur + 1):
+                    keys = [j for j in range(blk * block_size, min((blk + 1) * block_size, tk)) if j <= pos]
+                    values = torch.tensor(
+                        [(idx_q[b, qi, h].float() @ idx_k[b, j, 0].float()).item() * scale for j in keys]
+                    )
+                    scores[blk] = torch.logsumexp(values, 0).item()
+                forced = {cur} if local_blocks > 0 else set()
+                forced |= {blk for blk in range(lo, lo + init_blocks) if blk in scores}
+                chosen = set(forced)
+                ranked = sorted((blk for blk in scores if blk not in forced), key=lambda blk: scores[blk], reverse=True)
+                for blk in ranked:
+                    if len(chosen) >= min(topk, len(scores)):
+                        break
+                    chosen.add(blk)
+                selected[(b, h, qi)] = chosen
+    return selected
 
 
 @pytest.mark.parametrize("block_size,topk", [(8, 2), (8, 4), (16, 2)])
@@ -122,3 +179,67 @@ def test_eager_mask_consistent_with_selection():
     # every query attends to at least its own position (causal diagonal)
     diag = torch.arange(seqlen)
     assert keep[:, :, diag, diag].all()
+
+
+def test_fixed_width_lse_indices_match_document_local_reference(monkeypatch):
+    """Fixed-width support is causal, document-local, rebased, and padded with -1."""
+    seqlen, block_size, topk = 40, 4, 3
+    idx_q, idx_k = _rand_idx(seqlen, h_idx=2, dim=8, bsz=1, seed=43)
+    q_positions = torch.arange(seqlen)
+    document_start = 24
+    q_doc_starts = torch.where(
+        q_positions < document_start,
+        torch.zeros_like(q_positions),
+        torch.full_like(q_positions, document_start),
+    )
+    monkeypatch.setattr(layers_module, "_SELECT_SCORE_BUDGET_BYTES", 512)
+    selected = _select_sparse_block_indices(
+        idx_q,
+        idx_k,
+        block_size=block_size,
+        topk_blocks=topk,
+        init_blocks=1,
+        local_blocks=1,
+        score_type="lse",
+        q_positions=q_positions,
+        q_doc_starts=q_doc_starts,
+    )
+    reference = _brute_document_local_selection(
+        idx_q,
+        idx_k,
+        block_size=block_size,
+        topk=topk,
+        init_blocks=1,
+        local_blocks=1,
+        q_positions=q_positions,
+        q_doc_starts=q_doc_starts,
+    )
+
+    assert selected.shape == (1, 2, seqlen, topk)
+    assert selected.dtype == torch.int64
+    for head in range(2):
+        for query in range(seqlen):
+            row = selected[0, head, query]
+            valid = row[row >= 0]
+            start_block = int(q_doc_starts[query]) // block_size
+            assert set((valid + start_block).tolist()) == reference[(0, head, query)]
+            assert (row[valid.numel() :] == -1).all()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        pytest.param({"block_size": 0}, "block_size must be positive", id="block-size"),
+        pytest.param({"topk_blocks": 0}, "topk_blocks must be positive", id="topk"),
+        pytest.param({"score_type": "mean"}, "score_type", id="score-type"),
+        pytest.param({"q_positions": torch.arange(7)}, "q_positions", id="query-positions"),
+        pytest.param({"q_doc_starts": torch.arange(7)}, "q_doc_starts", id="document-starts"),
+    ],
+)
+def test_fixed_width_indices_reject_invalid_contract(overrides, match):
+    idx_q, idx_k = _rand_idx(8, h_idx=2, dim=8, bsz=1, seed=31)
+    kwargs = dict(block_size=4, topk_blocks=2, init_blocks=0, local_blocks=1)
+    kwargs.update(overrides)
+
+    with pytest.raises(ValueError, match=match):
+        _select_sparse_block_indices(idx_q, idx_k, **kwargs)
