@@ -627,6 +627,300 @@ def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path
     assert "2 output shard(s)" in caplog.text
 
 
+def test_fully_pruned_original_index_uses_size_based_consolidated_mapping(tmp_path, caplog):
+    class FakeTensor:
+        def __init__(self, bytes_: int):
+            self.bytes = bytes_
+
+        def numel(self):
+            return self.bytes
+
+        def element_size(self):
+            return 1
+
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="mistralai/Ministral-3-3B-Instruct-2512",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    state_dict = {
+        "layers.0.weight": FakeTensor(4 * 1024**3),
+        "layers.1.weight": FakeTensor(4 * 1024**3),
+    }
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="ministral3"),
+        _pre_shard_hf_state_dict_keys=list(state_dict),
+    )
+    model_state = SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+    parent_vlm_mapping = {
+        "language_model.layers.0.weight": 1,
+        "language_model.layers.1.weight": 2,
+        "vision_tower.weight": 2,
+    }
+    caplog.set_level(logging.INFO)
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(tmp_path / "source"),
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+            return_value=parent_vlm_mapping,
+        ),
+    ):
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+    assert mapping == {
+        "layers.0.weight": 1,
+        "layers.1.weight": 2,
+    }
+    assert "contained no exported model keys" in caplog.text
+
+
+def test_fully_pruned_original_index_uses_consistent_global_sizes_across_pp_ranks(tmp_path):
+    """Allium: RankAgreement, CompleteCoverage, DensePositiveIndices, TargetBoundaries."""
+
+    class FakeTensor:
+        def __init__(self, bytes_: int):
+            self.bytes = bytes_
+
+        def numel(self):
+            return self.bytes
+
+        def element_size(self):
+            return 1
+
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="example/extracted-pp-model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    pp_group = object()
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(
+            config,
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=0,
+            moe_mesh=None,
+            pp_group=pp_group,
+        )
+
+    global_keys = [f"layers.{index}.weight" for index in range(4)]
+    tensor_bytes = 4 * 1024**3
+    per_rank_state_dicts = [
+        {key: FakeTensor(tensor_bytes) for key in global_keys[:2]},
+        {key: FakeTensor(tensor_bytes) for key in global_keys[2:]},
+    ]
+    per_rank_size_maps = [{key: tensor_bytes for key in state_dict} for state_dict in per_rank_state_dicts]
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="example"),
+        _pre_shard_hf_state_dict_keys=global_keys,
+    )
+    model_state = SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+    parent_mapping = {f"language_model.{key}": index + 1 for index, key in enumerate(global_keys)}
+
+    def fake_all_gather_object(gathered, local_size_map, group):
+        assert group is pp_group
+        assert local_size_map in per_rank_size_maps
+        gathered[:] = per_rank_size_maps
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(tmp_path / "source"),
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+            side_effect=lambda *_args, **_kwargs: dict(parent_mapping),
+        ),
+        patch("nemo_automodel.components.checkpoint.checkpointing.is_rank_0", return_value=False),
+        patch("torch.distributed.is_available", return_value=True),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.all_gather_object", side_effect=fake_all_gather_object),
+    ):
+        per_rank_mappings = [
+            checkpointer._maybe_build_consolidated_index(model_state, state_dict) for state_dict in per_rank_state_dicts
+        ]
+
+    expected_mapping = {key: index + 1 for index, key in enumerate(global_keys)}
+    assert per_rank_mappings == [expected_mapping, expected_mapping]
+    assert set(expected_mapping) == set(global_keys)
+
+
+def _run_fully_pruned_index_pp_worker(rank: int, world_size: int, init_file: str, checkpoint_dir: str) -> None:
+    """Verify real PP ranks derive the same size-based consolidated index."""
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            model_save_format="safetensors",
+            model_cache_dir=os.path.join(checkpoint_dir, "cache"),
+            model_repo_id="example/extracted-pp-model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        checkpointer = Checkpointer(
+            config,
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=rank,
+            moe_mesh=None,
+            pp_group=torch.distributed.group.WORLD,
+        )
+        global_keys = [f"layers.{index}.weight" for index in range(4)]
+        local_keys = global_keys[rank * 2 : (rank + 1) * 2]
+        state_dict = {key: torch.empty(4 * 1024**3, dtype=torch.uint8, device="meta") for key in local_keys}
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="example"),
+            _pre_shard_hf_state_dict_keys=global_keys,
+        )
+        model_state = SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+        parent_mapping = {f"language_model.{key}": index + 1 for index, key in enumerate(global_keys)}
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value=os.path.join(checkpoint_dir, "source"),
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                return_value=parent_mapping,
+            ),
+            patch("nemo_automodel.components.checkpoint.checkpointing.is_rank_0", return_value=False),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+        expected_mapping = {key: index + 1 for index, key in enumerate(global_keys)}
+        assert mapping == expected_mapping
+        gathered_mappings = [None] * world_size
+        torch.distributed.all_gather_object(gathered_mappings, mapping)
+        assert gathered_mappings == [expected_mapping] * world_size
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.run_only_on("CPU")
+def test_fully_pruned_original_index_agrees_across_real_pp_processes(tmp_path):
+    """Disjoint PP stages complete the collective and produce one identical global index."""
+    torch.multiprocessing.spawn(
+        _run_fully_pruned_index_pp_worker,
+        args=(2, str(tmp_path / "dist_init"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_partially_pruned_original_index_preserves_source_mapping(tmp_path, caplog):
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="example/partially-matching-model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    state_dict = {
+        "layers.0.weight": torch.empty(1),
+        "layers.1.weight": torch.empty(1),
+    }
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="example"),
+        _pre_shard_hf_state_dict_keys=list(state_dict),
+    )
+    model_state = SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+    source_mapping = {
+        "layers.0.weight": 2,
+        "unused.weight": 1,
+    }
+    caplog.set_level(logging.INFO)
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(tmp_path / "source"),
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+            return_value=source_mapping,
+        ),
+    ):
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+    assert mapping == {
+        "layers.0.weight": 2,
+        "layers.1.weight": 2,
+    }
+    assert "contained no exported model keys" not in caplog.text
+
+
+def test_fully_pruned_original_index_does_not_readd_excluded_tied_lm_head(tmp_path):
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="example/extracted-tied-model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    state_dict = {
+        "embed_tokens.weight": torch.empty(1),
+        "lm_head.weight": torch.empty(1),
+    }
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="example"),
+        _pre_shard_hf_state_dict_keys=list(state_dict),
+    )
+    model_state = SimpleNamespace(model=[model], has_local_tied_lm_head=True, lm_head_param_name="lm_head.weight")
+    parent_mapping = {
+        "language_model.embed_tokens.weight": 1,
+        "language_model.lm_head.weight": 1,
+    }
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(tmp_path / "source"),
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+            return_value=parent_mapping,
+        ),
+    ):
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+    assert mapping == {"embed_tokens.weight": 1}
+
+
 def test_normalize_dtype_mapping_to_state_dict_keys_uses_hf_base_model_prefix():
     dtype_mapping = {
         "h.0.ln_1.weight": "BF16",
