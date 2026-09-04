@@ -890,6 +890,20 @@ class Gemma4MoEModel(HFGemma4Model):
 class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
+    # Whole-block activation checkpointing replays each decoder layer during backward.
+    # E2B/E4B tolerate that for two separate reasons, one per kind of layer:
+    #   * non-shared layers are the ones that call `past_key_values.update()`. A
+    #     training forward supplies no cache, so this class injects
+    #     `_Gemma4KVShareHolder`, whose `update()` returns its inputs unchanged --
+    #     the replay writes nothing and no `DynamicCache` is ever built.
+    #   * shared layers do not touch the cache at all; they read their source
+    #     layer's K/V out of HF's separate `shared_kv_states` mapping. Backward
+    #     recomputes blocks in reverse order, so a shared layer replays before its
+    #     source layer rewrites that entry, and reads the forward-era tensors.
+    # The claim is specific to this class: the sibling Gemma4 wrappers
+    # (`gemma4_unified`, `gemma4_drafter`) ride plain HF with an accumulating
+    # `DynamicCache` and must not set this.
+    kv_sharing_survives_checkpoint_replay = True
     # RoPE inv_freq must stay fp32: initialize_weights casts the model to bf16 and
     # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
     # modules afterwards (see llama/rope_utils.py).

@@ -399,15 +399,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
             else:
-                if (
-                    _should_use_hf_native_gradient_checkpointing(
-                        model,
-                        layer_groups,
-                        ac_scopes,
-                        enable_compile=enable_compile,
-                    )
-                    and not _has_kv_sharing
-                ):
+                if _should_use_hf_native_gradient_checkpointing(
+                    model,
+                    layer_groups,
+                    ac_scopes,
+                    enable_compile=enable_compile,
+                ) and (not _has_kv_sharing or _kv_sharing_survives_checkpoint_replay(model)):
                     # Work around a PyTorch FSDP2 bug that skips mixed-precision input casts during
                     # checkpoint recomputation. Remove when the minimum PyTorch version is 2.13.
                     apply_full_layer_checkpointing_to_layers(model, ac_layers)
@@ -2134,6 +2131,42 @@ def _should_use_hf_native_gradient_checkpointing(
         and getattr(model, "supports_gradient_checkpointing", False)
         and hasattr(model, "gradient_checkpointing_enable")
     )
+
+
+def _kv_sharing_survives_checkpoint_replay(model: nn.Module) -> bool:
+    """Return whether whole-block activation checkpointing is safe for a KV-shared model.
+
+    ``checkpoint_wrapper`` replays a whole decoder block during backward with the
+    arguments the forward saw. Unlike HF's ``GradientCheckpointingLayer.__call__``
+    it cannot drop ``past_key_values`` from that replay, so every layer that
+    writes to a cache writes to it a second time. A KV-shared model then needs
+    both halves to hold:
+
+    * the layers that populate the cache -- the *non*-shared ones, which are what
+      call ``Cache.update()`` -- must not accumulate on the replay, or the
+      recomputed K/V stops matching the forward;
+    * the shared layers must still read the K/V their source layer produced.
+
+    Neither holds for a model backed by an accumulating ``Cache``: the second
+    ``Cache.update()`` grows the entry and backward dies with a
+    ``CheckpointError`` about changed tensor metadata (observed on native HF
+    ``Gemma3nForCausalLM`` with ``use_cache=True``). KV-shared models therefore
+    stay on ``apply_submodule_checkpointing``, which leaves attention unwrapped,
+    by default.
+
+    A model that satisfies both halves opts in by setting the class attribute
+    ``kv_sharing_survives_checkpoint_replay = True``. Gemma4 E2B/E4B qualify: a
+    pass-through holder stands in for the cache, and the shared layers read a
+    separate store that the replay does not disturb (see
+    ``gemma4_moe/model.py``).
+
+    Args:
+        model: The model about to be checkpointed.
+
+    Returns:
+        Whether the model declares its KV sharing safe under whole-block replay.
+    """
+    return bool(getattr(model, "kv_sharing_survives_checkpoint_replay", False))
 
 
 def _uses_custom_moe_modules(model: nn.Module) -> bool:
