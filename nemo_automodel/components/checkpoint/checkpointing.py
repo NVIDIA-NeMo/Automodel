@@ -1539,9 +1539,15 @@ class Checkpointer:
             state_dict = _load_safetensors(_adapter_path(path))
         else:
             storage_reader = _maybe_msc_reader(path, storage_reader)
-            process_group = getattr(self, "process_group", None)
-            process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
-            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, **process_group_kwargs)
+            if is_init_step:
+                # Initialization state dicts already contain each rank's local destinations.
+                # Avoid DCP's distributed coordinator here: it is unnecessary for this load
+                # and leaves rank 0 holding extra NCCL allocations for the rest of training.
+                load_kwargs = {"no_dist": True}
+            else:
+                process_group = getattr(self, "process_group", None)
+                load_kwargs = {"process_group": process_group} if process_group is not None else {}
+            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, **load_kwargs)
         return state_dict
 
     def _do_save(

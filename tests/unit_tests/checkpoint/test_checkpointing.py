@@ -3693,6 +3693,33 @@ class TestDoSavePEFT:
 class TestDoLoadFullSFT:
     """Tests that _do_load correctly routes full-SFT loads for DCP and safetensors formats on cloud and local paths."""
 
+    def test_init_load_is_local_to_each_rank(self):
+        """Initialization avoids DCP coordination even when a process group exists."""
+        ckptr = _make_ckptr(is_peft=False)
+        ckptr.process_group = MagicMock(name="process_group")
+        sd = {"w": torch.zeros(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp:
+            Checkpointer._do_load(ckptr, sd, LOCAL_PATH_MODEL, is_init_step=True)
+
+        _, kwargs = mock_dcp.load.call_args
+        assert kwargs["no_dist"] is True
+        assert "process_group" not in kwargs
+
+    def test_resume_load_preserves_process_group_coordination(self):
+        """Training resume continues to use the checkpointer's process group."""
+        ckptr = _make_ckptr(is_peft=False)
+        process_group = MagicMock(name="process_group")
+        ckptr.process_group = process_group
+        sd = {"w": torch.zeros(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp:
+            Checkpointer._do_load(ckptr, sd, LOCAL_PATH_MODEL, is_init_step=False)
+
+        _, kwargs = mock_dcp.load.call_args
+        assert kwargs["process_group"] is process_group
+        assert "no_dist" not in kwargs
+
     def test_dcp_cloud_uses_msc_reader(self):
         """DCP + cloud: MSC reader injected when no reader provided."""
         ckptr = _make_ckptr(is_peft=False)
