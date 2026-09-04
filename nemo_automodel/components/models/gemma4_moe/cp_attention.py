@@ -849,11 +849,14 @@ def _ring_use_ffpa_varlen(attention_module: torch.nn.Module, ctx: Any) -> bool:
     """Whether this ring attention call may use the FFPA *varlen* ring path.
 
     The decision gates collective p2p exchanges so it must be rank-uniform: it
-    depends only on the per-layer config, the head_dim / dtype / scale, and
+    depends only on the per-layer config, the head_dim / dtype / scale / dropout, and
     *whether* ``_packed_seq_ids`` is present (a batch-level fact) -- never on
     per-rank slice content. This path *requires* ``_packed_seq_ids`` (the document
     map drives the varlen ``cu_seqlens``); Gemma4's manual CP batch always attaches
     one, so it is the sole FFPA path real CP training takes.
+
+    Raises:
+        NotImplementedError: If a statically eligible FFPA ring candidate requests nonzero attention dropout.
     """
     if not getattr(attention_module, "_gemma4_cp_use_ffpa", False):
         return False
@@ -869,6 +872,11 @@ def _ring_use_ffpa_varlen(attention_module: torch.nn.Module, ctx: Any) -> bool:
         return False
     if ctx.scale is None:
         return False
+    if ctx.dropout_p != 0.0:
+        raise NotImplementedError(
+            "Gemma4 FFPA ring CP does not support attention dropout: "
+            f"ffpa-attn requires dropout_p=0.0, got {ctx.dropout_p!r}."
+        )
     return _ffpa_varlen_ring_available()
 
 

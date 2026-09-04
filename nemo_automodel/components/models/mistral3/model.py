@@ -619,6 +619,26 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
 # -----------------------------------------------------------------------------
 # Register Ministral3 with transformers Auto classes
 # -----------------------------------------------------------------------------
+def _force_register(auto_cls, config_cls, model_cls) -> None:
+    """Map a native transformers config to our model class in ``auto_cls``.
+
+    transformers >=5.15 makes ``_LazyAutoMapping.register`` return without doing
+    anything when the config class lives under ``transformers.*``, so that hub
+    remote code cannot hijack a native config
+    (``models/auto/auto_factory.py``: ``if getattr(key, "__module__",
+    "").startswith("transformers."): return``). Ministral-3 checkpoints declare
+    ``model_type: mistral3``, so ``AutoConfig`` hands back HF's ``Mistral3Config``
+    and the public ``register`` silently no-ops -- ``AutoModelForCausalLM`` then
+    rejects the config outright. Writing the entry the way ``register`` did before
+    that guard keeps Ministral-3 loadable as a causal LM; it is a no-op once the
+    public call has already taken effect (transformers <=5.12).
+    """
+    mapping = auto_cls._model_mapping
+    if config_cls in mapping:
+        return
+    mapping._extra_content[config_cls] = model_cls
+
+
 def _register_ministral3_with_transformers():
     """
     Register Ministral3Config and models with transformers Auto classes.
@@ -659,6 +679,7 @@ def _register_ministral3_with_transformers():
         AutoModelForCausalLM.register(HFMistral3Config, Mistral3ForConditionalGeneration)
     except ValueError as e:
         _logger.debug(f"Mistral3ForConditionalGeneration (CausalLM) registration skipped: {e}")
+    _force_register(AutoModelForCausalLM, HFMistral3Config, Mistral3ForConditionalGeneration)
 
     try:
         AutoModelForImageTextToText.register(HFMistral3Config, Mistral3ForConditionalGeneration)

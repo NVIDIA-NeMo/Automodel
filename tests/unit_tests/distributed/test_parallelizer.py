@@ -2431,8 +2431,16 @@ class TestActivationCheckpointingKVSharing:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _setup_hf_native_model(monkeypatch, num_kv_shared_layers):
-        """Helper: configure a model + fake transformers module for the HF native path."""
+    def _setup_hf_native_model(monkeypatch, num_kv_shared_layers, replay_safe_kv_sharing=False):
+        """Helper: configure a model + fake transformers module for the HF native path.
+
+        Args:
+            monkeypatch: pytest monkeypatch fixture.
+            num_kv_shared_layers: Value placed on the text config; > 0 marks the
+                model as KV-shared.
+            replay_safe_kv_sharing: Whether the model declares its shared-K/V store
+                safe under whole-block checkpoint replay, as Gemma4 E2B/E4B do.
+        """
         import types
 
         class _FakeGradLayer(_FakeLayer):
@@ -2449,10 +2457,38 @@ class TestActivationCheckpointingKVSharing:
             model.model.layers[i] = _FakeGradLayer()
         model.supports_gradient_checkpointing = True  # type: ignore[attr-defined]
         model.gradient_checkpointing_enable = MagicMock()  # type: ignore[attr-defined]
+        if replay_safe_kv_sharing:
+            model.kv_sharing_survives_checkpoint_replay = True  # type: ignore[attr-defined]
         return model
 
-    def test_hf_native_candidate_with_kv_sharing_uses_submodule_checkpointing(self, monkeypatch):
-        """KV-shared models preserve their cache and use submodule checkpointing."""
+    def test_hf_native_candidate_with_replay_safe_kv_sharing_uses_full_layer_checkpointing(self, monkeypatch):
+        """A model that declares its shared-K/V store replay-safe keeps whole-block wrapping.
+
+        ``apply_submodule_checkpointing`` leaves ``self_attn`` unwrapped for
+        KV-shared models, so routing Gemma4 E2B/E4B there drops attention
+        activations from checkpointing and inflates peak memory. The cache
+        contract is unchanged: ``use_cache`` still stays on.
+        """
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20, replay_safe_kv_sharing=True)
+        self._run_parallelize(model)
+
+        assert model.config.use_cache is True
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert all(isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        # Whole-block wrapping, not the sub-module fallback that skips self_attn.
+        inner_layers = [layer._checkpoint_wrapped_module for layer in model.model.layers]
+        assert all(not isinstance(inner.mlp, self._Wrapped) for inner in inner_layers)
+        assert all(not isinstance(inner.self_attn, self._Wrapped) for inner in inner_layers)
+
+    def test_hf_native_candidate_with_plain_kv_sharing_uses_submodule_checkpointing(self, monkeypatch):
+        """A KV-shared model that does not opt in stays off whole-block checkpointing.
+
+        Native HF KV-shared models (e.g. ``Gemma3nForCausalLM``) keep an
+        accumulating ``DynamicCache`` while ``use_cache=True``. Replaying a whole
+        block calls ``Cache.update()`` a second time and backward dies with a
+        ``CheckpointError`` about changed K/V metadata, so they must stay on the
+        sub-module path that leaves ``self_attn`` unwrapped.
+        """
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20)
         self._run_parallelize(model)
 
@@ -2460,6 +2496,7 @@ class TestActivationCheckpointingKVSharing:
         model.gradient_checkpointing_enable.assert_not_called()
         assert all(not isinstance(layer, self._Wrapped) for layer in model.model.layers)
         assert all(isinstance(layer.mlp, self._Wrapped) for layer in model.model.layers)
+        assert all(not isinstance(layer.self_attn, self._Wrapped) for layer in model.model.layers)
 
     def test_hf_native_candidate_uses_non_reentrant_full_layer_checkpointing(self, monkeypatch):
         """HF-native candidates use full-layer checkpoint wrappers instead of the HF API."""

@@ -206,6 +206,22 @@ class TestKimiK25VLStateDictAdapter:
         for key in non_expert_keys:
             assert not adapter._is_quantized_expert_key(key), f"Should not identify {key} as expert key"
 
+    def test_convert_single_tensor_to_hf_expert_respects_quantization_flag(self, adapter):
+        """Routed-expert weights are packed to INT4 only when quantization=True (no hardcode)."""
+        fqn = "model.language_model.model.layers.5.mlp.experts.gate_and_up_projs"
+        inter = adapter.moe_config.moe_inter_dim  # the splitter slices gate/up at this width
+        tensor = torch.randn(8, 64, 2 * inter, dtype=torch.bfloat16)  # (E, H, 2*I); H % 32 == 0 for INT4 groups
+
+        plain = dict(adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=False))
+        assert plain, "expected per-expert keys"
+        assert all(k.endswith(".weight") for k in plain), list(plain)[:3]
+        assert not any("weight_packed" in k for k in plain)
+
+        packed = dict(adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True))
+        assert any(k.endswith(".weight_packed") for k in packed), list(packed)[:3]
+        assert any(k.endswith(".weight_scale") for k in packed)
+        assert not any(k.endswith(".weight") for k in packed)
+
     def test_convert_single_tensor_to_hf_vision_tower(self, adapter):
         """Test convert_single_tensor_to_hf handles vision tower keys."""
         fqn = "model.vision_tower.encoder.blocks.0.wqkv.weight"
@@ -303,7 +319,16 @@ class TestKimiK25VLStateDictAdapterFromHF:
 
         result = adapter.from_hf(hf_state_dict)
 
-        assert "lm_head.weight" in result
+        assert "model.language_model.lm_head.weight" in result
+        assert "lm_head.weight" not in result
+
+    def test_lm_head_round_trip(self, adapter):
+        """to_hf(from_hf(x)) returns the HF lm_head key unchanged."""
+        hf_state_dict = {"language_model.lm_head.weight": torch.randn(2, 3)}
+        native = adapter.from_hf(hf_state_dict)
+        back = adapter.to_hf(native)
+        assert "language_model.lm_head.weight" in back
+        assert torch.equal(back["language_model.lm_head.weight"].float(), native["model.language_model.lm_head.weight"].float())
 
     def test_from_hf_dtype_conversion(self, adapter):
         """Test from_hf converts tensors to target dtype."""

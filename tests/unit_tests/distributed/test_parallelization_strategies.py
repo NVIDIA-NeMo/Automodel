@@ -323,6 +323,7 @@ class TestDefaultParallelizationStrategy:
             "dp_shard_cp_mesh_name",
             "tp_mesh_name",
             "frozen_multimodal_sharding",
+            "reapply_trainability",
         ]
 
         for param in required_params:
@@ -367,6 +368,24 @@ class TestDefaultParallelizationStrategy:
         mock_distributed_env["validate_tp"].assert_called_once_with(model, tp_mesh)
         mock_distributed_env["get_plan"].assert_called_once()
         mock_distributed_env["parallelize_module"].assert_called_once()
+
+    def test_trainability_rebind_runs_after_tp_and_before_fsdp(self, strategy, mock_device_mesh, mock_distributed_env):
+        """FSDP captures the selector result on the post-TP hierarchy."""
+        mesh, _, _, tp_mesh = mock_device_mesh
+        tp_mesh.size.return_value = 2
+        model = MockModel()
+        events = []
+
+        mock_distributed_env["parallelize_module"].side_effect = lambda *_args, **_kwargs: events.append("tp")
+        mock_distributed_env["apply_fsdp"].side_effect = lambda *_args, **_kwargs: events.append("fsdp")
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            reapply_trainability=lambda _model: events.append("trainability"),
+        )
+
+        assert events == ["tp", "trainability", "fsdp"]
 
     def test_parallelize_with_activation_checkpointing(self, strategy, mock_device_mesh, mock_distributed_env):
         """Test parallelization with activation checkpointing enabled."""
@@ -1237,6 +1256,7 @@ class TestFsdp2StrategyParallelizeIntegration:
             "dp_shard_cp_mesh_name",
             "tp_mesh_name",
             "frozen_multimodal_sharding",
+            "reapply_trainability",
         ]
 
         for param in expected_params:

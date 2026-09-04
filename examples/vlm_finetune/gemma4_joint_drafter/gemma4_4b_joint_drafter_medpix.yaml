@@ -132,7 +132,6 @@ freeze_config:
   # Embeddings must stay trainable: the drafter consumes the base's token
   # embeddings via its pre_projection input at EVERY round, so freezing them
   # would block gradient flow from the drafter loss to the base.
-  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false

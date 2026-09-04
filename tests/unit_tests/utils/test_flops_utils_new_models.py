@@ -22,6 +22,7 @@
 - VL composite config text_config fallback in qwen3_flops and qwen3_5_flops
 - _mamba_layer_flops refactored formula
 - _hybrid_model_flops conditional accumulation
+- kimi_k3_flops registration (hybrid KDA / gated-MLA + latent MoE)
 """
 
 from types import SimpleNamespace
@@ -538,6 +539,10 @@ class TestGetFlopsFormula:
     def test_kimi_k2(self):
         cfg = self._make_config("KimiK2Config")
         assert flops_utils.get_flops_formula_for_hf_config(cfg) == flops_utils.mla_moe_flops
+
+    def test_kimi_k3(self):
+        cfg = self._make_config("KimiK3TextConfig")
+        assert flops_utils.get_flops_formula_for_hf_config(cfg) == flops_utils.kimi_k3_flops
 
     def test_unknown_falls_back_to_transformer(self):
         cfg = self._make_config("UnknownModelConfig")

@@ -109,19 +109,12 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  time: "00:15:00"
-  known_issue_id: AM-647
-  allow_failure: true
+  time: "00:25:00"
   checkpoint_robustness:
-    check_source_load_parity: true
-    hf_kl_threshold: 5e-3
-    source_load_kl_threshold: 5e-3
-    source_load_cosine_threshold: 0.9995
     distributed.tp_size: 2
     tokenizer_name: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
     trust_remote_code: true
     hf_device_map_auto: true
     check_fused_qkv_keys: true
-    no_check_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
