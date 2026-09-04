@@ -334,6 +334,20 @@ def ffpa_attention_forward(
         flex = _get_flex()
         if flex is None:
             raise RuntimeError("ffpa_attention_forward: flex_attention is unavailable for sliding-window layers")
+        if getattr(module, "head_dim", 0) > 256 and "kernel_options" not in kwargs:
+            kwargs = {
+                **kwargs,
+                "kernel_options": {
+                    "BLOCK_M": 32,
+                    "BLOCK_N": 32,
+                    "BLOCK_M1": 32,
+                    "BLOCK_N1": 32,
+                    "BLOCK_M2": 32,
+                    "BLOCK_N2": 32,
+                    "num_stages": 1,
+                    "num_warps": 4,
+                },
+            }
         return flex(module, query, key, value, attention_mask, scaling=scaling, softcap=softcap, **kwargs)
 
     # Full-attention (head_dim=512) path: run FFPA when eligible, else fall back to SDPA/eager below.
