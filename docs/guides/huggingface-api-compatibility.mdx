@@ -1,13 +1,13 @@
 ---
 title: "Hugging Face Transformers API Compatibility"
-description: ""
+description: "Summarizes Hugging Face Transformers API and artifact compatibility in NeMo AutoModel, including version support, drop-in APIs, and side-by-side examples."
 position: 5
 ---
 NeMo AutoModel is built to work with the Hugging Face ecosystem.
 In practice, compatibility comes in two layers:
 
-- **API compatibility**: for many workflows, you can keep your existing `transformers` code and swap in NeMo AutoModel “drop-in” wrappers (`NeMoAutoModel*`, `NeMoAutoTokenizer`) with minimal changes.
-- **Artifact compatibility**: NeMo AutoModel produces Hugging Face-compatible checkpoints (config, tokenizer, and safetensors) that can be loaded by Hugging Face Transformers and downstream tools (vLLM, SGLang, etc.).
+- **API compatibility**: For many workflows, you can keep your existing `transformers` code and swap in NeMo AutoModel drop-in wrappers (`NeMoAutoModel*`, `NeMoAutoTokenizer`) with minimal changes.
+- **Artifact compatibility**: NeMo AutoModel produces Hugging Face-compatible checkpoints (config, tokenizer, and safetensors) that can be loaded by Hugging Face Transformers and downstream tools such as vLLM and SGLang.
 
 This page summarizes Hugging Face compatibility in NeMo AutoModel, outlines key differences, and provides side-by-side examples.
 
@@ -35,7 +35,7 @@ NeMo AutoModel keeps v4 interoperability where practical:
 - **Stable artifact format**: Write checkpoints in Hugging Face-compatible `save_pretrained` layouts (config, tokenizer, and safetensors) for standard loading APIs and non-Transformers tools.
 
 <Note>
-If you need to consume NeMo AutoModel-produced consolidated checkpoints in a Transformers v4 environment, validate that specific model family and downstream tool path. For details on the checkpoint layouts, see [checkpointing](/development/checkpointing).
+If you need to consume NeMo AutoModel-produced consolidated checkpoints in a Transformers v4 environment, validate that specific model family and downstream tool path. For details on the checkpoint layouts, see [Checkpointing](/development/checkpointing).
 
 </Note>
 
@@ -56,8 +56,8 @@ These APIs follow familiar Hugging Face Transformers patterns for model loading,
 
 NeMo AutoModel introduces several optimizations and architectural changes to improve training efficiency and hardware utilization.
 
-- **Performance features**: NeMo AutoModel can automatically apply optional kernel patches and optimizations (e.g., SDPA selection, Liger kernels, DeepEP, etc.) while keeping the public model API the same.
-- **Distributed training stack**: NeMo AutoModel recipes and CLI are designed for multi-GPU and multi-node fine-tuning with PyTorch-native distributed features (FSDP2, pipeline parallelism, etc.). When loading models directly from Python, pass a [`DistributedSetup`](/development/distributed-setup) via `from_pretrained(..., distributed_setup=...)` to enable tensor, pipeline, context, and expert parallelism.
+- **Performance features**: NeMo AutoModel can automatically apply optional kernel patches and optimizations (for example, SDPA selection, Liger kernels, and DeepEP) while keeping the public model API the same.
+- **Distributed training stack**: NeMo AutoModel recipes and CLI are designed for multi-GPU and multi-node fine-tuning with PyTorch-native distributed features such as FSDP2 and pipeline parallelism. When loading models directly from Python, pass a [`DistributedSetup`](/development/distributed-setup) using `from_pretrained(..., distributed_setup=...)` to enable tensor, pipeline, context, and expert parallelism.
 - **CUDA expectation**: NeMo AutoModel `NeMoAutoModel*` wrappers are primarily optimized for NVIDIA GPU workflows and offer support for CPU workflows as well.
 
 <Info>
@@ -232,6 +232,35 @@ tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")`}</code></p
   </tbody>
 </table>
 
+Select the loading route with `tokenizer_backend`:
+
+- `"nemo_auto"` (the default) uses NeMo AutoModel's model-type registry and falls back to its
+  Transformers-compatible wrapper.
+- `"nemo_wrapped_auto"` bypasses registered NeMo tokenizers and uses Transformers `AutoTokenizer`
+  with NeMo AutoModel's tokenizer compatibility wrapper.
+- `"transformers_auto"` calls Transformers `AutoTokenizer` directly.
+- `"tokenizers"` loads `tokenizer.json` directly through Transformers `TokenizersBackend`. Use this route
+  when the serialized tokenizer should be authoritative and no repository-provided tokenizer code is needed.
+  Tokenizer policy arguments such as `add_bos_token`, `add_eos_token`, `split_special_tokens`,
+  `fix_mistral_regex`, and `padding_side` are forwarded to that backend.
+
+For example:
+
+```python
+tok = NeMoAutoTokenizer.from_pretrained(
+    "mistralai/Ministral-3-3B-Instruct-2512-BF16",
+    tokenizer_backend="tokenizers",
+    fix_mistral_regex=True,
+    split_special_tokens=True,
+    add_bos_token=True,
+    add_eos_token=False,
+)
+```
+
+The legacy `force_default=True` option is equivalent to `tokenizer_backend="nemo_wrapped_auto"`, and
+`force_hf=True` is equivalent to `tokenizer_backend="transformers_auto"`.
+Contradictory route selections raise `ValueError` instead of silently choosing one.
+
 ## Save Checkpoints in NeMo AutoModel and Load Everywhere
 
 NeMo AutoModel training recipes write checkpoints as sharded safetensors by default and generate a per-checkpoint helper that can export Hugging Face-compatible consolidated safetensors after training:
@@ -239,4 +268,4 @@ NeMo AutoModel training recipes write checkpoints as sharded safetensors by defa
 - See [Checkpointing](/development/checkpointing) for checkpoint formats and example directory layouts.
 - See [Model Coverage](/model-coverage/overview) for notes on how model support depends on the pinned Transformers version.
 
-If your goal is to train or fine-tune in NeMo AutoModel and deploy in the HF ecosystem, the recommended workflow is to keep `model_save_format: safetensors` with either `save_consolidated: final` for final-checkpoint export or `save_consolidated: false` plus `bash <checkpoint>/model/consolidate.sh` after training. Then, load `model/consolidated/` using standard HF APIs or downstream inference engines. Set `save_consolidated: every` (or legacy `true`) only if you want inline HF export at every checkpoint save.
+If your goal is to train or fine-tune in NeMo AutoModel and deploy in the Hugging Face ecosystem, keep `model_save_format: safetensors`. Use either `save_consolidated: final` for final-checkpoint export or `save_consolidated: false` plus `bash <checkpoint>/model/consolidate.sh` after training. Then load `model/consolidated/` using standard Hugging Face APIs or downstream inference engines. Set `save_consolidated: every` (or legacy `true`) only if you want inline Hugging Face export at every checkpoint save.
