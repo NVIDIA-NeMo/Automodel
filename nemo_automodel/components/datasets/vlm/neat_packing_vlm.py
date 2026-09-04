@@ -48,10 +48,9 @@ if TYPE_CHECKING:
 from nemo_automodel.components.datasets.llm.neat_packing import (
     greedy_knapsack,
 )
-from nemo_automodel.components.datasets.vlm.samplers import (
-    LengthGroupedSampler,
-    _smart_resize_image,
-    _smart_resize_video,
+from nemo_automodel.components.datasets.vlm.media_token_estimation import (
+    DEFAULT_TOKENS_PER_MEDIA_ITEM,
+    MediaTokenEstimator,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,75 +145,19 @@ def greedy_knapsack_vt_balanced(
 # ---------------------------------------------------------------------------
 
 
-def _estimate_image_tokens(img_meta, image_cfg: dict) -> int:
-    """Estimate token count for one image from its ``[height, width]`` metadata."""
-    height, width = int(img_meta[0]), int(img_meta[1])
-    resized_h, resized_w = _smart_resize_image(
-        height,
-        width,
-        factor=image_cfg["factor"],
-        min_pixels=image_cfg["min_pixels"],
-        max_pixels=image_cfg["max_pixels"],
-    )
-    merge_length = image_cfg["merge_size"] ** 2
-    return (resized_h // image_cfg["patch_size"]) * (resized_w // image_cfg["patch_size"]) // merge_length
-
-
-def _estimate_video_tokens(vid_meta, video_cfg: dict) -> int:
-    """Estimate token count for one video from its
-    ``[total_frames, height, width, fps, duration]`` metadata.
-    """
-    total_frames = int(vid_meta[0])
-    height = int(vid_meta[1])
-    width = int(vid_meta[2])
-    fps = float(vid_meta[3])
-    duration = float(vid_meta[4])
-
-    if total_frames == 0 and fps > 0:
-        total_frames = int(duration * fps)
-
-    if fps > 0:
-        nframes = max(1, int(total_frames / fps * video_cfg["fps"]))
-    else:
-        nframes = max(1, int(duration * video_cfg["fps"]))
-
-    nframes = min(total_frames, video_cfg["max_frames"], nframes)
-    nframes = max(video_cfg["min_frames"], nframes)
-
-    tp = video_cfg["temporal_patch_size"]
-    if nframes % tp != 0:
-        nframes = ((nframes + tp - 1) // tp) * tp
-
-    resized_h, resized_w = _smart_resize_video(
-        nframes,
-        height,
-        width,
-        temporal_factor=tp,
-        factor=video_cfg["factor"],
-        min_pixels=video_cfg["min_pixels"],
-        max_pixels=video_cfg["max_pixels"],
-    )
-    grid_t = nframes // tp
-    merge_length = video_cfg["merge_size"] ** 2
-    return grid_t * (resized_h // video_cfg["patch_size"]) * (resized_w // video_cfg["patch_size"]) // merge_length
-
-
 def _estimate_sample_length(
     example: dict,
-    image_cfg: dict | None = None,
-    video_cfg: dict | None = None,
-    return_media_tokens: bool = False,
-) -> int | tuple[int, int]:
+    media_estimator: MediaTokenEstimator,
+) -> tuple[int, int]:
     """Estimate token count from raw conversation without tokenization.
 
     Uses pre-computed ``_text_tokens`` (from ``precompute_tokens.py``) when
     available, otherwise falls back to ``chars // 3``.  Media tokens are
-    estimated via ``smart_resize`` when processor configs are provided,
-    otherwise falls back to 500 per media item.
+    resolved by ``media_estimator`` from ``mm_inputs_meta`` when present,
+    otherwise fall back to ``DEFAULT_TOKENS_PER_MEDIA_ITEM`` per media item.
 
-    Args:
-        return_media_tokens: If True, return ``(total_tokens, media_tokens)``
-            instead of just ``total_tokens``.
+    Returns:
+        ``(total_tokens, media_tokens)``.
     """
     # Text tokens
     precomputed = example.get("_text_tokens")
@@ -242,26 +185,15 @@ def _estimate_sample_length(
                     media_count += 1
 
     mm_meta = example.get("mm_inputs_meta")
-    if mm_meta is not None and (image_cfg is not None or video_cfg is not None):
-        media_tokens = 0
-        images_meta = mm_meta.get("images_meta")
-        if images_meta and image_cfg is not None:
-            for img_meta in images_meta:
-                if img_meta is not None:
-                    media_tokens += _estimate_image_tokens(img_meta, image_cfg)
-
-        videos_meta = mm_meta.get("videos_meta")
-        if videos_meta and video_cfg is not None:
-            for vid_meta in videos_meta:
-                if vid_meta is not None:
-                    media_tokens += _estimate_video_tokens(vid_meta, video_cfg)
+    if mm_meta is not None and media_estimator.can_estimate:
+        media_tokens = media_estimator.estimate_media_tokens(
+            images_meta=mm_meta.get("images_meta"),
+            videos_meta=mm_meta.get("videos_meta"),
+        )
     else:
-        media_tokens = media_count * 500
+        media_tokens = media_count * DEFAULT_TOKENS_PER_MEDIA_ITEM
 
-    total = text_tokens + media_tokens
-    if return_media_tokens:
-        return total, media_tokens
-    return total
+    return text_tokens + media_tokens, media_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -751,8 +683,8 @@ def neat_pack_dataset_vlm(
             overflow drops at ``__getitem__`` time.  The actual ``pack_size``
             is still used as the hard limit.
         processor: Optional HuggingFace processor (e.g. ``Qwen2VLProcessor``).
-            Used to extract ``image_processor`` / ``video_processor`` configs
-            for accurate media token estimation via ``smart_resize``.
+            Used by :class:`MediaTokenEstimator` to resolve accurate media
+            token counts.
         balance_media_tokens: If True (default), use VT-balanced knapsack
             that distributes visual tokens evenly across packs.  Falls back
             to standard knapsack if no media tokens are detected.
@@ -767,15 +699,15 @@ def neat_pack_dataset_vlm(
     if get_rope_index is not None and sequence_alignment > 1:
         raise NotImplementedError("Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented.")
 
-    # Extract processor configs for accurate media token estimation
-    image_cfg = LengthGroupedSampler._extract_image_config(processor) if processor is not None else None
-    video_cfg = LengthGroupedSampler._extract_video_config(processor) if processor is not None else None
-    if image_cfg is not None or video_cfg is not None:
-        logger.info("Neat packing VLM: using processor configs for media token estimation.")
+    # Media token counts are resolved from the processor (see media_token_estimation)
+    media_estimator = MediaTokenEstimator(processor)
+    if media_estimator.can_estimate:
+        logger.info("Neat packing VLM: resolving media token counts from the processor.")
     else:
         logger.warning(
             "Neat packing VLM: no processor provided — media tokens will use "
-            "fallback estimate (500/item). Pass processor= for accurate packing."
+            "fallback estimate (%d/item). Pass processor= for accurate packing.",
+            DEFAULT_TOKENS_PER_MEDIA_ITEM,
         )
 
     # Knapsack bin capacity: leave headroom for estimation inaccuracy
@@ -802,12 +734,7 @@ def neat_pack_dataset_vlm(
         t0 = time.perf_counter()
 
         for i in range(N):
-            est_len, media_toks = _estimate_sample_length(
-                ds_raw[i],
-                image_cfg=image_cfg,
-                video_cfg=video_cfg,
-                return_media_tokens=True,
-            )
+            est_len, media_toks = _estimate_sample_length(ds_raw[i], media_estimator)
             est_len = _aligned_length(max(est_len - 1, 0), sequence_alignment)  # -1 for shift
             if est_len > pack_size:
                 if drop_long_samples:
