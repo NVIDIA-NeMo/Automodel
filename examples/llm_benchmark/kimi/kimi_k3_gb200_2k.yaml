@@ -40,8 +40,9 @@
 # (~52 GiB on middle stages at 2k) and the run OOMs during step 1. The ring
 # pool sizes buffers to the 1F1B in-flight depth instead, saving ~45 GiB.
 #
-# compile_norm is left off here: this file documents the measured champion
-# configuration; the 2k x compile_norm stack is pending measurement.
+# compile_norm is on: the fp32 RMSNorm chain is the remaining per-token launch
+# tax at this scale (see kimi_k3_gb200.yaml), and the 2k x compile_norm stack is
+# the configuration being re-measured for the figures above.
 #
 # Other benchmark regime notes match examples/llm_benchmark/kimi/kimi_k3_gb200.yaml.
 #
@@ -98,7 +99,7 @@ model:
     fake_balanced_gate: true   # benchmark only — see kimi_k3_gb200.yaml header
     fake_gate_noise: 0.0
     compile_situ: true
-    compile_norm: false   # champion 2k measurement predates it; stack pending
+    compile_norm: true
     benchmark_static_routing: true   # requires fake_balanced_gate, noise 0.0
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
