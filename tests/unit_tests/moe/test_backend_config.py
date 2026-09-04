@@ -21,6 +21,16 @@ from nemo_automodel.components.models.common import BackendConfig, CudaGraphConf
 from nemo_automodel.components.moe.config import MoEConfig
 
 
+class TestBackendConfigSparseAttention:
+    """Test the independent sparse-attention backend selector."""
+
+    def test_sparse_attention_backend_contract(self):
+        assert BackendConfig().sparse_attn == "generic"
+        assert BackendConfig(sparse_attn="msa").sparse_attn == "msa"
+        with pytest.raises(ValueError, match="expected 'generic' or 'msa'"):
+            BackendConfig(sparse_attn="unknown")
+
+
 class TestBackendConfigGatePrecision:
     """Test BackendConfig gate_precision field."""
 
