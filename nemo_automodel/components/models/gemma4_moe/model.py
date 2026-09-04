@@ -342,7 +342,6 @@ class Gemma4MoEDecoderLayer(nn.Module):
 
         # Reuse HF modules
         self.self_attn = Gemma4Attention(config=config, layer_idx=layer_idx)
-        attach_gemma4_cp_ring_attention(self.self_attn)
         self.mlp = Gemma4MLP(config, layer_idx)
 
         # Norms
@@ -890,6 +889,8 @@ class Gemma4MoEModel(HFGemma4Model):
 class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
+    # Gemma4 owns CP batch sharding and its decoder-layer p2p attention ring.
+    _owns_cp_attention = True
     # Whole-block activation checkpointing replays each decoder layer during backward.
     # E2B/E4B tolerate that for two separate reasons, one per kind of layer:
     #   * non-shared layers are the ones that call `past_key_values.update()`. A
@@ -1055,6 +1056,25 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             padding_token_id=padding_token_id,
         )
 
+    def _apply_cp_attention_backend_policy(self) -> None:
+        """Apply the model-owned CP attention backend policy to the final module tree."""
+        text_config = getattr(self.config, "text_config", self.config)
+        full_backend = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower()
+        sliding_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
+
+        if full_backend not in {"flex", "ffpa"}:
+            raise ValueError(f"Unsupported cp_full_attn_backend: {full_backend!r}")
+        if sliding_backend not in {"flex", "fa"}:
+            raise ValueError(f"Unsupported cp_sliding_attn_backend: {sliding_backend!r}")
+
+        for module in self.modules():
+            if isinstance(module, Gemma4Attention):
+                attach_gemma4_cp_ring_attention(
+                    module,
+                    use_ffpa=full_backend == "ffpa",
+                    sliding_backend=sliding_backend,
+                )
+
     def __init__(
         self,
         config: Gemma4Config,
@@ -1113,19 +1133,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         if not enable_moe:
-            # Dense Gemma4 — keep vanilla HF model. Attach the model-owned p2p ring
-            # CP attention to each HF self-attn so setup_cp_attention can install it
-            # when CP is enabled. (The MoE path attaches it per Gemma4MoEDecoderLayer.)
-            # ``cp_full_attn_backend: ffpa`` routes the full-attention head_dim=512
-            # ring chunks through the FFPA CuTeDSL kernel (eligibility re-checked per
-            # call in _ring_use_ffpa_varlen); default "flex" preserves prior behavior.
-            use_ffpa_cp = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower() == "ffpa"
-            # ``cp_sliding_attn_backend``: "flex" (default) | "fa" — kernel for the
-            # sliding-window CP layers (see cp_local_ring). fa gets off compiled flex.
-            sliding_cp_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
-            for module in self.modules():
-                if isinstance(module, Gemma4Attention):
-                    attach_gemma4_cp_ring_attention(module, use_ffpa=use_ffpa_cp, sliding_backend=sliding_cp_backend)
+            self._apply_cp_attention_backend_policy()
             return
 
         # --- MoE path: replace the text model ---
@@ -1137,6 +1145,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
+        self._apply_cp_attention_backend_policy()
 
         # Expose moe_config for the MoE parallelizer assertion
         self.model.moe_config = self.model.language_model.moe_config
