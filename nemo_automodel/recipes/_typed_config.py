@@ -46,9 +46,9 @@ from dataclasses import fields, is_dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
-from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
-from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+from nemo_automodel.components.loggers import CometConfig, MLflowConfig, WandbConfig
+from nemo_automodel.components.optim import LRSchedulerConfig
+from nemo_automodel.components.training import StepSchedulerConfig
 
 if TYPE_CHECKING:
     from nemo_automodel._transformers.mfu import MFUConfig
@@ -172,7 +172,7 @@ class RecipeConfig:
 
     @cached_property
     def optimizer(self) -> "OptimizerConfig" | None:
-        from nemo_automodel.components.optim.optimizer import build_optimizer_config
+        from nemo_automodel.components.optim import build_optimizer_config
 
         node = self._raw.get("optimizer", None)
         if node is None:
@@ -209,7 +209,7 @@ class RecipeConfig:
 
     def _packing_config(self):
         """Resolve the recipe's optional sequence-packing strategy config."""
-        from nemo_automodel.components.datasets.loader import make_packing_config
+        from nemo_automodel.components.datasets import make_packing_config
 
         ps = _as_dict(self._raw.get("packed_sequence", None))
         if ps.get("packed_sequence_size", 0) > 0:
@@ -221,10 +221,10 @@ class RecipeConfig:
         from torch.utils.data import DataLoader
         from torchdata.stateful_dataloader import StatefulDataLoader
 
-        from nemo_automodel.components.datasets.llm.megatron.sampler import MegatronSamplerConfig
-        from nemo_automodel.components.datasets.loader import (
+        from nemo_automodel.components.datasets import (
             DataloaderConfig,
             DatasetBuildSchedule,
+            MegatronSamplerConfig,
             ScheduledDatasetConfig,
             make_collate_fn,
             make_dataset_config,
@@ -328,7 +328,7 @@ class RecipeConfig:
     @staticmethod
     def _resolve_vlm_processor(node: Any) -> "VlmProcessorConfig":
         """Resolve an optional processor section into its typed component config."""
-        from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig, VlmVideoProcessorConfig
+        from nemo_automodel.components.datasets import VlmProcessorConfig, VlmVideoProcessorConfig
 
         if node is None:
             return VlmProcessorConfig()
@@ -370,10 +370,13 @@ class RecipeConfig:
         """
         from torchdata.stateful_dataloader import StatefulDataLoader
 
-        from nemo_automodel.components.datasets.loader import make_dataset_config
-        from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
-        from nemo_automodel.components.datasets.vlm.loader import VlmCollatorConfig, VlmDataloaderConfig
-        from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
+        from nemo_automodel.components.datasets import (
+            NeatPackConfig,
+            PreTokenizedDatasetWrapperConfig,
+            VlmCollatorConfig,
+            VlmDataloaderConfig,
+            make_dataset_config,
+        )
 
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
         # `tokenizer`/`processor` are runtime build args, not declarative dataset fields.
@@ -517,12 +520,12 @@ class RecipeConfig:
         Returns:
             Typed dataloader config whose ``build`` accepts runtime rank and batch-size values.
         """
-        from nemo_automodel.components.datasets.diffusion.collate_fns import (
+        from nemo_automodel.components.datasets import (
+            MetaFilesDataloaderConfig,
+            MockWanDataloaderConfig,
             TextToImageDataloaderConfig,
             TextToVideoDataloaderConfig,
         )
-        from nemo_automodel.components.datasets.diffusion.meta_files_dataset import MetaFilesDataloaderConfig
-        from nemo_automodel.components.datasets.diffusion.mock_dataloader import MockWanDataloaderConfig
 
         target, kwargs = _callable_and_kwargs(node)
         module = getattr(target, "__module__", None)
@@ -568,8 +571,7 @@ class RecipeConfig:
     @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:
         """Typed packed-dataset and dataloader config for BAGEL recipes."""
-        from nemo_automodel.components.datasets.multimodal.datasets import BagelDatasetConfig
-        from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
+        from nemo_automodel.components.datasets import BagelDataloaderConfig, BagelDatasetConfig
 
         dataset_node = self._raw.get("dataset", None)
         if dataset_node is None:
@@ -615,13 +617,13 @@ class RecipeConfig:
         # output / get_mtp_loss_scaling_factor; ignore_index is fixed) and are not
         # exposed via YAML.  This typed accessor just lets recipes build MTP through
         # the typed-config boundary like the other sections.
-        from nemo_automodel.components.loss.mtp import MTPLossConfig
+        from nemo_automodel.components.loss import MTPLossConfig
 
         return MTPLossConfig()
 
     @cached_property
     def prewarm(self) -> "PrewarmConfig | None":
-        from nemo_automodel.components.training.prewarm import PrewarmConfig
+        from nemo_automodel.components.training import PrewarmConfig
 
         node = self._raw.get("prewarm", None)
         return PrewarmConfig(**_section_kwargs(node)) if node else None
@@ -635,14 +637,14 @@ class RecipeConfig:
 
     @cached_property
     def embedding_row_repair(self) -> "EmbeddingRowRepairConfig | None":
-        from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
+        from nemo_automodel.components.training import EmbeddingRowRepairConfig
 
         node = self._raw.get("embedding_row_repair", None)
         return EmbeddingRowRepairConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":
-        from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+        from nemo_automodel.components.checkpoint import CheckpointingConfig
 
         node = self._raw.get("checkpoint", None)
         kwargs = _as_dict(node) if node is not None else {}

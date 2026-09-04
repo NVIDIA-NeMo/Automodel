@@ -376,7 +376,7 @@ def _iter_samples(
 async def _run(args: argparse.Namespace) -> int:
     """Async driver: load dataset, regenerate, write shards. Returns a process exit code."""
     aiohttp = _import_aiohttp()
-    from nemo_automodel.components.datasets.llm.chat_dataset import _load_openai_messages
+    from nemo_automodel.components.datasets import load_openai_messages as _load_openai_messages
 
     _validate_args(args)
     output_dir = Path(args.output_dir)

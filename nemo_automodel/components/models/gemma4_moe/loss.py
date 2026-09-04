@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import Partial, Replicate
 
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss import FusedLinearCrossEntropy
 
 
 class Gemma4TensorParallelFusedLinearCrossEntropy(FusedLinearCrossEntropy):

@@ -43,7 +43,7 @@ from nemo_automodel._transformers.sentence_transformer_export import (
     _SentenceTransformerMetadataExporter,
     _supports_standard_sentence_transformer_export,
 )
-from nemo_automodel.components.loss.intermediate_distill import LayerCapture
+from nemo_automodel.components.loss import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)

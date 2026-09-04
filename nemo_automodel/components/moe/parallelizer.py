@@ -32,8 +32,14 @@ from torch.distributed.tensor import Replicate, Shard, distribute_module, distri
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-from nemo_automodel.components.distributed import parallelizer_utils
-from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
+from nemo_automodel.components.distributed import (
+    configure_fsdp_unused_param_reduction,
+    fully_shard_by_dtype,
+    get_internal_fsdp_mp_policy,
+    get_text_module,
+    reject_unsupported_mtp_cp,
+    reject_unsupported_mtp_cp_pp,
+)
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
     Gate,
@@ -258,7 +264,7 @@ def _resolve_moe_tp_plan(
     if tp_shard_plan is not None:
         # Reuse the standard parser for explicit dictionaries, named plans and
         # import paths, then apply the stricter MoE ownership validation below.
-        from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
+        from nemo_automodel.components.distributed import get_parallel_plan as _get_parallel_plan
 
         plan = _get_parallel_plan(
             model,
@@ -267,9 +273,11 @@ def _resolve_moe_tp_plan(
             tp_size=tp_size,
         )
     else:
-        from nemo_automodel.components.distributed.optimized_tp_plans import (
+        from nemo_automodel.components.distributed import (
             PARALLELIZE_FUNCTIONS,
-            _get_class_qualname,
+        )
+        from nemo_automodel.components.distributed import (
+            get_class_qualname as _get_class_qualname,
         )
 
         model_cls = type(model)
@@ -434,11 +442,11 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
 
     # Lazy imports keep the heavy, transformers-aware dense parallelizer module
     # off the text-only MoE call path.
-    from nemo_automodel.components.distributed.activation_checkpointing import (
+    from nemo_automodel.components.distributed import (
         apply_submodule_checkpointing,
+        get_model_layer_groups,
         sdpa_backend_snapshot_context_fn,
     )
-    from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 
     layer_groups = get_model_layer_groups(model)
     tower_layers = [
@@ -497,7 +505,7 @@ def apply_ac(
     # Lazy import: keeps the scope normalization single-sourced with the strategy
     # configs without importing distributed.config on the (torch-stub-friendly)
     # module import path.
-    from nemo_automodel.components.distributed.config import normalize_activation_checkpointing_scope
+    from nemo_automodel.components.distributed import normalize_activation_checkpointing_scope
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
@@ -521,7 +529,7 @@ def apply_ac(
         if checkpoint_decoder:
             # Reuse the dense FSDP2 selective policy so the save-op set (attention,
             # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
-            from nemo_automodel.components.distributed.activation_checkpointing import (
+            from nemo_automodel.components.distributed import (
                 SELECTIVE_AC_WRAPPER_FLAG,
                 make_selective_checkpoint_context_fn,
                 transformer_engine_attention_backend_snapshot_context_fn,
@@ -608,7 +616,7 @@ def apply_ac(
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
-    from nemo_automodel.components.distributed.activation_checkpointing import (
+    from nemo_automodel.components.distributed import (
         ensure_fsdp_ops_sac_ignored,
         ensure_profiler_ops_sac_ignored,
         transformer_engine_attention_backend_snapshot_context_fn,
@@ -686,7 +694,7 @@ def apply_fsdp(
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         )
-    experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
+    experts_mp_policy = get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
     fully_shard_impl = fully_shard
@@ -827,7 +835,7 @@ def apply_fsdp(
 
         # Reuse the dense dtype-aware path for model-owned fp32 contracts while
         # leaving EP-owned experts out of the block's dtype and FSDP ownership.
-        parallelizer_utils.fully_shard_by_dtype(
+        fully_shard_by_dtype(
             block,
             mesh=fsdp_mesh,
             mp_policy=mp_policy,
@@ -999,7 +1007,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     type(attn_module).__name__ if attn_module is not None else type(self_attn).__name__,
                 )
         elif layer_type == "mamba":
-            from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
+            from nemo_automodel.components.distributed import MambaContextParallel
 
             mixer = block.self_attn  # NemotronV3Block.self_attn aliases mixer
             mixer.cp = MambaContextParallel(
@@ -1088,7 +1096,7 @@ def parallelize_model(
         model._nemo_moe_tp_requires_pretrained_weights = True
         # PEFT is applied before distributed sharding. Translate each style so
         # LoRA-wrapped shared-expert/lm-head modules keep the same TP semantics.
-        from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+        from nemo_automodel.components.distributed import translate_to_lora
 
         model_parallel_plan = {path: translate_to_lora(style) for path, style in model_parallel_plan.items()}
         logger.info(
@@ -1102,8 +1110,8 @@ def parallelize_model(
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
-        parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
-        parallelizer_utils.reject_unsupported_mtp_cp(model)
+        reject_unsupported_mtp_cp_pp(model)
+        reject_unsupported_mtp_cp(model)
         apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
@@ -1132,7 +1140,7 @@ def parallelize_model(
     else:
         ep_shard_mesh = None
 
-    from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh, get_submesh
+    from nemo_automodel.components.distributed import get_fsdp_dp_mesh, get_submesh
 
     axis_names = tuple(dp_axis_names or ())
     # HSDP combines a native replica axis with a flattened shard/CP axis.
@@ -1157,7 +1165,7 @@ def parallelize_model(
             frozen_multimodal_sharding=frozen_multimodal_sharding,
         )
         if cp_enabled:
-            configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
+            configured_units = configure_fsdp_unused_param_reduction(model)
             logger.info(
                 "Enabled unused-parameter reduce-scatter on %d MoE FSDP units for context parallelism",
                 configured_units,

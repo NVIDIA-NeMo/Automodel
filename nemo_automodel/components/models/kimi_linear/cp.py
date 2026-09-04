@@ -45,7 +45,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+from nemo_automodel.components.distributed import ShardLayout
 
 _PAD_DOC_ID = 0
 

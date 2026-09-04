@@ -245,7 +245,7 @@ def _gemma4_tp_plan(model: nn.Module, sequence_parallel: bool = False) -> dict[s
 
 def register_gemma4_parallel_strategy() -> None:
     """Register Gemma4's model-owned FSDP2 strategy once."""
-    from nemo_automodel.components.distributed.parallelizer import (
+    from nemo_automodel.components.distributed import (
         PARALLELIZATION_STRATEGIES,
         DefaultParallelizationStrategy,
         register_parallel_strategy,

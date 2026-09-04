@@ -40,39 +40,48 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.checkpoint.checkpointing import (
+from nemo_automodel.components.checkpoint import (
     Checkpointer,
     CheckpointingConfig,
+    find_latest_checkpoint,
     load_torch_ckpt,
+    resolve_restore_from_to_checkpoint_dir,
     save_config,
     save_losses,
 )
-from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.llm.dspark_cache import (
-    DTYPE_MAP,
+from nemo_automodel.components.config import parse_args_and_load_config
+from nemo_automodel.components.datasets import (
+    DSPARK_DTYPE_MAP as DTYPE_MAP,
+)
+from nemo_automodel.components.datasets import (
     build_cached_dspark_dataloader,
-    read_manifest,
+    build_dspark_vlm_dataloader,
+    build_eagle3_dataloader,
     read_target_weight_modules,
 )
-from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
-from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
-from nemo_automodel.components.distributed.activation_checkpointing import (
+from nemo_automodel.components.datasets import (
+    dspark_read_manifest as read_manifest,
+)
+from nemo_automodel.components.distributed import (
+    FSDP2Config,
     apply_selective_checkpointing_to_layers,
     apply_submodule_checkpointing,
+    get_flat_mesh,
+    get_sync_ctx,
+    initialize_distributed,
     is_selective_activation_checkpointing,
 )
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.distributed.utils import get_sync_ctx
-from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.loggers import (
+    MetricsSample,
+    build_metric_logger,
+    init_wandb_run,
+    setup_logging,
+    suppress_wandb_log_messages,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
-from nemo_automodel.components.optim.optimizer import build_optimizer
+from nemo_automodel.components.optim import build_optimizer
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
@@ -108,8 +117,8 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
 from nemo_automodel.components.speculative.dspark.target_utils import (
     read_target_model_type as _read_target_model_type,
 )
-from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
+from nemo_automodel.components.training import StatefulRNG
+from nemo_automodel.components.utils import VLM_INPUT_KEYS
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,

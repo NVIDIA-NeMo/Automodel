@@ -49,12 +49,15 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
-from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes, parallelizer
-from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
-from nemo_automodel.components.distributed.ddp import DDPManager
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.components.distributed.parallelizer import (
+from nemo_automodel.components.distributed import (
+    PARALLELIZATION_STRATEGIES,
+    DDPConfig,
+    DDPManager,
+    DistributedSetup,
+    FSDP2Config,
+    FSDP2Manager,
     HunyuanParallelizationStrategy,
+    ParallelismSizes,
     WanParallelizationStrategy,
 )
 from nemo_automodel.shared.import_utils import safe_import_te
@@ -141,8 +144,8 @@ def _import_diffusers_class(class_name: str):
 
 def _init_parallelizer():
     """Register custom parallelization strategies."""
-    parallelizer.PARALLELIZATION_STRATEGIES["WanTransformer3DModel"] = WanParallelizationStrategy()
-    parallelizer.PARALLELIZATION_STRATEGIES["HunyuanVideo15Transformer3DModel"] = HunyuanParallelizationStrategy()
+    PARALLELIZATION_STRATEGIES["WanTransformer3DModel"] = WanParallelizationStrategy()
+    PARALLELIZATION_STRATEGIES["HunyuanVideo15Transformer3DModel"] = HunyuanParallelizationStrategy()
 
 
 def _choose_device(device: torch.device | None) -> torch.device:
@@ -506,7 +509,7 @@ def _enable_context_parallel(
         apply_cudnn_attention_patch,
         apply_native_flash_backward_patch,
     )
-    from nemo_automodel.components.distributed.mesh_utils import create_ring_ulysses_mesh
+    from nemo_automodel.components.distributed import create_ring_ulysses_mesh
 
     # Interim fixes for the diffusers<=0.39 _native_flash/_native_cudnn backward
     # bugs on the CP path; feature-detected, no-ops once upstream ships the fix.

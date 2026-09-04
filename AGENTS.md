@@ -139,9 +139,10 @@ then runs the training loop.
 
 ### Components
 
-Everything under `components/` is a self-contained building block. Components
-are composed by recipes, never by each other (no hidden cross-component
-imports).
+Everything under `components/` is a self-contained building block. Recipes and
+other packages consume components through the symbols exported by each
+component package; components use the same public interfaces when they depend
+on one another.
 
 ### Transformers Bridge
 

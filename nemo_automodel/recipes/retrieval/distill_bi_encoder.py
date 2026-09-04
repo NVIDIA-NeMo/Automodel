@@ -14,13 +14,18 @@ import torch
 import torch.distributed
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.utils import get_sync_ctx
-from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.loss.embedding_distill import EmbeddingDistillLoss, EmbeddingMSELoss, ScoreDistillLoss
-from nemo_automodel.components.loss.infonce import InfoNCEDistillLoss, InfoNCELoss
-from nemo_automodel.components.loss.intermediate_distill import IntermediateDistillLoss
-from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.components.config import parse_args_and_load_config
+from nemo_automodel.components.distributed import get_sync_ctx
+from nemo_automodel.components.loggers import MetricsSample
+from nemo_automodel.components.loss import (
+    EmbeddingDistillLoss,
+    EmbeddingMSELoss,
+    InfoNCEDistillLoss,
+    InfoNCELoss,
+    IntermediateDistillLoss,
+    ScoreDistillLoss,
+)
+from nemo_automodel.components.training import scale_grads_and_clip_grad_norm
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 
 logger = logging.getLogger(__name__)

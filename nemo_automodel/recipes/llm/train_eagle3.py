@@ -33,27 +33,26 @@ from transformers import AutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.checkpointing import (
+from nemo_automodel.components.checkpoint import (
     CheckpointingConfig,
+    find_latest_checkpoint,
     load_hf_safetensors_state_dict,
     load_torch_ckpt,
+    resolve_restore_from_to_checkpoint_dir,
     save_config,
     save_losses,
 )
-from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.llm.eagle3 import (
+from nemo_automodel.components.config import parse_args_and_load_config
+from nemo_automodel.components.datasets import (
+    build_cached_eagle3_dataloader,
     build_eagle3_dataloader,
     load_or_build_eagle3_token_mapping,
 )
-from nemo_automodel.components.datasets.llm.eagle3_cache import (
-    build_cached_eagle3_dataloader,
-    read_manifest,
+from nemo_automodel.components.datasets import (
+    eagle3_read_manifest as read_manifest,
 )
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.distributed import get_flat_mesh, initialize_distributed
+from nemo_automodel.components.loggers import init_wandb_run, setup_logging, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner, resolve_decode_eval_config
@@ -65,8 +64,8 @@ from nemo_automodel.components.speculative.eagle import (
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.components.speculative.regen_loop import RegenRunner, resolve_regen_config
-from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.components.training import StatefulRNG
+from nemo_automodel.components.utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
@@ -1314,7 +1313,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         ``self.target_model`` / ``self.target_wrapper`` to ``None`` and builds the
         cache-backed dataloader.
         """
-        from nemo_automodel.components.datasets.llm.eagle3_cache import read_target_embeddings
+        from nemo_automodel.components.datasets import read_target_embeddings
 
         self.target_model = None
         self.target_wrapper = None

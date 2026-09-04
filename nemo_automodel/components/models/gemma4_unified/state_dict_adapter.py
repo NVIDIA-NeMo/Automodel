@@ -17,7 +17,7 @@
 import re
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint import StateDictAdapter
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
