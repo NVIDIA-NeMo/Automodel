@@ -613,9 +613,8 @@ def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
     assert strategy.dflash_loss_fn.chunk_size == 17
     assert strategy.dflash_loss_fn.loss_type == "dpace"
     assert strategy.dflash_loss_fn.dpace_alpha == 0.25
-    # D-PACE is new to both DFlash training paths, so it uses TrainDFlashRecipe's
-    # "mean" convention here too rather than this strategy's own "tokens" default.
-    assert strategy.dflash_loss_fn.normalize == "mean"
+    # pre_step supplies the globally reduced batch-block denominator.
+    assert strategy.dflash_loss_fn.normalize == "tokens"
 
 
 def test_dflash_setup_extra_keeps_tokens_normalize_for_the_dflash_default(monkeypatch):
@@ -638,6 +637,13 @@ def test_dflash_setup_extra_keeps_tokens_normalize_for_the_dflash_default(monkey
 
     assert strategy.dflash_loss_fn.loss_type == "dflash"
     assert strategy.dflash_loss_fn.normalize == "tokens"
+
+
+def test_dflash_setup_extra_rejects_context_parallel(monkeypatch):
+    recipe = types.SimpleNamespace(distributed_config=types.SimpleNamespace(cp_size=2))
+
+    with pytest.raises(ValueError, match="context parallelism"):
+        DFlashStrategy().setup_extra(recipe)
 
 
 def test_dflash_setup_extra_requires_target_model_id():
@@ -713,6 +719,26 @@ def test_dflash_pre_step_stashes_target_and_anchor_tensors():
     assert batch["_dflash_block_output_ids"].shape == (2, 8)
     assert batch["_dflash_block_targets"].shape == (2, 6)
     assert batch["_dflash_block_mask"].sum().item() == 12.0
+
+
+def test_dpace_pre_step_reports_batch_block_denominator():
+    strategy = _make_strategy(block_size=4, overlap_anchors=False)
+    strategy.num_blocks_per_sample = 2
+    strategy.dflash_loss_fn = DFlashDecayLoss(loss_type="dpace")
+    strategy._run_target_forward = lambda input_ids, attention_mask, start: torch.ones(
+        input_ids.size(0), start, 3
+    )
+    recipe = types.SimpleNamespace(mask_token_id=MASK_ID, dist_env=types.SimpleNamespace(device=torch.device("cpu")))
+    batch = {
+        "input_ids": torch.arange(32, dtype=torch.long).view(2, 16),
+        "attention_mask": torch.ones(2, 16, dtype=torch.long),
+        "loss_mask": torch.ones(2, 16, dtype=torch.long),
+    }
+
+    num_loss_units, num_supervised = strategy.pre_step(recipe, [batch])
+
+    assert num_loss_units == 4
+    assert num_supervised == 12
 
 
 @pytest.mark.parametrize("use_fused_linear_ce", [False, True])

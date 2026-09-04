@@ -361,10 +361,13 @@ class TestDFlashDecayLoss:
         # objective encodes (and bias the DP gradient average).
         expected = (token_nll * mask * ref_weight).sum() / float(bsz * n)
 
-        out = DFlashDecayLoss(loss_type=loss_type, dpace_alpha=alpha, normalize="mean")(logits, target_ids, mask)
+        details = DFlashDecayLoss(
+            loss_type=loss_type, dpace_alpha=alpha, normalize="mean"
+        ).forward_with_token_nll(logits, target_ids, mask)
+        out = details.output
 
         assert torch.isclose(expected, out.total_loss, atol=1e-6)
-        assert out.loss_denominator.item() == float(bsz * n)
+        assert details.denominator.item() == float(bsz * n)
 
     def test_dpace_mean_divides_by_batch_and_blocks_not_weight_sum(self):
         """``normalize="mean"`` normalizes D-PACE over a data-independent denominator.
@@ -393,11 +396,14 @@ class TestDFlashDecayLoss:
         batch_block_loss = weighted_sum / float(bsz * n)
         weight_sum_loss = weighted_sum / ((mask * weight).sum() + 1e-6)
 
-        out = DFlashDecayLoss(loss_type="dpace", dpace_alpha=alpha, normalize="mean")(logits, target_ids, mask)
+        details = DFlashDecayLoss(
+            loss_type="dpace", dpace_alpha=alpha, normalize="mean"
+        ).forward_with_token_nll(logits, target_ids, mask)
+        out = details.output
 
         assert torch.isclose(out.total_loss, batch_block_loss, atol=1e-6)
         assert not torch.isclose(out.total_loss, weight_sum_loss, atol=1e-6)
-        assert out.loss_denominator.item() == float(bsz * n)
+        assert details.denominator.item() == float(bsz * n)
 
     def test_dpace_continuation_ratio_survives_alpha_zero(self):
         """At ``dpace_alpha=0`` the prefix is a bare confidence product that underflows.
@@ -452,10 +458,10 @@ class TestDFlashDecayLoss:
         target_ids = torch.randint(0, vocab, (bsz, n, k))
         loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.35, normalize="mean")
 
-        full = loss_fn(logits, target_ids, torch.ones(bsz, n, k))
-        sparse = loss_fn(logits, target_ids, (torch.rand(bsz, n, k) > 0.5).float())
+        full = loss_fn.forward_with_token_nll(logits, target_ids, torch.ones(bsz, n, k))
+        sparse = loss_fn.forward_with_token_nll(logits, target_ids, (torch.rand(bsz, n, k) > 0.5).float())
 
-        assert full.loss_denominator.item() == sparse.loss_denominator.item() == float(bsz * n)
+        assert full.denominator.item() == sparse.denominator.item() == float(bsz * n)
 
     def test_dpace_scale_is_comparable_to_dflash(self):
         """Flipping ``loss_type`` must not move the loss by orders of magnitude.
@@ -489,11 +495,11 @@ class TestDFlashDecayLoss:
         loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.5)  # normalize="tokens"
 
         num_tokens = 37
-        scaled = loss_fn(logits, target_ids, block_mask, num_tokens=num_tokens)
+        scaled = loss_fn.forward_with_token_nll(logits, target_ids, block_mask, num_tokens=num_tokens)
         raw = loss_fn(logits, target_ids, block_mask, num_tokens=None).total_loss
         # Dividing by num_tokens (not bsz=2) scales the summed loss by 1/num_tokens.
-        assert torch.isclose(scaled.total_loss * num_tokens, raw, atol=1e-5)
-        assert scaled.loss_denominator.item() == float(num_tokens)
+        assert torch.isclose(scaled.output.total_loss * num_tokens, raw, atol=1e-5)
+        assert scaled.denominator.item() == float(num_tokens)
 
     def test_dpace_alpha_changes_loss(self, dflash_inputs):
         logits, target_ids, block_mask = dflash_inputs
@@ -503,16 +509,65 @@ class TestDFlashDecayLoss:
 
         assert not torch.allclose(low_alpha, high_alpha, atol=1e-4)
 
-    def test_loss_denominator_reports_dflash_denominators(self, dflash_inputs):
-        """loss_denominator is the exact scalar the loss divided by: num_tokens in
-        the ``"tokens"`` mode, the effective decay-weight sum in dflash ``"mean"``."""
+    def test_output_keeps_four_field_contract(self, dflash_inputs):
         logits, target_ids, block_mask = dflash_inputs
-        tokens = DFlashDecayLoss(loss_gamma=7.0)(logits, target_ids, block_mask, num_tokens=13)
-        assert tokens.loss_denominator.item() == 13.0
 
-        mean = DFlashDecayLoss(loss_gamma=7.0, normalize="mean")(logits, target_ids, block_mask)
+        output = DFlashDecayLoss()(logits, target_ids, block_mask)
+
+        assert len(output) == 4
+
+    @pytest.mark.parametrize("loss_type", ["dflash", "dpace"])
+    def test_flattened_forward_matches_block_layout(self, dflash_inputs, loss_type):
+        logits, target_ids, block_mask = dflash_inputs
+        loss_fn = DFlashDecayLoss(loss_type=loss_type, dpace_alpha=0.35, normalize="mean")
+
+        block_output = loss_fn(logits, target_ids, block_mask)
+        flat_output = loss_fn(
+            logits.flatten(1, 2),
+            target_ids.flatten(1, 2),
+            block_mask.flatten(1, 2),
+            None,
+            K_D + 1,
+        )
+
+        torch.testing.assert_close(flat_output.total_loss, block_output.total_loss)
+        torch.testing.assert_close(flat_output.draft_correct_per_pos, block_output.draft_correct_per_pos)
+        torch.testing.assert_close(flat_output.draft_count_per_pos, block_output.draft_count_per_pos)
+
+    @pytest.mark.parametrize("loss_type", ["dflash", "dpace"])
+    def test_flattened_fused_matches_block_layout(self, loss_type):
+        torch.manual_seed(31)
+        hidden = torch.randn(B_D, N_D, K_D, 7)
+        weight = torch.randn(V_D, 7)
+        target_ids = torch.randint(0, V_D, (B_D, N_D, K_D))
+        block_mask = (torch.rand(B_D, N_D, K_D) > 0.25).float()
+        loss_fn = DFlashDecayLoss(loss_type=loss_type, dpace_alpha=0.35, normalize="mean", chunk_size=5)
+
+        block_output = loss_fn.forward_fused(hidden, weight, target_ids, block_mask)
+        flat_output = loss_fn.forward_fused(
+            hidden.flatten(1, 2),
+            weight,
+            target_ids.flatten(1, 2),
+            block_mask.flatten(1, 2),
+            None,
+            K_D + 1,
+        )
+
+        torch.testing.assert_close(flat_output.total_loss, block_output.total_loss)
+
+    def test_details_report_dflash_denominators(self, dflash_inputs):
+        """Details expose the exact scalar used by either normalization mode."""
+        logits, target_ids, block_mask = dflash_inputs
+        tokens = DFlashDecayLoss(loss_gamma=7.0).forward_with_token_nll(
+            logits, target_ids, block_mask, num_tokens=13
+        )
+        assert tokens.denominator.item() == 13.0
+
+        mean = DFlashDecayLoss(loss_gamma=7.0, normalize="mean").forward_with_token_nll(
+            logits, target_ids, block_mask
+        )
         expected_denom = (torch.exp(-torch.arange(K_D, dtype=torch.float) / 7.0).view(1, 1, K_D) * block_mask).sum()
-        assert torch.isclose(mean.loss_denominator, expected_denom + 1e-6, atol=1e-4)
+        assert torch.isclose(mean.denominator, expected_denom + 1e-6, atol=1e-4)
 
 
 class TestDFlashDecayLossWeightedMean:
@@ -620,11 +675,11 @@ class TestDFlashDecayLossWeightedMean:
         logits, target_ids, block_mask = dflash_inputs
         loss_fn = DFlashDecayLoss(loss_gamma=7.0, normalize="mean")
 
-        without = loss_fn(logits, target_ids, block_mask, total_blocks=None)
-        with_it = loss_fn(logits, target_ids, block_mask, total_blocks=999)
+        without = loss_fn.forward_with_token_nll(logits, target_ids, block_mask, total_blocks=None)
+        with_it = loss_fn.forward_with_token_nll(logits, target_ids, block_mask, total_blocks=999)
 
-        torch.testing.assert_close(without.total_loss, with_it.total_loss)
-        torch.testing.assert_close(without.loss_denominator, with_it.loss_denominator)
+        torch.testing.assert_close(without.output.total_loss, with_it.output.total_loss)
+        torch.testing.assert_close(without.denominator, with_it.denominator)
 
     def test_value_mask_narrows_the_reduction_without_perturbing_the_schedule(self):
         """Reproduces the reported selector-masking bug and its fix.

@@ -273,9 +273,11 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         # forward_with_token_nll's own per-token NLL is reused below for the
         # selector's D-PACE weighting, instead of a second full-vocabulary CE
         # pass over pred_logits.
-        base_token_nll, loss_out = loss_fn.forward_with_token_nll(
+        loss_details = loss_fn.forward_with_token_nll(
             pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors
         )
+        base_token_nll = loss_details.token_nll
+        loss_out = loss_details.output
 
         scores, candidate_ids, target_index, has_target = self._selector_scores(pred_hidden, pred_logits, target_ids)
         selector_mask = pred_mask * has_target.to(pred_mask.dtype)
@@ -295,14 +297,14 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             selected_ids = candidate_ids.gather(-1, scores.argmax(dim=-1, keepdim=True)).squeeze(-1)
             correct_tokens = ((selected_ids == pred_targets) & eval_mask).sum()
             accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(selected_ids, pred_targets, eval_mask)
-            base_ids = pred_logits.argmax(dim=-1)
+            base_ids = loss_details.pred_ids
             base_correct_tokens = ((base_ids == pred_targets) & eval_mask).sum()
             base_accept_len, base_accept_len_sum, _ = compute_acceptance_stats(base_ids, pred_targets, eval_mask)
             denominator = valid_tokens.clamp_min(1)
 
         return DFlash2StepMetrics(
             loss=loss,
-            loss_weight=loss_out.loss_denominator.detach(),
+            loss_weight=loss_details.denominator,
             accuracy=(correct_tokens / denominator).detach(),
             valid_tokens=valid_tokens.detach(),
             correct_tokens=correct_tokens.detach(),

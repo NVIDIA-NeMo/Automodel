@@ -565,9 +565,9 @@ class DFlashStrategy(DLLMStrategy):
     it. The two therefore divide by denominators that differ by about
     ``block_size - 1``, so the *same* ``loss_decay_gamma`` / learning rate is
     NOT directly comparable, or portable, between this strategy and that
-    recipe for ``"dflash"``. The ``"dpace*"`` variants are new to both paths
-    and use ``normalize="mean"`` (with ``total_blocks=num_blocks_per_sample``)
-    in both, so D-PACE's ``dpace_alpha`` / learning rate IS portable between them.
+    recipe for ``"dflash"``. D-PACE uses a globally reduced
+    batch-times-configured-block denominator here and the equivalent local mean
+    in the dedicated recipe, so its hyperparameters are portable between paths.
     """
 
     def __init__(self):
@@ -613,8 +613,10 @@ class DFlashStrategy(DLLMStrategy):
         """Load and freeze the target LM; resolve block_size, layer_ids, decay loss."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from nemo_automodel.components.loss.dllm_loss import _DPACE_LOSS_TYPES
         from nemo_automodel.components.loss.loss import DFlashDecayLossConfig
+
+        if getattr(getattr(recipe, "distributed_config", None), "cp_size", 1) > 1:
+            raise ValueError("DFlash does not support context parallelism (cp_size must be 1).")
 
         dflash_cfg = recipe.cfg.get("dflash", None) or {}
 
@@ -699,17 +701,15 @@ class DFlashStrategy(DLLMStrategy):
         self.use_fused_linear_ce = bool(dflash_cfg.get("use_fused_linear_ce", True))
         ce_chunk_size = int(dflash_cfg.get("ce_chunk_size", 1024))
         loss_type = str(dflash_cfg.get("loss_type", "dflash"))
-        # "dflash" keeps this strategy's own "tokens" normalize (a real,
-        # globally all-reduced count) for backward compatibility. D-PACE is new
-        # to both DFlash training paths, so it uses the same "mean" convention
-        # TrainDFlashRecipe does -- see the class docstring.
+        # This strategy always consumes a globally reduced denominator. For
+        # D-PACE, pre_step reports batch * configured blocks instead of tokens.
         self.dflash_loss_fn = DFlashDecayLossConfig(
             loss_gamma=loss_gamma,
             use_fused_linear_ce=self.use_fused_linear_ce,
             chunk_size=ce_chunk_size,
             loss_type=loss_type,
             dpace_alpha=float(dflash_cfg.get("dpace_alpha", 0.5)),
-            normalize="mean" if loss_type in _DPACE_LOSS_TYPES else "tokens",
+            normalize="tokens",
         ).build()
 
         # --- Multi-block ---
@@ -877,6 +877,7 @@ class DFlashStrategy(DLLMStrategy):
         """Sample anchor blocks and run frozen target forwards for all microbatches."""
         device = recipe.dist_env.device
         num_predicted = 0
+        num_loss_units = 0
         for batch in batches:
             input_ids = batch["input_ids"].to(device)
             attn = batch.get("attention_mask", torch.ones_like(input_ids)).to(device)
@@ -901,6 +902,9 @@ class DFlashStrategy(DLLMStrategy):
             batch["_dflash_block_targets"] = block_targets
             batch["_dflash_block_mask"] = block_mask
             num_predicted += int(block_mask.sum().item())
+            num_loss_units += int(input_ids.shape[0]) * self.num_blocks_per_sample
+        if getattr(self.dflash_loss_fn, "loss_type", "dflash") != "dflash":
+            return num_loss_units, num_predicted
         return num_predicted, num_predicted
 
     # ------------------------------------------------------------------

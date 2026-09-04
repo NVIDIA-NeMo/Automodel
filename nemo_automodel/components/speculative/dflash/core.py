@@ -61,7 +61,6 @@ from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
-from nemo_automodel.components.loss.dllm_loss import _DFLASH_LOSS_TYPES as _DECAY_LOSS_TYPES
 from nemo_automodel.components.loss.loss import DFlashDecayLossConfig
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
@@ -181,12 +180,6 @@ def compute_acceptance_stats(
     return accept_len, accept_len_sum, valid_blocks
 
 
-# DFlashDecayLoss owns the fixed-anchor objectives (``dflash`` plus the D-PACE
-# variants); ``variable_prefix`` computes its loss inline here. Deriving from its
-# set keeps the two in sync when a new decay-loss variant is added.
-_DFLASH_LOSS_TYPES = tuple(sorted(_DECAY_LOSS_TYPES)) + ("variable_prefix",)
-
-
 class DFlashTrainerModule(nn.Module):
     """DFlash online training wrapper with block-wise CE loss."""
 
@@ -212,8 +205,6 @@ class DFlashTrainerModule(nn.Module):
         dpace_alpha: float = 0.5,
     ):
         super().__init__()
-        if loss_type not in _DFLASH_LOSS_TYPES:
-            raise ValueError(f"loss_type must be one of {_DFLASH_LOSS_TYPES}, got {loss_type!r}")
         if prefix_weight_base <= 0:
             raise ValueError(f"prefix_weight_base must be > 0, got {prefix_weight_base}")
         self.draft_model = draft_model
@@ -608,19 +599,22 @@ class DFlashTrainerModule(nn.Module):
         loss_fn = self.loss_fn
         assert loss_fn is not None, "loss_fn is constructed for every loss_type except 'variable_prefix'"
         # total_blocks=self.num_anchors: see the "dpace*" bullet above.
-        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors)
+        loss_details = loss_fn.forward_with_token_nll(
+            pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors
+        )
+        loss_out = loss_details.output
 
         # The loss reports the exact denominator it divided by (batch * blocks for
         # D-PACE, the effective decay-weight sum for dflash), so read it directly --
         # the metric can never drift from the loss's own normalization.
-        loss_weight = loss_out.loss_denominator
+        loss_weight = loss_details.denominator
 
         count_per_pos = loss_out.draft_count_per_pos
         valid_tokens = count_per_pos.sum()
         correct_tokens = loss_out.draft_correct_per_pos.sum()
         accuracy = correct_tokens / valid_tokens.clamp_min(1)
         accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(
-            pred_logits.argmax(dim=-1),  # [bsz, n, bs-1]
+            loss_details.pred_ids,
             pred_targets,
             pred_mask.bool(),
         )

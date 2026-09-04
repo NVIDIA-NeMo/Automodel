@@ -175,7 +175,8 @@ class DFlashDecayLossConfig(LossConfig):
             materialised.
         chunk_size: Predicted positions per chunk in the fused path.
         normalize: Denominator policy — ``"tokens"`` (global ``num_tokens``) or
-            ``"mean"`` (effective weight sum for dflash, batch size for D-PACE).
+            ``"mean"`` (effective weight sum for dflash, batch size times block
+            count for D-PACE).
         loss_type: ``"dflash"`` or a ``"dpace*"`` variant.
         dpace_alpha: Smoothing α for the D-PACE confidence product.
     """
