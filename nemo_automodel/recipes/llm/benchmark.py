@@ -412,6 +412,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
                     f"loss={reporting_loss:.4f}"
                 )
+                if self._wandb_enabled and self.wandb_run is not None:
+                    self.wandb_run.log({"loss": reporting_loss}, step=i)
 
             # Collect and log MoE load balance metrics (inherited from train_ft)
             self._collect_moe_load_balance()

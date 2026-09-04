@@ -653,6 +653,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        from nemo_automodel.components.moe.mok_experts import enable_mok_mxfp8_optimizer_step_cache
+
+        enable_mok_mxfp8_optimizer_step_cache(self.model_parts, self.optimizer)
+
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
 
