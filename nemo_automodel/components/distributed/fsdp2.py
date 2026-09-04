@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import logging
+from collections.abc import Callable
 
+from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
@@ -131,12 +133,18 @@ class FSDP2Manager:
         self.fsdp2_forward_prefetch_depth = config.fsdp2_forward_prefetch_depth
         self.frozen_multimodal_sharding = config.multimodal.frozen_sharding
 
-    def parallelize(self, model):
+    def parallelize(
+        self,
+        model: nn.Module,
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
+    ) -> nn.Module:
         """
         Parallelizes the given model using FSDP2 and TP sharding strategies.
 
         Args:
             model (nn.Module): The model to be parallelized.
+            reapply_trainability: Optional callback that re-resolves parameter
+                trainability after model surgery and before FSDP construction.
 
         Returns:
             The parallelized model.
@@ -168,6 +176,8 @@ class FSDP2Manager:
                         model.gradient_checkpointing_enable()
                     else:
                         apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
+            if reapply_trainability is not None:
+                reapply_trainability(model)
             return model
 
         if self.config.patch_is_packed_sequence:
@@ -189,6 +199,7 @@ class FSDP2Manager:
             reshard_after_forward=self.reshard_after_forward,
             activation_checkpointing_scope=self.activation_checkpointing_scope,
             frozen_multimodal_sharding=self.frozen_multimodal_sharding,
+            reapply_trainability=reapply_trainability,
         )
 
         return model

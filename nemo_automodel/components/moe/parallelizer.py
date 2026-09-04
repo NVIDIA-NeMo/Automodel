@@ -1049,8 +1049,15 @@ def parallelize_model(
     sequence_parallel: bool = False,
     enable_async_tensor_parallel: bool = False,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+    reapply_trainability: Callable[[nn.Module], None] | None = None,
 ) -> None:
-    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism."""
+    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism.
+
+    Args:
+        reapply_trainability: Optional callback that re-resolves parameter
+            trainability after TP/EP/AC surgery and immediately before FSDP
+            construction.
+    """
 
     tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
     if tp_enabled:
@@ -1116,6 +1123,9 @@ def parallelize_model(
             selective=_is_selective_ac(activation_checkpointing),
             activation_checkpointing_scope=activation_checkpointing_scope,
         )
+
+    if reapply_trainability is not None:
+        reapply_trainability(model)
 
     if ep_shard_axis_names is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]
