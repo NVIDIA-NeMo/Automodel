@@ -38,6 +38,7 @@ from nemo_automodel.recipes.dllm.strategy import (
     _build_target_layer_ids,
     get_dllm_strategy,
 )
+from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -721,7 +722,7 @@ def test_dflash_pre_step_stashes_target_and_anchor_tensors():
     assert batch["_dflash_block_mask"].sum().item() == 12.0
 
 
-def test_dpace_pre_step_reports_batch_block_denominator():
+def test_dpace_pre_step_routes_batch_block_denominator_to_recipe():
     strategy = _make_strategy(block_size=4, overlap_anchors=False)
     strategy.num_blocks_per_sample = 2
     strategy.dflash_loss_fn = DFlashDecayLoss(loss_type="dpace")
@@ -733,10 +734,12 @@ def test_dpace_pre_step_reports_batch_block_denominator():
         "loss_mask": torch.ones(2, 16, dtype=torch.long),
     }
 
-    num_loss_units, num_supervised = strategy.pre_step(recipe, [batch])
+    num_noise, num_supervised = strategy.pre_step(recipe, [batch])
+    recipe.dllm_strategy = strategy
+    num_diffusion, num_ar = DiffusionLMSFTRecipe._compute_loss_denominators(recipe, [batch], num_noise, num_supervised)
 
-    assert num_loss_units == 4
-    assert num_supervised == 12
+    assert (num_noise, num_supervised) == (12, 4)
+    assert (num_diffusion, num_ar) == (4, 4)
 
 
 @pytest.mark.parametrize("use_fused_linear_ce", [False, True])

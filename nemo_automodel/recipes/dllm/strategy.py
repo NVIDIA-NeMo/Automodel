@@ -904,7 +904,8 @@ class DFlashStrategy(DLLMStrategy):
             num_predicted += int(block_mask.sum().item())
             num_loss_units += int(input_ids.shape[0]) * self.num_blocks_per_sample
         if getattr(self.dflash_loss_fn, "loss_type", "dflash") != "dflash":
-            return num_loss_units, num_predicted
+            # normalization_mode="supervised" makes the recipe select slot two.
+            return num_predicted, num_loss_units
         return num_predicted, num_predicted
 
     # ------------------------------------------------------------------
