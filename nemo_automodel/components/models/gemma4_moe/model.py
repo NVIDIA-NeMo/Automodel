@@ -131,6 +131,11 @@ class _Gemma4KVShareHolder:
         # (kv_length, kv_offset): no cache -> kv spans the current query, zero offset.
         return query_length, 0
 
+    def get_query_offset(self, layer_idx=None) -> int:
+        # No cache -> queries start at position 0. transformers >=5.15 calls this
+        # unguarded from _preprocess_mask_arguments (is_sliding stays hasattr-guarded).
+        return 0
+
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         return key_states, value_states
 
@@ -792,13 +797,14 @@ class Gemma4MoETextModelBackend(nn.Module):
             # local-query/global-key Gemma4 mask from model metadata.
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
         elif use_vision_bidirectional_mask and packed_seq_ids is not None:
+            full_attention_head_dim = self.config.per_layer_config["full_attention"].head_dim
             causal_mask_mapping = _build_packed_gemma4_causal_mask_mapping(
                 packed_seq_ids.to(device=inputs_embeds.device),
                 mm_token_type_ids.to(device=inputs_embeds.device),
                 dtype=inputs_embeds.dtype,
                 sliding_window=getattr(self.config, "sliding_window", None),
                 as_block_mask=getattr(self.config, "_attn_implementation", None) == "flex_attention",
-                flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
+                flex_block_size=(32, 32) if full_attention_head_dim > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
             causal_mask_mapping = _build_unpacked_gemma4_causal_mask_mapping(
@@ -1408,6 +1414,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 image_features = self.model.get_image_features(
                     pixel_values, image_position_ids=image_position_ids, return_dict=True
                 ).pooler_output
+                # transformers >=5.15 returns one tensor per image; earlier versions
+                # return them already stacked.
+                if not torch.is_tensor(image_features):
+                    image_features = torch.cat(image_features, dim=0)
                 image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
                 if mm_token_type_ids is not None:
@@ -1608,6 +1618,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             image_features = self.model.get_image_features(
                 pixel_values, image_position_ids=image_position_ids, return_dict=True
             ).pooler_output
+            # transformers >=5.15 returns one tensor per image; earlier versions
+            # return them already stacked.
+            if not torch.is_tensor(image_features):
+                image_features = torch.cat(image_features, dim=0)
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)

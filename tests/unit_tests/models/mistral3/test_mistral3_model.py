@@ -65,6 +65,17 @@ class TestConfigAndAutoIntegration:
         # May return transformers or nemo_automodel version, check by class name
         assert type(lm).__name__ == "Ministral3ForCausalLM"
 
+    def test_hf_mistral3_config_maps_to_causal_lm(self):
+        """Ministral-3 checkpoints declare ``model_type: mistral3``, so AutoConfig
+        returns HF's Mistral3Config. transformers >=5.15 makes the public
+        ``register`` a silent no-op for configs under ``transformers.*``, which
+        left AutoModelForCausalLM rejecting those checkpoints outright."""
+        from transformers.models.mistral3.configuration_mistral3 import Mistral3Config as HFMistral3Config
+
+        mapping = mistral_mod.AutoModelForCausalLM._model_mapping
+        assert HFMistral3Config in mapping
+        assert mapping[HFMistral3Config] is mistral_mod.Mistral3ForConditionalGeneration
+
     def test_fp8_devstral_config_resolves_streaming_custom_model(self):
         cfg = tiny_config(
             architectures=["Ministral3ForCausalLM"],

@@ -201,6 +201,8 @@ class Qwen3_5DenseMTPSublayer(Qwen3_5DecoderLayer):
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__(_make_full_attention_config(config, layer_idx), layer_idx)
+        # Transformers 5.15 renamed this discriminator to ``block_type``.
+        self.layer_type = self.block_type
         self.has_fusion = has_fusion
         self.has_final_norm = has_final_norm
         if has_fusion:
