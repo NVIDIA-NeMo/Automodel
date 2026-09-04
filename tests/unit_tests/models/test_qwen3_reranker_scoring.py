@@ -292,3 +292,110 @@ def test_untied_config_leaves_the_head_independent():
     model = Qwen3RerankerForCausalReranking(config)
 
     assert model.lm_head.weight is not model.model.embed_tokens.weight
+
+
+def _tiny_kwargs(**overrides) -> dict:
+    base = dict(
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+        head_dim=8,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_serialized_config_carries_a_non_default_rope_scale():
+    """A scaled-RoPE checkpoint must reload with the scale it was trained under.
+
+    ``rope_parameters`` nests the scaling config, and the serializer flattens that dict
+    into rope_theta + rope_scaling for vLLM and stock HF. Dropping the dict without
+    carrying the scaling across would reload the checkpoint with different position
+    encoding than it was trained with -- silently, and only visible as degraded long
+    -context quality.
+    """
+    config = Qwen3RerankerConfig(
+        yes_token_id=YES_ID,
+        no_token_id=NO_ID,
+        **_tiny_kwargs(
+            rope_parameters={
+                "rope_theta": 5.0,
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 8,
+            }
+        ),
+    )
+
+    serialized = config.to_dict()
+
+    assert serialized["rope_theta"] == 5.0
+    assert serialized["rope_scaling"]["rope_type"] == "yarn"
+    assert serialized["rope_scaling"]["factor"] == 4.0
+    assert "rope_parameters" not in serialized
+
+
+def test_serialized_config_has_no_rope_scaling_when_the_scale_is_default():
+    """The stock config carries rope_scaling: None; an empty dict would not round-trip."""
+    serialized = Qwen3RerankerConfig(yes_token_id=YES_ID, no_token_id=NO_ID, **_tiny_kwargs()).to_dict()
+
+    assert serialized["rope_scaling"] is None
+    assert serialized["rope_theta"] is not None
+
+
+def test_scoring_without_yes_no_ids_raises_rather_than_scoring_garbage():
+    """Unset ids would otherwise index the vocab at 0/0 and return a constant."""
+    model = Qwen3RerankerForCausalReranking(Qwen3RerankerConfig(**_tiny_kwargs()))
+    model.eval()
+
+    with pytest.raises(ValueError, match="yes_token_id/no_token_id are unset"):
+        model(input_ids=torch.tensor([[1, 2, 3]]), attention_mask=torch.tensor([[1, 1, 1]]))
+
+
+def test_labels_produce_a_pointwise_yes_no_loss():
+    """The recipe pops labels and computes its own listwise loss; this is the direct-caller
+    path, which must return a finite scalar tied to the yes/no logits."""
+    model = _tiny_model()
+    input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+
+    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=torch.tensor([1, 0]))
+
+    assert out.loss is not None
+    assert out.loss.ndim == 0
+    assert torch.isfinite(out.loss)
+
+
+def test_no_loss_without_labels():
+    out = _tiny_model()(input_ids=torch.tensor([[1, 2, 3]]), attention_mask=torch.tensor([[1, 1, 1]]))
+
+    assert out.loss is None
+
+
+def test_from_pretrained_resolves_missing_yes_no_ids_from_the_tokenizer(tmp_path, monkeypatch):
+    """A checkpoint saved as a plain causal LM carries no yes/no ids, so loading one must
+    recover them from the tokenizer rather than leaving the model unscoreable."""
+    import transformers
+
+    Qwen3ForCausalLM(Qwen3Config(**_tiny_kwargs())).save_pretrained(tmp_path)
+
+    class _StubTokenizer:
+        @staticmethod
+        def convert_tokens_to_ids(token: str) -> int:
+            return {"yes": YES_ID, "no": NO_ID}[token]
+
+    class _StubAutoTokenizer:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return _StubTokenizer()
+
+    monkeypatch.setattr(transformers, "AutoTokenizer", _StubAutoTokenizer)
+
+    model = Qwen3RerankerForCausalReranking.from_pretrained(tmp_path)
+
+    assert model.config.yes_token_id == YES_ID
+    assert model.config.no_token_id == NO_ID
