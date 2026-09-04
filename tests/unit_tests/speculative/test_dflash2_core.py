@@ -16,8 +16,11 @@
 
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 import torch
+import torch.nn.functional as F
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule
@@ -302,3 +305,52 @@ def test_dpace_alpha_changes_the_selector_loss():
     )
 
     assert not torch.allclose(low_alpha.selector_loss, high_alpha.selector_loss, atol=1e-4)
+
+
+def test_dpace_with_forced_candidate_misses_runs_finite_and_trains_the_selector():
+    """Every other D-PACE test uses ``selector_top_k == vocab_size``, which makes
+    ``has_target`` always true and hides how a missed candidate interacts with
+    the D-PACE weight recursion. A narrow top-k forces real misses on this tiny,
+    untrained model."""
+    trainer = _build_trainer(loss_type="dpace", dpace_alpha=0.35, selector_top_k=TOP_K)
+    input_ids, hidden, loss_mask = _inputs()
+
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    assert out.candidate_recall.item() < 1.0
+
+    assert torch.isfinite(out.loss) and torch.isfinite(out.selector_loss)
+    out.loss.backward()
+    for name, param in trainer.draft_model.named_parameters():
+        if param.grad is not None:
+            assert torch.isfinite(param.grad).all(), name
+
+
+def test_dpace_loss_weight_uses_num_anchors_not_the_achieved_block_count():
+    """Mirrors the DFlash regression: the achieved block count varies per
+    micro-batch and per DP rank, so the D-PACE "mean" denominator must stay
+    ``bsz * num_anchors`` rather than following it."""
+    trainer = _build_trainer(loss_type="dpace", dpace_alpha=0.4)
+    input_ids, hidden, loss_mask = _inputs()
+    bsz = input_ids.shape[0]
+    loss_mask[:, 4:] = 0.0  # far fewer valid anchor positions than num_anchors=8
+
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+
+    assert out.loss_weight.item() == float(bsz * trainer.num_anchors)
+
+
+@pytest.mark.parametrize("loss_type,expected_cross_entropy_calls", [("dflash", 2), ("dpace", 3)])
+def test_dflash_loss_type_skips_the_redundant_backbone_confidence_pass(loss_type, expected_cross_entropy_calls):
+    """``position_weights`` never reads the backbone confidence's values for
+    ``loss_type="dflash"``, so recomputing a second full-vocabulary CE for it
+    (on top of the one already inside ``loss_fn``, and the selector's own) would
+    be a pure, and on a real model sized, waste."""
+    trainer = _build_trainer(loss_type=loss_type, selector_top_k=VOCAB)
+    input_ids, hidden, loss_mask = _inputs()
+
+    with mock.patch(
+        "nemo_automodel.components.speculative.dflash.dflash2_core.F.cross_entropy", wraps=F.cross_entropy
+    ) as cross_entropy:
+        trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+
+    assert cross_entropy.call_count == expected_cross_entropy_calls

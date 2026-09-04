@@ -29,7 +29,13 @@ Three training objectives are supported via ``loss_type``:
 * ``"dpace*"``: the D-PACE objective (arXiv:2605.18810). Same fixed-anchor block
   as ``"dflash"``, but the CE is reweighted by detached Dynamic Position-Aware
   weights built from the draft's own confidence (see ``DFlashDecayLoss``);
-  ``dpace_alpha`` smooths those confidence products.
+  ``dpace_alpha`` smooths those confidence products. Its ``normalize="mean"``
+  denominator is ``batch_size * num_anchors`` (the *configured* block-sampling
+  budget passed as ``total_blocks``), not the batch's achieved sampled-block
+  count -- that count is ``min(num_anchors, valid_anchors_in_batch)``, which
+  varies with each micro-batch's own content and therefore differs across DP
+  ranks, desyncing the averaged gradient if used directly (see
+  ``DFlashDecayLoss._mean_denominator``).
 * ``"variable_prefix"``: the D2SD VP-Drafter objective (arXiv:2606.04446). Each
   block draws a visible-prefix length ``l`` from a truncated geometric prior
   (``Pr(l) ~ prefix_weight_base ** l``), positions ``< l`` are filled with the
@@ -194,10 +200,14 @@ class DFlashTrainerModule(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: float | None = None,
+        sliding_window: int | None = None,
+        # Keyword-only, and appended after the pre-existing params above: an
+        # old positional caller of this constructor must not have a later
+        # argument silently rebound to one of these when they were inserted.
+        *,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
         prefix_weight_base: float = 0.9,
-        sliding_window: int | None = None,
     ):
         super().__init__()
         if loss_type not in _DFLASH_LOSS_TYPES:
@@ -595,7 +605,8 @@ class DFlashTrainerModule(nn.Module):
 
         loss_fn = self.loss_fn
         assert loss_fn is not None, "loss_fn is constructed for every loss_type except 'variable_prefix'"
-        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None)
+        # total_blocks=self.num_anchors: see the "dpace*" bullet above.
+        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors)
 
         # The loss reports the exact denominator it divided by (batch * blocks for
         # D-PACE, the effective decay-weight sum for dflash), so read it directly --

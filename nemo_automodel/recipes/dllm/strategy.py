@@ -556,6 +556,17 @@ class DFlashStrategy(DLLMStrategy):
     - ``overlap_anchors`` (default ``True``) — when ``True``, anchors are
       sampled independently (paper behaviour); when ``False``, anchors are
       forced non-overlapping (stars-and-bars, caps at ``seq_len // block_size``).
+
+    This strategy's ``DFlashDecayLoss`` uses ``normalize="tokens"`` (a real,
+    globally all-reduced token count, ``num_diffusion_tokens``), while
+    ``nemo_automodel.recipes.llm.train_dflash.TrainDFlashRecipe`` -- the
+    dedicated DFlash recipe built on the same loss class -- hardcodes
+    ``normalize="mean"`` (roughly ``batch_size * num_anchors`` blocks, not
+    tokens). The two therefore divide by denominators that differ by about
+    ``block_size - 1``, so the *same* ``loss_decay_gamma`` / ``dpace_alpha`` /
+    learning rate is NOT directly comparable, or portable, between this
+    strategy and that recipe: retune the learning rate when switching between
+    them, do not assume "same YAML, same training dynamics".
     """
 
     def __init__(self):
@@ -685,6 +696,9 @@ class DFlashStrategy(DLLMStrategy):
         # ce_chunk_size trades peak memory (smaller = lower) against recompute.
         self.use_fused_linear_ce = bool(dflash_cfg.get("use_fused_linear_ce", True))
         ce_chunk_size = int(dflash_cfg.get("ce_chunk_size", 1024))
+        # normalize left at the class default ("tokens", a real globally
+        # all-reduced count) -- see the class docstring for why this differs
+        # from TrainDFlashRecipe's "mean" and is not directly LR-comparable.
         self.dflash_loss_fn = DFlashDecayLossConfig(
             loss_gamma=loss_gamma,
             use_fused_linear_ce=self.use_fused_linear_ce,

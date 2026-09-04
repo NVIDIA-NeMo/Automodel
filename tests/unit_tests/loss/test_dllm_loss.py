@@ -592,6 +592,69 @@ class TestDFlashDecayLossWeightedMean:
         assert torch.isclose(actual, expected, atol=1e-6)
         assert not torch.isclose(actual, (token_nll * weights).sum() / (weights.sum() + 1e-6), atol=1e-6)
 
+    def test_total_blocks_fixes_the_dpace_mean_denominators_rank_dependence(self):
+        """Reproduces the reported DDP-partition-dependence and its fix in one place:
+        two batches with the same batch size but a different sampled-block count
+        (``n_blocks`` -- e.g. one rank's micro-batch had fewer valid anchors than
+        another's) get different D-PACE ``normalize="mean"`` denominators when
+        ``total_blocks`` (the trainer's *configured* sampling budget, e.g.
+        ``num_anchors``) is not supplied, and the same denominator once it is."""
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.35, normalize="mean")
+        weights_few = loss_fn.position_weights(torch.rand(2, 1, K_D), torch.ones(2, 1, K_D))  # n_blocks=1
+        weights_many = loss_fn.position_weights(torch.rand(2, 4, K_D), torch.ones(2, 4, K_D))  # n_blocks=4
+
+        assert not torch.isclose(
+            loss_fn._mean_denominator(weights_few, bsz=2, n_blocks=1),
+            loss_fn._mean_denominator(weights_many, bsz=2, n_blocks=4),
+        )
+
+        denom_few = loss_fn._mean_denominator(weights_few, bsz=2, n_blocks=1, total_blocks=4)
+        denom_many = loss_fn._mean_denominator(weights_many, bsz=2, n_blocks=4, total_blocks=4)
+        assert torch.isclose(denom_few, denom_many)
+        assert denom_few.item() == float(2 * 4)
+
+    def test_total_blocks_does_not_change_the_dflash_denominator(self, dflash_inputs):
+        """``total_blocks`` is a D-PACE-only knob: fixed decay's denominator is
+        already the (data-dependent, but not partition-sensitive in the reported
+        way) weight sum, and must ignore it."""
+        logits, target_ids, block_mask = dflash_inputs
+        loss_fn = DFlashDecayLoss(loss_gamma=7.0, normalize="mean")
+
+        without = loss_fn(logits, target_ids, block_mask, total_blocks=None)
+        with_it = loss_fn(logits, target_ids, block_mask, total_blocks=999)
+
+        torch.testing.assert_close(without.total_loss, with_it.total_loss)
+        torch.testing.assert_close(without.loss_denominator, with_it.loss_denominator)
+
+    def test_value_mask_narrows_the_reduction_without_perturbing_the_schedule(self):
+        """Reproduces the reported selector-masking bug and its fix.
+
+        For per-position confidences ``[0.5, 0.5, 0.5]`` and ``dpace_alpha=0.5``,
+        the D-PACE weights built from a fully-valid mask are
+        ``[1.734375, 0.984375, 0.421875]`` (hand-derived from Eq. in
+        ``_dpace_weight``: ``smooth=0.75`` everywhere, ``prefix`` the running
+        product, ``suffix`` its reversed cumulative sum). Narrowing the schedule
+        mask itself to ``has_target=[0, 1, 1]`` (i.e. feeding it as ``block_mask``)
+        corrupts positions 1 and 2's weights too, not only position 0's --
+        ``value_mask`` must instead reproduce the *unperturbed* schedule with only
+        position 0 zeroed: ``[0, 0.984375, 0.421875]``.
+        """
+        bsz, n_blocks = 2, 3
+        nll = -torch.log(torch.tensor([0.5, 0.5, 0.5])).expand(bsz, n_blocks, 3)
+        full_mask = torch.ones(bsz, n_blocks, 3)
+        has_target = torch.tensor([0.0, 1.0, 1.0]).expand(bsz, n_blocks, 3)
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.5)
+
+        corrupted = loss_fn.position_weights(nll, full_mask * has_target)
+        fixed = loss_fn.position_weights(nll, full_mask) * has_target
+
+        torch.testing.assert_close(corrupted, torch.tensor([0.0, 1.3125, 0.5625]).expand(bsz, n_blocks, 3))
+        torch.testing.assert_close(fixed, torch.tensor([0.0, 0.984375, 0.421875]).expand(bsz, n_blocks, 3))
+
+        values = torch.ones(bsz, n_blocks, 3)
+        via_weighted_mean = loss_fn.weighted_mean(values, nll, full_mask, value_mask=full_mask * has_target)
+        torch.testing.assert_close(via_weighted_mean, (values * fixed).sum() / float(bsz * n_blocks))
+
 
 class TestDFlashDraftAccuracy:
     """Per-position draft top-1 accuracy (correct, count) sums.

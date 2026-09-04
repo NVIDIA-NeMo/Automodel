@@ -39,9 +39,22 @@ Both terms share ``base_loss``'s ``DFlashDecayLoss`` position-weighting scheme
 ``"dpace*"`` variants, arXiv:2605.18810) via
 :meth:`~nemo_automodel.components.loss.dllm_loss.DFlashDecayLoss.weighted_mean`,
 so a position's importance is identical in the two objectives and switching
-``loss_type`` rescales both consistently. ``loss_type="variable_prefix"`` is
+``loss_type`` rescales both consistently. The selector term's weight *schedule*
+is always built from the full ``pred_mask`` -- the same mask ``base_loss`` uses
+-- and only narrowed to the positions with selector signal (``has_target``)
+afterward, via ``weighted_mean``'s ``value_mask``. D-PACE's weight is a
+sequential cumprod/cumsum across the block, so building it from a narrower mask
+directly (e.g. ``pred_mask * has_target``) would corrupt neighboring positions'
+weights, not just the excluded one's. ``loss_type="variable_prefix"`` is
 rejected: the selector teacher-forces the predecessor from the fixed-anchor
 block layout, which a variable visible prefix breaks.
+
+Both terms also share the base objective's ``total_blocks`` fix: D-PACE's
+"mean" denominator is ``batch_size * num_anchors`` (the trainer's *configured*
+block-sampling budget), not the batch's achieved sampled-block count, which
+varies with each micro-batch's own content and therefore differs across DP
+ranks -- see
+:meth:`~nemo_automodel.components.loss.dllm_loss.DFlashDecayLoss._mean_denominator`.
 """
 
 from __future__ import annotations
@@ -120,10 +133,14 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: float | None = None,
-        loss_type: str = "dflash",
-        dpace_alpha: float = 0.5,
         selector_loss_weight: float = 1.0,
         sliding_window: int | None = None,
+        # Keyword-only, and appended after the pre-existing params above: an
+        # old positional caller of this constructor must not have a later
+        # argument silently rebound to one of these when they were inserted.
+        *,
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
     ):
         if loss_type == "variable_prefix":
             raise ValueError(
@@ -253,23 +270,27 @@ class DFlash2TrainerModule(DFlashTrainerModule):
 
         loss_fn = self.loss_fn
         assert loss_fn is not None, "loss_fn is always constructed (loss_type='variable_prefix' is rejected)"
-        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None)
+        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors)
 
         scores, candidate_ids, target_index, has_target = self._selector_scores(pred_hidden, pred_logits, target_ids)
         selector_mask = pred_mask * has_target.to(pred_mask.dtype)
         selector_nll = F.cross_entropy(
             scores.reshape(-1, scores.shape[-1]).float(), target_index.reshape(-1), reduction="none"
         ).view_as(selector_mask)
-        # The backbone's own per-position NLL, only ever read (never backpropped
-        # through) as the D-PACE confidence signal -- computed under no_grad so it
-        # does not double the base term's backward graph over pred_logits.
-        with torch.no_grad():
-            base_token_nll = F.cross_entropy(
-                pred_logits.reshape(-1, pred_logits.shape[-1]).float(), pred_targets.reshape(-1), reduction="none"
-            ).view_as(pred_mask)
-        # Shares base_loss's DFlashDecayLoss weighting scheme (see module docstring)
-        # so the selector term rescales identically when loss_type changes.
-        selector_loss = loss_fn.weighted_mean(selector_nll, base_token_nll, selector_mask)
+        if self.loss_type == "dflash":
+            # position_weights ignores this argument's values for "dflash"; skip
+            # the redundant full-vocabulary CE pass over pred_logits.
+            base_token_nll = pred_mask
+        else:
+            with torch.no_grad():
+                base_token_nll = F.cross_entropy(
+                    pred_logits.reshape(-1, pred_logits.shape[-1]).float(), pred_targets.reshape(-1), reduction="none"
+                ).view_as(pred_mask)
+        # See the module docstring for why the schedule mask stays pred_mask and
+        # has_target only narrows via value_mask.
+        selector_loss = loss_fn.weighted_mean(
+            selector_nll, base_token_nll, pred_mask, value_mask=selector_mask, total_blocks=self.num_anchors
+        )
         loss = loss_out.total_loss + self.selector_loss_weight * selector_loss
 
         with torch.no_grad():

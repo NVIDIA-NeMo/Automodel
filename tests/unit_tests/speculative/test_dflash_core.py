@@ -119,6 +119,22 @@ def test_forward_supports_dpace_loss_and_grads_flow_to_draft():
     assert grad > 0
 
 
+def test_dpace_loss_weight_uses_num_anchors_not_the_achieved_block_count():
+    """DDP-partition-dependence regression: the achieved block count
+    (``min(num_anchors, valid_anchors_in_batch)``) varies with each
+    micro-batch's own content and therefore differs across DP ranks; the
+    D-PACE "mean" denominator must stay ``bsz * num_anchors`` even when a
+    batch supplies far fewer valid anchors than ``num_anchors``."""
+    trainer = _build_trainer(loss_type="dpace", dpace_alpha=0.4)
+    input_ids, hidden, loss_mask = _inputs()
+    bsz = input_ids.shape[0]
+    loss_mask[:, 4:] = 0.0  # every sample now has far fewer than num_anchors=8 valid positions
+
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+
+    assert out.loss_weight.item() == float(bsz * trainer.num_anchors)
+
+
 @pytest.mark.parametrize("attention_backend", ["eager", "sdpa"])
 def test_padding_blocks_do_not_nan_loss_or_grads(attention_backend):
     """A batch mixing sequence lengths produces padding blocks (block_keep_mask

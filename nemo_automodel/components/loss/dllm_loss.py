@@ -936,14 +936,23 @@ class DFlashDecayLoss(nn.Module):
             return block_mask * dpace_weights
         raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
-    def _mean_denominator(self, weights: torch.Tensor, bsz: int, n_blocks: int) -> torch.Tensor:
+    def _mean_denominator(
+        self, weights: torch.Tensor, bsz: int, n_blocks: int, total_blocks: int | None = None
+    ) -> torch.Tensor:
         """Denominator for ``normalize="mean"``: weight sum for ``"dflash"``, else block count.
 
         Args:
             weights: Position weights from :meth:`position_weights`, shape
                 ``[batch, blocks, k]``.
             bsz: Batch size (``weights.shape[0]``).
-            n_blocks: Sampled-block count (``weights.shape[1]``).
+            n_blocks: Sampled-block count (``weights.shape[1]``); used for
+                D-PACE only when ``total_blocks`` is not given.
+            total_blocks: The trainer's *configured* block-sampling budget (e.g.
+                ``num_anchors``), used in place of ``n_blocks`` for D-PACE so the
+                denominator is identical on every DP rank. ``n_blocks`` is
+                ``min(num_anchors, valid_anchors_in_batch)`` and therefore
+                differs per micro-batch and per rank; ``num_anchors`` is a config
+                constant.
 
         Returns:
             Scalar tensor.
@@ -965,7 +974,8 @@ class DFlashDecayLoss(nn.Module):
         ``n_blocks`` times smaller than the published one.
         """
         if self.loss_type in _DPACE_LOSS_TYPES:
-            return weights.new_tensor(max(float(bsz * n_blocks), 1.0))
+            blocks = n_blocks if total_blocks is None else total_blocks
+            return weights.new_tensor(max(float(bsz * blocks), 1.0))
         return weights.sum() + 1e-6
 
     def weighted_mean(
@@ -973,6 +983,8 @@ class DFlashDecayLoss(nn.Module):
         values: torch.Tensor,
         token_nll: torch.Tensor,
         block_mask: torch.Tensor,
+        value_mask: torch.Tensor | None = None,
+        total_blocks: int | None = None,
     ) -> torch.Tensor:
         """Weight ``values`` by :meth:`position_weights` and reduce with ``normalize="mean"`` semantics.
 
@@ -990,14 +1002,30 @@ class DFlashDecayLoss(nn.Module):
                 typically the backbone's own per-position NLL over the same
                 block, shape ``[batch, blocks, k]``. Ignored for
                 ``loss_type="dflash"``.
-            block_mask: Valid-position mask, shape ``[batch, blocks, k]``.
+            block_mask: The mask :meth:`position_weights` builds the schedule
+                from, shape ``[batch, blocks, k]`` -- keep this the *base*
+                objective's own valid-position mask, not narrowed to some
+                condition specific to ``values``. The D-PACE weight is a
+                sequential cumprod/cumsum across the block, so narrowing this
+                mask changes every other position's weight too, not only the
+                excluded one's; narrow with ``value_mask`` instead.
+            value_mask: Which positions ``values`` is actually summed over, and
+                (for ``loss_type="dflash"``) the weight-sum denominator too --
+                matching a single-term reduction's own semantics. Defaults to
+                ``block_mask``. Pass a narrower mask (e.g. DFlash 2's
+                ``pred_mask * has_target``, valid only where a real supervision
+                target exists) to exclude positions from the reduction without
+                perturbing the schedule ``block_mask`` builds.
+            total_blocks: See :meth:`_mean_denominator`.
 
         Returns:
             Scalar tensor: the weighted mean of ``values``.
         """
+        if value_mask is None:
+            value_mask = block_mask
         bsz, n_blocks, _ = block_mask.shape
-        weights = self.position_weights(token_nll, block_mask)
-        denom = self._mean_denominator(weights, bsz, n_blocks)
+        weights = self.position_weights(token_nll, block_mask) * value_mask.to(token_nll.dtype)
+        denom = self._mean_denominator(weights, bsz, n_blocks, total_blocks=total_blocks)
         return (values * weights).sum() / denom
 
     def _reduce(
@@ -1007,6 +1035,7 @@ class DFlashDecayLoss(nn.Module):
         num_tokens: int | None,
         draft_correct_per_pos: torch.Tensor,
         draft_count_per_pos: torch.Tensor,
+        total_blocks: int | None = None,
     ) -> DLLMLossOutput:
         """Build per-position weights, then sum and normalise.
 
@@ -1019,6 +1048,7 @@ class DFlashDecayLoss(nn.Module):
                 denominator when ``normalize != "mean"``.
             draft_correct_per_pos: Per-offset argmax-correct counts, shape ``[k]``.
             draft_count_per_pos: Per-offset valid-position counts, shape ``[k]``.
+            total_blocks: See :meth:`_mean_denominator`.
 
         Returns:
             :class:`DLLMLossOutput` whose ``loss_denominator`` is the exact scalar
@@ -1028,7 +1058,7 @@ class DFlashDecayLoss(nn.Module):
         weights = self.position_weights(token_nll, block_mask)
         weighted_sum = (token_nll * weights).sum()
         if self.normalize == "mean":
-            denom = self._mean_denominator(weights, bsz, n_blocks)
+            denom = self._mean_denominator(weights, bsz, n_blocks, total_blocks=total_blocks)
         elif num_tokens is not None:
             denom = weighted_sum.new_tensor(max(float(num_tokens), 1.0))
         else:
@@ -1071,6 +1101,7 @@ class DFlashDecayLoss(nn.Module):
         target_ids: torch.Tensor,
         block_mask: torch.Tensor,
         num_tokens: int | None = None,
+        total_blocks: int | None = None,
     ) -> DLLMLossOutput:
         """Compute the DFlash decay-weighted loss from pre-computed logits.
 
@@ -1084,6 +1115,7 @@ class DFlashDecayLoss(nn.Module):
             block_mask: Float/bool valid-position mask, shape ``[batch, blocks, k]``;
                 zero entries (padding) are excluded from the loss.
             num_tokens: Optional global token count for loss normalisation.
+            total_blocks: See :meth:`_mean_denominator`.
 
         Returns:
             :class:`DLLMLossOutput`.
@@ -1098,6 +1130,7 @@ class DFlashDecayLoss(nn.Module):
             num_tokens,
             draft_correct_per_pos=c_per_pos,
             draft_count_per_pos=n_per_pos,
+            total_blocks=total_blocks,
         )
 
     @staticmethod
@@ -1126,6 +1159,7 @@ class DFlashDecayLoss(nn.Module):
         block_mask: torch.Tensor,
         num_tokens: int | None = None,
         lm_head_bias: torch.Tensor | None = None,
+        total_blocks: int | None = None,
     ) -> DLLMLossOutput:
         """Chunked linear-CE: never materialises the full logits tensor.
 
@@ -1145,6 +1179,7 @@ class DFlashDecayLoss(nn.Module):
             block_mask: Valid-position mask, shape ``[batch, blocks, k]``.
             num_tokens: as in :meth:`forward`.
             lm_head_bias: Optional LM-head bias, shape ``[vocab]``.
+            total_blocks: See :meth:`_mean_denominator`.
 
         Returns:
             :class:`DLLMLossOutput`.
@@ -1176,6 +1211,7 @@ class DFlashDecayLoss(nn.Module):
             num_tokens,
             draft_correct_per_pos=c_per_pos,
             draft_count_per_pos=n_per_pos,
+            total_blocks=total_blocks,
         )
 
 
