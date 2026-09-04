@@ -793,13 +793,14 @@ class Gemma4MoETextModelBackend(nn.Module):
             # local-query/global-key Gemma4 mask from model metadata.
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
         elif use_vision_bidirectional_mask and packed_seq_ids is not None:
+            full_attention_head_dim = self.config.per_layer_config["full_attention"].head_dim
             causal_mask_mapping = _build_packed_gemma4_causal_mask_mapping(
                 packed_seq_ids.to(device=inputs_embeds.device),
                 mm_token_type_ids.to(device=inputs_embeds.device),
                 dtype=inputs_embeds.dtype,
                 sliding_window=getattr(self.config, "sliding_window", None),
                 as_block_mask=getattr(self.config, "_attn_implementation", None) == "flex_attention",
-                flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
+                flex_block_size=(32, 32) if full_attention_head_dim > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
             causal_mask_mapping = _build_unpacked_gemma4_causal_mask_mapping(
