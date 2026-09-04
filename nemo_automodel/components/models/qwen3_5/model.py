@@ -50,7 +50,13 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
+from nemo_automodel.components.models.common.mtp import (
+    MTPConfig,
+    MTPContextParallelInputs,
+    MTPModule,
+    prepare_mtp_context_parallel_inputs,
+    roll_tensor,
+)
 from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -186,6 +192,26 @@ def _rolled_embed_inputs(inputs_embeds: torch.Tensor, num_depths: int) -> tuple[
         cur = roll_tensor(cur, shifts=-1, dim=-2)
         embed_inputs.append(cur)
     return tuple(embed_inputs)
+
+
+def _mask_mtp_embed_inputs(
+    embed_inputs: tuple[torch.Tensor, ...],
+    valid_masks: tuple[torch.BoolTensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    """Zero invalid future-token embeddings after they enter the local CP layout."""
+    if len(embed_inputs) != len(valid_masks):
+        raise ValueError(
+            f"MTP embed depth count {len(embed_inputs)} does not match valid-mask count {len(valid_masks)}"
+        )
+    masked = []
+    for depth, (embed_input, valid_mask) in enumerate(zip(embed_inputs, valid_masks), start=1):
+        if valid_mask.shape != embed_input.shape[:-1]:
+            raise ValueError(
+                f"MTP depth {depth} valid-mask shape {tuple(valid_mask.shape)} "
+                f"does not match embedding token shape {tuple(embed_input.shape[:-1])}"
+            )
+        masked.append(embed_input.masked_fill(~valid_mask.bool().unsqueeze(-1), 0))
+    return tuple(masked)
 
 
 class Qwen3_5DenseMTPSublayer(Qwen3_5DecoderLayer):
@@ -748,6 +774,8 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         past_key_values: Any | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
+        mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Any,
@@ -793,7 +821,19 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                     past_key_values=past_key_values,
                     position_ids=text_position_ids,
                 )
-            if input_ids is None:
+            if mtp_per_depth_input_ids is not None:
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    input_ids_per_depth=mtp_per_depth_input_ids,
+                    embed_fn=self.model.embed_tokens,
+                    position_ids_per_depth=mtp_per_depth_position_ids,
+                    attention_mask=causal_mask,
+                    rotary_emb=self.model.rotary_emb,
+                    **kwargs,
+                )
+            elif int(kwargs.get("cp_size", 1) or 1) > 1:
+                raise ValueError("Context-parallel Qwen3.5 MTP requires precomputed per-depth inputs and positions")
+            elif input_ids is None:
                 mtp_per_depth_h = self.mtp(
                     hidden_states,
                     embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
@@ -879,6 +919,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         supports_pp: bool = True
         supports_ep: bool = False
         supports_thd: bool = False
+        supports_mtp_cp: bool = True
         supports_cp_vision_frame_sharding: bool = True
 
     @classmethod
@@ -1154,6 +1195,14 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             **promoted,
         }
 
+    def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
+        """Prepare Qwen's future-token MTP streams after full-sequence mRoPE setup."""
+        return prepare_mtp_context_parallel_inputs(
+            batch,
+            num_depths=self.mtp_config.num_layers,
+            ignore_index=ignore_index,
+        )
+
     def _embed_and_splice_for_cp(
         self,
         input_ids: torch.Tensor,
@@ -1280,6 +1329,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
+        mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_valid_masks: tuple[torch.BoolTensor, ...] | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         padding_mask: torch.Tensor | None = None,
@@ -1327,6 +1379,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         # shard_batch_aux_only). The local shard matches the old dispatch-level
         # pre-embed and stays differentiable (gradients reach embeddings/vision).
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        mtp_embed_inputs = None
         if (
             cp_size > 1
             and is_first_stage
@@ -1346,6 +1399,20 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
             )
+            if self.mtp is not None and self.training:
+                if (
+                    mtp_per_depth_input_ids is None
+                    or mtp_per_depth_position_ids is None
+                    or mtp_per_depth_valid_masks is None
+                ):
+                    raise ValueError(
+                        "Context-parallel Qwen3.5 MTP requires precomputed per-depth inputs, positions, and masks"
+                    )
+                mtp_embed_inputs = tuple(
+                    shard_sequence_for_cp_round_robin(self.cp_mesh, embed_input, seq_dim=1)[0]
+                    for embed_input in _rolled_embed_inputs(inputs_embeds, self.mtp.num_depths)
+                )
+                mtp_embed_inputs = _mask_mtp_embed_inputs(mtp_embed_inputs, mtp_per_depth_valid_masks)
             inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
             input_ids = None
             pixel_values = None
@@ -1449,7 +1516,18 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     "qkv_format",
                 }
             }
-            if input_ids is None:
+            if mtp_embed_inputs is not None:
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    embed_inputs=mtp_embed_inputs,
+                    position_ids_per_depth=mtp_per_depth_position_ids,
+                    attention_mask=causal_mask,
+                    rotary_emb=language_model.rotary_emb,
+                    **mtp_kwargs,
+                )
+            elif cp_size > 1:
+                raise ValueError("Context-parallel Qwen3.5 MTP requires globally prepared per-depth inputs")
+            elif input_ids is None:
                 mtp_per_depth_h = self.mtp(
                     hidden_states,
                     embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),

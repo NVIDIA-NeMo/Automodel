@@ -165,6 +165,9 @@ class TestQwen3_5MTPModel:
 
 
 class TestQwen3_5VLMMTPModel:
+    def test_declares_mtp_cp_support(self):
+        assert Qwen3_5ForConditionalGeneration.ModelCapabilities().supports_mtp_cp is True
+
     def test_vlm_adapter_routes_fp32_linear_attn_keys(self):
         # Same native fp32 SSMGate routing as the text-only model (see above).
         cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)

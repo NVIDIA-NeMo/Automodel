@@ -260,7 +260,6 @@ def prepare_mtp_context_parallel_inputs(
         num_depths: Number of MTP future-token depths; must be positive.
         ignore_index: Fill value for invalid targets at trailing and packed
             boundary positions.
-
     Returns:
         Per-depth input IDs, position IDs, targets, and validity masks. Token
         tensors have global shape [batch, sequence] and independent storage;
@@ -309,18 +308,20 @@ def prepare_mtp_context_parallel_inputs(
     position_seq_dim = 2 if position_ids.dim() == 3 else 1
     seq_idx = _packed_seq_ids_from_batch(batch, input_ids=input_ids)
     depths = tuple(range(1, num_depths + 1))
+    per_depth_position_ids = tuple(
+        shift_packed_tensor(
+            position_ids,
+            depth=depth,
+            seq_idx=seq_idx,
+            batch_dim=position_batch_dim,
+            seq_dim=position_seq_dim,
+        )
+        for depth in depths
+    )
+
     return MTPContextParallelInputs(
         input_ids=tuple(shift_packed_tensor(input_ids, depth=depth, seq_idx=seq_idx) for depth in depths),
-        position_ids=tuple(
-            shift_packed_tensor(
-                position_ids,
-                depth=depth,
-                seq_idx=seq_idx,
-                batch_dim=position_batch_dim,
-                seq_dim=position_seq_dim,
-            )
-            for depth in depths
-        ),
+        position_ids=per_depth_position_ids,
         targets=tuple(
             shift_packed_tensor(labels, depth=depth, seq_idx=seq_idx, fill_value=ignore_index) for depth in depths
         ),
