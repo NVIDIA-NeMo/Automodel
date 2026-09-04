@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -26,8 +26,8 @@ pytest.importorskip("transformers.models.qwen3_5_moe")
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
-from nemo_automodel.components.models.common import BackendConfig, packing
-from nemo_automodel.components.models.qwen3_5 import packing as qwen3_5_packing
+from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeTextModelBackend
 
 
@@ -74,26 +74,33 @@ def test_reuses_packed_metadata_across_checkpointed_moe_layers():
             checkpoint_impl=CheckpointImpl.NO_REENTRANT,
         )
 
-    get_unpad_data = MagicMock(wraps=packing.get_unpad_data)
     chunk_gated_delta_rule = MagicMock(side_effect=lambda *args, **_kwargs: (args[2], None))
     for linear_attn in linear_attn_modules:
         linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda **kwargs: kwargs["x"])
         linear_attn.chunk_gated_delta_rule = chunk_gated_delta_rule
         linear_attn.norm.forward = MagicMock(side_effect=torch.add)
 
-    with patch.object(qwen3_5_packing, "get_unpad_data", get_unpad_data):
-        output = model(
-            input_ids=torch.tensor([[1, 2, 3, 4]]),
-            attention_mask=torch.tensor([[1, 1, 2, 2]]),
-        ).last_hidden_state
-        output.backward(torch.randn_like(output))
+    attention_mask = torch.tensor([[1, 1, 0, 0], [1, 1, 2, 0]])
+    packed_metadata = build_packed_sequence_metadata(attention_mask)
+    output = model(
+        input_ids=torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+        attention_mask=attention_mask,
+        packed_token_indices=packed_metadata["packed_token_indices"],
+        cu_seqlens=packed_metadata["cu_seqlens"],
+    ).last_hidden_state
+    output.backward(torch.randn_like(output))
 
-    assert get_unpad_data.call_count == 1
     assert chunk_gated_delta_rule.call_count == 4
     call_kwargs = [call.kwargs for call in chunk_gated_delta_rule.call_args_list]
     device_cu_seqlens = call_kwargs[0]["cu_seqlens"]
     cpu_cu_seqlens = call_kwargs[0]["cu_seqlens_cpu"]
     assert cpu_cu_seqlens.device.type == "cpu"
-    assert cpu_cu_seqlens.tolist() == [0, 2, 4]
+    assert cpu_cu_seqlens.tolist() == [0, 2, 4, 5]
     assert all(kwargs["cu_seqlens"] is device_cu_seqlens for kwargs in call_kwargs)
     assert all(kwargs["cu_seqlens_cpu"] is cpu_cu_seqlens for kwargs in call_kwargs)
+    expected_seq_idx = torch.tensor([[0, 0, 1, 1, 2]], dtype=torch.int32)
+    for linear_attn in linear_attn_modules:
+        assert all(
+            torch.equal(call.kwargs["seq_idx"], expected_seq_idx)
+            for call in linear_attn.causal_conv1d_fn.call_args_list
+        )

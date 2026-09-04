@@ -19,6 +19,12 @@ from unittest.mock import MagicMock
 import torch
 from PIL import Image as PILImage
 
+from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    PackedSequenceContract,
+    build_packed_sequence_metadata,
+)
+
 try:
     from qwen_vl_utils import process_vision_info
 
@@ -1505,7 +1511,7 @@ def neat_packed_vlm_collater(
     batch: list[dict],
     padding_idx: int = 0,
     max_length: int | None = None,
-    attn_implementation: str = "sdpa",
+    packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
     materialize_4d_mask: bool = True,
 ) -> dict:
     """Collater for neat-packed VLM sequences.
@@ -1513,12 +1519,9 @@ def neat_packed_vlm_collater(
     Packs arrive with **variable lengths** (no pre-padding).  This collater:
 
     1. Pads all text tensors to a common length.
-    2. Converts the indexed ``attention_mask`` to the appropriate format:
-       - ``flash_attention_2``: keeps the indexed ``[B, S]`` mask (values
-         1, 2, … for documents, 0 for padding).  The monkey-patched
-         ``_get_unpad_data`` converts this to ``cu_seqlens`` for
-         ``flash_attn_varlen_func``.
-       - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
+    2. Converts the indexed ``attention_mask`` to the representation requested
+       by ``packing``: a dense block-causal mask, compact document IDs, or
+       document IDs plus explicit varlen metadata.
     3. Concatenates media tensors across the batch dimension.
 
     **No autoregressive shift** — it was already applied during packing.
@@ -1530,8 +1533,8 @@ def neat_packed_vlm_collater(
             If ``None`` (default), pad to the longest pack in the batch.
             A fixed length avoids recompilation with ``torch.compile``
             and ensures uniform tensor shapes across steps.
-        attn_implementation: Attention backend (``"flash_attention_2"``,
-            ``"sdpa"``, or ``"eager"``).
+        packing: Structural model contract selecting the packed mask representation.
+            Defaults to block-causal masking without packed-sequence metadata.
         materialize_4d_mask: Whether SDPA/eager packing should expand the
             indexed ``[B, S]`` document map into a dense
             ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
@@ -1539,13 +1542,17 @@ def neat_packed_vlm_collater(
             False to avoid the quadratic allocation.
 
     Returns:
-        Dict with batched tensors ready for model forward.
+        Dict with batched tensors ready for model forward. Varlen output adds
+        batch-major ``packed_token_indices`` and ``cu_seqlens`` tensors plus
+        scalar ``max_seqlen``.
     """
     if not batch:
         return {}
 
     LABEL_PAD = -100
-    use_flash = attn_implementation == "flash_attention_2"
+    packed_mask_type = packing.packed_mask_type
+    if packed_mask_type not in ("block_causal", "document_ids"):
+        raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
 
     # Determine pad target: fixed max_length or batch-dynamic
     max_len = (
@@ -1575,7 +1582,7 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
-    if use_flash or not materialize_4d_mask:
+    if packed_mask_type != "block_causal" or not materialize_4d_mask:
         # Keep the compact indexed [B, S] document map. FlashAttention derives
         # cu_seqlens from it; block-diagonal CP rebuilds its local mask from the
         # identical _packed_seq_ids emitted below.
@@ -1608,13 +1615,15 @@ def neat_packed_vlm_collater(
         "attention_mask": attention_mask_out,
         "mm_token_type_ids": mm_token_type_ids,
     }
+    if packing.requires_packed_sequence_metadata:
+        result.update(build_packed_sequence_metadata(attention_mask))
 
     # Store indexed attention mask for loss functions that need per-sample
     # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
     # ``attention_mask_out`` is already converted to 4D, so keep a copy.
     has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
-    if has_multiple_docs or not materialize_4d_mask:
+    if has_multiple_docs or not materialize_4d_mask or packing.requires_packed_sequence_metadata:
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)

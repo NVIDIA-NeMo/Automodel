@@ -390,6 +390,8 @@ class Qwen3_5DenseBlock(Block):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                attn_kwargs.get("packed_token_indices"),
+                attn_kwargs.get("cu_seqlens"),
             )
 
         if packed_gdn_metadata is not None:
@@ -531,6 +533,8 @@ class Qwen3_5DenseTextBackbone(nn.Module):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                attn_kwargs.get("packed_token_indices"),
+                attn_kwargs.get("cu_seqlens"),
             )
 
         for decoder_layer in self.layers.values():
@@ -654,6 +658,7 @@ class Qwen3_5Model(HFQwen3_5Model):
 class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     """Qwen3.5 dense causal LM with optional Megatron-style MTP head."""
 
+    requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
@@ -770,6 +775,11 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
+            mtp_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"packed_token_indices", "cu_seqlens", "cu_seqlens_padded", "max_seqlen"}
+            }
             source_embeds = inputs_embeds if inputs_embeds is not None else self.model.embed_tokens(input_ids)
             rotary_position_ids, text_position_ids = _split_qwen3_5_position_ids(
                 position_ids,
@@ -800,7 +810,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                     position_ids=rotary_position_ids,
                     attention_mask=causal_mask,
                     rotary_emb=self.model.rotary_emb,
-                    **kwargs,
+                    **mtp_kwargs,
                 )
             else:
                 mtp_per_depth_h = self.mtp(
@@ -810,7 +820,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                     position_ids=rotary_position_ids,
                     attention_mask=causal_mask,
                     rotary_emb=self.model.rotary_emb,
-                    **kwargs,
+                    **mtp_kwargs,
                 )
 
         return Qwen3_5CausalLMOutputWithPast(
@@ -860,6 +870,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     hidden states, matching the dense text-only MTP architecture.
     """
 
+    requires_packed_sequence_metadata = True
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
@@ -1443,6 +1454,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     "cache_position",
                     "cu_seqlens",
                     "cu_seqlens_padded",
+                    "packed_token_indices",
                     "max_seqlen",
                     "mm_token_type_ids",
                     "padding_mask",

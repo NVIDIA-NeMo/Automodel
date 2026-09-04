@@ -46,6 +46,7 @@ from nemo_automodel._transformers import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT, get_unpad_data
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
@@ -317,6 +318,7 @@ def build_dataloader(
     cfg_ps=None,
     get_rope_index=None,
     pp_n_microbatches=None,
+    model: nn.Module | None = None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -328,7 +330,7 @@ def build_dataloader(
         device_mesh: Device mesh for distributed training.
         seed: Random seed.
         local_batch_size: Local batch size.
-        cfg_model: Model configuration (used to detect attention backend).
+        cfg_model: Deprecated compatibility argument; ignored.
         cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
             When provided, takes precedence over ``dataset.packing``.
         get_rope_index: Optional ``model.get_rope_index`` callable. When provided,
@@ -338,6 +340,7 @@ def build_dataloader(
             plain 1D positions.
         pp_n_microbatches: When set, wrap collate so VLM media tensors are
             pre-chunked for this many PP microbatches before entering the train loop.
+        model: Built model supplying the structural packing contract.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -365,14 +368,17 @@ def build_dataloader(
         if "cp" in getattr(device_mesh, "mesh_dim_names", ()):
             cp_size = device_mesh["cp"].size()
 
-    from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+    from nemo_automodel.components.models.common.packing import configure_packing, get_model_attn_implementation
 
-    packing_attn_implementation = config.resolve_packing_attn_implementation(
-        model_attn_implementation=get_attn_implementation(cfg_model),
-        cp_size=cp_size,
-    )
+    packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
     if config.packing is not None and config.packing.packing_format != "thd":
-        configure_packing(attn_implementation=packing_attn_implementation)
+        if model is None:
+            raise ValueError("Packed deprecated build_dataloader calls require the built model")
+        packing_contract = configure_packing(
+            get_model_attn_implementation(model),
+            model=model,
+            unpad_data=get_unpad_data,
+        )
 
     with ScopedRNG(seed=seed, ranked=True):
         result = config.build(
@@ -382,7 +388,7 @@ def build_dataloader(
             batch_size=local_batch_size,
             dataset_build_context=FirstRankPerNode(),
             get_rope_index=get_rope_index,
-            packing_attn_implementation=packing_attn_implementation,
+            packing_contract=packing_contract,
             pp_n_microbatches=pp_n_microbatches,
             cp_size=cp_size,
         )
@@ -600,14 +606,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
             packing_enabled=dataloader_config.packing is not None,
             cp_size=self.mesh_context.cp_size,
         )
-        from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+        from nemo_automodel.components.models.common.packing import configure_packing, get_model_attn_implementation
 
-        packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
-            model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
-            cp_size=self.mesh_context.cp_size,
-        )
+        packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
-            configure_packing(attn_implementation=packing_attn_implementation)
+            packing_contract = configure_packing(
+                get_model_attn_implementation(self.model_parts[0]),
+                model=self.model_parts[0],
+                unpad_data=get_unpad_data,
+            )
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
@@ -618,7 +625,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 dataset_build_context=dataset_build_context,
                 get_rope_index=get_rope_index,
-                packing_attn_implementation=packing_attn_implementation,
+                packing_contract=packing_contract,
                 pp_n_microbatches=pp_n_microbatches,
                 cp_size=self.mesh_context.cp_size,
             )
@@ -638,6 +645,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                     dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
+                    packing_contract=packing_contract,
                     cp_size=self.mesh_context.cp_size,
                 )
             self.val_dataloader = validation_build.dataloader

@@ -15,18 +15,19 @@
 """Test flash attention packing integration.
 
 Verifies that:
-1. get_unpad_data correctly extracts per-document cu_seqlens from indexed masks
-2. neat_packed_vlm_collater returns the right mask format per attn_implementation
-3. configure_packing patches the right functions
+1. Dataset helpers extract per-document cu_seqlens from indexed masks
+2. neat_packed_vlm_collater follows the structural packing contract
+3. configure_packing patches the right functions with an injected dataset helper
 """
 
 import pytest
 import torch
 
+from nemo_automodel.components.datasets.packing import get_seqlens_in_batch, get_unpad_data
+from nemo_automodel.components.models.common.packing import configure_packing, get_packing_capabilities
+
 
 def test_get_seqlens_in_batch():
-    from nemo_automodel.components.models.common.packing import get_seqlens_in_batch
-
     mask = torch.tensor(
         [
             [1, 1, 2, 2, 2, 0],
@@ -38,8 +39,6 @@ def test_get_seqlens_in_batch():
 
 
 def test_get_unpad_data():
-    from nemo_automodel.components.models.common.packing import get_unpad_data
-
     mask = torch.tensor(
         [
             [1, 1, 2, 2, 2, 0],
@@ -55,8 +54,6 @@ def test_get_unpad_data():
 
 def test_get_unpad_data_single_doc():
     """Single document per batch element (no packing)."""
-    from nemo_automodel.components.models.common.packing import get_unpad_data
-
     mask = torch.tensor([[1, 1, 1, 1, 0, 0]])
     indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
 
@@ -79,11 +76,77 @@ def test_collater_flash_returns_2d_mask():
             "n_videos": 0,
         },
     ]
-    result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+    result = neat_packed_vlm_collater(
+        batch,
+        packing=get_packing_capabilities("flash_attention_2"),
+    )
     assert result["attention_mask"].ndim == 2  # [B, S]
     assert result["attention_mask"].shape == (1, 5)
     # Values preserved
     assert result["attention_mask"][0].tolist() == [1, 1, 2, 2, 2]
+
+
+@pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+def test_collater_all_flash_variants_return_2d_mask(attn_implementation):
+    """Every flash variant keeps the indexed mask, not just FA2.
+
+    Regression: the collater matched ``== "flash_attention_2"`` exactly, so FA3/FA4
+    silently fell through to the dense 4D branch and lost the varlen fast path.
+    """
+    from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+    batch = [
+        {
+            "input_ids": torch.tensor([10, 20, 30, 40, 50]),
+            "labels": torch.tensor([-100, 20, 30, 40, 50]),
+            "attention_mask": torch.tensor([1, 1, 2, 2, 2]),
+            "position_ids": torch.tensor([0, 1, 0, 1, 2]),
+            "n_images": 0,
+            "n_videos": 0,
+        },
+    ]
+    result = neat_packed_vlm_collater(
+        batch,
+        packing=get_packing_capabilities(attn_implementation),
+    )
+    assert result["attention_mask"].ndim == 2, f"{attn_implementation} fell back to a dense mask"
+    assert result["attention_mask"].shape == (1, 5)
+    assert result["attention_mask"][0].tolist() == [1, 1, 2, 2, 2]
+
+
+def test_collater_native_fa4_emits_varlen_metadata():
+    """Native FA4 receives the unpadding metadata consumed by its BSHD adapter."""
+    from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+    batch = [
+        {
+            "input_ids": torch.tensor([10, 20, 30, 40, 50]),
+            "labels": torch.tensor([-100, 20, 30, 40, 50]),
+            "attention_mask": torch.tensor([1, 1, 2, 2, 2]),
+            "position_ids": torch.tensor([0, 1, 0, 1, 2]),
+            "n_images": 0,
+            "n_videos": 0,
+        },
+        {
+            "input_ids": torch.tensor([60, 70, 80]),
+            "labels": torch.tensor([-100, 70, 80]),
+            "attention_mask": torch.tensor([1, 1, 1]),
+            "position_ids": torch.tensor([0, 1, 2]),
+            "n_images": 0,
+            "n_videos": 0,
+        },
+    ]
+
+    result = neat_packed_vlm_collater(
+        batch,
+        packing=get_packing_capabilities("fa4"),
+    )
+
+    assert result["attention_mask"].tolist() == [[1, 1, 2, 2, 2], [1, 1, 1, 0, 0]]
+    assert result["_packed_seq_ids"].tolist() == result["attention_mask"].tolist()
+    assert result["packed_token_indices"].tolist() == [[0, 1, 2, 3, 4], [0, 1, 2, -1, -1]]
+    assert result["cu_seqlens"].tolist() == [[0, 2, 5], [0, 3, -1]]
+    assert result["max_seqlen"] == 3
 
 
 def test_collater_sdpa_returns_4d_mask():
@@ -100,7 +163,10 @@ def test_collater_sdpa_returns_4d_mask():
             "n_videos": 0,
         },
     ]
-    result = neat_packed_vlm_collater(batch, attn_implementation="sdpa")
+    result = neat_packed_vlm_collater(
+        batch,
+        packing=get_packing_capabilities("sdpa"),
+    )
     assert result["attention_mask"].ndim == 4  # [B, 1, S, S]
     assert result["attention_mask"].shape == (1, 1, 5, 5)
 
@@ -111,14 +177,12 @@ def test_configure_packing_patches():
 
     original_fn = flash_utils._get_unpad_data
 
-    from nemo_automodel.components.models.common.packing import configure_packing, get_unpad_data
-
     # Should not patch for sdpa
     configure_packing(attn_implementation="sdpa")
     assert flash_utils._get_unpad_data is original_fn
 
     # Should patch for flash_attention_2
-    configure_packing(attn_implementation="flash_attention_2")
+    configure_packing(attn_implementation="flash_attention_2", unpad_data=get_unpad_data)
     assert flash_utils._get_unpad_data is get_unpad_data
 
     # Restore
@@ -132,8 +196,6 @@ def test_flash_varlen_with_indexed_mask():
         from flash_attn import flash_attn_varlen_func
     except ImportError:
         pytest.skip("flash_attn not installed")
-
-    from nemo_automodel.components.models.common.packing import get_unpad_data
 
     B, S, H, D = 1, 12, 4, 64
     num_docs = 3

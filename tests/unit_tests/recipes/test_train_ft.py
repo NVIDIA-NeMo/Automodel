@@ -1464,6 +1464,31 @@ def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
     assert len(pp_info.schedule.step_calls) == 0, "schedule.step() should not be called for validation"
 
 
+def test_forward_backward_step_pp_does_not_treat_neat_metadata_as_thd(monkeypatch):
+    """Batch-major NEAT boundaries must not become the PP loss's flat THD fallback."""
+    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
+    pp_info.schedule._loss_fn = SimpleNamespace(cu_seqlens=torch.tensor([99]))
+    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+        "packed_token_indices": torch.tensor([[0, 1, 2]]),
+        "cu_seqlens": torch.tensor([[0, 1, 3]], dtype=torch.int32),
+        "max_seqlen": 2,
+    }
+
+    recipe._forward_backward_step(
+        idx=0,
+        batch=batch,
+        loss_buffer=[],
+        num_label_tokens=None,
+        num_batches=1,
+        is_train=False,
+    )
+
+    assert pp_info.schedule._loss_fn.cu_seqlens is None
+
+
 def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
     """Test that _forward_backward_step uses schedule.step() when is_train=True with PP."""
     from contextlib import nullcontext

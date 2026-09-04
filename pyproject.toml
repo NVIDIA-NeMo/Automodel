@@ -532,6 +532,36 @@ ignore_imports = [
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.mistral3_vlm.model",
 ]
 
+[[tool.importlinter.contracts]]
+name = "Datasets must not directly import models or attention"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.datasets"]
+forbidden_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel.components.attention",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Models and attention must not directly import datasets"
+type = "forbidden"
+source_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel.components.attention",
+]
+forbidden_modules = ["nemo_automodel.components.datasets"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Models must not import recipe configuration"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.models"]
+forbidden_modules = [
+    "nemo_automodel.components.config",
+    "nemo_automodel.recipes",
+]
+allow_indirect_imports = true
+
 # ty: type checking (https://github.com/astral-sh/ty)
 # Default: permissive. Strict checks are opt-in per-file via overrides below.
 # Phase 1 modules: launcher, attention, config, optim, loggers

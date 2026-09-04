@@ -17,6 +17,12 @@ import math
 import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
+from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    PackedSequenceContract,
+    build_packed_sequence_metadata,
+)
+
 
 def batchify(tensor, default_tensor_cls=torch.LongTensor):
     """
@@ -501,23 +507,29 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
     return mask_4d.unsqueeze(1)  # [B, 1, S, S]
 
 
-def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -> dict:
+def neat_packed_collater(
+    batch: list[dict],
+    *,
+    packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+) -> dict:
     """Collater for neat-packed LLM sequences.
 
     Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
-    indexed ``attention_mask`` to the format required by the attention backend.
+    indexed ``attention_mask`` to the representation requested by ``packing``.
 
-    For flash attention (``flash_attention_2`` / ``flash_attention_3`` /
-    ``flash_attention_4``): keeps the indexed 2D mask ``[B, S]``.
-    For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
+    ``document_ids`` keeps the indexed 2D mask ``[B, S]`` and
+    ``block_causal`` converts the mask to ``[B, 1, S, S]``. Models may
+    independently request flat-token metadata through the same contract.
 
     Args:
         batch: List of sample dicts produced by ``neat_pack_dataset``.
-        attn_implementation: Attention backend (``"flash_attention_2"``,
-            ``"sdpa"``, or ``"eager"``).
+        packing: Structural model contract selecting the packed mask representation.
+            Defaults to block-causal masking without packed-sequence metadata.
 
     Returns:
-        Dict with batched tensors ready for model forward.
+        Dict with batched tensors ready for model forward. Varlen output adds
+        batch-major ``packed_token_indices`` and ``cu_seqlens`` tensors plus
+        scalar ``max_seqlen``.
     """
     if not batch:
         return {}
@@ -526,11 +538,14 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     labels = batchify(torch.stack([torch.as_tensor(x["labels"]) for x in batch]))
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
+    packed_mask_type = packing.packed_mask_type
 
-    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
+    if packed_mask_type == "document_ids":
         mask_out = attention_mask
-    else:
+    elif packed_mask_type == "block_causal":
         mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
+    else:
+        raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
 
     result = {
         "input_ids": input_ids,
@@ -538,7 +553,9 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
         "position_ids": position_ids,
         "attention_mask": mask_out,
     }
-    if attention_mask.max() > 1:
+    if packing.requires_packed_sequence_metadata:
+        result.update(build_packed_sequence_metadata(attention_mask))
+    if attention_mask.max() > 1 or packing.requires_packed_sequence_metadata:
         result["_packed_seq_ids"] = attention_mask
     return result
 

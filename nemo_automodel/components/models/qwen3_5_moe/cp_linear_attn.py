@@ -35,7 +35,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
 
-from nemo_automodel.components.models.qwen3_5.packing import prepare_gated_delta_packed_metadata
+from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
@@ -163,14 +163,12 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             cache_params is not None and cache_params.has_previous_state(self.layer_idx) and seq_len == 1
         )
 
-        # Resolve packing kwargs. Fallback to mask-derivation only when neither
-        # was passed in (bypasses the decoder-layer subclass).
-        if not use_precomputed_states and cu_seqlens is None and indices is None:
-            packed_metadata = prepare_gated_delta_packed_metadata(attention_mask, None)
-            if packed_metadata is not None:
-                cu_seqlens = packed_metadata.cu_seqlens
-                cu_seqlens_cpu = packed_metadata.cu_seqlens_cpu
-                indices = packed_metadata.indices
+        if (
+            not use_precomputed_states
+            and is_indexed_packed_mask(attention_mask)
+            and (cu_seqlens is None or indices is None)
+        ):
+            raise ValueError("Packed Qwen3.5 linear attention requires dataset-provided indices and cu_seqlens.")
 
         if cu_seqlens is not None and cu_seqlens_cpu is None:
             cu_seqlens_cpu = cu_seqlens.detach().cpu()
@@ -222,12 +220,16 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 cache_params.update_conv_state(conv_state, self.layer_idx)
             if self.causal_conv1d_fn is not None:
                 # ``seq_idx`` for causal_conv1d_fn marks per-token segment ids.
-                # Source is the indexed mask, gathered at the same ``indices``
-                # used for unpadding so it lines up with the unpadded layout.
+                # Flattened batches need globally unique ids derived from the
+                # cumulative boundaries; document ids restart in every row.
                 if not is_packed:
                     seq_idx_for_conv = None
                 elif needs_unpad:
-                    seq_idx_for_conv = attention_mask.reshape(-1)[indices].unsqueeze(0).to(torch.int32).contiguous()
+                    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                    seq_idx_for_conv = torch.repeat_interleave(
+                        torch.arange(lengths.numel(), device=lengths.device, dtype=torch.int32),
+                        lengths,
+                    ).unsqueeze(0)
                 else:
                     seq_idx_for_conv = attention_mask.to(torch.int32).contiguous()
                 mixed_qkv = self.causal_conv1d_fn(

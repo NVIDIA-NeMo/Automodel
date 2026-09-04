@@ -278,12 +278,18 @@ class MoKBackendConfig:
         )
 
 
+AttentionBackend = Literal["torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi"]
+
+
 @dataclass(kw_only=True)
 class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
+        attn: Attention backend ("torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", or "magi").
+            "fa4" selects FlashAttention-4 (CuTe) and is the only backend that reaches the
+            Blackwell FA4 kernels; it requires an INSTALL_FA4=true image and accepts only
+            causal or varlen (cu_seqlens) masks -- an explicit attention_mask raises.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
@@ -343,9 +349,7 @@ class BackendConfig:
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
-        "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
-    )
+    attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope: Literal["torch", "quack"] = "torch"
@@ -1187,6 +1191,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
 
 
 __all__ = [
+    "AttentionBackend",
     "BackendConfig",
     "Float32RMSNorm",
     "TEFp8Config",

@@ -36,7 +36,10 @@ from nemo_automodel.components.attention.utils import (
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+from nemo_automodel.components.models.common.packing import (
+    flatten_packed_sequence_metadata,
+    is_indexed_packed_mask,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -829,7 +832,14 @@ class KimiDeltaAttention(nn.Module):
         if packed_context is not None and packed_context.cp_enabled:
             return self._forward_with_cp(hidden_states, packed_context)
 
-        if attention_mask is not None:
+        packed_seq_ids = kwargs.get("_packed_seq_ids")
+        packed_document_ids = packed_seq_ids if packed_seq_ids is not None else attention_mask
+        has_dataset_packing = packed_document_ids is not None and (
+            is_indexed_packed_mask(packed_document_ids)
+            or kwargs.get("packed_token_indices") is not None
+            or kwargs.get("cu_seqlens") is not None
+        )
+        if not has_dataset_packing and attention_mask is not None:
             if attention_mask.dim() != 2:
                 attention_mask = kwargs.get("padding_mask")
             if attention_mask is not None and attention_mask.dim() != 2:
@@ -839,10 +849,23 @@ class KimiDeltaAttention(nn.Module):
 
         cu_seqlens = kwargs.get("cu_seqlens")
         indices = None
-        if is_indexed_packed_mask(attention_mask):
+        if has_dataset_packing:
             # Packed rows: unpad to a single flat sequence and reset the recurrent
             # state per document instead of per row.
-            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            indices = kwargs.get("packed_token_indices")
+            if indices is None or cu_seqlens is None:
+                raise ValueError("Packed Kimi K3 inputs require dataset-provided packed_token_indices and cu_seqlens.")
+            indices, cu_seqlens = flatten_packed_sequence_metadata(
+                indices,
+                cu_seqlens,
+                batch_size=batch_size,
+                sequence_length=q_len,
+            )
+            indices = indices.to(device=hidden_states.device, dtype=torch.long)
+            if int(cu_seqlens[-1].item()) != indices.numel():
+                raise ValueError("Packed Kimi K3 token indices and cu_seqlens describe different token counts.")
+            if indices.numel() and (int(indices[0].item()) < 0 or int(indices[-1].item()) >= batch_size * q_len):
+                raise ValueError("Packed Kimi K3 token indices are outside the current batch layout.")
             hidden_states = _index_first_axis(hidden_states.reshape(batch_size * q_len, -1), indices).unsqueeze(0)
         elif attention_mask is not None and getattr(self.config, "kda_unpad_inputs", True):
             indices, cu_seqlens, _ = _get_unpad_data(attention_mask[:, -q_len:])
@@ -1575,12 +1598,18 @@ class KimiK3TextModel(nn.Module):
                 cp_size=kimi_packed_cp_size,
             )
         if packed_context is None:
+            packed_seq_ids = attn_kwargs.get("_packed_seq_ids")
             packed_context = _packed_context_from_inputs(
                 inputs_embeds,
-                attention_mask=attention_mask,
+                attention_mask=packed_seq_ids if packed_seq_ids is not None else attention_mask,
                 cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
+        has_packed_inputs = (
+            attn_kwargs.get("_packed_seq_ids") is not None
+            or attn_kwargs.get("packed_token_indices") is not None
+            or attn_kwargs.get("cu_seqlens") is not None
+        )
+        linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
         causal_mask = (
             None
             if packed_context is not None and packed_context.cp_enabled
@@ -1680,6 +1709,8 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # Kimi Linear owns context parallelism end to end: it shards the batch itself
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.
+    requires_packed_sequence_metadata = True
+    packed_mask_type = "document_ids"
     _owns_cp_attention = True
     # Packed documents are masked by the model itself: MLA gets a document-blocked
     # causal mask and KDA resets its recurrent state on per-document ``cu_seqlens``.
