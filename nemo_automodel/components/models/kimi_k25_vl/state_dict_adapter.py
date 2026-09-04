@@ -199,7 +199,6 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
             List of (fqn, tensor) tuples in HuggingFace format
         """
         quantization = kwargs.get("quantization", False)
-        quantization = True
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
         if fqn.startswith("model."):
