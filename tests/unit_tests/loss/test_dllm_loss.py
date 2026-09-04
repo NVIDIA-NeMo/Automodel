@@ -361,9 +361,9 @@ class TestDFlashDecayLoss:
         # objective encodes (and bias the DP gradient average).
         expected = (token_nll * mask * ref_weight).sum() / float(bsz * n)
 
-        details = DFlashDecayLoss(
-            loss_type=loss_type, dpace_alpha=alpha, normalize="mean"
-        ).forward_with_token_nll(logits, target_ids, mask)
+        details = DFlashDecayLoss(loss_type=loss_type, dpace_alpha=alpha, normalize="mean").forward_with_token_nll(
+            logits, target_ids, mask
+        )
         out = details.output
 
         assert torch.isclose(expected, out.total_loss, atol=1e-6)
@@ -396,9 +396,9 @@ class TestDFlashDecayLoss:
         batch_block_loss = weighted_sum / float(bsz * n)
         weight_sum_loss = weighted_sum / ((mask * weight).sum() + 1e-6)
 
-        details = DFlashDecayLoss(
-            loss_type="dpace", dpace_alpha=alpha, normalize="mean"
-        ).forward_with_token_nll(logits, target_ids, mask)
+        details = DFlashDecayLoss(loss_type="dpace", dpace_alpha=alpha, normalize="mean").forward_with_token_nll(
+            logits, target_ids, mask
+        )
         out = details.output
 
         assert torch.isclose(out.total_loss, batch_block_loss, atol=1e-6)
@@ -558,14 +558,10 @@ class TestDFlashDecayLoss:
     def test_details_report_dflash_denominators(self, dflash_inputs):
         """Details expose the exact scalar used by either normalization mode."""
         logits, target_ids, block_mask = dflash_inputs
-        tokens = DFlashDecayLoss(loss_gamma=7.0).forward_with_token_nll(
-            logits, target_ids, block_mask, num_tokens=13
-        )
+        tokens = DFlashDecayLoss(loss_gamma=7.0).forward_with_token_nll(logits, target_ids, block_mask, num_tokens=13)
         assert tokens.denominator.item() == 13.0
 
-        mean = DFlashDecayLoss(loss_gamma=7.0, normalize="mean").forward_with_token_nll(
-            logits, target_ids, block_mask
-        )
+        mean = DFlashDecayLoss(loss_gamma=7.0, normalize="mean").forward_with_token_nll(logits, target_ids, block_mask)
         expected_denom = (torch.exp(-torch.arange(K_D, dtype=torch.float) / 7.0).view(1, 1, K_D) * block_mask).sum()
         assert torch.isclose(mean.denominator, expected_denom + 1e-6, atol=1e-4)
 

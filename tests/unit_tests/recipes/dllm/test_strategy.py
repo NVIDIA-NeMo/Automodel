@@ -725,9 +725,7 @@ def test_dpace_pre_step_reports_batch_block_denominator():
     strategy = _make_strategy(block_size=4, overlap_anchors=False)
     strategy.num_blocks_per_sample = 2
     strategy.dflash_loss_fn = DFlashDecayLoss(loss_type="dpace")
-    strategy._run_target_forward = lambda input_ids, attention_mask, start: torch.ones(
-        input_ids.size(0), start, 3
-    )
+    strategy._run_target_forward = lambda input_ids, attention_mask, start: torch.ones(input_ids.size(0), start, 3)
     recipe = types.SimpleNamespace(mask_token_id=MASK_ID, dist_env=types.SimpleNamespace(device=torch.device("cpu")))
     batch = {
         "input_ids": torch.arange(32, dtype=torch.long).view(2, 16),
