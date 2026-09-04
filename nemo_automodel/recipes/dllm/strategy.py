@@ -557,16 +557,17 @@ class DFlashStrategy(DLLMStrategy):
       sampled independently (paper behaviour); when ``False``, anchors are
       forced non-overlapping (stars-and-bars, caps at ``seq_len // block_size``).
 
-    This strategy's ``DFlashDecayLoss`` uses ``normalize="tokens"`` (a real,
-    globally all-reduced token count, ``num_diffusion_tokens``), while
+    ``loss_type="dflash"`` here uses ``normalize="tokens"`` (a real, globally
+    all-reduced token count, ``num_diffusion_tokens``), while
     ``nemo_automodel.recipes.llm.train_dflash.TrainDFlashRecipe`` -- the
     dedicated DFlash recipe built on the same loss class -- hardcodes
-    ``normalize="mean"`` (roughly ``batch_size * num_anchors`` blocks, not
-    tokens). The two therefore divide by denominators that differ by about
-    ``block_size - 1``, so the *same* ``loss_decay_gamma`` / ``dpace_alpha`` /
-    learning rate is NOT directly comparable, or portable, between this
-    strategy and that recipe: retune the learning rate when switching between
-    them, do not assume "same YAML, same training dynamics".
+    ``normalize="mean"`` (``batch_size * num_anchors`` blocks, not tokens) for
+    it. The two therefore divide by denominators that differ by about
+    ``block_size - 1``, so the *same* ``loss_decay_gamma`` / learning rate is
+    NOT directly comparable, or portable, between this strategy and that
+    recipe for ``"dflash"``. The ``"dpace*"`` variants are new to both paths
+    and use ``normalize="mean"`` (with ``total_blocks=num_blocks_per_sample``)
+    in both, so D-PACE's ``dpace_alpha`` / learning rate IS portable between them.
     """
 
     def __init__(self):
@@ -612,6 +613,7 @@ class DFlashStrategy(DLLMStrategy):
         """Load and freeze the target LM; resolve block_size, layer_ids, decay loss."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        from nemo_automodel.components.loss.dllm_loss import _DPACE_LOSS_TYPES
         from nemo_automodel.components.loss.loss import DFlashDecayLossConfig
 
         dflash_cfg = recipe.cfg.get("dflash", None) or {}
@@ -696,15 +698,18 @@ class DFlashStrategy(DLLMStrategy):
         # ce_chunk_size trades peak memory (smaller = lower) against recompute.
         self.use_fused_linear_ce = bool(dflash_cfg.get("use_fused_linear_ce", True))
         ce_chunk_size = int(dflash_cfg.get("ce_chunk_size", 1024))
-        # normalize left at the class default ("tokens", a real globally
-        # all-reduced count) -- see the class docstring for why this differs
-        # from TrainDFlashRecipe's "mean" and is not directly LR-comparable.
+        loss_type = str(dflash_cfg.get("loss_type", "dflash"))
+        # "dflash" keeps this strategy's own "tokens" normalize (a real,
+        # globally all-reduced count) for backward compatibility. D-PACE is new
+        # to both DFlash training paths, so it uses the same "mean" convention
+        # TrainDFlashRecipe does -- see the class docstring.
         self.dflash_loss_fn = DFlashDecayLossConfig(
             loss_gamma=loss_gamma,
             use_fused_linear_ce=self.use_fused_linear_ce,
             chunk_size=ce_chunk_size,
-            loss_type=str(dflash_cfg.get("loss_type", "dflash")),
+            loss_type=loss_type,
             dpace_alpha=float(dflash_cfg.get("dpace_alpha", 0.5)),
+            normalize="mean" if loss_type in _DPACE_LOSS_TYPES else "tokens",
         ).build()
 
         # --- Multi-block ---
@@ -1049,6 +1054,7 @@ class DFlashStrategy(DLLMStrategy):
                     block_mask=block_mask,
                     num_tokens=num_diffusion_tokens,
                     lm_head_bias=getattr(self.target_head, "bias", None),
+                    total_blocks=self.num_blocks_per_sample,
                 )
             else:
                 logits = self.target_head(pred)
@@ -1057,6 +1063,7 @@ class DFlashStrategy(DLLMStrategy):
                     target_ids=block_targets,
                     block_mask=block_mask,
                     num_tokens=num_diffusion_tokens,
+                    total_blocks=self.num_blocks_per_sample,
                 )
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())

@@ -613,6 +613,31 @@ def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
     assert strategy.dflash_loss_fn.chunk_size == 17
     assert strategy.dflash_loss_fn.loss_type == "dpace"
     assert strategy.dflash_loss_fn.dpace_alpha == 0.25
+    # D-PACE is new to both DFlash training paths, so it uses TrainDFlashRecipe's
+    # "mean" convention here too rather than this strategy's own "tokens" default.
+    assert strategy.dflash_loss_fn.normalize == "mean"
+
+
+def test_dflash_setup_extra_keeps_tokens_normalize_for_the_dflash_default(monkeypatch):
+    """Unlike D-PACE, ``loss_type="dflash"`` predates this recipe and keeps its
+    existing ``normalize="tokens"`` -- switching it would retune every already
+    deployed DFlash config built on this strategy."""
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: _FakeTargetModel())
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
+
+    draft = types.SimpleNamespace(config=types.SimpleNamespace(block_size=8, num_target_layers=12, num_hidden_layers=3))
+    recipe = types.SimpleNamespace(
+        cfg={"dflash": {"target_model_id": "fake-target"}, "dataset": {}},
+        mask_token_id=None,
+        dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+        model_parts=[draft],
+    )
+
+    strategy = DFlashStrategy()
+    strategy.setup_extra(recipe)
+
+    assert strategy.dflash_loss_fn.loss_type == "dflash"
+    assert strategy.dflash_loss_fn.normalize == "tokens"
 
 
 def test_dflash_setup_extra_requires_target_model_id():

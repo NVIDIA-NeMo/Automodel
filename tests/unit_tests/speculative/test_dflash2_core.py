@@ -339,12 +339,13 @@ def test_dpace_loss_weight_uses_num_anchors_not_the_achieved_block_count():
     assert out.loss_weight.item() == float(bsz * trainer.num_anchors)
 
 
-@pytest.mark.parametrize("loss_type,expected_cross_entropy_calls", [("dflash", 2), ("dpace", 3)])
-def test_dflash_loss_type_skips_the_redundant_backbone_confidence_pass(loss_type, expected_cross_entropy_calls):
-    """``position_weights`` never reads the backbone confidence's values for
-    ``loss_type="dflash"``, so recomputing a second full-vocabulary CE for it
-    (on top of the one already inside ``loss_fn``, and the selector's own) would
-    be a pure, and on a real model sized, waste."""
+@pytest.mark.parametrize("loss_type", ["dflash", "dpace"])
+def test_selector_weighting_reuses_the_backbone_confidence_pass(loss_type):
+    """The backbone's per-token NLL is needed once regardless of loss_type (the
+    base term's own reduction always computes it) and the selector's D-PACE
+    weighting must reuse that same pass, not trigger a second full-vocabulary
+    CE over the same logits: exactly two CE calls total, the base term's and
+    the selector's own."""
     trainer = _build_trainer(loss_type=loss_type, selector_top_k=VOCAB)
     input_ids, hidden, loss_mask = _inputs()
 
@@ -353,4 +354,4 @@ def test_dflash_loss_type_skips_the_redundant_backbone_confidence_pass(loss_type
     ) as cross_entropy:
         trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
 
-    assert cross_entropy.call_count == expected_cross_entropy_calls
+    assert cross_entropy.call_count == 2

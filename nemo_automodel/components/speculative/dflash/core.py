@@ -200,14 +200,16 @@ class DFlashTrainerModule(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: float | None = None,
-        sliding_window: int | None = None,
-        # Keyword-only, and appended after the pre-existing params above: an
-        # old positional caller of this constructor must not have a later
-        # argument silently rebound to one of these when they were inserted.
-        *,
         loss_type: str = "dflash",
-        dpace_alpha: float = 0.5,
         prefix_weight_base: float = 0.9,
+        sliding_window: int | None = None,
+        # dpace_alpha is the only parameter this PR actually adds; it is
+        # appended after every pre-existing parameter (including loss_type and
+        # prefix_weight_base, both predating D-PACE) and keyword-only, so an
+        # old positional caller's arguments keep binding to what they always
+        # bound to.
+        *,
+        dpace_alpha: float = 0.5,
     ):
         super().__init__()
         if loss_type not in _DFLASH_LOSS_TYPES:

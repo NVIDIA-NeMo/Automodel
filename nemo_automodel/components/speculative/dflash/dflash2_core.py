@@ -270,22 +270,18 @@ class DFlash2TrainerModule(DFlashTrainerModule):
 
         loss_fn = self.loss_fn
         assert loss_fn is not None, "loss_fn is always constructed (loss_type='variable_prefix' is rejected)"
-        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors)
+        # forward_with_token_nll's own per-token NLL is reused below for the
+        # selector's D-PACE weighting, instead of a second full-vocabulary CE
+        # pass over pred_logits.
+        base_token_nll, loss_out = loss_fn.forward_with_token_nll(
+            pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors
+        )
 
         scores, candidate_ids, target_index, has_target = self._selector_scores(pred_hidden, pred_logits, target_ids)
         selector_mask = pred_mask * has_target.to(pred_mask.dtype)
         selector_nll = F.cross_entropy(
             scores.reshape(-1, scores.shape[-1]).float(), target_index.reshape(-1), reduction="none"
         ).view_as(selector_mask)
-        if self.loss_type == "dflash":
-            # position_weights ignores this argument's values for "dflash"; skip
-            # the redundant full-vocabulary CE pass over pred_logits.
-            base_token_nll = pred_mask
-        else:
-            with torch.no_grad():
-                base_token_nll = F.cross_entropy(
-                    pred_logits.reshape(-1, pred_logits.shape[-1]).float(), pred_targets.reshape(-1), reduction="none"
-                ).view_as(pred_mask)
         # See the module docstring for why the schedule mask stays pred_mask and
         # has_target only narrows via value_mask.
         selector_loss = loss_fn.weighted_mean(

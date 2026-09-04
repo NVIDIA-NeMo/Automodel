@@ -277,11 +277,17 @@ The following table describes the key configuration fields for DFlash fine-tunin
 <Note>
 The `dpace*` variants implement D-PACE (Dynamic Position-Aware Cross-Entropy),
 which reweights each position by detached cumulative draft confidence; see
-[arXiv:2605.18810](https://arxiv.org/abs/2605.18810). They are normalized to the
-same scale as `dflash` (the weighted sum is divided by the batch size times the
-sampled block count), so switching `loss_type` needs no change to `optimizer.lr`.
-Note that this makes the reported loss smaller than the published D-PACE value by
-the block count, which is a constant and so leaves the objective unchanged.
+[arXiv:2605.18810](https://arxiv.org/abs/2605.18810). Their weighted sum is
+divided by the batch size times `num_blocks_per_sample`, the same convention
+the dedicated DFlash recipe (`train_dflash.py`) uses, so `dpace_alpha` and
+`optimizer.lr` are portable between the two training paths. This makes the
+reported loss smaller than the published D-PACE value by the block count,
+which is a constant and so leaves the objective unchanged.
+
+Switching `loss_type` from `dflash` to a `dpace*` variant here does change the
+scale: `dflash` uses `normalize="tokens"` (a supervised-token count) in this
+strategy, not `normalize="mean"`, so it is on a different scale than either
+D-PACE convention. Retune `optimizer.lr` when switching `loss_type`.
 </Note>
 
 #### DFlash Training Metrics

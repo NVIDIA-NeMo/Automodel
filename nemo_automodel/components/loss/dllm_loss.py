@@ -1095,6 +1095,52 @@ class DFlashDecayLoss(nn.Module):
         count_per_pos = m.sum(dim=(0, 1))  # [k]
         return correct_per_pos, count_per_pos
 
+    def forward_with_token_nll(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        block_mask: torch.Tensor,
+        num_tokens: int | None = None,
+        total_blocks: int | None = None,
+    ) -> tuple[torch.Tensor, DLLMLossOutput]:
+        """Like :meth:`forward`, but also returns the per-token NLL it computed.
+
+        Lets a second training objective over the same fixed-anchor block layout
+        (DFlash 2's D-PACE selector weighting) reuse this call's own backbone
+        confidence instead of recomputing a second full-vocabulary
+        cross-entropy pass over the same ``logits``.
+
+        Args:
+            logits: Draft logits for the predicted block positions, shape
+                ``[batch, blocks, k, vocab]`` (``k = block_size - 1``; the clean
+                anchor at within-block position 0 is dropped by the caller). The
+                block dimension carries the layout, so the per-block confidence
+                reset is structural.
+            target_ids: Ground-truth token IDs, shape ``[batch, blocks, k]``.
+            block_mask: Float/bool valid-position mask, shape ``[batch, blocks, k]``;
+                zero entries (padding) are excluded from the loss.
+            num_tokens: Optional global token count for loss normalisation.
+            total_blocks: See :meth:`_mean_denominator`.
+
+        Returns:
+            Tuple ``(token_nll, output)``: ``token_nll`` has shape
+            ``[batch, blocks, k]``; ``output`` is the same
+            :class:`DLLMLossOutput` :meth:`forward` returns.
+        """
+        token_nll = _compute_per_token_nll(logits, target_ids)  # [batch, blocks, k]
+        correct = logits.argmax(dim=-1) == target_ids  # [batch, blocks, k]
+        del logits
+        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask)
+        output = self._reduce(
+            token_nll,
+            block_mask,
+            num_tokens,
+            draft_correct_per_pos=c_per_pos,
+            draft_count_per_pos=n_per_pos,
+            total_blocks=total_blocks,
+        )
+        return token_nll, output
+
     def forward(
         self,
         logits: torch.Tensor,
@@ -1120,18 +1166,8 @@ class DFlashDecayLoss(nn.Module):
         Returns:
             :class:`DLLMLossOutput`.
         """
-        token_nll = _compute_per_token_nll(logits, target_ids)  # [batch, blocks, k]
-        correct = logits.argmax(dim=-1) == target_ids  # [batch, blocks, k]
-        del logits
-        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask)
-        return self._reduce(
-            token_nll,
-            block_mask,
-            num_tokens,
-            draft_correct_per_pos=c_per_pos,
-            draft_count_per_pos=n_per_pos,
-            total_blocks=total_blocks,
-        )
+        _, output = self.forward_with_token_nll(logits, target_ids, block_mask, num_tokens, total_blocks)
+        return output
 
     @staticmethod
     def _chunk_nll(
