@@ -42,6 +42,7 @@ def adapter():
     a.moe_config = MagicMock()
     a.backend = MagicMock()
     a.dtype = torch.bfloat16
+    a.vision_uses_native_radio = False
     # Echo input keys through unchanged — lets us verify *only* the
     # NemotronOmni-side key handling without depending on NemotronV3 internals.
     a._llm_adapter = MagicMock()
@@ -222,3 +223,78 @@ def test_mapping_tables_are_inverses():
     for hf_key, custom_key in _VISION_PROJ_HF_TO_CUSTOM.items():
         assert _VISION_PROJ_CUSTOM_TO_HF[custom_key] == hf_key
     assert len(_VISION_PROJ_HF_TO_CUSTOM) == len(_VISION_PROJ_CUSTOM_TO_HF)
+
+
+# ---------------------------------------------------------------------------
+# Native RadioModel remap (NemotronH_Omni_Reasoning_V3 / Super-scale omni)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def native_adapter():
+    """Adapter configured for a checkpoint whose vision tower is the native RadioModel."""
+    a = NemotronOmniStateDictAdapter.__new__(NemotronOmniStateDictAdapter)
+    a.config = MagicMock()
+    a.llm_config = MagicMock()
+    a.moe_config = MagicMock()
+    a.backend = MagicMock()
+    a.dtype = torch.bfloat16
+    a.vision_uses_native_radio = True
+    a._llm_adapter = MagicMock()
+    a._llm_adapter.from_hf.side_effect = lambda sd, **kwargs: dict(sd)
+    a._llm_adapter.to_hf.side_effect = lambda sd, **kwargs: dict(sd)
+    a._llm_adapter.convert_single_tensor_to_hf.side_effect = lambda fqn, tensor, **kwargs: [(fqn, tensor)]
+    return a
+
+
+def test_from_hf_renames_legacy_radio_keys_to_native(native_adapter):
+    """Legacy ``radio_model.model.blocks``/``patch_generator`` keys remap to the native tree."""
+    hf_sd = {
+        "vision_model.radio_model.model.blocks.0.norm1.weight": torch.zeros(2),
+        "vision_model.radio_model.model.blocks.0.attn.proj.weight": torch.zeros(2, 2),
+        "vision_model.radio_model.model.patch_generator.cls_token.token": torch.zeros(1),
+        "vision_model.radio_model.input_conditioner.norm_mean": torch.zeros(3),
+    }
+    out = native_adapter.from_hf(dict(hf_sd))
+
+    assert "vision_model.encoder.layer.0.norm1.weight" in out
+    assert "vision_model.encoder.layer.0.attention.output.dense.weight" in out
+    assert "vision_model.embeddings.cls_register_token" in out
+    assert "vision_model.input_conditioner.norm_mean" in out
+    assert not any("radio_model" in k for k in out)
+
+
+def test_from_hf_splits_fused_qkv_for_native_radio(native_adapter):
+    """A fused ``attn.qkv`` tensor splits into three native query/key/value tensors."""
+    qkv = torch.arange(9 * 2, dtype=torch.float32).reshape(9, 2)  # 3 chunks of 3 rows each
+    hf_sd = {"vision_model.radio_model.model.blocks.0.attn.qkv.weight": qkv}
+    out = native_adapter.from_hf(dict(hf_sd))
+
+    q_key = "vision_model.encoder.layer.0.attention.attention.query.weight"
+    k_key = "vision_model.encoder.layer.0.attention.attention.key.weight"
+    v_key = "vision_model.encoder.layer.0.attention.attention.value.weight"
+    assert q_key in out and k_key in out and v_key in out
+    assert torch.equal(out[q_key], qkv[0:3])
+    assert torch.equal(out[k_key], qkv[3:6])
+    assert torch.equal(out[v_key], qkv[6:9])
+
+
+def test_native_radio_round_trip(native_adapter):
+    """from_hf -> to_hf recovers the original legacy keys, shapes, and values (incl. fused qkv)."""
+    hf_sd = {
+        "vision_model.radio_model.model.blocks.0.norm1.weight": torch.randn(4),
+        "vision_model.radio_model.model.blocks.0.attn.qkv.weight": torch.randn(9, 4),
+        "vision_model.radio_model.model.patch_generator.pos_embed": torch.randn(2, 4),
+    }
+    custom_sd = native_adapter.from_hf(dict(hf_sd))
+    round_tripped = native_adapter.to_hf(dict(custom_sd))
+
+    assert set(round_tripped) == set(hf_sd)
+    for key, value in hf_sd.items():
+        assert torch.equal(round_tripped[key], value)
+
+
+def test_supports_write_through_checkpoint_load_false_for_native_radio(native_adapter):
+    """Native RadioModel's fused-qkv split changes cardinality; write-through must be disabled."""
+    native_adapter._llm_adapter.supports_write_through_checkpoint_load = True
+    assert native_adapter.supports_write_through_checkpoint_load is False

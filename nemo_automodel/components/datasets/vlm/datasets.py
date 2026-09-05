@@ -46,6 +46,21 @@ from nemo_automodel.components.datasets.vlm.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _replacement_rng(idx: int) -> random.Random:
+    """Per-sample RNG for picking a substitute when sample ``idx`` is unusable.
+
+    Seeded from the ORIGINAL sample index only, so every rank (and every
+    dp/cp world size) that materializes sample ``idx`` substitutes the same
+    replacement. Drawing from the process-global ``random`` instead made the
+    substitute rank-dependent: ranks whose global RNG stream had advanced
+    differently (e.g. the per-node dataset-building rank) picked a different
+    document, so context-parallel ranks in one CP group ended up with
+    different packs / ``cu_seqlens`` for the same microbatch -- corrupting the
+    ring-attention gradient accumulation (inf/nan or silently wrong dk/dv).
+    """
+    return random.Random(0x9E3779B9 + 2654435761 * int(idx))
+
+
 @dataclass
 class RdrDatasetConfig:
     """Construction-time configuration for the RDR dataset."""
@@ -1467,6 +1482,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        rng = _replacement_rng(idx)
         from nemo_automodel.components.datasets.vlm.collate_fns import (
             _extract_media_from_conversations,
             build_labels_from_template,
@@ -1545,7 +1561,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                             seq_len,
                             self.max_length,
                         )
-                        idx = random.randint(0, len(self.dataset) - 1)
+                        idx = rng.randint(0, len(self.dataset) - 1)
                         continue
 
                 # Build labels BEFORE truncation so the full assistant text
@@ -1580,7 +1596,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         idx,
                         mismatch,
                     )
-                    idx = random.randint(0, len(self.dataset) - 1)
+                    idx = rng.randint(0, len(self.dataset) - 1)
                     continue
 
                 output = {
@@ -1616,7 +1632,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     self.max_retries,
                     e,
                 )
-                idx = random.randint(0, len(self.dataset) - 1)
+                idx = rng.randint(0, len(self.dataset) - 1)
 
         raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
 
@@ -1645,6 +1661,7 @@ class RobustDatasetWrapper(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        rng = _replacement_rng(idx)
         from nemo_automodel.components.datasets.vlm.fake_image import (
             _conversation_has_media,
             inject_fake_image_into_conversation,
@@ -1663,7 +1680,7 @@ class RobustDatasetWrapper(torch.utils.data.Dataset):
                 return example
             except Exception as e:
                 logger.warning(f"Error loading sample {idx}: {e}. Retrying with a different sample.")
-                idx = random.randint(0, len(self.dataset) - 1)
+                idx = rng.randint(0, len(self.dataset) - 1)
         raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
 
     def robust_collate(self, collate_fn):

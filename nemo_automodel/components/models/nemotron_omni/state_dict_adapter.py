@@ -94,6 +94,85 @@ _VISION_PROJ_CUSTOM_TO_HF = {v: k for k, v in _VISION_PROJ_HF_TO_CUSTOM.items()}
 # Sound projector: Keys are identical between HF and custom
 # sound_projection.norm.weight, sound_projection.linear1.weight, sound_projection.linear2.weight
 
+# Vision encoder (RADIO), legacy checkpoint -> transformers-native RadioModel.
+#
+# Checkpoints whose remote code ships the transformers-native RadioModel
+# (`embeddings`/`encoder` module tree -- e.g. NemotronH_Omni_Reasoning_V3) still save
+# weights under the older timm-style "radio_model.model.blocks" naming with a fused QKV
+# projection. transformers applies the equivalent rename + QKV split automatically during
+# `from_pretrained` via `register_checkpoint_conversion_mapping("radio", ...)`
+# (see the checkpoint's `modeling_radio.py`); nemo_automodel's checkpoint loading bypasses
+# `from_pretrained`, so the same mapping is replicated here. Order matters: prefixes are
+# matched most-specific-first via ``str.replace`` on the sub-key (after stripping the
+# "vision_model." prefix), mirroring the checkpoint's own ``WeightRenaming`` list.
+_RADIO_LEGACY_TO_NATIVE_RENAMES: list[tuple[str, str]] = [
+    ("radio_model.model.patch_generator.video_embedder", "embeddings.video_patch_projection"),
+    ("radio_model.model.patch_generator.embedder", "embeddings.patch_projection"),
+    ("radio_model.model.patch_generator.pos_embed", "embeddings.position_embedding"),
+    ("radio_model.model.patch_generator.cls_token.token", "embeddings.cls_register_token"),
+    ("radio_model.model.blocks", "encoder.layer"),
+    ("attn.proj", "attention.output.dense"),
+    ("radio_model.input_conditioner", "input_conditioner"),
+    ("radio_model.summary_idxs", "summary_idxs"),
+]
+_RADIO_NATIVE_TO_LEGACY_RENAMES: list[tuple[str, str]] = [(new, old) for old, new in _RADIO_LEGACY_TO_NATIVE_RENAMES]
+# attn.qkv.{weight,bias} (fused) <-> attention.attention.{query,key,value}.{weight,bias},
+# chunked/concatenated along dim 0 in query, key, value order.
+_RADIO_QKV_SPLIT_TARGETS = ("attention.attention.query", "attention.attention.key", "attention.attention.value")
+
+
+def _rename_radio_key(sub_key: str, renames: list[tuple[str, str]]) -> str:
+    """Apply every matching rename in order (chained), not just the first match.
+
+    E.g. "radio_model.model.blocks.0.attn.proj.weight" needs both the
+    "radio_model.model.blocks" -> "encoder.layer" AND "attn.proj" -> "attention.output.dense"
+    renames applied in sequence.
+    """
+    for old, new in renames:
+        if old in sub_key:
+            sub_key = sub_key.replace(old, new, 1)
+    return sub_key
+
+
+def _radio_legacy_to_native(sub_key: str, value: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    """Rename one legacy ("radio_model.model.blocks...") RADIO sub-key to the native layout.
+
+    Returns a list because a fused ``attn.qkv`` tensor splits into three (query/key/value).
+    The general rename chain (e.g. "radio_model.model.blocks" -> "encoder.layer") is applied
+    first so it composes with the "attn.qkv" -> query/key/value split that follows.
+    """
+    renamed = _rename_radio_key(sub_key, _RADIO_LEGACY_TO_NATIVE_RENAMES)
+    if "attn.qkv" in renamed:
+        chunks = value.chunk(3, dim=0)
+        return [
+            (renamed.replace("attn.qkv", target, 1), chunk) for target, chunk in zip(_RADIO_QKV_SPLIT_TARGETS, chunks)
+        ]
+    return [(renamed, value)]
+
+
+def _radio_native_to_legacy(vision_sub_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Inverse of :func:`_radio_legacy_to_native`: native RadioModel sub-keys -> legacy checkpoint keys.
+
+    ``attention.attention.{query,key,value}`` triplets are concatenated back into a single
+    fused ``attn.qkv`` tensor (query, key, value order along dim 0). The qkv-target ->
+    "attn.qkv" placeholder substitution happens before the general rename chain, so
+    "encoder.layer" still gets reverse-renamed to "radio_model.model.blocks" for qkv keys too.
+    """
+    result: dict[str, torch.Tensor] = {}
+    qkv_groups: dict[str, dict[str, torch.Tensor]] = {}
+    for sub_key, value in vision_sub_dict.items():
+        matched_target = next((t for t in _RADIO_QKV_SPLIT_TARGETS if t in sub_key), None)
+        if matched_target is not None:
+            group_key = _rename_radio_key(
+                sub_key.replace(matched_target, "attn.qkv", 1), _RADIO_NATIVE_TO_LEGACY_RENAMES
+            )
+            qkv_groups.setdefault(group_key, {})[matched_target] = value
+        else:
+            result[_rename_radio_key(sub_key, _RADIO_NATIVE_TO_LEGACY_RENAMES)] = value
+    for group_key, parts in qkv_groups.items():
+        result[group_key] = torch.cat([parts[t] for t in _RADIO_QKV_SPLIT_TARGETS], dim=0)
+    return result
+
 
 class NemotronOmniStateDictAdapter(StateDictAdapter):
     """State dict adapter for NemotronOmni (NemotronH_Nano_Omni_Reasoning_V3) models.
@@ -107,8 +186,14 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
 
     @property
     def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether the embedded language adapter and all wrapper renames preserve storage."""
-        return self._llm_adapter.supports_write_through_checkpoint_load
+        """Whether the embedded language adapter and all wrapper renames preserve storage.
+
+        False when the vision tower needs the native-RadioModel remap: the fused
+        ``attn.qkv`` <-> split query/key/value conversion changes tensor cardinality
+        (1 checkpoint tensor <-> 3 module tensors), which `convert_single_tensor_to_hf`
+        cannot do correctly one tensor at a time.
+        """
+        return self._llm_adapter.supports_write_through_checkpoint_load and not self.vision_uses_native_radio
 
     def __init__(
         self,
@@ -117,6 +202,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         moe_config: MoEConfig,
         backend: BackendConfig,
         dtype: torch.dtype = torch.bfloat16,
+        vision_uses_native_radio: bool = False,
     ):
         """Initialize the state dict adapter.
 
@@ -126,12 +212,18 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
             moe_config: MoE configuration
             backend: Backend configuration
             dtype: Target dtype
+            vision_uses_native_radio: Whether the vision tower is the transformers-native
+                RadioModel (embeddings/encoder module tree), requiring the legacy
+                "radio_model.model.blocks" checkpoint keys to be renamed and their fused
+                QKV split. False for the legacy `radio_model`-wrapped vision class, whose
+                checkpoint keys already match the module tree as-is.
         """
         self.config = config
         self.llm_config = llm_config
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
+        self.vision_uses_native_radio = vision_uses_native_radio
 
         # Create the LLM state dict adapter (handles expert merging etc.)
         self._llm_adapter = NemotronV3StateDictAdapter(
@@ -179,9 +271,14 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         for key in list(hf_state_dict.keys()):
             value = hf_state_dict.pop(key)
 
-            # 1. Vision model keys (pass through as-is)
+            # 1. Vision model keys (pass through as-is, or remap legacy RADIO naming)
             if key.startswith("vision_model."):
-                result[key] = value
+                sub_key = key[len("vision_model.") :]
+                if self.vision_uses_native_radio:
+                    for new_sub_key, new_value in _radio_legacy_to_native(sub_key, value):
+                        result[f"vision_model.{new_sub_key}"] = new_value
+                else:
+                    result[key] = value
                 debug_counts["vision_model"] += 1
 
             # 2. Vision projector keys (mlp1.* -> vision_projector.*)
@@ -277,6 +374,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         """
         hf_result = {}
         llm_state_dict = {}
+        vision_state_dict = {}
 
         for fqn in list(state_dict.keys()):
             tensor = state_dict.pop(fqn)
@@ -284,9 +382,9 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
             if exclude_key_regex and re.match(exclude_key_regex, fqn):
                 continue
 
-            # Vision model (pass through)
+            # Vision model (pass through, or remap back to legacy RADIO naming)
             if fqn.startswith("vision_model."):
-                hf_result[fqn] = tensor
+                vision_state_dict[fqn[len("vision_model.") :]] = tensor
 
             # Vision projector (custom -> HF)
             elif fqn.startswith("vision_projector."):
@@ -319,6 +417,14 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         for key, value in converted_llm.items():
             hf_result[f"language_model.{key}"] = value
 
+        # Convert vision keys back to the checkpoint's own naming (remap for native RadioModel,
+        # pass through otherwise) and re-add "vision_model." prefix
+        converted_vision = (
+            _radio_native_to_legacy(vision_state_dict) if self.vision_uses_native_radio else vision_state_dict
+        )
+        for key, value in converted_vision.items():
+            hf_result[f"vision_model.{key}"] = value
+
         return hf_result
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
@@ -334,9 +440,13 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
-        # Vision model (pass through)
+        # Vision model (pass through, or rename for native RadioModel checkpoints)
         if fqn.startswith("vision_model."):
-            new_fqn = fqn
+            if self.vision_uses_native_radio:
+                sub_key = fqn[len("vision_model.") :]
+                new_fqn = f"vision_model.{_rename_radio_key(sub_key, _RADIO_NATIVE_TO_LEGACY_RENAMES)}"
+            else:
+                new_fqn = fqn
 
         # Vision projector
         elif fqn.startswith("vision_projector."):
