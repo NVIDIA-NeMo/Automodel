@@ -22,6 +22,11 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
+from nemo_automodel.components.training._fused_grad_clipping import (
+    can_use_fused_grad_norm,
+    fused_multi_tensor_max,
+    fused_multi_tensor_scaled_l2,
+)
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -188,15 +193,26 @@ def _clip_grad_norm_impl(
         # those per-grad (each full_tensor() is a same-shape collective, safe).
         has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
 
-        local_max = torch.zeros((), dtype=torch.float64, device=target_device)
+        local_grads = []
         for p in group_params:
             g = p.grad
+            if g is None:
+                continue
             if isinstance(g, DTensor):
                 g = g.full_tensor() if has_partial else g.to_local()
             if g.numel() == 0:
                 continue
-            g_abs_max = g.detach().abs().max().to(device=target_device, dtype=torch.float64)
-            local_max = torch.maximum(local_max, g_abs_max)
+            local_grads.append(g)
+
+        if not local_grads:
+            local_max = torch.zeros((), dtype=torch.float64, device=target_device)
+        elif can_use_fused_grad_norm(target_device):
+            local_max = fused_multi_tensor_max(local_grads, target_device)
+        else:
+            local_max = torch.zeros((), dtype=torch.float64, device=target_device)
+            for g in local_grads:
+                g_abs_max = g.detach().abs().max().to(device=target_device, dtype=torch.float64)
+                local_max = torch.maximum(local_max, g_abs_max)
 
         if is_dtensor and not has_partial:
             mesh = first.device_mesh
@@ -210,18 +226,19 @@ def _clip_grad_norm_impl(
             continue
 
         scale = torch.where(torch.isfinite(local_max) & local_max.ne(0), local_max, torch.ones_like(local_max))
-        local_val = torch.zeros((), dtype=torch.float64, device=target_device)
-        for p in group_params:
-            g = p.grad
-            if isinstance(g, DTensor):
-                g = g.full_tensor() if has_partial else g.to_local()
-            if g.numel() == 0:
-                continue
-            g = g.detach().abs().div(scale)
-            if norm_type == 2.0:
-                local_val = local_val + g.square().sum(dtype=torch.float64)
-            else:
-                local_val = local_val + g.pow(norm_type).sum(dtype=torch.float64)
+
+        if not local_grads:
+            local_val = torch.zeros((), dtype=torch.float64, device=target_device)
+        elif can_use_fused_grad_norm(target_device) and norm_type == 2.0:
+            local_val = fused_multi_tensor_scaled_l2(local_grads, scale, target_device)
+        else:
+            local_val = torch.zeros((), dtype=torch.float64, device=target_device)
+            for g in local_grads:
+                g_scaled = g.detach().abs().div(scale)
+                if norm_type == 2.0:
+                    local_val = local_val + g_scaled.square().sum(dtype=torch.float64)
+                else:
+                    local_val = local_val + g_scaled.pow(norm_type).sum(dtype=torch.float64)
 
         if is_dtensor and not has_partial:
             mesh = first.device_mesh
