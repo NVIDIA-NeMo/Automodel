@@ -658,6 +658,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
+        if self.te_fp8 is not None:
+            for part in self.model_parts:
+                self.te_fp8.apply_filter_fqns(part)
 
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()

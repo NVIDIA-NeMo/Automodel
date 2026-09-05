@@ -1126,6 +1126,30 @@ def test_nvtx_false_skips_patching(monkeypatch):
     assert patch_calls == []
 
 
+def test_setup_applies_te_exclusions_from_model_backend(monkeypatch):
+    from nemo_automodel.components.models.common.utils import BackendConfig, TEFp8Config
+
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    model = DummyModel()
+    te_config = TEFp8Config(filter_fqns=["lm_head"])
+    model.backend = BackendConfig(te_fp8=te_config)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *a, **k: model)
+    calls = []
+
+    def apply_filter(config, part):
+        calls.append((config, part))
+        return []
+
+    # Wiring only: actual precision and gradient behavior is covered by the
+    # TE functional test, not simulated in this CPU recipe setup test.
+    monkeypatch.setattr(TEFp8Config, "apply_filter_fqns", apply_filter)
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+    assert trainer.te_fp8 is te_config
+    assert calls == [(te_config, model)]
+
+
 def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False, optimizer_target="torch.optim.AdamW")
 
