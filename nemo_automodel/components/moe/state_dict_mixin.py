@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import gc
-import logging
 import re
 from typing import Any, Optional
 
@@ -28,8 +27,6 @@ from nemo_automodel.components.moe.state_dict_utils import (
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
 )
-
-logger = logging.getLogger(__name__)
 
 # Native LoRA suffixes for grouped MoE expert tensors
 _LORA_EXPERT_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
@@ -401,7 +398,9 @@ class MoESplitExpertsStateDictMixin:
         when the loader provided one (``_paramwrapper_layout_hint``), otherwise
         from the tensors whose shapes distinguish the two generations, so
         adapters exported under either peft load correctly. When neither
-        settles it, a clear error is raised instead of guessing.
+        settles it, a clear error is raised instead of guessing. The stamp
+        must be one of the two known layout ids and must agree with whatever
+        the shapes say; a stamp that fails either check is rejected, not trusted.
 
         Reverse transforms (down_proj is outer, the input projection is inner),
         peft >= 0.19.1 layout:
@@ -462,18 +461,35 @@ class MoESplitExpertsStateDictMixin:
         # Metadata first: the save path stamps the layout into
         # automodel_peft_config.json and the checkpoint loader hands it to us
         # through this attribute; shape detection is the fallback for adapters
-        # saved before the stamp existed.
-        layout_hint = getattr(self, "_paramwrapper_layout_hint", None)
-        if layout_hint is not None:
-            swapped = layout_hint != _PARAMWRAPPER_LAYOUT_LEGACY
-        elif len(votes) == 1:
-            swapped = next(iter(votes))
-        elif votes:
+        # saved before the stamp existed. The two must agree: an unknown stamp,
+        # or one the tensor shapes rule out, is an error rather than a guess.
+        if len(votes) > 1:
             raise ValueError(
                 "ParamWrapper LoRA tensors in this adapter disagree about their layout "
                 "(peft flipped it in 0.19.1, huggingface/peft#3165). The adapter file "
                 "does not match this model's dimensions, or it is corrupt."
             )
+        shape_vote = next(iter(votes)) if votes else None
+        layout_hint = getattr(self, "_paramwrapper_layout_hint", None)
+        if layout_hint is not None:
+            if layout_hint not in (_PARAMWRAPPER_LAYOUT_MODERN, _PARAMWRAPPER_LAYOUT_LEGACY):
+                raise ValueError(
+                    f"Unknown peft ParamWrapper layout {layout_hint!r} in this adapter's "
+                    f"automodel_peft_config.json; expected {_PARAMWRAPPER_LAYOUT_MODERN!r} or "
+                    f"{_PARAMWRAPPER_LAYOUT_LEGACY!r}. The metadata is corrupt, or the adapter "
+                    "was exported by a newer automodel than this one."
+                )
+            swapped = layout_hint == _PARAMWRAPPER_LAYOUT_MODERN
+            if shape_vote is not None and shape_vote != swapped:
+                raise ValueError(
+                    f"This adapter's automodel_peft_config.json says its ParamWrapper layout is "
+                    f"{layout_hint!r}, but the LoRA tensor shapes only fit the "
+                    f"{(_PARAMWRAPPER_LAYOUT_LEGACY if swapped else _PARAMWRAPPER_LAYOUT_MODERN)!r} layout "
+                    "(peft flipped it in 0.19.1, huggingface/peft#3165). The metadata and the weights "
+                    "do not belong together, or the adapter does not match this model's dimensions."
+                )
+        elif shape_vote is not None:
+            swapped = shape_vote
         else:
             raise ValueError(
                 "Cannot tell which peft ParamWrapper layout this adapter uses: the "

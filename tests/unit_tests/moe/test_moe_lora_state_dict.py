@@ -839,6 +839,53 @@ class TestParamWrapperLayoutVersions:
                 {f"{base}.lora_A.weight": torch.randn(LORA_DIM * N_EXPERTS, MOE_INTER_DIM)}
             )
 
+    @pytest.mark.parametrize("legacy, stamp", [(False, "peft-0.19.1"), (True, "peft-0.18")])
+    def test_metadata_stamp_agreeing_with_shapes_loads(self, legacy, stamp):
+        adapter = _Adapter()
+        native = self._native()
+        adapter._paramwrapper_layout_hint = stamp
+
+        back = adapter._convert_paramwrapper_to_native(self._export(adapter, native, legacy=legacy))
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])
+
+    def test_unknown_metadata_stamp_fails_clearly(self):
+        """Only the two known layout ids are accepted; anything else is an error, not 'modern'."""
+        adapter = _Adapter()
+        adapter._paramwrapper_layout_hint = "peft-0.21"
+
+        with pytest.raises(ValueError, match="Unknown peft ParamWrapper layout 'peft-0.21'"):
+            adapter._convert_paramwrapper_to_native(self._export(adapter, self._native()))
+
+    @pytest.mark.parametrize("file_is_legacy, stamp", [(True, "peft-0.19.1"), (False, "peft-0.18")])
+    def test_metadata_stamp_contradicting_shapes_fails_clearly(self, file_is_legacy, stamp):
+        """A stamp the tensor shapes rule out must not win silently, in either direction."""
+        adapter = _Adapter()
+        exported = self._export(adapter, self._native(), legacy=file_is_legacy)
+        adapter._paramwrapper_layout_hint = stamp
+
+        with pytest.raises(ValueError, match="do not belong together"):
+            adapter._convert_paramwrapper_to_native(exported)
+
+    @pytest.mark.parametrize("stamp", [None, "peft-0.19.1", "peft-0.18"])
+    def test_tensors_disagreeing_about_the_layout_fail_even_with_a_valid_stamp(self, stamp):
+        """A file mixing both layouts is corrupt; a valid stamp must not mask that."""
+        adapter = _Adapter()
+        native = self._native()
+        mixed = self._export(adapter, native, legacy=True)
+        modern_down_b = {
+            key: value
+            for key, value in self._export(adapter, native).items()
+            if key.endswith(".lora_B.weight") and "base_layer" not in key
+        }
+        mixed.update(modern_down_b)
+        adapter._paramwrapper_layout_hint = stamp
+
+        with pytest.raises(ValueError, match="disagree about their layout"):
+            adapter._convert_paramwrapper_to_native(mixed)
+
     @pytest.mark.parametrize("legacy", [False, True])
     def test_non_gated_experts_round_trip_for_both_layouts(self, legacy):
         """Nemotron-V3-style non-gated experts (gate_up width == moe_inter)."""
