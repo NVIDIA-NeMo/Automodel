@@ -16,24 +16,20 @@
 # throughput benchmark at 2k-token rows on 64 nodes x 4 GB200 (256 GPUs):
 # EP32 x PP8, DP32, GBS 4096.
 #
-# Measured with this exact configuration: ~616 tok/s/GPU, i.e. ~17.1% MFU on
-# the basis  MFU = tok/s/GPU * 6 * 104e9 / 2.25e15  (GB200 bf16 dense peak).
-# Wall-clock cross-check: 4096 rows x 2048 tok = 8.39M tokens/step at ~53 s.
-# Peak memory 139.6 GiB per GPU (44 GiB headroom on 184 GiB HBM).
-#
-# Measurement provenance: taken before #3792 aligned the KimiK3TextConfig
-# defaults with the released checkpoint (from_config then built a 56-head MLA
-# / 18432-wide dense FFN model, ~101.5B active matmul params instead of
-# 104.0B). On the checkpoint-aligned shape this file builds today expect ~2%
-# fewer tok/s at about the same MFU and ~1 GiB more per GPU; a re-measurement
-# on the aligned shape will replace the figures above. Run the file through
+# Measured with this exact configuration (64 nodes, 12 iterations, recipe
+# summary = mean over the 9 iterations after 3 warm-up iterations):
+# 538.8 tok/s/GPU at 60.8 s/iteration, Average MFU 15.1% on the recipe's
+# config-derived FLOPs basis (14.9% on tok/s/GPU * 6 * 104e9 / 2.25e15, the
+# GB200 bf16 dense peak). Peak memory 139.8 GiB per GPU (44 GiB headroom on
+# 184 GiB HBM). Run the file through
 # nemo_automodel/recipes/llm/benchmark.py --config <this file> for the
 # recipe's own per-iteration MFU and Average MFU summary.
 #
-# Why 2k rows beat the 1k config (13.7% MFU) by 3.4pp: at this scale the
-# workload is launch-bound, so doubling tokens per row halves the per-token
-# kernel-launch tax, and K3's KDA linear attention does not penalize longer
-# rows. The PP bubble at this point is 9.9% (64 microbatches).
+# Why 2k rows beat the 1k config (kimi_k3_gb200.yaml: 392.4 tok/s/GPU, 10.9%)
+# by 37% / 4.2pp: at this scale the workload is launch-bound, so doubling
+# tokens per row halves the per-token kernel-launch tax, and K3's KDA linear
+# attention does not penalize longer rows. The PP bubble at this point is 9.9%
+# (64 microbatches).
 #
 # This shape REQUIRES distributed.pipeline.pp_recv_buffer_pool: without it,
 # torch pre-allocates recv buffers for all 64 microbatches x both directions
@@ -41,8 +37,7 @@
 # pool sizes buffers to the 1F1B in-flight depth instead, saving ~45 GiB.
 #
 # compile_norm is on: the fp32 RMSNorm chain is the remaining per-token launch
-# tax at this scale (see kimi_k3_gb200.yaml), and the 2k x compile_norm stack is
-# the configuration being re-measured for the figures above.
+# tax at this scale (see kimi_k3_gb200.yaml); the figures above include it.
 #
 # Other benchmark regime notes match examples/llm_benchmark/kimi/kimi_k3_gb200.yaml.
 #
