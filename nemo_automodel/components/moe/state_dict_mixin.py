@@ -65,17 +65,16 @@ class MoESplitExpertsStateDictMixin:
 
     @property
     def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether non-expert and grouped-expert destinations both alias model storage."""
-        experts_alias = self.moe_config is None or self._supports_write_through_expert_checkpoint_load
-        return self._supports_write_through_checkpoint_load and experts_alias
+        """Whether every checkpoint tensor, including expert tensors, loads directly into model weights."""
+        experts_load_directly = self.moe_config is None or self._supports_write_through_expert_checkpoint_load
+        return self._supports_write_through_checkpoint_load and experts_load_directly
 
     @property
     def _supports_write_through_expert_checkpoint_load(self) -> bool:
-        """Whether all grouped expert destinations alias final model storage.
+        """Whether grouped expert checkpoint tensors load directly into model weight memory.
 
-        This only describes the shared expert conversion. Concrete adapters
-        must separately verify that their non-expert conversions also alias
-        model storage before opting into a write-through full-checkpoint load.
+        This covers only the shared expert conversion. A concrete adapter must also verify that all non-expert
+        checkpoint tensors load directly before it enables the full-checkpoint fast path.
         """
         return self.backend.experts != "te" and self.backend.dispatcher != "mok"
 
@@ -723,12 +722,23 @@ class MoESplitExpertsStateDictMixin:
             Creates gate_and_up_projs [n_experts, dim, inter_dim] and transposed down_projs tensors.
 
         Args:
+            hf_state_dict: State mapping consumed by this method. Per-expert gate and up tensors have shape
+                [expert_hidden, hidden], while down tensors have shape [hidden, expert_hidden]. DTensor values
+                use the same global layouts and are localized before merging.
+            device_mesh: Optional device mesh whose expert-parallel dimension selects the local experts. The
+                returned grouped expert tensors use the placements created by ``create_dtensor_from_local``.
             reset_view_loaded_keys: Clear the in-place (strided-view) loaded-key record at the
                 start of this call. A single ``from_hf`` may invoke this method more than once
                 (e.g. backbone then MTP merge); the later call(s) pass ``False`` so the view-loaded
                 keys accumulate across one logical load. Resetting here (rather than in the loader)
                 keeps the whole view-key lifecycle inside the adapter and ensures each load starts
                 clean (no leak from a prior load such as an init-time partial load).
+
+        Returns:
+            Native state mapping. Gated input projections have shape
+            [local_experts, hidden, 2 * expert_hidden], non-gated input projections have shape
+            [local_experts, hidden, expert_hidden], and down projections have shape
+            [local_experts, expert_hidden, hidden].
         """
         if reset_view_loaded_keys:
             self._view_loaded_native_keys = set()
@@ -821,7 +831,7 @@ class MoESplitExpertsStateDictMixin:
 
                     if all_complete:
                         expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
-                        tensors = []
+                        expert_parts = []
                         for expert_id in expert_ids:
                             expert_data = expert_weights_by_layer[layer_num][native_key][expert_id]
 
@@ -834,29 +844,26 @@ class MoESplitExpertsStateDictMixin:
                                     up_weight = up_weight.to_local()
                                 gate_t = gate_weight.transpose(0, 1)
                                 up_t = up_weight.transpose(0, 1)
-                                tensors.append(torch.cat([gate_t, up_t], dim=-1))
+                                expert_parts.append((gate_t, up_t))
                             else:
                                 up_weight = expert_data
                                 if is_dtensor(up_weight):
                                     up_weight = up_weight.to_local()
-                                tensors.append(up_weight.transpose(0, 1))
+                                expert_parts.append((up_weight.transpose(0, 1),))
 
-                        stacked = torch.stack(tensors, dim=0).to(self.dtype)
-                        state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
+                        merged = self._direct_fill_grouped_expert_tensor(expert_parts)
+                        state_dict[native_key] = create_dtensor_from_local(merged, device_mesh, rank)
+                        merged_on_cuda = merged.is_cuda
 
-                        # Aggressively release intermediates so the per-layer
-                        # transient does not pile on top of the model's
-                        # already-materialized GPU DTensors. Without this,
-                        # ``tensors``/``stacked`` and the per-expert dict
-                        # entries hang around until Python's refcount GC
-                        # eventually runs — too late under tight GPU budgets
-                        # (e.g. a large MoE on 2 nodes / 8 GPUs).
-                        del tensors, stacked
+                        # Release the per-expert sources before processing the next projection or layer so they
+                        # do not accumulate alongside the grouped output. Only trim the CUDA allocator when the
+                        # merge itself used CUDA storage; the single-device fallback merges on the host.
+                        del expert_parts, merged
                         del expert_weights_by_layer[layer_num][native_key]
                         if not expert_weights_by_layer[layer_num]:
                             del expert_weights_by_layer[layer_num]
-                        gc.collect()
-                        if torch.cuda.is_available():
+                        gc.collect(0)
+                        if merged_on_cuda:
                             torch.cuda.empty_cache()
 
                 else:  # down_proj
@@ -865,7 +872,7 @@ class MoESplitExpertsStateDictMixin:
                     if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
                         expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
 
-                        ordered = []
+                        expert_parts = []
                         for expert_id in expert_ids:
                             down_weight = expert_weights_by_layer[layer_num][native_key][expert_id]  # [dim, inter_dim]
 
@@ -874,20 +881,19 @@ class MoESplitExpertsStateDictMixin:
                                 down_weight = down_weight.to_local()
 
                             down_t = down_weight.transpose(0, 1)  # [inter_dim, dim]
-                            ordered.append(down_t)
+                            expert_parts.append((down_t,))
 
-                        stacked = torch.stack(ordered, dim=0)
-                        stacked = stacked.to(self.dtype)
-
-                        state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
+                        merged = self._direct_fill_grouped_expert_tensor(expert_parts)
+                        state_dict[native_key] = create_dtensor_from_local(merged, device_mesh, rank)
+                        merged_on_cuda = merged.is_cuda
 
                         # See gate/up branch above for the cleanup rationale.
-                        del ordered, stacked
+                        del expert_parts, merged
                         del expert_weights_by_layer[layer_num][native_key]
                         if not expert_weights_by_layer[layer_num]:
                             del expert_weights_by_layer[layer_num]
-                        gc.collect()
-                        if torch.cuda.is_available():
+                        gc.collect(0)
+                        if merged_on_cuda:
                             torch.cuda.empty_cache()
 
             else:
@@ -913,30 +919,48 @@ class MoESplitExpertsStateDictMixin:
 
         return state_dict
 
+    def _direct_fill_grouped_expert_tensor(self, expert_parts: list[tuple[torch.Tensor, ...]]) -> torch.Tensor:
+        """Merge experts directly into one final grouped tensor.
+
+        Args:
+            expert_parts: Projection tensors for each local expert. Multiple tensors in a tuple are joined along
+                the last dimension.
+
+        Returns:
+            One contiguous grouped tensor in ``self.dtype``.
+        """
+        if not expert_parts or not expert_parts[0]:
+            raise ValueError("At least one expert projection tensor is required")
+
+        first_expert = expert_parts[0]
+        leading_shape = first_expert[0].shape[:-1]
+        grouped = torch.empty(
+            (len(expert_parts), *leading_shape, sum(part.shape[-1] for part in first_expert)),
+            dtype=self.dtype,
+            device=first_expert[0].device,
+        )
+        if len(first_expert) == 1:
+            torch.stack([parts[0] for parts in expert_parts], dim=0, out=grouped)
+        else:
+            for expert_index, parts in enumerate(expert_parts):
+                torch.cat(parts, dim=-1, out=grouped[expert_index])
+
+        return grouped
+
     def _convert_single_merged_expert_to_hf_split_experts(
         self,
         fqn: str,
         tensor: torch.Tensor,
         *,
         prefix_override: str | None = None,
+        for_checkpoint_load: bool = False,
         **kwargs,
     ) -> list[tuple[str, torch.Tensor]]:
-        """Convert a single merged expert tensor from native format to split HuggingFace format.
+        """Convert one grouped expert tensor to Hugging Face's per-expert layout.
 
-        When ``tensor`` is a model DTensor with a plain (non-DTensor) local
-        split — i.e. ``ep_shard == 1`` — the per-expert outputs are returned
-        as **non-contiguous strided views** into the local storage of the
-        model's grouped DTensor instead of newly-allocated contiguous copies.
-        DCP's ``target.copy_(source)`` then writes safetensors data directly
-        through the views into the model's storage, and
-        ``_from_hf_w_merged_experts`` skips the rebuild for the corresponding
-        native key (tracked in ``_inplace_loaded_native_keys``). For loads of
-        large MoE checkpoints this avoids tens of GB of per-expert
-        scratch on top of the already-materialized model.
-
-        Save callers must materialize the views before serializing —
-        ``safetensors.torch.save`` rejects non-contiguous tensors. See
-        ``_materialize_to_hf_views_for_save`` in ``checkpointing.py``.
+        During checkpoint loading, DCP can write into contiguous or non-contiguous views. A view into model weight
+        memory updates the model directly. A view into temporary TE or MoK grouped storage is rebuilt into the model
+        by ``from_hf`` after the read. Save/export conversion still creates contiguous tensors for serialization.
 
         Args:
             fqn: Fully qualified name of the tensor in native format.
@@ -944,6 +968,8 @@ class MoESplitExpertsStateDictMixin:
             prefix_override: When provided, replaces ``self._hf_prefix`` in
                 emitted HF keys. Used to route conversions through namespaces
                 outside the main backbone, e.g. ``"mtp."`` for the MTP head.
+            for_checkpoint_load: Return views that DCP will completely overwrite. Save/export callers leave this
+                disabled so converted tensors preserve their current values in contiguous storage.
             **kwargs: Absorbed for forward-compatibility with base callers
                 that forward arbitrary state-dict kwargs (e.g. ``exclude_key_regex``).
 
@@ -954,28 +980,38 @@ class MoESplitExpertsStateDictMixin:
         inter_dim = self.moe_config.moe_inter_dim
         prefix = prefix_override if prefix_override is not None else self._hf_prefix
         expert_segment = self._expert_path_segment
-        # When quantizing, the adapter casts each split with ``value.to(float8_e4m3fn)``,
-        # which ALLOCATES a new tensor that no longer aliases the model's grouped storage.
-        # An in-place DCP ``copy_`` into that throwaway buffer would silently never reach the
-        # model (experts stay at random init -> garbage loss). So fp8 loads must take the
-        # rebuild path: never mark these keys in-place-loaded when ``quantization`` is set.
+        # Quantization casts each split with ``value.to(float8_e4m3fn)``, creating storage separate from the model's
+        # grouped weights. DCP must not treat that cast as model weight memory, or the model would keep its random
+        # expert values. Quantized loads therefore rebuild the grouped expert tensor after the read.
         quantization = kwargs.get("quantization", False)
+        reused_checkpoint_load_views = False
 
         # GroupedExpertsTE (backend.experts == "te") exposes both virtual grouped tensors as
         # torch.stack copies, so neither can be loaded through in-place views. GroupedExpertsMoK
-        # keeps separate contiguous gate/up parameters and exposes gate_and_up_projs through a
-        # torch.cat copy; its down_projs is still an aliasing transpose view. Treat the two native
-        # keys independently so MoK rebuilds gate/up during from_hf without giving up the
-        # zero-copy down-projection load.
+        # keeps separate contiguous gate/up parameters and exposes gate_and_up_projs through a torch.cat copy. Its
+        # down_projs transpose still uses the model's weight memory. Treat the two native tensors independently so
+        # MoK rebuilds gate/up after the read while DCP loads down directly into the model.
         backend = getattr(self, "backend", None)
-        grouped_storage_aliases = getattr(backend, "experts", None) != "te"
-        gate_up_storage_aliases = grouped_storage_aliases and getattr(backend, "dispatcher", None) != "mok"
-        down_storage_aliases = grouped_storage_aliases
+        grouped_storage_is_model_weight = getattr(backend, "experts", None) != "te"
+        gate_up_storage_is_model_weight = (
+            grouped_storage_is_model_weight and getattr(backend, "dispatcher", None) != "mok"
+        )
+        down_storage_is_model_weight = grouped_storage_is_model_weight
 
         from nemo_automodel.components.moe.state_dict_utils import (
             is_dtensor,
             validate_dtensor_expert_sharding,
         )
+
+        def checkpoint_load_destination(view: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+            """Return the checkpoint-layout view that DCP will fill."""
+            nonlocal reused_checkpoint_load_views
+
+            if for_checkpoint_load and not quantization and not is_dtensor(source):
+                reused_checkpoint_load_views = True
+                return view
+
+            return view.contiguous()
 
         if f".{expert_segment}.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
             layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
@@ -990,7 +1026,7 @@ class MoESplitExpertsStateDictMixin:
                 and len(splits) > 0
                 and not is_dtensor(splits[0])
                 and not quantization
-                and gate_up_storage_aliases
+                and gate_up_storage_is_model_weight
             )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
@@ -1004,8 +1040,10 @@ class MoESplitExpertsStateDictMixin:
                         w_gate = w[:, :inter_dim].transpose(0, 1)
                         w_up = w[:, inter_dim:].transpose(0, 1)
                     else:
-                        w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
-                        w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
+                        w_gate_view = w[:, :inter_dim].transpose(0, 1)
+                        w_up_view = w[:, inter_dim:].transpose(0, 1)
+                        w_gate = checkpoint_load_destination(w_gate_view, w)
+                        w_up = checkpoint_load_destination(w_up_view, w)
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.gate_proj.weight", w_gate))
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
                 else:
@@ -1013,12 +1051,15 @@ class MoESplitExpertsStateDictMixin:
                     if inplace_ok:
                         w_up = w.transpose(0, 1)
                     else:
-                        w_up = w.transpose(0, 1).contiguous()
+                        w_up = checkpoint_load_destination(w.transpose(0, 1), w)
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
+            # These split views were created during this conversion. Check only newly created Python objects before
+            # releasing unused CUDA blocks; scanning every long-lived model object for each layer makes exports slow.
             del splits
             if not inplace_ok and isinstance(tensor, torch.Tensor) and not tensor.is_meta and torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.empty_cache()
+                if tensor.is_cuda and not reused_checkpoint_load_views:
+                    gc.collect(0)
+                    torch.cuda.empty_cache()
             return result
 
         elif (
@@ -1038,7 +1079,7 @@ class MoESplitExpertsStateDictMixin:
                 and len(splits) > 0
                 and not is_dtensor(splits[0])
                 and not quantization
-                and down_storage_aliases
+                and down_storage_is_model_weight
             )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
@@ -1049,7 +1090,7 @@ class MoESplitExpertsStateDictMixin:
                 if inplace_ok:
                     w_down = w.transpose(0, 1)
                 else:
-                    w_down = w.transpose(0, 1).contiguous()
+                    w_down = checkpoint_load_destination(w.transpose(0, 1), w)
                 result.append(
                     (
                         f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.down_proj.weight",
@@ -1059,8 +1100,9 @@ class MoESplitExpertsStateDictMixin:
             # See gate_and_up branch above for the cleanup rationale.
             del splits
             if not inplace_ok and isinstance(tensor, torch.Tensor) and not tensor.is_meta and torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.empty_cache()
+                if tensor.is_cuda and not reused_checkpoint_load_views:
+                    gc.collect(0)
+                    torch.cuda.empty_cache()
             return result
 
         # MoE expert LoRA keys: convert to HF-PEFT-compatible format.

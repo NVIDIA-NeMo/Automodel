@@ -125,7 +125,6 @@ distributed:
         cost_alpha: auto
 
 freeze_config:
-  freeze_embeddings: false
   freeze_vision_tower: false
   freeze_audio_tower: true
   freeze_language_model: false

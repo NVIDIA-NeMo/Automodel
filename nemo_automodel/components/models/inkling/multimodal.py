@@ -288,13 +288,13 @@ class InklingVisionModel(nn.Module):
             **kwargs: Reserved for the common multimodal calling convention.
 
         Returns:
-            An output whose pooler output has shape ``[patches, text_hidden]``.
+            An output whose pooler output has shape ``[patches, sequence, text_hidden]``.
         """
         del kwargs
         hidden_states = pixel_values
         for layer in self.encoder_layers:
             hidden_states = layer(hidden_states)
-        hidden_states = self.final_norm(hidden_states).reshape(pixel_values.shape[0], -1)
+        hidden_states = self.final_norm(hidden_states).reshape(pixel_values.shape[0], -1, self.config.text_hidden_size)
         return BaseModelOutputWithPooling(last_hidden_state=hidden_states, pooler_output=hidden_states)
 
     @torch.no_grad()
@@ -332,7 +332,7 @@ class InklingModel(nn.Module):
             **kwargs: Reserved for the common multimodal calling convention.
 
         Returns:
-            An output whose pooler output has shape ``[patches, text_hidden]``.
+            An output whose pooler output has shape ``[patches, sequence, text_hidden]``.
         """
         return self.vision_tower(pixel_values, **kwargs)
 

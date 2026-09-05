@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -91,7 +92,12 @@ class MegatronFSDPManager:
         self.fsdp_double_buffer = config.fsdp_double_buffer
         self.activation_checkpointing = config.activation_checkpointing
 
-    def parallelize(self, model, optimizer=None):
+    def parallelize(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer | None = None,
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
+    ) -> tuple[nn.Module, torch.optim.Optimizer | None]:
         """
         Parallelizes the given model using MegatronFSDP and TP sharding strategies.
 
@@ -101,6 +107,8 @@ class MegatronFSDPManager:
                 model.finish_grad_sync() before optimizer.step(),
                 model.install_optimized_model_weights() and model.zero_grad_buffer()
                 after optimizer.zero_grad().
+            reapply_trainability: Optional callback that re-resolves parameter
+                trainability after model surgery and before FSDP construction.
 
         Returns:
             tuple: (parallelized_model, optimizer)
@@ -113,6 +121,8 @@ class MegatronFSDPManager:
                     model.gradient_checkpointing_enable()
                 else:
                     logger.error("Model does not support gradient checkpointing. Skipping.")
+            if reapply_trainability is not None:
+                reapply_trainability(model)
             return model, optimizer
 
         if self.activation_checkpointing:
@@ -170,6 +180,7 @@ class MegatronFSDPManager:
             fsdp_double_buffer=self.fsdp_double_buffer,
             dp_shard_dim=dp_shard_dim,
             tp_dim=tp_dim,
+            reapply_trainability=reapply_trainability,
         )
 
         return model, optimizer

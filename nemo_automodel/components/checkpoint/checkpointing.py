@@ -60,6 +60,7 @@ from nemo_automodel.components.checkpoint._backports.filesystem import FileSyste
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
+    _is_integrated_cuda_device,
     _maybe_rename_index_for_diffusers,
     get_fqn_to_dtype_mapping,
     get_fqn_to_file_index_mapping,
@@ -832,11 +833,10 @@ class Checkpointer:
         # fall behind other ranks' async allocations.
         is_safetensors = _is_safetensors_checkpoint(model_path)
         is_custom_model = _is_custom_model(model_state.model[0])
-        # Custom adapters traditionally took the frugal full-state path here because converting
-        # grouped experts into load destinations could materialize a second on-device copy and OOM.
-        # Adapters whose destinations all alias final model storage can now opt into the standard
-        # DCP path below, which writes checkpoint tensors directly through those views. Keep the CPU
-        # path for non-aliasing backends and quantized initialization, whose conversion allocates.
+        # Custom models traditionally loaded the complete checkpoint on the host because model-specific conversion
+        # could otherwise create a second full copy on the GPU. Use DCP when the adapter can place large checkpoint
+        # tensors directly in model weight memory. An adapter such as Gemma4 may also use a small temporary tensor that
+        # it applies after the read. Other custom adapters and quantized initialization keep the host fallback.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
         if torch.distributed.is_initialized():
@@ -844,13 +844,16 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
-        supports_write_through_checkpoint_load = (
+        can_load_without_full_copy = (
             isinstance(state_dict_adapter, StateDictAdapter)
-            and state_dict_adapter.supports_write_through_checkpoint_load
+            and (
+                state_dict_adapter.supports_write_through_checkpoint_load
+                or state_dict_adapter.supports_checkpoint_load_without_full_copy
+            )
             and not self.config.dequantize_base_checkpoint
         )
         single_device_custom_safetensors = (
-            is_safetensors and is_custom_model and world_size == 1 and not supports_write_through_checkpoint_load
+            is_safetensors and is_custom_model and world_size == 1 and not can_load_without_full_copy
         )
         if (
             is_init_step
@@ -862,7 +865,20 @@ class Checkpointer:
             )
         ):
             t0 = time.monotonic()
-            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
+            # Full-state safetensors remain mmap-backed. Prefault only when the
+            # destination shares host memory; CPU and discrete-GPU paths stay unchanged.
+            # UMA regression guard: do not reintroduce full checkpoint materialization here.
+            model_cuda_devices = {
+                parameter.device
+                for part in model_state.model
+                for parameter in part.parameters()
+                if parameter.device.type == "cuda"
+            }
+            prefault_safetensors = any(_is_integrated_cuda_device(device) for device in model_cuda_devices)
+            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(
+                model_path,
+                prefault_safetensors=prefault_safetensors,
+            )
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
@@ -873,6 +889,7 @@ class Checkpointer:
                 )
             else:
                 state_dict_from_disk = {}
+            t_adapt = time.monotonic()
 
             # Apply key_mapping (e.g. _checkpoint_conversion_mapping) so that
             # HF checkpoint keys are renamed to match the model's parameter FQNs.
@@ -901,13 +918,14 @@ class Checkpointer:
             t_end = time.monotonic()
 
             disk_s = t_disk - t0
-            dist_s = t_end - t_disk
+            adapt_s = t_adapt - t_disk
+            install_s = t_end - t_adapt
             total_s = t_end - t0
             gb = total_bytes / (1 << 30)
             logging.info(
                 f"load_model: {gb:.2f} GB loaded in {total_s:.2f}s "
                 f"({gb / total_s:.2f} GB/s overall | "
-                f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
+                f"disk read {disk_s:.2f}s, adapt {adapt_s:.2f}s, install {install_s:.2f}s)"
             )
             del state_dict_from_disk
             gc.collect()
@@ -935,6 +953,7 @@ class Checkpointer:
             # Only base-checkpoint initialization needs FP8 scale destinations.
             quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
+            for_checkpoint_load=True,
         )
         destinations_ready = time.monotonic()
         requested_bytes = sum(
@@ -1356,7 +1375,7 @@ class Checkpointer:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
                 if is_rank_0():
                     logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
-            except BaseException as e:  # noqa: B036 - re-raised on the main thread in async_wait
+            except BaseException as e:  # Re-raised on the main thread in async_wait.
                 self._consolidation_error = e
 
         self._consolidation_thread = threading.Thread(
@@ -2033,7 +2052,12 @@ def _create_dirs(*dirs: str | None) -> None:
     """Create local directory paths and ignore cloud paths."""
     for directory in dirs:
         if directory and not is_cloud_path(directory):
-            os.makedirs(directory, exist_ok=True)
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except FileExistsError:
+                # virtiofs & co.: a racing rank's mkdir can surface as EEXIST while isdir() lags
+                if not os.path.isdir(directory):
+                    raise
 
 
 def _ensure_dirs(*dirs: str | None, process_group: torch.distributed.ProcessGroup | None = None) -> None:
@@ -2622,7 +2646,11 @@ def _is_custom_model(module: nn.Module) -> bool:
     )
 
 
-def _load_hf_checkpoint_preserving_dtype(model_path: str) -> dict[str, torch.Tensor] | None:
+def _load_hf_checkpoint_preserving_dtype(
+    model_path: str,
+    *,
+    prefault_safetensors: bool = False,
+) -> dict[str, torch.Tensor] | None:
     """
     Load a HuggingFace checkpoint into a new state dict so tensor dtypes
     match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
@@ -2637,19 +2665,40 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> dict[str, torch.Ten
     if _is_bin_checkpoint(model_path):
         return _load_hf_bin_checkpoint(model_path)
     elif _is_safetensors_checkpoint(model_path):
-        return _load_hf_safetensors_checkpoint(model_path)
+        return _load_hf_safetensors_checkpoint(model_path, prefault_mmap=prefault_safetensors)
     return None
 
 
-def _load_hf_safetensors_checkpoint(model_path: str) -> dict[str, torch.Tensor] | None:
+def _load_hf_safetensors_checkpoint(
+    model_path: str,
+    *,
+    prefault_mmap: bool = False,
+) -> dict[str, torch.Tensor] | None:
     """
     Load a safetensors checkpoint into a state dict.
+
+    On integrated CUDA systems, ``prefault_mmap`` reads every file-backed tensor
+    once before installation. This keeps the returned tensors mmap-backed and
+    reclaimable while avoiding page-by-page migration during the later CUDA copy.
     """
     from safetensors import safe_open
 
+    def get_tensor(handle, key: str) -> torch.Tensor:
+        tensor = handle.get_tensor(key)
+        if prefault_mmap:
+            # Fault the mmap pages now, then discard the anonymous copy so the
+            # returned state remains file-backed and reclaimable under pressure.
+            prefaulted = tensor.clone()
+            del prefaulted
+        return tensor
+
     out: dict[str, torch.Tensor] = {}
     if os.path.isfile(model_path):
-        return dict(load_file(model_path))
+        if not prefault_mmap:
+            return dict(load_file(model_path))
+        # load_file hides per-tensor access; safe_open lets us prefault each view.
+        with safe_open(model_path, framework="pt", device="cpu") as f:
+            return {key: get_tensor(f, key) for key in f.keys()}
     # Directory: try index first, then glob
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.isfile(index_file):
@@ -2668,12 +2717,12 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> dict[str, torch.Tensor] 
                 available_keys = set(f.keys())
                 for key in keys:
                     if key in available_keys:
-                        out[key] = f.get_tensor(key)
+                        out[key] = get_tensor(f, key)
     else:
         for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    out[key] = f.get_tensor(key)
+                    out[key] = get_tensor(f, key)
     return out if out else None
 
 
