@@ -255,12 +255,35 @@ generation prompt supplies at inference (the role header and any empty reasoning
 loss mask, so a cache is tied to the options it was produced with: the producer takes the same two
 flags, records them in the manifest, and the cached trainer refuses to start when the recipe
 setting differs from the manifest. To train with `mask_generation_prompt` on a cache, pass the
-flag at both ends:
+flag at both ends.
+
+Both options locate assistant turns by rendering conversation prefixes, like answer-only
+masking on a template without `{% generation %}` blocks, so they need a template that renders
+earlier turns the same way as the conversation grows. The stock Qwen3 template (`Qwen/Qwen3-8B`)
+does not: it drops the `<think>` block from every assistant turn before the last user query, so
+a multi-turn sample fails while rendering its first assistant turn, whether or not the flags are
+set. With that template keep the data single-turn (PerfectBlend holds 2-72-turn conversations),
+or supply a prefix-stable or `{% generation %}` template; Qwen3-Instruct-2507 renders history
+stably and needs no filtering.
+
+```python
+from pathlib import Path
+from datasets import load_dataset
+
+def single_turn(row):
+    roles = [m["role"] for m in row["messages"]]
+    return roles.count("assistant") == 1 and roles[-1] == "assistant"
+
+out = Path("./cache/dataset/perfectblend-qwen3-8b-regen-single-turn")
+out.mkdir(parents=True, exist_ok=True)
+ds = load_dataset("./cache/dataset/perfectblend-qwen3-8b-regen-messages", split="train")
+ds.filter(single_turn).to_parquet(out / "train.parquet")
+```
 
 ```bash
 python -m nemo_automodel.components.speculative.precompute_eagle3 \
   --target-model Qwen/Qwen3-8B \
-  --input-data ./cache/dataset/perfectblend-qwen3-8b-regen-messages \
+  --input-data ./cache/dataset/perfectblend-qwen3-8b-regen-single-turn \
   --output-dir ./cache/eagle3_qwen3_8b_maskgen \
   --mask-generation-prompt
 ```
@@ -271,8 +294,8 @@ recipe_args:
   mask_generation_prompt: true
 ```
 
-The online backends (`colocated`, `remote`) need only the `recipe_args` key; see the commented
-line in `eagle3/qwen3_eagle3_perfectblend.yaml`.
+The online backends (`colocated`, `remote`) need only the `recipe_args` key, under the same
+template constraint; see the commented line in `eagle3/qwen3_eagle3_perfectblend.yaml`.
 
 For DSpark targets too large to fit on one node (DeepSeek-V4-Flash, GLM-5.2), a
 **distributed** precompute (`precompute_dspark_dist.py`) loads the target frozen

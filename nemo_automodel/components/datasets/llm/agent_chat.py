@@ -803,7 +803,9 @@ def make_agent_chat_dataset(
                 padding=False,
                 truncation=True,
                 mask_reasoning_content=mask_reasoning_content,
-                mask_generation_prompt=mask_generation_prompt,
+                # Only the length is read here and the loss-mask options never change
+                # input_ids, so skip the generation-prompt renders on this probe.
+                mask_generation_prompt=False,
                 train_on_last_turn_only=train_on_last_turn_only,
                 drop_history_reasoning_content=drop_history_reasoning_content,
                 truncate_history=truncate_history,

@@ -170,11 +170,13 @@ def _build_multiturn_assistant_mask(
       its closing boundary is the full conversation, so passing it skips
       re-tokenizing the entire prefix (the single most expensive call in the
       loop). When omitted, the full conversation is tokenized once here.
-    - Prefix renders are memoized in ``prefix_cache`` (``k`` -> ids of
-      ``formatted_text[:k]``) so a boundary shared by adjacent turns (a turn's
-      end and the next turn's start) is tokenized at most once. Passing the
-      same dict to :func:`_build_generation_prompt_mask` lets it reuse these
-      renders instead of repeating them.
+    - Each prefix length is memoized so a boundary shared by adjacent turns (a
+      turn's end and the next turn's start) is tokenized at most once. When the
+      caller passes a ``prefix_cache`` dict (``k`` -> ids of
+      ``formatted_text[:k]``) the rendered ids are kept in it as well, so
+      :func:`_build_generation_prompt_mask` can reuse these renders instead of
+      repeating them; without one only the lengths are retained, since holding
+      every prefix render would cost O(turns x sequence length) per sample.
 
     Every tokenized prefix is validated against ``unpadded_full_ids`` (see
     :func:`_is_consistent_render_prefix`). A known trailing EOS may differ when
@@ -192,12 +194,13 @@ def _build_multiturn_assistant_mask(
             truncation=truncation,
             seq_length=seq_length,
         )
-    if prefix_cache is None:
-        prefix_cache = {}
-    prefix_cache.setdefault(len(formatted_text), unpadded_full_ids)
+    length_cache: Dict[int, int] = {len(formatted_text): len(unpadded_full_ids)}
+    if prefix_cache is not None:
+        prefix_cache.setdefault(len(formatted_text), unpadded_full_ids)
+        length_cache.update((k, len(ids)) for k, ids in prefix_cache.items())
 
     def prefix_length(k: int) -> int:
-        if k not in prefix_cache:
+        if k not in length_cache:
             prefix_ids = _tokenize_chat(
                 tokenizer,
                 formatted_text[:k],
@@ -218,8 +221,10 @@ def _build_multiturn_assistant_mask(
                     f"wraps assistant turns in {{% generation %}}...{{% endgeneration %}} so the "
                     f"tokenizer returns the assistant mask directly."
                 )
-            prefix_cache[k] = prefix_ids
-        return len(prefix_cache[k])
+            length_cache[k] = len(prefix_ids)
+            if prefix_cache is not None:
+                prefix_cache[k] = prefix_ids
+        return length_cache[k]
 
     for idx, message in enumerate(formatted_text):
         if message["role"] != "assistant":
@@ -326,11 +331,13 @@ def _generation_prefix_bound(
     Removing the text can also merge the template's own characters into one
     token: Qwen3-Thinking renders a reasoning turn as ``<think>\\n`` + text,
     and with no text the ``\\n`` fuses with the ``\\n</think>`` that follows
-    into a single ``\\n\\n`` token. Both renders agree on every character up
-    to that token, and the empty render's token there is template text only,
-    so when the real turn's token is a strict prefix of it (compared through
-    ``convert_ids_to_tokens``) that token is template text as well and the
-    empty bound moves past it. The non-empty sentinels still cap the result.
+    into a single ``\\n\\n`` token, so the empty render diverges from the real
+    turn one token before the text starts. The bound stops there and that
+    ``\\n`` keeps its supervision. Extending it would need a proof on the
+    rendered text that the real token lies inside the template's characters;
+    a prefix relation between tokenizer-internal token strings is not one
+    (byte-level tokens can share an internal prefix while their decoded text
+    differs), so the comparison is on token ids only and fails closed.
     """
     tails: list[list[int]] = []
     for sentinel in _SENTINEL_TEXTS:
@@ -343,21 +350,7 @@ def _generation_prefix_bound(
         return 0
     bound = min(_common_prefix_length(tail, turn) for tail in sentinels)
     bound = min(bound, _common_prefix_length(*sentinels))
-    empty_bound = _common_prefix_length(empty, turn)
-    if empty_bound < min(bound, len(empty)) and _is_strict_token_prefix(
-        tokenizer, turn[empty_bound], empty[empty_bound]
-    ):
-        empty_bound += 1
-    return min(bound, empty_bound)
-
-
-def _is_strict_token_prefix(tokenizer: "PreTrainedTokenizer", short_id: int, long_id: int) -> bool:
-    """Return whether the string of token ``short_id`` is a strict prefix of that of ``long_id``."""
-    convert = getattr(tokenizer, "convert_ids_to_tokens", None)
-    if convert is None:
-        return False
-    short, long = convert(short_id), convert(long_id)
-    return isinstance(short, str) and isinstance(long, str) and len(short) < len(long) and long.startswith(short)
+    return min(bound, _common_prefix_length(empty, turn))
 
 
 def _common_prefix_length(left: list[int], right: list[int]) -> int:
@@ -1075,8 +1068,10 @@ def format_chat_template(
     # of each rebuilding it. None (recompute in the builder) when no
     # attention_mask is available.
     _unpadded_full_ids_memo: "dict[str, list[int] | None]" = {}
-    # Prefix renders (k -> ids of formatted_text[:k]) shared by the mask builders.
-    prefix_cache: dict[int, list[int]] = {}
+    # Prefix renders (k -> ids of formatted_text[:k]) shared by the mask builders. Only
+    # the generation-prompt builder reuses the ids; without it the multiturn builder
+    # keeps prefix lengths alone rather than every render.
+    prefix_cache: dict[int, list[int]] | None = {} if mask_generation_prompt else None
 
     def unpadded_full_ids() -> "list[int] | None":
         if "value" not in _unpadded_full_ids_memo:
