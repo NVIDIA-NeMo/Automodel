@@ -426,6 +426,9 @@ class MiMoV2FlashModel(nn.Module):
             expert_activation="swiglu",
             softmax_before_topk=False,
             force_e_score_correction_bias=True,
+            # The checkpoint stores fp32 gates; the reference router returns fp32 weights.
+            gate_dtype=torch.float32,
+            router_weights_fp32=True,
             dtype=get_dtype(config.torch_dtype, torch.bfloat16),
         )
         if moe_overrides:
@@ -593,7 +596,12 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # "rotary_emb" (matches self.rotary_emb + self.swa_rotary_emb) pins their inv_freq
     # buffers in fp32: cast_model_to_dtype's bf16 cast would otherwise round inv_freq and
     # degrade RoPE precision vs HF (see llama/rope_utils.py).
-    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias", "rotary_emb"]
+    _keep_in_fp32_modules_strict = [
+        "mlp.gate.weight",
+        "mlp.gate.e_score_correction_bias",
+        "attention_sink_bias",
+        "rotary_emb",
+    ]
     _pp_keep_self_forward = True
     _skip_init_weights_on_load = True
 

@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
 from nemo_automodel.components.models.mimo_v2_flash.model import (
     MiMoV2FlashAttention,
@@ -292,12 +293,73 @@ class TestMiMoV2FlashForCausalLM:
         model.set_output_embeddings(new_head)
         assert model.lm_head is new_head
 
-    def test_keep_in_fp32_modules_strict_includes_buffers(self):
-        """Buffers stay in fp32 regardless of activation dtype; gate weight is bf16 (Pattern A)."""
-        assert "mlp.gate.e_score_correction_bias" in MiMoV2FlashForCausalLM._keep_in_fp32_modules_strict
-        assert "attention_sink_bias" in MiMoV2FlashForCausalLM._keep_in_fp32_modules_strict
-        # gate weight is no longer kept in fp32 (Pattern A uses gate_precision instead).
-        assert "mlp.gate.weight" not in MiMoV2FlashForCausalLM._keep_in_fp32_modules_strict
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_router_checkpoint_precision(self, tiny_config, backend_config, dtype):
+        tiny_config.torch_dtype = dtype
+        backend_config.enable_hf_state_dict_adapter = True
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
+        gate = model.model.layers["1"].mlp.gate
+        assert gate.weight.dtype == torch.float32
+        torch.manual_seed(17)
+        checkpoint_weight = torch.randn(gate.weight.shape, dtype=torch.float32)
+        key = "model.layers.1.mlp.gate.weight"
+        state_dict = model.state_dict_adapter.from_hf({key: checkpoint_weight})
+        model.load_state_dict(state_dict, strict=False)
+        cast_model_to_dtype(model, dtype)
+        torch.testing.assert_close(gate.weight, checkpoint_weight, rtol=0, atol=0)
+        exported = model.state_dict_adapter.to_hf({key: gate.weight.detach()})
+        torch.testing.assert_close(exported[key], checkpoint_weight, rtol=0, atol=0)
+        assert model.lm_head.weight.dtype == dtype
+
+    @pytest.mark.parametrize("n_group", [1, 2])
+    def test_router_fp32_weights_and_gradients(self, tiny_config, backend_config, n_group):
+        tiny_config.torch_dtype = torch.bfloat16
+        tiny_config.n_group = n_group
+        tiny_config.topk_group = 1
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
+        gate = model.model.layers["1"].mlp.gate
+        torch.manual_seed(42)
+        with torch.no_grad():
+            gate.weight.copy_(torch.randn_like(gate.weight))
+            gate.e_score_correction_bias.zero_()
+        hidden_states = torch.randn(8, tiny_config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+        weights, indices, _ = gate(hidden_states, token_mask=None, cp_mesh=None)
+        assert weights.dtype == torch.float32
+        reference_input = hidden_states.detach().clone().requires_grad_()
+        reference_weight = gate.weight.detach().clone().requires_grad_()
+        scores = torch.nn.functional.linear(reference_input.float(), reference_weight.float()).sigmoid()
+        scores_for_choice = scores
+        if n_group > 1:
+            group_scores = scores.view(8, n_group, -1).topk(2, dim=-1).values.sum(dim=-1)
+            group_indices = group_scores.topk(1, dim=-1).indices
+            group_mask = torch.zeros_like(group_scores).scatter_(1, group_indices, 1)
+            mask = group_mask.unsqueeze(-1).expand(8, n_group, tiny_config.n_routed_experts // n_group)
+            scores_for_choice = scores.masked_fill(~mask.reshape_as(scores).bool(), float("-inf"))
+        expected_indices = scores_for_choice.topk(tiny_config.num_experts_per_tok, dim=-1).indices
+        expected_weights = scores.gather(1, expected_indices)
+        expected_weights = expected_weights / (expected_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        expected_weights = expected_weights * tiny_config.routed_scaling_factor
+        torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
+        torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+        upstream_gradient = torch.randn_like(weights)
+        weights.backward(upstream_gradient)
+        expected_weights.backward(upstream_gradient)
+        torch.testing.assert_close(hidden_states.grad, reference_input.grad, rtol=0, atol=0)
+        torch.testing.assert_close(gate.weight.grad, reference_weight.grad, rtol=0, atol=0)
+
+    def test_router_output_precision_override(self, tiny_config, backend_config):
+        tiny_config.torch_dtype = torch.bfloat16
+        model = MiMoV2FlashForCausalLM(
+            tiny_config, backend=backend_config, moe_overrides={"router_weights_fp32": False}
+        )
+        gate = model.model.layers["1"].mlp.gate
+        with torch.no_grad():
+            gate.weight.zero_()
+            gate.e_score_correction_bias.zero_()
+        weights, _, _ = gate(
+            torch.ones(2, tiny_config.hidden_size, dtype=torch.bfloat16), token_mask=None, cp_mesh=None
+        )
+        assert weights.dtype == torch.bfloat16
 
     def test_customize_pipeline_stage_modules_keeps_swa_rotary(self, tiny_config, backend_config):
         model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
