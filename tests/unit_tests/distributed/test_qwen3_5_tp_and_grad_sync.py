@@ -72,6 +72,18 @@ class TestGetHfTpShardPlanSkipsNoneStyles:
         assert "model.layers.0.self_attn.q_proj" in plan
         assert "model.layers.0.self_attn.q_norm" not in plan
 
+    def test_none_styled_module_is_marked_for_sum_reduction(self):
+        model = self._build_model_with_inner_plan(
+            {
+                "q_norm": "replicated_with_grad_allreduce",
+            }
+        )
+        model.model.q_norm = nn.LayerNorm(4)
+
+        parallelizer.get_hf_tp_shard_plan(model)
+
+        assert model.model.q_norm._nemo_tp_replica_grad_reduction == "sum"
+
 
 class TestParallelizeQwen35VlmRegistered:
     """_parallelize_qwen3_5_vlm is registered in PARALLELIZE_FUNCTIONS and
