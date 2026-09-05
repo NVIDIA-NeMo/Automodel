@@ -1195,13 +1195,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
-    def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
-        pp_group = self.device_mesh["pp"].get_group()
-        pp_src_rank = torch.distributed.get_global_rank(pp_group, torch.distributed.get_world_size(pp_group) - 1)
-        torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
-        return tensor
-
     def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 

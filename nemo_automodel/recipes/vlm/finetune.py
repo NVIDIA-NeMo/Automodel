@@ -602,8 +602,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
+        model_attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
-            model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
+            model_attn_implementation=model_attn_implementation,
             cp_size=self.mesh_context.cp_size,
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
@@ -629,6 +630,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.val_dataloader = None
         validation_config = self.cfg.vlm_validation_dataloader
         if validation_config is not None:
+            if self.pp_enabled and not validation_config.drop_last:
+                raise ValueError(
+                    "Pipeline-parallel VLM validation requires validation_dataloader.drop_last=true because "
+                    "AutoPipeline uses a fixed outer batch size. Enable drop_last or remove validation_dataset."
+                )
+            _validate_cp_packing_support(
+                self.model_parts[0],
+                packing_enabled=validation_config.packing is not None,
+                cp_size=self.mesh_context.cp_size,
+            )
+            validation_packing_attn_implementation = validation_config.resolve_packing_attn_implementation(
+                model_attn_implementation=model_attn_implementation,
+                cp_size=self.mesh_context.cp_size,
+            )
+            if validation_config.packing is not None and validation_config.packing.packing_format != "thd":
+                configure_packing(attn_implementation=validation_packing_attn_implementation)
             validation_build_context = FirstRankPerNode(group=process_group)
             with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
                 validation_build = validation_config.build(
@@ -638,6 +655,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                     dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
+                    packing_attn_implementation=validation_packing_attn_implementation,
+                    pp_n_microbatches=pp_n_microbatches,
                     cp_size=self.mesh_context.cp_size,
                 )
             self.val_dataloader = validation_build.dataloader
@@ -701,12 +720,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                     val_loss = {}
                     if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                        if self.pp_enabled:
-                            logger.warning("Validation is not supported for pipeline parallelism")
-                        else:
-                            val_log_data = self._run_validation_epoch(self.val_dataloader)
-                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_log_data)
+                        val_log_data = self._run_validation_epoch(self.val_dataloader)
+                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                        self.log_val_metrics(val_log_data)
                         for mp in self.model_parts:
                             mp.train()
 
@@ -915,10 +931,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         labels = batch.pop("labels")
 
         if self.pp_enabled:
-            if not is_train:
-                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
-                return
-
             with self._cp_vision_frame_sharding_context(), train_ctx():
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
@@ -933,7 +945,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self._maybe_set_pp_first_stage_embed_input_meta(model_input)
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
-                    self.pp.step(model_input, target=targets, losses=losses, **batch)
+                    if is_train:
+                        self.pp.step(model_input, target=targets, losses=losses, **batch)
+                    else:
+                        # Forward-only: validation must not enqueue backward work on
+                        # the schedule, which would also desync the other stages.
+                        self.pp.eval(model_input, target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1183,7 +1200,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):
-        """Run one pass over `self.val_dataloader`."""
+        """Run one pass over `self.val_dataloader`.
+
+        Args:
+            val_dataloader: Iterable of collated VLM batches. Each batch maps model
+                input names to tensors; ``labels`` has shape [batch, sequence] and
+                marks unsupervised positions with ``-100``.
+
+        Returns:
+            MetricsSample whose ``val_loss`` is the mean loss per supervised label
+            token over the whole pass.
+        """
+        if self.pp_enabled:
+            return self._run_pp_validation_epoch(val_dataloader)
+
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
@@ -1253,6 +1283,77 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 "num_label_tokens": total_num_label_tokens,
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
             },
+        )
+
+    @torch.no_grad()
+    def _run_pp_validation_epoch(self, val_dataloader) -> MetricsSample:
+        """Run one validation pass under pipeline parallelism.
+
+        Every batch goes through the same ``_forward_backward_step`` path as
+        training -- media staging, stage-shape updates and CP sharding included --
+        but with the schedule's forward-only entry point, so only the last stage
+        produces a loss.
+
+        Args:
+            val_dataloader: Iterable of collated VLM batches. Each batch maps model
+                input names to tensors; ``labels`` has shape [batch, sequence] and
+                marks unsupervised positions with ``-100``.
+
+        Returns:
+            MetricsSample whose ``val_loss`` is the mean loss per supervised label
+            token, matching the non-PP path's metric.
+        """
+        with ScopedRNG(seed=1, ranked=True):
+            for mp in self.model_parts:
+                mp.eval()
+
+            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
+            total_num_label_tokens = 0
+
+            for batch in val_dataloader:
+                loss_buffer = []
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+                self._forward_backward_step(
+                    0,
+                    batch,
+                    loss_buffer=loss_buffer,
+                    num_label_tokens=None,  # we will normalize outside.
+                    num_batches=1,
+                    is_train=False,
+                )
+
+                total_loss += torch.sum(torch.stack(loss_buffer)).item()
+                total_num_label_tokens += num_label_tokens
+
+        total_loss = self._dp_allreduce(total_loss, include_cp=True)
+        total_num_label_tokens = self._dp_allreduce(
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+        ).item()
+        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+
+        # For PP, send val_loss and num_label_tokens from last stage to main rank
+        if self.pp_enabled:
+            val_loss = val_loss.to(self.dist_env.device)
+            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
+            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+            val_loss = self._broadcast_from_last_pp_stage(val_loss)
+            pp_num_tokens = self._broadcast_from_last_pp_stage(pp_num_tokens)
+            if self.dist_env.is_main:
+                total_num_label_tokens = pp_num_tokens.item()
+
+        val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
+
+        metrics = {
+            "val_loss": val_loss,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "num_label_tokens": total_num_label_tokens,
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+        }
+
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics=metrics,
         )
 
     def log_val_metrics(self, log_data):
