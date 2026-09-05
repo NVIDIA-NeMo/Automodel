@@ -48,6 +48,7 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
+from torch.distributed.checkpoint.metadata import BytesStorageMetadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel
@@ -314,14 +315,14 @@ def _summarize_state_dict_key_diff(
     }
 
 
-def _get_checkpoint_metadata_keys(
+def _get_checkpoint_state_dict_metadata(
     path: str,
     storage_reader: StorageReader | None = None,
-) -> set[str]:
-    """Return checkpoint FQNs present in metadata."""
+) -> dict[str, TensorStorageMetadata | BytesStorageMetadata]:
+    """Return checkpoint FQN -> storage metadata mapping."""
     reader = storage_reader if storage_reader is not None else FileSystemReader(path)
     metadata = reader.read_metadata()
-    return set(metadata.state_dict_metadata.keys())
+    return dict(metadata.state_dict_metadata)
 
 
 if _is_geq_torch_2_9():
@@ -965,15 +966,42 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
+        checkpoint_metadata: dict[str, TensorStorageMetadata | BytesStorageMetadata] = {}
         checkpoint_metadata_keys: set[str] = set()
-        extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
+        extra_state_keys = sorted(key for key in state_dict if key.rsplit(".", 1)[-1] == "_extra_state")
+        # Reinsert missing entries after DCP so strict module loading retains them.
+        preserved_extra_state: dict[str, Any] = {}
         if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys:
-            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            checkpoint_metadata = _get_checkpoint_state_dict_metadata(model_path, storage_reader)
+            checkpoint_metadata_keys = set(checkpoint_metadata.keys())
+            # DCP flattens dictionary/list extra state into descendant FQNs. Key
+            # compatibility checks operate on module entries, not those leaves;
+            # keep the original metadata mapping for tensor allocation below.
+            for key in checkpoint_metadata:
+                parts = key.split(".")
+                if "_extra_state" in parts:
+                    checkpoint_metadata_keys.discard(key)
+                    checkpoint_metadata_keys.add(".".join(parts[: parts.index("_extra_state") + 1]))
         if extra_state_keys:
             missing_extra_state_keys = [key for key in extra_state_keys if key not in checkpoint_metadata_keys]
             if missing_extra_state_keys:
+                required_missing = [
+                    key
+                    for key in missing_extra_state_keys
+                    if not is_init_step
+                    and not (
+                        type(state_dict[key]) is torch.Tensor
+                        and state_dict[key].dtype == torch.uint8
+                        and state_dict[key].ndim == 1
+                        and state_dict[key].numel() == 0
+                    )
+                ]
+                if required_missing:
+                    raise RuntimeError(
+                        f"Checkpoint {model_path} is missing required module extra state: {required_missing[:10]}"
+                    )
                 for key in missing_extra_state_keys:
-                    state_dict.pop(key, None)
+                    preserved_extra_state[key] = state_dict.pop(key)
                 logging.warning(
                     "Checkpoint %s is missing %d requested module _extra_state keys. Keeping current module "
                     "extra state for those entries (examples=%s).",
@@ -981,6 +1009,24 @@ class Checkpointer:
                     len(missing_extra_state_keys),
                     missing_extra_state_keys[:10],
                 )
+            # Serialized byte state (e.g. TE quantizer state) has a checkpoint-owned
+            # length, not a parameter shape. A fresh module may return an empty
+            # placeholder even when resuming the same recipe. Allocate its full saved
+            # payload for DCP and let set_extra_state validate/restore it; dropping it
+            # would silently reset training state. Other tensor contracts stay strict.
+            for key in extra_state_keys:
+                saved_meta = checkpoint_metadata.get(key)
+                current = state_dict.get(key)
+                if (
+                    type(current) is torch.Tensor
+                    and current.dtype == torch.uint8
+                    and current.ndim == 1
+                    and isinstance(saved_meta, TensorStorageMetadata)
+                    and saved_meta.properties.dtype == torch.uint8
+                    and len(saved_meta.size) == 1
+                    and saved_meta.size != current.size()
+                ):
+                    state_dict[key] = torch.empty(saved_meta.size, dtype=current.dtype, device=current.device)
         if should_try_tied_lm_head_compat:
             if lm_head_param_name not in checkpoint_metadata_keys:
                 for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):
@@ -1048,6 +1094,10 @@ class Checkpointer:
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
         storage_read_complete = time.monotonic()
+
+        # Missing extra state keeps its current value while satisfying strict loading.
+        if preserved_extra_state:
+            state_dict.update(preserved_extra_state)
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
