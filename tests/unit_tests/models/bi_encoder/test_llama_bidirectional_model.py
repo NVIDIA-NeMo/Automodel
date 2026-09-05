@@ -91,6 +91,7 @@ def test_llama_bidirectional_config_fields():
     assert cfg.pooling == "cls"
     # Some downstream configs may overwrite; just ensure attribute exists and is float-like
     assert isinstance(cfg.temperature, float)
+    assert cfg.is_causal is False
 
 
 def test_llama_bidirectional_sequence_classification_auto_class_registration():
@@ -213,6 +214,30 @@ def test_bidirectional_attention_is_symmetric():
     assert not torch.allclose(out_base[0, 0], out_modified[0, 0], atol=1e-6), (
         "Bidirectional model: changing last token should affect first token's hidden state"
     )
+
+
+def test_causal_attention_blocks_future_token_influence():
+    """Causal mode uses the parent mask and blocks future tokens."""
+    cfg = LlamaBidirectionalConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        intermediate_size=64,
+        pad_token_id=0,
+        is_causal=True,
+    )
+    model = LlamaBidirectionalModel(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    modified = input_ids.clone()
+    modified[0, -1] = (modified[0, -1] + 1) % cfg.vocab_size
+
+    with torch.no_grad():
+        original = model(input_ids=input_ids).last_hidden_state
+        changed = model(input_ids=modified).last_hidden_state
+
+    assert all(layer.self_attn.is_causal is True for layer in model.layers)
+    torch.testing.assert_close(original[0, 0], changed[0, 0])
 
 
 # --- Fakes for classification and encoder tests ---

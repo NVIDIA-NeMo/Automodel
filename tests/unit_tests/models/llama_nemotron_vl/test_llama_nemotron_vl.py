@@ -23,6 +23,7 @@ from transformers.processing_utils import ProcessorMixin
 
 from nemo_automodel.components.models.llama_nemotron_vl.model import (
     LlamaBidirectionalConfig,
+    LlamaBidirectionalModel,
     LlamaNemotronVLConfig,
     LlamaNemotronVLModel,
 )
@@ -517,6 +518,34 @@ def test_fast_image_processor_preprocess_honors_image_kwargs(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_llama_nemotron_text_backbone_honors_attention_policy(is_causal):
+    """The multimodal language tower supports both saved attention policies."""
+    config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        is_causal=is_causal,
+    )
+    model = LlamaBidirectionalModel(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    modified = input_ids.clone()
+    modified[0, -1] = (modified[0, -1] + 1) % config.vocab_size
+
+    with torch.no_grad():
+        original = model(input_ids=input_ids).last_hidden_state
+        changed = model(input_ids=modified).last_hidden_state
+
+    assert all(layer.self_attn.is_causal is is_causal for layer in model.layers)
+    if is_causal:
+        torch.testing.assert_close(original[0, 0], changed[0, 0])
+    else:
+        assert not torch.allclose(original[0, 0], changed[0, 0])
+
+
 def test_llama_nemotron_vl_config_builds_composed_subconfigs():
     config = LlamaNemotronVLConfig(
         vision_config=_tiny_vision_config(),
@@ -533,6 +562,21 @@ def test_llama_nemotron_vl_config_builds_composed_subconfigs():
     assert config.q_max_length == 13
     assert config.p_max_length == 21
     assert config.pooling == "avg"
+    assert config.get_text_config(decoder=True) is config.llm_config
+
+
+def test_llama_nemotron_vl_config_accepts_but_drops_legacy_attention_field():
+    """Legacy outer attention metadata loads without overriding the text policy."""
+    llm_config = _tiny_llm_config()
+    llm_config["is_causal"] = True
+    config = LlamaNemotronVLConfig(
+        vision_config=_tiny_vision_config(),
+        llm_config=llm_config,
+        bidirectional_attention=True,
+    )
+
+    assert config.llm_config.is_causal is True
+    assert "bidirectional_attention" not in config.to_dict()
 
 
 def test_llama_nemotron_vl_config_rejects_unsupported_vision_model():
