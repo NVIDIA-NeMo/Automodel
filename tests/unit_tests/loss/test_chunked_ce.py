@@ -270,3 +270,55 @@ def test_chunked_cross_entropy_cuda_bf16_matches_fp32_reference():
     reference.backward()
     torch.cuda.synchronize(device)
     torch.testing.assert_close(logits.grad.float(), reference_logits.grad, rtol=2e-2, atol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# Chunking must not change the answer, for every reduction
+# ---------------------------------------------------------------------------
+
+
+class TestReductionIsChunkInvariant:
+    """``chunk_len`` is a memory knob; it must not alter the returned loss.
+
+    The fallback loop accumulated per-chunk results, which is only valid for
+    ``sum``: summing per-chunk *means* returned ``num_chunks`` x the loss, and
+    adding per-chunk *vectors* returned ``chunk_len`` values instead of one per
+    token. Both were silent.
+    """
+
+    N, V = 512, 16
+
+    def _batch(self, with_ignored=True):
+        torch.manual_seed(0)
+        logits = torch.randn(self.N, self.V)
+        labels = torch.randint(0, self.V, (self.N,))
+        if with_ignored:
+            labels[::7] = -100  # scatter ignored positions across chunk boundaries
+        return logits, labels
+
+    # 96 and 100 do not divide 512 evenly; 512 is a single chunk.
+    CHUNK_LENS = [1, 32, 96, 100, 128, 512]
+
+    @pytest.mark.parametrize("chunk_len", CHUNK_LENS)
+    @pytest.mark.parametrize("with_ignored", [False, True])
+    def test_mean_matches_reference(self, chunk_len, with_ignored):
+        logits, labels = self._batch(with_ignored)
+        ref = F.cross_entropy(logits.float(), labels, reduction="mean", ignore_index=-100)
+        got = ChunkedCrossEntropy(reduction="mean", chunk_len=chunk_len, compile=False)(logits.clone(), labels.clone())
+        assert torch.allclose(got, ref, rtol=1e-5, atol=1e-5), f"chunk_len={chunk_len}: {got} vs {ref}"
+
+    @pytest.mark.parametrize("chunk_len", CHUNK_LENS)
+    def test_none_returns_one_value_per_token(self, chunk_len):
+        logits, labels = self._batch()
+        ref = F.cross_entropy(logits.float(), labels, reduction="none", ignore_index=-100)
+        got = ChunkedCrossEntropy(reduction="none", chunk_len=chunk_len, compile=False)(logits.clone(), labels.clone())
+        assert got.shape == (self.N,), f"chunk_len={chunk_len}: got {tuple(got.shape)}"
+        assert torch.allclose(got, ref, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("chunk_len", CHUNK_LENS)
+    def test_sum_matches_reference(self, chunk_len):
+        """The default reduction, unchanged by this fix -- guards against regression."""
+        logits, labels = self._batch()
+        ref = F.cross_entropy(logits.float(), labels, reduction="sum", ignore_index=-100)
+        got = ChunkedCrossEntropy(reduction="sum", chunk_len=chunk_len)(logits.clone(), labels.clone())
+        assert torch.allclose(got, ref, rtol=1e-4, atol=1e-4)
