@@ -338,6 +338,17 @@ def _generation_prefix_bound(
     a prefix relation between tokenizer-internal token strings is not one
     (byte-level tokens can share an internal prefix while their decoded text
     differs), so the comparison is on token ids only and fails closed.
+
+    Token ids alone also cannot tell a template's closing token from a
+    content token that maps to the same id (through normalization or an UNK
+    mapping): with a header-less turn whose closing ``<eot>`` and content
+    marker ``<word_start>`` share an id, the empty render ``[X]`` is a prefix
+    of the real turn ``[X, text..., X]`` although its only token is the
+    closing. The empty render is therefore also aligned from its end: it is
+    ``template prefix + closing`` and each sentinel render is ``template
+    prefix + text + closing``, so their common suffix is at least the
+    closing, and no token inside it may be masked. Everything a token could
+    be is excluded; the two alignments never overlap.
     """
     tails: list[list[int]] = []
     for sentinel in _SENTINEL_TEXTS:
@@ -350,7 +361,17 @@ def _generation_prefix_bound(
         return 0
     bound = min(_common_prefix_length(tail, turn) for tail in sentinels)
     bound = min(bound, _common_prefix_length(*sentinels))
-    return min(bound, _common_prefix_length(empty, turn))
+    bound = min(bound, _common_prefix_length(empty, turn))
+    closing = max(_common_suffix_length(empty, tail) for tail in sentinels)
+    return max(0, min(bound, len(empty) - closing))
+
+
+def _common_suffix_length(left: list[int], right: list[int]) -> int:
+    """Return the number of trailing elements ``left`` and ``right`` share."""
+    n = 0
+    while n < min(len(left), len(right)) and left[-(n + 1)] == right[-(n + 1)]:
+        n += 1
+    return n
 
 
 def _common_prefix_length(left: list[int], right: list[int]) -> int:

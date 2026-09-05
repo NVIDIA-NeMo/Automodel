@@ -2179,6 +2179,37 @@ def test_mask_generation_prompt_bound_ignores_token_string_prefix_relation():
     assert _decode(tok, masked) == body
 
 
+def test_mask_generation_prompt_bound_fails_closed_when_closing_and_content_tokens_collide():
+    # The content-owned <word_start> marker and the closing <eot> map to the same id (as
+    # normalization or an UNK mapping can do). On the header-less continuation turn the empty
+    # render is then [X] and a prefix of the real turn [X, text..., X], so prefix comparison
+    # alone would mask the generated marker. Aligning the empty render from its end recognizes
+    # that X as the closing: nothing of the continuation turn is masked, and the tool-call turn
+    # still loses exactly its <assistant> header.
+    class _Colliding(_StubTokenizerChatNoGenGemmaLikeWordStart):
+        chat_template = "<dummy gemma-like colliding template>"
+
+        def _id_for_token(self, tok: str) -> int:
+            return super()._id_for_token("<eot>" if tok == "<word_start>" else tok)
+
+    tok = _Colliding()
+    text = "The weather in Paris is sunny."
+    messages = [
+        {"role": "user", "content": text},
+        {"role": "assistant", "content": "", "tool_calls": _TOOL_CALL},
+        {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        {"role": "assistant", "content": text},
+    ]
+    default = _format(tok, messages)
+    masked = _format(tok, messages, mask_generation_prompt=True)
+    assert masked["input_ids"] == default["input_ids"]
+    final_span = len(text.split()) + 2  # <word_start> (== <eot> id), words, <eot>
+    assert default["loss_mask"][-final_span:] == [1] * final_span
+    assert masked["loss_mask"][-final_span:] == [1] * final_span
+    header = default["input_ids"].index(tok._id_for_token("<assistant>"), 1)
+    assert [i for i, (a, b) in enumerate(zip(default["loss_mask"], masked["loss_mask"])) if a != b] == [header]
+
+
 class _StubTokenizerChatNoGenQwen3ThinkingLike(_StubTokenizerChatNoGen):
     """Qwen3-Thinking style: a reasoning turn renders ``<assistant> <think> \\n reasoning \\n
     </think> \\n\\n content EOS`` and the generation prompt is ``<assistant> <think> \\n``. The
