@@ -70,7 +70,7 @@ _HF_TO_NATIVE_RENAMES: tuple[tuple[re.Pattern[str], str], ...] = (
 class HyMT2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Bridges Automodel native (grouped experts) and on-disk Hy-MT2 HF format."""
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,
@@ -92,7 +92,7 @@ class HyMT2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         **kwargs,
     ) -> dict[str, Any]:
         """Native -> on-disk Hy-MT2 HF: per-expert split + name renames."""
-        hf_split: dict[str, Any] = self._to_hf_w_split_experts(state_dict)
+        hf_split: dict[str, Any] = self._to_hf_w_split_experts(state_dict, **kwargs)
 
         out: dict[str, Any] = {}
         for k, v in hf_split.items():

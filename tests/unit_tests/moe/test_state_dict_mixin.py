@@ -22,14 +22,31 @@ from torch.distributed.device_mesh import DeviceMesh
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
-from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin, get_world_size_safe
+
+
+def test_get_world_size_safe_uses_initialized_process_group():
+    with (
+        patch("nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=True),
+        patch("nemo_automodel.components.moe.state_dict_mixin.torch.distributed.get_world_size", return_value=8),
+    ):
+        assert get_world_size_safe() == 8
+
+
+def test_get_world_size_safe_uses_preinit_environment():
+    with (
+        patch("nemo_automodel.components.moe.state_dict_mixin.torch.distributed.is_initialized", return_value=False),
+        patch.dict("os.environ", {"WORLD_SIZE": "8"}),
+    ):
+        assert get_world_size_safe() == 8
 
 
 class MockMoEConfig:
-    def __init__(self, n_routed_experts=8, moe_inter_dim=512, expert_activation="swiglu"):
+    def __init__(self, n_routed_experts=8, moe_inter_dim=512, expert_activation="swiglu", expert_bias=False):
         self.n_routed_experts = n_routed_experts
         self.moe_inter_dim = moe_inter_dim
         self.expert_activation = expert_activation
+        self.expert_bias = expert_bias
 
 
 class MockConfig:
@@ -44,6 +61,8 @@ class MockBackend:
 
 
 class MockMoEStateDictMixin(MoESplitExpertsStateDictMixin):
+    _supports_low_memory_dcp_load = True
+
     def __init__(
         self,
         n_experts=8,
@@ -91,6 +110,7 @@ def _run_ep_free_dtensor_split(rank: int, world_size: int, init_file: str) -> No
             mixin._convert_single_merged_expert_to_hf_split_experts(
                 "model.layers.0.mlp.experts.gate_and_up_projs",
                 expert_sharded_weight,
+                for_checkpoint_load=True,
             )
         )
         assert len(converted) == 4
@@ -106,6 +126,7 @@ def _run_ep_free_dtensor_split(rank: int, world_size: int, init_file: str) -> No
             mixin._convert_single_merged_expert_to_hf_split_experts(
                 "model.layers.0.mlp.experts.down_projs",
                 down_weight,
+                for_checkpoint_load=True,
             )
         )
 
@@ -897,6 +918,7 @@ class TestConvertSingleMergedExpertToHfSplitExperts:
     def test_allocating_cuda_conversions_use_generation_zero_collection(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         gate_up_tensor = Mock(spec=torch.Tensor, is_meta=False, is_cuda=True)
         down_tensor = Mock(spec=torch.Tensor, ndim=3, shape=(2, 3, 4), is_meta=False, is_cuda=True)
         gate_up_splits = [
@@ -905,6 +927,7 @@ class TestConvertSingleMergedExpertToHfSplitExperts:
         down_splits = [torch.arange(12, dtype=torch.float32).reshape(3, 4) + 12 * expert_id for expert_id in range(2)]
 
         with (
+            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=2),
             patch.object(mixin, "_split_experts_weights", side_effect=[gate_up_splits, down_splits]),
             patch("torch.cuda.is_available", return_value=True),
             patch("nemo_automodel.components.moe.state_dict_mixin.gc.collect") as collect,
@@ -1048,18 +1071,65 @@ class TestInplaceLoadViews:
     conversion function, so patches must target that module path.
     """
 
-    def test_expert_write_through_capability_matches_grouped_storage_aliasing(self):
+    @pytest.mark.parametrize("dispatcher", ["deepep", "hybridep", "uccl_ep"])
+    @pytest.mark.parametrize(
+        ("experts", "expected"),
+        [("gmm", True), ("torch_mm", True), ("torch_mm_mxfp8", True), ("te", False), ("torch", False)],
+    )
+    def test_expert_checkpoint_storage_capability_matches_grouped_storage_aliasing(self, dispatcher, experts, expected):
         mixin = MockMoEStateDictMixin()
-        assert mixin._supports_write_through_expert_checkpoint_load is True
+        mixin.backend.experts = experts
+        mixin.backend.dispatcher = dispatcher
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+            assert mixin._expert_checkpoint_tensors_use_model_storage is expected
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
+            assert mixin._expert_checkpoint_tensors_use_model_storage is True
 
-        mixin.backend.experts = "te"
-        assert mixin._supports_write_through_expert_checkpoint_load is False
+        mixin.backend.dispatcher = "torch"
+        assert mixin._expert_checkpoint_tensors_use_model_storage is True
 
         mixin.backend.experts = "gmm"
         mixin.backend.dispatcher = "mok"
-        assert mixin._supports_write_through_expert_checkpoint_load is False
+        assert mixin._expert_checkpoint_tensors_use_model_storage is False
 
-    def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits):
+        mixin.backend.experts = "te"
+        assert mixin._grouped_expert_storage_is_model_weight is False
+        assert mixin._expert_checkpoint_tensors_use_model_storage is False
+
+    def test_grouped_expert_bias_native_roundtrip_preserves_grouped_keys(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        mixin.moe_config.expert_bias = True
+        native = {
+            "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(2, 4, 6),
+            "model.layers.0.mlp.experts.down_projs": torch.randn(2, 3, 4),
+            "model.layers.0.mlp.experts.gate_up_proj_bias": torch.randn(2, 6),
+            "model.layers.0.mlp.experts.down_proj_bias": torch.randn(2, 4),
+        }
+
+        assert mixin.supports_low_memory_dcp_load is False
+        hf_state = mixin._to_hf_w_split_experts(dict(native))
+        assert hf_state["model.layers.0.mlp.experts.gate_up_proj_bias"] is native[
+            "model.layers.0.mlp.experts.gate_up_proj_bias"
+        ]
+        assert hf_state["model.layers.0.mlp.experts.down_proj_bias"] is native[
+            "model.layers.0.mlp.experts.down_proj_bias"
+        ]
+
+        restored = mixin._from_hf_w_merged_experts(dict(hf_state))
+        assert set(restored) == set(native)
+        for key in native:
+            torch.testing.assert_close(restored[key], native[key])
+
+    def test_hf_per_expert_bias_load_is_rejected(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        mixin.moe_config.expert_bias = True
+
+        with pytest.raises(NotImplementedError, match="per-expert bias"):
+            mixin._from_hf_w_merged_experts(
+                {"model.layers.0.mlp.experts.0.gate_proj.bias": torch.randn(3)}
+            )
+
+    def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits, *, for_checkpoint_load=False):
         mixin._split_experts_weights = Mock(return_value=splits)
         mixin._last_expert_ids = list(range(len(splits)))
 
@@ -1070,7 +1140,9 @@ class TestInplaceLoadViews:
             ),
             patch("nemo_automodel.components.moe.state_dict_utils.validate_dtensor_expert_sharding"),
         ):
-            return mixin._convert_single_merged_expert_to_hf_split_experts(fqn, mock_dtensor)
+            return mixin._convert_single_merged_expert_to_hf_split_experts(
+                fqn, mock_dtensor, for_checkpoint_load=for_checkpoint_load
+            )
 
     def test_inplace_load_gate_and_up_returns_views(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
@@ -1080,7 +1152,11 @@ class TestInplaceLoadViews:
         mock_dtensor = Mock()
 
         result = self._run_inplace_conversion(
-            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+            mixin,
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            mock_dtensor,
+            splits,
+            for_checkpoint_load=True,
         )
 
         assert result is not None
@@ -1103,7 +1179,13 @@ class TestInplaceLoadViews:
         mock_dtensor.shape = (2, 512, 1024)
         mock_dtensor.is_meta = False
 
-        result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
+        result = self._run_inplace_conversion(
+            mixin,
+            "model.layers.3.mlp.experts.down_projs",
+            mock_dtensor,
+            splits,
+            for_checkpoint_load=True,
+        )
 
         assert result is not None and len(result) == 2
         src_ptr = local_storage.untyped_storage().data_ptr()
@@ -1141,7 +1223,11 @@ class TestInplaceLoadViews:
         mock_dtensor = Mock()
 
         result = self._run_inplace_conversion(
-            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+            mixin,
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            mock_dtensor,
+            splits,
+            for_checkpoint_load=True,
         )
 
         gate0 = next(v for k, v in result if k.endswith("0.gate_proj.weight"))
@@ -1171,6 +1257,36 @@ class TestInplaceLoadViews:
         assert "model.layers.0.mlp.experts.down_projs" not in out
         assert mixin._inplace_loaded_native_keys == set()
 
+    def test_save_conversion_does_not_poison_later_from_hf(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        grouped_gate_up = torch.arange(2 * 4 * 6, dtype=torch.float32).reshape(2, 4, 6)
+        grouped_down = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+        gate_up_dtensor = Mock()
+        down_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        down_dtensor.ndim = 3
+        down_dtensor.shape = (2, 3, 4)
+        down_dtensor.is_meta = False
+
+        exported = self._run_inplace_conversion(
+            mixin,
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            gate_up_dtensor,
+            [grouped_gate_up[expert_id] for expert_id in range(2)],
+            for_checkpoint_load=False,
+        )
+        exported += self._run_inplace_conversion(
+            mixin,
+            "model.layers.0.mlp.experts.down_projs",
+            down_dtensor,
+            [grouped_down[expert_id] for expert_id in range(2)],
+            for_checkpoint_load=False,
+        )
+
+        assert not hasattr(mixin, "_inplace_loaded_native_keys")
+        restored = mixin._from_hf_w_merged_experts(dict(exported))
+        torch.testing.assert_close(restored["model.layers.0.mlp.experts.gate_and_up_projs"], grouped_gate_up)
+        torch.testing.assert_close(restored["model.layers.0.mlp.experts.down_projs"], grouped_down)
+
     def test_inplace_load_skips_when_backend_experts_is_te_gate_and_up(self):
         # GroupedExpertsTE (backend.experts == "te") exposes gate_and_up_projs as a
         # torch.stack copy of per-expert weights that does not alias the model's grouped
@@ -1178,13 +1294,15 @@ class TestInplaceLoadViews:
         # the copy_ would write the throwaway and the experts would never be loaded.
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         local_storage = torch.randn(2, 1024, 1024)
         splits = [local_storage[i] for i in range(2)]
         mock_dtensor = Mock()
 
-        result = self._run_inplace_conversion(
-            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
-        )
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+            result = self._run_inplace_conversion(
+                mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+            )
 
         assert result is not None
         converted = dict(result)
@@ -1225,6 +1343,7 @@ class TestInplaceLoadViews:
     def test_te_checkpoint_layout_views_are_reused(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         gate_up_storage = torch.arange(2 * 6 * 4, dtype=torch.float32).reshape(2, 6, 4)
         down_storage = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
 
@@ -1234,6 +1353,7 @@ class TestInplaceLoadViews:
         virtual_down = down_storage.transpose(-1, -2)
 
         with (
+            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8),
             patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
             patch("torch.empty_like") as empty_like,
         ):
@@ -1272,12 +1392,14 @@ class TestInplaceLoadViews:
         """Catch allocating a second model-sized destination for TE checkpoint views."""
         mixin = MockMoEStateDictMixin(n_experts=8, inter_dim=1024, dtype=torch.bfloat16)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         # The TE stack is 64 MiB. Reusing its checkpoint-layout views fits this 70 MiB budget; allocating blank
         # destinations of the same total size would double live allocation to 128 MiB.
         gate_up_storage = torch.empty((8, 2048, 2048), dtype=torch.bfloat16, device="cuda")
         virtual_gate_up = gate_up_storage.transpose(-1, -2)
 
         with (
+            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8),
             patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
             patch("nemo_automodel.components.moe.state_dict_mixin.gc.collect") as collect,
             patch("torch.cuda.empty_cache") as empty_cache,
@@ -1297,10 +1419,14 @@ class TestInplaceLoadViews:
     def test_temporary_checkpoint_views_round_trip_loaded_values(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         initialized_gate_up = torch.full((2, 4, 6), 99.0)
         initialized_down = torch.full((2, 3, 4), 99.0)
 
-        with patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False):
+        with (
+            patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8),
+            patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
+        ):
             destinations = dict(
                 mixin._convert_single_merged_expert_to_hf_split_experts(
                     "model.layers.0.mlp.experts.gate_and_up_projs",
@@ -1343,6 +1469,7 @@ class TestInplaceLoadViews:
         # Same non-aliasing reason as the gate_and_up case, for the down_projs branch.
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
         mixin.backend.experts = "te"
+        mixin.backend.dispatcher = "deepep"
         local_storage = torch.randn(2, 512, 1024)
         splits = [local_storage[i] for i in range(2)]
         mock_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
@@ -1350,7 +1477,8 @@ class TestInplaceLoadViews:
         mock_dtensor.shape = (2, 512, 1024)
         mock_dtensor.is_meta = False
 
-        result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+            result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
 
         assert result is not None and len(result) == 2
         for _, v in result:
@@ -1392,6 +1520,7 @@ class TestInplaceLoadViews:
             "model.layers.3.mlp.experts.down_projs",
             down_dtensor,
             [down_storage[i] for i in range(2)],
+            for_checkpoint_load=True,
         )
 
         assert down_result is not None

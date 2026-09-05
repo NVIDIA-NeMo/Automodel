@@ -799,7 +799,7 @@ class MoE(nn.Module):
                     dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
             else:
-                # experts == "te"
+                # All other expert backends use the TE grouped implementation.
                 self.experts = GroupedExpertsTE(
                     config,
                     backend=backend,

@@ -78,7 +78,7 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     only the three HYV3-specific name renames + MTP-layer filtering live here.
     """
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,
@@ -111,7 +111,7 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
              gate.weight -> router.gate.weight, shared_experts. -> shared_mlp.).
         """
         # Step 1: per-expert split via the mixin. Pass-through for non-expert keys.
-        hf_split: dict[str, Any] = self._to_hf_w_split_experts(state_dict)
+        hf_split: dict[str, Any] = self._to_hf_w_split_experts(state_dict, **kwargs)
 
         # Step 2: rename native -> on-disk Tencent.
         out: dict[str, Any] = {}

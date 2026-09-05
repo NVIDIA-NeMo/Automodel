@@ -545,11 +545,11 @@ def test_grouped_experts_and_fp32_gdn_use_inherited_qwen35_conversion(
     torch.testing.assert_close(restored_a_log, a_log)
 
 
-def test_adapter_advertises_nonquantized_write_through_loading(
+def test_adapter_advertises_nonquantized_low_memory_loading(
     adapter: Qwen3_8_FlashNextStateDictAdapter,
 ) -> None:
     """The loader may bypass host staging for valid BF16/fp32 model state."""
-    assert adapter.supports_write_through_checkpoint_load
+    assert adapter.supports_low_memory_dcp_load
 
 
 def test_table_export_honors_exclude_regex(

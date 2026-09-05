@@ -175,6 +175,20 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
             state_dict.pop(key, None)
         return state_dict
 
+    def _prepare_hf_for_merge(self, state_dict: dict[str, Any]) -> None:
+        """Prepare Hugging Face projection tensors for grouped-expert merging.
+
+        Args:
+            state_dict: Mapping mutated in place. Expert projection tensors have shape
+                [expert_hidden, hidden] for gate/up and [hidden, expert_hidden] for down;
+                MXFP8 projection tensors are dequantized before their keys are renamed.
+        """
+        self._dequantize(state_dict)
+        for key in list(state_dict):
+            new_key = self._hf_key_to_native(key)
+            if new_key != key:
+                state_dict[new_key] = state_dict.pop(key)
+
     @property
     def _mtp_enabled(self) -> bool:
         return int(getattr(self.config, "num_mtp_modules", 0) or 0) > 0
@@ -221,11 +235,7 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         # decoder block); dropped entirely when the model has no MTP module.
         mtp_keys = {k: hf_state_dict.pop(k) for k in list(hf_state_dict) if ".mtp." in k}
 
-        self._dequantize(hf_state_dict)
-        for key in list(hf_state_dict.keys()):
-            new_key = self._hf_key_to_native(key)
-            if new_key != key:
-                hf_state_dict[new_key] = hf_state_dict.pop(key)
+        self._prepare_hf_for_merge(hf_state_dict)
         native = self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
 
         if mtp_keys and self._mtp_enabled:
@@ -233,25 +243,42 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         return native
 
     def _mtp_from_hf(self, mtp_keys: dict[str, Any], device_mesh: Optional["DeviceMesh"] = None) -> dict[str, Any]:
-        """Convert MTP tensors: the transformer_layer reuses the full text from_hf
-        (as a fake 1-layer model, so expert-merge / index / dequant all apply); the
-        enorm/hnorm/eh_proj/final_layernorm fusion tensors pass through (eh_proj is FP8)."""
+        """Convert MTP tensors through a temporary one-layer text namespace."""
         pattern = re.compile(r"(?P<pfx>.*?)mtp\.layers\.(?P<d>\d+)\.(?P<rest>.+)")
         tl_hf: dict[str, Any] = {}
         passthrough: dict[str, Any] = {}
         for key, value in mtp_keys.items():
             m = pattern.match(key)
+            if m is None:
+                passthrough[key] = value
+                continue
             depth, rest = m.group("d"), m.group("rest")
             if rest.startswith("transformer_layer."):
-                tl_hf[f"model.layers.{depth}.{rest[len('transformer_layer.') :]}"] = value
+                tl_hf[f"layers.{depth}.{rest[len('transformer_layer.') :]}"] = value
             else:
                 passthrough[key] = value
 
         self._dequantize(passthrough)  # eh_proj is MXFP8
         native = dict(passthrough)
-        for key, value in self.from_hf(tl_hf, device_mesh).items():
-            m = re.match(r"model\.layers\.(\d+)\.(.+)", key)
+        self._prepare_hf_for_merge(tl_hf)
+
+        # The backbone merge already reset the per-load record. Preserve it while
+        # processing MTP, then translate the temporary layers.* names back to
+        # the native model.mtp.layers.* namespace used by the checkpoint key diff.
+        prior_view_keys = set(self.view_loaded_native_keys)
+        tl_native = self._from_hf_w_merged_experts(tl_hf, device_mesh, reset_view_loaded_keys=False)
+        for key, value in tl_native.items():
+            m = re.match(r"layers\.(\d+)\.(.+)", key)
             native[f"model.mtp.layers.{m.group(1)}.transformer_layer.{m.group(2)}"] = value
+        new_view_keys = self.view_loaded_native_keys - prior_view_keys
+        self._view_loaded_native_keys = prior_view_keys | {
+            re.sub(
+                r"^layers\.(\d+)\.",
+                r"model.mtp.layers.\1.transformer_layer.",
+                key,
+            )
+            for key in new_view_keys
+        }
         return native
 
     def to_hf(
@@ -303,12 +330,19 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
     def _mtp_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         m = re.match(r"(?P<head>.*?)mtp\.layers\.(?P<d>\d+)\.(?P<rest>.+)", fqn)
+        if m is None:
+            exclude_key_regex = kwargs.get("exclude_key_regex", None)
+            if exclude_key_regex and re.match(exclude_key_regex, fqn):
+                return []
+            return [(fqn, tensor)]
         head, depth, rest = m.group("head"), m.group("d"), m.group("rest")
         if rest.startswith("transformer_layer."):
             suffix = rest[len("transformer_layer.") :]
-            converted = self.convert_single_tensor_to_hf(f"model.layers.{depth}.{suffix}", tensor, **kwargs)
+            converted = self.convert_single_tensor_to_hf(
+                f"mtp.layers.{depth}.{suffix}", tensor, prefix_override="mtp.", **kwargs
+            )
             tl_prefix = f"{head}mtp.layers.{depth}.transformer_layer."
-            return [(k.replace(f"model.layers.{depth}.", tl_prefix, 1), v) for k, v in converted]
+            return [(k.replace(f"mtp.layers.{depth}.", tl_prefix, 1), v) for k, v in converted]
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
         if exclude_key_regex and re.match(exclude_key_regex, fqn):
             return []
@@ -331,6 +365,11 @@ class MiniMaxM3VLStateDictAdapter(StateDictAdapter):
     def __init__(self, config: Any, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype = torch.bfloat16):
         self.config = config
         self.text_adapter = MiniMaxM3StateDictAdapter(config.text_config, moe_config, backend, dtype=dtype)
+
+    @property
+    def view_loaded_native_keys(self) -> set[str]:
+        """Native text keys loaded through the inner adapter's checkpoint views."""
+        return set(self.text_adapter.view_loaded_native_keys)
 
     @staticmethod
     def _map_non_text_from_hf(key: str) -> str | None:

@@ -115,16 +115,59 @@ class TestNemotronV3StateDictAdapter:
 
         assert adapter._expert_path_segment == "mixer.experts"
 
-    def test_write_through_load_capability_requires_aliasing_expert_backend(self, config, moe_config, backend):
+    def test_low_memory_dcp_capability_requires_model_backed_experts(self, config, moe_config, backend):
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
-        assert adapter.supports_write_through_checkpoint_load is True
+        assert adapter.supports_low_memory_dcp_load is True
 
         adapter.backend.experts = "te"
-        assert adapter.supports_write_through_checkpoint_load is False
+        adapter.backend.dispatcher = "deepep"
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
+            assert adapter.supports_low_memory_dcp_load is False
+
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
+            assert adapter.supports_low_memory_dcp_load is True
 
         adapter.backend.experts = "gmm"
         adapter.backend.dispatcher = "mok"
-        assert adapter.supports_write_through_checkpoint_load is False
+        assert adapter.supports_low_memory_dcp_load is False
+
+    def test_te_single_device_fallback_loads_through_grouped_parameter_views(self, config, moe_config, backend):
+        backend.experts = "te"
+        backend.dispatcher = "deepep"
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        gate_and_up = torch.zeros(
+            moe_config.n_routed_experts,
+            moe_config.expert_dim,
+            moe_config.moe_inter_dim,
+        )
+        down = torch.zeros(
+            moe_config.n_routed_experts,
+            moe_config.moe_inter_dim,
+            moe_config.expert_dim,
+        )
+
+        with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
+            destinations = adapter.to_hf(
+                {
+                    "model.layers.0.mixer.experts.gate_and_up_projs": gate_and_up,
+                    "model.layers.0.mixer.experts.down_projs": down,
+                },
+                for_checkpoint_load=True,
+            )
+            assert adapter.supports_low_memory_dcp_load is True
+
+        assert set(destinations) == {
+            f"backbone.layers.0.mixer.experts.{expert_id}.{projection}.weight"
+            for expert_id in range(moe_config.n_routed_experts)
+            for projection in ("up_proj", "down_proj")
+        }
+        for expert_id in range(moe_config.n_routed_experts):
+            up_destination = destinations[f"backbone.layers.0.mixer.experts.{expert_id}.up_proj.weight"]
+            down_destination = destinations[f"backbone.layers.0.mixer.experts.{expert_id}.down_proj.weight"]
+            assert up_destination.untyped_storage().data_ptr() == gate_and_up.untyped_storage().data_ptr()
+            assert down_destination.untyped_storage().data_ptr() == down.untyped_storage().data_ptr()
+            assert not up_destination.is_contiguous()
+            assert not down_destination.is_contiguous()
 
     def test_from_hf_map_structure(self, config, moe_config, backend):
         """Test from_hf_map structure."""
@@ -153,7 +196,7 @@ class TestNemotronV3AdapterDense:
 
     def test_init_accepts_none_moe_config(self, adapter):
         assert adapter.moe_config is None
-        assert adapter.supports_write_through_checkpoint_load is True
+        assert adapter.supports_low_memory_dcp_load is True
 
     def test_from_hf_renames_without_experts(self, adapter):
         hf_sd = {
@@ -184,6 +227,18 @@ class TestNemotronV3AdapterDense:
         back = adapter.to_hf(dict(native))
 
         assert set(back.keys()) == set(hf_sd.keys())
+
+    def test_dense_mtp_keys_do_not_enter_moe_conversion(self, adapter):
+        hf_tensor = torch.randn(4, dtype=torch.bfloat16)
+        native = adapter.from_hf({"mtp.layers.0.mixer.A_log": hf_tensor})
+
+        assert set(native) == {"mtp.layers.0.mixer._fp32_params.A_log"}
+        assert native["mtp.layers.0.mixer._fp32_params.A_log"].dtype == torch.float32
+
+        exported = adapter.convert_single_tensor_to_hf(
+            "mtp.layers.0.mixer._fp32_params.A_log", native["mtp.layers.0.mixer._fp32_params.A_log"]
+        )
+        assert exported[0][0] == "mtp.layers.0.mixer.A_log"
 
     def test_peft_outer_prefix_round_trip(self, adapter):
         hf_key = "base_model.model.backbone.layers.0.mixer.in_proj.lora_A.weight"
@@ -243,6 +298,45 @@ class TestNemotronV3AdapterMTP:
             "mtp.layers.1.mixer.experts.gate_and_up_projs",
             "mtp.layers.1.mixer.experts.down_projs",
         }
+
+    def test_mtp_expert_conversion_forwards_checkpoint_kwargs(self):
+        moe_config = MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=1,
+            n_activated_experts=1,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            dim=256,
+            inter_dim=512,
+            moe_inter_dim=128,
+            norm_topk_prob=False,
+            expert_bias=False,
+            expert_activation="relu2",
+            dtype=torch.bfloat16,
+        )
+        adapter = NemotronV3StateDictAdapter(MockNemotronV3Config(), moe_config, BackendConfig())
+        tensor = torch.randn(moe_config.n_routed_experts, 256, 128)
+
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None) as convert:
+            adapter.convert_single_tensor_to_hf(
+                "mtp.layers.1.mixer.experts.gate_and_up_projs",
+                tensor,
+                for_checkpoint_load=True,
+                v4_compatible=True,
+            )
+
+        convert.assert_called_once_with(
+            "mtp.layers.1.mixer.experts.gate_and_up_projs",
+            tensor,
+            prefix_override="mtp.",
+            for_checkpoint_load=True,
+            v4_compatible=True,
+        )
 
 
 class TestNemotronV3AdapterToHf:

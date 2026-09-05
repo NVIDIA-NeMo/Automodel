@@ -160,6 +160,7 @@ class TestQwen3NextStateDictAdapter:
         moe_config = Mock(spec=MoEConfig)
         moe_config.n_routed_experts = overrides.get("n_routed_experts", 8)
         moe_config.moe_inter_dim = overrides.get("moe_inter_dim", 512)
+        moe_config.expert_bias = overrides.get("expert_bias", False)
         for key, value in overrides.items():
             setattr(moe_config, key, value)
         return moe_config
@@ -457,6 +458,7 @@ class TestConvertSingleTensorToHf:
         moe_config = Mock()
         moe_config.n_routed_experts = 8
         moe_config.moe_inter_dim = 512
+        moe_config.expert_bias = False
         return moe_config
 
     def create_mock_backend_config(self):
@@ -565,6 +567,7 @@ class TestFp32HolderKeyStripping:
         moe_config = Mock()
         moe_config.n_routed_experts = 8
         moe_config.moe_inter_dim = 512
+        moe_config.expert_bias = False
         backend = Mock()
         backend.dispatcher = "torch"
         backend.experts = "torch"
