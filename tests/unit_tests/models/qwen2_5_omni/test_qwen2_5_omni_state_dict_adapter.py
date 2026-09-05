@@ -130,12 +130,65 @@ class TestToHF:
             assert key in restored, f"missing key after round-trip: {key}"
             assert torch.equal(restored[key], value), f"value mismatch for {key}"
 
+    def test_peft_lora_keys_to_hf(self, adapter):
+        # PEFT keys should have thinker prefix placed inside base_model.model.
+        nemo_peft_state = {
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(4, 4),
+            "base_model.model.model.layers.0.self_attn.v_proj.lora_B.weight": torch.randn(4, 4),
+        }
+        hf_state = adapter.to_hf(nemo_peft_state)
+        assert (
+            "base_model.model.thinker.model.layers.0.self_attn.q_proj.lora_A.weight" in hf_state
+        )
+        assert (
+            "base_model.model.thinker.model.layers.0.self_attn.v_proj.lora_B.weight" in hf_state
+        )
+        assert not any(k.startswith("thinker.base_model.model.") for k in hf_state)
+
+    def test_peft_lora_keys_from_hf(self, adapter):
+        hf_peft_state = {
+            "base_model.model.thinker.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(4, 4),
+            "base_model.model.thinker.model.layers.0.self_attn.v_proj.lora_B.weight": torch.randn(4, 4),
+        }
+        restored = adapter.from_hf(hf_peft_state)
+        assert (
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight" in restored
+        )
+        assert (
+            "base_model.model.model.layers.0.self_attn.v_proj.lora_B.weight" in restored
+        )
+        assert adapter._uses_thinker_prefix is True
+
+    def test_peft_lora_round_trip(self, adapter):
+        nemo_peft_state = {
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(4, 4),
+            "base_model.model.model.layers.0.self_attn.v_proj.lora_B.weight": torch.randn(4, 4),
+        }
+        hf_state = adapter.to_hf(nemo_peft_state)
+        restored = adapter.from_hf(hf_state)
+        for key, value in nemo_peft_state.items():
+            assert key in restored, f"missing PEFT key after round-trip: {key}"
+            assert torch.equal(restored[key], value)
+
 
 class TestSingleTensorConversion:
     def test_prefixes_key(self, adapter):
         out = adapter.convert_single_tensor_to_hf("model.embed_tokens.weight", torch.zeros(2, 2))
         assert out == [("thinker.model.embed_tokens.weight", out[0][1])]
 
+    def test_prefixes_peft_key(self, adapter):
+        out = adapter.convert_single_tensor_to_hf(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+            torch.zeros(2, 2),
+        )
+        assert out == [
+            (
+                "base_model.model.thinker.model.layers.0.self_attn.q_proj.lora_A.weight",
+                out[0][1],
+            )
+        ]
+
     def test_respects_exclude_regex(self, adapter):
         out = adapter.convert_single_tensor_to_hf("drop.me", torch.zeros(1), exclude_key_regex=r"^thinker\.drop")
         assert out == []
+
