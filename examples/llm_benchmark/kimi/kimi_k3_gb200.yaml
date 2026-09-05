@@ -15,21 +15,15 @@
 # Full-size Kimi-K3 (93 layers / 896 experts, 2.78T total / 104B active)
 # throughput benchmark on 64 nodes x 4 GB200 (256 GPUs): EP32 x PP8, DP32.
 #
-# Measured with this exact configuration: ~496 tok/s/GPU, i.e. ~13.7% MFU on
-# the basis  MFU = tok/s/GPU * 6 * 104e9 / 2.25e15  (GB200 bf16 dense peak).
-# Wall-clock cross-check: 4096 rows x 1024 tok = 4.19M tokens/step at ~33 s.
-# (Without compile_norm and benchmark_static_routing this measures ~441-458
-# tok/s/GPU = 12.2-12.7% MFU.)
-#
-# Measurement provenance: these numbers were taken before #3792 aligned the
-# KimiK3TextConfig defaults with the released checkpoint. from_config then
-# built a 56-head MLA / 18432-wide dense FFN model (~101.5B active matmul
-# params instead of 104.0B), so on the checkpoint-aligned shape this file
-# builds today expect ~2% fewer tok/s at about the same MFU; a re-measurement
-# on the aligned shape will replace the figures above. With #3792 the recipe
-# itself prints MFU on the config-derived basis (run it through
+# Measured with this exact configuration (64 nodes, 12 iterations, recipe
+# summary = mean over the 9 iterations after 3 warm-up iterations):
+# 392.4 tok/s/GPU at 41.8 s/iteration, Average MFU 10.9% on the recipe's
+# config-derived FLOPs basis (also 10.9% on tok/s/GPU * 6 * 104e9 / 2.25e15,
+# the GB200 bf16 dense peak). Peak memory 129.3 GiB per GPU. Measured
+# with the model initialized by this PR's fix (earlier figures for this file
+# came from an uninitialized model and were higher). Run the file through
 # nemo_automodel/recipes/llm/benchmark.py --config <this file> to get the
-# per-iteration MFU and the Average MFU summary).
+# per-iteration MFU and the Average MFU summary.
 #
 # Benchmark regime notes:
 # - Random init + fake_balanced_gate (uniform static routing): the standard
