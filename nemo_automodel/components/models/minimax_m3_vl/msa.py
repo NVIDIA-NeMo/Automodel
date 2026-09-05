@@ -33,6 +33,7 @@ import torch.nn as nn
 from torch.autograd.function import once_differentiable
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_patch import _patch_msa_fmax
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import _MSABackwardSchedule
 from nemo_automodel.components.models.minimax_m3_vl.msa_plan import _MSALaunchMetadata, _MSAPackedLayout
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import, safe_import_from
@@ -78,13 +79,14 @@ class _MSAForwardKernels:
 @lru_cache(maxsize=1)
 def _resolve_msa_forward() -> _MSAForwardKernels | None:
     """Resolve the optional forward entry points once, or ``None`` if absent."""
-    available, module = safe_import("fmha_sm100", msg=_MSA_IMPORT_ERROR)
+    available, module = safe_import("fmha_sm100.sparse", msg=_MSA_IMPORT_ERROR)
     if not available:
         return None
     build_k2q_csr = getattr(module, "build_k2q_csr", None)
     sparse_atten_func = getattr(module, "sparse_atten_func", None)
     if not callable(build_k2q_csr) or not callable(sparse_atten_func):
         return None
+    _patch_msa_fmax(module)
     return _MSAForwardKernels(build_k2q_csr=build_k2q_csr, sparse_atten_func=sparse_atten_func)
 
 
@@ -267,8 +269,7 @@ def _validate_flat_msa_inputs(
     misaligned = [name for name, tensor in metadata_and_support if tensor.data_ptr() % 16 != 0]
     if misaligned:
         raise ValueError(
-            "MiniMax M3 MSA requires 16-byte-aligned support and layout storage; "
-            f"misaligned tensors={misaligned}."
+            f"MiniMax M3 MSA requires 16-byte-aligned support and layout storage; misaligned tensors={misaligned}."
         )
     if metadata.workspace_positions.dtype != torch.int64:
         raise ValueError(

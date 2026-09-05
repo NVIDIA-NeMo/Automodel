@@ -195,11 +195,11 @@ media = [
     "nemo_automodel[diffusion-media]",
 ]
 # MiniMax M3 MSA sparse-prefill forward (BackendConfig.sparse_attn="msa"); Linux + SM100 only.
-# fmha-sm100 is the MSA package (MiniMax-AI/MSA, MIT). It is resolved from the
-# Butterfingrz/MSA fork, pinned to commit bd37d095 on branch butterfingrz/fix/cutlass-dsl-4.6.2
-# (see [tool.uv.sources])
+# fmha-sm100 is pinned to official MiniMax-AI/MSA (MIT); kernels/msa_patch.py
+# supplies the CuTe DSL 4.6.2 fmax fix. The base dependency already pins quack-kernels==0.6.4.
 msa = [
     "fmha-sm100; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
 ]
 all = [
     "nemo_automodel[cli]",
@@ -321,9 +321,8 @@ deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "4214430375
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
-# MSA fork carrying the CuTe DSL 4.6.2 fmax fix (branch butterfingrz/fix/cutlass-dsl-4.6.2);
-# only pulled in by the `msa` extra.
-fmha-sm100 = { git = "https://github.com/Butterfingrz/MSA.git", rev = "bd37d095345e502e4475bcbbcb8e91fd39f60847" }
+# Official MSA; only pulled in by the `msa` extra.
+fmha-sm100 = { git = "https://github.com/MiniMax-AI/MSA.git", rev = "80434d7f67877c6570ca19cac444b84bc9855dac" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },

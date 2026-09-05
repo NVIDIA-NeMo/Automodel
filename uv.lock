@@ -1956,7 +1956,7 @@ wheels = [
 [[package]]
 name = "fmha-sm100"
 version = "0.1.1"
-source = { git = "https://github.com/Butterfingrz/MSA.git?rev=bd37d095345e502e4475bcbbcb8e91fd39f60847#bd37d095345e502e4475bcbbcb8e91fd39f60847" }
+source = { git = "https://github.com/MiniMax-AI/MSA.git?rev=80434d7f67877c6570ca19cac444b84bc9855dac#80434d7f67877c6570ca19cac444b84bc9855dac" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "cuda-python" },
@@ -4188,6 +4188,7 @@ moe = [
 ]
 msa = [
     { name = "fmha-sm100", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cutlass-dsl", marker = "sys_platform == 'linux'" },
 ]
 msc = [
     { name = "multi-storage-client" },
@@ -4280,7 +4281,7 @@ requires-dist = [
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
     { name = "flash-linear-attention", marker = "extra == 'fla'", specifier = ">=0.4.2" },
     { name = "flashoptim", specifier = ">=0.1.3" },
-    { name = "fmha-sm100", marker = "sys_platform == 'linux' and extra == 'msa'", git = "https://github.com/Butterfingrz/MSA.git?rev=bd37d095345e502e4475bcbbcb8e91fd39f60847" },
+    { name = "fmha-sm100", marker = "sys_platform == 'linux' and extra == 'msa'", git = "https://github.com/MiniMax-AI/MSA.git?rev=80434d7f67877c6570ca19cac444b84bc9855dac" },
     { name = "ftfy", marker = "extra == 'diffusion'" },
     { name = "imageio", marker = "extra == 'diffusion'" },
     { name = "imageio-ffmpeg", marker = "extra == 'diffusion-media'" },
@@ -4309,6 +4310,7 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'vlm'" },
     { name = "nv-grouped-gemm", marker = "extra == 'cuda'" },
     { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'cuda'", specifier = ">=1.27.0" },
+    { name = "nvidia-cutlass-dsl", marker = "sys_platform == 'linux' and extra == 'msa'", specifier = "==4.6.2" },
     { name = "nvidia-cutlass-dsl", marker = "extra == 'ffpa'", specifier = "==4.6.2" },
     { name = "onnxscript", marker = "extra == 'cuda'", specifier = ">=0.5.6" },
     { name = "open-clip-torch", marker = "extra == 'vlm'" },
