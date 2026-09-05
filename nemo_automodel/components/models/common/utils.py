@@ -289,6 +289,9 @@ class BackendConfig:
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
             CUDA BF16; CPU execution retains the PyTorch numerical oracle.
+        sparse_attn: Sparse-attention backend. "generic" preserves each model's
+            existing sparse mask plus ``attn`` path; "msa" selects the optional
+            MiniMax M3 SM100 MSA implementation for sparse layers only.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
@@ -346,6 +349,7 @@ class BackendConfig:
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
         "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     )
+    sparse_attn: Literal["generic", "msa"] = "generic"
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope: Literal["torch", "quack"] = "torch"
@@ -404,6 +408,9 @@ class BackendConfig:
                 "fake_gate_noise=0.0; with a learned or noisy gate the cached routing "
                 "metadata would go stale and corrupt expert dispatch."
             )
+
+        if self.sparse_attn not in ("generic", "msa"):
+            raise ValueError(f"Unsupported sparse_attn={self.sparse_attn!r}; expected 'generic' or 'msa'.")
 
         # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
         # instead assumes contiguous [0, seq_len) positions, so combining the two
