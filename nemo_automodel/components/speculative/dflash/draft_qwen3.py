@@ -49,15 +49,116 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from nemo_automodel.components.speculative.dflash.target import resolve_text_config
 
+# Below this, ``sample`` decodes greedily instead of dividing by ``temperature``:
+# a division by a positive-but-tiny temperature blows the logits up enough that
+# the softmax it feeds can turn to NaN. Callers that branch between greedy and
+# distributional decoding on their own (e.g. DFlash 2's rejection-sampling path)
+# must gate on this same threshold, not on ``temperature > 0``.
+GREEDY_TEMPERATURE_EPS = 1e-5
 
-def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
-    """Greedy (temperature ~ 0) or temperature sampling over the last dim."""
-    if temperature < 1e-5:
+
+def resolve_output_head(target: nn.Module) -> nn.Module:
+    """Return the target's output projection.
+
+    Prefers ``lm_head`` and falls back to ``get_output_embeddings()``, which is
+    what a ``*ForConditionalGeneration`` target exposes instead.
+
+    Args:
+        target: The frozen verifier.
+
+    Returns:
+        The module projecting hidden states to vocabulary logits.
+    """
+    head = getattr(target, "lm_head", None)
+    return head if head is not None else target.get_output_embeddings()
+
+
+def validate_sampling(temperature: float, top_p: float = 1.0, top_k: int = 0) -> None:
+    """Reject sampling parameters the decode path cannot honor.
+
+    Args:
+        temperature: Sampling temperature; ``0`` means greedy.
+        top_p: Nucleus mass to keep, in ``(0, 1]``.
+        top_k: Candidates to keep, ``0`` for the whole vocabulary.
+
+    Raises:
+        ValueError: If any parameter is outside its supported range.
+    """
+    if temperature < 0 or not 0 < top_p <= 1 or top_k < 0:
+        raise ValueError(
+            f"Invalid sampling parameters: temperature={temperature} must be >= 0, "
+            f"top_p={top_p} must be in (0, 1], top_k={top_k} must be >= 0."
+        )
+
+
+def sampling_probs(
+    logits: torch.Tensor,
+    temperature: float,
+    top_p: float = 1.0,
+    top_k: int = 0,
+) -> torch.Tensor:
+    """Full-vocabulary sampling distribution after temperature, top-k, and top-p.
+
+    Speculative decoding needs the *distribution*, not just a draw: rejection
+    sampling compares the target's probability of a drafted token against the
+    draft's, so both sides must be built the same way. Filtered-out tokens keep a
+    probability of exactly 0 so the residual ``clamp(p - q, 0)`` stays correct.
+
+    Args:
+        logits: Tensor of shape [..., vocab]; raw scores, with arbitrary leading
+            dimensions.
+        temperature: Sampling temperature; must be > 0.
+        top_p: Nucleus mass to keep, in ``(0, 1]``.
+        top_k: Candidates to keep, ``0`` for the whole vocabulary.
+
+    Returns:
+        Tensor of shape [..., vocab] in float32; a probability distribution over
+        the last dimension that is zero outside the kept set.
+    """
+    scores = logits.float() / temperature
+    vocab_size = scores.shape[-1]
+    indices = None
+    if 0 < top_k < vocab_size:
+        scores, indices = torch.topk(scores, top_k, dim=-1)
+
+    probs = torch.softmax(scores, dim=-1)
+    if top_p < 1.0:
+        sorted_probs, order = probs.sort(dim=-1, descending=True)
+        # Exclusive cumulative mass: always keeps the top token, even when it
+        # already exceeds top_p on its own.
+        keep = sorted_probs.cumsum(dim=-1) - sorted_probs < top_p
+        probs = torch.zeros_like(probs).scatter(-1, order, sorted_probs * keep)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    if indices is not None:
+        probs = torch.zeros_like(logits, dtype=probs.dtype).scatter(-1, indices, probs)
+    return probs
+
+
+def sample(
+    logits: torch.Tensor,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+) -> torch.Tensor:
+    """Greedy (``temperature == 0``) or truncated-distribution sampling over the last dim.
+
+    Args:
+        logits: Tensor of shape [..., vocab]; raw scores, with arbitrary leading
+            dimensions.
+        temperature: Sampling temperature; ``0`` selects greedily.
+        top_p: Nucleus mass to keep, in ``(0, 1]``.
+        top_k: Candidates to keep, ``0`` for the whole vocabulary.
+
+    Returns:
+        Long tensor of shape [...]; the sampled token id per position.
+    """
+    validate_sampling(temperature, top_p, top_k)
+    if temperature < GREEDY_TEMPERATURE_EPS:
         return torch.argmax(logits, dim=-1)
-    bsz, seq_len, vocab_size = logits.shape
-    logits = logits.view(-1, vocab_size) / temperature
-    probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+    probs = sampling_probs(logits, temperature, top_p, top_k)
+    shape = probs.shape[:-1]
+    return torch.multinomial(probs.reshape(-1, probs.shape[-1]), num_samples=1).view(shape)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
@@ -379,6 +480,19 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                 "DFlash draft config carries no block_size, neither in dflash_config nor at the top level."
             )
         self.mask_token_id = dflash_config.get("mask_token_id", None)
+        # Output/input transforms some targets apply around the shared embedding
+        # and head; identity for every Qwen3-family target (see compute_logits).
+        multiplier = float(dflash_config.get("output_multiplier", 1.0))
+        if multiplier <= 0:
+            # A non-positive multiplier would flip or flatten the argmax, changing
+            # every greedy pick without raising anywhere.
+            raise ValueError(f"output_multiplier must be > 0 when set, got {multiplier}.")
+        self.output_multiplier = multiplier
+        softcap = dflash_config.get("final_logit_softcapping", None)
+        if softcap is not None and float(softcap) <= 0:
+            raise ValueError(f"final_logit_softcapping must be > 0 when set, got {softcap}.")
+        self.final_logit_softcapping = None if softcap is None else float(softcap)
+        self.input_embedding_scale = float(dflash_config.get("input_embedding_scale", 1.0))
         # Optional Domino correction head (ported from SpecForge#571). DFlash drafts
         # a block in parallel and is non-causal; the Domino head adds a *causal*
         # low-rank logit correction conditioned on a GRU state built from the
@@ -462,6 +576,52 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             )
         return self.norm(hidden_states)
 
+    def embed_noise_block(self, target: nn.Module, block_ids: torch.LongTensor) -> torch.Tensor:
+        """Embed a draft block with the target's (frozen, shared) input embedding.
+
+        Applies ``input_embedding_scale`` from ``dflash_config`` -- 1.0, hence a
+        no-op, for every Qwen3-family target. Unlike the reference, this calls the
+        embedding *module* rather than indexing its weight table directly: under
+        tensor parallelism the target's ``embed_tokens`` is vocab-parallel and only
+        the module call carries the DTensor plan.
+
+        Args:
+            target: The frozen verifier.
+            block_ids: Long tensor of shape [batch, draft]; the block's token ids,
+                position 0 holding the verified anchor and the rest ``MASK``.
+
+        Returns:
+            Tensor of shape [batch, draft, hidden].
+        """
+        embedded = target.get_input_embeddings()(block_ids)
+        return embedded if self.input_embedding_scale == 1.0 else embedded * self.input_embedding_scale
+
+    def compute_logits(self, hidden: torch.Tensor, output_head: nn.Module) -> torch.Tensor:
+        """Project draft hidden states to logits, applying the target's output transform.
+
+        Some targets do not read their ``lm_head`` output raw: Muse Glimmer scales
+        it by ``output_multiplier`` and squashes it through
+        ``final_logit_softcapping``. The draft is trained against, and verified
+        by, those transformed logits, so both training and decoding have to apply
+        them -- otherwise the draft learns one distribution and is served another.
+        Both fields live in ``dflash_config``; absent (every Qwen3-family target),
+        this is just the head.
+
+        Args:
+            hidden: Tensor of shape [..., hidden]; draft hidden states with
+                arbitrary leading dimensions.
+            output_head: The frozen target's output projection.
+
+        Returns:
+            Tensor of shape [..., vocab].
+        """
+        logits = output_head(hidden)
+        if self.output_multiplier != 1.0:
+            logits = logits * self.output_multiplier
+        if self.final_logit_softcapping is not None:
+            logits = torch.tanh(logits / self.final_logit_softcapping) * self.final_logit_softcapping
+        return logits
+
     @torch.inference_mode()
     def spec_generate(
         self,
@@ -470,10 +630,30 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int] | None,
         temperature: float,
+        top_p: float = 1.0,
+        top_k: int = 0,
     ) -> torch.LongTensor:
-        """Block-parallel speculative decoding: draft a block, verify with the target, accept the matching prefix."""
+        """Block-parallel speculative decoding: draft a block, verify with the target, accept the matching prefix.
+
+        ``top_p`` / ``top_k`` truncate the *target's* distribution, which is what
+        defines the emitted tokens; the draft proposes from plain temperature.
+
+        Args:
+            target: The frozen verifier.
+            input_ids: Long tensor of shape [1, prompt].
+            max_new_tokens: Maximum number of tokens to generate.
+            stop_token_ids: Token ids that end generation, or ``None``.
+            temperature: Sampling temperature; ``0`` decodes greedily.
+            top_p: Nucleus mass to keep, in ``(0, 1]``.
+            top_k: Candidates to keep, ``0`` for the whole vocabulary.
+
+        Returns:
+            Long tensor of shape [1, prompt + generated].
+        """
         self.eval()
+        validate_sampling(temperature, top_p, top_k)
         assert_target_supports_rollback(target)
+        output_head = resolve_output_head(target)
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
         block_size = self.block_size
@@ -498,22 +678,26 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             output_hidden_states=True,
         )
         output_ids[:, :num_input_tokens] = input_ids
-        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
+        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature, top_p, top_k)
         target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
 
+        stop_tokens = (
+            torch.tensor(stop_token_ids, dtype=output_ids.dtype, device=output_ids.device) if stop_token_ids else None
+        )
         start = num_input_tokens
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
+            noise_embedding = self.embed_noise_block(target, block_output_ids)
+            draft_logits = self.compute_logits(
                 self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
                     position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + block_size],
                     past_key_values=past_key_values_draft,
                     use_cache=True,
-                )[:, -block_size + 1 :, :]
+                )[:, -block_size + 1 :, :],
+                output_head,
             )
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
@@ -525,7 +709,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                 use_cache=True,
                 output_hidden_states=True,
             )
-            posterior = sample(output.logits, temperature)
+            posterior = sample(output.logits, temperature, top_p, top_k)
             acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
@@ -534,8 +718,8 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[
                 :, : acceptance_length + 1, :
             ]
-            if stop_token_ids is not None and any(
-                stop_id in output_ids[:, num_input_tokens:] for stop_id in stop_token_ids
+            if stop_tokens is not None and bool(
+                torch.isin(output_ids[0, start - acceptance_length - 1 : start + 1], stop_tokens).any()
             ):
                 break
 
@@ -543,9 +727,8 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         # at the end of the previous block), so the generated sequence is exactly
         # ``[0, start]``; everything past it is still MASK padding.
         output_ids = output_ids[:, : min(start + 1, max_length)]
-        if stop_token_ids is not None:
-            stop_ids = torch.tensor(stop_token_ids, device=output_ids.device)
-            stop_indices = torch.isin(output_ids[0][num_input_tokens:], stop_ids).nonzero(as_tuple=True)[0]
+        if stop_tokens is not None:
+            stop_indices = torch.isin(output_ids[0, num_input_tokens:], stop_tokens).nonzero(as_tuple=True)[0]
             if stop_indices.numel() > 0:
                 output_ids = output_ids[:, : num_input_tokens + stop_indices[0] + 1]
         return output_ids
