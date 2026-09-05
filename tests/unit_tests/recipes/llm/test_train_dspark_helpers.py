@@ -887,6 +887,8 @@ def test_recipe_cached_path_does_not_load_target_model(monkeypatch, tmp_path):
             "target_hidden_dim": hidden_size * len(target_layer_ids),
             "target_last_hidden_dim": hidden_size,
             "target_layer_ids": target_layer_ids,
+            "mask_reasoning_content": False,
+            "mask_generation_prompt": False,
         },
     )
 

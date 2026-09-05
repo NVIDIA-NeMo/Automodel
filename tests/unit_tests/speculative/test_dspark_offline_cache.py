@@ -385,6 +385,7 @@ def test_precompute_resume_mismatch_does_not_overwrite_target_weights(monkeypatc
         target_layer_ids=list(_LAYERS),
         chat_template=None,
         mask_reasoning_content=False,
+        mask_generation_prompt=False,
         target_attn_implementation=None,
         target_force_hf=False,
         trust_remote_code=False,
@@ -497,6 +498,7 @@ def test_precompute_run_writes_cache(monkeypatch, tmp_path):
         target_layer_ids=list(_LAYERS),
         chat_template=None,
         mask_reasoning_content=False,
+        mask_generation_prompt=False,
         target_attn_implementation=None,
         target_force_hf=False,
         trust_remote_code=False,
@@ -514,3 +516,9 @@ def test_precompute_run_writes_cache(monkeypatch, tmp_path):
     loaded_embed, loaded_head = read_target_weight_modules(cache_dir)
     torch.testing.assert_close(loaded_embed.weight, fake_model.embed.weight.detach().float())
     torch.testing.assert_close(loaded_head.weight, fake_model.head.weight.detach().float())
+
+
+def test_parser_mask_generation_prompt_flag():
+    base = ["--target-model", "tiny", "--input-data", "data.jsonl", "--output-dir", "out"]
+    assert _build_parser().parse_args(base).mask_generation_prompt is False
+    assert _build_parser().parse_args(base + ["--mask-generation-prompt"]).mask_generation_prompt is True
