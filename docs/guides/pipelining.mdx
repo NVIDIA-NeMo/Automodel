@@ -135,6 +135,32 @@ ap = AutoPipeline(
 ).build(model, loss_fn=loss_fn)
 ```
 
+### Receive Buffer Pooling (`pp_recv_buffer_pool`)
+
+`torch.distributed.pipelining` pre-allocates one receive buffer per microbatch and
+per direction (activations forward, gradients backward). With many microbatches and
+wide stage inputs those buffers can exceed the activations themselves — Kimi-K3 at
+2k-token rows with 64 microbatches needs ~52 GiB of them on middle stages.
+
+Under the 1F1B schedule only `num_stages - stage_index` microbatches are ever in
+flight on a stage, so `pp_recv_buffer_pool: true` rebinds the per-microbatch
+receive slots onto a ring of `(num_stages - stage_index) + pp_recv_buffer_pool_slack`
+real buffer sets (default slack 2). The values flowing through the schedule are
+unchanged; only which buffer object receives each chunk differs.
+
+```yaml
+distributed:
+  pipeline:
+    pp_schedule: 1f1b
+    pp_recv_buffer_pool: true        # default false
+    pp_recv_buffer_pool_slack: 2     # extra buffer sets beyond the in-flight depth
+```
+
+The option applies only to schedules with a bounded in-flight depth (currently
+`1f1b`); other schedules keep the stock allocation with a warning. If the installed
+torch exposes neither of the two known `PipelineStage` layouts, the pool is not
+installed and stock behavior is kept (logged at install time).
+
 ### Model Patching (`patch_inner_model`, `patch_causal_lm_model`)
 
 AutoPipeline splits a model by deep-copying it per stage and pruning away modules that don't belong to that stage. Many Hugging Face models assume the full module tree is present and return `ModelOutput` objects; after pruning, their original `forward()` often breaks (or returns objects that are awkward to pipeline).
