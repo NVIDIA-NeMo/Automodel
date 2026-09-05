@@ -19,6 +19,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import contextmanager
+from fnmatch import fnmatchcase
 from functools import lru_cache
 from types import FunctionType
 from typing import Any, Dict, Generator, List, Sequence, Tuple, Union
@@ -130,6 +131,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_llama_nemotron_super_tp_plan,
 )
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+from nemo_automodel.components.distributed.tp_replicas import _mark_tp_replica_gradient_reduction
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 
 _MEGATRON_FSDP_050_REQUIRED_MSG = (
@@ -1469,9 +1471,12 @@ def get_hf_tp_shard_plan(model):
             translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
             style = translate_to_torch_parallel_style(v)
-            # Translator returns None for styles that should be skipped (e.g.
-            # "replicated_with_grad_allreduce" under FSDP where leaving the
-            # param un-wrapped is equivalent).
+            if v == "replicated_with_grad_allreduce":
+                for module_name, module in model.named_modules():
+                    if fnmatchcase(module_name, k):
+                        _mark_tp_replica_gradient_reduction(module, "sum")
+            # The optimizer-boundary replica synchronization owns styles that
+            # intentionally leave parameters unwrapped.
             if style is None:
                 continue
             translated_plan[k] = style
@@ -1540,11 +1545,8 @@ def translate_to_torch_parallel_style(style: str):
     elif style == "sequence_parallel":
         return SequenceParallel()
     elif style == "replicated_with_grad_allreduce":
-        # transformers v5 style for norm weights (q_norm, k_norm, etc.) that are
-        # replicated across TP ranks but need gradient all-reduce. Under FSDP+TP,
-        # leaving the param un-wrapped (no TP style) is equivalent: FSDP handles
-        # grad sync on its DP/DP_shard mesh, and since the param is replicated on
-        # the TP mesh, no TP-level collective is needed in forward.
+        # get_hf_tp_shard_plan marks the owning module so the shared optimizer
+        # boundary performs the required sum across partial-head gradients.
         return None
     else:
         raise ValueError(f"Unknown parallel style: {style}")

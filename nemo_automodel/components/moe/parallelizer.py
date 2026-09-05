@@ -1079,12 +1079,12 @@ def parallelize_model(
         # get_expert_tp_replication_factor reads this marker to remove that
         # factor in scale_grads_and_clip_grad_norm.
         model._nemo_moe_tp_requires_replica_sync = True
-        # The replicated paths have no gradient synchronization of their own;
-        # they stay identical across TP ranks only when every rank starts from
-        # the same complete pretrained checkpoint. This marker makes
-        # apply_model_infrastructure and checkpoint loading fail closed on
-        # random/from-config initialization or partial checkpoints. It applies
-        # equally to registered and explicit custom-MoE plans.
+        # Retain the conservative pretrained-weight contract until this combined
+        # TP/EP path has dedicated replica-sync parity coverage. The generic
+        # optimizer-boundary synchronization must not silently broaden custom-MoE
+        # support. This marker makes apply_model_infrastructure and checkpoint
+        # loading fail closed on random/from-config initialization or partial
+        # checkpoints. It applies equally to registered and explicit plans.
         model._nemo_moe_tp_requires_pretrained_weights = True
         # PEFT is applied before distributed sharding. Translate each style so
         # LoRA-wrapped shared-expert/lm-head modules keep the same TP semantics.

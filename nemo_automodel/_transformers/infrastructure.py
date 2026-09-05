@@ -62,6 +62,7 @@ from nemo_automodel.components.distributed.megatron_fsdp import (
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
+from nemo_automodel.components.distributed.tp_replicas import _broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
@@ -114,9 +115,9 @@ def _validate_safe_moe_tp_weight_source(
     """Fail closed when replicated MoE-TP paths cannot start from identical weights.
 
     The conservative plan intentionally leaves attention/router/norm modules
-    replicated across TP ranks.  Until those replicas have explicit gradient
-    synchronization, they may only be used for deterministic full-parameter
-    training from one successfully loaded shared base checkpoint.
+    replicated across TP ranks. Keep its stricter pretrained, non-PEFT contract
+    until the combined TP/EP path has dedicated replica-sync parity coverage;
+    the generic synchronization must not silently broaden model support.
     """
     parts = _safe_moe_tp_parts(model)
     if not parts:
@@ -124,13 +125,14 @@ def _validate_safe_moe_tp_weight_source(
     if peft_config is not None:
         raise ValueError(
             "Safe custom-MoE tensor parallelism does not support PEFT yet: "
-            "replicated adapters are rank-initialized and can diverge."
+            "the combined TP/EP adapter ownership contract lacks parity coverage."
         )
     if not checkpoint_source_available:
         raise ValueError(
             "Safe custom-MoE tensor parallelism requires pretrained weights on every TP rank. "
             "from_config/random initialization and load_base_model=False are unsupported; "
-            "use from_pretrained (or an explicitly preloaded shared checkpoint)."
+            "use from_pretrained (or an explicitly preloaded shared checkpoint) until the combined TP/EP path "
+            "has replica-sync parity coverage."
         )
 
 
@@ -881,4 +883,10 @@ def apply_model_infrastructure(
     restore_distributed_param_attrs(model, mfsdp_param_attrs)
 
     model = _apply_runtime_compatibility_fixes(model)
+    synchronized_tp_replicas = _broadcast_tp_replicas(
+        model.parts if hasattr(model, "parts") else [model],
+        mesh.device_mesh,
+    )
+    if synchronized_tp_replicas:
+        logger.info("Synchronized %d replicated tensors across TP ranks", synchronized_tp_replicas)
     return model
