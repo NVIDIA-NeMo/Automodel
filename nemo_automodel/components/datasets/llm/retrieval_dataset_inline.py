@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import logging
 import os
@@ -103,7 +104,9 @@ def _resolve_doc_to_example(doc: Any) -> dict:
     return example
 
 
-def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True):
+def load_datasets(
+    data_dir_list: Union[List[str], str], concatenate: bool = True, extra_columns: tuple[str, ...] | None = None
+):
     """
     Load retrieval datasets from JSON/JSONL files.
 
@@ -111,6 +114,10 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
 
     Returns:
         Tuple of (dataset, corpus_dict)
+
+    Columns named in *extra_columns* are carried through verbatim; every other key
+    outside the normalized set is dropped. Absent values become None so the column
+    stays present on every row.
     """
     if not isinstance(data_dir_list, list):
         data_dir_list = [data_dir_list]
@@ -169,6 +176,8 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
                 "pos_doc": [_normalize_inline_doc(d) for d in pos_docs_raw],
                 "neg_doc": [_normalize_inline_doc(d) for d in _coerce_to_list(item.get("neg_doc"))],
             }
+            for column in extra_columns or ():
+                normalized_item[column] = item.get(column)
             normalized_data.append(normalized_item)
 
         datasets.append(Dataset.from_list(normalized_data))
@@ -432,6 +441,219 @@ def make_retrieval_dataset(
     return dataset
 
 
+def _flatten_context_columns(data: dict, context_columns: tuple[str, ...]) -> dict:
+    """Flatten a bi-encoder batch and repeat the extra per-query columns per document.
+
+    ``flatten_bi_encoder_to_cross_encoder`` returns a fixed set of keys, so any column
+    beyond question/doc_text is dropped. Context fields are per-query, so they repeat
+    exactly like the question does.
+    """
+    flattened = flatten_bi_encoder_to_cross_encoder(data)
+    docs_per_query = [len(group) for group in data["doc_image"]]
+    for column in context_columns:
+        values = data.get(column)
+        if values is None:
+            continue
+        flattened[column] = [v for v, n in zip(values, docs_per_query) for _ in range(n)]
+    return flattened
+
+
+def _group_aware_split(dataset, validation_fraction: float, group_key: str | None, data_type: str, seed: int):
+    """Carve a deterministic held-out slice, keeping rows that share a group together.
+
+    Splitting on rows alone leaks when one query contributes several rows -- a mixed
+    dataset holding two labelings of the same query is the case that motivated this.
+    Grouping on ``group_key`` puts every row of a group on the same side.
+    """
+    if group_key is None:
+        groups = list(range(len(dataset)))
+        row_groups = groups
+    else:
+        if group_key not in dataset.column_names:
+            raise ValueError(
+                f"validation_group_key={group_key!r} is not a column of the dataset; "
+                f"available columns are {sorted(dataset.column_names)}. The split key must be "
+                "requested as an extra column so it survives loading."
+            )
+        row_groups = dataset[group_key]
+        # load_datasets fills absent extra columns with None, so a group key that is present
+        # on some rows and missing on others reaches here as a mix of str and None. sorted()
+        # then raises TypeError from inside dataset construction, which reads as a library
+        # bug rather than as the data problem it is. Fail with the column name instead.
+        missing = sum(1 for g in row_groups if g is None or (isinstance(g, str) and not g.strip()))
+        if missing:
+            raise ValueError(
+                f"validation_group_key={group_key!r} is missing or blank on {missing} of "
+                f"{len(row_groups)} rows; every row needs a group value or the split cannot "
+                "keep a group on one side"
+            )
+        groups = sorted(set(row_groups))
+
+    # ASSIGN EACH GROUP INDEPENDENTLY, BY HASH.
+    #
+    # The train and validation halves are produced by two SEPARATE calls to this function,
+    # from two separate configs. They are complementary only if both calls see the same
+    # groups in the same order with the same seed. Shuffling a materialised list made that
+    # coupling silent and brittle: any difference in file order, or one extra row on one
+    # side, permutes the shuffle and moves groups across the boundary -- reintroducing
+    # exactly the leakage the grouping exists to prevent, with no error raised.
+    #
+    # Hashing (seed, group) instead makes a group's side a pure function of its own id. Two
+    # calls agree as long as they share the seed and fraction, whatever order the rows
+    # arrive in and whatever else is present.
+    #
+    # The score is COMPARED AGAINST THE FRACTION rather than ranked, so a group's side
+    # depends on nothing but (seed, group, fraction). Ranking -- take the lowest
+    # round(n * fraction) scores -- yields an exact validation count, but the cutoff is a
+    # property of the whole group set, which reintroduces both failure modes this function
+    # exists to prevent:
+    #   * Adding one group can evict an existing group from validation into training. With
+    #     10 groups at 0.2, n_val is 2; add an 11th group that hashes low and n_val is
+    #     still 2, so whichever group held the second slot silently moves to training and
+    #     any model that already trained on the new split has seen it.
+    #   * Train and validation are built by two SEPARATE calls from two separate configs.
+    #     If those configs do not resolve to an identical group set -- one extra file, one
+    #     filtered row -- the two calls compute different cutoffs, and a group can land in
+    #     training on one side and validation on the other. That is silent leakage, not an
+    #     error.
+    # Thresholding costs an exact count: the size is binomial, so 0.2 of 40 groups can come
+    # out as 7 rather than 8, and at 249 groups a 10% split varies by roughly +/-5. A
+    # validation slice a few groups off target is a far cheaper failure than leakage.
+    def _in_validation(group) -> bool:
+        h = hashlib.blake2b(f"{seed}:{group}".encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(h, "big") / 2.0**64 < validation_fraction
+
+    val_groups = {g for g in groups if _in_validation(g)} if validation_fraction > 0 else set()
+
+    # A thresholded split has a binomial size, so with few groups a run that asked for a
+    # held-out slice can legitimately draw every group onto one side. Neither outcome is
+    # usable and both fail far from here: an empty validation side yields a zero-length
+    # eval dataset, and an empty training side yields a run with nothing to train on.
+    # Fail here instead, where the seed and fraction that produced it are in scope.
+    if validation_fraction > 0 and len(groups) > 0 and (not val_groups or len(val_groups) == len(groups)):
+        empty_side = "validation" if not val_groups else "train"
+        raise ValueError(
+            f"group-aware split put every group on one side: {len(groups)} group(s), "
+            f"{len(val_groups)} selected for validation, so the {empty_side} side is empty "
+            f"(validation_fraction={validation_fraction}, seed={seed}, "
+            f"validation_group_key={group_key!r}). The split assigns each group independently "
+            f"by hash, so with this few groups the drawn size can miss the requested fraction "
+            f"entirely. Use more groups, change the seed, adjust validation_fraction, or set "
+            f"validation_fraction=0 and supply an explicit validation dataset."
+        )
+
+    keep_val = data_type in ("validation", "eval")
+    indices = [i for i, g in enumerate(row_groups) if (g in val_groups) == keep_val]
+    # Log a fingerprint of the chosen validation set. The train and validation builds print
+    # one of these each, back to back, so a seed or fraction mismatch between the two configs
+    # is visible in the job log as two differing fingerprints rather than as silent leakage.
+    fp = hashlib.blake2b("|".join(sorted(map(str, val_groups))).encode("utf-8"), digest_size=6).hexdigest()
+    logging.info(
+        "group-aware split on %r: %d groups -> %d validation, %d rows selected for %s "
+        "(seed=%s fraction=%s val_fingerprint=%s)",
+        group_key,
+        len(groups),
+        len(val_groups),
+        len(indices),
+        data_type,
+        seed,
+        validation_fraction,
+        fp,
+    )
+    return dataset.select(indices)
+
+
+def make_context_aware_retrieval_dataset(
+    data_dir_list: Union[List[str], str],
+    model_type: str = "cross_encoder",
+    data_type: str = "train",
+    n_passages: int = 8,
+    validation_fraction: float = 0.0,
+    validation_group_key: str | None = None,
+    reasoning_column: str | None = None,
+    global_query_column: str | None = None,
+    seed: int = 42,
+    do_shuffle: bool = False,
+    max_train_samples: int | None = None,
+    train_data_select_offset: int = 0,
+):
+    """Inline retrieval dataset that also carries per-query context columns.
+
+    Same ``pos_doc``/``neg_doc`` schema and loader as :func:`make_retrieval_dataset`,
+    plus two things it does not provide:
+
+    * ``reasoning_column`` / ``global_query_column`` are passed through as ``reasoning``
+      and ``global_query``. ``Qwen3RerankerCollator`` reads both with ``.get()`` and
+      selects its prompt mode from whichever survive its drop probabilities, so rows
+      missing them simply train in a narrower mode.
+    * ``validation_fraction`` carves a held-out slice at the level of
+      ``validation_group_key`` rather than the row, so rows sharing a group cannot land
+      on opposite sides.
+
+    Args:
+        data_dir_list: Path(s) to inline JSON/JSONL with ``query``/``pos_doc``/``neg_doc``.
+        model_type: ``"cross_encoder"`` or ``"bi_encoder"``.
+        data_type: ``"train"``, or ``"validation"``/``"eval"`` for the held-out side.
+        n_passages: Passages per query (1 positive + ``n_passages - 1`` negatives).
+        validation_fraction: Fraction of groups held out, in [0, 1). 0 uses the whole
+            split; values outside the range are rejected.
+        validation_group_key: Column defining a group; None groups by row.
+        reasoning_column: Column holding the reasoning trace.
+        global_query_column: Column holding the originating question.
+        seed: Seeds the split and any shuffle.
+        do_shuffle: Shuffle before subsetting (train only).
+        max_train_samples: Cap on training rows, applied after the split.
+        train_data_select_offset: Offset of the selected window.
+
+    Returns:
+        A ``Dataset`` whose transform emits question/doc_text plus the context columns.
+    """
+    _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
+    if model_type not in _VALID_MODEL_TYPES:
+        raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
+    if data_type not in ("train", "validation", "eval"):
+        raise ValueError(f"Invalid data type: {data_type}")
+    # Both ends fail silently rather than loudly if left unchecked. A negative fraction skips
+    # the split below entirely, so the validation build returns the WHOLE dataset and every
+    # training row is also an eval row -- total leakage, no error. A fraction of 1 or more
+    # puts every group in validation; that does raise, but from the empty-side check, whose
+    # message blames the group count and suggests changing the seed, none of which is the
+    # problem. Reject the value here, where it was supplied.
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError(f"validation_fraction must be in [0, 1), got {validation_fraction!r}")
+
+    requested = tuple(c for c in (reasoning_column, global_query_column, validation_group_key) if c)
+    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, extra_columns=requested)
+    logging.info(f"Loaded dataset with {len(dataset)} examples")
+
+    if validation_fraction > 0:
+        dataset = _group_aware_split(dataset, validation_fraction, validation_group_key, data_type, seed)
+
+    if data_type == "train":
+        if do_shuffle:
+            dataset = dataset.shuffle(seed=seed)
+        if max_train_samples is not None:
+            dataset = dataset.select(
+                range(train_data_select_offset, min(train_data_select_offset + max_train_samples, len(dataset)))
+            )
+
+    context_columns = tuple(c for c in ((reasoning_column, "reasoning"), (global_query_column, "global_query")) if c[0])
+    negative_size = n_passages - 1
+
+    def transform(examples):
+        data = _retrieval_transform_func(examples, negative_size, corpus_dict)
+        for source, target in context_columns:
+            if source in examples:
+                data[target] = examples[source]
+        if model_type == "bi_encoder":
+            return data
+        return _flatten_context_columns(data, tuple(t for _, t in context_columns))
+
+    dataset.set_transform(transform)
+    logging.info(f"Created {data_type} dataset with {len(dataset)} examples")
+    return dataset
+
+
 @dataclass
 class InlineRetrievalDatasetConfig:
     """Construction-time configuration for inline retrieval datasets."""
@@ -460,4 +682,39 @@ class InlineRetrievalDatasetConfig:
             max_train_samples=self.max_train_samples,
             train_data_select_offset=self.train_data_select_offset,
             use_dataset_instruction=self.use_dataset_instruction,
+        )
+
+
+@dataclass
+class ContextAwareRetrievalDatasetConfig:
+    """Construction-time configuration for context-aware inline retrieval datasets."""
+
+    data_dir_list: list[str] | str
+    model_type: str = "cross_encoder"
+    data_type: str = "train"
+    n_passages: int = 8
+    validation_fraction: float = 0.0
+    validation_group_key: str | None = None
+    reasoning_column: str | None = None
+    global_query_column: str | None = None
+    seed: int = 42
+    do_shuffle: bool = False
+    max_train_samples: int | None = None
+    train_data_select_offset: int = 0
+
+    def build(self) -> Dataset:
+        """Build the context-aware retrieval dataset from this config."""
+        return make_context_aware_retrieval_dataset(
+            data_dir_list=self.data_dir_list,
+            model_type=self.model_type,
+            data_type=self.data_type,
+            n_passages=self.n_passages,
+            validation_fraction=self.validation_fraction,
+            validation_group_key=self.validation_group_key,
+            reasoning_column=self.reasoning_column,
+            global_query_column=self.global_query_column,
+            seed=self.seed,
+            do_shuffle=self.do_shuffle,
+            max_train_samples=self.max_train_samples,
+            train_data_select_offset=self.train_data_select_offset,
         )
