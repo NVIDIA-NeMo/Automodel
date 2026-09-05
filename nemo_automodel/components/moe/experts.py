@@ -1239,6 +1239,12 @@ class GroupedExpertsTE(nn.Module):
 
         super().__init__()
 
+        # TE grouped experts are never DTensor-wrapped on the EP axis, so their
+        # grads differ per EP rank without their mesh saying so. Grad clipping
+        # and EP grad scaling identify these params structurally through this
+        # marker (see training/utils.py) instead of matching parameter names.
+        self._nemo_ep_local_expert_params = True
+
         self.config = config
         self.num_local_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias

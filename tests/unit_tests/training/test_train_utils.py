@@ -552,11 +552,13 @@ class _TEGroupedLinearMock(nn.Module):
 
 
 class _ExpertsModule(nn.Module):
-    """Mock experts module with parameters matching GroupedExpertsTE pattern."""
+    """Mock experts module carrying the GroupedExpertsTE structural marker."""
 
     def __init__(self):
         super().__init__()
-        # Submodule names match GroupedExpertsTE: gate_up_linear, down_linear
+        # EP grad scaling and the grad-clip EP reduction identify TE expert
+        # params through this marker, mirroring GroupedExpertsTE.__init__.
+        self._nemo_ep_local_expert_params = True
         self.gate_up_linear = _TEGroupedLinearMock()
 
 
@@ -566,7 +568,6 @@ class _MoEModule(nn.Module):
     def __init__(self):
         super().__init__()
         self.gate = nn.Linear(4, 2, bias=False)
-        # FQN will be mlp.experts.gate_up_linear.weight0, matching _EXPERT_PARAM_PATTERN
         self.mlp = nn.ModuleDict({"experts": _ExpertsModule()})
 
 
@@ -587,8 +588,8 @@ class TestScaleGradsAndClipGradNorm:
 
         torch.testing.assert_close(model.weight.grad, torch.full_like(model.weight, 2.0))
 
-    def test_ep_scaling_for_expert_params_by_name(self):
-        """Test that expert params are scaled by EP ratio based on param name."""
+    def test_ep_scaling_for_marked_expert_params(self):
+        """Expert params found via the structural marker are scaled by the EP ratio."""
         model = _MoEModule()
         expert_param = model.mlp["experts"].gate_up_linear.weight0
         model.gate.weight.grad = torch.ones_like(model.gate.weight) * 2.0

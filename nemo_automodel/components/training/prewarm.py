@@ -90,6 +90,7 @@ class PrewarmConfig:
         device: torch.device | int | str | None,
         batch_size: int = 1,
         pp_mesh: DeviceMesh | None = None,
+        ep_mesh: DeviceMesh | None = None,
     ) -> None:
         """Run the enabled prewarms.
 
@@ -102,6 +103,10 @@ class PrewarmConfig:
             pp_mesh: The pipeline-parallel submesh, if pipeline parallelism is
                 enabled (its process group is warmed for the grad-norm
                 all-reduce).
+            ep_mesh: The flat expert-parallel submesh, if EP is enabled. TE
+                grouped expert params never carry the EP axis in their own
+                placements, so the enumeration cannot discover this group
+                either; grad clipping all-reduces expert norms over it.
         """
         if self.cublas_backward:
             try:
@@ -120,7 +125,7 @@ class PrewarmConfig:
                 logger.exception("Mamba SSD autotune prewarm failed; continuing without it.")
         if self.comm_groups:
             try:
-                _prewarm_comm_groups(model_parts, device, pp_mesh=pp_mesh)
+                _prewarm_comm_groups(model_parts, device, pp_mesh=pp_mesh, ep_mesh=ep_mesh)
             except Exception:
                 logger.exception("Communication-group prewarm failed; continuing without it.")
 
@@ -612,6 +617,7 @@ def _prewarm_comm_groups(
     model_parts: list[torch.nn.Module],
     device: torch.device | int | str | None,
     pp_mesh: DeviceMesh | None = None,
+    ep_mesh: DeviceMesh | None = None,
 ) -> int:
     """Eagerly create the NCCL communicators gradient-norm clipping will use.
 
@@ -633,6 +639,9 @@ def _prewarm_comm_groups(
             also all-reduces the total norm across the PP group, but
             parameters are never sharded along pp, so the placement
             enumeration alone cannot discover that group.
+        ep_mesh: Flat expert-parallel submesh, if enabled. TE grouped expert
+            params never carry the EP axis in their placements either, and
+            ``clip_grad_norm`` all-reduces their norm contribution over it.
 
     Returns:
         The number of process groups warmed.
@@ -664,11 +673,13 @@ def _prewarm_comm_groups(
                 seen.add(id(group))
                 groups.append(group)
 
-    if pp_mesh is not None:
+    for extra_mesh, axis in ((pp_mesh, "PP"), (ep_mesh, "EP")):
+        if extra_mesh is None:
+            continue
         try:
-            group = pp_mesh.get_group()
+            group = extra_mesh.get_group()
         except Exception:
-            logger.exception("Failed to resolve the PP mesh process group; skipping its prewarm.")
+            logger.exception("Failed to resolve the %s mesh process group; skipping its prewarm.", axis)
             group = None
         if group is not None and id(group) not in seen:
             seen.add(id(group))

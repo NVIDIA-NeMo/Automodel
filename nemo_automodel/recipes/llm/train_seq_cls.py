@@ -254,6 +254,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             norm_type=2.0,
             pp_enabled=self._get_pp_rank() != 0 if hasattr(self, "_get_pp_rank") else False,
             device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in (self.moe_mesh.mesh_dim_names or ()) else None,
         )
 
         # Calculate accuracy
