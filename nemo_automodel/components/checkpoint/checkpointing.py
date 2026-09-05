@@ -50,6 +50,7 @@ from safetensors.torch import save as safetensors_save
 from torch import nn
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel
 from torch.serialization import MAP_LOCATION, FileLike
 
@@ -86,6 +87,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
@@ -1179,17 +1181,18 @@ class Checkpointer:
             and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
             and hasattr(model, "backbone")  # is HF remote code
         )
-        # HF's _init_weights calls init.zeros_(weight[padding_idx]) on
-        # nn.Embedding layers.  When the weight is a DTensor (TP-sharded),
-        # the integer index triggers a redistribute that fails.  Temporarily
-        # clear padding_idx so the zeroing is skipped, then restore it and
-        # zero the row via local-tensor ops instead.
-        has_padding_idx = any(
-            isinstance(mod, nn.Embedding)
-            and type(mod.weight).__name__ == "DTensor"
-            and getattr(mod, "padding_idx", None) is not None
+        # HF's _init_weights calls init.zeros_(weight[padding_idx]) on nn.Embedding
+        # layers. When the weight is a DTensor the integer index triggers a
+        # redistribute (an all-gather of the whole embedding) and fails for TP
+        # shards. Clear padding_idx for the duration of initialize_weights() so
+        # that op is skipped, then zero the row on the rank-local shard. Skipping
+        # the whole initialization instead left every from_config parameter as the
+        # uninitialized memory to_empty() handed out (all-zero or garbage models).
+        padded_embeddings = [
+            mod
             for mod in model.modules()
-        )
+            if isinstance(mod, nn.Embedding) and isinstance(mod.weight, DTensor) and mod.padding_idx is not None
+        ]
         # Models that know the upcoming load will fully populate every tensor
         # (e.g. Devstral FP8 via its state_dict_adapter) can opt out of HF's
         # random init. Skipping also sidesteps stage-divergent DTensor
@@ -1203,7 +1206,6 @@ class Checkpointer:
             ]
             or is_nemotron_v2
             or is_nemotron_v3_hf
-            or has_padding_idx
             or owns_weight_load
         )
         if not skip_initialize_weights:
@@ -1221,14 +1223,23 @@ class Checkpointer:
                     if p.is_floating_point():
                         param_dtype = p.dtype
                         break
+                saved_padding_idx = [(mod, mod.padding_idx) for mod in padded_embeddings]
+                for mod, _ in saved_padding_idx:
+                    mod.padding_idx = None
                 try:
-                    if param_dtype is not None:
-                        model.initialize_weights(dtype=param_dtype)
-                    else:
+                    try:
+                        if param_dtype is not None:
+                            model.initialize_weights(dtype=param_dtype)
+                        else:
+                            model.initialize_weights()
+                    except TypeError:
+                        # Model's initialize_weights() does not accept a dtype kwarg.
                         model.initialize_weights()
-                except TypeError:
-                    # Model's initialize_weights() does not accept a dtype kwarg.
-                    model.initialize_weights()
+                finally:
+                    for mod, padding_idx in saved_padding_idx:
+                        mod.padding_idx = padding_idx
+                for mod, padding_idx in saved_padding_idx:
+                    zero_embedding_row_(mod.weight, padding_idx)
             else:
                 logging.warning(
                     "Warning: Model does not have initialize_weights method."

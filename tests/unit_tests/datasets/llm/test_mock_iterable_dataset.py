@@ -207,3 +207,45 @@ class TestMockIterableDataset:
 
         # All tokens should be 0 (the only valid token)
         assert torch.all(sample["input_ids"] == 0)
+
+
+class TestMockIterableDatasetExcludeTokenIds:
+    """exclude_token_ids keeps chosen ids (e.g. pad_token_id) out of input_ids."""
+
+    def test_default_is_unchanged(self):
+        dataset = MockIterableDataset(vocab_size=1000, seq_len=512)
+        assert dataset.exclude_token_ids == ()
+        assert dataset._allowed_ids is None
+
+    def test_excluded_ids_never_appear(self):
+        torch.manual_seed(0)
+        dataset = MockIterableDataset(
+            vocab_size=16, seq_len=4096, num_samples=8, batch_size=2, exclude_token_ids=[0, 5]
+        )
+        assert dataset.exclude_token_ids == (0, 5)
+        seen = torch.cat([sample["input_ids"].flatten() for sample in dataset])
+        assert not torch.isin(seen, torch.tensor([0, 5])).any()
+        # every other id still gets sampled (uniform over the remaining 14 ids)
+        assert set(seen.tolist()) == set(range(16)) - {0, 5}
+
+    def test_labels_stay_the_shifted_inputs(self):
+        dataset = MockIterableDataset(vocab_size=100, seq_len=32, num_samples=1, batch_size=1, exclude_token_ids=(0,))
+        sample = next(iter(dataset))
+        assert torch.equal(sample["labels"][:, :-1], sample["input_ids"][:, 1:])
+        assert (sample["labels"][:, -1] == -100).all()
+        assert sample["input_ids"].shape == (1, 32)
+
+    def test_config_passes_exclusions_through(self):
+        from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDatasetConfig
+
+        dataset = MockIterableDatasetConfig(vocab_size=50, seq_len=8, exclude_token_ids=[3]).build()
+        assert dataset.exclude_token_ids == (3,)
+        assert 3 not in next(iter(dataset))["input_ids"].tolist()[0]
+
+    def test_out_of_range_or_exhaustive_exclusions_raise(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            MockIterableDataset(vocab_size=10, seq_len=4, exclude_token_ids=[10])
+        with pytest.raises(ValueError):
+            MockIterableDataset(vocab_size=2, seq_len=4, exclude_token_ids=[0, 1])
