@@ -840,8 +840,9 @@ if _HF_MISTRAL3_AVAILABLE:
             pixel_values: torch.Tensor | None = None,
             image_sizes: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
+            logits_to_keep: Union[int, torch.Tensor] = 0,
             **kwargs: Any,
-        ) -> torch.Tensor:
+        ) -> torch.Tensor | dict[str, torch.Tensor]:
             # PP VLM support: retrieve pixel_values from stored chunks
             if (
                 pixel_values is None
@@ -862,7 +863,8 @@ if _HF_MISTRAL3_AVAILABLE:
                             image_sizes = image_grid_hws
                         self._vlm_chunk_idx = chunk_idx + 1
 
-            if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
+            is_thd = kwargs.get("qkv_format") == "thd"
+            if is_thd:
                 input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
                     input_ids, position_ids, padding_mask, kwargs
                 )
@@ -880,13 +882,23 @@ if _HF_MISTRAL3_AVAILABLE:
             )
 
             hidden_states = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs
+
+            # ``0`` is the default "project every position". Anything else is the
+            # fused-loss path: FusedLinearCrossEntropy applies the lm_head itself,
+            # fused with the loss, so hand back hidden states rather than
+            # materialising the [tokens, vocab_size] logits tensor.
+            if not (isinstance(logits_to_keep, int) and logits_to_keep == 0):
+                if is_thd and hidden_states.dim() == 2:
+                    hidden_states = hidden_states.unsqueeze(0)
+                return {"hidden_states": hidden_states}
+
             try:
                 lm = self.lm_head
             except (AttributeError, TypeError):
                 lm = None
             logits = lm(hidden_states) if lm is not None else hidden_states
 
-            if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
+            if is_thd:
                 logits = logits.unsqueeze(0)
 
             return logits
