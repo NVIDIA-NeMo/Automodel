@@ -46,6 +46,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
+# Which torch PipelineStage layout the patch bound to ("per-direction-setup" or
+# "prepare-infra"); None until installed. Logged at install time so a run's log
+# states which code path it exercised.
+_INSTALLED_LAYOUT: str | None = None
 
 # Schedules whose in-flight microbatch count per stage is bounded by
 # num_stages - stage_index, making the ring size proof valid. Interleaved /
@@ -73,6 +77,8 @@ def _ring_size(stage, num_microbatches: int, slack: int) -> int:
         slack: Extra buffer sets beyond the 1F1B in-flight depth.
     """
     inflight = max(1, stage.num_stages - stage.stage_index)
+    # Floor of 2: even the last-in-flight stage keeps one buffer set receiving
+    # while the previous chunk's backward still reads its saved input.
     return max(2, min(num_microbatches, inflight + slack))
 
 
@@ -90,8 +96,14 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
     Returns:
         True if installed (or already installed), False if the torch
         internals do not match any known layout (stock behavior is kept).
+
+    Raises:
+        ValueError: if ``slack`` is negative (a ring smaller than the 1F1B
+            in-flight depth would silently corrupt gradients).
     """
-    global _INSTALLED
+    global _INSTALLED, _INSTALLED_LAYOUT
+    if slack < 0:
+        raise ValueError(f"recv_buffer_pool: slack must be >= 0, got {slack}")
     if _INSTALLED:
         return True
 
@@ -105,9 +117,12 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         return False
 
     def _alias_fwd_ring(self, k, num_microbatches):
+        # Forward setup does not touch self.chunks in any known layout; restore
+        # it defensively anyway so a layout that does cannot leave it at k.
+        self.chunks = num_microbatches
         for chunk_id in range(k, num_microbatches):
             self.args_recv_info[chunk_id] = self.args_recv_info[chunk_id % k]
-        logger.info(
+        logger.debug(
             "recv_buffer_pool: stage %d fwd recv ring %d/%d buffer sets",
             self.stage_index,
             k,
@@ -120,7 +135,7 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         self.chunks = num_microbatches
         for chunk_id in range(k, num_microbatches):
             self.grad_recv_info[chunk_id] = self.grad_recv_info[chunk_id % k]
-        logger.info(
+        logger.debug(
             "recv_buffer_pool: stage %d bwd recv ring %d/%d buffer sets",
             self.stage_index,
             k,
@@ -128,7 +143,11 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         )
 
     if hasattr(manual_cls, "_setup_forward_recv_info"):
-        # torch >= 2.13: per-direction setup helpers.
+        # Layout "per-direction-setup" (torch release/2.12 and later): the
+        # manual PipelineStage allocates in _setup_forward_recv_info(
+        # num_microbatches, has_backward) and the base class in
+        # _setup_backward_recv_info(num_microbatches).
+        layout = "per-direction-setup"
         orig_fwd = manual_cls._setup_forward_recv_info
         orig_bwd = base_cls._setup_backward_recv_info
 
@@ -151,9 +170,11 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         manual_cls._setup_forward_recv_info = pooled_setup_forward_recv_info
         base_cls._setup_backward_recv_info = pooled_setup_backward_recv_info
     elif hasattr(manual_cls, "_prepare_forward_infra"):
-        # torch 2.12 line (e.g. the NGC 26.06 container): allocation inside
+        # Layout "prepare-infra" (torch <= 2.11 and the pre-refactor 2.12
+        # nightlies, e.g. the NGC 26.06 container): allocation inside
         # _prepare_forward_infra(num_microbatches, args, kwargs) and the base
         # class's _prepare_backward_infra(num_microbatches).
+        layout = "prepare-infra"
         orig_fwd = manual_cls._prepare_forward_infra
         orig_bwd = base_cls._prepare_backward_infra
 
@@ -181,5 +202,17 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         logger.warning("recv_buffer_pool: no known recv-infra entry points on PipelineStage; not installing")
         return False
     _INSTALLED = True
-    logger.info("recv_buffer_pool: installed (slack=%d)", slack)
+    _INSTALLED_LAYOUT = layout
+    if _is_rank_zero():
+        logger.info("recv_buffer_pool: installed (slack=%d, layout=%s)", slack, layout)
     return True
+
+
+def _is_rank_zero() -> bool:
+    """True on rank 0 or when torch.distributed is not initialized (single log line per job)."""
+    try:
+        import torch.distributed as dist
+
+        return not dist.is_initialized() or dist.get_rank() == 0
+    except Exception:  # noqa: BLE001 - logging must never fail install
+        return True

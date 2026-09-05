@@ -111,6 +111,11 @@ class PipelineConfig:
     pp_recv_buffer_pool: bool = False
     pp_recv_buffer_pool_slack: int = 2
 
+    def __post_init__(self) -> None:
+        """Validate the recv-buffer-pool knobs."""
+        if self.pp_recv_buffer_pool_slack < 0:
+            raise ValueError(f"pp_recv_buffer_pool_slack must be >= 0, got {self.pp_recv_buffer_pool_slack}")
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
         return {
