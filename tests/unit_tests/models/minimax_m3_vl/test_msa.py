@@ -14,8 +14,11 @@
 
 """CPU contracts for MiniMax M3 MSA planning, policy, and Adapter state."""
 
+import subprocess
+import sys
 from collections import Counter
-from types import SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -488,6 +491,56 @@ def test_optional_dependency_failures_are_deferred_and_actionable(monkeypatch: p
         msa._require_msa()
     with pytest.raises(UnavailableError, match=r"uv sync --extra msa"):
         msa._require_msa_backward()
+
+
+def test_msa_import_and_construction_do_not_load_gpu_dependencies() -> None:
+    script = """
+import sys
+
+class RejectGpuImports:
+    def find_spec(self, fullname: str, path: object = None, target: object = None) -> None:
+        if fullname.split(".")[0] in {"fmha_sm100", "cutlass", "quack"}:
+            raise AssertionError(f"Unexpected GPU dependency import: {fullname}")
+
+sys.meta_path.insert(0, RejectGpuImports())
+from nemo_automodel.components.models.minimax_m3_vl.msa import _MSAFlatAttention
+_MSAFlatAttention(0.125)
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=60)
+
+
+def test_missing_sparse_stack_has_actionable_dependency_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    package = ModuleType("fmha_sm100")
+    package.__path__ = []
+
+    def missing_sparse_export(name: str) -> None:
+        raise ImportError("MSA's CuTe dependencies are unavailable")
+
+    package.__getattr__ = missing_sparse_export
+    monkeypatch.setitem(sys.modules, "fmha_sm100", package)
+    monkeypatch.setitem(sys.modules, "fmha_sm100.sparse", None)
+    monkeypatch.setattr(msa, "_resolve_msa_forward", msa._resolve_msa_forward.__wrapped__)
+
+    with pytest.raises(UnavailableError, match=r"uv sync --extra msa"):
+        msa._require_msa()
+
+
+def test_msa_rejects_foreign_utils_without_modifying_it(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    sparse_module = ModuleType("fmha_sm100.sparse")
+    sparse_module.__file__ = str(tmp_path / "fmha_sm100/sparse.py")
+    sparse_module.build_k2q_csr = lambda: None
+    sparse_module.sparse_atten_func = lambda: None
+    foreign_utils = ModuleType("src.common.utils")
+    foreign_utils.__file__ = str(tmp_path / "foreign/src/common/utils.py")
+    original_fmax = object()
+    foreign_utils.fmax = original_fmax
+    monkeypatch.setitem(sys.modules, "fmha_sm100.sparse", sparse_module)
+    monkeypatch.setitem(sys.modules, "src.common.utils", foreign_utils)
+    monkeypatch.setattr(msa, "_resolve_msa_forward", msa._resolve_msa_forward.__wrapped__)
+
+    with pytest.raises(ImportError, match="conflicting src package"):
+        msa._require_msa()
+    assert foreign_utils.fmax is original_fmax
 
 
 def test_custom_autograd_reuses_forward_schedule_and_returns_compact_gradients(
