@@ -271,6 +271,82 @@ class ParallelizationStrategy(ABC):
         pass
 
 
+def _fully_shard_untied_input_output_embeddings(
+    model: nn.Module,
+    *,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy,
+    offload_policy: OffloadPolicy | None,
+    input_reshard_after_forward: bool,
+    fully_shard_fn: Callable[..., nn.Module],
+) -> None:
+    """Give large trainable untied embedding tables independent FSDP buffers.
+
+    The generic dense path otherwise leaves both tables in the root FSDP unit.
+    With fp32 gradient reduction, that unit allocates one contiguous
+    reduce-scatter input containing both gradients. Keeping the two trainable
+    leaf modules in separate FSDP units bounds that allocation by the larger
+    table instead of their sum. Tied weights stay in one unit to preserve
+    aliasing, and frozen tables stay in the root because they have no gradient
+    communication buffer to split.
+
+    Args:
+        model: Model whose input and output embedding modules may be sharded.
+        mesh: Device mesh that owns the FSDP shards.
+        mp_policy: Mixed-precision policy used by the surrounding FSDP units.
+        offload_policy: Optional offload policy used by the surrounding FSDP
+            units.
+        input_reshard_after_forward: Whether the input embedding unit reshards
+            its parameters after forward.
+        fully_shard_fn: FSDP sharding callable, injectable for unit tests.
+    """
+    weights_are_tied = ensure_tied_lm_head(model)
+
+    def _resolve(getter_name: str) -> nn.Module | None:
+        getter = getattr(model, getter_name, None)
+        if not callable(getter):
+            return None
+        try:
+            module = getter()
+        except (AttributeError, NotImplementedError):
+            return None
+        return module if isinstance(module, nn.Module) else None
+
+    input_embeddings = _resolve("get_input_embeddings")
+    output_embeddings = _resolve("get_output_embeddings")
+    input_weight = getattr(input_embeddings, "weight", None)
+    output_weight = getattr(output_embeddings, "weight", None)
+    weights_are_physically_tied = input_embeddings is not None and (
+        input_embeddings is output_embeddings or (input_weight is not None and input_weight is output_weight)
+    )
+    if weights_are_tied or weights_are_physically_tied:
+        logger.info("Keeping tied input/output embeddings in the root FSDP unit")
+        return
+
+    seen: set[int] = set()
+    for role, module, module_reshard_after_forward in (
+        ("input embedding", input_embeddings, input_reshard_after_forward),
+        # The output projection is the last compute unit. Keep it gathered until
+        # backward, matching the old root-owned behavior and allowing
+        # FusedLinearCrossEntropy to consume its mixed-precision compute weight
+        # outside the module's forward.
+        ("output embedding", output_embeddings, False),
+    ):
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        if not any(param.requires_grad for param in module.parameters()):
+            continue
+        fully_shard_fn(
+            module,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=module_reshard_after_forward,
+            offload_policy=offload_policy,
+        )
+        logger.info("Sharded %s as an independent FSDP unit", role)
+
+
 class DefaultParallelizationStrategy(ParallelizationStrategy):
     """Default parallelization strategy used by most models."""
 
@@ -453,6 +529,18 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             fully_shard_fn=fully_shard_fn,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
             ignored_multimodal_params=ignored_multimodal_params,
+        )
+
+        input_embedding_reshard_after_forward = (
+            reshard_after_forward if reshard_after_forward is not None else not pp_enabled
+        )
+        _fully_shard_untied_input_output_embeddings(
+            model,
+            mesh=dp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            input_reshard_after_forward=input_embedding_reshard_after_forward,
+            fully_shard_fn=fully_shard_fn,
         )
 
         # Apply FSDP to the root model

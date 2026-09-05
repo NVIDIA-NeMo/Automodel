@@ -350,6 +350,91 @@ class TestDefaultParallelizationStrategy:
         mock_distributed_env["apply_fsdp"].assert_called_once()
         mock_distributed_env["fully_shard"].assert_called()
 
+    @pytest.mark.parametrize(
+        ("reshard_after_forward", "expected_input_reshard", "expected_output_reshard"),
+        [(None, True, False), (True, True, False), (False, False, False)],
+    )
+    def test_parallelize_splits_untied_input_and_output_embeddings(
+        self,
+        strategy,
+        mock_device_mesh,
+        mock_distributed_env,
+        reshard_after_forward,
+        expected_input_reshard,
+        expected_output_reshard,
+    ):
+        """Untied trainable tables become separate FSDP units before the root."""
+        mesh, _, _, _ = mock_device_mesh
+        model = MockModel()
+        model.model.embed_tokens = nn.Embedding(32, 10)
+        model.lm_head = nn.Linear(10, 32, bias=False)
+        model.get_input_embeddings = lambda: model.model.embed_tokens
+        model.get_output_embeddings = lambda: model.lm_head
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+        calls = mock_distributed_env["fully_shard"].call_args_list
+        modules = [item.args[0] for item in calls]
+        assert model.model.embed_tokens in modules
+        assert model.lm_head in modules
+        assert modules[-1] is model
+        embed_call = next(item for item in calls if item.args[0] is model.model.embed_tokens)
+        head_call = next(item for item in calls if item.args[0] is model.lm_head)
+        assert embed_call.kwargs["reshard_after_forward"] is expected_input_reshard
+        assert head_call.kwargs["reshard_after_forward"] is expected_output_reshard
+
+    def test_parallelize_keeps_tied_embeddings_in_root(self, strategy, mock_device_mesh, mock_distributed_env):
+        """Input/output parameters sharing storage must not acquire two FSDP owners."""
+        mesh, _, _, _ = mock_device_mesh
+        model = MockModel()
+        model.config.tie_word_embeddings = True
+        model.model.embed_tokens = nn.Embedding(32, 10)
+        model.lm_head = nn.Linear(10, 32, bias=False)
+        model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach())
+        assert model.lm_head.weight is not model.model.embed_tokens.weight
+        assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+        model.get_input_embeddings = lambda: model.model.embed_tokens
+        model.get_output_embeddings = lambda: model.lm_head
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
+
+        modules = [item.args[0] for item in mock_distributed_env["fully_shard"].call_args_list]
+        assert model.model.embed_tokens not in modules
+        assert model.lm_head not in modules
+        assert modules[-1] is model
+
+    def test_parallelize_keeps_frozen_embeddings_in_root(self, strategy, mock_device_mesh, mock_distributed_env):
+        """Frozen tables do not need standalone gradient communication units."""
+        mesh, _, _, _ = mock_device_mesh
+        model = MockModel()
+        model.model.embed_tokens = nn.Embedding(32, 10).requires_grad_(False)
+        model.lm_head = nn.Linear(10, 32, bias=False).requires_grad_(False)
+        model.get_input_embeddings = lambda: model.model.embed_tokens
+        model.get_output_embeddings = lambda: model.lm_head
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
+
+        modules = [item.args[0] for item in mock_distributed_env["fully_shard"].call_args_list]
+        assert model.model.embed_tokens not in modules
+        assert model.lm_head not in modules
+        assert modules[-1] is model
+
     def test_parallelize_with_tensor_parallel(self, strategy, mock_device_mesh, mock_distributed_env):
         """Test parallelization with tensor parallelism enabled."""
         mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
