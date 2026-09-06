@@ -12,12 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-private kernels for MiniMax M3 sparse attention (MSA).
-
-Holds the SM100 training backward for main attention: the KV-parallel CuTe DSL
-kernel, its ``sum(O * dO)`` delta preprocess, and the CPU-side task/CTA schedule
-derived from the forward work items. Nothing is re-exported: ``msa.py`` resolves
-the backward launcher by module path so a MiniMax M3 import never pulls in the
-CuTe DSL. The sparse prefill forward is not vendored; it comes from the optional
-``fmha_sm100`` package at first use.
-"""
+"""Model-private MSA kernels, loaded lazily by _msa; no eager CuTe imports."""

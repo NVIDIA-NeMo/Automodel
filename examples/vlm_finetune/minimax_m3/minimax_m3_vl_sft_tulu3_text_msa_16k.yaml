@@ -1,119 +1,70 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# MiniMax M3 VL text-only SFT on Tulu-3, packed to 16k, on the SM100 MSA
-# sparse-attention backend (128 GPUs / 32 nodes).
-
+# Tulu-3 text SFT: SM100 MSA, 16k BSHD packing, 128 GPUs (PP=4, EP=32).
 recipe: FinetuneRecipeForVLM
-
 seed: 1234
-
 step_scheduler:
-  # local_batch_size = pp_size fills the pipeline; dp = 128/4 = 32, so
-  # global_batch_size = 4 * 32 with a single grad-accum step.
   global_batch_size: 128
   local_batch_size: 4
   ckpt_every_steps: 1000000
   val_every_steps: 1000000
-  log_remote_every_steps: 1
   gc_every_steps: 10
   max_steps: 100
-
 dist_env:
-  backend: nccl
   timeout_minutes: 60
-
-rng:
-  _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1234
-  ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
-  trust_remote_code: false
   torch_dtype: bfloat16
   text_config:
-    # The bf16 checkpoint ships no MTP weights
-    # (its config declares 7, but none are present), so this must stay 0.
+    # The BF16 checkpoint has no MTP weights.
     num_mtp_modules: 0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    # sdpa (not te): the dense layers (0-2) consume the packed 4-D block-causal
-    # mask, which only SDPA's explicit-mask path accepts.
+    # Dense layers require SDPA for the packed 4D mask; MSA requires uv sync --extra msa.
     attn: sdpa
-    # Sparse layers (3-59) run the SM100 MSA forward and custom backward instead
-    # of the generic block-sparse mask. Requires compute capability 10.0 and
-    # `uv sync --extra msa`; te_fp8, rope_fusion and MTP are rejected at construction.
     sparse_attn: msa
     linear: te
-    rms_norm: torch_fp32
     rope_fusion: false
     experts: gmm
     dispatcher: hybridep
-    fake_balanced_gate: false
-    enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
 processor:
   _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
   pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
   trust_remote_code: true
-
 checkpoint:
-  enabled: false               # smoke run: don't persist a 400B checkpoint
+  enabled: false
   checkpoint_dir: vlm_checkpoints/minimax_m3_vl_sft_tulu3_text_msa_16k/
-  model_save_format: safetensors
   save_consolidated: false
   dequantize_base_checkpoint: false
 
 distributed:
-  strategy: fsdp2
-  tp_size: 1
-  # MSA is BSHD-only and rejects context parallelism at the first forward.
-  cp_size: 1
   pp_size: 4
   ep_size: 32
-  sequence_parallel: false
   activation_checkpointing: true
   pipeline:
     pp_schedule: interleaved1f1b
-    pp_microbatch_size: 1
     layers_per_stage: 2
     round_virtual_stages_to_pp_multiple: down
-    scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-  moe:
-    reshard_after_forward: false
-    wrap_outer_model: true
-
 freeze_config:
-  freeze_vision_tower: true
   freeze_audio_tower: true
-  freeze_language_model: false
-
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
   fp32_upcast: false
 
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
-  path_or_dataset: allenai/tulu-3-sft-mixture
-  split: train
-  truncate: false
-
 packed_sequence:
-  # Neat (BSHD) packing: MSA rejects THD. attn_implementation is left unset so the
-  # collator follows backend.attn and emits the 4-D mask the dense layers require.
-  pretokenize: true
   max_length: 16384
   pack_size: 16384
   collate_max_length: 16384
   packing_ratio: 0.9
   drop_long_samples: true
-
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 4
   persistent_workers: true
   pin_memory: true
@@ -122,17 +73,6 @@ dataloader:
 optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
-  eps: 1e-8
   lr: 2.0e-5
-  weight_decay: 0.01
-
 lr_scheduler:
-  lr_decay_style: cosine
   min_lr: 2.0e-6
-
-wandb:
-  enable: false
-  project: <your_wandb_project>
-  entity: <your_wandb_entity>
-  name: <your_wandb_name>
-  dir: <your_wandb_save_dir>

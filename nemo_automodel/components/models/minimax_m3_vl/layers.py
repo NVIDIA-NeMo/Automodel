@@ -14,10 +14,10 @@
 
 """MiniMax M3 VL text-backbone layers.
 
-Covers the dense + MoE text path and the sparse-attention index branch (no MTP).
-Mirrors the canonical sglang reference ``sglang.srt.models.minimax_m3``
-(``MiniMaxM3Attention`` / ``MiniMaxM3MLP`` / ``MiniMaxM3MoE`` /
-``MiniMaxM3DecoderLayer``):
+Stage 1 covers the dense + MoE text path (no sparse-attention index branch and
+no MTP).  Mirrors the canonical sglang reference
+``sglang.srt.models.minimax_m3`` (``MiniMaxM3Attention`` / ``MiniMaxM3MLP`` /
+``MiniMaxM3MoE`` / ``MiniMaxM3DecoderLayer``):
 
 * per-head **Gemma** RMSNorm on Q/K (``qk_norm_type='per_head'``,
   ``use_gemma_norm=True``),
@@ -41,14 +41,14 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
-from nemo_automodel.components.models.minimax_m3_vl.msa import (
+from nemo_automodel.components.models.minimax_m3_vl._msa import (
     _msa_cp_enabled,
     _MSAFlatAttention,
+    _MSAPackedLayout,
     _reject_unsupported_msa_configuration,
     _reject_unsupported_msa_runtime,
     _validate_msa_topology,
 )
-from nemo_automodel.components.models.minimax_m3_vl.msa_plan import _MSAPackedLayout
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 
 
@@ -120,7 +120,11 @@ class MiniMaxM3MLP(nn.Module):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
 
 
-# Per-chunk cap on the fp32 score tensor; unchunked 128k/cp8 scores would be hundreds of GB.
+# Cap the fp32 indexer-score tensor [B, H_idx, q_chunk, Tk] per chunk. At 128k with
+# cp_size=8 the full [B, H_idx, T_local, T_global] scores would be hundreds of GB
+# (the real long-context OOM, not FlexAttention) -- so select_sparse_blocks chunks
+# the query dim to keep each chunk's scores within this budget. No effect on small
+# (eager / 4k) cases, which fit in a single chunk.
 _SELECT_SCORE_BUDGET_BYTES = 2 * (1024**3)
 
 
@@ -137,58 +141,7 @@ def _select_sparse_block_indices(
     q_positions: torch.Tensor | None = None,
     q_doc_starts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Select a fixed-width list of document-local key-block ids per query.
-
-    Mirrors the sglang ``minimax_sparse`` selection (``block_size_q=1`` ->
-    per-query-position): the index score for (query ``i``, key ``j``) is
-    ``(idx_q[i] . idx_k[j]) * idx_dim**-0.5`` with causal masking; keys are
-    grouped into blocks of ``block_size`` and reduced per block (``max`` or
-    ``lse``). Each query's candidate blocks are ``[lo, cur]``, where ``lo`` is
-    the first block of its document (``q_doc_starts // block_size``, or 0) and
-    ``cur`` is the block holding its own position. The current block
-    (``local_blocks``) and the first ``init_blocks`` candidates are always kept
-    and the remaining budget is filled with the highest-scoring candidates, up
-    to ``min(topk_blocks, num_candidates)``.
-
-    Queries and keys are decoupled so the same selection serves the eager square
-    case (``Tq == Tk``, ``q_positions`` defaulting to ``arange``), the
-    context-parallel case (local queries against the gathered global key
-    sequence) and the packed MSA case (compact queries against the aligned
-    workspace). The query dim is chunked so the fp32 score tensor stays within
-    ``_SELECT_SCORE_BUDGET_BYTES``; per-query independence makes chunking exact.
-    Every unusable slot carries a score of exactly ``-inf`` (masked keys,
-    non-candidate blocks, and width padding alike) while real candidates are
-    finite and forced blocks are ``+inf``, so ``-inf`` top-k values identify the
-    unused slots.
-
-    Args:
-        idx_q: Tensor of shape [batch, query_tokens, index_heads, index_dim]
-            containing post-RoPE index queries.
-        idx_k: Tensor of shape [batch, key_tokens, 1, index_dim] containing
-            post-RoPE shared index keys.
-        block_size: Number of key rows in one selectable block.
-        topk_blocks: Fixed number of block-id slots returned per query.
-        init_blocks: Number of blocks forced from each query's candidate-range start.
-        local_blocks: A positive value forces the query's current block.
-        score_type: Block reduction, either ``"max"`` or ``"lse"``.
-        q_positions: Optional tensor of shape [query_tokens] containing each
-            query's position on the key axis. ``None`` uses ``arange(query_tokens)``.
-        q_doc_starts: Optional tensor of shape [query_tokens] containing each
-            query document's first row on the key axis. The document floor is
-            exact only when documents start on block-aligned rows. ``None`` means
-            one document beginning at row zero.
-
-    Returns:
-        Tensor of shape [batch, index_heads, query_tokens, topk_blocks] with
-        dtype int64. Valid entries are document-local block ids, i.e. key-axis
-        block ids minus the query's ``lo``; unused slots contain -1 and follow
-        the valid ones. The hard selection is non-differentiable.
-
-    Raises:
-        ValueError: If ``block_size`` or ``topk_blocks`` is not positive,
-            ``score_type`` is not ``"max"`` or ``"lse"``, or a query-coordinate
-            tensor does not contain exactly one entry per query row.
-    """
+    """Get int64 local ids[B,Hidx,Q,topk] (-1 padding) from idx_q[B,Q,Hidx,D], idx_k[B,K,1,D], positions/starts[Q]."""
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
     if topk_blocks <= 0:
@@ -268,28 +221,32 @@ def select_sparse_blocks(
 ) -> torch.Tensor:
     """Select, per query, which key blocks to attend to (DSA block top-k).
 
-    The boolean form of :func:`_select_sparse_block_indices` over one document
-    starting at key row zero; it serves the eager square case and context
-    parallelism's local-query/global-key case.
+    Mirrors the sglang ``minimax_sparse`` selection (``block_size_q=1`` ->
+    per-query-position): the index score for (query ``i``, key ``j``) is
+    ``(idx_q[i] . idx_k[j]) * idx_dim**-0.5`` with causal masking; keys are
+    grouped into blocks of ``block_size`` and reduced per block (``max`` or
+    ``lse``). For each query, the current block (``local_blocks``) and the first
+    ``init_blocks`` are always kept and the remaining budget is filled with the
+    highest-scoring causal blocks, up to ``min(topk_blocks, valid_blocks)``.
+
+    Queries and keys are decoupled so the same selection serves the eager square
+    case (``Tq == Tk``, ``q_positions`` defaulting to ``arange``) and the
+    context-parallel case (local queries ``Tq`` against the gathered global key
+    sequence ``Tk``, with ``q_positions`` giving each local query's global
+    position). Key block ``b`` spans key indices ``[b*block_size, ...)`` in the
+    (global) key order. The query dim is chunked so the fp32 score tensor stays
+    within ``_SELECT_SCORE_BUDGET_BYTES`` (the long-context memory bottleneck);
+    per-query independence makes chunking exact (concatenated along Tq).
 
     Args:
-        idx_q: Tensor of shape [batch, query_tokens, index_heads, index_dim]
-            containing post-RoPE index queries.
-        idx_k: Tensor of shape [batch, key_tokens, 1, index_dim] containing
-            post-RoPE shared index keys.
-        block_size: Number of key rows in one selectable block.
-        topk_blocks: Maximum number of causal blocks selected per query.
-        init_blocks: Number of leading causal blocks forced into the selection.
-        local_blocks: A positive value forces the query's current block.
-        score_type: Block reduction, either ``"max"`` or ``"lse"``.
-        q_positions: Optional tensor of shape [query_tokens] containing each
-            query's global key-axis position. ``None`` uses
-            ``arange(query_tokens)`` for square eager attention.
+        idx_q: ``[B, Tq, H_idx, D]`` index queries (post norm + RoPE).
+        idx_k: ``[B, Tk, 1, D]`` shared index key (post norm + RoPE).
+        q_positions: ``[Tq]`` long global position of each query; defaults to
+            ``arange(Tq)`` (the eager square case).
 
     Returns:
-        Boolean tensor of shape [batch, index_heads, query_tokens, key_blocks].
-        True entries are the causal blocks selected for attention. The hard
-        selection is non-differentiable.
+        ``[B, H_idx, Tq, num_blocks]`` bool block-selection mask (causal +
+        forced init/local blocks + top-k). Non-differentiable (hard selection).
     """
     selected = _select_sparse_block_indices(
         idx_q,
@@ -385,8 +342,9 @@ class MiniMaxM3Indexer(nn.Module):
     Projects hidden states to ``num_index_heads`` index queries and a single
     shared index key (``disable_index_value=True`` for M3, so there is no index
     value/output projection). Per-head Gemma RMSNorm + partial RoPE mirror the
-    main attention. The produced ``idx_q``/``idx_k`` feed either the generic
-    boolean-mask builder or the model-private document-local MSA selector.
+    main attention. The produced ``idx_q``/``idx_k`` feed
+    :func:`build_block_sparse_attn_bias` to select which key blocks each query
+    attends to.
     """
 
     def __init__(self, config: Any, sparse_cfg: dict, backend: BackendConfig):
@@ -419,22 +377,7 @@ class MiniMaxM3Indexer(nn.Module):
         cp_size: int,
         cp_rank: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project, normalize, and rotate the index queries and shared key.
-
-        Args:
-            x: Tensor of shape [batch, sequence, hidden] for generic BSHD
-                selection, or compact [tokens, hidden] for MSA.
-            freqs_cis: Rotary tensor aligned with ``x``: [batch, sequence,
-                rotary_dim] for non-fused BSHD, its fused-RoPE layout, or the
-                compact token-major layout used by MSA.
-            cp_size: Number of context-parallel ranks represented by the rotary input.
-            cp_rank: Context-parallel rank of ``x``.
-
-        Returns:
-            Post-norm, post-RoPE index queries and shared keys. Their leading
-            token dimensions match ``x``; the final shapes are
-            ``[..., index_heads, index_dim]`` and ``[..., 1, index_dim]``.
-        """
+        """Project x[...,hidden] and aligned freqs_cis[...,rotary] to rotated index Q[...,Hidx,D] and K[...,1,D]."""
         token_shape = x.shape[:-1]
         idx_q = self.index_q_norm(self.index_q_proj(x).view(*token_shape, self.num_index_heads, self.index_head_dim))
         idx_k = self.index_k_norm(self.index_k_proj(x).view(*token_shape, 1, self.index_head_dim))
@@ -457,17 +400,7 @@ class MiniMaxM3Indexer(nn.Module):
         *,
         layout: _MSAPackedLayout,
     ) -> torch.Tensor:
-        """Return canonical document-local MSA support.
-
-        Args:
-            index_q: Post-RoPE index queries with layout ``[T, Hidx, Didx]``.
-            index_k: Post-RoPE shared index keys with layout ``[T, 1, Didx]``.
-            layout: Opaque packed-document layout for the same compact token axis.
-
-        Returns:
-            Contiguous int32 ``q2k`` with layout ``[Hidx, T, topk]``. Valid
-            entries are document-local key-block ids and unused slots are ``-1``.
-        """
+        """Select int32 local blocks[Hidx,T,topk] from index_q[T,Hidx,D], index_k[T,1,D] and layout; pad with -1."""
         aligned_index_k, query_positions, document_starts = layout._selection_inputs(index_k)
         selected = _select_sparse_block_indices(
             index_q.unsqueeze(0),
@@ -485,21 +418,7 @@ class MiniMaxM3Indexer(nn.Module):
     def forward(
         self, x: torch.Tensor, *, freqs_cis: torch.Tensor, num_q_heads: int, **attn_kwargs: Any
     ) -> torch.Tensor:
-        """Build the generic backend's dense boolean sparse-attention mask.
-
-        Args:
-            x: Tensor of shape [batch, sequence, hidden] containing decoder-layer
-                input states.
-            freqs_cis: Rotary tensor of shape [batch, sequence, rotary_dim] for
-                non-fused RoPE or [sequence, 1, 1, rotary_dim] for fused RoPE.
-            num_q_heads: Number of heads in the main attention projection.
-            **attn_kwargs: Attention metadata. ``cp_size`` and ``cp_rank`` are
-                scalar context-parallel coordinates; other entries are ignored.
-
-        Returns:
-            Boolean tensor of shape [batch, num_q_heads, sequence, sequence]
-            whose True entries are causal keys retained by block selection.
-        """
+        """Map x[B,S,H] and aligned freqs_cis to a bool sparse keep-mask[B,num_q_heads,S,S]."""
         idx_q, idx_k = self._project_qk(
             x,
             freqs_cis=freqs_cis,
@@ -622,35 +541,7 @@ class MiniMaxM3Attention(nn.Module):
         _msa_layout: _MSAPackedLayout | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        """Run dense or index-selected MiniMax M3 self-attention.
-
-        Args:
-            x: Tensor of shape [batch, sequence, hidden] for BSHD attention or
-                [tokens, hidden] for the generic THD path.
-            freqs_cis: Rotary tensor of shape [batch, sequence, rotary_dim] for
-                non-fused BSHD RoPE, [sequence, 1, 1, rotary_dim] for fused BSHD
-                RoPE, or the corresponding token-major THD rotary tensor.
-            attention_mask: Optional keep mask of shape [batch, sequence] or
-                boolean attention mask of shape [batch, heads_or_one, sequence,
-                sequence]. MSA obtains equivalent padding/document semantics
-                from ``_msa_layout`` instead of forwarding this mask to its kernel.
-            _msa_layout: Model-owned packed layout for the active MSA stage, or
-                ``None`` for generic attention. Its tensors describe the same
-                [batch, sequence] token grid as ``x``.
-            **attn_kwargs: Backend metadata. Generic THD attention may carry an
-                int32 ``cu_seqlens`` tensor of shape [documents + 1].
-
-        Returns:
-            Tensor of shape [batch, sequence, hidden] for BSHD input or [tokens,
-            hidden] for generic THD input. MSA restores compact output to BSHD
-            and writes exact zeros at padding query rows after the output projection.
-
-        Raises:
-            NotImplementedError: If MSA is selected for THD input or a runtime
-                mode rejected by :func:`_reject_unsupported_msa_runtime`.
-            TypeError: If MSA receives an object other than its packed layout.
-            ValueError: If MSA is selected without per-forward document metadata.
-        """
+        """Map x[B,S,H]/[T,H], freqs_cis[...,R] and mask[B,S]/[B,heads,S,S] to x-shaped output; MSA skips padding."""
         if self._use_msa:
             if x.dim() != 3:
                 raise NotImplementedError(
@@ -687,6 +578,8 @@ class MiniMaxM3Attention(nn.Module):
             k = self.k_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
             v = self.v_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
+        # Per-head QK norm (over head_dim) is applied before RoPE, matching the
+        # sglang reference (``_qk_norm`` then ``rotary_emb``).
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -705,6 +598,9 @@ class MiniMaxM3Attention(nn.Module):
                 if qkv_format != "bshd":
                     raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
                 sparse_keep = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
+                # Preserve the caller's padding mask: padded keys must stay masked
+                # rather than becoming eligible for top-k block selection. Boolean AND
+                # (not additive) so SDPA is bf16-safe -- see build_block_sparse_attn_mask.
                 if attention_mask is not None:
                     sparse_keep = sparse_keep & _padding_mask_to_keep_mask(attention_mask, sparse_keep)
                 attention_mask = sparse_keep
@@ -813,27 +709,8 @@ class Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        _msa_layout: _MSAPackedLayout | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        """Run one decoder layer.
-
-        Args:
-            x: Tensor of shape [batch, sequence, hidden] for BSHD execution or
-                [tokens, hidden] for the generic THD path.
-            freqs_cis: Rotary tensor aligned with ``x`` and accepted by
-                :class:`MiniMaxM3Attention`.
-            attention_mask: Optional tensor of shape [batch, sequence] or
-                [batch, heads_or_one, sequence, sequence].
-            padding_mask: Optional tensor of shape [batch, sequence], with true
-                entries denoting padding for the MoE router.
-            _msa_layout: Model-owned packed layout for the same [batch,
-                sequence] token grid, or ``None`` for a non-MSA layer.
-            **attn_kwargs: Runtime attention metadata.
-
-        Returns:
-            Tensor with the same shape and dtype as ``x``.
-        """
         if attention_mask is not None and padding_mask is None:
             # Derive a per-token [B, T] pad mask (True = pad) for the MoE router.
             # Needed because packed sequences without CP pass a 4-D block-causal mask
@@ -856,7 +733,6 @@ class Block(nn.Module):
             # Consumed by CP-aware sparse attention to mask interior pad keys after
             # gathering CP shards; popped (ignored) by the eager attention forward.
             padding_mask=padding_mask,
-            _msa_layout=_msa_layout,
             **attn_kwargs,
         )
         x = x + attn_out

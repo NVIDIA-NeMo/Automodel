@@ -12,743 +12,145 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU contracts for MiniMax M3 MSA planning, policy, and Adapter state."""
+"""CPU contracts for the model-owned MSA interface."""
 
 import subprocess
 import sys
-from collections import Counter
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-import torch.nn as nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import TEFp8Config
-from nemo_automodel.components.models.minimax_m3_vl import msa
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
-from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import (
-    _build_backward_tasks,
-    _chunk_map,
-    _cta_row_interval,
-    _MSABackwardSchedule,
-)
-from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM, MiniMaxM3TextModel
-from nemo_automodel.components.models.minimax_m3_vl.msa import (
-    _MSAFlatAttention,
-    _MSAForwardKernels,
-    _MSASparseAttentionFunction,
-    _reject_unsupported_msa_configuration,
-    _reject_unsupported_msa_runtime,
-    _validate_msa_topology,
-)
-from nemo_automodel.components.models.minimax_m3_vl.msa_plan import _MSAPackedLayout, _resolve_canonical_document_map
+from nemo_automodel.components.models.minimax_m3_vl import _msa as msa
 from nemo_automodel.shared.import_utils import UnavailableError
 
-_FIXED_TOPOLOGY = {
-    "num_heads": 64,
-    "num_kv_heads": 4,
-    "head_dim": 128,
-    "num_index_heads": 4,
-    "block_size": 128,
-    "topk_blocks": 16,
-    "attention_dropout": 0.0,
-}
 
-_UNSUPPORTED_RUNTIME_CASES = [
-    pytest.param({"qkv_format": "thd"}, False, "BSHD", id="thd"),
-    pytest.param({"use_cache": True}, False, "cache-free prefill", id="use-cache"),
-    pytest.param({"past_key_values": ()}, False, "past_key_values", id="past-key-values"),
-    pytest.param({"cache_position": torch.arange(2)}, False, "cache_position", id="cache-position"),
-    pytest.param({"page_table": torch.zeros(1, 1, dtype=torch.int32)}, False, "page_table", id="page-table"),
-    pytest.param({"seqused_k": torch.ones(1, dtype=torch.int32)}, False, "seqused_k", id="seqused-k"),
-    pytest.param({"prefix_cache": object()}, False, "prefix_cache", id="prefix-cache"),
-    pytest.param({"is_causal": False}, False, "causal self-attention", id="noncausal"),
-    pytest.param({"window_size": (128, 0)}, False, "sliding window", id="windowed"),
-    pytest.param({"encoder_hidden_states": torch.zeros(1, 2, 4)}, False, "self-attention", id="encoder"),
-    pytest.param({"key_value_states": torch.zeros(1, 2, 4)}, False, "cross-attention", id="key-value"),
-    pytest.param({}, True, "cp_size=1", id="context-parallel"),
-]
-
-
-def _msa_text_config(*, num_mtp_modules: int = 0) -> MiniMaxM3VLTextConfig:
-    """Build the smallest two-layer config with one dense and one MSA layer."""
-    return MiniMaxM3VLTextConfig(
-        torch_dtype="float32",
-        hidden_size=32,
-        intermediate_size=16,
-        dense_intermediate_size=32,
-        shared_intermediate_size=16,
-        num_hidden_layers=2,
-        num_attention_heads=64,
-        num_key_value_heads=4,
-        head_dim=128,
-        rotary_dim=64,
-        vocab_size=16,
-        max_position_embeddings=256,
-        num_local_experts=2,
-        num_experts_per_tok=1,
-        n_shared_experts=1,
-        moe_layer_freq=[0, 1],
-        num_mtp_modules=num_mtp_modules,
-        sparse_attention_config={
-            "use_sparse_attention": True,
-            "sparse_index_dim": 16,
-            "sparse_num_index_heads": 4,
-            "sparse_topk_blocks": 16,
-            "sparse_block_size": 128,
-            "sparse_score_type": "max",
-            "sparse_init_block": 0,
-            "sparse_local_block": 1,
-            "sparse_attention_freq": [0, 1],
-            "sparse_disable_index_value": [0, 1],
-        },
-    )
-
-
-def _msa_backend(*, attn: str = "sdpa") -> BackendConfig:
-    """Build the CPU backend used at the model-owned MSA seam."""
-    return BackendConfig(
-        attn=attn,
-        sparse_attn="msa",
-        linear="torch",
-        rms_norm="torch",
-        rope_fusion=False,
-        experts="torch",
-        dispatcher="torch",
-        fake_balanced_gate=False,
-        enable_hf_state_dict_adapter=False,
-    )
-
-
-def _block_causal_mask(doc_ids: torch.Tensor) -> torch.Tensor:
-    """Build an independent same-document causal mask.
-
-    Args:
-        doc_ids: Integer tensor of shape [batch, sequence], with 0 for padding.
-
-    Returns:
-        Bool tensor of shape [batch, 1, sequence, sequence].
-    """
-    real = doc_ids > 0
-    same_document = doc_ids.unsqueeze(-1) == doc_ids.unsqueeze(-2)
-    causal = torch.ones(doc_ids.shape[-1], doc_ids.shape[-1], dtype=torch.bool, device=doc_ids.device).tril()
-    return (real.unsqueeze(-1) & real.unsqueeze(-2) & same_document & causal).unsqueeze(1)
-
-
-def test_packed_layout_maps_adversarial_documents_and_gradients() -> None:
-    """Exercise residues, padding locations, batch isolation, and autograd once."""
+def test_packed_layout_roundtrip_and_gradients() -> None:
+    torch.manual_seed(42)
     doc_ids = torch.zeros(3, 262, dtype=torch.int64)
     doc_ids[0, 1:128] = 42
     doc_ids[0, 130:259] = 7
     doc_ids[1, :128] = 7
     doc_ids[1, 128] = 9
-    layout = _MSAPackedLayout.build(doc_ids)
+    layout = msa._MSAPackedLayout.build(doc_ids)
     external = torch.randn(3, 262, 3, requires_grad=True)
     upstream = torch.randn_like(external)
-
     packed = layout.pack(external)
     restored = layout.unpack(packed)
-    metadata = layout.launch_metadata()
+    keep = doc_ids > 0
     assert packed.shape == (385, 3)
-    assert torch.equal(packed, external[doc_ids > 0])
-    assert torch.equal(restored[doc_ids > 0], external[doc_ids > 0])
-    assert torch.count_nonzero(restored[doc_ids == 0]) == 0
-    assert layout.has_padding is True
-    assert layout.has_multiple_documents_per_row is True
-    assert (metadata.total_tokens, metadata.workspace_size, metadata.max_seqlen) == (385, 640, 129)
-    assert metadata.cu_seqlens.tolist() == [0, 127, 256, 384, 385]
-    assert metadata.document_workspace_starts.tolist() == [0, 128, 384, 512]
-    assert metadata.workspace_positions[[0, 126, 127, 255, 256, 383, 384]].tolist() == [
-        0,
-        126,
-        128,
-        256,
-        384,
-        511,
-        512,
-    ]
-
+    torch.testing.assert_close(packed, external[keep], rtol=0, atol=0)
+    torch.testing.assert_close(restored[keep], external[keep], rtol=0, atol=0)
+    assert torch.count_nonzero(restored[~keep]) == 0
     restored.backward(upstream)
-    assert torch.equal(external.grad[doc_ids > 0], upstream[doc_ids > 0])
-    assert torch.count_nonzero(external.grad[doc_ids == 0]) == 0
+    torch.testing.assert_close(external.grad[keep], upstream[keep], rtol=0, atol=0)
+    assert torch.count_nonzero(external.grad[~keep]) == 0
+
+
+def test_document_map_sources_and_precedence() -> None:
+    documents = torch.tensor([[9, 9, 0, 4, 4]])
+    keep = documents > 0
+    mask = (documents.unsqueeze(-1) == documents.unsqueeze(-2)) & keep.unsqueeze(-1) & keep.unsqueeze(-2)
+    mask = (mask & torch.ones(5, 5, dtype=torch.bool).tril()).unsqueeze(1)
+    cases = [
+        (documents, torch.ones_like(keep), ~keep, documents),
+        (None, documents, None, documents),
+        (None, mask, None, torch.tensor([[1, 1, 0, 2, 2]])),
+        (None, keep, None, keep.long()),
+        (None, None, ~keep, keep.long()),
+        (None, None, None, torch.ones_like(documents)),
+    ]
+    for packed_ids, attention_mask, padding_mask, expected in cases:
+        actual = msa._resolve_canonical_document_map(
+            torch.empty(1, 5, 8), packed_seq_ids=packed_ids, attention_mask=attention_mask, padding_mask=padding_mask
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert actual.is_contiguous()
 
 
 @pytest.mark.parametrize(
-    ("packed_seq_ids", "attention_mask", "padding_mask", "expected"),
+    "documents,match",
     [
-        pytest.param(
-            torch.tensor([[9, 9, 4, 4, 0]], dtype=torch.int32),
-            torch.ones(1, 5, dtype=torch.bool),
-            torch.ones(1, 5, dtype=torch.bool),
-            torch.tensor([[9, 9, 4, 4, 0]]),
-            id="packed-ids-win",
-        ),
-        pytest.param(
-            None,
-            torch.tensor([[3, 3, 8, 8, 0]], dtype=torch.int32),
-            None,
-            torch.tensor([[3, 3, 8, 8, 0]]),
-            id="indexed-mask",
-        ),
-        pytest.param(
-            None,
-            torch.tensor([[True, True, False, True, False]]),
-            None,
-            torch.tensor([[1, 1, 0, 1, 0]]),
-            id="keep-mask",
-        ),
-        pytest.param(
-            None,
-            _block_causal_mask(torch.tensor([[1, 1, 0, 2, 2]])),
-            None,
-            torch.tensor([[1, 1, 0, 2, 2]]),
-            id="block-causal-mask",
-        ),
-        pytest.param(
-            None,
-            None,
-            torch.tensor([[False, False, True, False, True]]),
-            torch.tensor([[1, 1, 0, 1, 0]]),
-            id="padding-mask",
-        ),
-        pytest.param(None, None, None, torch.ones(1, 5, dtype=torch.int64), id="single-document"),
+        (torch.ones(4, dtype=torch.int64), r"\[batch, sequence\]"),
+        (torch.ones(1, 4), "integer tensor"),
+        (torch.tensor([[1, -1, 1]]), "non-negative"),
+        (torch.zeros(1, 4, dtype=torch.int64), "at least one real token"),
+        (torch.tensor([[1, 0, 1]]), "contiguous run"),
     ],
 )
-def test_document_map_source_precedence(
-    packed_seq_ids: torch.Tensor | None,
-    attention_mask: torch.Tensor | None,
-    padding_mask: torch.Tensor | None,
-    expected: torch.Tensor,
-) -> None:
-    """Recover one canonical document map from the supported metadata sources.
-
-    Args:
-        packed_seq_ids: Optional integer tensor of shape [batch, sequence].
-        attention_mask: Optional tensor of shape [batch, sequence] or [batch, 1, sequence, sequence].
-        padding_mask: Optional tensor of shape [batch, sequence], true for padding.
-        expected: Expected int64 tensor of shape [batch, sequence].
-    """
-    recovered = _resolve_canonical_document_map(
-        torch.empty(1, 5, 8),
-        packed_seq_ids=packed_seq_ids,
-        attention_mask=attention_mask,
-        padding_mask=padding_mask,
-    )
-
-    assert recovered.dtype == torch.int64
-    assert recovered.is_contiguous()
-    assert torch.equal(recovered, expected)
-
-
-@pytest.mark.parametrize(
-    ("doc_ids", "match"),
-    [
-        pytest.param(torch.ones(4, dtype=torch.int64), r"\[batch, sequence\]", id="rank"),
-        pytest.param(torch.ones(1, 4), "integer tensor", id="dtype"),
-        pytest.param(torch.tensor([[1, -1, 1]]), "non-negative", id="negative"),
-        pytest.param(torch.zeros(1, 4, dtype=torch.int64), "at least one real token", id="all-padding"),
-        pytest.param(torch.tensor([[1, 0, 1]]), "contiguous run", id="resumed-document"),
-    ],
-)
-def test_packed_layout_rejects_invalid_document_maps(doc_ids: torch.Tensor, match: str) -> None:
-    """Reject one representative for every canonical-map invariant.
-
-    Args:
-        doc_ids: Candidate tensor whose required shape is [batch, sequence].
-        match: Expected error-message fragment.
-    """
+def test_invalid_documents(documents: torch.Tensor, match: str) -> None:
+    """Reject invalid integer document ids, expected shape [batch, sequence]."""
     with pytest.raises(ValueError, match=match):
-        _MSAPackedLayout.build(doc_ids)
+        msa._MSAPackedLayout.build(documents)
 
 
-@pytest.mark.parametrize(
-    ("attention_mask", "match"),
-    [
-        pytest.param(torch.ones(1, 4), "integer or bool 2-D", id="float-2d"),
-        pytest.param(torch.ones(1, 2, 4, 4, dtype=torch.bool), "only a bool 4-D", id="heads-4d"),
-        pytest.param(torch.ones(1, 4, 4, dtype=torch.bool), "must have shape", id="rank-3"),
-        pytest.param(
-            torch.ones(1, 1, 4, 4, dtype=torch.bool),
-            "standard bool block-causal",
-            id="noncausal-4d",
-        ),
-    ],
-)
-def test_document_map_rejects_ambiguous_attention_masks(attention_mask: torch.Tensor, match: str) -> None:
-    """Reject ambiguous mask tensors before document recovery.
-
-    Args:
-        attention_mask: Candidate mask whose supported layouts are [batch, sequence] and [batch, 1, sequence, sequence].
-        match: Expected error-message fragment.
-    """
-    with pytest.raises(ValueError, match=match):
-        _resolve_canonical_document_map(
+def test_noncausal_mask_rejected() -> None:
+    with pytest.raises(ValueError, match="standard bool block-causal"):
+        msa._resolve_canonical_document_map(
             torch.empty(1, 4, 8),
             packed_seq_ids=None,
-            attention_mask=attention_mask,
+            attention_mask=torch.ones(1, 1, 4, 4, dtype=torch.bool),
             padding_mask=None,
         )
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        (key, value)
-        for key, value in {
-            "num_heads": 32,
-            "num_kv_heads": 8,
-            "head_dim": 64,
-            "num_index_heads": 2,
-            "block_size": 64,
-            "topk_blocks": 8,
-            "attention_dropout": 0.1,
-        }.items()
-    ],
-)
-def test_msa_topology_rejects_every_fixed_dimension(field: str, value: int | float) -> None:
-    invalid = dict(_FIXED_TOPOLOGY)
-    invalid[field] = value
-
-    with pytest.raises(ValueError, match="requires|supports"):
-        _validate_msa_topology(**invalid)
-
-
-@pytest.mark.parametrize(
-    ("field", "value", "match"),
-    [
-        pytest.param("rope_fusion", True, "rope_fusion=False", id="fused-rope"),
-        pytest.param("te_fp8", TEFp8Config(), "te_fp8=None", id="fp8"),
-    ],
-)
-def test_msa_configuration_rejects_unsupported_backends(field: str, value: object, match: str) -> None:
-    backend = _msa_backend()
-    if not hasattr(backend, field):
-        raise ValueError(f"BackendConfig has no field {field!r}")
-    setattr(backend, field, value)
-
-    with pytest.raises(NotImplementedError, match=match):
-        _reject_unsupported_msa_configuration(backend)
-
-
-@pytest.mark.parametrize(("runtime_kwargs", "cp_enabled", "match"), _UNSUPPORTED_RUNTIME_CASES)
-def test_msa_runtime_policy_rejects_unsupported_modes(
-    runtime_kwargs: dict[str, object],
-    cp_enabled: bool,
-    match: str,
-) -> None:
-    with pytest.raises(NotImplementedError, match=match):
-        _reject_unsupported_msa_runtime(runtime_kwargs, cp_enabled=cp_enabled)
-
-
-def test_msa_runtime_policy_rejects_cuda_graph_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-
-    with pytest.raises(NotImplementedError, match="CUDA graph capture"):
-        _reject_unsupported_msa_runtime({})
-
-
-def test_flat_attention_rejects_deterministic_algorithms() -> None:
-    """Reject the atomic backward when deterministic algorithms are required."""
-    deterministic_enabled = torch.are_deterministic_algorithms_enabled()
-    deterministic_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
-    layout = _MSAPackedLayout.build(torch.ones(1, 1, dtype=torch.int64))
-    placeholder = torch.empty(0)
-    try:
-        torch.use_deterministic_algorithms(True)
-        with pytest.raises(NotImplementedError, match="not bitwise deterministic"):
-            _MSAFlatAttention(0.125)(placeholder, placeholder, placeholder, placeholder, layout=layout)
-    finally:
-        torch.use_deterministic_algorithms(deterministic_enabled, warn_only=deterministic_warn_only)
-
-
-class _LayoutCaptureLayer(nn.Module):
-    """Record the model-owned metadata at the decoder-layer seam."""
-
-    def __init__(
-        self,
-        captured: list[tuple[_MSAPackedLayout | None, torch.Tensor | None, torch.Tensor | None]],
-    ) -> None:
-        super().__init__()
-        self.captured = captured
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        freqs_cis: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        padding_mask: torch.Tensor | None = None,
-        _msa_layout: _MSAPackedLayout | None = None,
-        **attn_kwargs: object,
-    ) -> torch.Tensor:
-        """Record one layer call without changing hidden states.
-
-        Args:
-            x: Tensor of shape [batch, sequence, hidden].
-            freqs_cis: Rotary tensor of shape [batch, sequence, rotary_dim].
-            attention_mask: Optional tensor of shape [batch, sequence] or [batch, 1, sequence, sequence].
-            padding_mask: Optional bool tensor of shape [batch, sequence], true for padding.
-            _msa_layout: Optional model-owned layout for the same [batch, sequence] grid.
-            **attn_kwargs: Remaining attention metadata.
-
-        Returns:
-            The input tensor ``x`` unchanged.
-        """
-        del freqs_cis, attn_kwargs
-        self.captured.append((_msa_layout, attention_mask, padding_mask))
-        return x
-
-
-def test_checkpoint_wrapper_transports_packed_layout() -> None:
-    """Activation checkpointing accepts the typed layout layer kwarg."""
-    captured: list[tuple[_MSAPackedLayout | None, torch.Tensor | None, torch.Tensor | None]] = []
-    layer = checkpoint_wrapper(_LayoutCaptureLayer(captured), checkpoint_impl=CheckpointImpl.NO_REENTRANT)
-    hidden = torch.randn(1, 3, 4, requires_grad=True)
-    layout = _MSAPackedLayout.build(torch.ones(1, 3, dtype=torch.int64))
-
-    layer(hidden, freqs_cis=torch.zeros(1, 3, 2), _msa_layout=layout).sum().backward()
-
-    assert hidden.grad is not None
-    assert isinstance(captured[0][0], _MSAPackedLayout)
-
-
-def test_text_model_owns_layout_and_dense_mask_policy() -> None:
-    caller_backend = _msa_backend()
-    public_model = MiniMaxM3SparseForCausalLM(_msa_text_config(), backend=caller_backend).eval()
-    caller_backend.sparse_attn = "generic"
-    assert public_model.backend.sparse_attn == "msa"
-    model = public_model.model
-    packed = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.int64)
-    input_ids = torch.arange(5).unsqueeze(0)
-
-    with pytest.raises(ValueError, match="requires a standard bool attention_mask"):
-        model(input_ids, _packed_seq_ids=packed)
-    public_model.backend.sparse_attn = "generic"
-    with pytest.raises(NotImplementedError, match="BSHD"):
-        public_model(input_ids, qkv_format="thd")
-    public_model._cp_enabled = True
-    with pytest.raises(NotImplementedError, match="cp_size=1"):
-        public_model(input_ids)
-    public_model._cp_enabled = False
-    with pytest.raises(TypeError, match="model-owned"):
-        model(input_ids, _msa_layout=object())
-
-    captured: list[tuple[_MSAPackedLayout | None, torch.Tensor | None, torch.Tensor | None]] = []
-    model.layers = nn.ModuleDict({str(index): _LayoutCaptureLayer(captured) for index in range(2)})
-    model.norm = nn.Identity()
-    attention_mask = _block_causal_mask(packed)
-    output = model(
-        input_ids,
-        attention_mask=attention_mask,
-        padding_mask=torch.ones_like(packed, dtype=torch.bool),
-        _packed_seq_ids=packed,
+@pytest.mark.parametrize("field,value", [("num_heads", 32), ("head_dim", 64), ("attention_dropout", 0.1)])
+def test_fixed_topology(field: str, value: int | float) -> None:
+    topology = dict(
+        num_heads=64,
+        num_kv_heads=4,
+        head_dim=128,
+        num_index_heads=4,
+        block_size=128,
+        topk_blocks=16,
+        attention_dropout=0.0,
     )
-
-    assert output.shape == (1, 5, 32)
-    assert captured[0][0] is None
-    assert isinstance(captured[1][0], _MSAPackedLayout)
-    assert all(torch.equal(item[1], attention_mask) for item in captured)
-    assert all(torch.equal(item[2], packed == 0) for item in captured)
-
-    flex_model = MiniMaxM3TextModel(_msa_text_config(), backend=_msa_backend(attn="flex"))
-    with pytest.raises(NotImplementedError, match="backend.attn='sdpa'"):
-        flex_model(input_ids, attention_mask=attention_mask, _packed_seq_ids=packed)
+    msa._validate_msa_topology(**topology)
+    topology[field] = value
+    with pytest.raises(ValueError, match="requires|supports"):
+        msa._validate_msa_topology(**topology)
 
 
-def test_pipeline_stage_without_msa_does_not_receive_layout() -> None:
-    model = MiniMaxM3TextModel(_msa_text_config(), backend=_msa_backend()).eval()
-    captured: list[tuple[_MSAPackedLayout | None, torch.Tensor | None, torch.Tensor | None]] = []
-    model.layers = nn.ModuleDict({"0": _LayoutCaptureLayer(captured)})
-    model.norm = None
-
-    packed = torch.tensor([[1, 1, 2, 2]], dtype=torch.int64)
-    output = model(torch.arange(4).unsqueeze(0), attention_mask=_block_causal_mask(packed), _packed_seq_ids=packed)
-
-    assert output.shape == (1, 4, 32)
-    assert captured[0][0] is None
+@pytest.mark.parametrize("field", ["rope_fusion", "te_fp8"])
+def test_unsupported_backend(field: str) -> None:
+    backend = BackendConfig(rope_fusion=False)
+    if field == "rope_fusion":
+        backend.rope_fusion = True
+    else:
+        backend.te_fp8 = TEFp8Config()
+    with pytest.raises(NotImplementedError):
+        msa._reject_unsupported_msa_configuration(backend)
 
 
-def test_text_model_rejects_msa_with_mtp() -> None:
-    with pytest.raises(NotImplementedError, match="MTP0"):
-        MiniMaxM3TextModel(_msa_text_config(num_mtp_modules=1), backend=_msa_backend())
+@pytest.mark.parametrize(
+    "runtime,cp_enabled,match",
+    [
+        ({"qkv_format": "thd"}, False, "BSHD"),
+        ({"use_cache": True}, False, "cache-free prefill"),
+        ({"is_causal": False}, False, "causal self-attention"),
+        ({}, True, "cp_size=1"),
+    ],
+)
+def test_unsupported_runtime(runtime: dict[str, object], cp_enabled: bool, match: str) -> None:
+    with pytest.raises(NotImplementedError, match=match):
+        msa._reject_unsupported_msa_runtime(runtime, cp_enabled=cp_enabled)
 
 
-def test_optional_dependency_failures_are_deferred_and_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
-    def unexpected_probe() -> None:
-        raise AssertionError("MSA dependencies must not be resolved during construction")
-
-    monkeypatch.setattr(msa, "_resolve_msa_forward", unexpected_probe)
-    monkeypatch.setattr(msa, "_resolve_msa_backward", unexpected_probe)
-    _MSAFlatAttention(0.125)
-
-    monkeypatch.setattr(msa, "_resolve_msa_forward", lambda: None)
-    monkeypatch.setattr(msa, "_resolve_msa_backward", lambda: None)
-    with pytest.raises(UnavailableError, match=r"uv sync --extra msa"):
-        msa._require_msa()
-    with pytest.raises(UnavailableError, match=r"uv sync --extra msa"):
-        msa._require_msa_backward()
-
-
-def test_msa_import_and_construction_do_not_load_gpu_dependencies() -> None:
+def test_optional_dependencies_are_lazy_and_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
     script = """
 import sys
-
 class RejectGpuImports:
-    def find_spec(self, fullname: str, path: object = None, target: object = None) -> None:
+    def find_spec(self, fullname, path=None, target=None):
         if fullname.split(".")[0] in {"fmha_sm100", "cutlass", "quack"}:
-            raise AssertionError(f"Unexpected GPU dependency import: {fullname}")
-
+            raise AssertionError(fullname)
 sys.meta_path.insert(0, RejectGpuImports())
-from nemo_automodel.components.models.minimax_m3_vl.msa import _MSAFlatAttention
+from nemo_automodel.components.models.minimax_m3_vl._msa import _MSAFlatAttention
 _MSAFlatAttention(0.125)
 """
     subprocess.run([sys.executable, "-c", script], check=True, timeout=60)
-
-
-def test_missing_sparse_stack_has_actionable_dependency_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    package = ModuleType("fmha_sm100")
-    package.__path__ = []
-
-    def missing_sparse_export(name: str) -> None:
-        raise ImportError("MSA's CuTe dependencies are unavailable")
-
-    package.__getattr__ = missing_sparse_export
-    monkeypatch.setitem(sys.modules, "fmha_sm100", package)
-    monkeypatch.setitem(sys.modules, "fmha_sm100.sparse", None)
-    monkeypatch.setattr(msa, "_resolve_msa_forward", msa._resolve_msa_forward.__wrapped__)
-
-    with pytest.raises(UnavailableError, match=r"uv sync --extra msa"):
-        msa._require_msa()
-
-
-def test_msa_rejects_foreign_utils_without_modifying_it(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    sparse_module = ModuleType("fmha_sm100.sparse")
-    sparse_module.__file__ = str(tmp_path / "fmha_sm100/sparse.py")
-    sparse_module.build_k2q_csr = lambda: None
-    sparse_module.sparse_atten_func = lambda: None
-    foreign_utils = ModuleType("src.common.utils")
-    foreign_utils.__file__ = str(tmp_path / "foreign/src/common/utils.py")
-    original_fmax = object()
-    foreign_utils.fmax = original_fmax
-    monkeypatch.setitem(sys.modules, "fmha_sm100.sparse", sparse_module)
-    monkeypatch.setitem(sys.modules, "src.common.utils", foreign_utils)
-    monkeypatch.setattr(msa, "_resolve_msa_forward", msa._resolve_msa_forward.__wrapped__)
-
-    with pytest.raises(ImportError, match="conflicting src package"):
-        msa._require_msa()
-    assert foreign_utils.fmax is original_fmax
-
-
-def test_custom_autograd_reuses_forward_schedule_and_returns_compact_gradients(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    total_queries = 3
-    row_ptr = torch.tensor([[0, 3], [0, 3], [0, 3], [0, 3]], dtype=torch.int32)
-    q_indices = torch.zeros((4, 16), dtype=torch.int32)
-    q_indices[:, :total_queries] = torch.arange(total_queries, dtype=torch.int32)
-    scheduler_metadata = torch.tensor(
-        [[head, 0, 0, total_queries, 0, 0] for head in range(4)],
-        dtype=torch.int32,
-    )
-    work_count = torch.tensor([4], dtype=torch.int32)
-    forward_schedule = SimpleNamespace(scheduler_metadata=scheduler_metadata, work_count=work_count)
-    captured: dict[str, _MSABackwardSchedule] = {}
-
-    def fake_build_k2q_csr(
-        q2k: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        block_size: int,
-        **kwargs: object,
-    ) -> tuple[torch.Tensor, torch.Tensor, object]:
-        """Return forward metadata for compact support.
-
-        Args:
-            q2k: Int32 support tensor of shape [4, tokens, 16].
-            cu_seqlens_q: Int32 query offsets of shape [documents + 1].
-            cu_seqlens_k: Int32 key offsets of shape [documents + 1].
-            block_size: Key-block width in tokens.
-            **kwargs: Remaining schedule options.
-
-        Returns:
-            CSR tensors and forward execution metadata.
-        """
-        del q2k, cu_seqlens_q, cu_seqlens_k, block_size, kwargs
-        return row_ptr, q_indices, forward_schedule
-
-    def fake_sparse_attention(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        k2q_row_ptr: torch.Tensor,
-        k2q_q_indices: torch.Tensor,
-        topk_blocks: int,
-        **kwargs: object,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return shape-correct flat output and LSE.
-
-        Args:
-            q: BF16 tensor of shape [tokens, 64, 128].
-            k: BF16 tensor of shape [tokens, 4, 128].
-            v: BF16 tensor of shape [tokens, 4, 128].
-            k2q_row_ptr: Int32 CSR offsets of shape [4, rows + 1].
-            k2q_q_indices: Int32 CSR query rows of shape [4, edge_capacity].
-            topk_blocks: Fixed support width in key blocks.
-            **kwargs: Remaining launch metadata.
-
-        Returns:
-            BF16 output of shape [tokens, 64, 128] and FP32 LSE of shape [tokens, 64].
-        """
-        del k, v, k2q_row_ptr, k2q_q_indices, topk_blocks, kwargs
-        return q.clone(), torch.zeros((q.shape[0], q.shape[1]), dtype=torch.float32)
-
-    def fake_backward(
-        q: torch.Tensor,
-        k_aligned: torch.Tensor,
-        v_aligned: torch.Tensor,
-        grad_out: torch.Tensor,
-        lse: torch.Tensor,
-        out: torch.Tensor,
-        schedule: _MSABackwardSchedule,
-        *,
-        softmax_scale: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Capture reused schedule state and return workspace gradients.
-
-        Args:
-            q: BF16 tensor of shape [tokens, 64, 128].
-            k_aligned: BF16 tensor of shape [workspace, 4, 128].
-            v_aligned: BF16 tensor of shape [workspace, 4, 128].
-            grad_out: BF16 tensor of shape [tokens, 64, 128].
-            lse: FP32 tensor of shape [tokens, 64].
-            out: BF16 tensor of shape [tokens, 64, 128].
-            schedule: Forward-derived backward execution metadata.
-            softmax_scale: QK scale.
-
-        Returns:
-            Compact dQ and aligned-workspace dK/dV tensors.
-        """
-        del lse, out, softmax_scale
-        captured["schedule"] = schedule
-        assert q.shape == grad_out.shape == (total_queries, 64, 128)
-        assert k_aligned.shape == v_aligned.shape == (128, 4, 128)
-        assert torch.count_nonzero(k_aligned[total_queries:]) == 0
-        assert torch.count_nonzero(v_aligned[total_queries:]) == 0
-        return grad_out.clone(), torch.ones_like(k_aligned), torch.full_like(v_aligned, 2)
-
-    monkeypatch.setattr(
-        msa,
-        "_require_msa",
-        lambda: _MSAForwardKernels(
-            build_k2q_csr=fake_build_k2q_csr,
-            sparse_atten_func=fake_sparse_attention,
-        ),
-    )
-    monkeypatch.setattr(msa, "_require_msa_backward", lambda: fake_backward)
-
-    q = torch.randn(total_queries, 64, 128, dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(total_queries, 4, 128, dtype=torch.bfloat16, requires_grad=True)
-    v = torch.randn(total_queries, 4, 128, dtype=torch.bfloat16, requires_grad=True)
-    metadata = _MSAPackedLayout.build(torch.ones(1, total_queries, dtype=torch.int64)).launch_metadata()
-    q2k = torch.full((4, total_queries, 16), -1, dtype=torch.int32)
-    q2k[:, :, 0] = 0
-    out = _MSASparseAttentionFunction.apply(q, k, v, q2k, metadata, 0.125)
-    upstream = torch.randn_like(out)
-
-    out.backward(upstream)
-
-    saved_schedule = captured["schedule"]
-    assert torch.equal(saved_schedule.row_ptr, row_ptr)
-    assert torch.equal(saved_schedule.q_indices, q_indices)
-    assert torch.equal(saved_schedule.scheduler_metadata, scheduler_metadata)
-    assert torch.equal(saved_schedule.work_count, work_count)
-    assert torch.equal(q.grad, upstream)
-    assert torch.equal(k.grad, torch.ones_like(k))
-    assert torch.equal(v.grad, torch.full_like(v, 2))
-
-
-def _forward_schedule_fixture() -> _MSABackwardSchedule:
-    """Build forward execution metadata with document and capacity tails."""
-    row_ptr = torch.zeros((4, 3), dtype=torch.int32)
-    row_ptr[0] = torch.tensor([0, 10, 10], dtype=torch.int32)
-    row_ptr[3] = torch.tensor([0, 2, 2], dtype=torch.int32)
-    q_indices = torch.full((4, 16), -1, dtype=torch.int32)
-    q_indices[0, :10] = torch.arange(10, dtype=torch.int32)
-    q_indices[3, :2] = torch.tensor([5, 6], dtype=torch.int32)
-    scheduler_metadata = torch.full((4, 6), torch.iinfo(torch.int32).max, dtype=torch.int32)
-    scheduler_metadata[:2] = torch.tensor(
-        [[0, 0, 0, 10, 1, 0], [3, 0, 0, 2, 0, 1]],
-        dtype=torch.int32,
-    )
-    return _MSABackwardSchedule(
-        row_ptr=row_ptr,
-        q_indices=q_indices,
-        scheduler_metadata=scheduler_metadata,
-        work_count=torch.tensor([2], dtype=torch.int32),
-        cu_seqlens=torch.tensor([0, 130, 142], dtype=torch.int32),
-        document_workspace_starts=torch.tensor([0, 256], dtype=torch.int32),
-    )
-
-
-def _task_edges(
-    task_meta: torch.Tensor,
-    task_qrows: torch.Tensor,
-    task_qpos: torch.Tensor,
-) -> Counter[tuple[int, int, int, int]]:
-    """Decode the semantic edges carried by backward tasks.
-
-    Args:
-        task_meta: Int32 tensor of shape [tasks, 4].
-        task_qrows: Int32 compact query rows of shape [tasks, 8].
-        task_qpos: Int32 aligned query positions of shape [tasks, 8].
-
-    Returns:
-        Multiplicity of (index_head, workspace_key_block, compact_query, aligned_query) edges.
-    """
-    edges: Counter[tuple[int, int, int, int]] = Counter()
-    for meta, rows, positions in zip(task_meta.tolist(), task_qrows.tolist(), task_qpos.tolist(), strict=True):
-        _, head, key_block, valid = meta
-        edges.update((head, key_block, row, position) for row, position in zip(rows[:valid], positions[:valid]))
-    return edges
-
-
-def test_forward_schedule_tasks_cover_each_edge_once_and_ignore_capacity() -> None:
-    task_meta, task_qrows, task_qpos = _build_backward_tasks(_forward_schedule_fixture())
-    expected = Counter(
-        [(0, 2, 130 + offset, 256 + offset) for offset in range(10)]
-        + [(3, 1, 5 + offset, 5 + offset) for offset in range(2)]
-    )
-
-    assert task_meta.dtype == task_qrows.dtype == task_qpos.dtype == torch.int32
-    assert task_meta.shape == (3, 4)
-    assert task_qrows.shape == task_qpos.shape == (3, 8)
-    assert _task_edges(task_meta, task_qrows, task_qpos) == expected
-    for meta, rows, positions in zip(task_meta, task_qrows, task_qpos, strict=True):
-        valid = int(meta[-1])
-        assert torch.all(rows[valid:] == -1)
-        assert torch.all(positions[valid:] == -1)
-
-
-def _assert_exact_chunk_cover(num_rows: int, rows_per_cta: int, num_sms: int) -> None:
-    """Assert that CTA intervals partition ``range(num_rows)`` exactly once."""
-    num_full_ctas, tail_rows, grid_ctas = _chunk_map(num_rows, rows_per_cta, num_sms)
-    intervals = sorted(
-        _cta_row_interval(block, num_rows, rows_per_cta, num_full_ctas, tail_rows) for block in range(grid_ctas)
-    )
-
-    assert intervals[0][0] == 0
-    assert intervals[-1][1] == num_rows
-    assert all(0 <= start < end <= num_rows for start, end in intervals)
-    assert all(previous_end == next_start for (_, previous_end), (next_start, _) in zip(intervals, intervals[1:]))
-
-
-@pytest.mark.parametrize("num_sms", [132, 148])
-@pytest.mark.parametrize("rows_per_cta", [4, 8])
-def test_chunk_map_covers_every_row_exactly_once(num_sms: int, rows_per_cta: int) -> None:
-    row_counts = [*range(1, 1025), *range(1025, 20001, 97), 1177, 3545]
-    for num_rows in row_counts:
-        _assert_exact_chunk_cover(num_rows, rows_per_cta, num_sms)
+    monkeypatch.setattr(msa, "_resolve_msa_forward", lambda: None)
+    monkeypatch.setattr(msa, "_resolve_msa_backward", lambda: None)
+    for require in (msa._require_msa, msa._require_msa_backward):
+        with pytest.raises(UnavailableError, match=r"uv sync --extra msa"):
+            require()

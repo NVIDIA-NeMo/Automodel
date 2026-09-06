@@ -22,10 +22,11 @@ lightning indexer builds its block-sparse mask from index q/k over the *global*
 causal sequence, so a CP-aware sparse layer must gather the indexer inputs from
 every rank and reorder them into global token order before selecting blocks.
 
-This module holds the reorder primitives shared by the CP-aware attention.
-``order_by_positions`` / ``restore_by_positions`` stay pure tensor functions so
-the load-balance inverse is unit-testable on CPU without a process group: a wrong
-inverse trains without shape errors and never converges.
+This module holds the reorder primitives shared by the CP-aware attention. The
+reorder math (``order_by_positions`` / ``restore_by_positions``) is factored out
+as pure tensor functions so the load-balance inverse -- a silent-failure trap: a
+wrong inverse trains without shape errors but never converges -- is unit-testable
+on CPU without a process group.
 """
 
 from __future__ import annotations
@@ -38,8 +39,6 @@ from torch.autograd import Function
 
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Attention, select_sparse_blocks
-from nemo_automodel.components.models.minimax_m3_vl.msa import _msa_cp_enabled, _reject_unsupported_msa_runtime
-from nemo_automodel.components.models.minimax_m3_vl.msa_plan import _MSAPackedLayout
 
 # Compiled FlexAttention is built lazily (and cached) on first CP use so that
 # importing this module / instantiating the attention on CPU does not require a
@@ -257,11 +256,9 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         """Install the CP submesh consumed by :meth:`_cp_forward` (model-owned CP).
 
         Called post-FSDP by the MoE parallelizer's ``apply_cp`` for each sparse
-        layer, which keeps M3 on the same model-owned CP path as the other
-        custom-attention models (Gemma4, DeepSeek-V4).
-
-        Args:
-            cp_mesh: One-dimensional context-parallel device mesh.
+        layer. Routing M3 through this hook -- rather than having ``apply_cp`` set
+        ``_cp_mesh`` directly -- keeps it on the same model-owned CP path as the
+        other custom-attention models (Gemma4, DeepSeek-V4).
         """
         self._cp_mesh = cp_mesh
 
@@ -271,46 +268,13 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        _msa_layout: _MSAPackedLayout | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        """Run local or context-parallel MiniMax M3 sparse attention.
-
-        Args:
-            x: Local hidden states shaped ``[batch, local_sequence, hidden]``.
-            freqs_cis: Rotary frequencies aligned with local tokens, shaped
-                ``[batch, local_sequence, rotary]``.
-            attention_mask: Optional local attention mask shaped ``[batch,
-                local_sequence]`` or ``[batch, 1, local_sequence,
-                local_sequence]``. The CP implementation derives its sparse
-                relation from gathered token positions instead.
-            _msa_layout: Model-owned packed-layout contract for MSA. Generic
-                attention must receive ``None``.
-            **attn_kwargs: Runtime attention metadata such as position ids,
-                padding masks, and context-parallel sizing.
-
-        Returns:
-            Local attention output shaped ``[batch, local_sequence, hidden]``.
-
-        Raises:
-            TypeError: If a packed MSA layout reaches generic CP attention.
-            NotImplementedError: If MSA is combined with context parallelism or
-                another unsupported runtime mode.
-        """
+        """Map local x[B,S,H], freqs_cis[B,S,R] and mask[B,S] or [B,1,S,S] to local output[B,S,H]."""
         cp_mesh = self._cp_mesh
-        if cp_mesh is None or cp_mesh.size() <= 1 or self.indexer is None:
-            return super().forward(
-                x,
-                freqs_cis=freqs_cis,
-                attention_mask=attention_mask,
-                _msa_layout=_msa_layout,
-                **attn_kwargs,
-            )
-        if self._use_msa:
-            # This branch never reaches ``super().forward()``, so the MSA runtime
-            # rules have to be applied here, before the first CP collective.
-            _reject_unsupported_msa_runtime(attn_kwargs, cp_enabled=_msa_cp_enabled(self))
-        if _msa_layout is not None:
+        if self._use_msa or cp_mesh is None or cp_mesh.size() <= 1 or self.indexer is None:
+            return super().forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
+        if attn_kwargs.get("_msa_layout") is not None:
             raise TypeError("_msa_layout is model-owned and may only be passed to MSA attention layers.")
         return self._cp_forward(x, freqs_cis=freqs_cis, **attn_kwargs)
 

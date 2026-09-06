@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility for official MiniMax-AI/MSA at 80434d7f67877c6570ca19cac444b84bc9855dac.
-
-CUTLASS DSL 4.6.2 infers the result type of ``nvvm.fmax`` for both CUDA
-flavors, but MSA passes an explicit type on CUDA 12.9. QuACK 0.6.4 needs
-the same DSL version; its compatibility change is the dependency pin only.
-Remove this patch when the pinned official MSA uses the inferred-result call.
-"""
+"""Compatibility for official MiniMax-AI/MSA at 80434d7f67877c6570ca19cac444b84bc9855dac."""
 
 from pathlib import Path
 from types import ModuleType
@@ -27,19 +21,7 @@ from nemo_automodel.shared.import_utils import safe_import
 
 
 def _patch_msa_fmax(sparse_module: ModuleType) -> None:
-    """Install the scalar fix after loading MSA and before its first JIT compile.
-
-    MSA loads its CuTe sources as top-level ``src`` modules. Verify ownership
-    before replacing the helper shared by its softmax consumers. The replacement
-    lives for the process lifetime, like the existing cached forward resolver;
-    neither the installed source files nor CUTLASS globals are modified.
-
-    Args:
-        sparse_module: The loaded ``fmha_sm100.sparse`` module.
-
-    Raises:
-        ImportError: If MSA's helper is missing or a foreign ``src`` module shadows it.
-    """
+    """Patch only the loaded MSA-owned utils before JIT; preserve fp32, third operand and loc/ip."""
     available, utils = safe_import("src.common.utils")
     expected_path = Path(sparse_module.__file__).resolve().parent / "cute/src/common/utils.py"
     if not available or Path(utils.__file__).resolve() != expected_path:

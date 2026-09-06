@@ -45,10 +45,14 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
+from nemo_automodel.components.models.minimax_m3_vl._msa import (
+    _msa_cp_enabled,
+    _MSAPackedLayout,
+    _reject_unsupported_msa_runtime,
+    _resolve_canonical_document_map,
+)
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import Block, MiniMaxM3RMSNorm
-from nemo_automodel.components.models.minimax_m3_vl.msa import _msa_cp_enabled, _reject_unsupported_msa_runtime
-from nemo_automodel.components.models.minimax_m3_vl.msa_plan import _MSAPackedLayout, _resolve_canonical_document_map
 from nemo_automodel.components.models.minimax_m3_vl.mtp import MiniMaxM3MTP
 from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import (
     MiniMaxM3StateDictAdapter,
@@ -138,7 +142,7 @@ class MiniMaxM3TextModel(nn.Module):
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
-            self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, self.backend)
+            self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
         self._msa_layer_ids = frozenset(layer_id for layer_id, block in self.layers.items() if block.self_attn._use_msa)
         self._msa_model_has_dense_layers = len(self._msa_layer_ids) != len(self.layers)
         if self._msa_layer_ids and int(getattr(config, "num_mtp_modules", 0) or 0) > 0:
@@ -173,7 +177,7 @@ class MiniMaxM3TextModel(nn.Module):
 
         # Multi-token prediction (DeepSeek-V3 style); shares the main lm_head.
         num_mtp = int(getattr(config, "num_mtp_modules", 0) or 0)
-        self.mtp = MiniMaxM3MTP(config, self.moe_config, self.backend, num_mtp) if num_mtp > 0 else None
+        self.mtp = MiniMaxM3MTP(config, self.moe_config, backend, num_mtp) if num_mtp > 0 else None
 
     def make_freqs_cis(self, position_ids: torch.Tensor, **attn_kwargs: Any) -> torch.Tensor:
         return position_ids_to_freqs_cis(
@@ -194,38 +198,7 @@ class MiniMaxM3TextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        """Run the text backbone.
-
-        When the model has MSA layers, the packed document layout is built once
-        here and handed to those layers as the model-owned ``_msa_layout``.
-
-        Args:
-            input_ids: Token ids shaped ``[batch, sequence]``. A later pipeline
-                stage may instead receive floating hidden states shaped
-                ``[batch, sequence, hidden]`` through this slot.
-            position_ids: Optional positions shaped ``[batch, sequence]``.
-            attention_mask: Optional keep/document mask shaped ``[batch,
-                sequence]`` or standard bool block-causal mask shaped
-                ``[batch, 1, sequence, sequence]``.
-            padding_mask: Optional bool padding mask shaped ``[batch,
-                sequence]``, where ``True`` marks padding.
-            inputs_embeds: Optional input embeddings shaped ``[batch,
-                sequence, hidden]`` instead of ``input_ids``.
-            **attn_kwargs: Attention runtime metadata. ``_packed_seq_ids`` may
-                carry integer document ids shaped ``[batch, sequence]``; callers
-                must not provide the model-owned ``_msa_layout``.
-
-        Returns:
-            Final or pipeline-stage hidden states shaped ``[batch, sequence,
-            hidden]``.
-
-        Raises:
-            TypeError: If a caller supplies the model-owned ``_msa_layout``.
-            ValueError: If packed dense layers lack a standard 4-D block-causal
-                mask or document metadata violates the MSA layout contract.
-            NotImplementedError: If MSA is combined with an unsupported runtime
-                mode or dense attention backend.
-        """
+        """Map ids/positions/padding[B,S], embeds[B,S,H] and mask[B,S] or [B,1,S,S] to hidden[B,S,H]; own MSA layout."""
         if "_msa_layout" in attn_kwargs:
             raise TypeError("_msa_layout is model-owned and cannot be supplied by callers.")
 
@@ -274,8 +247,7 @@ class MiniMaxM3TextModel(nn.Module):
                         f"4-D block-causal mask; got backend.attn={self._attn_impl!r}."
                     )
 
-            # Canonical ids own padding semantics too, so a lower-priority mask
-            # cannot reach dense attention or the MoE router after support is built.
+            # Canonical ids also own padding for dense attention and the MoE router.
             padding_mask = doc_ids == 0
             if block_causal_mask is None:
                 attention_mask = doc_ids != 0 if has_padding else None
@@ -289,8 +261,9 @@ class MiniMaxM3TextModel(nn.Module):
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 _msa_layout=msa_layout if layer_id in self._msa_layer_ids else None,
-                # CP-aware sparse attention derives per-document boundaries from
-                # these; the eager path pops them.
+                # Forwarded so CP-aware sparse attention can derive per-document
+                # boundaries (position_ids reset to 0 per packed document) for
+                # block-diagonal masking; ignored/popped by the eager path.
                 position_ids=position_ids,
                 **attn_kwargs,
             )
@@ -414,33 +387,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor | MiniMaxM3CausalLMOutput:
-        """Run standalone MiniMax M3 causal language modeling.
-
-        The MSA runtime rules are enforced here, before the generic THD squeeze,
-        because MSA accepts only cache-free BSHD prefill.
-
-        Args:
-            input_ids: Token ids shaped ``[batch, sequence]``.
-            position_ids: Optional positions shaped ``[batch, sequence]``.
-            attention_mask: Optional keep/document mask shaped ``[batch,
-                sequence]`` or bool attention relation shaped ``[batch, 1,
-                sequence, sequence]``.
-            padding_mask: Optional bool padding mask shaped ``[batch,
-                sequence]``, where ``True`` marks padding.
-            **attn_kwargs: Attention runtime metadata, including optional
-                ``_packed_seq_ids`` shaped ``[batch, sequence]`` and
-                ``qkv_format``.
-
-        Returns:
-            Logits shaped ``[batch, sequence, vocab]`` for BSHD, logits shaped
-            ``[1, tokens, vocab]`` for THD, or ``MiniMaxM3CausalLMOutput`` with
-            the primary logits and per-depth MTP logits during MTP training.
-
-        Raises:
-            NotImplementedError: If MSA is combined with an unsupported runtime
-                mode such as THD, cache use, context parallelism, or non-causal
-                attention.
-        """
+        """Map ids/positions/padding[B,S] and mask[B,S] or [B,1,S,S] to logits[B,S,V] or MTP logits; MSA uses BSHD."""
         use_msa = bool(self.model._msa_layer_ids)
         if use_msa:
             _reject_unsupported_msa_runtime(attn_kwargs, cp_enabled=_msa_cp_enabled(self))
@@ -493,30 +440,56 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
 
 
 class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """MiniMax M3 VL model with vision splicing and an M3 text backbone."""
+    """MiniMax M3 VL: CLIP-style vision tower + projector/merger + M3 text backbone.
+
+    Vision features (``vision_tower(pixel_values, grid_thw)``) are spliced into
+    the text embeddings at ``image_token_index`` / ``video_token_index``
+    positions, then run through the (sparse/dense MoE) language model + lm_head.
+    """
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
-    # Keep text and vision rotary buffers in FP32.
+    # Pipeline-parallel routing: keep this VLM's own forward (which splices vision
+    # features) instead of letting patch_hf_model_for_pp swap in the generic
+    # CausalLM forward (which would drop pixel_values). MTP per-depth outputs are
+    # logits (shared lm_head); rotary buffers stay fp32. "rotary_emb" covers the text
+    # rope; "inv_freq" additionally pins the vision tower's rotary buffer
+    # (vision_encoder.py) fp32 — the bf16 cast would otherwise round it and degrade
+    # vision RoPE (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb", "inv_freq"]
     _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
-    # Preserve vision splicing by retaining this forward under PP.
     _pp_keep_self_forward: bool = True
     mtp_outputs_are_logits = True
-    # Use SDPA for context-parallel dense attention.
+    # Opt into context parallelism on the SDPA attention backend (M3's block-sparse DSA
+    # bias is an explicit additive mask that only SDPA accepts, not TE). Dense layers use
+    # the standard CP path (mask-strip hook + is_causal); sparse layers require the
+    # CP-aware indexer attention for a correct global-sequence bias.
     _supports_cp_sdpa = True
-    # Let M3 attention own packed document masking.
+    # MiniMaxM3CPSparseAttention derives per-document ids from the packed position ids
+    # and builds its own block mask, so packing needs no packing-aware attention backend.
     _owns_packed_attention = True
-    # Let M3 attention own packed CP sharding.
+    # The same attention shards the packed sequence in forward and carries the document
+    # boundaries into every layer, so it owns the packed CP path end to end.
     _owns_cp_attention = True
-    # Skip random initialization because checkpoint loading populates every tensor.
+    # The state-dict adapter fully populates every tensor from the checkpoint
+    # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
+    # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
     _skip_init_weights_on_load = True
-    # Store the CP submesh installed by the MoE parallelizer.
+    # CP submesh, installed by the MoE parallelizer's apply_cp when context
+    # parallelism is active; None (default) means the forward embeds and shards
+    # nothing for CP. See prepare_model_inputs_for_cp / forward.
     cp_mesh = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
-        """Declare the supported parallelism modes."""
+        """Declared parallelism capabilities for this model class.
+
+        Mirrors the MiniMax M2 backbone: PP + EP are validated; TP is unsupported
+        by the custom MoE parallelizer. Context parallelism is supported via the
+        CP-aware block-sparse DSA attention (dense layers use the standard CP
+        path; sparse layers gather K/V and rebuild the global block-sparse mask
+        using FlexAttention).
+        """
 
         supports_tp: bool = False
         supports_cp: bool = True
@@ -589,7 +562,15 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         layers_prefix: str,
         text_model: nn.Module | None = None,
     ) -> list[list[str]]:
-        """Rewrite generated pipeline FQNs to M3's module paths."""
+        """Rewrite auto-generated pipeline FQNs to M3's real module paths.
+
+        M3's text stack lives directly under ``self.model`` and the vision tower
+        is a top-level sibling (``vision_tower``). The framework, seeing the
+        ``language_model`` property, derives a nested ``model.language_model.``
+        prefix for the text modules and a ``model.`` prefix for the multimodal
+        encoders. Map both back to M3's actual paths so per-stage module nulling
+        keeps/drops the correct submodules.
+        """
         if getattr(self.model, "mtp", None) is not None:
             raise NotImplementedError(
                 "MiniMax M3 VL does not support MTP modules under pipeline parallelism yet; "
@@ -630,7 +611,19 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         seq_len: int,
         dtype: torch.dtype,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Build PP meta tensors with full stage-zero ids and CP-local activations."""
+        """Per-stage input/output meta tensors for the PP schedule's shape inference.
+
+        First stage consumes the FULL token ids ``[mb, seq]``; later stages
+        consume hidden states. The final stage (owning ``lm_head``) emits logits;
+        earlier stages emit hidden states.
+
+        Under context parallelism the first stage embeds the full sequence and
+        shards it to this rank's round-robin chunk pair inside forward
+        (see :func:`shard_sequence_for_cp_round_robin`), so every stage output and every
+        later-stage input carries the LOCAL (padded-to-``2*cp`` then ``//cp``)
+        sequence length while the first stage's input stays full-length. At
+        ``cp_size == 1`` the lengths coincide and the layout is symmetric.
+        """
         text_config = self.config.text_config
         hidden_size = text_config.hidden_size
         vocab_size = text_config.vocab_size
@@ -644,14 +637,17 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         def meta(*shape: int) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dtype)
 
-        # Keep token ids int64 and inter-stage activations in the requested dtype.
+        # Inter-stage tensors (hidden states) carry the model/activation dtype the
+        # framework passes in. token ids are always long.
         if is_first:
             inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
             inputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
 
         if self.lm_head is not None:
-            # Match the output meta dtype to the language-model head.
+            # Logits follow lm_head's own param dtype, which may diverge from the
+            # model dtype if lm_head is ever kept in fp32 (_keep_in_fp32_modules);
+            # deriving it here keeps the schedule's output buffer correctly sized.
             head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
             outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=head_dtype),)
         else:
@@ -672,7 +668,10 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         grid_thw,
         token_index: int,
     ) -> torch.Tensor:
-        # Suspend CP dispatch while the vision tower runs bidirectional attention.
+        # The vision tower's bidirectional patch attention is not CP-sharded; when
+        # this embed+splice runs in-forward under an active CP ring context it must
+        # suspend the ring dispatcher, or torch's load-balanced ring SDPA rejects
+        # the non-causal attention. No-op when CP is inactive.
         from nemo_automodel.components.distributed.context_parallel.utils import (
             cp_dispatcher_suspended,  # noqa: PLC0415
         )
@@ -698,7 +697,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw=None,
     ) -> torch.Tensor:
-        """Embed token ids and splice vision or video features."""
+        """Embed token ids and splice vision/video features into the embeddings.
+
+        Shared by ``forward`` and ``prepare_model_inputs_for_cp`` so the splice logic
+        lives in one place.
+        """
         inputs_embeds = self.model.embed_tokens(input_ids)
         if pixel_values is not None or pixel_values_videos is not None:
             inputs_embeds = inputs_embeds.clone()
@@ -718,7 +721,21 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         *,
         num_chunks: int = 1,
     ) -> dict[str, Any]:
-        """Return a CP sharder while deferring embedding and vision splicing to forward."""
+        """Return a sharder-only CP backend; embed + splice + shard happen in forward.
+
+        The returned :class:`ContextParallelSharder` round-robin-shards only the
+        no-grad aux streams (labels/position_ids/loss_mask/padding_mask) via
+        :func:`shard_batch_aux_only`, leaving ``input_ids`` and the multimodal inputs
+        full-length; the forward then embeds + splices and calls
+        :func:`shard_sequence_for_cp_round_robin` per microbatch, so embeddings and vision stay
+        trainable under CP. Nothing is consumed here.
+        Defining this method is the opt-in signal the recipe checks
+        (``hasattr(model, "prepare_model_inputs_for_cp")``).
+
+        Args:
+            batch: The full-sequence batch; left intact (nothing consumed).
+            num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
+        """
         del batch, num_chunks
         return {
             "cp_sharder": ContextParallelSharder(
@@ -743,14 +760,22 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ) -> torch.Tensor | MiniMaxM3CausalLMOutput | dict[str, torch.Tensor]:
         is_pp_stage = self._is_pipeline_parallel_stage()
 
-        # Reject MTP on every pipeline stage using the unsplit config.
+        # Authoritative MTP-under-PP guard: keyed on the config (which survives the
+        # splitter nulling the mtp module) and is_pp_stage, so it fires for both the
+        # auto-generated split (also caught earlier in customize_pipeline_stage_modules)
+        # and a manually supplied module_fqns_per_model_part that bypasses that hook.
         if is_pp_stage and int(getattr(self.config.text_config, "num_mtp_modules", 0) or 0) > 0:
             raise NotImplementedError(
                 "MiniMax M3 VL does not support MTP modules under pipeline parallelism yet; "
                 "set text_config.num_mtp_modules=0 for pp_size>1 runs."
             )
 
-        # Restore this PP microbatch's staged media before embedding.
+        # Pipeline stage 0 does not receive media in the batch: the VLM-PP collate
+        # strips pixel_values/grids and stage_vlm_media_for_pp attaches them here as
+        # per-microbatch chunks. Pull this microbatch's media off the cursor before
+        # embedding so vision features still get spliced (mirrors KimiVL/Step3p7).
+        # `_vlm_image_grid_hws_chunks` holds M3's image_grid_thw values (the PP media
+        # prep stores whatever grid the model emits under that key), so no reshape.
         chunks = getattr(self, "_vlm_pixel_values_chunks", None)
         if (
             pixel_values is None
@@ -779,7 +804,16 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
 
-        # Route floating PP inputs directly to the text model as hidden states.
+        # Media under CP×PP rides the same per-microbatch side channel as cp1×PP:
+        # stage_vlm_media_for_pp stashed grid-aware pixel chunks (pulled just above),
+        # and the embed + vision splice below runs on this microbatch's FULL sequence
+        # before shard_sequence_for_cp_round_robin shards it. So the CP shard composes with the
+        # media staging without changing the stage metas (the first-stage input is
+        # still input_ids [mb, S]; media never enters the stage tensor stream).
+
+        # Pipeline stages after the first receive the previous stage's hidden
+        # states in the input_ids slot (a float tensor); route them straight to
+        # the text model (no embedding / vision splicing on non-first stages).
         if inputs_embeds is None and input_ids is not None and torch.is_floating_point(input_ids):
             inputs_embeds = input_ids
             input_ids = None
@@ -792,7 +826,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
-            # Shard freshly embedded full-sequence activations for CP.
+            # Per-microbatch CP: keep this rank's round-robin chunk pair of the
+            # freshly embedded full sequence (aux streams + ring-SDPA context aligned
+            # by shard_batch_aux_only). Differentiable: gradients reach embeddings/vision.
             if cp_size > 1:
                 inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
 
@@ -803,7 +839,10 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             attention_mask=attention_mask,
             **kwargs,
         )
-        # Return hidden states directly for fused loss without materializing logits.
+        # Fused-loss path: hand back hidden states and skip lm_head, so the
+        # [tokens, vocab_size] logits tensor is never materialised. Requesting this
+        # alongside MTP raises rather than returning something mtp_logits cannot
+        # consume, matching the MTP-under-PP guard above.
         if logits_to_keep is not None and not is_pp_stage:
             if self.model.mtp is not None and self.training and input_ids is not None:
                 raise NotImplementedError(
@@ -812,10 +851,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 )
             return {"hidden_states": hidden}
 
-        # Use hidden states as output on non-final pipeline stages.
+        # lm_head is None on non-final pipeline stages -> forward hidden states.
         logits = self.lm_head(hidden) if self.lm_head is not None else hidden
 
-        # Return plain tensors between pipeline stages.
+        # Pipeline stages return a plain tensor; the schedule wires each stage's
+        # output to the next stage's input and only the final stage owns lm_head.
         if is_pp_stage:
             return logits
 
