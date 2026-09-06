@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Union
 
 import torch
 
-from nemo_automodel.components.datasets.llm.agent_chat import (
+from nemo_automodel.components.datasets import (
     make_agent_chat_eval_samples,
 )
 from nemo_automodel.components.eval.tool_call_parser import (

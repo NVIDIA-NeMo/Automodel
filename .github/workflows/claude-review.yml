@@ -94,8 +94,9 @@ jobs:
           - optional dependencies imported without `safe_import()` from
             `nemo_automodel.shared.import_utils`, including raw
             `try/except ImportError` or mock/stub fallbacks in production code;
-          - new cross-component imports between directories under
-            `nemo_automodel/components/`;
+          - new imports of a component from any code outside that component that
+            bypass the target component's package-level exports (`__all__`),
+            including imports from recipes and framework code;
           - new component config fields without a backward-compatible default, or
             component code that converts typed configs into untyped dictionaries
             instead of preserving the typed config boundary;

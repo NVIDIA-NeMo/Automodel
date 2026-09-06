@@ -30,9 +30,9 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
+from nemo_automodel.components.datasets import build_block_causal_additive_mask
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
-from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+from nemo_automodel.components.utils import filter_forward_kwargs
 
 
 @dataclass
@@ -74,7 +74,7 @@ class HFDSparkTargetModel:
         self.cp_mesh = cp_mesh
         self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
         if self._cp_size > 1:
-            from nemo_automodel.components.distributed.context_parallel.utils import attach_context_parallel_hooks
+            from nemo_automodel.components.distributed import attach_context_parallel_hooks
             from nemo_automodel.components.speculative.target_cp import attach_cp_kv_gather_hooks
 
             # Strip the 4D mask (self_attn then calls SDPA on the local shard), and

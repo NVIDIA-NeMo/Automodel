@@ -18,10 +18,10 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.utils import get_sync_ctx
-from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.training.rng import ScopedRNG
+from nemo_automodel.components.config import parse_args_and_load_config
+from nemo_automodel.components.distributed import get_sync_ctx
+from nemo_automodel.components.loggers import MetricsSample
+from nemo_automodel.components.training import ScopedRNG
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe, _get_autocast_ctx
 from nemo_automodel.shared.import_utils import safe_import
 

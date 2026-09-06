@@ -49,23 +49,35 @@ import torch.distributed as dist
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.llm.dspark_cache import (
-    DTYPE_MAP,
+from nemo_automodel.components.config import parse_args_and_load_config
+from nemo_automodel.components.datasets import (
+    DSPARK_DTYPE_MAP as DTYPE_MAP,
+)
+from nemo_automodel.components.datasets import (
     build_cache_manifest,
+    build_eagle3_dataloader,
     compute_batch_cache,
-    existing_shard_indices,
     manifest_mismatch_fields,
-    manifest_path,
-    read_manifest,
     tokenizer_chat_template_sha256,
-    write_manifest,
-    write_shard,
+    write_cache_shards_distributed,
     write_target_weights,
 )
-from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
-from nemo_automodel.components.datasets.llm.offline_cache import write_cache_shards_distributed
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.datasets import (
+    dspark_existing_shard_indices as existing_shard_indices,
+)
+from nemo_automodel.components.datasets import (
+    dspark_manifest_path as manifest_path,
+)
+from nemo_automodel.components.datasets import (
+    dspark_read_manifest as read_manifest,
+)
+from nemo_automodel.components.datasets import (
+    dspark_write_manifest as write_manifest,
+)
+from nemo_automodel.components.datasets import (
+    dspark_write_shard as write_shard,
+)
+from nemo_automodel.components.distributed import initialize_distributed
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.speculative.dspark.registry import build_target_layer_ids
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel

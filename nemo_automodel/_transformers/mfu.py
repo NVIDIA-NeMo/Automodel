@@ -31,7 +31,7 @@ import torch
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
-from nemo_automodel.components.utils.flops_utils import (
+from nemo_automodel.components.utils import (
     calculate_mfu,
     get_flops_formula_for_hf_config,
 )

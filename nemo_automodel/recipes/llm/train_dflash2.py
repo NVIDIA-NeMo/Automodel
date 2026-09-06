@@ -38,7 +38,7 @@ import logging
 
 import torch
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config import parse_args_and_load_config
 from nemo_automodel.components.speculative.dflash.dflash2_core import DFlash2TrainerModule
 from nemo_automodel.components.speculative.dflash.registry import DFlashDraftSpec
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe

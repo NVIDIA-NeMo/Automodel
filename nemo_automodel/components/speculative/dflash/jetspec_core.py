@@ -47,7 +47,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.loss.kd_loss import KDLoss
+from nemo_automodel.components.loss import KDLoss
 from nemo_automodel.components.speculative.dflash.core import (
     DFlashTrainerModule,
     NoValidAnchorsError,

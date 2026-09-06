@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib as _importlib
+
 from .dion import build_dion_optimizer, is_dion_optimizer
 from .optimizer import (
     OPTIMIZER_CONFIG_REGISTRY,
@@ -52,3 +54,26 @@ __all__ = [
     "build_dion_optimizer",
     "is_dion_optimizer",
 ]
+
+_LAZY_ATTRS = {
+    "resolve_storage_dtype": (".precision_warnings", "resolve_storage_dtype"),
+    "warn_if_torch_adam_with_bf16_params": (".precision_warnings", "warn_if_torch_adam_with_bf16_params"),
+}
+
+__all__ += sorted(_LAZY_ATTRS.keys())
+
+
+def __getattr__(name: str) -> object:
+    """Load an exported component symbol on first access."""
+    if name in _LAZY_ATTRS:
+        module_path, attr_name = _LAZY_ATTRS[name]
+        module = _importlib.import_module(module_path, __name__)
+        attr = getattr(module, attr_name)
+        globals()[name] = attr
+        return attr
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Return the component's exported symbols."""
+    return sorted(__all__)

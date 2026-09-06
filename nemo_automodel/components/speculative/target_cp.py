@@ -172,7 +172,7 @@ def run_target_cp_forward_and_gather(
         **forward_kwargs,
     }
     if filter_kwargs:
-        from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+        from nemo_automodel.components.utils import filter_forward_kwargs
 
         call_kwargs = filter_forward_kwargs(model, call_kwargs)
     with cp_ctx:

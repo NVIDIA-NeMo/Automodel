@@ -314,10 +314,11 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
         MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
     )
 
-    from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
-
     enable_optimization = MagicMock(return_value=True)
-    monkeypatch.setattr(hunyuan_module, "enable_hunyuan_flash_varlen_mask_optimization", enable_optimization)
+    monkeypatch.setattr(
+        "nemo_automodel.components.flow_matching.enable_hunyuan_flash_varlen_mask_optimization",
+        enable_optimization,
+    )
 
     recipe = TrainDiffusionRecipe(_minimal_diffusion_recipe_cfg())
 

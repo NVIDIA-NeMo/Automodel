@@ -438,7 +438,7 @@ def test_run_resume_skips_already_written_shards(tmp_path: Path, monkeypatch):
         for i in range(4)
     ]
     monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages",
+        "nemo_automodel.components.datasets.load_openai_messages",
         lambda *args, **kwargs: fake_dataset,
     )
 

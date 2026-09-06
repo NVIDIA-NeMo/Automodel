@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
+from nemo_automodel.components.distributed import (
     ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
@@ -54,7 +54,7 @@ from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import (
 from nemo_automodel.components.models.minimax_m3_vl.vision_encoder import MiniMaxM3VisionModel
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.components.utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -513,7 +513,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 "MiniMax M3 VL does not support MTP modules under pipeline parallelism yet; "
                 "set text_config.num_mtp_modules=0 for pp_size>1 runs."
             )
-        from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
+        from nemo_automodel.components.distributed import MULTIMODAL_SUFFIXES
 
         text_prefix = "model."  # M3's text stack lives directly under self.model
         fixed: list[list[str]] = []
@@ -609,7 +609,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         # this embed+splice runs in-forward under an active CP ring context it must
         # suspend the ring dispatcher, or torch's load-balanced ring SDPA rejects
         # the non-causal attention. No-op when CP is inactive.
-        from nemo_automodel.components.distributed.context_parallel.utils import (
+        from nemo_automodel.components.distributed import (
             cp_dispatcher_suspended,  # noqa: PLC0415
         )
 

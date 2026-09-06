@@ -118,7 +118,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_fr
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.components.utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # Check for flash attention

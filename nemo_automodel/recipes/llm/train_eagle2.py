@@ -23,7 +23,7 @@ remember that the underlying optimization is identical to EAGLE-1.
 
 from __future__ import annotations
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 
 

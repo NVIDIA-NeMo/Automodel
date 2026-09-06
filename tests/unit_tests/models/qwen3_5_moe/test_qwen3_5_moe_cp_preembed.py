@@ -261,7 +261,6 @@ class TestEmbedAndSpliceForCP:
 
 class TestPackedCPDispatch:
     def test_full_attention_routes_through_blockdiag_sdpa(self, monkeypatch):
-        from nemo_automodel.components.distributed import blockdiag_cp
         from nemo_automodel.components.models.qwen3_next import layers as qwen3_next_layers
 
         attention = _Qwen3_5MoeAttention.__new__(_Qwen3_5MoeAttention)
@@ -284,8 +283,10 @@ class TestPackedCPDispatch:
             return q
 
         monkeypatch.setattr(qwen3_next_layers, "apply_rotary_emb_qk", lambda q, k, *args, **kwargs: (q, k))
-        monkeypatch.setattr(blockdiag_cp, "current_blockdiag_cp_state", lambda: {"row_offset": 0})
-        monkeypatch.setattr(blockdiag_cp, "cp_blockdiag_sdpa", _cp_sdpa)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.current_blockdiag_cp_state", lambda: {"row_offset": 0}
+        )
+        monkeypatch.setattr("nemo_automodel.components.distributed.cp_blockdiag_sdpa", _cp_sdpa)
 
         x = torch.randn(1, 3, 4)
         out = attention(x, freqs_cis=torch.zeros(3, 1, 3, 2))
@@ -296,7 +297,6 @@ class TestPackedCPDispatch:
         assert calls[0][3]["is_causal"] is True
 
     def test_gdn_forward_receives_active_blockdiag_state(self, monkeypatch):
-        from nemo_automodel.components.distributed import blockdiag_cp
         from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 
         module = CPAwareGatedDeltaNet.__new__(CPAwareGatedDeltaNet)
@@ -310,7 +310,7 @@ class TestPackedCPDispatch:
 
         module._forward_with_cp = types.MethodType(_forward_with_cp, module)
         state = {"doc_ids": torch.tensor([[1, 1, 2, 2]])}
-        monkeypatch.setattr(blockdiag_cp, "current_blockdiag_cp_state", lambda: state)
+        monkeypatch.setattr("nemo_automodel.components.distributed.current_blockdiag_cp_state", lambda: state)
 
         hidden = torch.randn(1, 2, 4)
         assert module(hidden) is hidden

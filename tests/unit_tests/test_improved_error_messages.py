@@ -90,8 +90,9 @@ class TestModelsAlias:
     ``nemo_automodel.components.models``."""
 
     def test_alias_package_is_same_object(self):
-        import nemo_automodel.components.models as real
         import nemo_automodel.models as alias
+
+        import nemo_automodel.components.models as real
 
         assert alias is real
 
@@ -277,7 +278,7 @@ class TestCheckpointDtypeRestoration:
 
         model = DummyModel().to(torch.float32)
         with patch(
-            "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+            "nemo_automodel._transformers.model_init.get_checkpoint_tensor_dtypes",
             return_value={
                 "linear.weight": torch.bfloat16,
                 "norm.weight": torch.float32,
@@ -315,7 +316,7 @@ class TestCheckpointDtypeRestoration:
 
         model = DummyModel().to(torch.float32)
         with patch(
-            "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+            "nemo_automodel._transformers.model_init.get_checkpoint_tensor_dtypes",
             return_value={
                 "model.language_model.layers.0.linear_attn.A_log": torch.bfloat16,
                 "model.language_model.layers.0.linear_attn.dt_bias": torch.bfloat16,
@@ -355,7 +356,7 @@ class TestCheckpointDtypeRestoration:
 
         model = DummyModel().to(torch.float32)
         with patch(
-            "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+            "nemo_automodel._transformers.model_init.get_checkpoint_tensor_dtypes",
             return_value={"layer.linear_attn.A_log": torch.bfloat16},
         ):
             _restore_loaded_model_dtype(
@@ -382,7 +383,7 @@ class TestCheckpointDtypeRestoration:
 
         model = DummyModel().to(torch.float32)
         with patch(
-            "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+            "nemo_automodel._transformers.model_init.get_checkpoint_tensor_dtypes",
             return_value={"lm_head.weight": torch.bfloat16},
         ):
             _restore_loaded_model_dtype(

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config import parse_args_and_load_config
 from nemo_automodel.components.speculative.dflash.jetspec_core import JetSpecTrainerModule
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe

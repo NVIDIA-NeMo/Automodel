@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from nemo_automodel.components.loss.soft_ce import masked_soft_cross_entropy
+from nemo_automodel.components.loss import masked_soft_cross_entropy
 
 
 def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:

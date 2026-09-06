@@ -21,11 +21,9 @@ import contextlib
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
+from nemo_automodel.components.distributed import (
     ShardLayout,
     contiguous_local_indices,
-)
-from nemo_automodel.components.distributed.thd_utils import (
     split_batch_into_thd_chunks,
     thd_padding_mask_from_token_ids,
 )

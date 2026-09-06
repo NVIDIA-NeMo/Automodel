@@ -61,22 +61,33 @@ import torch
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader, build_eagle3_token_mapping
-from nemo_automodel.components.datasets.llm.eagle3_cache import (
-    DTYPE_MAP,
-    compress_target_probs,
-    existing_shard_indices,
-    is_compressed,
-    manifest_path,
-    read_manifest,
-    write_manifest,
-    write_shard,
-    write_target_embeddings,
+from nemo_automodel.components.datasets import (
+    EAGLE3_DTYPE_MAP as DTYPE_MAP,
 )
-from nemo_automodel.components.datasets.llm.offline_cache import (
+from nemo_automodel.components.datasets import (
+    build_eagle3_dataloader,
+    build_eagle3_token_mapping,
+    compress_target_probs,
     dataloader_from_sample,
+    is_compressed,
     resume_start_sample,
     write_cache_shards,
+    write_target_embeddings,
+)
+from nemo_automodel.components.datasets import (
+    eagle3_existing_shard_indices as existing_shard_indices,
+)
+from nemo_automodel.components.datasets import (
+    eagle3_manifest_path as manifest_path,
+)
+from nemo_automodel.components.datasets import (
+    eagle3_read_manifest as read_manifest,
+)
+from nemo_automodel.components.datasets import (
+    eagle3_write_manifest as write_manifest,
+)
+from nemo_automodel.components.datasets import (
+    eagle3_write_shard as write_shard,
 )
 from nemo_automodel.components.speculative.eagle import HFEagle3TargetModel
 from nemo_automodel.components.speculative.eagle.core import _compute_target_distribution

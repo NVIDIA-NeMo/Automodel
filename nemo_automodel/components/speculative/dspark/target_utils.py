@@ -18,7 +18,12 @@ from __future__ import annotations
 
 from transformers import AutoConfig, PretrainedConfig
 
-from nemo_automodel.components.datasets.llm.formatting_utils import _has_chat_template, _resolve_chat_template
+from nemo_automodel.components.datasets import (
+    has_chat_template as _has_chat_template,
+)
+from nemo_automodel.components.datasets import (
+    resolve_chat_template as _resolve_chat_template,
+)
 
 GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_unified")
 DEEPSEEK_V4_MODEL_TYPE = "deepseek_v4"

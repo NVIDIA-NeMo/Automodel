@@ -18,7 +18,7 @@ from typing import Any
 
 import torch
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 
 logger = logging.getLogger(__name__)

@@ -90,7 +90,9 @@ def _resolve_hf_weight_path(model_path: str) -> str:
 
 def _load_hf_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     """Load a HF safetensors/bin checkpoint as a full CPU state dict."""
-    from nemo_automodel.components.checkpoint.checkpointing import _load_hf_checkpoint_preserving_dtype
+    from nemo_automodel.components.checkpoint import (
+        load_hf_checkpoint_preserving_dtype as _load_hf_checkpoint_preserving_dtype,
+    )
 
     resolved_path = _resolve_hf_weight_path(model_path)
     state_dict = _load_hf_checkpoint_preserving_dtype(resolved_path)
@@ -120,7 +122,7 @@ def _copy_qwen_mot_weights_from_und(language_model) -> int:
 
 def _load_qwen_backbone_into_bagel(model, llm_path: str, *, copy_init_moe: bool) -> None:
     """Load vanilla Qwen weights into BAGEL's language model after AM sharding."""
-    from nemo_automodel.components.checkpoint.checkpointing import _load_full_state_dict_into_model
+    from nemo_automodel.components.checkpoint import load_full_state_dict_into_model as _load_full_state_dict_into_model
 
     logger.info("Loading Qwen backbone from %s", llm_path)
     state_dict = _load_hf_state_dict(llm_path)
@@ -140,7 +142,7 @@ def _load_qwen_backbone_into_bagel(model, llm_path: str, *, copy_init_moe: bool)
 
 def _load_siglip_backbone_into_bagel(model, vit_path: str) -> None:
     """Load SigLIP weights into BAGEL's packed-NaViT vision model after AM sharding."""
-    from nemo_automodel.components.checkpoint.checkpointing import _load_full_state_dict_into_model
+    from nemo_automodel.components.checkpoint import load_full_state_dict_into_model as _load_full_state_dict_into_model
 
     logger.info("Loading SigLIP vision backbone from %s", vit_path)
     state_dict = _load_hf_state_dict(vit_path)
@@ -294,7 +296,7 @@ def build_bagel_from_hf_backbones(
         if meta_init:
             from transformers.initialization import no_init_weights
 
-            from nemo_automodel.components.utils.model_utils import init_empty_weights
+            from nemo_automodel.components.utils import init_empty_weights
 
             with no_init_weights(), init_empty_weights():
                 model = BagelForUnifiedMultimodal(bagel_config, backend=backend)

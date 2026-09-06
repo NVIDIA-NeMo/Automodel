@@ -7,9 +7,9 @@ NeMo AutoModel provides GPU-accelerated, `transformers`-compatible training for 
 
 ## Why NeMo AutoModel?
 
-- **Hugging Face native**: Train any model from the Hub with no checkpoint conversion -- day-0 support for new releases.
+- **Hugging Face native**: Train any model from the Hub with no checkpoint conversion. Day-0 support for new releases.
 - **High performance**: Custom CUDA kernels (TransformerEngine, DeepEP, FlexAttn) deliver up to 279 TFLOPs/sec/GPU.
-- **Any scale**: The same recipe runs on 1 GPU or across hundreds of nodes -- parallelism is configuration, not code.
+- **Any scale**: The same recipe runs on 1 GPU or across hundreds of nodes. Parallelism is configuration, not code.
 - **Hackable**: Linear training scripts with YAML config. No hidden trainer abstractions.
 - **Open source**: Apache 2.0 licensed, NVIDIA-supported, and actively maintained.
 
@@ -76,7 +76,7 @@ FP8 training via torchao for reduced memory and higher throughput on supported m
 </Card>
 
 <Card title="Multi-Node with SLURM">
-Copy the checked-in `slurm.sub` or download it from Github (available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/slurm.sub)), edit its `CONFIG` and `#SBATCH` directives for your cluster, and submit it with `sbatch`. See the [Cluster guide](/job-launchers/slurm-cluster).
+Copy the checked-in `slurm.sub` or download it from GitHub (available in the [repository root `slurm.sub` file](https://github.com/NVIDIA-NeMo/Automodel/blob/main/slurm.sub)), edit its `CONFIG` and `#SBATCH` directives for your cluster, and submit it with `sbatch`. See the [Cluster guide](/job-launchers/slurm-cluster).
 </Card>
 
 </Cards>
@@ -126,12 +126,12 @@ Components are modular, self-contained building blocks that recipes assemble:
 | `_peft/` | LoRA and QLoRA implementations |
 | `attention/` | Fused attention, rotary embeddings, FlexAttn |
 | `checkpoint/` | DCP save/load with SafeTensors output |
-| `moe/` | Mixture of Experts routing and DeepEP integration |
+| `moe/` | Mixture-of-Experts routing and DeepEP integration |
 | `optim/` | Optimizers and LR schedulers |
 | `loss/` | Cross-entropy, linear cross-entropy, KD loss |
 | `launcher/` | Interactive, SkyPilot, and NeMo-Run job launch; Slurm uses the root-level `slurm.sub` script |
 
-Each component can be used independently and has no cross-module imports.
+Consumers of the component packages covered by the import contract, including recipes and other components, import symbols from the target component's package API. The package's `__all__` defines that public interface.
 
 ### The `automodel` CLI
 

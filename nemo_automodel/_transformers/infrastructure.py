@@ -39,38 +39,37 @@ from nemo_automodel._transformers.v4_patches.kv_sharing import (
 )
 from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.checkpointing import (
+from nemo_automodel.components.checkpoint import (
     Checkpointer,
     CheckpointingConfig,
-    _maybe_adapt_state_dict_to_hf,
 )
-from nemo_automodel.components.distributed.config import (
+from nemo_automodel.components.checkpoint import (
+    maybe_adapt_state_dict_to_hf as _maybe_adapt_state_dict_to_hf,
+)
+from nemo_automodel.components.distributed import (
+    AutoPipeline,
     DDPConfig,
+    DDPManager,
     DistributedStrategyConfig,
     FSDP2Config,
+    FSDP2Manager,
     MegatronFSDPConfig,
-    MoEParallelizerConfig,
-)
-from nemo_automodel.components.distributed.ddp import DDPManager
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.components.distributed.init_utils import get_world_size_safe
-from nemo_automodel.components.distributed.megatron_fsdp import (
     MegatronFSDPManager,
+    MeshContext,
+    MoEParallelizerConfig,
+    PipelineConfig,
+    get_world_size_safe,
     restore_distributed_param_attrs,
     snapshot_distributed_param_attrs,
 )
-from nemo_automodel.components.distributed.mesh import MeshContext
-from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
-from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
-from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
-from nemo_automodel.components.utils.compile_utils import compile_model
-from nemo_automodel.components.utils.model_utils import (
+from nemo_automodel.components.utils import (
     FreezeConfig,
-    _supports_logits_to_keep,
     apply_parameter_freezing,
+    compile_model,
     count_model_parameters,
     enable_radio_vit_fused_attn,
     freeze_deepseek_v4_indexer_params,
@@ -79,6 +78,9 @@ from nemo_automodel.components.utils.model_utils import (
     init_empty_weights,
     parse_freeze_config,
     print_trainable_parameters,
+)
+from nemo_automodel.components.utils import (
+    supports_logits_to_keep as _supports_logits_to_keep,
 )
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
@@ -836,7 +838,7 @@ def apply_model_infrastructure(
     uses_te_attention = _uses_te_attention(model) if mesh.cp_size > 1 or mesh.tp_size > 1 else False
     uses_thd_only_te_attention = _uses_thd_only_te_attention(model) if uses_te_attention else False
     if mesh.ep_size <= 1 and (mesh.cp_size > 1 or (mesh.tp_size > 1 and uses_thd_only_te_attention)):
-        from nemo_automodel.components.distributed.context_parallel.utils import (
+        from nemo_automodel.components.distributed import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
             attach_te_context_parallel,

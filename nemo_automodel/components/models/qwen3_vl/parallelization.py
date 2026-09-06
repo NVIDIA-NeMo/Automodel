@@ -19,7 +19,7 @@ from __future__ import annotations
 
 def register_qwen3_vl_parallel_strategy() -> None:
     """Register the dense Qwen3-VL FSDP2 strategy once."""
-    from nemo_automodel.components.distributed.parallelizer import (
+    from nemo_automodel.components.distributed import (
         PARALLELIZATION_STRATEGIES,
         DefaultParallelizationStrategy,
         register_parallel_strategy,

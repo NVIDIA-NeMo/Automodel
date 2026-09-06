@@ -187,7 +187,7 @@ def _load_prompts(args: argparse.Namespace) -> list[list[dict[str, Any]]]:
     an optional attribute -- callers that only ever use ``messages_column``
     (the two single-dataset benchmarks' own ``argparse.Namespace``) need not set it.
     """
-    from nemo_automodel.components.datasets.llm.chat_dataset import _load_openai_messages
+    from nemo_automodel.components.datasets import load_openai_messages as _load_openai_messages
 
     dataset = _load_openai_messages(
         args.input_data,

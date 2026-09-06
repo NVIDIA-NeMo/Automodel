@@ -45,43 +45,58 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForMultimodalLM,
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
-from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
-from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
-from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+from nemo_automodel.components.config import parse_args_and_load_config
+from nemo_automodel.components.datasets import stage_vlm_media_for_pp
+from nemo_automodel.components.distributed import (
+    AutoPipeline,
+    ContextParallelSharder,
     CpVisionFrameShardingConfig,
+    DistributedSetup,
+    FirstRankPerNode,
+    FSDP2Config,
+    MagiState,
+    MegatronFSDPConfig,
+    get_sync_ctx,
+    initialize_distributed,
     reset_cp_vision_group,
     set_cp_vision_group,
+    setup_magi,
 )
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
-from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.loggers.mlflow_utils import (
+from nemo_automodel.components.loggers import (
+    MetricsSample,
+    build_metric_logger,
     end_mlflow_active_run_as_killed,
+    setup_logging,
+    suppress_wandb_log_messages,
     to_float_metrics,
 )
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
+from nemo_automodel.components.loss import (
+    FusedLinearCrossEntropy,
+    MaskedCrossEntropy,
+    calculate_loss,
+    calculate_mtp_loss,
+)
+from nemo_automodel.components.loss import get_lm_head_weight as _get_lm_head_weight
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.utils import (
+from nemo_automodel.components.training import (
+    ScopedRNG,
+    StatefulRNG,
     count_tail_padding,
     get_expert_tp_replication_factor,
+    get_final_hidden_states,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils import (
+    VLM_INPUT_KEYS,
+    build_compile_config,
+    filter_forward_kwargs,
+)
+from nemo_automodel.components.utils import (
+    supports_logits_to_keep as _supports_logits_to_keep,
+)
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -357,7 +372,7 @@ def build_dataloader(
     dp_world_size = 1
     cp_size = 1
     if device_mesh is not None:
-        from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+        from nemo_automodel.components.distributed import get_flat_mesh
 
         dp_mesh = get_flat_mesh(device_mesh, "dp")
         dp_rank = dp_mesh.get_local_rank()

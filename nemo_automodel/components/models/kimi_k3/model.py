@@ -33,7 +33,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.distributed.init_utils import get_world_size_safe
+from nemo_automodel.components.distributed import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
@@ -65,7 +65,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.components.utils import squeeze_input_for_thd
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -1982,7 +1982,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         Returns:
             Batch updates carrying the model-owned context-parallel sharder.
         """
-        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+        from nemo_automodel.components.distributed import (  # noqa: PLC0415
             ContextParallelSharder,
             contiguous_local_indices,
         )

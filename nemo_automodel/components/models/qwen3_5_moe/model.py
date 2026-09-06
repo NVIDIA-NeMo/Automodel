@@ -61,17 +61,15 @@ except ModuleNotFoundError:
     Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
     HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
+from nemo_automodel.components.distributed import (
     ContextParallelSharder,
     contiguous_local_indices,
+    cp_vision_frame_sharding_active,
+    maybe_distribute_visual,
     round_robin_local_indices,
     shard_batch_aux_only,
     shard_sequence_for_cp_contiguous,
     shard_sequence_for_cp_round_robin,
-)
-from nemo_automodel.components.distributed.cp_vision_frame_shard import (
-    cp_vision_frame_sharding_active,
-    maybe_distribute_visual,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -95,7 +93,7 @@ from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttentio
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.components.utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_linear_attn import CPAwareGatedDeltaNet
@@ -138,7 +136,7 @@ class _Qwen3_5MoeAttention(Qwen3NextAttention):
             Attention output of shape
             ``[batch, heads, local_sequence, head_dim]``.
         """
-        from nemo_automodel.components.distributed.blockdiag_cp import (
+        from nemo_automodel.components.distributed import (
             cp_blockdiag_sdpa,
             current_blockdiag_cp_state,
         )
@@ -204,7 +202,7 @@ class Qwen3_5MoeBlock(Block):
             )
 
         linear_attn_mask = attention_mask
-        from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+        from nemo_automodel.components.distributed import current_blockdiag_cp_state
 
         if current_blockdiag_cp_state() is not None:
             packed_gdn_metadata = None
@@ -746,7 +744,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         # do not support padding masks, so we null them out.
         if getattr(self, "_cp_enabled", False):
             attention_mask = None
-            from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+            from nemo_automodel.components.distributed import current_blockdiag_cp_state
 
             if current_blockdiag_cp_state() is None:
                 padding_mask = None
@@ -1422,7 +1420,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         if uses_blockdiag_cp and self.backend.attn != "sdpa":
             raise ValueError("Qwen3.5-MoE packed context parallelism requires model.backend.attn='sdpa'")
         if uses_blockdiag_cp:
-            from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
+            from nemo_automodel.components.distributed import make_cp_blockdiag_batch_and_ctx
 
             cp_sharder = ContextParallelSharder(
                 shard_batch=partial(make_cp_blockdiag_batch_and_ctx, shard_primary=False),
@@ -1497,7 +1495,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # splice runs in-forward under an active CP ring context it must suspend the
         # ring dispatcher, or torch's load-balanced ring SDPA all-gathers the vision
         # Q/K/V and rejects the non-causal attention. No-op when CP is inactive.
-        from nemo_automodel.components.distributed.context_parallel.utils import (
+        from nemo_automodel.components.distributed import (
             cp_dispatcher_suspended,  # noqa: PLC0415
         )
 
@@ -1735,7 +1733,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     image_grid_thw=image_grid_thw,
                     video_grid_thw=video_grid_thw,
                 )
-                from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+                from nemo_automodel.components.distributed import current_blockdiag_cp_state
 
                 uses_blockdiag_cp = current_blockdiag_cp_state() is not None
                 if self.mtp is not None and self.training:

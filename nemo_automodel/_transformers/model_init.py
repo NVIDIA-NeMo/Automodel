@@ -58,10 +58,9 @@ from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
 
-import nemo_automodel.components.checkpoint.utils as checkpoint_utils
-import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry, resolve_custom_config_cls
-from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
+from nemo_automodel.components.checkpoint import get_checkpoint_tensor_dtypes
+from nemo_automodel.components.distributed import FirstRankPerNode, get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     has_gated_delta_net_fp32_checkpoint_contract,
     is_gated_delta_net_fp32_param_key,
@@ -72,7 +71,8 @@ from nemo_automodel.components.models.common.utils import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
+from nemo_automodel.components.utils import resolve_trust_remote_code, skip_random_init
+from nemo_automodel.shared.tied_weights import is_tied_word_embeddings
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -406,9 +406,7 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path, process_gr
                 "downloaded path to the `pretrained_model_name_or_path` argument.",
                 num_nodes,
             )
-        # Import via module reference (vs bound name) so unit tests can patch
-        # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
-        with dist_utils.FirstRankPerNode(group=process_group):
+        with FirstRankPerNode(group=process_group):
             snapshot_download(pretrained_model_name_or_path)
 
 
@@ -441,7 +439,7 @@ def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwa
             if isinstance(ref, str) and "." in ref:
                 module_files.add(ref.rsplit(".", 1)[0] + ".py")
     src_py = glob.glob(os.path.join(src_dir, "*.py"))
-    with dist_utils.FirstRankPerNode(group=process_group):
+    with FirstRankPerNode(group=process_group):
         for module_file in module_files:
             try:
                 cached = get_cached_module_file(src_dir, module_file)
@@ -970,7 +968,7 @@ def _init_model_bnb_streaming(
     from transformers.initialization import no_init_weights
     from transformers.integrations.bitsandbytes import replace_with_bnb_linear
 
-    from nemo_automodel.components.utils.model_utils import init_empty_weights
+    from nemo_automodel.components.utils import init_empty_weights
 
     if isinstance(torch_dtype, str) and torch_dtype != "auto":
         torch_dtype = dtype_from_str(torch_dtype)
@@ -1065,9 +1063,7 @@ def _restore_loaded_model_dtype(
         return
 
     try:
-        checkpoint_dtypes = checkpoint_utils._get_checkpoint_tensor_dtypes(
-            pretrained_model_name_or_path, hf_config, load_kwargs
-        )
+        checkpoint_dtypes = get_checkpoint_tensor_dtypes(pretrained_model_name_or_path, hf_config, load_kwargs)
     except Exception as exc:
         logger.warning(
             "Failed to inspect checkpoint tensor dtypes for %s; leaving loaded dtypes unchanged: %s",
@@ -1390,7 +1386,7 @@ def _tie_weights_nemo(model):
     # model is tied. Re-tying an untied model here would alias away the trained
     # ``lm_head.weight`` that ``from_pretrained`` just loaded (see #2941).
     config = getattr(model, "config", None)
-    if config is not None and not checkpoint_utils.is_tied_word_embeddings(model):
+    if config is not None and not is_tied_word_embeddings(model):
         return
 
     def get_module_by_fqn(model, fqn):
