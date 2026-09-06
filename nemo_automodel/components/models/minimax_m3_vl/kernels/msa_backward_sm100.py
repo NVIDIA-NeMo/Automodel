@@ -16,13 +16,18 @@
 
 KV-parallel: each CTA walks task rows (8 queries x 16 main heads = one 128-row
 tile) bucketed by (batch, index_head, key_block), with K/V TMA-resident per
-bucket and Q/dO cp.async-gathered per tile. One mma warp issues all five tcgen05
-GEMMs transposed (S^T, dP^T, dV, dK, dQ^T) over four 128-column TMEM
-allocations; dV/dK accumulate per bucket segment and dQ per tile, all flushed
-with fp32 atomics.
+bucket and Q/dO TMA-loaded per tile (one load warp, 8-row gathers). One mma warp
+issues all five tcgen05 GEMMs transposed (S^T, dP^T, dV, dK, dQ^T) over four
+128-column TMEM allocations; dV/dK accumulate per bucket segment and are flushed
+with fp32 vector atomics, dQ^T per tile with packed 16-bit atomics (fp16 by
+default, ``MSA_M3_DQ_ACCUM=bf16``) into a head-pair-interleaved pool that
+``msa_grad_finalize_sm100`` casts to the bf16 gradient. The task tables come
+from ``msa_task_build_sm100`` (``MSA_M3_TASK_BUILD=torch`` restores the eager
+chain).
 """
 
 import math
+import os
 from typing import Any
 
 import cutlass
@@ -33,19 +38,27 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.common import OperandMajorMode
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_preprocess_sm100 import (
     _run_msa_backward_preprocess,
+    preprocess_executable,
 )
-from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import (
-    _build_backward_tasks,
-    _chunk_map,
-    _MSABackwardSchedule,
-    _select_rows_per_cta,
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_grad_finalize_sm100 import (
+    grad_finalize_executable,
+    run_grad_finalize,
+)
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import _MSABackwardSchedule
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_task_build_sm100 import (
+    DESC_WORDS,
+    build_backward_tasks,
+    compile_task_build,
+    task_build_storage,
 )
 
 BLOCK_SIZE = 128
@@ -54,6 +67,12 @@ TILE_N = 128  # folded (q_slot, head) rows per tile
 HEAD_DIM = 128
 NUM_Q_HEADS = 64
 NUM_KV_HEADS = 4
+# Packed 16-bit dQ atomics: fp16 has 10 mantissa bits but saturates at 65504, bf16 keeps the FP32 range.
+_DQ_ACCUM = os.environ.get("MSA_M3_DQ_ACCUM", "fp16")
+if _DQ_ACCUM not in ("fp16", "bf16"):
+    raise ValueError(f"MSA_M3_DQ_ACCUM must be 'fp16' or 'bf16', got {_DQ_ACCUM!r}")
+_DQ_ACCUM_TORCH_DTYPE = {"fp16": torch.float16, "bf16": torch.bfloat16}[_DQ_ACCUM]
+_DQ_ACCUM_CUTLASS_DTYPE = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}[_DQ_ACCUM]
 NUM_INDEX_HEADS = 4
 MAIN_HEADS_PER_INDEX = NUM_Q_HEADS // NUM_INDEX_HEADS
 QUERY_CHUNK = TILE_N // MAIN_HEADS_PER_INDEX
@@ -61,15 +80,89 @@ QUERY_CHUNK = TILE_N // MAIN_HEADS_PER_INDEX
 _COMPILE_CACHE = {}
 
 
-class _MSABackwardSm100Kernel:
-    arch = 100
+@dsl_user_op
+def _pack_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """Round two FP32 values to one f16x2 word, low logical element in the low half."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.f16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
+
+@dsl_user_op
+def _pack_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """Round two FP32 values to one bf16x2 word, low logical element in the low half."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _l2_policy_evict_last(*, loc=None, ip=None) -> cutlass.Uint64:
+    """64-bit L2 cache policy: keep the whole line set as evict-last (fraction 1.0)."""
+    return cutlass.Uint64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _red_add_16bitx2_hint(kind: str, destination: cute.Pointer, word, policy, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            destination.toint(loc=loc, ip=ip).ir_value(),
+            cutlass.Uint32(word).ir_value(loc=loc, ip=ip),
+            cutlass.Uint64(policy).ir_value(loc=loc, ip=ip),
+        ],
+        f"red.global.add.noftz.L2::cache_hint.{kind} [$0], $1, $2;",
+        "l,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _red_add_f16x2_hint(
+    destination: cute.Pointer, word: cutlass.Uint32, policy: cutlass.Uint64, *, loc=None, ip=None
+) -> None:
+    _red_add_16bitx2_hint("f16x2", destination, word, policy, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _red_add_bf16x2_hint(
+    destination: cute.Pointer, word: cutlass.Uint32, policy: cutlass.Uint64, *, loc=None, ip=None
+) -> None:
+    _red_add_16bitx2_hint("bf16x2", destination, word, policy, loc=loc, ip=ip)
+
+
+class _MSABackwardSm100Kernel:
     def __init__(self) -> None:
         self.main_per_index = MAIN_HEADS_PER_INDEX
         self.query_chunk = QUERY_CHUNK
         self.index_heads_per_kv = NUM_INDEX_HEADS // NUM_KV_HEADS
-        # Always causal for M3: the non-causal predicate branches were folded away.
-        self.causal = True
 
         self.acc_dtype = Float32
         self.q_stage = 2
@@ -77,26 +170,23 @@ class _MSABackwardSm100Kernel:
         # Double buffered: gather publishes tile t+1 while tile t is consumed.
         self.row_stage = 2
 
-        # warp roles (16 warps / 512 threads)
-        self.gather_warp_id = (0, 1, 2, 3)
+        # warp roles (16 warps / 512 threads); warps 0-3 and 15 are idle
         self.compute_warp_id = (4, 5, 6, 7)
         self.reduce_warp_id = (8, 9, 10, 11)
         self.mma_warp_id = 12
         self.load_warp_id = 13
-        self.empty_warp_id = (14, 15)
-        self.num_gather_warps = 4
+        self.scalar_warp_id = 14
         self.num_compute_warps = 4
         self.num_reduce_warps = 4
         self.threads_per_warp = 32
         self.threads_per_cta = 512
 
-        # register budget: 4*32*(48 + R_compute + R_reduce) + 32*192 <= 512*128
-        self.num_regs_gather = 48
+        # register budget: 4*32*(R_compute + R_reduce) + 32*(3*48 + 5*24) <= 512*128
         self.num_regs_compute = 184
-        # Measured: reduce=184 deadlocks in setmaxnreg.inc on B200 though the sum fits.
-        self.num_regs_reduce = 168
+        self.num_regs_reduce = 168  # 184 deadlocks in setmaxnreg.inc on B200 though the budget fits
         self.num_regs_mma = 48
         self.num_regs_load = 48
+        self.num_regs_scalar = 48
         self.num_regs_empty = 24
         # compute processes S^T/dP^T in 32-column chunks to bound registers
         self.compute_chunk_cols = 32
@@ -115,12 +205,6 @@ class _MSABackwardSm100Kernel:
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=self.threads_per_warp * (self.num_compute_warps + self.num_reduce_warps + 1),
-        )
-        self.compute_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=2, num_threads=self.num_compute_warps * self.threads_per_warp
-        )
-        self.gather_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=3, num_threads=self.num_gather_warps * self.threads_per_warp
         )
         self.reduce_sync_barrier = pipeline.NamedBarrier(
             barrier_id=4, num_threads=self.num_reduce_warps * self.threads_per_warp
@@ -161,14 +245,11 @@ class _MSABackwardSm100Kernel:
         mTaskMeta: cute.Tensor,  # [num_tasks, 4] int32
         mTaskQRows: cute.Tensor,  # [num_tasks, 8] int32, compact Q/dO/dQ rows
         mTaskQPos: cute.Tensor,  # [num_tasks, 8] int32, aligned causal positions
-        mdQ: cute.Tensor,  # [1, Hq, T, D] fp32 view of [T, Hq, D]
+        mdQ: cute.Tensor,  # [1, T, Hq/2, D, 2] fp16 head-pair pool: (t, hp, d, e) = dQ[t, 2*hp + e, d]
         mdK: cute.Tensor,  # [1, Hkv, W, D] fp32 view of [W, Hkv, D]
         mdV: cute.Tensor,  # [1, Hkv, W, D] fp32 view of [W, Hkv, D]
-        num_task_rows: Int32,
-        rows_per_cta: Int32,
-        n_full_ctas: Int32,
-        tail_rows: Int32,
-        grid_ctas: Int32,
+        mDesc: cute.Tensor,  # [8] int32 CTA-walk descriptor (msa_task_build_sm100.DESC_*)
+        grid_launch: Int32,  # CTAs launched: >= desc[4]; the surplus ones get an empty interval
         softmax_scale: Float32,
         # Keep the stream last: with --enable-tvm-ffi it is the TVM FFI environment stream.
         stream: cuda.CUstream,
@@ -272,6 +353,33 @@ class _MSABackwardSm100Kernel:
 
         self.tma_copy_KV_bytes = cute.size_in_bytes(dt, sK_layout_single) + cute.size_in_bytes(dt, sV_layout_single)
 
+        # One TMA box = the (16 heads, 64 d) K-major SW128 sub-block of sQ/sdO for one query slot
+        # and d half, so G1-G4's MMA descriptors read it unchanged; a slot with row -1 is out of
+        # bounds and TMA zero-fills it.
+        sQbox_layout = cute.make_composed_layout(
+            sQ_layout.inner, 0, cute.make_layout((MAIN_HEADS_PER_INDEX, 64), stride=(64, 1))
+        )
+        mQ_hdt = cute.make_tensor(
+            mQ.iterator,
+            cute.make_layout(
+                (mQ.shape[1], mQ.shape[3], (mQ.shape[2], mQ.shape[0])),
+                stride=(mQ.stride[1], mQ.stride[3], (mQ.stride[2], mQ.stride[0])),
+            ),
+        )
+        mdO_hdt = cute.make_tensor(
+            mdO.iterator,
+            cute.make_layout(
+                (mdO.shape[1], mdO.shape[3], (mdO.shape[2], mdO.shape[0])),
+                stride=(mdO.stride[1], mdO.stride[3], (mdO.stride[2], mdO.stride[0])),
+            ),
+        )
+        qdo_box_tiler = (MAIN_HEADS_PER_INDEX, 64)
+        tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(tma_load_op, mQ_hdt, sQbox_layout, qdo_box_tiler)
+        tma_atom_dO, tma_tensor_dO = cpasync.make_tiled_tma_atom(tma_load_op, mdO_hdt, sQbox_layout, qdo_box_tiler)
+        sQ_layout_single = cute.select(sQ_layout, mode=[0, 1, 2])
+        sdO_layout_single = cute.select(sdO_layout, mode=[0, 1, 2])
+        self.tma_copy_QdO_bytes = cute.size_in_bytes(dt, sQ_layout_single) + cute.size_in_bytes(dt, sdO_layout_single)
+
         _max_smem_bytes = 232448
 
         @cute.struct
@@ -327,8 +435,10 @@ class _MSABackwardSm100Kernel:
             tma_tensor_K,
             tma_atom_V,
             tma_tensor_V,
-            mQ,
-            mdO,
+            tma_atom_Q,
+            tma_tensor_Q,
+            tma_atom_dO,
+            tma_tensor_dO,
             mLSE,
             mDelta,
             mTaskMeta,
@@ -337,10 +447,7 @@ class _MSABackwardSm100Kernel:
             mdQ,
             mdK,
             mdV,
-            num_task_rows,
-            rows_per_cta,
-            n_full_ctas,
-            tail_rows,
+            mDesc,
             softmax_scale * LOG2_E,
             LOG2_E,
             sK_layout,
@@ -359,7 +466,7 @@ class _MSABackwardSm100Kernel:
             sQRows_layout,
             sQPos_layout,
         ).launch(
-            grid=[grid_ctas, 1, 1],
+            grid=[grid_launch, 1, 1],
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
             smem=self.shared_storage.size_in_bytes(),
@@ -428,8 +535,10 @@ class _MSABackwardSm100Kernel:
         tma_tensor_K: cute.Tensor,
         tma_atom_V: cute.CopyAtom,
         tma_tensor_V: cute.Tensor,
-        mQ: cute.Tensor,
-        mdO: cute.Tensor,
+        tma_atom_Q: cute.CopyAtom,
+        tma_tensor_Q: cute.Tensor,
+        tma_atom_dO: cute.CopyAtom,
+        tma_tensor_dO: cute.Tensor,
         mLSE: cute.Tensor,
         mDelta: cute.Tensor,
         mTaskMeta: cute.Tensor,
@@ -438,10 +547,7 @@ class _MSABackwardSm100Kernel:
         mdQ: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
-        num_task_rows: Int32,
-        rows_per_cta: Int32,
-        n_full_ctas: Int32,
-        tail_rows: Int32,
+        mDesc: cute.Tensor,
         scale_log2e: Float32,
         log2_e: Float32,
         sK_layout: cute.ComposedLayout,
@@ -461,24 +567,33 @@ class _MSABackwardSm100Kernel:
         sQPos_layout: cute.Layout,
     ):
         bidx, _, _ = cute.arch.block_idx()
-        tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if warp_idx == self.load_warp_id:
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
+            cpasync.prefetch_descriptor(tma_atom_Q)
+            cpasync.prefetch_descriptor(tma_atom_dO)
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # CTA -> contiguous task-row interval (final wave split into tail_rows
-        # pieces). A split bucket stays correct: each CTA reloads K/V and atomically
-        # accumulates dK/dV.
+        # CTA -> contiguous task-row interval, read from the descriptor the task build wrote on the
+        # device. A split bucket stays correct: each CTA reloads K/V and atomically accumulates
+        # dK/dV. The grid is an upper bound, so CTAs beyond desc[4] get an empty interval.
+        num_task_rows = cute.arch.make_warp_uniform(mDesc[0])
+        rows_per_cta = cute.arch.make_warp_uniform(mDesc[1])
+        n_full_ctas = cute.arch.make_warp_uniform(mDesc[2])
+        tail_rows = cute.arch.make_warp_uniform(mDesc[3])
+        grid_ctas = cute.arch.make_warp_uniform(mDesc[4])
         row_lo = bidx * rows_per_cta
         row_hi = cutlass.min(row_lo + rows_per_cta, num_task_rows)
         if bidx >= n_full_ctas:
             row_lo = n_full_ctas * rows_per_cta + (bidx - n_full_ctas) * tail_rows
             row_hi = cutlass.min(row_lo + tail_rows, num_task_rows)
+        if bidx >= grid_ctas:
+            row_lo = num_task_rows
+            row_hi = num_task_rows
 
         load_mma_KV_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.load_mma_KV_mbar_ptr.data_ptr(),
@@ -488,21 +603,18 @@ class _MSABackwardSm100Kernel:
             tx_count=self.tma_copy_KV_bytes,
             defer_sync=True,
         )
-        gather_mma_QdO_pipeline = pipeline.PipelineAsyncUmma.create(
+        gather_mma_QdO_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.gather_mma_QdO_mbar_ptr.data_ptr(),
             num_stages=self.gather_mma_QdO_stage,
-            producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_gather_warps * self.threads_per_warp
-            ),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            tx_count=self.tma_copy_QdO_bytes,
             defer_sync=True,
         )
         gather_row_pipeline = pipeline.PipelineAsync.create(
             barrier_storage=storage.gather_row_mbar_ptr.data_ptr(),
             num_stages=self.gather_row_stage,
-            producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_gather_warps * self.threads_per_warp
-            ),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.threads_per_warp),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 (self.num_compute_warps + self.num_reduce_warps) * self.threads_per_warp,
@@ -584,33 +696,37 @@ class _MSABackwardSm100Kernel:
 
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
-            self.load_kv(
+            self.load_kv_qdo(
                 mma_S,
                 mma_dP,
                 tma_atom_K,
                 tma_tensor_K,
                 tma_atom_V,
                 tma_tensor_V,
+                tma_atom_Q,
+                tma_tensor_Q,
+                tma_atom_dO,
+                tma_tensor_dO,
                 sK,
                 sV,
+                sQ,
+                sdO,
                 mTaskMeta,
+                mTaskQRows,
                 row_lo,
                 row_hi,
                 load_mma_KV_pipeline,
+                gather_mma_QdO_pipeline,
             )
 
-        elif warp_idx in self.gather_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_gather)
-            self.gather_rows(
-                mQ,
-                mdO,
+        elif warp_idx == self.scalar_warp_id:
+            cute.arch.setmaxregister_decrease(self.num_regs_scalar)
+            self.gather_scalars(
                 mLSE,
                 mDelta,
                 mTaskMeta,
                 mTaskQRows,
                 mTaskQPos,
-                sQ,
-                sdO,
                 sLSE,
                 sDelta,
                 sQRows,
@@ -618,7 +734,6 @@ class _MSABackwardSm100Kernel:
                 row_lo,
                 row_hi,
                 log2_e,
-                gather_mma_QdO_pipeline,
                 gather_row_pipeline,
             )
 
@@ -639,7 +754,6 @@ class _MSABackwardSm100Kernel:
                 sV,
                 sQ,
                 sdO,
-                sPdS,
                 sdOb,
                 sQb,
                 sKt,
@@ -728,9 +842,9 @@ class _MSABackwardSm100Kernel:
         else:
             cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
-    # ---- load warp: TMA K/V per bucket segment ----
+    # ---- load warp: TMA K/V per bucket segment, TMA Q/dO boxes per task ----
     @cute.jit
-    def load_kv(
+    def load_kv_qdo(
         self,
         mma_S: cute.TiledMma,
         mma_dP: cute.TiledMma,
@@ -738,26 +852,51 @@ class _MSABackwardSm100Kernel:
         tma_tensor_K: cute.Tensor,
         tma_atom_V: cute.CopyAtom,
         tma_tensor_V: cute.Tensor,
+        tma_atom_Q: cute.CopyAtom,
+        tma_tensor_Q: cute.Tensor,
+        tma_atom_dO: cute.CopyAtom,
+        tma_tensor_dO: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
+        sQ: cute.Tensor,
+        sdO: cute.Tensor,
         mTaskMeta: cute.Tensor,
+        mTaskQRows: cute.Tensor,
         row_lo: Int32,
         row_hi: Int32,
         load_mma_KV_pipeline,
+        gather_mma_QdO_pipeline,
     ):
         producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_KV_stage)
+        qdo_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.gather_mma_QdO_stage)
 
         tiler = (TILE_M, TILE_N, HEAD_DIM)
         thr_mma_S = mma_S.get_slice(0)
         thr_mma_dP = mma_dP.get_slice(0)
 
+        # (box = (16 heads, 64 d), slot, d half, stage) views of sQ / sdO -- the bytes G1-G4 read.
+        boxes_layout = cute.make_layout(
+            (MAIN_HEADS_PER_INDEX, 64, self.query_chunk, 2, self.q_stage),
+            stride=(64, 1, MAIN_HEADS_PER_INDEX * 64, 64 * TILE_N, TILE_N * HEAD_DIM),
+        )
+        sQ_boxes = cute.make_tensor(sQ.iterator, boxes_layout)
+        sdO_boxes = cute.make_tensor(sdO.iterator, boxes_layout)
+        gQ = cute.local_tile(tma_tensor_Q, (MAIN_HEADS_PER_INDEX, 64), (None, None, None))
+        gdO = cute.local_tile(tma_tensor_dO, (MAIN_HEADS_PER_INDEX, 64), (None, None, None))
+        tQsQ, tQgQ = cpasync.tma_partition(
+            tma_atom_Q, 0, cute.make_layout(1), cute.group_modes(sQ_boxes, 0, 2), cute.group_modes(gQ, 0, 2)
+        )
+        tOsO, tOgO = cpasync.tma_partition(
+            tma_atom_dO, 0, cute.make_layout(1), cute.group_modes(sdO_boxes, 0, 2), cute.group_modes(gdO, 0, 2)
+        )
+
         row = row_lo
         while row < row_hi:
+            b, index_head, kb, _valid = self._task_fields(mTaskMeta, row)
             is_seg_start = cutlass.Boolean(row == row_lo)
             if row > row_lo:
                 is_seg_start = ~self._same_bucket(mTaskMeta, row, row - 1)
             if is_seg_start:
-                b, index_head, kb, _valid = self._task_fields(mTaskMeta, row)
                 kv_head = index_head // Int32(self.index_heads_per_kv)
                 # (bM, bK, RestM, RestK) at the dynamic (kv_head, batch)
                 gK = cute.local_tile(
@@ -801,21 +940,38 @@ class _MSABackwardSm100Kernel:
                     tma_bar_ptr=tma_barrier,
                 )
                 producer_state.advance()
+
+            # 8 slots x 2 d halves x 2 tensors, one transaction count; a row -1 slot lands as zeros.
+            gather_mma_QdO_pipeline.producer_acquire(qdo_state)
+            qdo_barrier = gather_mma_QdO_pipeline.producer_get_barrier(qdo_state)
+            stage = qdo_state.index
+            for slot in cutlass.range_constexpr(self.query_chunk):
+                q_row = mTaskQRows[row, slot]
+                for half in cutlass.range_constexpr(2):
+                    cute.copy(
+                        tma_atom_Q,
+                        tQgQ[None, index_head, half, (q_row, b)],
+                        tQsQ[None, slot, half, stage],
+                        tma_bar_ptr=qdo_barrier,
+                    )
+                    cute.copy(
+                        tma_atom_dO,
+                        tOgO[None, index_head, half, (q_row, b)],
+                        tOsO[None, slot, half, stage],
+                        tma_bar_ptr=qdo_barrier,
+                    )
+            qdo_state.advance()
             row += 1
 
-    # ---- gather warps: Q/dO row gather + per-row scalars, per tile ----
+    # ---- scalar warp: per-row LSE / Delta / q rows / q positions, per tile ----
     @cute.jit
-    def gather_rows(
+    def gather_scalars(
         self,
-        mQ: cute.Tensor,
-        mdO: cute.Tensor,
         mLSE: cute.Tensor,
         mDelta: cute.Tensor,
         mTaskMeta: cute.Tensor,
         mTaskQRows: cute.Tensor,
         mTaskQPos: cute.Tensor,
-        sQ: cute.Tensor,
-        sdO: cute.Tensor,
         sLSE: cute.Tensor,
         sDelta: cute.Tensor,
         sQRows: cute.Tensor,
@@ -823,102 +979,45 @@ class _MSABackwardSm100Kernel:
         row_lo: Int32,
         row_hi: Int32,
         log2_e: Float32,
-        gather_mma_QdO_pipeline,
         gather_row_pipeline,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        local_tidx = tidx % self.threads_per_warp
-        local_warp = tidx // self.threads_per_warp  # 0..3 (gather warps are 0..3)
-
-        async_copy_atom = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.element_dtype,
-            num_bits_per_copy=128,
-        )
-        thr_layout = cute.make_layout((16,))
-        val_layout = cute.make_layout((8,))
-        async_tiled_copy = cute.make_tiled_copy_tv(async_copy_atom, thr_layout, val_layout)
-        async_thr_copy = async_tiled_copy.get_slice(local_tidx % 16)
-
-        qdo_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.gather_mma_QdO_stage)
+        lane = tidx % self.threads_per_warp
+        # lane -> (query slot, 4-head group): 8 slots x 4 groups x 4 heads = 128 folded rows
+        slot = lane // 4
+        part = lane - slot * 4
         row_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.gather_row_stage)
 
         mpp = Int32(self.main_per_index)
         row = row_lo
         while row < row_hi:
             b, index_head, _kb, valid = self._task_fields(mTaskMeta, row)
-
-            # Lane l < 2 holds the compact row for this warp's q slot.
-            qrow_reg = Int32(0)
-            if local_tidx < Int32(self.query_chunk // self.num_gather_warps):
-                qrow_reg = mTaskQRows[row, local_warp * Int32(self.query_chunk // self.num_gather_warps) + local_tidx]
-
-            gather_mma_QdO_pipeline.producer_acquire(qdo_state)
             gather_row_pipeline.producer_acquire(row_state)
-
-            sQ_slice = sQ[(None, None), 0, (None, None), qdo_state.index % self.q_stage]
-            sQ_slice = cute.composition(sQ_slice, cute.make_layout((TILE_N, HEAD_DIM)))
-            sdO_slice = sdO[(None, None), 0, (None, None), qdo_state.index % self.do_stage]
-            sdO_slice = cute.composition(sdO_slice, cute.make_layout((TILE_N, HEAD_DIM)))
-
-            # each warp owns rows [32*warp, +32); lanes 0-15 / 16-31 take two rows
-            for i in cutlass.range_constexpr(16):
-                r = local_warp * 32 + i * 2 + local_tidx // 16
-                q_slot = Int32(r) // mpp
-                head_off = Int32(r) - q_slot * mpp
-                slot_in_warp = q_slot - local_warp * Int32(self.query_chunk // self.num_gather_warps)
-                q_row = cute.arch.shuffle_sync(qrow_reg, slot_in_warp)
-                head = index_head * mpp + head_off
-
-                tile_sQ = sQ_slice[r, None]
-                tile_sdO = sdO_slice[r, None]
-                if q_slot < valid:
-                    gQ_row = mQ[b, head, q_row, None]
-                    tQs = async_thr_copy.partition_D(tile_sQ)
-                    tQg = async_thr_copy.partition_S(gQ_row)
-                    cute.copy(async_copy_atom, tQg, tQs)
-                    gdO_row = mdO[b, head, q_row, None]
-                    tOs = async_thr_copy.partition_D(tile_sdO)
-                    tOg = async_thr_copy.partition_S(gdO_row)
-                    cute.copy(async_copy_atom, tOg, tOs)
-                else:
-                    zfill = cute.flat_divide(tile_sQ, (8,))
-                    zfill[None, local_tidx % 16].fill(0.0)
-                    zfillo = cute.flat_divide(tile_sdO, (8,))
-                    zfillo[None, local_tidx % 16].fill(0.0)
-
-            # per-row scalars: the row pipeline's mbarrier release orders them
-            r = local_warp * 32 + local_tidx
-            q_slot = Int32(r) // mpp
-            head_off = Int32(r) - q_slot * mpp
-            # sLSE holds the prefolded -lse*log2e; invalid slots carry -inf, so
-            # exp2 is exactly +0 there and P/dS vanish without a validity compare.
-            if q_slot < valid:
-                q_row2 = mTaskQRows[row, q_slot]
-                head2 = index_head * mpp + head_off
-                sLSE[r, row_state.index] = Float32(0.0) - mLSE[b, head2, q_row2] * log2_e
-                sDelta[r, row_state.index] = mDelta[b, head2, q_row2]
+            ridx = row_state.index
+            # sLSE holds -lse*log2e; invalid slots carry -inf, so exp2 is +0 and P/dS vanish there.
+            if slot < valid:
+                q_row = mTaskQRows[row, slot]
+                for k in cutlass.range_constexpr(4):
+                    head = index_head * mpp + Int32(part * 4 + k)
+                    r = slot * mpp + Int32(part * 4 + k)
+                    sLSE[r, ridx] = Float32(0.0) - mLSE[b, head, q_row] * log2_e
+                    sDelta[r, ridx] = mDelta[b, head, q_row]
             else:
-                sLSE[r, row_state.index] = Float32(float("-inf"))
-                sDelta[r, row_state.index] = Float32(0.0)
-            if local_warp == 0 and local_tidx < Int32(self.query_chunk):
+                for k in cutlass.range_constexpr(4):
+                    r = slot * mpp + Int32(part * 4 + k)
+                    sLSE[r, ridx] = Float32(float("-inf"))
+                    sDelta[r, ridx] = Float32(0.0)
+            if lane < Int32(self.query_chunk):
                 qrow = Int32(-1)
                 qpos = Int32(-1)
-                if local_tidx < valid:
-                    qrow = mTaskQRows[row, local_tidx]
-                    qpos = mTaskQPos[row, local_tidx]
-                sQRows[local_tidx, row_state.index] = qrow
-                sQPos[local_tidx, row_state.index] = qpos
-
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
+                if lane < valid:
+                    qrow = mTaskQRows[row, lane]
+                    qpos = mTaskQPos[row, lane]
+                sQRows[lane, ridx] = qrow
+                sQPos[lane, ridx] = qpos
             cute.arch.fence_view_async_shared()
-            self.gather_sync_barrier.arrive_and_wait()
-            gather_mma_QdO_pipeline.producer_commit(qdo_state)
-            qdo_state.advance()
             gather_row_pipeline.producer_commit(row_state)
             row_state.advance()
-
             row += 1
 
     # ---- mma warp ----
@@ -934,7 +1033,6 @@ class _MSABackwardSm100Kernel:
         sV: cute.Tensor,
         sQ: cute.Tensor,
         sdO: cute.Tensor,
-        sPdS: cute.Tensor,
         sdOb: cute.Tensor,
         sQb: cute.Tensor,
         sKt: cute.Tensor,
@@ -961,9 +1059,8 @@ class _MSABackwardSm100Kernel:
             mma_reduce_dKV_pipeline,
         ) = pipelines
 
-        # TMEM-resident A operands: P^T over the S columns, dS^T over the dP ones.
-        # The column offset must be applied to the *fragment* iterator in bf16 units:
-        # a recast_ptr(base + off) view silently drops it in the TS-gemm lowering.
+        # TMEM-resident A operands: P^T over the S columns, dS^T over the dP ones. Apply the column
+        # offset to the *fragment* iterator in bf16 units: a recast_ptr(base + off) view drops it.
         tP_base = cute.make_tensor(tmem_ptr_base, tP_layout.outer)
         col_units = self.acc_dtype.width // self.element_dtype.width
 
@@ -993,10 +1090,9 @@ class _MSABackwardSm100Kernel:
         chunk_rel_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.compute_mma_chunk_stage)
         dkv_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.mma_reduce_dKV_stage)
 
-        # held-slot protocol for TMEM cols [128,256): dP(t) is committed after G2,
-        # then re-acquired (on the compute warps' release) before dQ overwrites it.
+        # held slot for TMEM cols [128,256): dP(t) commits after G2, re-acquired before dQ takes it.
         mma_compute_dP_pipeline.producer_acquire(dp_state)
-        # held-slot for TMEM cols [0,128): S(t), then S(t+1).
+        # held slot for TMEM cols [0,128): S(t), then S(t+1).
         mma_compute_S_pipeline.producer_acquire(s_state)
 
         is_first_tile = True
@@ -1015,7 +1111,7 @@ class _MSABackwardSm100Kernel:
                     mma_S,
                     tStS,
                     tSrK[None, None, kk, kv_state.index],
-                    tSrQ[None, None, kk, qdo_state.index % self.q_stage],
+                    tSrQ[None, None, kk, qdo_state.index],
                     tStS,
                 )
                 mma_S.set(tcgen05.Field.ACCUMULATE, True)
@@ -1032,7 +1128,7 @@ class _MSABackwardSm100Kernel:
                     mma_dP,
                     tdPtdP,
                     tdPrV[None, None, kk, kv_state.index],
-                    tdPrdO[None, None, kk, qdo_state.index % self.do_stage],
+                    tdPrdO[None, None, kk, qdo_state.index],
                     tdPtdP,
                 )
                 mma_dP.set(tcgen05.Field.ACCUMULATE, True)
@@ -1040,8 +1136,7 @@ class _MSABackwardSm100Kernel:
             dp_state.advance()
 
             if seg_first:
-                # G1/G2 never touch the dV/dK columns, so the acquire sits here and
-                # the flush of segment s-1 overlaps segment s.
+                # G1/G2 never touch the dV/dK columns, so segment s-1's flush overlaps segment s.
                 mma_reduce_dKV_pipeline.producer_acquire(dkv_state)
 
             # ---- G3/G4 per chunk: dV += P^T[:,c].dO[c,:], dK += dS^T[:,c].Q[c,:] ----
@@ -1060,7 +1155,7 @@ class _MSABackwardSm100Kernel:
                         mma_dV,
                         tdVtdV,
                         tdVrP[None, None, kk],
-                        tdVrdOb[None, None, kk, qdo_state.index % self.do_stage],
+                        tdVrdOb[None, None, kk, qdo_state.index],
                         tdVtdV,
                     )
                     mma_dV.set(tcgen05.Field.ACCUMULATE, True)
@@ -1070,7 +1165,7 @@ class _MSABackwardSm100Kernel:
                         mma_dK,
                         tdKtdK,
                         tdKrdS[None, None, kk],
-                        tdKrQb[None, None, kk, qdo_state.index % self.q_stage],
+                        tdKrQb[None, None, kk, qdo_state.index],
                         tdKtdK,
                     )
                     mma_dK.set(tcgen05.Field.ACCUMULATE, True)
@@ -1080,8 +1175,7 @@ class _MSABackwardSm100Kernel:
             qdo_state.advance()
 
             # ---- G5: dQ^T = K^T . dS^T (cols 128..256, aliases dP^T/dS^T) ----
-            # dP and the previous dQ generation are released; G4's dS^T reads
-            # precede G5 in the tensor core's issue order.
+            # dP and the previous dQ are released; G4's dS^T reads precede G5 in issue order.
             mma_compute_dP_pipeline.producer_acquire(dp_state)
             mma_reduce_dQ_pipeline.producer_acquire(dq_state)
             mma_dQ.set(tcgen05.Field.ACCUMULATE, False)
@@ -1097,8 +1191,7 @@ class _MSABackwardSm100Kernel:
             mma_reduce_dQ_pipeline.producer_commit(dq_state)
             dq_state.advance()
 
-            # release every chunk stage: the tcgen05.commit fires once G5 has drained,
-            # so compute may only then overwrite sPdS / the packed TMEM columns.
+            # release every chunk stage: tcgen05.commit fires once G5 drained, freeing sPdS / TMEM.
             for st in cutlass.range_constexpr(len(self.chunk_stage_starts)):
                 compute_mma_chunk_pipeline.consumer_release(chunk_rel_state)
                 chunk_rel_state.advance()
@@ -1150,7 +1243,7 @@ class _MSABackwardSm100Kernel:
         ) = pipelines
 
         tidx, _, _ = cute.arch.thread_idx()
-        dp_idx = (tidx - self.compute_warp_id[0] * self.threads_per_warp) % 128
+        dp_idx = tidx - self.compute_warp_id[0] * self.threads_per_warp
 
         s_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_S_stage)
         dp_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_dP_stage)
@@ -1187,8 +1280,7 @@ class _MSABackwardSm100Kernel:
             tTR_tS.append(thr_t2r.partition_S(tSc[(None, None), 0, 0]))
             tTR_tdP.append(thr_t2r.partition_S(tdPc[(None, None), 0, 0]))
 
-        # P^T / dS^T publication: chunk c's 32 bf16 values pack into the 16 f32-typed
-        # columns [c*HALF, (c+1)*HALF) that this thread has already drained.
+        # P^T / dS^T publication: chunk c's 32 bf16 values pack into the 16 f32 columns it drained.
         p_chunk_shape = (cute.make_layout((TILE_M, HALF)), 1, 1)
         tP_chunk_layout = cute.composition(tStS, p_chunk_shape).layout
         tmem_store_atom = cute.make_copy_atom(tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(HALF)), self.acc_dtype)
@@ -1238,15 +1330,12 @@ class _MSABackwardSm100Kernel:
             for c in cutlass.range_constexpr(NCHUNK):
                 rLse = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
                 rDelta = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
+                rQpos = cute.make_rmem_tensor(tTR_cS.shape, cutlass.Int32)
                 for i in cutlass.range_constexpr(cute.size(tTR_cS)):
                     n_col = Int32(c * CHUNK) + tTR_cS[i][1]
                     rLse[i] = sLSE[n_col, ridx]
                     rDelta[i] = sDelta[n_col, ridx]
-                if cutlass.const_expr(self.causal):
-                    rQpos = cute.make_rmem_tensor(tTR_cS.shape, cutlass.Int32)
-                    for i in cutlass.range_constexpr(cute.size(tTR_cS)):
-                        n_col = Int32(c * CHUNK) + tTR_cS[i][1]
-                        rQpos[i] = sQPos[n_col // mpp, ridx]
+                    rQpos[i] = sQPos[n_col // mpp, ridx]
 
                 # ---- S / dP chunk -> registers (chunk 0 defers its dP load) ----
                 tTR_rS = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
@@ -1265,12 +1354,8 @@ class _MSABackwardSm100Kernel:
                 # ---- S chunk -> P chunk (branchless, vectorized) ----
                 # invalid slots carry lse = -inf (exp2 -> +0); causal masks qpos = -1
                 v = tTR_rS.load() * scale_log2e + rLse.load()
-                if cutlass.const_expr(self.causal):
-                    cond = rQpos.load() >= key_pos_thr
-                    p = cute.where(cond, cute.math.exp2(v, fastmath=True), Float32(0.0))
-                else:
-                    p = cute.math.exp2(v, fastmath=True)
-                tTR_rS.store(p)
+                cond = rQpos.load() >= key_pos_thr
+                tTR_rS.store(cute.where(cond, cute.math.exp2(v, fastmath=True), Float32(0.0)))
                 # P^T chunk -> TMEM (A operand of G3)
                 rP_f16 = self.quantize(tTR_rS, 4)
                 rP_words = cute.make_rmem_tensor(tRT_cP.shape, self.acc_dtype)
@@ -1336,7 +1421,7 @@ class _MSABackwardSm100Kernel:
         ) = pipelines
 
         tidx, _, _ = cute.arch.thread_idx()
-        dp_idx = (tidx - self.reduce_warp_id[0] * self.threads_per_warp) % 128
+        dp_idx = tidx - self.reduce_warp_id[0] * self.threads_per_warp
 
         dq_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_reduce_dQ_stage)
         dkv_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_reduce_dKV_stage)
@@ -1363,8 +1448,7 @@ class _MSABackwardSm100Kernel:
             b, index_head, kb, valid = self._task_fields(mTaskMeta, row)
             gather_row_pipeline.consumer_wait(row_state)
             ridx = row_state.index
-            # Release the row slot before the dQ atomics below (measured: holding it
-            # through red_atomic throttled gth_acq by ~1.5 us/tile).
+            # Release the row slot before the dQ atomics: holding it across them stalls the gather.
             rQRow = cute.make_rmem_tensor((self.query_chunk,), cutlass.Int32)
             for qs in cutlass.range_constexpr(self.query_chunk):
                 rQRow[qs] = sQRows[qs, ridx]
@@ -1379,19 +1463,34 @@ class _MSABackwardSm100Kernel:
             self.t2r_dQ_done_barrier.arrive()
             mma_reduce_dQ_pipeline.consumer_release(dq_state)
             dq_state.advance()
-            # coalesced scatter: the 128 dp lanes span head_dim -> 128B RED runs.
-            # Keep the per-element crd2idx; hoisting a base pointer out of the loop
-            # grew instruction count and stack usage, as ptxas already optimizes it.
-            for i in cutlass.range_constexpr(cute.size(tTR_r)):
-                n_col = tTR_cAcc[i][1]
-                d_row = tTR_cAcc[i][0]
-                q_slot = n_col // mpp
-                head_off = n_col - q_slot * mpp
+            # Packed 16-bit atomics into the (T, Hq/2, D, 2) dQ pool: column pair (2j, 2j+1) of this
+            # lane = heads (2m, 2m+1) of one query slot at this lane's d, adjacent in the pool -> one
+            # 4-byte RED per pair, no lane exchange. The L2 evict-last hint keeps the pool lines
+            # resident for the read-modify-writes of later tasks.
+            policy = _l2_policy_evict_last()
+            pk = cute.make_rmem_tensor((8,), cutlass.Uint32)
+            PAIRS_PER_SLOT = self.main_per_index // 2
+            hp0 = index_head * Int32(PAIRS_PER_SLOT)
+            d_row = tTR_cAcc[0][0]
+            for g in cutlass.range_constexpr(cute.size(tTR_r) // (2 * PAIRS_PER_SLOT)):
+                for pp in cutlass.range_constexpr(PAIRS_PER_SLOT):
+                    e = 2 * (g * PAIRS_PER_SLOT + pp)
+                    if cutlass.const_expr(mdQ.element_type == cutlass.Float16):
+                        pk[pp] = _pack_f16x2(tTR_r[e], tTR_r[e + 1])
+                    else:
+                        pk[pp] = _pack_bf16x2(tTR_r[e], tTR_r[e + 1])
+                n_col0 = tTR_cAcc[2 * g * PAIRS_PER_SLOT][1]
+                q_slot = n_col0 // mpp
                 if q_slot < valid:
                     q_row = rQRow[q_slot]
-                    head = index_head * mpp + head_off
-                    dq_ptr = mdQ.iterator + cute.crd2idx((b, head, q_row, d_row), mdQ.layout)
-                    cute.arch.atomic_add(dq_ptr.llvm_ptr, tTR_r[i])
+                    base = mdQ.iterator + cute.crd2idx((b, q_row, hp0, d_row, Int32(0)), mdQ.layout)
+                    for pp in cutlass.range_constexpr(PAIRS_PER_SLOT):
+                        hoff = tTR_cAcc[2 * (g * PAIRS_PER_SLOT + pp)][1] - n_col0
+                        dq_ptr = base + (hoff // 2) * Int32(2 * HEAD_DIM)
+                        if cutlass.const_expr(mdQ.element_type == cutlass.Float16):
+                            _red_add_f16x2_hint(dq_ptr, pk[pp], policy)
+                        else:
+                            _red_add_bf16x2_hint(dq_ptr, pk[pp], policy)
 
             # ---- segment flush: dV^T / dK^T ----
             is_seg_end = cutlass.Boolean(row + 1 >= row_hi)
@@ -1402,10 +1501,9 @@ class _MSABackwardSm100Kernel:
                 key_base = kb * Int32(BLOCK_SIZE)
                 mma_reduce_dKV_pipeline.consumer_wait(dkv_state)
 
-                # dV / dK land as (M = key lanes, N = d columns). The RED path is
-                # sector-bound, so each 4x4 block is transposed inside the quad first:
-                # one warp instruction then writes 8 rows x 64 B = 16 full sectors
-                # instead of 32 half-filled ones.
+                # dV / dK land as (M = key lanes, N = d columns). The RED path is sector-bound,
+                # so each 4x4 block is transposed inside the quad first: one warp instruction
+                # then writes 8 rows x 64 B = 16 full sectors instead of 32 half-filled ones.
                 row_in_tile = tTR_cAcc[0][0]
                 q4 = row_in_tile % 4
                 quad_row = key_base + row_in_tile - q4
@@ -1469,9 +1567,8 @@ class _MSABackwardSm100Kernel:
     def _quad_transpose4(self, blk, c0, c1):
         """In-place 4x4 transpose of four F32x4 fragments across a quad's 4 lanes.
 
-        Lane q holds element (row q, block k) before and (row k, block q) after.
-        ``c0``/``c1`` are 4-wide lane-bit vectors, so each butterfly stage's slot
-        choice lowers to FSEL rather than a branch.
+        Lane q holds element (row q, block k) before and (row k, block q) after. ``c0``/``c1``
+        are 4-wide lane-bit vectors, so each stage's slot choice lowers to FSEL, not a branch.
         """
         tmp = cute.make_rmem_tensor((4,), self.acc_dtype)
         recv = cute.make_rmem_tensor((4,), self.acc_dtype)
@@ -1510,53 +1607,29 @@ def _validate_inputs(
     grad_out: torch.Tensor,
     lse: torch.Tensor,
     out: torch.Tensor,
-    task_meta: torch.Tensor,
-    task_qrows: torch.Tensor,
-    task_qpos: torch.Tensor,
     softmax_scale: float,
 ) -> None:
     """Check device, dtype, 16-byte alignment, and THD shapes before launch."""
-    tensors = (q, k_aligned, v_aligned, grad_out, lse, out, task_meta, task_qrows, task_qpos)
+    names = ("q", "k_aligned", "v_aligned", "grad_out", "lse", "out")
+    tensors = (q, k_aligned, v_aligned, grad_out, lse, out)
     if q.device.type != "cuda":
         raise ValueError("MiniMax M3 MSA backward requires CUDA tensors")
     if any(tensor.device != q.device for tensor in tensors):
         raise ValueError("all MiniMax M3 MSA backward tensors must be on one CUDA device")
     if torch.cuda.get_device_capability(q.device) != (10, 0):
         raise NotImplementedError("MiniMax M3 MSA backward requires an SM100 CUDA device")
-    misaligned = [
-        name
-        for name, tensor in zip(
-            ("q", "k_aligned", "v_aligned", "grad_out", "lse", "out", "task_meta", "task_qrows", "task_qpos"),
-            tensors,
-            strict=True,
-        )
-        if tensor.data_ptr() % 16 != 0
-    ]
+    misaligned = [name for name, tensor in zip(names, tensors, strict=True) if tensor.data_ptr() % 16 != 0]
     if misaligned:
         raise ValueError(
             "MiniMax M3 MSA backward requires 16-byte-aligned storage for its compiled tensor ABI; "
             f"misaligned tensors={misaligned}."
         )
 
-    if q.dtype != torch.bfloat16:
-        raise TypeError(f"q must be BF16, got {q.dtype}")
-    for name, tensor in (
-        ("k_aligned", k_aligned),
-        ("v_aligned", v_aligned),
-        ("grad_out", grad_out),
-        ("out", out),
-    ):
-        if tensor.dtype != torch.bfloat16:
+    for name, tensor in zip(names, tensors, strict=True):
+        if name != "lse" and tensor.dtype != torch.bfloat16:
             raise TypeError(f"{name} must be BF16, got {tensor.dtype}")
     if lse.dtype != torch.float32:
         raise TypeError(f"lse must be FP32, got {lse.dtype}")
-    for name, tensor in (
-        ("task_meta", task_meta),
-        ("task_qrows", task_qrows),
-        ("task_qpos", task_qpos),
-    ):
-        if tensor.dtype != torch.int32:
-            raise TypeError(f"{name} must be int32, got {tensor.dtype}")
 
     if q.ndim != 3 or q.shape[1] != NUM_Q_HEADS or q.shape[2] != HEAD_DIM:
         raise ValueError(f"q must have shape [T, {NUM_Q_HEADS}, {HEAD_DIM}], got {tuple(q.shape)}")
@@ -1573,14 +1646,6 @@ def _validate_inputs(
         raise ValueError("grad_out and out must have the same shape as q")
     if lse.shape != q.shape[:2]:
         raise ValueError(f"lse must have shape {tuple(q.shape[:2])}, got {tuple(lse.shape)}")
-
-    if task_meta.ndim != 2 or task_meta.shape[1] != 4:
-        raise ValueError(f"task_meta must have shape [num_tasks, 4], got {tuple(task_meta.shape)}")
-    expected_task_shape = (task_meta.shape[0], QUERY_CHUNK)
-    if task_qrows.shape != expected_task_shape:
-        raise ValueError(f"task_qrows must have shape {expected_task_shape}, got {tuple(task_qrows.shape)}")
-    if task_qpos.shape != expected_task_shape:
-        raise ValueError(f"task_qpos must have shape {expected_task_shape}, got {tuple(task_qpos.shape)}")
     if not math.isfinite(softmax_scale) or softmax_scale <= 0.0:
         raise ValueError(f"softmax_scale must be finite and positive, got {softmax_scale}")
 
@@ -1588,10 +1653,9 @@ def _validate_inputs(
 def _compile_backward() -> Any:
     """Compile the backward once with dynamic token, workspace, and task counts.
 
-    The fake tensors describe the head-major views ``_run_msa_backward`` builds, so
-    every stride except the size-1 batch stride is static; ``stride_order[i]`` is the
-    rank of mode ``i``, ``0`` innermost. Returns an executable taking the kernel's
-    positional arguments minus the trailing stream.
+    The fake tensors describe the head-major views ``_run_msa_backward`` builds;
+    ``stride_order[i]`` is the rank of mode ``i``, ``0`` innermost. Returns an executable
+    taking the kernel's positional arguments minus the trailing stream.
     """
     num_tokens = cute.sym_int32(symbol="num_tokens")
     workspace_rows = cute.sym_int32(divisibility=BLOCK_SIZE, symbol="workspace_rows")
@@ -1618,18 +1682,57 @@ def _compile_backward() -> Any:
         tasks(4),
         tasks(QUERY_CHUNK),
         tasks(QUERY_CHUNK),
-        rows_by_head(Float32, NUM_Q_HEADS, num_tokens),
+        make_fake_compact_tensor(
+            _DQ_ACCUM_CUTLASS_DTYPE,
+            (1, num_tokens, NUM_Q_HEADS // 2, HEAD_DIM, 2),
+            stride_order=(4, 3, 2, 1, 0),
+            assumed_align=16,
+        ),  # 16-bit dQ pool
         rows_by_head(Float32, NUM_KV_HEADS, workspace_rows),
         rows_by_head(Float32, NUM_KV_HEADS, workspace_rows),
-        Int32(1),
-        Int32(1),
-        Int32(1),
-        Int32(1),
+        make_fake_compact_tensor(Int32, (DESC_WORDS,), stride_order=(0,), assumed_align=16),  # CTA-walk descriptor
         Int32(1),
         Float32(1.0),
         make_fake_stream(use_tvm_ffi_env_stream=True),
     )
     return cute.compile(_MSABackwardSm100Kernel(), *fake_args, options="--enable-tvm-ffi")
+
+
+def _round_up(n: int, m: int = 256) -> int:
+    return (n + m - 1) // m * m
+
+
+def _alloc_call_buffers(q_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor, schedule: _MSABackwardSchedule):
+    """One internal allocation per call (freed when the plan dies), carved into: the 16-bit dQ
+    head-pair pool ``[T, Hq/2, D, 2]`` + the FP32 dK/dV pool (cleared by ``zero()``), the FP32
+    ``delta [T, 64]``, and the int32 scratch / tables of the fused task build. One block of one
+    size per call keeps the caching allocator from splitting and re-growing."""
+    num_dk, num_dv = k_c.numel(), v_c.numel()
+    dq_bytes = q_c.numel() * _DQ_ACCUM_TORCH_DTYPE.itemsize  # multiple of 256: keeps the FP32 pool 16-byte aligned
+    pool_bytes = dq_bytes + (num_dk + num_dv) * 4
+    delta_off = _round_up(pool_bytes)
+    delta_bytes = q_c.shape[0] * NUM_Q_HEADS * 4
+    scratch_off = _round_up(delta_off + delta_bytes)
+    scratch_words, table_words = task_build_storage(schedule, int(q_c.shape[0]), int(k_c.shape[0]))
+    tables_off = _round_up(scratch_off + scratch_words * 4)
+    total = _round_up(tables_off + table_words * 4)
+    raw = torch.empty(total, dtype=torch.uint8, device=q_c.device)
+    pool = raw[:pool_bytes]
+    dq_pool = pool[:dq_bytes].view(_DQ_ACCUM_TORCH_DTYPE).view(q_c.shape[0], NUM_Q_HEADS // 2, HEAD_DIM, 2)
+    grad_pool = pool[dq_bytes:].view(torch.float32)
+    delta = raw[delta_off : delta_off + delta_bytes].view(torch.float32).view(q_c.shape[0], NUM_Q_HEADS)
+    scratch = raw[scratch_off : scratch_off + scratch_words * 4].view(torch.int32) if scratch_words else None
+    tables = raw[tables_off : tables_off + table_words * 4].view(torch.int32) if table_words else None
+    return (
+        pool,
+        dq_pool,
+        grad_pool,
+        grad_pool[:num_dk].view(k_c.shape),
+        grad_pool[num_dk:].view(v_c.shape),
+        delta,
+        scratch,
+        tables,
+    )
 
 
 def _run_msa_backward(
@@ -1648,84 +1751,171 @@ def _run_msa_backward(
     ``q``/``grad_out``/``out`` are BF16 ``[T, 64, 128]`` (compact tokens, heads,
     head_dim), ``lse`` is FP32 ``[T, 64]``, and ``k_aligned``/``v_aligned`` are BF16
     ``[W, 4, 128]`` with ``W`` a multiple of 128. Every kernel operand must have
-    contiguous, 16-byte-aligned storage. Returns BF16
-    ``(dq, dk_aligned, dv_aligned)`` in those same layouts, zero outside the support.
-    The kernel's head-major operands are strided views built here, so no transposed
-    copies are made, and one executable serves every ``T``, ``W``, and task count.
+    contiguous, 16-byte-aligned storage. Returns BF16 ``(dq, dk_aligned, dv_aligned)`` in
+    those same layouts, zero outside the support. The kernel's head-major operands are
+    strided views built here, so no transposed copies are made.
+
+    The Delta preprocess and the pool clear are issued first (they depend only on the
+    inputs) so the GPU is busy while the host issues the task build.
     """
-    task_meta, task_qrows, task_qpos = _build_backward_tasks(schedule)
-    _validate_inputs(
-        q,
-        k_aligned,
-        v_aligned,
-        grad_out,
-        lse,
-        out,
-        task_meta,
-        task_qrows,
-        task_qpos,
+    plan = _plan_msa_backward(
+        q, k_aligned, v_aligned, grad_out, lse, out, schedule, softmax_scale=softmax_scale, build_tasks_now=False
+    )
+    plan.preprocess()
+    plan.zero()
+    plan.build_tasks()
+    plan.launch_main()
+    plan.cast()
+    return plan.outputs()
+
+
+class _MSABackwardPlan:
+    """One backward call minus its launches: validated inputs, one internal buffer (dQ/dK/dV
+    pools, delta, task scratch and tables) and the compiled executables (nothing compiles in the
+    methods). ``zero`` and ``build_tasks`` must both run before ``launch_main``; ``build_tasks``
+    sets ``tables``, whose ``desc`` carries the exact task count and the CTA walk that
+    ``device_counts()`` reads back. A schedule without tasks yields zero gradients through the
+    same launches. Methods are bound on access, so the plan holds no reference cycle and its
+    buffers return to the caching allocator as soon as it is dropped."""
+
+    def __init__(
+        self,
+        *,
+        exe,
+        args_before_tasks,
+        args_after_tasks,
+        out_c,
+        grad_out_c,
+        delta,
+        pool,
+        dq_pool,
+        dq_bf16,
+        grad_pool,
+        grad_pool_bf16,
+        num_dk,
+        k_shape,
+        v_shape,
+        schedule,
+        num_tokens,
+        workspace_rows,
+        num_sms,
+        scratch,
+        tables_buf,
         softmax_scale,
-    )
+    ):
+        self._exe = exe
+        self._softmax_scale = float(softmax_scale)
+        self._args_before_tasks = args_before_tasks
+        self._args_after_tasks = args_after_tasks
+        self._out_c, self._grad_out_c, self._delta = out_c, grad_out_c, delta
+        self._pool, self._dq_pool, self._dq_bf16 = pool, dq_pool, dq_bf16
+        self.grad_pool, self._grad_pool_bf16 = grad_pool, grad_pool_bf16
+        self._num_dk, self._k_shape, self._v_shape = num_dk, k_shape, v_shape
+        self._schedule, self._num_tokens, self._workspace_rows, self._num_sms = (
+            schedule,
+            num_tokens,
+            workspace_rows,
+            num_sms,
+        )
+        self._scratch, self._tables_buf = scratch, tables_buf
+        self.tables = None
 
-    q_c = q.detach().contiguous()
-    k_c = k_aligned.detach().contiguous()
-    v_c = v_aligned.detach().contiguous()
-    grad_out_c = grad_out.detach().contiguous()
-    lse_c = lse.detach().contiguous()
-    out_c = out.detach().contiguous()
-    task_meta_c = task_meta.detach().contiguous()
-    task_qrows_c = task_qrows.detach().contiguous()
-    task_qpos_c = task_qpos.detach().contiguous()
+    def build_tasks(self):
+        self.tables = build_backward_tasks(
+            self._schedule,
+            self._num_tokens,
+            self._workspace_rows,
+            num_sms=self._num_sms,
+            scratch=self._scratch,
+            tables=self._tables_buf,
+        )
 
-    num_task_rows = int(task_meta_c.shape[0])
-    if num_task_rows == 0:
-        return torch.zeros_like(q_c), torch.zeros_like(k_c), torch.zeros_like(v_c)
+    def device_counts(self):
+        return self.tables.device_counts()
 
-    delta = _run_msa_backward_preprocess(out_c, grad_out_c)
+    def preprocess(self):
+        _run_msa_backward_preprocess(self._out_c, self._grad_out_c, self._delta)
 
-    num_dq = q_c.numel()
+    def zero(self):
+        self._pool.zero_()
+
+    def launch_main(self):
+        tables = self.tables
+        if tables is None:
+            raise RuntimeError("build_tasks() must run before launch_main()")
+        if tables.grid_launch <= 0:
+            return  # no task can exist: the cleared pools already hold the zero gradients
+        self._exe(
+            *self._args_before_tasks,
+            tables.task_meta,
+            tables.task_qrows,
+            tables.task_qpos,
+            *self._args_after_tasks,
+            tables.desc,
+            Int32(tables.grid_launch),
+            Float32(self._softmax_scale),
+        )
+
+    def cast(self):
+        run_grad_finalize(self._dq_pool, self._dq_bf16, self.grad_pool, self._grad_pool_bf16)
+
+    def outputs(self):
+        return (
+            self._dq_bf16,
+            self._grad_pool_bf16[: self._num_dk].view(self._k_shape),
+            self._grad_pool_bf16[self._num_dk :].view(self._v_shape),
+        )
+
+
+def _plan_msa_backward(q, k_aligned, v_aligned, grad_out, lse, out, schedule, *, softmax_scale, build_tasks_now=True):
+    """Build a :class:`_MSABackwardPlan` (validation, one internal buffer, compiled executables);
+    ``build_tasks_now=False`` leaves the task build to the caller."""
+    _validate_inputs(q, k_aligned, v_aligned, grad_out, lse, out, softmax_scale=softmax_scale)
+    q_c, k_c, v_c = q.detach().contiguous(), k_aligned.detach().contiguous(), v_aligned.detach().contiguous()
+    grad_out_c, lse_c, out_c = grad_out.detach().contiguous(), lse.detach().contiguous(), out.detach().contiguous()
+    device = q.device
+    num_sms = _num_sms(device)
+    num_tokens, workspace_rows = int(q_c.shape[0]), int(k_c.shape[0])
     num_dk = k_c.numel()
-    num_dv = v_c.numel()
-    grad_pool = torch.zeros(num_dq + num_dk + num_dv, dtype=torch.float32, device=q.device)
-    dq = grad_pool[:num_dq].view(q_c.shape)
-    dk = grad_pool[num_dq : num_dq + num_dk].view(k_c.shape)
-    dv = grad_pool[num_dq + num_dk :].view(v_c.shape)
-
-    # Head-major kernel views; only the size-1 batch mode is added.
-    q_v, grad_out_v, dq_v, k_v, v_v, dk_v, dv_v = (
-        tensor.unsqueeze(0).transpose(1, 2) for tensor in (q_c, grad_out_c, dq, k_c, v_c, dk, dv)
+    pool, dq_pool, grad_pool, dk, dv, delta, scratch, tables_buf = _alloc_call_buffers(q_c, k_c, v_c, schedule)
+    dq_bf16 = torch.empty_like(q_c)
+    grad_pool_bf16 = torch.empty_like(grad_pool, dtype=torch.bfloat16)
+    q_v, grad_out_v, k_v, v_v, dk_v, dv_v = (
+        t.unsqueeze(0).transpose(1, 2) for t in (q_c, grad_out_c, k_c, v_c, dk, dv)
     )
+    dq_v = dq_pool.unsqueeze(0)
     lse_v = lse_c.unsqueeze(0).transpose(1, 2)
     delta_v = delta.unsqueeze(0).transpose(1, 2)
-
-    rows_per_cta = _select_rows_per_cta(num_task_rows)
-    num_full_ctas, tail_rows, grid_ctas = _chunk_map(num_task_rows, rows_per_cta, _num_sms(q.device))
-    key = ("minimax-m3-msa-backward-sm100", torch.cuda.get_device_capability(q.device), q_c.dtype)
+    key = ("minimax-m3-msa-backward-sm100", torch.cuda.get_device_capability(device), q_c.dtype, _DQ_ACCUM)
     if key not in _COMPILE_CACHE:
         _COMPILE_CACHE[key] = _compile_backward()
-    _COMPILE_CACHE[key](
-        q_v,
-        k_v,
-        v_v,
-        grad_out_v,
-        lse_v,
-        delta_v,
-        task_meta_c,
-        task_qrows_c,
-        task_qpos_c,
-        dq_v,
-        dk_v,
-        dv_v,
-        Int32(num_task_rows),
-        Int32(rows_per_cta),
-        Int32(num_full_ctas),
-        Int32(tail_rows),
-        Int32(grid_ctas),
-        Float32(softmax_scale),
+    exe = _COMPILE_CACHE[key]
+    preprocess_executable(device, out_c.dtype)
+    grad_finalize_executable(device, dq_pool.dtype, interleaved=True)
+    compile_task_build(device)
+    plan = _MSABackwardPlan(
+        exe=exe,
+        args_before_tasks=(q_v, k_v, v_v, grad_out_v, lse_v, delta_v),
+        args_after_tasks=(dq_v, dk_v, dv_v),
+        out_c=out_c,
+        grad_out_c=grad_out_c,
+        delta=delta,
+        pool=pool,
+        dq_pool=dq_pool,
+        dq_bf16=dq_bf16,
+        grad_pool=grad_pool,
+        grad_pool_bf16=grad_pool_bf16,
+        num_dk=num_dk,
+        k_shape=k_c.shape,
+        v_shape=v_c.shape,
+        schedule=schedule,
+        num_tokens=num_tokens,
+        workspace_rows=workspace_rows,
+        num_sms=num_sms,
+        scratch=scratch,
+        tables_buf=tables_buf,
+        softmax_scale=softmax_scale,
     )
-
-    grad_pool_bf16 = grad_pool.to(dtype=torch.bfloat16)
-    dq_out = grad_pool_bf16[:num_dq].view(q_c.shape)
-    dk_out = grad_pool_bf16[num_dq : num_dq + num_dk].view(k_c.shape)
-    dv_out = grad_pool_bf16[num_dq + num_dk :].view(v_c.shape)
-    return dq_out, dk_out, dv_out
+    if build_tasks_now:
+        plan.build_tasks()
+    return plan

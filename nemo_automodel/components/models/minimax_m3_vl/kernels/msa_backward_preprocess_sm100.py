@@ -134,8 +134,10 @@ class _MSABackwardPreprocessSm100:
                     gDelta[row] = row_sums[m]
 
 
-def _run_msa_backward_preprocess(out: torch.Tensor, grad_out: torch.Tensor) -> torch.Tensor:
-    """Reduce contiguous, 16-byte-aligned BF16 rows to FP32 ``[T, 64]`` delta."""
+def _run_msa_backward_preprocess(
+    out: torch.Tensor, grad_out: torch.Tensor, delta: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Reduce contiguous, 16-byte-aligned BF16 rows to FP32 ``[T, 64]`` delta (into ``delta`` when given)."""
     if out.device.type != "cuda" or grad_out.device != out.device:
         raise ValueError("MiniMax M3 MSA delta preprocess requires CUDA tensors on one device")
     if out.dtype != torch.bfloat16 or grad_out.dtype != torch.bfloat16:
@@ -149,8 +151,19 @@ def _run_msa_backward_preprocess(out: torch.Tensor, grad_out: torch.Tensor) -> t
     if out.data_ptr() % 16 != 0 or grad_out.data_ptr() % 16 != 0:
         raise ValueError("out and grad_out must have 16-byte-aligned storage")
 
-    delta = torch.empty((out.shape[0], NUM_Q_HEADS), dtype=torch.float32, device=out.device)
-    key = ("minimax-m3-msa-backward-preprocess-sm100", torch.cuda.get_device_capability(out.device), out.dtype)
+    if delta is None:
+        delta = torch.empty((out.shape[0], NUM_Q_HEADS), dtype=torch.float32, device=out.device)
+    elif delta.shape != (out.shape[0], NUM_Q_HEADS) or delta.dtype != torch.float32 or not delta.is_contiguous():
+        raise ValueError(
+            f"delta must be a contiguous FP32 [T, {NUM_Q_HEADS}] tensor, got {tuple(delta.shape)} {delta.dtype}"
+        )
+    preprocess_executable(out.device, out.dtype)(out, grad_out, delta)
+    return delta
+
+
+def preprocess_executable(device: torch.device, dtype: torch.dtype) -> Any:
+    """Compile (once per device capability and dtype) and return the delta executable."""
+    key = ("minimax-m3-msa-backward-preprocess-sm100", torch.cuda.get_device_capability(device), dtype)
     if key not in _COMPILE_CACHE:
         num_tokens = cute.sym_int32(symbol="num_tokens")
         # stride_order[i] is the rank of mode i, 0 = innermost: row-major THD.
@@ -166,5 +179,4 @@ def _run_msa_backward_preprocess(out: torch.Tensor, grad_out: torch.Tensor) -> t
             make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
-    _COMPILE_CACHE[key](out, grad_out, delta)
-    return delta
+    return _COMPILE_CACHE[key]
