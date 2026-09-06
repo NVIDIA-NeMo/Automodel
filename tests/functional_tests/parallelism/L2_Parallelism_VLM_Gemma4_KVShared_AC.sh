@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-configs:
-  - deepseek_v4/deepseek_v4_flash_mok_mxfp8_fineweb_8k.yaml
-  - deepseek_v4/deepseek_v4_flash_pretrain.yaml
-  - glm/glm_5.2_mok_mxfp8_fineweb_8k.yaml
+#!/bin/bash
+# Activation checkpointing must cover attention on KV-shared Gemma4 (E2B/E4B).
+#
+# The model is built in-process from a shrunk E4B config, so this needs nothing
+# staged in TEST_DATA_DIR. See run_gemma4_kv_shared_ac.py for what it asserts.
+
+set -xeuo pipefail
+
+export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+export CUDA_VISIBLE_DEVICES="0,1"
+
+python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
+    tests/functional_tests/parallelism/run_gemma4_kv_shared_ac.py
