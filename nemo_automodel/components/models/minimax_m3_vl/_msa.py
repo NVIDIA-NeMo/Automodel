@@ -718,7 +718,8 @@ class _MSAFlatAttention(nn.Module):
             raise TypeError(f"layout must be an _MSAPackedLayout, got {type(layout).__name__}.")
         if torch.are_deterministic_algorithms_enabled():
             raise NotImplementedError(
-                "MiniMax M3 MSA backward uses global FP32 atomic accumulation and is not bitwise deterministic; "
+                "MiniMax M3 MSA backward accumulates dK/dV with FP32 atomics and dQ with packed 16-bit atomics, "
+                "so it is not bitwise deterministic; "
                 "disable torch deterministic algorithms or use sparse_attn='generic'."
             )
         _validate_flat_msa_inputs(q, k, v, q2k, layout, softmax_scale=self.softmax_scale)
