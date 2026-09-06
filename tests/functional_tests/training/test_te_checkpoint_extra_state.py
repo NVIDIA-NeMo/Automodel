@@ -17,8 +17,10 @@
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
+from transformers import LlamaConfig
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import safe_import
 
 HAVE_TE, te = safe_import("transformer_engine.pytorch")
@@ -83,3 +85,53 @@ def test_te_extra_state_restore_and_runtime_precision(tmp_path, saved_recipe):
     assert destination.fp8 is True
     assert torch.isfinite(output).all()
     assert torch.isfinite(destination.weight.grad).all()
+
+
+def test_te_extra_state_restore_with_state_dict_adapter(tmp_path):
+    """Restore TE quantizer state while an adapter converts ordinary weight keys."""
+    from transformer_engine.common.recipe import DelayedScaling
+    from transformer_engine.pytorch.quantization import autocast
+
+    class AdapterModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = te.Linear(128, 128, params_dtype=torch.bfloat16, device="cuda")
+            self.state_dict_adapter = LlamaStateDictAdapter(LlamaConfig(tie_word_embeddings=False))
+
+        def forward(self, x):
+            """Apply the TE projection to ``x`` of shape [tokens, hidden]."""
+            return self.model(x)
+
+    torch.manual_seed(123)
+    source = AdapterModel()
+    x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    with autocast(enabled=True, recipe=DelayedScaling()):
+        source(x).float().square().mean().backward()
+    assert source.model.get_extra_state().numel() > 0
+
+    checkpointer = Checkpointer(
+        CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            save_consolidated=False,
+        ),
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+        moe_mesh=None,
+    )
+    checkpoint_path = tmp_path / "step_1"
+    checkpointer.save_model(source, str(checkpoint_path))
+
+    destination = AdapterModel()
+    assert destination.model.get_extra_state().numel() == 0
+    checkpointer.load_model(destination, model_path=str(checkpoint_path / "model"))
+
+    torch.testing.assert_close(destination.model.weight, source.model.weight)
+    torch.testing.assert_close(destination.model.bias, source.model.bias)
+    for direction in ("scaling_fwd", "scaling_bwd"):
+        for key in ("scale", "amax_history"):
+            torch.testing.assert_close(
+                getattr(destination.model.fp8_meta[direction], key), getattr(source.model.fp8_meta[direction], key)
+            )

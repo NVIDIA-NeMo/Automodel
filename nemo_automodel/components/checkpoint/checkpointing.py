@@ -619,17 +619,26 @@ class Checkpointer:
             model_state.model[0],
             state_dict,
             quantization=False,
+            preserve_extra_state=True,
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
         )
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
+        # State-dict adapters preserve native module state for resumable DCP
+        # checkpoints, but it is not part of the consolidated HF weight format.
+        has_state_dict_adapter = bool(getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None))
+        hf_export_state_dict = (
+            {key: value for key, value in state_dict.items() if key.rsplit(".", 1)[-1] != "_extra_state"}
+            if has_state_dict_adapter
+            else state_dict
+        )
         # Build the consolidated model.safetensors.index.json if needed
-        fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
-        fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
+        fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, hf_export_state_dict)
+        fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, hf_export_state_dict)
         _warn_if_large_inline_consolidation(
             self.config,
-            state_dict,
+            hf_export_state_dict,
             fqn_to_file_index_mapping,
             is_final_checkpoint,
         )
@@ -948,6 +957,7 @@ class Checkpointer:
             # Training checkpoints are saved from the dequantized native model.
             # Only base-checkpoint initialization needs FP8 scale destinations.
             quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
+            preserve_extra_state=not is_init_step,
             device_mesh=self.moe_mesh,
             for_checkpoint_load=True,
         )
@@ -2584,14 +2594,43 @@ def _convert_checkpoint_with_transformers(
 
 
 def _maybe_adapt_state_dict_to_hf(
-    model_part: nn.Module, state_dict: dict[str, torch.Tensor], quantization: bool = False, **kwargs
-) -> dict[str, torch.Tensor]:
-    """
-    Custom models use state dict adapters to convert the state dict to the Hugging Face format.
+    model_part: nn.Module,
+    state_dict: dict[str, Any],
+    quantization: bool = False,
+    preserve_extra_state: bool = False,
+    **kwargs,
+) -> dict[str, Any]:
+    """Convert model state to Hugging Face keys while optionally retaining native module state.
+
+    Args:
+        model_part: Model that may own a state-dict adapter.
+        state_dict: Native state mapping. Tensor values retain their model-defined
+            rank, shape, and axis order; module extra state may be non-tensor data.
+        quantization: Whether the adapter should emit quantization metadata.
+        preserve_extra_state: Whether native ``_extra_state`` entries should be
+            reattached after ordinary weights are converted.
+        **kwargs: Additional adapter-specific conversion options.
+
+    Returns:
+        State mapping with ordinary weights in Hugging Face format. When requested,
+        module extra state remains under its native fully qualified name.
     """
     adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
-        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
+        # Module-owned serialized state has no Hugging Face equivalent. Keep its
+        # native FQN so DCP can checkpoint it independently of weight conversion.
+        module_extra_state = {
+            key: value for key, value in state_dict.items() if key.rsplit(".", 1)[-1] == "_extra_state"
+        }
+        state_dict = {key: value for key, value in state_dict.items() if key not in module_extra_state}
+        state_dict = adapter.to_hf(
+            state_dict,
+            exclude_key_regex=r".*_extra_state.*",
+            quantization=quantization,
+            **kwargs,
+        )
+        if preserve_extra_state:
+            state_dict.update(module_extra_state)
     return state_dict
 
 
@@ -2835,14 +2874,29 @@ def _load_hf_bin_checkpoint(model_path: str) -> dict[str, torch.Tensor] | None:
 
 
 def _maybe_adapt_state_dict_from_hf(
-    model_part: nn.Module, state_dict: dict[str, torch.Tensor], moe_mesh: DeviceMesh | None = None
-) -> dict[str, torch.Tensor]:
-    """
-    Custom models use state dict adapters to convert the state dict from the Hugging Face format to the native format.
+    model_part: nn.Module, state_dict: dict[str, Any], moe_mesh: DeviceMesh | None = None
+) -> dict[str, Any]:
+    """Convert Hugging Face weights to native keys without transforming module state.
+
+    Args:
+        model_part: Model that may own a state-dict adapter.
+        state_dict: Checkpoint state mapping. Tensor values retain their checkpoint-defined
+            rank, shape, and axis order; module extra state may be non-tensor data.
+        moe_mesh: Optional device mesh used by expert-parallel adapter conversion.
+
+    Returns:
+        Native model state mapping, including any untouched ``_extra_state`` entries.
     """
     adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
+        # Convert only HF weight keys, then put the native module state back for
+        # ModelState.load_state_dict() to deliver to the owning module.
+        module_extra_state = {
+            key: value for key, value in state_dict.items() if key.rsplit(".", 1)[-1] == "_extra_state"
+        }
+        state_dict = {key: value for key, value in state_dict.items() if key not in module_extra_state}
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
-        return adapter.from_hf(state_dict, device_mesh=ep_mesh)
+        state_dict = adapter.from_hf(state_dict, device_mesh=ep_mesh)
+        state_dict.update(module_extra_state)
     return state_dict

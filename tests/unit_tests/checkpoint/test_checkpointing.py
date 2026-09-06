@@ -2062,6 +2062,70 @@ class TestLoadModelExtraState:
         torch.testing.assert_close(destination[0].weight, source[0].weight)
         torch.testing.assert_close(destination[0].extra, source[0].extra)
 
+    @pytest.mark.parametrize(
+        ("model_save_format", "save_consolidated"),
+        [("torch_save", False), ("safetensors", False), ("safetensors", True)],
+    )
+    def test_tensor_extra_state_round_trip_with_state_dict_adapter(
+        self, tmp_path, model_save_format, save_consolidated
+    ):
+        """Keep native module state outside adapter key conversion during save and resume."""
+        from transformers import LlamaConfig
+
+        from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
+
+        class StatefulLayer(torch.nn.Linear):
+            def __init__(self, size):
+                super().__init__(2, 2, bias=False)
+                self.extra = torch.arange(size, dtype=torch.uint8)
+
+            def get_extra_state(self):
+                """Return a CPU byte tensor of shape [serialized_bytes]."""
+                return self.extra
+
+            def set_extra_state(self, state):
+                """Install serialized module state.
+
+                Args:
+                    state: CPU byte tensor of shape [serialized_bytes].
+                """
+                self.extra = state.clone()
+
+        class AdapterModel(torch.nn.Module):
+            def __init__(self, size):
+                super().__init__()
+                self.model = StatefulLayer(size)
+                self.state_dict_adapter = LlamaStateDictAdapter(LlamaConfig(tie_word_embeddings=False))
+
+        source = AdapterModel(size=5)
+        destination = AdapterModel(size=0)
+        with torch.no_grad():
+            source.model.weight.fill_(7)
+            destination.model.weight.zero_()
+
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format=model_save_format,
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=save_consolidated,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+        checkpoint_path = tmp_path / "step_1"
+        checkpointer.save_model(source, str(checkpoint_path))
+        if save_consolidated:
+            exported_state_dict = _load_hf_safetensors_checkpoint(str(checkpoint_path / "model" / "consolidated"))
+            assert exported_state_dict is not None
+            assert set(exported_state_dict) == {"model.weight"}
+        checkpointer.load_model(destination, model_path=str(checkpoint_path / "model"))
+
+        torch.testing.assert_close(destination.model.weight, source.model.weight)
+        torch.testing.assert_close(destination.model.extra, source.model.extra)
+
     @pytest.mark.parametrize("dtype,shape", [(torch.float32, (5,)), (torch.uint8, (2, 3))])
     def test_non_serialized_extra_state_shape_mismatch_is_not_dropped(self, tmp_path, dtype, shape):
         """Ordinary tensor extra state must retain DCP's shape validation."""
