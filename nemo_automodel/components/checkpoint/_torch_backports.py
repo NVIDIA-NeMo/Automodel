@@ -100,9 +100,11 @@ def apply_async_checkpoint_patch() -> None:
                 while ape_mod._CHECKPOINT_PROCESS is None:
                     if save_future.done():
                         save_future.result()
-                        raise RuntimeError(
-                            "Async checkpoint initialization completed without creating the checkpoint process"
-                        )
+                        if ape_mod._CHECKPOINT_PROCESS is None:
+                            raise RuntimeError(
+                                "Async checkpoint initialization completed without creating the checkpoint process"
+                            )
+                        break
                     time.sleep(0.01)
                 return save_future
 

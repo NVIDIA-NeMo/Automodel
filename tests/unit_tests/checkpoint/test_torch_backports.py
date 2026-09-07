@@ -92,3 +92,38 @@ def test_async_checkpoint_patch_propagates_initialization_failure(monkeypatch: p
 
     with pytest.raises(RuntimeError, match="daemon initialization failed"):
         FakeExecutor().execute_save()
+
+
+def test_async_checkpoint_patch_accepts_successful_completion_after_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AssigningFuture(Future[None]):
+        def done(self) -> bool:
+            async_process_executor._CHECKPOINT_PROCESS = object()
+            if not super().done():
+                self.set_result(None)
+            return True
+
+    save_future: Future[None] = AssigningFuture()
+
+    class FakeExecutor:
+        @staticmethod
+        def _execute_save_impl() -> None:
+            return None
+
+        def execute_save(self) -> Future[None]:
+            return save_future
+
+    async_process_executor = SimpleNamespace(
+        _CHECKPOINT_PROCESS=None,
+        _ProcessBasedAsyncCheckpointExecutor=FakeExecutor,
+    )
+    monkeypatch.setattr(
+        _torch_backports.importlib,
+        "import_module",
+        lambda _: async_process_executor,
+    )
+    _torch_backports.apply_async_checkpoint_patch()
+
+    assert FakeExecutor().execute_save() is save_future
+    assert async_process_executor._CHECKPOINT_PROCESS is not None
