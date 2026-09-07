@@ -21,7 +21,7 @@ issues all five tcgen05 GEMMs transposed (S^T, dP^T, dV, dK, dQ^T) over four
 128-column TMEM allocations; dV/dK accumulate per bucket segment and are flushed
 with fp32 vector atomics, dQ^T per tile with packed 16-bit atomics (fp16 by
 default, ``MSA_M3_DQ_ACCUM=bf16``) into a head-pair-interleaved pool that
-``msa_grad_finalize_sm100`` casts to the bf16 gradient. The task tables come
+``msa_backward_postprocess_sm100`` casts to the bf16 gradient. The task tables come
 from ``msa_task_build_sm100`` (``MSA_M3_TASK_BUILD=torch`` restores the eager
 chain).
 """
@@ -45,13 +45,13 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_postprocess_sm100 import (
+    grad_finalize_executable,
+    run_grad_finalize,
+)
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_preprocess_sm100 import (
     _run_msa_backward_preprocess,
     preprocess_executable,
-)
-from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_grad_finalize_sm100 import (
-    grad_finalize_executable,
-    run_grad_finalize,
 )
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import _MSABackwardSchedule
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_task_build_sm100 import (

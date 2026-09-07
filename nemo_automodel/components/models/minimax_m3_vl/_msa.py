@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.autograd.function import once_differentiable
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_patch import _patch_msa_fmax
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_forward_patch import _patch_msa_fmax
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import _MSABackwardSchedule
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import, safe_import_from
 
