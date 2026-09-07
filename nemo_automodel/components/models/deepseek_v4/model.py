@@ -1207,6 +1207,18 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def prepare_peft_checkpoint_load(self, peft_config) -> None:
+        """Configure model-owned PEFT storage before loading a checkpoint."""
+        from nemo_automodel.components.models.deepseek_v4.mxfp4_peft import prepare_mxfp4_peft_checkpoint_load
+
+        prepare_mxfp4_peft_checkpoint_load(self, peft_config)
+
+    def finalize_peft_checkpoint_load(self, peft_config) -> None:
+        """Finalize model-owned PEFT storage after loading a checkpoint."""
+        from nemo_automodel.components.models.deepseek_v4.mxfp4_peft import finalize_mxfp4_peft_checkpoint_load
+
+        finalize_mxfp4_peft_checkpoint_load(self, peft_config)
+
     def customize_pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],

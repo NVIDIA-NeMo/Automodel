@@ -33,7 +33,11 @@ from nemo_automodel._transformers.auto_model import (
     _patch_remote_code_compat,
     _resolve_distributed_setup,
 )
-from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision, instantiate_infrastructure
+from nemo_automodel._transformers.infrastructure import (
+    _apply_peft_and_lower_precision,
+    _call_model_hook,
+    instantiate_infrastructure,
+)
 from nemo_automodel._transformers.model_init import (
     _filter_kwargs_for_init,
     _filter_meta_device_from_init_context,
@@ -798,6 +802,51 @@ class TestApplyPeftAndLowerPrecision:
 
             assert mock_peft_config.use_triton is False
             assert "Disabling Triton with Pipeline Parallelism" in caplog.text
+
+    def test_apply_peft_calls_explicit_model_hook(self):
+        """Model-owned PEFT setup runs after generic LoRA patching."""
+
+        class HookedModel:
+            def __init__(self):
+                self.prepared_with = None
+
+            def prepare_peft_checkpoint_load(self, peft_config):
+                self.prepared_with = peft_config
+
+        model = HookedModel()
+        peft_config = MagicMock()
+
+        with patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as apply_lora:
+            _apply_peft_and_lower_precision(
+                model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
+
+        apply_lora.assert_called_once()
+        assert model.prepared_with is peft_config
+
+    def test_model_hook_calls_each_explicit_pipeline_part(self):
+        """Model-owned post-load setup is preserved for pipeline model parts."""
+
+        class HookedPart:
+            def __init__(self):
+                self.finalized_with = None
+
+            def finalize_peft_checkpoint_load(self, peft_config):
+                self.finalized_with = peft_config
+
+        parts = [HookedPart(), HookedPart()]
+        model = types.SimpleNamespace(parts=parts)
+        peft_config = object()
+
+        _call_model_hook(model, "finalize_peft_checkpoint_load", peft_config)
+
+        assert all(part.finalized_with is peft_config for part in parts)
 
     def test_apply_fp8_when_configured(self):
         """When fp8_config provided, calls apply_fp8_to_model."""
