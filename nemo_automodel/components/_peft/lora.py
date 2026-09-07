@@ -24,8 +24,10 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
-    GroupedExpertsDeepEPLoRAMXFP4,
     GroupedExpertsLoRA,
+)
+from nemo_automodel.components._peft.lora_experts_mxfp4 import (
+    GroupedExpertsDeepEPLoRAMXFP4,
     GroupedExpertsLoRAMXFP4,
 )
 from nemo_automodel.components._peft.lora_kernel import (

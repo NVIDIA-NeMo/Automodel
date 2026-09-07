@@ -25,10 +25,8 @@ import pytest
 import torch
 
 from nemo_automodel.components._peft.lora import convert_frozen_experts_to_mxfp4, patch_moe_module
-from nemo_automodel.components._peft.lora_experts import (
-    GroupedExpertsDeepEPLoRA,
-    GroupedExpertsDeepEPLoRAMXFP4,
-)
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA
+from nemo_automodel.components._peft.lora_experts_mxfp4 import GroupedExpertsDeepEPLoRAMXFP4
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
 from nemo_automodel.components.moe.quantized_experts import GroupedExpertsDeepEPMXFP4, GroupedExpertsMXFP4
