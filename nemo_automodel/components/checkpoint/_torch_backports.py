@@ -19,7 +19,6 @@ from __future__ import annotations
 import importlib
 import logging
 import threading
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -92,24 +91,25 @@ def apply_async_checkpoint_patch() -> None:
                 # Defensive: if staticmethod replacement fails, leave as-is
                 logger.debug("Failed to assign locked _execute_save_impl", exc_info=True)
 
-        if Exec is not None and not hasattr(Exec, "_nemo_orig_execute_save"):
+        ProcessGroupInitInfo = getattr(ape_mod, "_ProcessGroupInitInfo", None)
+        AsyncCheckpointProcess = getattr(ape_mod, "_AsyncCheckpointProcess", None)
+        if (
+            Exec is not None
+            and ProcessGroupInitInfo is not None
+            and AsyncCheckpointProcess is not None
+            and not hasattr(Exec, "_nemo_orig_execute_save")
+        ):
             Exec._nemo_orig_execute_save = Exec.execute_save
 
-            def _nemo_wait_for_checkpoint_process(self, *args, **kwargs):
-                save_future = Exec._nemo_orig_execute_save(self, *args, **kwargs)
-                while ape_mod._CHECKPOINT_PROCESS is None:
-                    if save_future.done():
-                        save_future.result()
-                        if ape_mod._CHECKPOINT_PROCESS is None:
-                            raise RuntimeError(
-                                "Async checkpoint initialization completed without creating the checkpoint process"
-                            )
-                        break
-                    time.sleep(0.01)
-                return save_future
+            def _nemo_initialize_checkpoint_process(self, *args, **kwargs):
+                with ape_mod._NEMO_CREATE_LOCK:
+                    if ape_mod._CHECKPOINT_PROCESS is None:
+                        pg_init_info = ProcessGroupInitInfo(kwargs.get("process_group"))
+                        ape_mod._CHECKPOINT_PROCESS = AsyncCheckpointProcess(pg_init_info=pg_init_info)
+                return Exec._nemo_orig_execute_save(self, *args, **kwargs)
 
             try:
-                Exec.execute_save = _nemo_wait_for_checkpoint_process
+                Exec.execute_save = _nemo_initialize_checkpoint_process
                 logger.debug("Applied synchronous initialization patch to DCP process executor")
             except Exception:
                 # Defensive: if method replacement fails, leave as-is
