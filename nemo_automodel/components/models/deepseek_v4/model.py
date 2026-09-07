@@ -430,8 +430,7 @@ class DeepseekV4HashGate(nn.Module):
         scores = F.linear(x.float(), self.weight.float())
         if self.score_func == "sqrtsoftplus":
             # clamp_min: softplus underflows to 0.0 for very negative logits and sqrt'(0)=inf
-            # makes the backward NaN; bound it with a negligible forward change. See the
-            # matching guard in moe/layers.py Gate.
+            # makes the backward NaN; bound it here with a negligible forward change.
             scores = F.softplus(scores).clamp_min(1e-12).sqrt()
         elif self.score_func == "sigmoid":
             scores = scores.sigmoid()
