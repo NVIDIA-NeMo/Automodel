@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.utils.weak import WeakIdKeyDictionary
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -110,6 +111,38 @@ def build_moe_config(config: Any, dtype: torch.dtype) -> MoEConfig:
         gate_dtype=torch.float32,
         dtype=dtype,
     )
+
+
+_MSA_LAYOUT_MEMO: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+
+def _memoized_msa_layout(doc_ids: torch.Tensor, packed_seq_ids: torch.Tensor | None) -> _MSAPackedLayout:
+    """Build the packed MSA layout once per microbatch, shared by that microbatch's pipeline stages.
+
+    ``_MSAPackedLayout.build`` costs about 1.6 ms and forces one device-to-host sync, while this
+    model's ``forward`` runs once per virtual pipeline stage, so an unmemoized build repeats the
+    same layout ``stages_per_rank`` times for one microbatch. ``packed_seq_ids`` is the batch
+    tensor the pipeline runtime hands unchanged to every stage, and ``doc_ids`` is derived from it,
+    so its identity keys the layout without any staleness risk. The memo holds it weakly, so the
+    entry disappears with the batch.
+
+    Args:
+        doc_ids: Tensor of shape [batch, sequence], int64, on the compute device; 0 marks padding
+            and positive values index documents within a row.
+        packed_seq_ids: The batch tensor of shape [batch, sequence] that ``doc_ids`` was derived
+            from, or None when the collator emitted none. Only its identity is used; the layout is
+            rebuilt on every call when it is None.
+
+    Returns:
+        The ``_MSAPackedLayout`` for ``doc_ids``, shared with every other stage of this microbatch.
+    """
+    if packed_seq_ids is None:
+        return _MSAPackedLayout.build(doc_ids)
+    layout = _MSA_LAYOUT_MEMO.get(packed_seq_ids)
+    if layout is None:
+        layout = _MSAPackedLayout.build(doc_ids)
+        _MSA_LAYOUT_MEMO[packed_seq_ids] = layout
+    return layout
 
 
 class MiniMaxM3TextModel(nn.Module):
@@ -228,7 +261,7 @@ class MiniMaxM3TextModel(nn.Module):
             block_causal_mask = attention_mask if attention_mask is not None and attention_mask.dim() == 4 else None
             stage_uses_msa = any(layer_id in self.layers for layer_id in self._msa_layer_ids)
             if stage_uses_msa:
-                msa_layout = _MSAPackedLayout.build(doc_ids)
+                msa_layout = _memoized_msa_layout(doc_ids, packed_seq_ids)
                 has_padding = msa_layout.has_padding
                 has_multiple_documents = msa_layout.has_multiple_documents_per_row
             else:
