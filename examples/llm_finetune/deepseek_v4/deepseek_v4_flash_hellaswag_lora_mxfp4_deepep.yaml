@@ -172,9 +172,25 @@ validation_dataloader:
   drop_last: true
 
 optimizer:
-  _target_: torch.optim.AdamW
-  fused: true
+  # Keep the BF16 adapter parameters/checkpoint while TE FusedAdam reconstructs
+  # FP32 master weights from the BF16 values plus their stored 16-bit remainders.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   betas: [0.9, 0.95]
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+wandb:
+  enable: false
+  project: automodel-dsv4
+  name: deepseek-v4-flash-mxfp4-lora-hybridep-te-fusedadam
+  group: pr-2548
+  tags: [deepseek-v4-flash, mxfp4, lora, hybridep, te-fusedadam]
+  mode: online
