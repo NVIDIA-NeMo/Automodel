@@ -131,7 +131,8 @@ def _memoized_msa_layout(doc_ids: torch.Tensor, packed_seq_ids: torch.Tensor | N
             and positive values index documents within a row.
         packed_seq_ids: The batch tensor of shape [batch, sequence] that ``doc_ids`` was derived
             from, or None when the collator emitted none. Only its identity is used; the layout is
-            rebuilt on every call when it is None.
+            rebuilt on every call when it is None -- and so, in turn, is that microbatch's selection
+            plan, which is keyed on the layout.
 
     Returns:
         The ``_MSAPackedLayout`` for ``doc_ids``, shared with every other stage of this microbatch.
@@ -182,6 +183,16 @@ class MiniMaxM3TextModel(nn.Module):
         self._msa_model_has_dense_layers = len(self._msa_layer_ids) != len(self.layers)
         if self._msa_layer_ids and int(getattr(config, "num_mtp_modules", 0) or 0) > 0:
             raise NotImplementedError("MiniMax M3 MSA sparse attention supports MTP0 only; set num_mtp_modules=0")
+        # `_msa_model_has_dense_layers` is vacuously true when there are no MSA layers at all, so the
+        # `_msa_layer_ids` conjunct is load-bearing: without it every sparse_attn='generic' model
+        # stops constructing.
+        if self._msa_layer_ids and self._msa_model_has_dense_layers and self._attn_impl != "te":
+            raise NotImplementedError(
+                "MiniMax M3 backend.sparse_attn='msa' packs its dense attention layers to [tokens, hidden], "
+                "so they isolate documents with cu_seqlens and need a varlen backend: set backend.attn='te' "
+                f"(got backend.attn={self._attn_impl!r}). backend.attn='sdpa' ignores cu_seqlens entirely "
+                "and backend.attn='flex' rejects grouped-query attention."
+            )
 
         gemma = getattr(config, "use_gemma_norm", False)
         self.norm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
@@ -260,32 +271,16 @@ class MiniMaxM3TextModel(nn.Module):
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
             )
-            block_causal_mask = attention_mask if attention_mask is not None and attention_mask.dim() == 4 else None
-            stage_uses_msa = any(layer_id in self.layers for layer_id in self._msa_layer_ids)
-            if stage_uses_msa:
-                msa_layout = _memoized_msa_layout(doc_ids, packed_seq_ids)
-                has_padding = msa_layout.has_padding
-                has_multiple_documents = msa_layout.has_multiple_documents_per_row
-            else:
-                has_padding, has_multiple_documents = _MSAPackedLayout.validate(doc_ids)
-
-            if self._msa_model_has_dense_layers and has_multiple_documents:
-                if block_causal_mask is None:
-                    raise ValueError(
-                        "Packed MiniMax M3 MSA input crosses dense attention layers and therefore requires a "
-                        "standard bool attention_mask with shape [batch,1,sequence,sequence]. A 2-D mask or "
-                        "_packed_seq_ids alone cannot preserve document isolation in dense layers."
-                    )
-                if self._attn_impl != "sdpa":
-                    raise NotImplementedError(
-                        "Packed MiniMax M3 MSA dense layers first support backend.attn='sdpa' with the explicit "
-                        f"4-D block-causal mask; got backend.attn={self._attn_impl!r}."
-                    )
-
-            # Canonical ids also own padding for dense attention and the MoE router.
+            # Every stage builds the layout: with 28 virtual stages over 60 layers, virtual stage 0
+            # holds only the dense layers 0-2 and still needs it to pack them.
+            msa_layout = _memoized_msa_layout(doc_ids, packed_seq_ids)
+            # Canonical ids still own padding for the MoE router. Every attention layer packs, so
+            # document isolation travels as cu_seqlens and no attention mask may survive: a non-None
+            # mask makes the TE backend silently drop cu_seqlens (attention/utils.py:135-143).
             padding_mask = doc_ids == 0
-            if block_causal_mask is None:
-                attention_mask = doc_ids != 0 if has_padding else None
+            attention_mask = None
+            attn_kwargs["cu_seqlens"] = msa_layout.cu_seqlens
+            attn_kwargs["max_seqlen"] = msa_layout.max_seqlen
 
         freqs_cis = self.make_freqs_cis(position_ids, **attn_kwargs)
 
@@ -295,7 +290,8 @@ class MiniMaxM3TextModel(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
-                _msa_layout=msa_layout if layer_id in self._msa_layer_ids else None,
+                # Dense layers pack too: they isolate documents with cu_seqlens, not a 4-D mask.
+                _msa_layout=msa_layout,
                 # Forwarded so CP-aware sparse attention can derive per-document
                 # boundaries (position_ids reset to 0 per packed document) for
                 # block-diagonal masking; ignored/popped by the eager path.

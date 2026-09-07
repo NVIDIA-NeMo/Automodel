@@ -17,8 +17,10 @@
 import pytest
 import torch
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.minimax_m3_vl import _msa as msa
 from nemo_automodel.components.models.minimax_m3_vl import model as m3_model
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 
 
 def test_align_backward_tensor_scatters_in_place_without_a_copy() -> None:
@@ -103,3 +105,50 @@ def test_layout_exposes_the_packed_document_geometry() -> None:
     assert int(cu_seqlens[-1]) == packed_ids.shape[0]
     for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist(), strict=True):
         assert packed_ids[start:end].unique().numel() == 1
+
+
+def _text_model(attn: str, sparse_attn: str) -> m3_model.MiniMaxM3TextModel:
+    """Construct the smallest MiniMaxM3TextModel (1 dense + 1 sparse layer) on the meta device."""
+    config = MiniMaxM3VLTextConfig(
+        hidden_size=32,
+        intermediate_size=32,
+        dense_intermediate_size=48,
+        shared_intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=64,
+        num_key_value_heads=4,
+        head_dim=128,
+        vocab_size=64,
+        rotary_dim=64,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=0,
+        moe_layer_freq=[0, 0],
+        num_mtp_modules=0,
+        attention_dropout=0.0,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_num_index_heads": 4,
+            "sparse_index_dim": 128,
+            "sparse_block_size": 128,
+            "sparse_topk_blocks": 16,
+            "sparse_init_block": 0,
+            "sparse_local_block": 1,
+            "sparse_score_type": "max",
+            "sparse_attention_freq": [0, 1],
+            "sparse_disable_index_value": [0, 1],
+        },
+    )
+    backend = BackendConfig(attn=attn, sparse_attn=sparse_attn, linear="torch", rms_norm="torch", rope_fusion=False)
+    with torch.device("meta"):
+        return m3_model.MiniMaxM3TextModel(config, backend)
+
+
+def test_msa_with_dense_layers_requires_a_varlen_attention_backend() -> None:
+    # Dense layers are packed to [tokens, hidden] once MSA is on, so they isolate documents with
+    # cu_seqlens; sdpa drops cu_seqlens on the floor (attention/utils.py:207-212).
+    with pytest.raises(NotImplementedError, match="backend.attn='te'"):
+        _text_model("sdpa", "msa")
+    # _msa_model_has_dense_layers is vacuously true with zero MSA layers, so a guard missing the
+    # _msa_layer_ids conjunct would stop every sparse_attn='generic' model from constructing.
+    assert _text_model("sdpa", "generic") is not None

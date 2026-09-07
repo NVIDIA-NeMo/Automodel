@@ -21,8 +21,10 @@ model:
     num_mtp_modules: 0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    # Dense layers require SDPA for the packed 4D mask; MSA requires uv sync --extra msa.
-    attn: sdpa
+    # MSA packs every attention layer to [tokens, hidden], so the dense layers isolate documents
+    # with cu_seqlens instead of a 4D mask and need the TE varlen backend.
+    # MSA requires uv sync --extra msa.
+    attn: te
     sparse_attn: msa
     linear: te
     rope_fusion: false

@@ -516,22 +516,28 @@ class MiniMaxM3Attention(nn.Module):
         """Map hidden states and rotary tables to an output of the same layout as ``x``.
 
         Args:
-            x: Tensor of shape [batch, sequence, hidden], or [tokens, hidden] under a varlen
-                backend; the return value keeps the same layout.
-            freqs_cis: Rotary table of shape [..., rotary_dim], with ``x``'s leading layout.
+            x: Tensor of shape [batch, sequence, hidden]. When ``_msa_layout`` is given it is packed
+                to [tokens, hidden] inside this method and unpacked again before returning, so both
+                the argument and the return value stay [batch, sequence, hidden].
+            freqs_cis: Rotary table of shape [batch, sequence, rotary_dim], packed alongside ``x``.
             attention_mask: Tensor of shape [batch, sequence] or [batch, heads, sequence, sequence].
-            _msa_layout: Model-owned packed-microbatch layout. Must be None here: only MSA
-                attention layers consume one, and they override this method.
-            **attn_kwargs: Backend arguments forwarded to the attention implementation.
+                Must be None when ``_msa_layout`` is given: document isolation then travels as
+                ``cu_seqlens``, and a non-None mask makes the TE backend drop it.
+            _msa_layout: Packed-microbatch layout owned by ``MiniMaxM3TextModel``. Present on
+                every attention layer once MSA is enabled, so dense layers isolate documents with
+                ``cu_seqlens`` instead of a [batch, 1, sequence, sequence] mask.
+            **attn_kwargs: Backend arguments. With ``_msa_layout`` these carry ``cu_seqlens``
+                (int32 [documents + 1], in ``pack`` row order) and ``max_seqlen``.
 
         Returns:
-            Tensor with the same shape as ``x``.
+            Tensor of shape [batch, sequence, hidden]; padding rows are zero.
         """
-        if _msa_layout is not None:
-            raise TypeError("_msa_layout is valid only for an attention layer constructed with sparse_attn='msa'.")
-
         attn_kwargs.pop("padding_mask", None)
         attn_kwargs.pop("position_ids", None)
+        if _msa_layout is not None:
+            # Pack once so no projection or output GEMM runs on padding rows.
+            x = _msa_layout.pack(x)
+            freqs_cis = _msa_layout.pack(freqs_cis)
         qkv_format = "thd" if x.dim() == 2 else "bshd"
         q, k, v = self._project_qkv(x)
 
@@ -564,7 +570,8 @@ class MiniMaxM3Attention(nn.Module):
         out = postprocess_output_for_attn(out, self._attn_impl)
 
         flatten_dim = 2 if qkv_format == "bshd" else 1
-        return self.o_proj(out.flatten(flatten_dim))
+        out = self.o_proj(out.flatten(flatten_dim))
+        return _msa_layout.unpack(out) if _msa_layout is not None else out
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
         for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):

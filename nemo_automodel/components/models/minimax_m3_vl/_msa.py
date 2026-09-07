@@ -200,7 +200,6 @@ class _MSAPackedLayout:
     _external_shape: tuple[int, int]  # Batch and sequence dimensions.
     _workspace_size: int  # W: positive multiple of 128, including each document's alignment tail.
     _max_seqlen: int  # Longest real document.
-    has_multiple_documents_per_row: bool
 
     @property
     def cu_seqlens(self) -> torch.Tensor:
@@ -213,21 +212,8 @@ class _MSAPackedLayout:
         return self._max_seqlen
 
     @classmethod
-    def validate(cls, doc_ids: torch.Tensor) -> tuple[bool, bool]:
-        """Validate integer doc_ids[B,S] (0 padding); return has-padding and has-multiple-documents flags."""
-        _, has_padding, has_multiple_documents = cls._prepare(doc_ids, materialize=False)
-        return has_padding, has_multiple_documents
-
-    @classmethod
     def build(cls, doc_ids: torch.Tensor) -> "_MSAPackedLayout":
         """Build a layout from integer doc_ids[B,S] with contiguous positive documents and 0 padding."""
-        layout, _, _ = cls._prepare(doc_ids, materialize=True)
-        assert layout is not None
-        return layout
-
-    @classmethod
-    def _prepare(cls, doc_ids: torch.Tensor, *, materialize: bool) -> tuple["_MSAPackedLayout | None", bool, bool]:
-        """Probe integer doc_ids[B,S] once; return optional layout, has-padding and has-multiple-documents."""
         if doc_ids.dim() != 2:
             raise ValueError(f"doc_ids must have shape [batch, sequence], got {tuple(doc_ids.shape)}")
         if doc_ids.dtype == torch.bool or doc_ids.dtype.is_floating_point or doc_ids.dtype.is_complex:
@@ -268,8 +254,6 @@ class _MSAPackedLayout:
 
         runs_are_valid, first_bad = _check_document_runs(ids, batch_rows, is_real, external_rows)
         document_lengths_at_starts = torch.where(is_run_start, run_length, torch.zeros_like(run_length))
-        documents_per_batch_row = torch.zeros(batch_size, dtype=torch.int64, device=device)
-        documents_per_batch_row.scatter_add_(0, batch_rows, is_run_start.to(torch.int64))
 
         probe = torch.stack(
             (
@@ -280,7 +264,6 @@ class _MSAPackedLayout:
                 (ids >= 0).all().to(torch.int64),
                 runs_are_valid.to(torch.int64),
                 first_bad,
-                documents_per_batch_row.max(),
             )
         )
         (
@@ -291,7 +274,6 @@ class _MSAPackedLayout:
             ids_are_valid,
             structure_is_valid,
             bad_external_row,
-            max_documents_per_row,
         ) = probe.tolist()  # The single device-to-host synchronization.
 
         if not ids_are_valid:
@@ -309,11 +291,6 @@ class _MSAPackedLayout:
                 "MSA document coordinates must fit int32, got "
                 f"tokens={num_real_tokens}, workspace_size={workspace_size}, max_seqlen={max_seqlen}"
             )
-
-        has_padding = num_real_tokens != num_external_tokens
-        has_multiple_documents = max_documents_per_row > 1
-        if not materialize:
-            return None, has_padding, has_multiple_documents
 
         aligned_start = aligned_prefix - aligned_run_length
         workspace_row = aligned_start + (external_rows - run_start)
@@ -343,20 +320,15 @@ class _MSAPackedLayout:
             )
         ).contiguous()
 
-        return (
-            cls(
-                _token_rows=token_rows,
-                _workspace_positions=workspace_positions,
-                _query_doc_starts=query_doc_starts,
-                _document_workspace_starts=document_workspace_starts,
-                _cu_seqlens=cu_seqlens,
-                _external_shape=(batch_size, sequence_length),
-                _workspace_size=workspace_size,
-                _max_seqlen=max_seqlen,
-                has_multiple_documents_per_row=has_multiple_documents,
-            ),
-            has_padding,
-            has_multiple_documents,
+        return cls(
+            _token_rows=token_rows,
+            _workspace_positions=workspace_positions,
+            _query_doc_starts=query_doc_starts,
+            _document_workspace_starts=document_workspace_starts,
+            _cu_seqlens=cu_seqlens,
+            _external_shape=(batch_size, sequence_length),
+            _workspace_size=workspace_size,
+            _max_seqlen=max_seqlen,
         )
 
     @property

@@ -53,9 +53,9 @@ _SKIP_REASON = None if _PP_WORKER else _unavailable()
 pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "SM100 available")
 
 
-def _backend(sparse_attn: str = "msa") -> BackendConfig:
+def _backend(sparse_attn: str = "msa", attn: str = "sdpa") -> BackendConfig:
     return BackendConfig(
-        attn="sdpa",
+        attn=attn,
         sparse_attn=sparse_attn,
         linear="torch",
         rms_norm="torch",
@@ -259,7 +259,9 @@ def _run_pp_worker() -> None:
     try:
         torch.manual_seed(20260906)
         with device:
-            model = MiniMaxM3SparseForCausalLM(_config(), backend=_backend())
+            # Dense layer 0 is packed to [tokens, hidden] under MSA, so it needs a varlen
+            # backend; this is also the first co-run of TransformerEngine and MSA in one process.
+            model = MiniMaxM3SparseForCausalLM(_config(), backend=_backend(attn="te"))
             model.initialize_weights(buffer_device=device, dtype=torch.bfloat16)
         model.train()
         reference = copy.deepcopy(model)
@@ -317,6 +319,48 @@ def _run_pp_worker() -> None:
             print("MINIMAX_M3_MSA_PP_PASS", flush=True)
     finally:
         dist.destroy_process_group()
+
+
+def test_full_model_runs_dense_layers_through_a_varlen_backend() -> None:
+    # The only single-GPU coverage of MiniMaxM3TextModel.forward under MSA: dense layer 0 is packed
+    # to [tokens, hidden] and isolates documents with cu_seqlens, sparse layer 1 goes through the
+    # fused scorer and the SM100 kernels, and both run in one process with TransformerEngine.
+    # On a host whose CUDA toolkit disagrees with the wheels, TE's fused attention raises
+    # "Multiple libcudart libraries found" here; that is a toolchain problem, not a model one.
+    pytest.importorskip("transformer_engine.pytorch")
+    device = torch.device("cuda", torch.cuda.current_device())
+    torch.manual_seed(20260907)
+    with torch.device("meta"):
+        model = MiniMaxM3SparseForCausalLM(_config(), backend=_backend(attn="te"))
+    model.to_empty(device=device)
+    model.initialize_weights(buffer_device=device, dtype=torch.bfloat16)
+    model.train()
+
+    lengths = (200, 184)
+    sequence = sum(lengths)
+    documents = torch.zeros(1, sequence, dtype=torch.int64, device=device)
+    position = 0
+    for document, length in enumerate(lengths, start=1):
+        documents[0, position : position + length] = document
+        position += length
+    same_document = documents.unsqueeze(-1) == documents.unsqueeze(-2)
+    mask = (same_document & torch.ones(sequence, sequence, dtype=torch.bool, device=device).tril()).unsqueeze(1)
+    logits = model(torch.randint(1, 64, (1, sequence), device=device), attention_mask=mask)
+
+    assert logits.shape == (1, sequence, 64) and torch.isfinite(logits).all()
+    logits.float().pow(2).sum().backward()
+    gradients = {name: parameter.grad for name, parameter in model.named_parameters()}
+    # MSA selects blocks under no_grad, so the indexer is frozen on this path and nothing else is.
+    absent = {name for name, gradient in gradients.items() if gradient is None}
+    assert absent == {
+        "model.layers.1.self_attn.indexer.index_q_proj.weight",
+        "model.layers.1.self_attn.indexer.index_k_proj.weight",
+        "model.layers.1.self_attn.indexer.index_q_norm.weight",
+        "model.layers.1.self_attn.indexer.index_k_norm.weight",
+    }, sorted(absent)
+    for name, gradient in gradients.items():
+        if gradient is not None:
+            assert torch.isfinite(gradient).all() and torch.count_nonzero(gradient) > 0, name
 
 
 def test_two_rank_pipeline_forward_backward_parity() -> None:
