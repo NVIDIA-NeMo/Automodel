@@ -80,6 +80,8 @@ logger = logging.getLogger(__name__)
 # Thread-local: when True, HF's get_init_context must not add torch.device("meta")
 # so that model init runs on real device (used when retrying after "Cannot copy out of meta tensor").
 _hf_meta_device_disabled = threading.local()
+_hf_fp32_contract = threading.local()
+_hf_fp32_contract_lock = threading.RLock()
 
 
 def _get_hf_meta_device_disabled():
@@ -102,12 +104,38 @@ def _filter_meta_device_from_init_context(contexts):
     return [c for c in contexts if not (isinstance(c, torch.device) and getattr(c, "type", None) == "meta")]
 
 
+@contextmanager
+def _apply_hf_fp32_contract(model_cls: type, module_names: tuple[str, ...]):
+    """Temporarily apply an FP32 contract to the concrete class selected by HF."""
+    attr = "_keep_in_fp32_modules_strict"
+    with _hf_fp32_contract_lock:
+        if not module_names:
+            yield
+            return
+
+        # ``__dict__`` distinguishes a class-owned value from an inherited one,
+        # which lets us restore Python's original MRO behavior exactly.
+        had_own_attr = attr in model_cls.__dict__
+        previous = model_cls.__dict__.get(attr)
+        inherited = getattr(model_cls, attr, None)
+        setattr(model_cls, attr, set(inherited or ()) | set(module_names))
+        try:
+            yield
+        finally:
+            if had_own_attr:
+                setattr(model_cls, attr, previous)
+            else:
+                delattr(model_cls, attr)
+
+
 def _patched_get_init_context(cls, *args, **kwargs):
     """Wrapper around PreTrainedModel.get_init_context that strips meta device when requested."""
     original = _patched_get_init_context.__wrapped__
     contexts = original(cls, *args, **kwargs)
     if _get_hf_meta_device_disabled():
-        return _filter_meta_device_from_init_context(contexts)
+        contexts = _filter_meta_device_from_init_context(contexts)
+    module_names = getattr(_hf_fp32_contract, "module_names", ())
+    contexts.append(_apply_hf_fp32_contract(cls, module_names))
     return contexts
 
 
@@ -255,6 +283,39 @@ def _resolve_custom_model_cls_for_config(config):
         return None
 
     return ModelRegistry.resolve_custom_model_cls(arch_name, config)
+
+
+@contextmanager
+def _keep_model_owned_hf_modules_in_fp32(hf_config: object):
+    """Request a model-specific strict FP32 contract during an HF load.
+
+    The request is thread-local. The patched ``get_init_context`` receives the
+    concrete class selected by Transformers, including trust-remote-code model
+    classes, and applies the contract only while that class is constructed.
+    ``post_init`` copies the class contract onto the instance before checkpoint
+    materialization creates the dtype plan.
+
+    Args:
+        hf_config: Hugging Face config used to select the model-owned contract.
+
+    Yields:
+        Control while the model-owned strict FP32 contract is active.
+    """
+    module_names = ModelRegistry.get_force_hf_fp32_module_names(hf_config)
+    if not module_names:
+        yield
+        return
+
+    had_previous = hasattr(_hf_fp32_contract, "module_names")
+    previous = getattr(_hf_fp32_contract, "module_names", ())
+    _hf_fp32_contract.module_names = tuple(dict.fromkeys((*previous, *module_names)))
+    try:
+        yield
+    finally:
+        if had_previous:
+            _hf_fp32_contract.module_names = previous
+        else:
+            del _hf_fp32_contract.module_names
 
 
 def _load_registered_custom_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
@@ -1235,14 +1296,15 @@ def __init_model(
             kwargs["quantization_config"] = quantization_config
             _setup_bnb_loading_kwargs(kwargs)
         if is_pretrained_init:
-            with skip_random_init():
-                model = cls._from_pretrained_parent_class(
-                    pretrained_model_name_or_path,
-                    *model_args,
-                    torch_dtype=torch_dtype,
-                    attn_implementation=attn_implementation,
-                    **kwargs,
-                )
+            with _keep_model_owned_hf_modules_in_fp32(hf_config):
+                with skip_random_init():
+                    model = cls._from_pretrained_parent_class(
+                        pretrained_model_name_or_path,
+                        *model_args,
+                        torch_dtype=torch_dtype,
+                        attn_implementation=attn_implementation,
+                        **kwargs,
+                    )
             if restore_loaded_dtype:
                 _restore_loaded_model_dtype(
                     model,
