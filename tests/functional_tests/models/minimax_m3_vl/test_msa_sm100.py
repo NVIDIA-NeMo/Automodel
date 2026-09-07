@@ -27,6 +27,7 @@ from torch.utils.checkpoint import checkpoint
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.minimax_m3_vl import _msa as msa
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_forward_select import select_blocks_reference
 from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Attention, MiniMaxM3Indexer
 from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 from nemo_automodel.components.models.minimax_m3_vl.msa_attn import MiniMaxM3MSAAttention
@@ -194,7 +195,18 @@ def test_top16_truncation_large_schedule_parity() -> None:
     )
     index_k = torch.zeros(tokens, 1, _DIM, dtype=torch.bfloat16, device=device)
     index_k[:, 0, 0] = scores.repeat_interleave(_BLOCK)[:tokens]
-    support = indexer._select_msa_blocks(index_q, index_k, layout=layout)
+    aligned_key, query_positions, document_starts = layout._selection_inputs(index_k)
+    support = select_blocks_reference(
+        index_q,
+        aligned_key,
+        query_positions,
+        document_starts,
+        block_size=indexer.block_size,
+        topk_blocks=indexer.topk_blocks,
+        init_blocks=indexer.init_blocks,
+        local_blocks=indexer.local_blocks,
+        score_type=indexer.score_type,
+    )
     final = support[0, -1]
     assert set(final.tolist()) == set(range(18)) - {0, 2}
     _check_flat_attention(layout, support, (tokens,), torch.arange(tokens - 8, tokens, device=device))

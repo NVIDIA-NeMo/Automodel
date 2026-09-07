@@ -26,6 +26,7 @@ from nemo_automodel.components.models.minimax_m3_vl._msa import (
     _reject_unsupported_msa_configuration,
     _validate_msa_topology,
 )
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_forward_select import select_blocks_reference
 from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Attention
 
 
@@ -99,7 +100,18 @@ class MiniMaxM3MSAAttention(MiniMaxM3Attention):
         Returns:
             Document-local block ids [index_heads, tokens, topk_blocks], int32, padded with -1.
         """
-        return self.indexer._select_msa_blocks(index_q, index_k, layout=layout)
+        aligned_index_k, query_positions, document_starts = layout._selection_inputs(index_k)
+        return select_blocks_reference(
+            index_q,
+            aligned_index_k,
+            query_positions,
+            document_starts,
+            block_size=self.indexer.block_size,
+            topk_blocks=self.indexer.topk_blocks,
+            init_blocks=self.indexer.init_blocks,
+            local_blocks=self.indexer.local_blocks,
+            score_type=self.indexer.score_type,
+        )
 
     def forward(
         self,
