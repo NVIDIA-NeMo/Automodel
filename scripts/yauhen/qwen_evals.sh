@@ -155,13 +155,14 @@ python3 submit_nemo_run.py \
 # Text evals
 python3 submit_nemo_run.py \
     --cluster draco \
+    --partition interactive \
     --experiment_name qwen3_2b_text \
     --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
     --num_nodes 1 \
     --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
     --train_script "" \
     --eval_script ./scripts/yauhen/eval_script_vl_old.sh \
-    --eval_datasets TEXT_EVAL TEXT_PLUS_VISION_EVAL \
+    --eval_datasets LONG_EMBED \
     --more_eval_args " \
         --model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Qwen3-VL-Embedding-2B \
         --model_type qwen3_vl_embedding \
@@ -175,6 +176,9 @@ python3 submit_nemo_run.py \
         --log_wandb False \
     " \
     --num_training_rounds 0
+
+
+# TEXT_EVAL TEXT_PLUS_VISION_EVAL LONG_EMBED
 
 python3 submit_nemo_run.py \
     --cluster draco \
@@ -226,34 +230,6 @@ python3 submit_nemo_run.py \
         --attn_implementation flash_attention_2 \
         --log_wandb False \
     "
-
-
-model_size=2B
-model_tag=2b
-
-python3 submit_nemo_run.py \
-    --cluster draco \
-    --experiment_name qwen3_vl_reranker_${model_tag}_eval \
-    --num_nodes 1 \
-    --partition interactive \
-    --num_training_rounds 0 \
-    --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
-    --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
-    --train_script "" \
-    --eval_script ./scripts/yauhen/eval_qwen3_vl_reranker.sh \
-    --eval_datasets RERANK_RTEB_QUICK \
-    --results_dir_name eval_ranker_results_31_1B \
-    --more_eval_args " \
-        --model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Qwen3-VL-Reranker-${model_size} \
-        --rerank_instruction \"Retrieve images or text relevant to the user's query.\" \
-        --batch_size 2 \
-        --max_length 10240 \
-        --topk_candidates 50 \
-        --precision bf16 \
-        --attn_implementation flash_attention_2 \
-        --log_wandb False \
-    "
-
 
 
 model_size=8B

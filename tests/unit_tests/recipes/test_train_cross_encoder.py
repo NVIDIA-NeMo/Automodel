@@ -14,6 +14,10 @@
 
 """Unit tests for the cross-encoder training recipe."""
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -252,3 +256,32 @@ def test_batch_mrr_wider_output():
     target = torch.tensor([2, 2, 3])
     mrr_sum = batch_mrr(output, target)
     torch.testing.assert_close(mrr_sum, torch.tensor(19.0 / 12.0))
+
+
+def test_cross_encoder_nonfinite_loss_is_detected_before_backward(monkeypatch):
+    logits = torch.tensor([[float("inf")], [0.0]], requires_grad=True)
+    recipe = TrainCrossEncoderRecipe.__new__(TrainCrossEncoderRecipe)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.distributed_config = SimpleNamespace(autocast_dtype=None, defer_fsdp_grad_sync=True)
+    recipe.model_parts = [Mock(return_value=SimpleNamespace(logits=logits))]
+    recipe.train_n_passages = 2
+    recipe.temperature = 1.0
+    recipe._acc_buffer = []
+    recipe.step_scheduler = SimpleNamespace(step=7, epoch=0)
+    recipe._has_nonfinite_across_dp = lambda local_has_nonfinite: local_has_nonfinite
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.retrieval.train_cross_encoder.get_sync_ctx", lambda *args, **kwargs: nullcontext()
+    )
+
+    loss_buffer = []
+    skipped_update = recipe._forward_backward_step(
+        0,
+        {"input_ids": torch.ones(2, 1, dtype=torch.long), "labels": torch.tensor([0])},
+        loss_buffer=loss_buffer,
+        num_batches=1,
+    )
+
+    assert skipped_update is True
+    assert len(loss_buffer) == 1
+    assert torch.isnan(loss_buffer[0])
+    assert logits.grad is None

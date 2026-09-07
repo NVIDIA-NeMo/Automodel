@@ -244,7 +244,7 @@ python3 submit_nemo_run.py \
 
 python3 submit_nemo_run.py \
     --cluster draco \
-    --experiment_name full_nemorun_gabriel_stage_2_draco_from_4_epochs_lr_5e14_8_nodes \
+    --experiment_name full_nemorun_gabriel_stage_2_draco_from_4_epochs_lr_5e15_8_nodes \
     --num_nodes 8 \
     --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
     --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
@@ -253,18 +253,18 @@ python3 submit_nemo_run.py \
     --more_train_args " \
         --model.pretrained_model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/oliver_stock_mr_stage_1_epoch_2_08-14-150136/LATEST/model/consolidated \
         --tokenizer.pretrained_model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/oliver_stock_mr_stage_1_epoch_2_08-14-150136/LATEST/model/consolidated \
-        --optimizer.lr 1.0e-14 \
+        --optimizer.lr 5.0e-15 \
         --freeze_config.freeze_vision_tower false \
         --freeze_config.freeze_language_model false \
         --step_scheduler.num_epochs 10 \
     " \
-    --num_training_rounds 5 \
+    --num_training_rounds 3 \
     --use_remote_code_symlink
 
 
 python3 submit_nemo_run.py \
     --cluster draco \
-    --experiment_name full_nemorun_gabriel_stage_2_draco_from_4_epochs_lr_6e14_8_nodes \
+    --experiment_name full_nemorun_gabriel_stage_2_draco_from_4_epochs_lr_1e16_8_nodes \
     --num_nodes 8 \
     --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
     --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
@@ -273,12 +273,12 @@ python3 submit_nemo_run.py \
     --more_train_args " \
         --model.pretrained_model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/oliver_stock_mr_stage_1_epoch_2_08-14-150136/LATEST/model/consolidated \
         --tokenizer.pretrained_model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/oliver_stock_mr_stage_1_epoch_2_08-14-150136/LATEST/model/consolidated \
-        --optimizer.lr 2.0e-14 \
+        --optimizer.lr 1.0e-16 \
         --freeze_config.freeze_vision_tower false \
         --freeze_config.freeze_language_model false \
         --step_scheduler.num_epochs 10 \
     " \
-    --num_training_rounds 5 \
+    --num_training_rounds 3 \
     --use_remote_code_symlink
 
 
@@ -774,3 +774,233 @@ python3 submit_nemo_run.py \
 # VISION_EVAL TEXT_EVAL RTEB_QUICK
 # MIRACL_VISION CHINESE_KOREAN_VIDORE
 # --corpus_modalities image
+
+# RERANKER PRETRAINING 8B
+
+python3 submit_nemo_run.py \
+    --cluster draco \
+    --experiment_name ministral3_8b_reranker_text_100k_pretrain_frozenvision_09-03-214434 \
+    --num_nodes 8 \
+    --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
+    --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
+    --yaml_config examples/retrieval/cross_encoder/yauhen/ministral_8b_pretrain.yaml \
+    --train_script ./scripts/yauhen/train_reranker.sh \
+    --more_train_args " \
+        --model.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Ministral-3-8B-Instruct-2512-combined \
+        --tokenizer.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Ministral-3-8B-Instruct-2512-combined \
+        --optimizer.lr 5.0e-6 \
+        --freeze_config.freeze_vision_tower true \
+        --freeze_config.freeze_multimodal_projector true \
+        --freeze_config.freeze_language_model false \
+    " \
+    --num_training_rounds 2 \
+    --use_remote_code_symlink \
+    --no_append_timestamp \
+    --eval_script ./scripts/yauhen/eval_reranker.sh \
+    --eval_datasets RERANK_RTEB_QUICK RERANK_TEXT_EVAL \
+    --results_dir_name eval_ranker_results_31_1B \
+    --more_eval_args " \
+        --multimodal True \
+        --model_type mistral3_vl \
+        --batch_size 4 \
+        --max_length 10240 \
+        --topk_candidates 50 \
+        --log_wandb False \
+    "
+
+
+python3 submit_nemo_run.py \
+    --cluster draco \
+    --experiment_name ministral3_8b_reranker_text_finetune_frozenvision_lr_5e6 \
+    --num_nodes 8 \
+    --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
+    --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
+    --yaml_config examples/retrieval/cross_encoder/yauhen/ministral_8b_finetune.yaml \
+    --train_script ./scripts/yauhen/train_reranker.sh \
+    --more_train_args " \
+        --model.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Ministral-3-8B-Instruct-2512-combined \
+        --tokenizer.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Ministral-3-8B-Instruct-2512-combined \
+        --optimizer.lr 5.0e-6 \
+        --freeze_config.freeze_vision_tower true \
+        --freeze_config.freeze_multimodal_projector true \
+        --freeze_config.freeze_language_model false \
+    " \
+    --num_training_rounds 8 \
+    --use_remote_code_symlink \
+    --eval_script ./scripts/yauhen/eval_reranker.sh \
+    --eval_datasets RERANK_RTEB_QUICK RERANK_TEXT_EVAL \
+    --results_dir_name eval_ranker_results_31_1B \
+    --more_eval_args " \
+        --multimodal True \
+        --model_type mistral3_vl \
+        --batch_size 4 \
+        --max_length 10240 \
+        --topk_candidates 50 \
+        --log_wandb False \
+    "
+
+python3 submit_nemo_run.py \
+    --cluster draco \
+    --experiment_name ministral3_195014_8b_reranker_text_finetune_frozenvision_lr_3e6_09-06-195014 \
+    --num_nodes 8 \
+    --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
+    --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
+    --yaml_config examples/retrieval/cross_encoder/yauhen/ministral_8b_finetune.yaml \
+    --train_script ./scripts/yauhen/train_reranker.sh \
+    --more_train_args " \
+        --model.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Ministral-3-8B-Instruct-2512-combined \
+        --tokenizer.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Ministral-3-8B-Instruct-2512-combined \
+        --optimizer.lr 3.0e-6 \
+        --freeze_config.freeze_vision_tower true \
+        --freeze_config.freeze_multimodal_projector true \
+        --freeze_config.freeze_language_model false \
+    " \
+    --num_training_rounds 5 \
+    --use_remote_code_symlink \
+    --no_append_timestamp \
+    --eval_script ./scripts/yauhen/eval_reranker.sh \
+    --eval_datasets RERANK_RTEB_QUICK RERANK_TEXT_EVAL \
+    --results_dir_name eval_ranker_results_31_1B \
+    --more_eval_args " \
+        --multimodal True \
+        --model_type mistral3_vl \
+        --batch_size 4 \
+        --max_length 10240 \
+        --topk_candidates 50 \
+        --log_wandb False \
+    "
+
+
+
+python3 submit_nemo_run.py \
+    --cluster draco \
+    --experiment_name ministral3_8b_reranker_text_finetune_frozenvision_lr_1e5_09-04-162311 \
+    --num_nodes 8 \
+    --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
+    --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
+    --yaml_config examples/retrieval/cross_encoder/yauhen/ministral_8b_finetune.yaml \
+    --train_script ./scripts/yauhen/train_reranker.sh \
+    --more_train_args " \
+        --model.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Ministral-3-8B-Instruct-2512-combined \
+        --tokenizer.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/Ministral-3-8B-Instruct-2512-combined \
+        --optimizer.lr 1.0e-5 \
+        --freeze_config.freeze_vision_tower true \
+        --freeze_config.freeze_multimodal_projector true \
+        --freeze_config.freeze_language_model false \
+    " \
+    --num_training_rounds 1 \
+    --use_remote_code_symlink \
+    --no_append_timestamp \
+    --eval_script ./scripts/yauhen/eval_reranker.sh \
+    --eval_datasets RERANK_RTEB_QUICK RERANK_TEXT_EVAL \
+    --results_dir_name eval_ranker_results_31_1B \
+    --more_eval_args " \
+        --multimodal True \
+        --model_type mistral3_vl \
+        --batch_size 4 \
+        --max_length 10240 \
+        --topk_candidates 50 \
+        --log_wandb False \
+    "
+
+
+
+python3 submit_nemo_run.py \
+    --cluster draco \
+    --experiment_name ministral3_8b_reranker_nemotron3_init_text_finetune_frozenvision_lr_5e6_09-05-183331 \
+    --num_nodes 8 \
+    --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
+    --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
+    --yaml_config examples/retrieval/cross_encoder/yauhen/ministral_8b_finetune.yaml \
+    --train_script ./scripts/yauhen/train_reranker.sh \
+    --more_train_args " \
+        --model.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_8B \
+        --tokenizer.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_8B \
+        --optimizer.lr 5.0e-6 \
+        --freeze_config.freeze_vision_tower true \
+        --freeze_config.freeze_multimodal_projector true \
+        --freeze_config.freeze_language_model false \
+    " \
+    --num_training_rounds 2 \
+    --no_append_timestamp \
+    --use_remote_code_symlink \
+    --eval_script ./scripts/yauhen/eval_reranker.sh \
+    --eval_datasets RERANK_RTEB_QUICK RERANK_TEXT_EVAL \
+    --results_dir_name eval_ranker_results_31_1B \
+    --more_eval_args " \
+        --multimodal True \
+        --model_type mistral3_vl \
+        --batch_size 4 \
+        --max_length 10240 \
+        --topk_candidates 50 \
+        --log_wandb False \
+    "
+
+
+python3 submit_nemo_run.py \
+    --cluster draco \
+    --experiment_name ministral3_8b_reranker_nemotron3_init_text_finetune_frozenvision_lr_3e6 \
+    --num_nodes 8 \
+    --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
+    --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
+    --yaml_config examples/retrieval/cross_encoder/yauhen/ministral_8b_finetune.yaml \
+    --train_script ./scripts/yauhen/train_reranker.sh \
+    --more_train_args " \
+        --model.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_8B \
+        --tokenizer.pretrained_model_name_or_path /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_8B \
+        --optimizer.lr 3.0e-6 \
+        --freeze_config.freeze_vision_tower true \
+        --freeze_config.freeze_multimodal_projector true \
+        --freeze_config.freeze_language_model false \
+    " \
+    --num_training_rounds 8 \
+    --use_remote_code_symlink \
+    --eval_script ./scripts/yauhen/eval_reranker.sh \
+    --eval_datasets RERANK_RTEB_QUICK RERANK_TEXT_EVAL \
+    --results_dir_name eval_ranker_results_31_1B \
+    --more_eval_args " \
+        --multimodal True \
+        --model_type mistral3_vl \
+        --batch_size 4 \
+        --max_length 10240 \
+        --topk_candidates 50 \
+        --log_wandb False \
+    "
+
+
+
+
+
+
+
+
+
+python3 submit_nemo_run.py \
+    --cluster draco \
+    --experiment_name eval_5e6_ft \
+    --num_nodes 1 \
+    --num_training_rounds 0 \
+    --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
+    --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
+    --train_script "" \
+    --eval_script ./scripts/yauhen/eval_reranker.sh \
+    --eval_datasets RERANK_RTEB_QUICK RERANK_TEXT_EVAL \
+    --results_dir_name eval_ranker_results_31_1B \
+    --more_eval_args " \
+        --model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/ministral3_8b_reranker_text_finetune_frozenvision_lr_1e5_09-04-162311/LATEST/model/consolidated \
+        --multimodal True \
+        --model_type mistral3_vl \
+        --batch_size 4 \
+        --max_length 10240 \
+        --topk_candidates 50 \
+        --log_wandb False \
+    " \
+    --num_training_rounds 0
+
+
+# Initialize VL part from this model, after text part is frozen? Or from Ministral stock itself?
+# Use embeddings model as a Teacher: Nemotron-3-Embed-8B-VL
+# /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/gmoreira/model_checkpoints/nemorun_ministral_8b_stage_2_full_lr_1e6_pass_4_image_08-24-222331/LATEST/model/consolidated/
+
+#  \
+#     --use_remote_code_symlink
