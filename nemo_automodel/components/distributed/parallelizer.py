@@ -131,8 +131,8 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_llama_nemotron_super_tp_plan,
 )
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
-from nemo_automodel.components.distributed.tp_replicas import _mark_tp_replica_gradient_reduction
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
+from nemo_automodel.shared.tp_replicas import mark_tp_replica_gradient_reduction
 
 _MEGATRON_FSDP_050_REQUIRED_MSG = (
     "megatron_fsdp.MixedPrecisionPolicy could not be imported: NeMo Automodel requires megatron-fsdp==0.5.0"
@@ -1474,7 +1474,7 @@ def get_hf_tp_shard_plan(model):
             if v == "replicated_with_grad_allreduce":
                 for module_name, module in model.named_modules():
                     if fnmatchcase(module_name, k):
-                        _mark_tp_replica_gradient_reduction(module, "sum")
+                        mark_tp_replica_gradient_reduction(module, "sum")
             # The optimizer-boundary replica synchronization owns styles that
             # intentionally leave parameters unwrapped.
             if style is None:

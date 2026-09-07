@@ -62,7 +62,6 @@ from nemo_automodel.components.distributed.megatron_fsdp import (
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
-from nemo_automodel.components.distributed.tp_replicas import _broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
@@ -82,6 +81,7 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
+from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas
 
 if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
@@ -883,7 +883,7 @@ def apply_model_infrastructure(
     restore_distributed_param_attrs(model, mfsdp_param_attrs)
 
     model = _apply_runtime_compatibility_fixes(model)
-    synchronized_tp_replicas = _broadcast_tp_replicas(
+    synchronized_tp_replicas = broadcast_tp_replicas(
         model.parts if hasattr(model, "parts") else [model],
         mesh.device_mesh,
     )

@@ -21,8 +21,8 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
-from nemo_automodel.components.distributed.tp_replicas import _synchronize_tp_replica_gradients
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
+from nemo_automodel.shared.tp_replicas import synchronize_tp_replica_gradients
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -449,7 +449,7 @@ def scale_grads_and_clip_grad_norm(
         or 0.0 when clipping is disabled.
     """
 
-    _synchronize_tp_replica_gradients(model_parts, device_mesh)
+    synchronize_tp_replica_gradients(model_parts, device_mesh)
 
     # Precompute scale factors
     pp_divisor: float | None = None

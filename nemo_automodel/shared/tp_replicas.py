@@ -27,7 +27,7 @@ _TP_REPLICA_GRAD_REDUCTION_ATTR = "_nemo_tp_replica_grad_reduction"
 _MAX_FLAT_BUFFER_BYTES = 256 * 1024 * 1024
 
 
-def _mark_tp_replica_gradient_reduction(
+def mark_tp_replica_gradient_reduction(
     module: torch.nn.Module,
     reduction: Literal["mean", "sum"],
 ) -> None:
@@ -136,7 +136,7 @@ def _iter_unique_buffers(model_parts: list[torch.nn.Module]) -> Iterator[torch.T
 
 
 @torch.no_grad()
-def _broadcast_tp_replicas(
+def broadcast_tp_replicas(
     model_parts: list[torch.nn.Module],
     device_mesh: DeviceMesh | None,
     tp_axis_name: str = "tp",
@@ -214,7 +214,7 @@ def _gradient_chunks(gradients: list[torch.Tensor]) -> Iterator[list[torch.Tenso
 
 
 @torch.no_grad()
-def _synchronize_tp_replica_gradients(
+def synchronize_tp_replica_gradients(
     model_parts: list[torch.nn.Module],
     device_mesh: DeviceMesh | None,
     tp_axis_name: str = "tp",

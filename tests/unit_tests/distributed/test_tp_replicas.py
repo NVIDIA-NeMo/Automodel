@@ -22,11 +22,11 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from nemo_automodel.components.distributed.tp_replicas import (
-    _broadcast_tp_replicas,
+from nemo_automodel.shared.tp_replicas import (
     _is_tp_replicated,
-    _mark_tp_replica_gradient_reduction,
-    _synchronize_tp_replica_gradients,
+    broadcast_tp_replicas,
+    mark_tp_replica_gradient_reduction,
+    synchronize_tp_replica_gradients,
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
@@ -46,7 +46,7 @@ class _ReplicaModel(nn.Module):
         super().__init__()
         self.mean_replica = _ParameterHolder(nn.Parameter(torch.tensor([1.0 + rank, 2.0 + rank])))
         self.sum_replica = _ParameterHolder(nn.Parameter(torch.tensor([3.0 + rank])))
-        _mark_tp_replica_gradient_reduction(self.sum_replica, "sum")
+        mark_tp_replica_gradient_reduction(self.sum_replica, "sum")
 
         replicated = DTensor.from_local(
             torch.tensor([4.0 + rank]),
@@ -122,7 +122,7 @@ def _run_replica_sync_worker(rank: int, world_size: int, init_file: str) -> None
         if rank == 0:
             asymmetric_model.mean_replica.weight.grad = torch.ones_like(asymmetric_model.mean_replica.weight)
         try:
-            _synchronize_tp_replica_gradients([asymmetric_model], tp_mesh)
+            synchronize_tp_replica_gradients([asymmetric_model], tp_mesh)
         except RuntimeError as error:
             assert "Gradient presence differs across TP replicas" in str(error)
         else:
@@ -136,7 +136,7 @@ def _run_replica_sync_case(rank: int, world_size: int, accumulation_steps: int, 
     """Run one accumulation-depth case inside an initialized TP process group."""
     model = _ReplicaModel(rank, tp_mesh)
 
-    synchronized = _broadcast_tp_replicas([model], tp_mesh)
+    synchronized = broadcast_tp_replicas([model], tp_mesh)
     assert synchronized == 6
     torch.testing.assert_close(model.mean_replica.weight, torch.tensor([1.0, 2.0]))
     torch.testing.assert_close(model.sum_replica.weight, torch.tensor([3.0]))
