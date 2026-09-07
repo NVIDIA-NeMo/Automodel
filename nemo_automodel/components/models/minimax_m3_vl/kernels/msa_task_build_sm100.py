@@ -12,18 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build locality-ordered backward task tables and their CTA walk.
+"""Build locality-ordered backward task tables and their CTA walk on the device.
 
-The fused path uses four launches: work scan, segment keys, bin scan, table scatter.
-
-Forward buckets have ascending queries and contiguous (head, query window, key block)
-segments, so ``offsets[segment] + task - first_tasks[segment]`` reproduces the eager locality sort.
-Noncontiguous segments keep source order (descriptor flag 2). Capacity overflow
-disables the CTA walk (flag 1). Exact task counts and the walk stay on the device;
-the host launches a grid bound and surplus CTAs take empty intervals.
+One JIT issues four launches: work scan, segment keys, bin scan, table scatter. Forward buckets have
+ascending queries and contiguous (head, query window, key block) segments, so
+``offsets[segment] + task - first_tasks[segment]`` reproduces the Torch reference order kept in
+``tests/functional_tests/models/minimax_m3_vl/test_msa_task_build_sm100.py``. Noncontiguous segments
+keep source order (descriptor flag 2). Capacity overflow disables the CTA walk (flag 1). Exact task
+counts and the walk stay on the device; the host launches a grid bound and surplus CTAs take empty
+intervals.
 """
 
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,13 +41,9 @@ from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import 
     _ROWS_PER_CTA_LARGE,
     _ROWS_PER_CTA_SMALL,
     _ROWS_PER_CTA_SWITCH,
-    _build_backward_tasks,
     _check_schedule,
-    _chunk_map,
     _grid_launch_bound,
     _MSABackwardSchedule,
-    _rows_per_cta_override,
-    _select_rows_per_cta,
 )
 
 THREADS = 256
@@ -72,11 +67,8 @@ BIN_LAST_TASKS = 2
 BIN_OFFSETS = 3
 _INT32_MAX = 2**31 - 1
 
-# Zero disables locality sorting; a positive window keeps nearby Q/dO/dQ rows together.
-_TASK_ORDER_CHUNK = int(os.environ.get("MSA_M3_TASK_ORDER_CHUNK", "2048"))
-_TASK_BUILD = os.environ.get("MSA_M3_TASK_BUILD", "fused")
-if _TASK_BUILD not in ("fused", "torch"):
-    raise ValueError(f"MSA_M3_TASK_BUILD must be 'fused' or 'torch', got {_TASK_BUILD!r}")
+# Locality window in queries: a wave of CTAs stays inside one, so its Q/dO/dQ rows are hit in L2.
+_LOCALITY_WINDOW = 2048
 
 _COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
 
@@ -86,30 +78,14 @@ class _MSABackwardTaskTables:
     """Task tables in the locality order plus the CTA-walk descriptor the main kernel reads.
 
     The tables hold ``capacity`` rows; rows past the task count are never written nor read (the
-    descriptor's exact count bounds every CTA interval). ``grid_launch >= desc[4]``.
+    descriptor's exact count bounds every CTA interval). ``grid_launch >= desc[DESC_GRID_CTAS]``.
     """
 
     task_meta: torch.Tensor  # [capacity, 4] int32
     task_qrows: torch.Tensor  # [capacity, 8] int32
     task_qpos: torch.Tensor  # [capacity, 8] int32
     desc: torch.Tensor  # [8] int32 on the device (see DESC_*)
-    capacity: int
     grid_launch: int  # CTAs to launch for the main kernel
-
-    def device_counts(self) -> dict[str, int]:
-        """Read the descriptor (synchronizes the stream); for tests and diagnostics."""
-        words = self.desc.tolist()
-        names = (
-            "num_task_rows",
-            "rows_per_cta",
-            "num_full_ctas",
-            "tail_rows",
-            "grid_ctas",
-            "num_work",
-            "num_tasks",
-            "flags",
-        )
-        return dict(zip(names, words))
 
 
 def _task_capacity(schedule: _MSABackwardSchedule) -> int:
@@ -118,14 +94,13 @@ def _task_capacity(schedule: _MSABackwardSchedule) -> int:
 
 
 def _task_build_sizes(
-    schedule: _MSABackwardSchedule, num_tokens: int, workspace_rows: int, chunk: int
+    schedule: _MSABackwardSchedule, num_tokens: int, workspace_rows: int
 ) -> tuple[int, int, int, int]:
-    """``(capacity, bins, scratch_words, table_words)`` of the fused build for this schedule (host shape math only)."""
+    """``(capacity, bins, scratch_words, table_words)`` of the build for this schedule (host shape math only)."""
     capacity = _task_capacity(schedule)
-    window = max(chunk, 1)  # Storage may be queried before the fused eligibility check.
-    num_chunks = (num_tokens + window - 1) // window
+    num_windows = (num_tokens + _LOCALITY_WINDOW - 1) // _LOCALITY_WINDOW
     num_kblocks = workspace_rows // _BLOCK_SIZE
-    bins = _NUM_INDEX_HEADS * num_chunks * max(num_kblocks, 1)
+    bins = _NUM_INDEX_HEADS * num_windows * max(num_kblocks, 1)
     work_capacity = int(schedule.scheduler_metadata.shape[0])
     return capacity, bins, DESC_WORDS + work_capacity + capacity + 4 * bins, capacity * (4 + 2 * _QUERY_CHUNK)
 
@@ -221,7 +196,6 @@ class _MSATaskBuildSm100:
         num_windows: Int32,
         num_kblocks: Int32,
         locality_window: Int32,
-        rows_forced: Int32,  # > 0: forced walk length (MSA_M3_ROWS_PER_CTA); 0: the size rule below
         num_sms: Int32,
         stream: cuda.CUstream,
     ):
@@ -257,7 +231,6 @@ class _MSATaskBuildSm100:
             mQRows,
             mQPos,
             mDesc,
-            rows_forced,
             num_sms,
         ).launch(grid=[cute.ceil_div(capacity, THREADS), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
@@ -389,7 +362,6 @@ class _MSATaskBuildSm100:
         mQRows: cute.Tensor,
         mQPos: cute.Tensor,
         mDesc: cute.Tensor,
-        rows_forced: Int32,
         num_sms: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -430,11 +402,9 @@ class _MSATaskBuildSm100:
             if total > capacity:
                 overflow = Int32(FLAG_CAPACITY_OVERFLOW)
                 num_rows = Int32(0)  # contract violation: no CTA walks, zero gradients, flag set
-            rows_per_cta = rows_forced
-            if rows_per_cta <= Int32(0):
-                rows_per_cta = Int32(_ROWS_PER_CTA_LARGE)
-                if num_rows <= Int32(_ROWS_PER_CTA_SWITCH):
-                    rows_per_cta = Int32(_ROWS_PER_CTA_SMALL)
+            rows_per_cta = Int32(_ROWS_PER_CTA_LARGE)
+            if num_rows <= Int32(_ROWS_PER_CTA_SWITCH):
+                rows_per_cta = Int32(_ROWS_PER_CTA_SMALL)
             num_cta_chunks = (num_rows + rows_per_cta - Int32(1)) // rows_per_cta
             num_full = (num_cta_chunks // num_sms) * num_sms
             whole = num_rows // rows_per_cta
@@ -491,8 +461,8 @@ def _compile(device: torch.device) -> Any:
             task_rows,
             tensor((DESC_WORDS,)),
         )
-        # num_windows, num_kblocks, locality_window, rows_forced, num_sms
-        scalars = (Int32(0), Int32(0), Int32(0), Int32(0), Int32(0))
+        # num_windows, num_kblocks, locality_window, num_sms
+        scalars = (Int32(0), Int32(0), Int32(0), Int32(0))
         _COMPILE_CACHE[key] = cute.compile(
             _MSATaskBuildSm100(),
             *tensors,
@@ -503,51 +473,50 @@ def _compile(device: torch.device) -> Any:
     return _COMPILE_CACHE[key]
 
 
-def compile_task_build(device: torch.device) -> None:
-    """Precompile the fused build; no-op when the Torch implementation is selected."""
-    if _TASK_BUILD == "fused":
-        _compile(device)
+def task_build_storage(schedule: _MSABackwardSchedule, num_tokens: int, workspace_rows: int) -> tuple[int, int]:
+    """Required scratch/table int32 words; the caller owns and may reuse both buffers."""
+    return _task_build_sizes(schedule, num_tokens, workspace_rows)[2:]
 
 
-def _fused_task_build_applies(schedule: _MSABackwardSchedule, bins: int, chunk: int) -> bool:
-    """Whether a validated schedule can use the fused implementation."""
-    if chunk <= 0 or bins > MAX_BINS:
-        return False
-    device = schedule.row_ptr.device
-    if device.type != "cuda" or any(
-        t.device != device
-        for t in (
-            schedule.q_indices,
-            schedule.scheduler_metadata,
-            schedule.work_count,
-            schedule.cu_seqlens,
-            schedule.document_workspace_starts,
-        )
-    ):
-        return False
-    return True
-
-
-def _build_backward_tasks_fused(
+def build_backward_tasks(
     schedule: _MSABackwardSchedule,
     num_tokens: int,
     workspace_rows: int,
-    chunk: int,
     *,
     num_sms: int,
     scratch: torch.Tensor | None = None,
     tables: torch.Tensor | None = None,
-) -> _MSABackwardTaskTables | None:
-    """Enqueue four launches without host sync; return None for the torch fallback.
+) -> _MSABackwardTaskTables:
+    """Enqueue the four build launches without a host sync; return the tables and the CTA walk.
 
-    The descriptor stays at scratch offset zero to preserve its 16-byte alignment.
+    Args:
+        schedule: Forward-derived int32 schedule (see ``_MSABackwardSchedule``), all on one CUDA device.
+        num_tokens: Compact token count ``T`` of the backward call.
+        workspace_rows: Aligned K/V workspace length ``W``, a multiple of 128.
+        num_sms: Streaming multiprocessors of the device; sizes the CTA walk.
+        scratch: Optional int32 buffer of at least ``task_build_storage(...)[0]`` words on the schedule
+            device, carved as ``descriptor | task ends | task segments | bins``; replaced when missing
+            or undersized. The descriptor stays at offset zero to keep its 16-byte alignment.
+        tables: Optional int32 buffer of at least ``task_build_storage(...)[1]`` words on the schedule
+            device, carved as ``task_meta [capacity, 4] | task_qrows [capacity, 8] | task_qpos
+            [capacity, 8]``; replaced when missing or undersized.
+
+    Returns:
+        The three task tables (views into ``tables``), the device descriptor (a view into
+        ``scratch``) and the grid bound to launch the main kernel with.
+
+    Raises:
+        ValueError: If the locality bins exceed ``MAX_BINS``, which happens past roughly 250k tokens.
     """
     _check_schedule(schedule)
-    capacity, bins, scratch_words, table_words = _task_build_sizes(schedule, num_tokens, workspace_rows, chunk)
-    if not _fused_task_build_applies(schedule, bins, chunk):
-        return None
+    capacity, bins, scratch_words, table_words = _task_build_sizes(schedule, num_tokens, workspace_rows)
+    if bins > MAX_BINS:
+        raise ValueError(
+            f"MiniMax M3 MSA backward supports at most {MAX_BINS} locality bins per microbatch, got {bins} "
+            f"for {num_tokens} tokens and {workspace_rows} workspace rows."
+        )
     device = schedule.row_ptr.device
-    num_chunks = (num_tokens + chunk - 1) // chunk
+    num_windows = (num_tokens + _LOCALITY_WINDOW - 1) // _LOCALITY_WINDOW
     num_kblocks = workspace_rows // _BLOCK_SIZE
     meta = schedule.scheduler_metadata.contiguous()
     work_capacity = int(meta.shape[0])
@@ -557,7 +526,6 @@ def _build_backward_tasks_fused(
     cu = schedule.cu_seqlens.contiguous()
     dws = schedule.document_workspace_starts.contiguous()
     work_count = schedule.work_count.contiguous()
-    # scratch: descriptor | task ends | task segments | bins; tables: meta | qrows | qpos.
     if scratch is None or scratch.numel() < scratch_words:
         scratch = torch.empty(scratch_words, dtype=torch.int32, device=device)
     desc = scratch[:DESC_WORDS]
@@ -571,7 +539,6 @@ def _build_backward_tasks_fused(
     task_meta = tables[: 4 * capacity].view(capacity, 4)
     task_qrows = tables[4 * capacity : (4 + _QUERY_CHUNK) * capacity].view(capacity, _QUERY_CHUNK)
     task_qpos = tables[(4 + _QUERY_CHUNK) * capacity : table_words].view(capacity, _QUERY_CHUNK)
-    forced = _rows_per_cta_override()
     tensors = (
         meta,
         work_count,
@@ -587,89 +554,6 @@ def _build_backward_tasks_fused(
         task_qpos,
         desc,
     )
-    scalars = (Int32(num_chunks), Int32(num_kblocks), Int32(chunk), Int32(forced), Int32(num_sms))
+    scalars = (Int32(num_windows), Int32(num_kblocks), Int32(_LOCALITY_WINDOW), Int32(num_sms))
     exe(*tensors, *scalars)
-    return _MSABackwardTaskTables(
-        task_meta, task_qrows, task_qpos, desc, capacity, _grid_launch_bound(capacity, forced, num_sms)
-    )
-
-
-def _host_task_tables(
-    task_meta: torch.Tensor, task_qrows: torch.Tensor, task_qpos: torch.Tensor, num_sms: int
-) -> _MSABackwardTaskTables:
-    """Wrap eager tables with the exact CTA walk, uploading the descriptor once."""
-    num_tasks = int(task_meta.shape[0])
-    rows_per_cta = _select_rows_per_cta(num_tasks)
-    num_full, tail, grid = _chunk_map(num_tasks, rows_per_cta, num_sms)
-    desc = torch.tensor([num_tasks, rows_per_cta, num_full, tail, grid, 0, num_tasks, 0], dtype=torch.int32).to(
-        task_meta.device
-    )
-    return _MSABackwardTaskTables(
-        task_meta.contiguous(), task_qrows.contiguous(), task_qpos.contiguous(), desc, num_tasks, grid
-    )
-
-
-def _order_tasks_for_locality(
-    task_meta: torch.Tensor,
-    task_qrows: torch.Tensor,
-    task_qpos: torch.Tensor,
-    num_tokens: int,
-    workspace_rows: int,
-    chunk: int = _TASK_ORDER_CHUNK,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reorder task rows by (index_head, query_chunk, key_block, first query); no host sync."""
-    num_tasks = int(task_meta.shape[0])
-    if chunk <= 0 or num_tasks <= 1:
-        return task_meta, task_qrows, task_qpos
-    head = task_meta[:, 1].to(torch.int64)
-    kblock = task_meta[:, 2].to(torch.int64)
-    qmin = task_qrows[:, 0].to(torch.int64)
-    num_chunks = (num_tokens + chunk - 1) // chunk
-    num_kblocks = workspace_rows // _BLOCK_SIZE
-    key = ((head * num_chunks + qmin // chunk) * num_kblocks + kblock) * chunk + qmin % chunk
-    order = torch.argsort(key)
-    return (
-        task_meta.index_select(0, order),
-        task_qrows.index_select(0, order),
-        task_qpos.index_select(0, order),
-    )
-
-
-def task_build_storage(schedule: _MSABackwardSchedule, num_tokens: int, workspace_rows: int) -> tuple[int, int]:
-    """Required scratch/table int32 words; the caller owns and may reuse both buffers."""
-    if _TASK_BUILD == "torch":
-        return 0, 0
-    return _task_build_sizes(schedule, num_tokens, workspace_rows, _TASK_ORDER_CHUNK)[2:]
-
-
-def build_backward_tasks(
-    schedule: _MSABackwardSchedule,
-    num_tokens: int,
-    workspace_rows: int,
-    *,
-    num_sms: int,
-    scratch: torch.Tensor | None = None,
-    tables: torch.Tensor | None = None,
-) -> _MSABackwardTaskTables:
-    """Build ordered tables and the CTA walk, using Torch when fused is disabled or ineligible.
-
-    The fused path leaves counts on device. Buffers are optional, contiguous int32 storage
-    on the schedule device; undersized buffers are replaced. See ``task_build_storage``.
-    """
-    if _TASK_BUILD == "fused":
-        built = _build_backward_tasks_fused(
-            schedule,
-            num_tokens,
-            workspace_rows,
-            _TASK_ORDER_CHUNK,
-            num_sms=num_sms,
-            scratch=scratch,
-            tables=tables,
-        )
-        if built is not None:
-            return built
-    task_meta, task_qrows, task_qpos = _build_backward_tasks(schedule)
-    return _host_task_tables(
-        *_order_tasks_for_locality(task_meta, task_qrows, task_qpos, num_tokens, workspace_rows, _TASK_ORDER_CHUNK),
-        num_sms,
-    )
+    return _MSABackwardTaskTables(task_meta, task_qrows, task_qpos, desc, _grid_launch_bound(capacity, num_sms))

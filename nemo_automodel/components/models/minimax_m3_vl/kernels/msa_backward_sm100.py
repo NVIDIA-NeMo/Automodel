@@ -22,8 +22,7 @@ issues all five tcgen05 GEMMs transposed (S^T, dP^T, dV, dK, dQ^T) over four
 with fp32 vector atomics, dQ^T per tile with packed 16-bit atomics (fp16 by
 default, ``MSA_M3_DQ_ACCUM=bf16``) into a head-pair-interleaved pool that
 ``msa_backward_postprocess_sm100`` casts to the bf16 gradient. The task tables come
-from ``msa_task_build_sm100`` (``MSA_M3_TASK_BUILD=torch`` restores the eager
-chain).
+from ``msa_task_build_sm100``.
 """
 
 import math
@@ -1703,7 +1702,7 @@ def _round_up(n: int, m: int = 256) -> int:
 def _alloc_call_buffers(q_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor, schedule: _MSABackwardSchedule):
     """One internal allocation per call (freed when the plan dies), carved into: the 16-bit dQ
     head-pair pool ``[T, Hq/2, D, 2]`` + the FP32 dK/dV pool (cleared by ``zero()``), the FP32
-    ``delta [T, 64]``, and the int32 scratch / tables of the fused task build. One block of one
+    ``delta [T, 64]``, and the int32 scratch / tables of the task build. One block of one
     size per call keeps the caching allocator from splitting and re-growing."""
     num_dk, num_dv = k_c.numel(), v_c.numel()
     dq_bytes = q_c.numel() * _DQ_ACCUM_TORCH_DTYPE.itemsize  # multiple of 256: keeps the FP32 pool 16-byte aligned
@@ -1719,8 +1718,8 @@ def _alloc_call_buffers(q_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor,
     dq_pool = pool[:dq_bytes].view(_DQ_ACCUM_TORCH_DTYPE).view(q_c.shape[0], NUM_Q_HEADS // 2, HEAD_DIM, 2)
     grad_pool = pool[dq_bytes:].view(torch.float32)
     delta = raw[delta_off : delta_off + delta_bytes].view(torch.float32).view(q_c.shape[0], NUM_Q_HEADS)
-    scratch = raw[scratch_off : scratch_off + scratch_words * 4].view(torch.int32) if scratch_words else None
-    tables = raw[tables_off : tables_off + table_words * 4].view(torch.int32) if table_words else None
+    scratch = raw[scratch_off : scratch_off + scratch_words * 4].view(torch.int32)
+    tables = raw[tables_off : tables_off + table_words * 4].view(torch.int32)
     return (
         pool,
         dq_pool,
@@ -1773,10 +1772,10 @@ class _MSABackwardPlan:
     task-build and grad-finalize executables are fetched from their own module-level caches inside
     ``preprocess``/``build_tasks``/``cast``, so the very first call of a process compiles there.
     ``zero`` and ``build_tasks`` must both run before ``launch_main``; ``build_tasks``
-    sets ``tables``, whose ``desc`` carries the exact task count and the CTA walk that
-    ``device_counts()`` reads back. A schedule without tasks yields zero gradients through the
-    same launches. Methods are bound on access, so the plan holds no reference cycle and its
-    buffers return to the caching allocator as soon as it is dropped."""
+    sets ``tables``, whose ``desc`` carries the exact task count and the CTA walk. A schedule
+    without tasks yields zero gradients through the same launches. Methods are bound on access,
+    so the plan holds no reference cycle and its buffers return to the caching allocator as soon
+    as it is dropped."""
 
     def __init__(
         self,
@@ -1829,9 +1828,6 @@ class _MSABackwardPlan:
             scratch=self._scratch,
             tables=self._tables_buf,
         )
-
-    def device_counts(self):
-        return self.tables.device_counts()
 
     def preprocess(self):
         _run_msa_backward_preprocess(self._out_c, self._grad_out_c, self._delta)
