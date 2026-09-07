@@ -64,9 +64,15 @@ _SENTENCE_TRANSFORMER_MODULE_TYPES = {
     "normalize": {
         "sentence_transformers.models.Normalize",
         "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
+        "sentence_transformers.base.modules.normalize.Normalize",
     },
 }
+_SUPPORTED_SENTENCE_TRANSFORMER_MODULE_STACKS = {
+    ("transformer", "pooling"),
+    ("transformer", "pooling", "normalize"),
+}
 _SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES = {
+    # v6 remaps these v5.4-era paths, keeping exported checkpoints loadable across v5.4+.
     "transformer": "sentence_transformers.base.modules.transformer.Transformer",
     "pooling": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
     "normalize": "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
@@ -154,23 +160,52 @@ def _load_sentence_transformer_wrapper_options(
     if not isinstance(modules, list):
         raise ValueError("Sentence Transformers modules.json must contain a list of modules.")
 
-    expected_module_types = [
-        _SENTENCE_TRANSFORMER_MODULE_TYPES["transformer"],
-        _SENTENCE_TRANSFORMER_MODULE_TYPES["pooling"],
-    ]
-    module_types = [module.get("type") if isinstance(module, dict) else None for module in modules]
-    if len(module_types) == 3:
-        expected_module_types.append(_SENTENCE_TRANSFORMER_MODULE_TYPES["normalize"])
-    if len(module_types) not in (2, 3) or any(
-        module_type not in allowed_types
-        for module_type, allowed_types in zip(module_types, expected_module_types, strict=True)
-    ):
+    module_roles = []
+    for module in modules:
+        module_type = module.get("type") if isinstance(module, dict) else None
+        module_role = next(
+            (
+                role
+                for role, allowed_types in _SENTENCE_TRANSFORMER_MODULE_TYPES.items()
+                if module_type in allowed_types
+            ),
+            None,
+        )
+        module_roles.append(module_role)
+    module_roles = tuple(module_roles)
+    if module_roles not in _SUPPORTED_SENTENCE_TRANSFORMER_MODULE_STACKS:
         raise ValueError(
             "Sentence Transformers metadata must use the exact supported module stack: "
             "Transformer, Pooling, and optional Normalize."
         )
-    if modules[0].get("path") != "":
+
+    modules_by_role = dict(zip(module_roles, modules, strict=True))
+    transformer_module = modules_by_role["transformer"]
+    pooling_module = modules_by_role["pooling"]
+    normalize_module = modules_by_role.get("normalize")
+    if transformer_module.get("path") != "":
         raise ValueError("Sentence Transformers Transformer metadata must reference the checkpoint root.")
+
+    if normalize_module is not None:
+        normalize_path = normalize_module.get("path")
+        if not isinstance(normalize_path, str) or not normalize_path:
+            raise ValueError("Sentence Transformers Normalize metadata must reference a module path.")
+        normalize_config = _load_sentence_transformer_json(
+            model_name_or_path,
+            os.path.join(normalize_path, "config.json"),
+            hf_kwargs,
+        )
+        if normalize_config is not None:
+            if not isinstance(normalize_config, dict):
+                raise ValueError("Sentence Transformers Normalize config.json is invalid.")
+            normalize_input_name = normalize_config.get("module_input_name", "sentence_embedding")
+            normalize_output_name = normalize_config.get("module_output_name")
+            if normalize_output_name is None:
+                normalize_output_name = normalize_input_name
+            if normalize_input_name != "sentence_embedding" or normalize_output_name != "sentence_embedding":
+                raise ValueError(
+                    "Sentence Transformers Normalize metadata must normalize the final sentence embedding in place."
+                )
 
     sentence_bert_config = _load_sentence_transformer_json(
         model_name_or_path,
@@ -183,7 +218,7 @@ def _load_sentence_transformer_wrapper_options(
             "the NeMo inference path does not lowercase text."
         )
 
-    pooling_path = modules[1].get("path")
+    pooling_path = pooling_module.get("path")
     if not isinstance(pooling_path, str) or not pooling_path:
         raise ValueError("Sentence Transformers Pooling metadata must reference a module path.")
     pooling_config = _load_sentence_transformer_json(
@@ -246,7 +281,7 @@ def _load_sentence_transformer_wrapper_options(
 
     return SentenceTransformerWrapperOptions(
         pooling=matching_pooling[0],
-        l2_normalize=len(modules) == 3,
+        l2_normalize=normalize_module is not None,
         query_prompt=query_prompt,
         document_prompt=document_prompt,
     )

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -51,6 +51,24 @@ class DFlashTargetBatch:
     position_ids: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None
     doc_remaining: torch.Tensor | None = None
+
+
+def resolve_text_config(config: Any) -> Any:
+    """Return the decoder-stack config, unwrapping a multimodal wrapper config.
+
+    A ``*ForConditionalGeneration`` target (e.g. ``Qwen3_5ForConditionalGeneration``,
+    which is what ``Qwen/Qwen3.8-27B`` ships as) keeps ``num_hidden_layers``,
+    ``hidden_size``, and ``vocab_size`` on a nested ``text_config`` and leaves the
+    outer config holding only the vision/text composition. Causal-LM targets keep
+    them at the top level, so this is the identity for them.
+
+    Args:
+        config: A ``PretrainedConfig`` for the frozen target model.
+
+    Returns:
+        ``config.text_config`` when present, otherwise ``config`` unchanged.
+    """
+    return getattr(config, "text_config", None) or config
 
 
 class HFDFlashTargetModel:
@@ -97,7 +115,7 @@ class HFDFlashTargetModel:
             )
 
     def _validate_layer_ids(self, target_layer_ids: Sequence[int]) -> list[int]:
-        num_layers = self.model.config.num_hidden_layers
+        num_layers = resolve_text_config(self.model.config).num_hidden_layers
         target_layer_ids = list(target_layer_ids)
         if len(target_layer_ids) == 0:
             raise ValueError("DFlash requires at least one target_layer_id.")

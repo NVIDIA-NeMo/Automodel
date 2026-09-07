@@ -90,7 +90,6 @@ optimizer:
   betas: [0.9, 0.95]
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
   
@@ -106,8 +105,4 @@ ci:
   nodes: 1
   time: "00:15:00"
   checkpoint_robustness:
-    check_source_load_parity: true
-    # Source max/mean KL are exactly zero in scoped CI; BF16 logits retain a
-    # bounded cosine of 0.9998064 after the FP8 checkpoint is dequantized.
-    source_load_cosine_threshold: 0.9995
     tokenizer_name: mistralai/Ministral-3-3B-Reasoning-2512

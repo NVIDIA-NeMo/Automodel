@@ -17,6 +17,7 @@ import inspect
 import logging
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
@@ -263,6 +264,7 @@ class ParallelizationStrategy(ABC):
         reshard_after_forward: bool | None = None,
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
@@ -292,20 +294,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         reshard_after_forward: bool | None = None,
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         fully_shard_fn=None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
-        frozen_multimodal_modules = [
-            name for name, module in iter_multimodal_modules(model) if module_is_fully_frozen(module)
-        ]
-        if frozen_multimodal_sharding == "per_layer" and frozen_multimodal_modules:
-            logger.warning(
-                "distributed.multimodal.frozen_sharding='per_layer' selected for %s. Every rank in the FSDP "
-                "group must execute or skip these modules the same number of times and in the same order on every "
-                "microbatch; rank-asymmetric modality execution can hang or desynchronize FSDP collectives.",
-                ", ".join(frozen_multimodal_modules),
-            )
         tp_mesh = device_mesh[tp_mesh_name]
         if fully_shard_fn is None:
             fully_shard_fn = fully_shard
@@ -406,20 +399,33 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
             else:
-                if (
-                    _should_use_hf_native_gradient_checkpointing(
-                        model,
-                        layer_groups,
-                        ac_scopes,
-                        enable_compile=enable_compile,
-                    )
-                    and not _has_kv_sharing
-                ):
+                if _should_use_hf_native_gradient_checkpointing(
+                    model,
+                    layer_groups,
+                    ac_scopes,
+                    enable_compile=enable_compile,
+                ) and (not _has_kv_sharing or _kv_sharing_survives_checkpoint_replay(model)):
                     # Work around a PyTorch FSDP2 bug that skips mixed-precision input casts during
                     # checkpoint recomputation. Remove when the minimum PyTorch version is 2.13.
                     apply_full_layer_checkpointing_to_layers(model, ac_layers)
                 else:
                     apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
+
+        if reapply_trainability is not None:
+            reapply_trainability(model)
+
+        # Evaluate frozen-module ownership only after TP/AC transformations and
+        # trainability rebinding so FSDP sees the final module hierarchy.
+        frozen_multimodal_modules = [
+            name for name, module in iter_multimodal_modules(model) if module_is_fully_frozen(module)
+        ]
+        if frozen_multimodal_sharding == "per_layer" and frozen_multimodal_modules:
+            logger.warning(
+                "distributed.multimodal.frozen_sharding='per_layer' selected for %s. Every rank in the FSDP "
+                "group must execute or skip these modules the same number of times and in the same order on every "
+                "microbatch; rank-asymmetric modality execution can hang or desynchronize FSDP collectives.",
+                ", ".join(frozen_multimodal_modules),
+            )
 
         # Set up mixed precision policy
         if not mp_policy:
@@ -508,6 +514,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
         reshard_after_forward: bool | None = None,
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
@@ -588,6 +595,9 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                     block_container[key] = checkpoint_wrapper(layer)
             # Refresh the local handle so the FSDP wrap below sees the wrapped blocks.
             _, layers = _nemotronh_decoder_blocks(model)
+
+        if reapply_trainability is not None:
+            reapply_trainability(model)
 
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
@@ -778,6 +788,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         # Not using custom tp_shard_plan; apply Wan-specific plan
@@ -855,6 +866,9 @@ class WanParallelizationStrategy(ParallelizationStrategy):
                 output_dtype=torch.float32,
             )
 
+        if reapply_trainability is not None:
+            reapply_trainability(model)
+
         # Apply FSDP sharding recursively and to root
         apply_fsdp2_sharding_recursively(
             model,
@@ -890,6 +904,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
@@ -908,6 +923,9 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
                     model.transformer_blocks[idx],
                     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
                 )
+
+        if reapply_trainability is not None:
+            reapply_trainability(model)
 
         # Apply FSDP sharding recursively and to root
         apply_fsdp2_sharding_recursively(
@@ -1513,6 +1531,10 @@ def translate_to_torch_parallel_style(style: str):
         return RowwiseParallel()
     elif style == "colwise_rep":
         return ColwiseParallel(output_layouts=Replicate())
+    elif style == "colwise_gather_output":
+        # HF maps this to ColwiseParallel(gather_output=True); gathering the output
+        # is the same as replicating it, so this matches "colwise_rep" above.
+        return ColwiseParallel(output_layouts=Replicate())
     elif style == "rowwise_rep":
         return RowwiseParallel(input_layouts=Replicate())
     elif style == "sequence_parallel":
@@ -1906,6 +1928,10 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
             "language": ["model.language_model.layers"],
             "vision": ["model.vision_model.transformer.resblocks"],
         },
+        "DeepseekV4ForCausalLM": {
+            "language": ["model.layers"],
+            "vision": ["model.vision.blocks"],
+        },
         # BAGEL (text-to-image + understanding). String-keyed to avoid an
         # import cycle: parallelizer is core distributed code, the BAGEL
         # model lives under components/models/bagel/. Lists both the Qwen2
@@ -2109,6 +2135,42 @@ def _should_use_hf_native_gradient_checkpointing(
         and getattr(model, "supports_gradient_checkpointing", False)
         and hasattr(model, "gradient_checkpointing_enable")
     )
+
+
+def _kv_sharing_survives_checkpoint_replay(model: nn.Module) -> bool:
+    """Return whether whole-block activation checkpointing is safe for a KV-shared model.
+
+    ``checkpoint_wrapper`` replays a whole decoder block during backward with the
+    arguments the forward saw. Unlike HF's ``GradientCheckpointingLayer.__call__``
+    it cannot drop ``past_key_values`` from that replay, so every layer that
+    writes to a cache writes to it a second time. A KV-shared model then needs
+    both halves to hold:
+
+    * the layers that populate the cache -- the *non*-shared ones, which are what
+      call ``Cache.update()`` -- must not accumulate on the replay, or the
+      recomputed K/V stops matching the forward;
+    * the shared layers must still read the K/V their source layer produced.
+
+    Neither holds for a model backed by an accumulating ``Cache``: the second
+    ``Cache.update()`` grows the entry and backward dies with a
+    ``CheckpointError`` about changed tensor metadata (observed on native HF
+    ``Gemma3nForCausalLM`` with ``use_cache=True``). KV-shared models therefore
+    stay on ``apply_submodule_checkpointing``, which leaves attention unwrapped,
+    by default.
+
+    A model that satisfies both halves opts in by setting the class attribute
+    ``kv_sharing_survives_checkpoint_replay = True``. Gemma4 E2B/E4B qualify: a
+    pass-through holder stands in for the cache, and the shared layers read a
+    separate store that the replay does not disturb (see
+    ``gemma4_moe/model.py``).
+
+    Args:
+        model: The model about to be checkpointed.
+
+    Returns:
+        Whether the model declares its KV sharing safe under whole-block replay.
+    """
+    return bool(getattr(model, "kv_sharing_survives_checkpoint_replay", False))
 
 
 def _uses_custom_moe_modules(model: nn.Module) -> bool:
@@ -2356,7 +2418,8 @@ def fsdp2_strategy_parallelize(
     reshard_after_forward: bool | None = None,
     activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
-):
+    reapply_trainability: Callable[[nn.Module], None] | None = None,
+) -> nn.Module:
     """
     Apply parallelisms and activation checkpointing to the model.
 
@@ -2391,6 +2454,9 @@ def fsdp2_strategy_parallelize(
             owned by the root FSDP unit (``"root"``), sharded normally
             (``"per_layer"``), or excluded from FSDP and copied on every rank
             (``"replicate"``).
+        reapply_trainability: Optional callback that re-resolves parameter
+            trainability after strategy-specific model surgery and immediately
+            before FSDP construction.
 
     Returns:
         The parallelized model.
@@ -2421,6 +2487,7 @@ def fsdp2_strategy_parallelize(
         reshard_after_forward=reshard_after_forward,
         activation_checkpointing_scope=activation_checkpointing_scope,
         frozen_multimodal_sharding=frozen_multimodal_sharding,
+        reapply_trainability=reapply_trainability,
     )
 
 
@@ -2551,6 +2618,7 @@ def megatron_fsdp_strategy_parallelize(
     fsdp_double_buffer: bool = False,
     dp_shard_dim: str = "dp",
     tp_dim: str = "tp",
+    reapply_trainability: Callable[[nn.Module], None] | None = None,
 ):
     """
     Apply tensor/data parallelism (MegatronFSDP) and optional activation-checkpointing to the model.
@@ -2606,6 +2674,9 @@ def megatron_fsdp_strategy_parallelize(
             Defaults to "dp".
         tp_dim (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tp".
+        reapply_trainability: Optional callback that re-resolves parameter
+            trainability after tensor-parallel surgery and immediately before
+            Megatron-FSDP construction.
 
     NOTE: The passed-in model should preferably reside on the meta device.
     Otherwise, ensure the model fits into available GPU or CPU memory.
@@ -2630,6 +2701,9 @@ def megatron_fsdp_strategy_parallelize(
     # TP sharding.
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
+
+    if reapply_trainability is not None:
+        reapply_trainability(model)
 
     # MegatronFSDP requires a sharded DP dimension to create its param/grad buffers.
     # In practice, configurations like world_size=2,tp=2 -> dp=1 frequently hit

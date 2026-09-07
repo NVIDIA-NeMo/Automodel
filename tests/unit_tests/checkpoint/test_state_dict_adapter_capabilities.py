@@ -173,10 +173,11 @@ def test_materializing_grouped_expert_adapters_keep_frugal_load(adapter_type):
     assert adapter.supports_write_through_checkpoint_load is False
 
 
-def test_materializing_gemma4_moe_adapter_keeps_frugal_load():
+def test_gemma4_moe_adapter_loads_without_a_full_checkpoint_copy():
     adapter = object.__new__(Gemma4MoEStateDictAdapter)
 
     assert adapter.supports_write_through_checkpoint_load is False
+    assert adapter.supports_checkpoint_load_without_full_copy is True
 
 
 def test_dense_grouped_adapter_does_not_require_an_expert_backend():
