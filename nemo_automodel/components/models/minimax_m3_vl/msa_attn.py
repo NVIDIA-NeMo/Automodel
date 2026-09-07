@@ -26,7 +26,10 @@ from nemo_automodel.components.models.minimax_m3_vl._msa import (
     _reject_unsupported_msa_configuration,
     _validate_msa_topology,
 )
-from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_forward_select import select_blocks_reference
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_forward_select import (
+    select_blocks,
+    warm_selection_variants,
+)
 from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Attention
 
 
@@ -53,9 +56,30 @@ class MiniMaxM3MSAAttention(MiniMaxM3Attention):
             num_index_heads=self.indexer.num_index_heads,
             block_size=self.indexer.block_size,
             topk_blocks=self.indexer.topk_blocks,
+            index_head_dim=self.indexer.index_head_dim,
             attention_dropout=float(getattr(config, "attention_dropout", 0.0) or 0.0),
+            score_type=self.indexer.score_type,
         )
         self._msa_attn = _MSAFlatAttention(self.head_dim**-0.5)
+
+    def _selection_arguments(self) -> dict[str, int]:
+        """Return the indexer settings block selection is keyed on.
+
+        The scorer warm-up and every per-layer selection call must agree on all five: the warm-up
+        otherwise compiles variants production never reaches, and a microbatch scored twice with
+        different values would silently reuse the first plan.
+
+        Returns:
+            The keyword arguments ``select_blocks`` and ``warm_selection_variants`` both take.
+        """
+        indexer = self.indexer
+        return {
+            "index_heads": indexer.num_index_heads,
+            "block_size": indexer.block_size,
+            "topk_blocks": indexer.topk_blocks,
+            "init_blocks": indexer.init_blocks,
+            "local_blocks": indexer.local_blocks,
+        }
 
     def _initialize_attention(self, softmax_scale: float) -> tuple[None, None]:
         """Own no generic attention backend; MSA runs its own SM100 kernels.
@@ -73,6 +97,17 @@ class MiniMaxM3MSAAttention(MiniMaxM3Attention):
         """
         return None, None
 
+    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
+        """Initialize the projections and, once per process, compile every scorer variant.
+
+        Args:
+            buffer_device: The device weights are materialized on. Construction happens on the meta
+                device, so this is the first point that knows where the scorer will run.
+            init_std: Standard deviation of the truncated-normal projection initialization.
+        """
+        super().init_weights(buffer_device, init_std)
+        warm_selection_variants(buffer_device, index_dim=self.indexer.index_head_dim, **self._selection_arguments())
+
     def setup_cp_attention(self, cp_mesh: Any) -> None:
         """Reject context parallelism at setup; MSA has no CP-aware selection or kernel.
 
@@ -87,30 +122,6 @@ class MiniMaxM3MSAAttention(MiniMaxM3Attention):
         raise NotImplementedError(
             "MiniMax M3 backend.sparse_attn='msa' requires cp_size=1; disable context parallelism "
             "or set backend.sparse_attn='generic'."
-        )
-
-    def _select_blocks(self, index_q: torch.Tensor, index_k: torch.Tensor, layout: _MSAPackedLayout) -> torch.Tensor:
-        """Choose each query's key blocks within its own document.
-
-        Args:
-            index_q: Index queries [tokens, index_heads, index_dim], post norm and RoPE.
-            index_k: Shared index key [tokens, 1, index_dim], post norm and RoPE.
-            layout: The packed-microbatch layout the tokens came from.
-
-        Returns:
-            Document-local block ids [index_heads, tokens, topk_blocks], int32, padded with -1.
-        """
-        aligned_index_k, query_positions, document_starts = layout._selection_inputs(index_k)
-        return select_blocks_reference(
-            index_q,
-            aligned_index_k,
-            query_positions,
-            document_starts,
-            block_size=self.indexer.block_size,
-            topk_blocks=self.indexer.topk_blocks,
-            init_blocks=self.indexer.init_blocks,
-            local_blocks=self.indexer.local_blocks,
-            score_type=self.indexer.score_type,
         )
 
     def forward(
@@ -128,7 +139,8 @@ class MiniMaxM3MSAAttention(MiniMaxM3Attention):
             x: Tensor of shape [batch, sequence, hidden], packed to [tokens, hidden] here and
                 unpacked again before returning.
             freqs_cis: Rotary table of shape [batch, sequence, rotary_dim], packed alongside ``x``.
-            attention_mask: Ignored. Document isolation travels as ``_msa_layout``.
+            attention_mask: Ignored. Document isolation travels as ``_msa_layout``; the model sets
+                the mask to None for every layer once MSA is on.
             _msa_layout: Packed-microbatch layout owned by ``MiniMaxM3TextModel``; required.
             **attn_kwargs: Backend arguments, none of which this path reads.
 
@@ -140,7 +152,7 @@ class MiniMaxM3MSAAttention(MiniMaxM3Attention):
         q, k, v = self._project_qkv(x)
         with torch.no_grad():
             index_q, index_k = self.indexer._project_qk(x, freqs_cis=freqs_cis, cp_size=1, cp_rank=0)
-            q2k = self._select_blocks(index_q, index_k, _msa_layout)
+            q2k = select_blocks(_msa_layout, index_q, index_k, **self._selection_arguments())
         q, k = apply_rotary_emb_qk(q, k, freqs_cis, format="thd", rope_fusion=self._rope_fusion)
         out = self._msa_attn(q, k, v, q2k, layout=_msa_layout)
         return _msa_layout.unpack(self.o_proj(out.flatten(1)))

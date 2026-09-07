@@ -97,7 +97,18 @@ def test_noncausal_mask_rejected() -> None:
         )
 
 
-@pytest.mark.parametrize("field,value", [("num_heads", 32), ("head_dim", 64), ("attention_dropout", 0.1)])
+@pytest.mark.parametrize(
+    "field,value",
+    # score_type: the fused scorer reports unscaled QK maxima, so "lse" would rank differently.
+    [
+        ("num_heads", 32),
+        ("head_dim", 64),
+        ("attention_dropout", 0.1),
+        ("score_type", "lse"),
+        # The fused scorer's QK tile fixes the index channel extent at 128 and checks nothing.
+        ("index_head_dim", 192),
+    ],
+)
 def test_fixed_topology(field: str, value: int | float) -> None:
     topology = dict(
         num_heads=64,
@@ -106,7 +117,9 @@ def test_fixed_topology(field: str, value: int | float) -> None:
         num_index_heads=4,
         block_size=128,
         topk_blocks=16,
+        index_head_dim=128,
         attention_dropout=0.0,
+        score_type="max",
     )
     msa._validate_msa_topology(**topology)
     topology[field] = value

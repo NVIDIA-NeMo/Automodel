@@ -84,4 +84,22 @@ def test_layout_is_rebuilt_when_the_batch_carries_no_packed_ids(builds: list[int
 
     assert builds[0] == 2 and first is not second
     assert len(m3_model._MSA_LAYOUT_MEMO) == 0
-    assert torch.equal(first._cu_seqlens, second._cu_seqlens) and first._max_seqlen == second._max_seqlen
+    assert torch.equal(first.cu_seqlens, second.cu_seqlens) and first.max_seqlen == second.max_seqlen
+
+
+def test_layout_exposes_the_packed_document_geometry() -> None:
+    doc_ids = torch.zeros(2, 8, dtype=torch.int64)
+    doc_ids[0, :3] = 1
+    doc_ids[0, 3:5] = 2
+    doc_ids[1, 2:6] = 1
+    layout = msa._MSAPackedLayout.build(doc_ids)
+
+    cu_seqlens = layout.cu_seqlens
+    assert cu_seqlens.dtype == torch.int32 and cu_seqlens.is_contiguous()
+    assert cu_seqlens.tolist() == [0, 3, 5, 9]
+    assert layout.max_seqlen == 4
+    # Every cu_seqlens slice must cover exactly one document, in pack row order.
+    packed_ids = layout.pack(doc_ids.unsqueeze(-1)).squeeze(-1)
+    assert int(cu_seqlens[-1]) == packed_ids.shape[0]
+    for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist(), strict=True):
+        assert packed_ids[start:end].unique().numel() == 1

@@ -34,3 +34,20 @@ def sm_capability(device: torch.device) -> tuple[int, int]:
         The ``(major, minor)`` compute capability of that device.
     """
     return torch.cuda.get_device_capability(device)
+
+
+def require_sm100(device: torch.device) -> None:
+    """Reject any device the MSA kernels are not built for, before compiling or launching one.
+
+    Args:
+        device: CUDA device the caller is about to run MSA kernels on.
+
+    Raises:
+        NotImplementedError: If ``device`` is not SM100.
+    """
+    capability = sm_capability(device)
+    if capability != (10, 0):
+        raise NotImplementedError(
+            "MiniMax M3 MSA first supports SM100 (compute capability 10.0) only; got compute capability "
+            f"{capability[0]}.{capability[1]} on {device}. Use sparse_attn='generic' on this GPU."
+        )

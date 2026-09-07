@@ -28,12 +28,12 @@ import torch
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.minimax_m3_vl._msa import _MSAPackedLayout
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
-from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_forward_select import select_blocks_reference
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
     MiniMaxM3Indexer,
     build_block_sparse_attn_mask,
     select_sparse_blocks,
 )
+from tests.unit_tests.models.minimax_m3_vl._msa_select_reference import select_blocks_reference_for
 
 
 def _rand_idx(seqlen, h_idx=4, dim=16, bsz=2, seed=0):
@@ -148,18 +148,7 @@ def test_indexer_document_local_support(
     query[..., 0] = 1
     key = torch.zeros(24, 1, indexer.index_head_dim)
     key[:, 0, 0] = torch.tensor([9.0] * 4 + [2.0] * 4 + [5.0] * 4 + [-1.0] * 2 + [1.0] * 4 + [8.0] * 4 + [-1.0] * 2)
-    aligned_key, query_positions, document_starts = layout._selection_inputs(key)
-    support = select_blocks_reference(
-        query,
-        aligned_key,
-        query_positions,
-        document_starts,
-        block_size=indexer.block_size,
-        topk_blocks=indexer.topk_blocks,
-        init_blocks=indexer.init_blocks,
-        local_blocks=indexer.local_blocks,
-        score_type=indexer.score_type,
-    )
+    support = select_blocks_reference_for(indexer, layout, query, key)
     assert support.shape == (indexer.num_index_heads, 24, 2)
     assert support.dtype == torch.int32 and support.is_contiguous()
     assert support[:, 0, 0].eq(0).all() and support[:, 0, 1].eq(-1).all()

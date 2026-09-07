@@ -25,7 +25,11 @@ import torch.nn as nn
 from torch.autograd.function import once_differentiable
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_forward_patch import _patch_msa_fmax
+from nemo_automodel.components.models.minimax_m3_vl.kernels import require_sm100
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_forward_patch import (
+    _patch_msa_fmax,
+    _patch_msa_jit_gencode,
+)
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import _MSABackwardSchedule
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import, safe_import_from
 
@@ -36,6 +40,8 @@ _MSA_KV_HEADS = 4
 _MSA_INDEX_HEADS = 4
 _MSA_HEAD_DIM = 128
 _MSA_ATTENTION_DROPOUT = 0.0
+_MSA_SCORE_TYPE = "max"
+_MSA_INDEX_DIM = 128
 
 _MSA_IMPORT_ERROR = (
     "BackendConfig.sparse_attn='msa' requires the fixed fmha-sm100 optional dependency. "
@@ -195,6 +201,16 @@ class _MSAPackedLayout:
     _workspace_size: int  # W: positive multiple of 128, including each document's alignment tail.
     _max_seqlen: int  # Longest real document.
     has_multiple_documents_per_row: bool
+
+    @property
+    def cu_seqlens(self) -> torch.Tensor:
+        """Contiguous int32 [documents + 1] compact document offsets, in exactly ``pack`` row order."""
+        return self._cu_seqlens
+
+    @property
+    def max_seqlen(self) -> int:
+        """Longest real document, in tokens."""
+        return self._max_seqlen
 
     @classmethod
     def validate(cls, doc_ids: torch.Tensor) -> tuple[bool, bool]:
@@ -378,34 +394,15 @@ class _MSAPackedLayout:
         restored = restored.index_copy(0, self._token_rows, packed)
         return restored.reshape(batch_size, sequence_length, *packed.shape[1:])
 
-    def _selection_inputs(
-        self,
-        index_k: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Map index_k[T,1,D] to aligned keys[1,W,1,D], query workspace rows[T] and document starts[T]."""
-        expected_tokens = self._token_rows.numel()
-        if index_k.dim() != 3 or index_k.shape[0] != expected_tokens or index_k.shape[1] != 1:
-            raise ValueError(
-                "index_k must have shape [tokens, 1, index_dim], got "
-                f"{tuple(index_k.shape)} for {expected_tokens} packed tokens"
-            )
-        if index_k.device != self._workspace_positions.device:
-            raise ValueError(f"layout is on {self._workspace_positions.device} but index_k is on {index_k.device}")
-
-        if self._workspace_size == expected_tokens:
-            aligned_index_k = index_k
-        else:
-            aligned_index_k = index_k.new_zeros((self._workspace_size, *index_k.shape[1:]))
-            aligned_index_k = aligned_index_k.index_copy(0, self._workspace_positions, index_k)
-        return aligned_index_k.unsqueeze(0), self._workspace_positions, self._query_doc_starts
-
 
 @dataclass(frozen=True, slots=True)
 class _MSAForwardKernels:
-    """Optional CSR/schedule builder and flat SM100 forward launchers."""
+    """Optional CSR/schedule builder, block scorer and flat SM100 forward launchers."""
 
     build_k2q_csr: Callable[..., Any]
     sparse_atten_func: Callable[..., Any]
+    fmha_sm100: Callable[..., Any]
+    fmha_sm100_plan: Callable[..., Any]
 
 
 # Cache success and absence; load CuTe only after runtime and tensor validation.
@@ -413,14 +410,21 @@ class _MSAForwardKernels:
 def _resolve_msa_forward() -> _MSAForwardKernels | None:
     """Resolve the optional forward entry points once, or ``None`` if absent."""
     available, module = safe_import("fmha_sm100.sparse", msg=_MSA_IMPORT_ERROR)
-    if not available:
+    has_jit, jit_module = safe_import("fmha_sm100.jit", msg=_MSA_IMPORT_ERROR)
+    has_fmha, fmha_module = safe_import("fmha_sm100", msg=_MSA_IMPORT_ERROR)
+    if not (available and has_jit and has_fmha):
         return None
-    build_k2q_csr = getattr(module, "build_k2q_csr", None)
-    sparse_atten_func = getattr(module, "sparse_atten_func", None)
-    if not callable(build_k2q_csr) or not callable(sparse_atten_func):
+    entry_points = (
+        getattr(module, "build_k2q_csr", None),
+        getattr(module, "sparse_atten_func", None),
+        getattr(fmha_module, "fmha_sm100", None),
+        getattr(fmha_module, "fmha_sm100_plan", None),
+    )
+    if not all(callable(entry_point) for entry_point in entry_points):
         return None
     _patch_msa_fmax(module)
-    return _MSAForwardKernels(build_k2q_csr=build_k2q_csr, sparse_atten_func=sparse_atten_func)
+    _patch_msa_jit_gencode(jit_module)
+    return _MSAForwardKernels(*entry_points)
 
 
 @lru_cache(maxsize=1)
@@ -458,18 +462,37 @@ def _validate_msa_topology(
     num_index_heads: int,
     block_size: int,
     topk_blocks: int,
+    index_head_dim: int,
     attention_dropout: float,
+    score_type: str,
 ) -> None:
-    """Require the fixed 64-query/4-KV-head, 128-channel, top-16 MSA topology and zero dropout."""
-    actual = (num_heads, num_kv_heads, head_dim, num_index_heads, block_size, topk_blocks)
-    expected = (_MSA_QUERY_HEADS, _MSA_KV_HEADS, _MSA_HEAD_DIM, _MSA_INDEX_HEADS, _MSA_BLOCK_SIZE, _MSA_TOPK_BLOCKS)
+    """Require the fixed 64-query/4-KV-head, 128-channel, top-16 MSA topology, zero dropout, max scores.
+
+    ``index_head_dim`` is load-bearing rather than cosmetic: the fused scorer's QK tile fixes the
+    channel extent at 128, and neither it nor its Python wrapper checks the argument, so a wider
+    index would be silently truncated to its first 128 channels and a narrower one zero-filled.
+    """
+    actual = (num_heads, num_kv_heads, head_dim, num_index_heads, block_size, topk_blocks, index_head_dim)
+    expected = (
+        _MSA_QUERY_HEADS,
+        _MSA_KV_HEADS,
+        _MSA_HEAD_DIM,
+        _MSA_INDEX_HEADS,
+        _MSA_BLOCK_SIZE,
+        _MSA_TOPK_BLOCKS,
+        _MSA_INDEX_DIM,
+    )
     if actual != expected:
         raise ValueError(
-            "MSA requires (num_heads, num_kv_heads, head_dim, num_index_heads, block_size, topk_blocks) "
-            f"= {expected}; got {actual}."
+            "MSA requires (num_heads, num_kv_heads, head_dim, num_index_heads, block_size, topk_blocks, "
+            f"index_head_dim) = {expected}; got {actual}."
         )
     if attention_dropout != _MSA_ATTENTION_DROPOUT:
         raise ValueError(f"MSA requires attention_dropout={_MSA_ATTENTION_DROPOUT:g}; got {attention_dropout}.")
+    if score_type != _MSA_SCORE_TYPE:
+        # The fused scorer reports unscaled QK maxima, so only a reduction that is invariant under a
+        # positive rescaling of the logits keeps the same ranking; logsumexp is not.
+        raise ValueError(f"MSA requires sparse_score_type={_MSA_SCORE_TYPE!r}; got {score_type!r}.")
 
 
 def _validate_flat_msa_inputs(
@@ -502,12 +525,7 @@ def _validate_flat_msa_inputs(
     misaligned = [name for name, tensor in (("q", q), ("k", k), ("v", v)) if tensor.data_ptr() % 16 != 0]
     if misaligned:
         raise ValueError(f"MSA requires 16-byte-aligned q/k/v storage; misaligned tensors={misaligned}.")
-    capability = torch.cuda.get_device_capability(q.device)
-    if capability != (10, 0):
-        raise NotImplementedError(
-            "MiniMax M3 MSA first supports SM100 (compute capability 10.0) only; got compute capability "
-            f"{capability[0]}.{capability[1]} on {q.device}. Use sparse_attn='generic' on this GPU."
-        )
+    require_sm100(q.device)
 
     metadata_tensors = (
         layout._workspace_positions,
