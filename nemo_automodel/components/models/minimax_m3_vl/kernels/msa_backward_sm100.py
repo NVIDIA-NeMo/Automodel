@@ -45,19 +45,17 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 
+from nemo_automodel.components.models.minimax_m3_vl.kernels import sm_capability
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_postprocess_sm100 import (
-    grad_finalize_executable,
     run_grad_finalize,
 )
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_preprocess_sm100 import (
     _run_msa_backward_preprocess,
-    preprocess_executable,
 )
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import _MSABackwardSchedule
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_task_build_sm100 import (
     DESC_WORDS,
     build_backward_tasks,
-    compile_task_build,
     task_build_storage,
 )
 
@@ -1616,7 +1614,7 @@ def _validate_inputs(
         raise ValueError("MiniMax M3 MSA backward requires CUDA tensors")
     if any(tensor.device != q.device for tensor in tensors):
         raise ValueError("all MiniMax M3 MSA backward tensors must be on one CUDA device")
-    if torch.cuda.get_device_capability(q.device) != (10, 0):
+    if sm_capability(q.device) != (10, 0):
         raise NotImplementedError("MiniMax M3 MSA backward requires an SM100 CUDA device")
     misaligned = [name for name, tensor in zip(names, tensors, strict=True) if tensor.data_ptr() % 16 != 0]
     if misaligned:
@@ -1771,8 +1769,10 @@ def _run_msa_backward(
 
 class _MSABackwardPlan:
     """One backward call minus its launches: validated inputs, one internal buffer (dQ/dK/dV
-    pools, delta, task scratch and tables) and the compiled executables (nothing compiles in the
-    methods). ``zero`` and ``build_tasks`` must both run before ``launch_main``; ``build_tasks``
+    pools, delta, task scratch and tables) and the main compiled executable. The preprocess,
+    task-build and grad-finalize executables are fetched from their own module-level caches inside
+    ``preprocess``/``build_tasks``/``cast``, so the very first call of a process compiles there.
+    ``zero`` and ``build_tasks`` must both run before ``launch_main``; ``build_tasks``
     sets ``tables``, whose ``desc`` carries the exact task count and the CTA walk that
     ``device_counts()`` reads back. A schedule without tasks yields zero gradients through the
     same launches. Methods are bound on access, so the plan holds no reference cycle and its
@@ -1886,13 +1886,10 @@ def _plan_msa_backward(q, k_aligned, v_aligned, grad_out, lse, out, schedule, *,
     dq_v = dq_pool.unsqueeze(0)
     lse_v = lse_c.unsqueeze(0).transpose(1, 2)
     delta_v = delta.unsqueeze(0).transpose(1, 2)
-    key = ("minimax-m3-msa-backward-sm100", torch.cuda.get_device_capability(device), q_c.dtype, _DQ_ACCUM)
+    key = ("minimax-m3-msa-backward-sm100", sm_capability(device), q_c.dtype, _DQ_ACCUM)
     if key not in _COMPILE_CACHE:
         _COMPILE_CACHE[key] = _compile_backward()
     exe = _COMPILE_CACHE[key]
-    preprocess_executable(device, out_c.dtype)
-    grad_finalize_executable(device, dq_pool.dtype, interleaved=True)
-    compile_task_build(device)
     plan = _MSABackwardPlan(
         exe=exe,
         args_before_tasks=(q_v, k_v, v_v, grad_out_v, lse_v, delta_v),

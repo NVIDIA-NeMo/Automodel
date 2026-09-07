@@ -34,6 +34,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Int32
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
+from nemo_automodel.components.models.minimax_m3_vl.kernels import sm_capability
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import (
     _BLOCK_SIZE,
     _NUM_INDEX_HEADS,
@@ -459,7 +460,7 @@ class _MSATaskBuildSm100:
 
 
 def _compile(device: torch.device) -> Any:
-    key = ("minimax-m3-msa-task-build-sm100", torch.cuda.get_device_capability(device))
+    key = ("minimax-m3-msa-task-build-sm100", sm_capability(device))
     if key not in _COMPILE_CACHE:
         n_work = cute.sym_int32(symbol="work_capacity")
         n_rows = cute.sym_int32(symbol="rows_plus_one")

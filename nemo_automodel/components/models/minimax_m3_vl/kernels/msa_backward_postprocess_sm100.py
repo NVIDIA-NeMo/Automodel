@@ -34,6 +34,8 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
+from nemo_automodel.components.models.minimax_m3_vl.kernels import sm_capability
+
 HEAD_DIM = 128
 POOL_ROW = 2 * HEAD_DIM  # (d, e) pairs of one head pair
 NUM_THREADS = 256
@@ -142,7 +144,7 @@ class _MSAGradFinalizeSm100:
 
 def grad_finalize_executable(device: torch.device, dq_dtype: torch.dtype, interleaved: bool) -> Any:
     """Compile (once per device capability, pool dtype and layout) and return the finalize executable."""
-    key = ("minimax-m3-msa-grad-finalize-sm100", torch.cuda.get_device_capability(device), dq_dtype, interleaved)
+    key = ("minimax-m3-msa-grad-finalize-sm100", sm_capability(device), dq_dtype, interleaved)
     if key not in _COMPILE_CACHE:
         in_dtype = {torch.float16: cutlass.Float16, torch.bfloat16: cutlass.BFloat16}[dq_dtype]
         n_rows = cute.sym_int32(symbol="dq_rows")

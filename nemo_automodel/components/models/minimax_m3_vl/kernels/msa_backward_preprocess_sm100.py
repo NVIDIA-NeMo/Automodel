@@ -34,6 +34,8 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
+from nemo_automodel.components.models.minimax_m3_vl.kernels import sm_capability
+
 HEAD_DIM = 128
 NUM_Q_HEADS = 64
 TILE_M = 128
@@ -163,7 +165,7 @@ def _run_msa_backward_preprocess(
 
 def preprocess_executable(device: torch.device, dtype: torch.dtype) -> Any:
     """Compile (once per device capability and dtype) and return the delta executable."""
-    key = ("minimax-m3-msa-backward-preprocess-sm100", torch.cuda.get_device_capability(device), dtype)
+    key = ("minimax-m3-msa-backward-preprocess-sm100", sm_capability(device), dtype)
     if key not in _COMPILE_CACHE:
         num_tokens = cute.sym_int32(symbol="num_tokens")
         # stride_order[i] is the rank of mode i, 0 = innermost: row-major THD.

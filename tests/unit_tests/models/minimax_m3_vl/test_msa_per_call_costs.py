@@ -21,6 +21,19 @@ from nemo_automodel.components.models.minimax_m3_vl import _msa as msa
 from nemo_automodel.components.models.minimax_m3_vl import model as m3_model
 
 
+def test_align_backward_tensor_scatters_in_place_without_a_copy() -> None:
+    compact = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3)
+    positions = torch.tensor([5, 0, 3, 1], dtype=torch.int64)
+
+    aligned = msa._align_backward_tensor(compact, positions, 8)
+
+    assert aligned.shape == (8, 2, 3)
+    assert aligned.is_contiguous()
+    torch.testing.assert_close(aligned[positions], compact, rtol=0, atol=0)
+    unwritten = torch.ones(8, dtype=torch.bool).index_fill_(0, positions, False)
+    assert torch.count_nonzero(aligned[unwritten]) == 0
+
+
 def _doc_ids() -> torch.Tensor:
     """Return int64 packed ids[1, 262] with two documents and a padding tail."""
     ids = torch.zeros(1, 262, dtype=torch.int64)

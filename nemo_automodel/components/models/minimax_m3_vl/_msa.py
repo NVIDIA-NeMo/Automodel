@@ -565,7 +565,7 @@ def _align_backward_tensor(
             f"workspace_positions{workspace_positions.shape} must have one entry per row of {compact.shape}."
         )
     workspace = compact.new_zeros((workspace_size, compact.shape[1], compact.shape[2]))
-    return workspace.index_copy(0, workspace_positions, compact).contiguous()
+    return workspace.index_copy_(0, workspace_positions, compact)
 
 
 class _MSASparseAttentionFunction(torch.autograd.Function):

@@ -13,3 +13,24 @@
 # limitations under the License.
 
 """Model-private MSA kernels, loaded lazily by _msa; no eager CuTe imports."""
+
+from functools import lru_cache
+
+import torch
+
+
+@lru_cache
+def sm_capability(device: torch.device) -> tuple[int, int]:
+    """Return the memoized CUDA compute capability of ``device``.
+
+    ``torch.cuda.get_device_capability`` costs about 1.6 us and one MSA backward calls it eight
+    times: the SM100 guard plus four compile-cache keys, three of which are reached twice. A
+    device's capability cannot change, so look it up once per device.
+
+    Args:
+        device: CUDA device taken from a tensor, which always carries an explicit index.
+
+    Returns:
+        The ``(major, minor)`` compute capability of that device.
+    """
+    return torch.cuda.get_device_capability(device)
