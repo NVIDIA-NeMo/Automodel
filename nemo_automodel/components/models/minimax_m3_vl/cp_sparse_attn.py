@@ -272,10 +272,8 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
     ) -> torch.Tensor:
         """Map local x[B,S,H], freqs_cis[B,S,R] and mask[B,S] or [B,1,S,S] to local output[B,S,H]."""
         cp_mesh = self._cp_mesh
-        if self._use_msa or cp_mesh is None or cp_mesh.size() <= 1 or self.indexer is None:
+        if cp_mesh is None or cp_mesh.size() <= 1 or self.indexer is None:
             return super().forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
-        if attn_kwargs.get("_msa_layout") is not None:
-            raise TypeError("_msa_layout is model-owned and may only be passed to MSA attention layers.")
         return self._cp_forward(x, freqs_cis=freqs_cis, **attn_kwargs)
 
     def _cp_forward(self, x: torch.Tensor, *, freqs_cis: torch.Tensor, **attn_kwargs: Any) -> torch.Tensor:

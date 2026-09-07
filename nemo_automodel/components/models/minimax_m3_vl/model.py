@@ -47,13 +47,13 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.minimax_m3_vl._msa import (
-    _msa_cp_enabled,
     _MSAPackedLayout,
     _reject_unsupported_msa_runtime,
     _resolve_canonical_document_map,
 )
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import Block, MiniMaxM3RMSNorm
+from nemo_automodel.components.models.minimax_m3_vl.msa_attn import MiniMaxM3MSAAttention
 from nemo_automodel.components.models.minimax_m3_vl.mtp import MiniMaxM3MTP
 from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import (
     MiniMaxM3StateDictAdapter,
@@ -176,7 +176,9 @@ class MiniMaxM3TextModel(nn.Module):
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
-        self._msa_layer_ids = frozenset(layer_id for layer_id, block in self.layers.items() if block.self_attn._use_msa)
+        self._msa_layer_ids = frozenset(
+            layer_id for layer_id, block in self.layers.items() if isinstance(block.self_attn, MiniMaxM3MSAAttention)
+        )
         self._msa_model_has_dense_layers = len(self._msa_layer_ids) != len(self.layers)
         if self._msa_layer_ids and int(getattr(config, "num_mtp_modules", 0) or 0) > 0:
             raise NotImplementedError("MiniMax M3 MSA sparse attention supports MTP0 only; set num_mtp_modules=0")
@@ -237,7 +239,7 @@ class MiniMaxM3TextModel(nn.Module):
 
         use_msa = bool(self._msa_layer_ids)
         if use_msa:
-            _reject_unsupported_msa_runtime(attn_kwargs, cp_enabled=_msa_cp_enabled(self))
+            _reject_unsupported_msa_runtime(attn_kwargs)
 
         # Pipeline stages after the first receive the previous stage's hidden
         # states in the input_ids slot (a float tensor) with embed_tokens=None.
@@ -423,7 +425,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         """Map ids/positions/padding[B,S] and mask[B,S] or [B,1,S,S] to logits[B,S,V] or MTP logits; MSA uses BSHD."""
         use_msa = bool(self.model._msa_layer_ids)
         if use_msa:
-            _reject_unsupported_msa_runtime(attn_kwargs, cp_enabled=_msa_cp_enabled(self))
+            _reject_unsupported_msa_runtime(attn_kwargs)
         if attn_kwargs.get("qkv_format") == "thd":
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs

@@ -29,6 +29,7 @@ from nemo_automodel.components.models.minimax_m3_vl import _msa as msa
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Attention, MiniMaxM3Indexer
 from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+from nemo_automodel.components.models.minimax_m3_vl.msa_attn import MiniMaxM3MSAAttention
 from nemo_automodel.shared.import_utils import UnavailableError
 
 _BLOCK, _HEADS, _KV_HEADS, _DIM, _TOPK = 128, 64, 4, 128, 16
@@ -204,7 +205,7 @@ def test_checkpointed_layer_projection_gradient_parity() -> None:
     config = _config()
     torch.manual_seed(20260903)
     with device:
-        actual_layer = MiniMaxM3Attention(config, _backend(), is_sparse_attention_layer=True)
+        actual_layer = MiniMaxM3MSAAttention(config, _backend(), is_sparse_attention_layer=True)
         reference_layer = MiniMaxM3Attention(config, _backend("generic"), is_sparse_attention_layer=True)
     reference_layer.load_state_dict(actual_layer.state_dict())
     documents = torch.ones(2, 16, dtype=torch.int64, device=device)
@@ -221,7 +222,7 @@ def test_checkpointed_layer_projection_gradient_parity() -> None:
 
     def recompute(hidden: torch.Tensor) -> torch.Tensor:
         """Map BF16 hidden[batch,sequence,hidden] to attention output with the same shape."""
-        return actual_layer(hidden, freqs_cis=frequencies, attention_mask=keep, _msa_layout=layout)
+        return actual_layer(hidden, freqs_cis=frequencies, _msa_layout=layout)
 
     actual = checkpoint(recompute, actual_x, use_reentrant=False)
     expected = reference_layer(reference_x, freqs_cis=frequencies, attention_mask=keep)

@@ -41,14 +41,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
-from nemo_automodel.components.models.minimax_m3_vl._msa import (
-    _msa_cp_enabled,
-    _MSAFlatAttention,
-    _MSAPackedLayout,
-    _reject_unsupported_msa_configuration,
-    _reject_unsupported_msa_runtime,
-    _validate_msa_topology,
-)
+from nemo_automodel.components.models.minimax_m3_vl._msa import _MSAPackedLayout
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 
 
@@ -461,11 +454,8 @@ class MiniMaxM3Attention(nn.Module):
     ):
         super().__init__()
         self.backend = backend
-        self._use_msa = is_sparse_attention_layer and backend.sparse_attn == "msa"
         self._attn_impl = backend.attn
         self._rope_fusion = backend.rope_fusion
-        if self._use_msa:
-            _reject_unsupported_msa_configuration(backend)
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
@@ -507,30 +497,48 @@ class MiniMaxM3Attention(nn.Module):
             MiniMaxM3Indexer(config, config.sparse_attention_config, backend) if is_sparse_attention_layer else None
         )
 
-        softmax_scale = self.head_dim**-0.5
-        if self._use_msa:
-            _validate_msa_topology(
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                num_index_heads=self.indexer.num_index_heads,
-                block_size=self.indexer.block_size,
-                topk_blocks=self.indexer.topk_blocks,
-                attention_dropout=float(getattr(config, "attention_dropout", 0.0) or 0.0),
-            )
-            self._msa_attn = _MSAFlatAttention(softmax_scale)
-            self.attn_module = None
-            self.attn_func = None
-        else:
-            self._msa_attn = None
-            self.attn_module, self.attn_func = initialize_attn_module_and_func(
-                attn_impl=self._attn_impl,
-                num_attention_heads=self.num_heads,
-                num_qk_channels=self.head_dim,
-                num_v_channels=self.head_dim,
-                softmax_scale=softmax_scale,
-                num_gqa_groups=self.num_kv_heads,
-            )
+        self.attn_module, self.attn_func = self._initialize_attention(self.head_dim**-0.5)
+
+    def _initialize_attention(self, softmax_scale: float) -> tuple[nn.Module | None, Any]:
+        """Build the attention backend this layer computes with.
+
+        Subclasses that run their own kernels override this rather than letting the generic backend
+        be built and discarded: constructing it can import an optional dependency they do not need.
+
+        Args:
+            softmax_scale: The scale the backend applies to the QK product.
+
+        Returns:
+            The backend module, or None when the layer owns no module, and the callable ``forward``
+            invokes.
+        """
+        return initialize_attn_module_and_func(
+            attn_impl=self._attn_impl,
+            num_attention_heads=self.num_heads,
+            num_qk_channels=self.head_dim,
+            num_v_channels=self.head_dim,
+            softmax_scale=softmax_scale,
+            num_gqa_groups=self.num_kv_heads,
+        )
+
+    def _project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project hidden states to per-head q/k/v, with per-head QK norm already applied.
+
+        Args:
+            x: Hidden states whose last dimension is ``hidden``; [tokens, hidden] and
+                [batch, sequence, hidden] are both accepted and the leading layout is preserved.
+
+        Returns:
+            ``q[..., num_heads, head_dim]`` and ``k``/``v[..., num_kv_heads, head_dim]``. QK norm
+            runs before RoPE, matching the sglang reference (``_qk_norm`` then ``rotary_emb``).
+        """
+        leading = tuple(x.shape[:-1])
+        q = self.q_proj(x).view(*leading, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(*leading, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(*leading, self.num_kv_heads, self.head_dim)
+        if self.q_norm is None:
+            return q, k, v
+        return self.q_norm(q), self.k_norm(k), v
 
     def forward(
         self,
@@ -541,69 +549,38 @@ class MiniMaxM3Attention(nn.Module):
         _msa_layout: _MSAPackedLayout | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        """Map x[B,S,H]/[T,H], freqs_cis[...,R] and mask[B,S]/[B,heads,S,S] to x-shaped output; MSA skips padding."""
-        if self._use_msa:
-            if x.dim() != 3:
-                raise NotImplementedError(
-                    "MiniMax M3 backend.sparse_attn='msa' supports BSHD input only; "
-                    "use qkv_format='bshd' or set backend.sparse_attn='generic' for THD."
-                )
-            _reject_unsupported_msa_runtime(attn_kwargs, cp_enabled=_msa_cp_enabled(self))
-            if _msa_layout is None:
-                raise ValueError(
-                    "MiniMax M3 backend.sparse_attn='msa' requires the model-owned _msa_layout; "
-                    "call the attention through MiniMaxM3TextModel."
-                )
-            if not isinstance(_msa_layout, _MSAPackedLayout):
-                raise TypeError(f"_msa_layout must be an _MSAPackedLayout, got {type(_msa_layout).__name__}.")
-        elif _msa_layout is not None:
+        """Map hidden states and rotary tables to an output of the same layout as ``x``.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden], or [tokens, hidden] under a varlen
+                backend; the return value keeps the same layout.
+            freqs_cis: Rotary table of shape [..., rotary_dim], with ``x``'s leading layout.
+            attention_mask: Tensor of shape [batch, sequence] or [batch, heads, sequence, sequence].
+            _msa_layout: Model-owned packed-microbatch layout. Must be None here: only MSA
+                attention layers consume one, and they override this method.
+            **attn_kwargs: Backend arguments forwarded to the attention implementation.
+
+        Returns:
+            Tensor with the same shape as ``x``.
+        """
+        if _msa_layout is not None:
             raise TypeError("_msa_layout is valid only for an attention layer constructed with sparse_attn='msa'.")
 
         attn_kwargs.pop("padding_mask", None)
         attn_kwargs.pop("position_ids", None)
-        if self._use_msa:
-            # Pack once so no projection or output GEMM runs on padding rows.
-            x = _msa_layout.pack(x)
-            freqs_cis = _msa_layout.pack(freqs_cis)
-        if len(x.shape) == 2:
-            qkv_format = "thd"
-            num_tokens = x.shape[0]
-            q = self.q_proj(x).view(num_tokens, self.num_heads, self.head_dim)
-            k = self.k_proj(x).view(num_tokens, self.num_kv_heads, self.head_dim)
-            v = self.v_proj(x).view(num_tokens, self.num_kv_heads, self.head_dim)
-        else:
-            qkv_format = "bshd"
-            bsz, seqlen, _ = x.size()
-            q = self.q_proj(x).view(bsz, seqlen, self.num_heads, self.head_dim)
-            k = self.k_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-            v = self.v_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-
-        # Per-head QK norm (over head_dim) is applied before RoPE, matching the
-        # sglang reference (``_qk_norm`` then ``rotary_emb``).
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        qkv_format = "thd" if x.dim() == 2 else "bshd"
+        q, k, v = self._project_qkv(x)
 
         if self.indexer is not None:
-            if self._use_msa:
-                with torch.no_grad():
-                    idx_q, idx_k = self.indexer._project_qk(
-                        x,
-                        freqs_cis=freqs_cis,
-                        cp_size=1,
-                        cp_rank=0,
-                    )
-                    q2k = self.indexer._select_msa_blocks(idx_q, idx_k, layout=_msa_layout)
-            else:
-                if qkv_format != "bshd":
-                    raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
-                sparse_keep = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
-                # Preserve the caller's padding mask: padded keys must stay masked
-                # rather than becoming eligible for top-k block selection. Boolean AND
-                # (not additive) so SDPA is bf16-safe -- see build_block_sparse_attn_mask.
-                if attention_mask is not None:
-                    sparse_keep = sparse_keep & _padding_mask_to_keep_mask(attention_mask, sparse_keep)
-                attention_mask = sparse_keep
+            if qkv_format != "bshd":
+                raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
+            sparse_keep = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
+            # Preserve the caller's padding mask: padded keys must stay masked
+            # rather than becoming eligible for top-k block selection. Boolean AND
+            # (not additive) so SDPA is bf16-safe -- see build_block_sparse_attn_mask.
+            if attention_mask is not None:
+                sparse_keep = sparse_keep & _padding_mask_to_keep_mask(attention_mask, sparse_keep)
+            attention_mask = sparse_keep
 
         q, k = apply_rotary_emb_qk(
             q,
@@ -615,10 +592,6 @@ class MiniMaxM3Attention(nn.Module):
             cp_size=attn_kwargs.get("cp_size", 1),
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
-
-        if self._use_msa:
-            out = self._msa_attn(q, k, v, q2k, layout=_msa_layout)
-            return _msa_layout.unpack(self.o_proj(out.flatten(1)))
 
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
             q, k, v, attention_mask, self._attn_impl, **attn_kwargs
@@ -669,7 +642,13 @@ class Block(nn.Module):
                 f"MiniMax M3 sparse layer {layer_idx} has disable_index_value=0 (index value/output "
                 "projections), which is not supported (only the selection-only indexer is implemented)."
             )
-        if is_sparse_attention_layer:
+        if is_sparse_attention_layer and backend.sparse_attn == "msa":
+            # MSA owns packing, block selection and the SM100 kernels; it never reaches the generic
+            # attention backend and rejects CP in setup_cp_attention. Lazy import breaks the cycle.
+            from nemo_automodel.components.models.minimax_m3_vl.msa_attn import MiniMaxM3MSAAttention
+
+            self.self_attn = MiniMaxM3MSAAttention(config, backend, is_sparse_attention_layer=True)
+        elif is_sparse_attention_layer:
             # Sparse layers use the CP-aware attention so context parallelism can
             # rebuild a correct global-sequence block-sparse mask (FlexAttention).
             # It delegates to the plain sparse forward when CP is off (_cp_mesh

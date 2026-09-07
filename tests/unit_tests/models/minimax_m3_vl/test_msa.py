@@ -23,6 +23,8 @@ import torch
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import TEFp8Config
 from nemo_automodel.components.models.minimax_m3_vl import _msa as msa
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+from nemo_automodel.components.models.minimax_m3_vl.msa_attn import MiniMaxM3MSAAttention
 from nemo_automodel.shared.import_utils import UnavailableError
 
 
@@ -124,17 +126,68 @@ def test_unsupported_backend(field: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "runtime,cp_enabled,match",
+    "runtime,match",
     [
-        ({"qkv_format": "thd"}, False, "BSHD"),
-        ({"use_cache": True}, False, "cache-free prefill"),
-        ({"is_causal": False}, False, "causal self-attention"),
-        ({}, True, "cp_size=1"),
+        ({"qkv_format": "thd"}, "BSHD"),
+        ({"use_cache": True}, "cache-free prefill"),
+        ({"is_causal": False}, "causal self-attention"),
     ],
 )
-def test_unsupported_runtime(runtime: dict[str, object], cp_enabled: bool, match: str) -> None:
+def test_unsupported_runtime(runtime: dict[str, object], match: str) -> None:
     with pytest.raises(NotImplementedError, match=match):
-        msa._reject_unsupported_msa_runtime(runtime, cp_enabled=cp_enabled)
+        msa._reject_unsupported_msa_runtime(runtime)
+
+
+def _msa_attention() -> MiniMaxM3MSAAttention:
+    """Build one MSA attention layer on the meta device, at MSA's fixed 64/4/128 topology."""
+    config = MiniMaxM3VLTextConfig(
+        hidden_size=32,
+        num_attention_heads=64,
+        num_key_value_heads=4,
+        head_dim=128,
+        rotary_dim=64,
+        attention_dropout=0.0,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_num_index_heads": 4,
+            "sparse_index_dim": 128,
+            "sparse_block_size": 128,
+            "sparse_topk_blocks": 16,
+            "sparse_init_block": 0,
+            "sparse_local_block": 1,
+            "sparse_score_type": "max",
+        },
+    )
+    backend = BackendConfig(attn="te", sparse_attn="msa", linear="torch", rms_norm="torch", rope_fusion=False)
+    with torch.device("meta"):
+        return MiniMaxM3MSAAttention(config, backend)
+
+
+def test_context_parallelism_is_rejected_at_setup() -> None:
+    # moe/parallelizer.py:991 dispatches on hasattr(self_attn, "setup_cp_attention"); without this
+    # method CP would be skipped with only a log warning and the run would silently be wrong.
+    with pytest.raises(NotImplementedError, match="cp_size=1"):
+        _msa_attention().setup_cp_attention(cp_mesh=None)
+
+
+def test_the_generic_attention_backend_is_not_installed() -> None:
+    # A leftover TE DotProductAttention would also route apply_cp into TE's CP branch instead of
+    # setup_cp_attention (moe/parallelizer.py:983).
+    attention = _msa_attention()
+    assert attention.attn_module is None and attention.attn_func is None
+
+
+def test_deterministic_algorithms_are_rejected_before_any_kernel_runs() -> None:
+    # The backward accumulates dK/dV with fp32 atomics and dQ with packed 16-bit atomics, so a run
+    # that asked for determinism must be told, not silently given a non-reproducible result.
+    layout = msa._MSAPackedLayout.build(torch.ones(1, 8, dtype=torch.int64))
+    empty = torch.empty(0)
+    torch.use_deterministic_algorithms(True)
+    try:
+        with pytest.raises(NotImplementedError, match="not bitwise deterministic"):
+            msa._MSAFlatAttention(0.125)(empty, empty, empty, empty, layout=layout)
+    finally:
+        torch.use_deterministic_algorithms(False)
 
 
 def test_optional_dependencies_are_lazy_and_actionable(monkeypatch: pytest.MonkeyPatch) -> None:

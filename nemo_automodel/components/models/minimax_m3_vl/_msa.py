@@ -744,20 +744,8 @@ def _reject_unsupported_msa_configuration(backend: BackendConfig) -> None:
         )
 
 
-def _msa_cp_enabled(owner: Any) -> bool:
-    """Check the apply_cp flag or attention CP mesh; runtime kwargs do not encode BSHD CP topology."""
-    if getattr(owner, "_cp_enabled", False):
-        return True
-    cp_mesh = getattr(owner, "_cp_mesh", None)
-    return cp_mesh is not None and cp_mesh.size() > 1
-
-
-def _reject_unsupported_msa_runtime(attn_kwargs: Mapping[str, Any], *, cp_enabled: bool = False) -> None:
-    """Reject CP/cache/THD/window/cross-attention/capture; tensor kwargs are checked only for presence."""
-    if cp_enabled:
-        raise NotImplementedError(
-            "MiniMax M3 MSA requires cp_size=1; disable context parallelism or set backend.sparse_attn='generic'."
-        )
+def _reject_unsupported_msa_runtime(attn_kwargs: Mapping[str, Any]) -> None:
+    """Reject cache/THD/window/cross-attention/capture; tensor kwargs are checked only for presence."""
     qkv_format = attn_kwargs.get("qkv_format", "bshd")
     if qkv_format != "bshd":
         raise NotImplementedError(
