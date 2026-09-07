@@ -176,3 +176,10 @@ def _cta_row_interval(
     else:
         row_lo = bidx * rows_per_cta
     return row_lo, min(row_lo + rows_per_cta, num_rows)
+
+
+def _grid_launch_bound(capacity: int, rows_forced: int, num_sms: int) -> int:
+    """Bound every count up to capacity: full CTAs plus at most one tail CTA per SM."""
+    if rows_forced > 0:
+        return capacity // rows_forced + num_sms
+    return max(min(capacity, _ROWS_PER_CTA_SWITCH) // _ROWS_PER_CTA_SMALL, capacity // _ROWS_PER_CTA_LARGE) + num_sms

@@ -44,6 +44,7 @@ from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import 
     _build_backward_tasks,
     _check_schedule,
     _chunk_map,
+    _grid_launch_bound,
     _MSABackwardSchedule,
     _rows_per_cta_override,
     _select_rows_per_cta,
@@ -126,13 +127,6 @@ def _task_build_sizes(
     bins = _NUM_INDEX_HEADS * num_chunks * max(num_kblocks, 1)
     work_capacity = int(schedule.scheduler_metadata.shape[0])
     return capacity, bins, DESC_WORDS + work_capacity + capacity + 4 * bins, capacity * (4 + 2 * _QUERY_CHUNK)
-
-
-def _grid_launch_bound(capacity: int, rows_forced: int, num_sms: int) -> int:
-    """Bound every count up to capacity: full CTAs plus at most one tail CTA per SM."""
-    if rows_forced > 0:
-        return capacity // rows_forced + num_sms
-    return max(min(capacity, _ROWS_PER_CTA_SWITCH) // _ROWS_PER_CTA_SMALL, capacity // _ROWS_PER_CTA_LARGE) + num_sms
 
 
 @cute.jit
