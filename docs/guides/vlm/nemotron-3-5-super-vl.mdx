@@ -240,10 +240,14 @@ distributed:
   ep_size: 16
 
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   lr: 2e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
+  master_weights: true              # fp32 master copy of the bf16 LoRA weights, as in the SFT recipe
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
 ```
 
 Without fp32 master weights and optimizer state for the frozen 121B parameters, LoRA fits on
@@ -287,22 +291,22 @@ srun --nodes=2 --ntasks-per-node=8 --gpus-per-node=8 \
 Trainable parameters: 177,012,736
 Trainable parameters percentage: 0.15%
 
-step    0 | loss 0.5051 | grad_norm  1.96 | lr 2.00e-04 | mem 22.18 GiB
-step   10 | loss 0.1096 | grad_norm  0.72 | lr 2.00e-04 | mem 22.25 GiB
-step   50 | loss 0.0566 | grad_norm  0.37 | lr 2.00e-04 | mem 22.25 GiB
-step  100 | loss 0.0314 | grad_norm  1.03 | lr 2.00e-04 | mem 22.25 GiB
-step  200 | loss 0.0112 | grad_norm  0.16 | lr 2.00e-04 | mem 22.25 GiB
-step  300 | loss 0.0144 | grad_norm  0.22 | lr 2.00e-04 | mem 22.25 GiB
-step  399 | loss 0.0030 | grad_norm  0.10 | lr 2.00e-04 | mem 22.25 GiB
+step    0 | loss 0.5060 | grad_norm  1.98 | lr 2.00e-04 | mem 22.18 GiB
+step   10 | loss 0.0973 | grad_norm  0.70 | lr 2.00e-04 | mem 22.27 GiB
+step   50 | loss 0.0528 | grad_norm  0.30 | lr 2.00e-04 | mem 22.27 GiB
+step  100 | loss 0.0277 | grad_norm  0.27 | lr 2.00e-04 | mem 22.27 GiB
+step  200 | loss 0.0065 | grad_norm  0.11 | lr 2.00e-04 | mem 22.27 GiB
+step  300 | loss 0.0205 | grad_norm  0.44 | lr 2.00e-04 | mem 22.28 GiB
+step  399 | loss 0.0053 | grad_norm  0.13 | lr 2.00e-04 | mem 22.26 GiB
 
 Validation:
-  step  99 | val_loss 0.0447
-  step 199 | val_loss 0.0401  <-- LOWEST_VAL
-  step 299 | val_loss 0.0423
-  step 399 | val_loss 0.0458
+  step  99 | val_loss 0.0449
+  step 199 | val_loss 0.0402  <-- LOWEST_VAL
+  step 299 | val_loss 0.0438
+  step 399 | val_loss 0.0403
 ```
 
-400 steps take ~19 min on 2x8 H100. Each checkpoint holds the adapter only (~355 MB), so
+400 steps take ~18 min on 2x8 H100. Each checkpoint holds the adapter only (~355 MB), so
 `vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/` stays small even with a checkpoint per validation step.
 
 ### Training log — Full SFT
@@ -414,8 +418,8 @@ its free-form descriptions run to the token limit.
 | Base (`NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`) | 0/20 | 0.048 | 0/20 (free-form description of the photo) |
 | Full SFT, step 99 (`LOWEST_VAL`, val loss 0.061) | **8/20** | **0.956** (median 0.995; 17/20 above 0.9) | 20/20 |
 | Full SFT, step 399 (`LATEST`, lr=5e-5, 400 steps) | 6/20 | 0.889 (median 0.985; 15/20 above 0.9) | 20/20 |
-| LoRA PEFT, step 199 (`LOWEST_VAL`, val loss 0.040) | **9/20** | 0.952 (median 0.994; 17/20 above 0.9) | 20/20 |
-| LoRA PEFT, step 399 (`LATEST`, lr=2e-4, 400 steps) | 8/20 | 0.955 (median 0.996; 15/20 above 0.9) | 20/20 |
+| LoRA PEFT, step 199 (`LOWEST_VAL`, val loss 0.040) | **10/20** | **0.958** (median 0.996; 16/20 above 0.9) | 20/20 |
+| LoRA PEFT, step 399 (`LATEST`, lr=2e-4, 400 steps) | 8/20 | 0.965 (median 0.996; 17/20 above 0.9) | 20/20 |
 
 The checkpoint with the lowest validation loss also decodes best, so evaluate `LOWEST_VAL` (run its
 `model/consolidate.sh` first; the final step is the only one exported inline).
@@ -443,10 +447,10 @@ dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or
 | | Full SFT | LoRA PEFT |
 |---|---|---|
 | Trainable params | 120.7B (99.31%) | 177M (0.15%) |
-| Learning rate | 5e-5 | 2e-4 |
+| Learning rate | 5e-5 | 2e-4 (both TE FusedAdam, fp32 master weights) |
 | GPU memory | ~31.8 GiB / GPU (64 GPUs) | ~22 GiB / GPU (16 GPUs) |
-| Training time | ~26 min on 8x8 H100 (~32 min wall clock) | ~19 min on 2x8 H100 |
-| Best val loss | 0.061 (step 99) | 0.040 (step 199) |
-| Final train loss | 0.0046 (step 399; mean of last 10 steps 0.029) | 0.0030 (step 399; mean of last 10 steps 0.011) |
+| Training time | ~26 min on 8x8 H100 (~32 min wall clock) | ~18 min on 2x8 H100 |
+| Best val loss | 0.061 (step 99) | 0.040 (step 199; 0.040 again at step 399) |
+| Final train loss | 0.0046 (step 399; mean of last 10 steps 0.029) | 0.0053 (step 399; mean of last 10 steps 0.014) |
 | Checkpoint size | ~227 GB (consolidated bf16) | ~355 MB (adapter only) |
-| Exact matches (20 val) | 8/20 at step 99 (`LOWEST_VAL`, mean similarity 0.96); 6/20 at step 399 (0.89) | 9/20 at step 199 (`LOWEST_VAL`, mean similarity 0.95); 8/20 at step 399 (0.96) |
+| Exact matches (20 val) | 8/20 at step 99 (`LOWEST_VAL`, mean similarity 0.96); 6/20 at step 399 (0.89) | 10/20 at step 199 (`LOWEST_VAL`, mean similarity 0.96); 8/20 at step 399 (0.97) |
