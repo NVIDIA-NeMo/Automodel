@@ -15,12 +15,14 @@
 """Real-collective tests for tensor-parallel replica synchronization."""
 
 import os
+import sys
 from datetime import timedelta
+from unittest.mock import patch
 
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.tp_replicas import (
@@ -111,6 +113,29 @@ class _OwnerShardedExpertModel(nn.Module):
         exclude_from_tp_replica_sync(self.expert)
 
 
+class _ModelOwnedShardedParameterModel(nn.Module):
+    """Plain parameter whose rank-local shard is owned by the model."""
+
+    def __init__(self, rank: int, owner_world_size: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.full((4,), 80.0 + rank))
+        setattr(self.weight, "_nemo_model_owned_grad_divisor", float(owner_world_size))
+
+
+class _PartialGradientModel(nn.Module):
+    """TP-replicated parameter whose gradient remains Partial on TP."""
+
+    def __init__(self, rank: int, tp_mesh) -> None:
+        super().__init__()
+        parameter = DTensor.from_local(
+            torch.tensor([90.0 + rank]),
+            tp_mesh,
+            (Replicate(),),
+            run_check=False,
+        )
+        self.weight = nn.Parameter(parameter)
+
+
 def _replicated_dtensor_gradient(local_gradient: torch.Tensor, tp_mesh) -> DTensor:
     """Wrap a rank-local gradient as a replicated DTensor without checking peers."""
     return DTensor.from_local(local_gradient, tp_mesh, (Replicate(),), run_check=False)
@@ -130,7 +155,7 @@ def _sharded_dtensor_gradient(local_gradient: torch.Tensor, tp_mesh) -> DTensor:
 
 def _run_replica_sync_worker(rank: int, world_size: int, init_file: str) -> None:
     """Compare two-rank replica synchronization and clipping with an FP32 reference."""
-    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo0" if sys.platform == "darwin" else "lo"
     torch.distributed.init_process_group(
         "gloo",
         init_method=f"file://{init_file}",
@@ -177,6 +202,57 @@ def _run_replica_sync_worker(rank: int, world_size: int, init_file: str) -> None
         torch.testing.assert_close(owner_sharded_experts.expert.weight, torch.full((4,), 50.0 + rank))
         torch.testing.assert_close(owner_sharded_experts.expert.scale, torch.full((2,), 60.0 + rank))
         torch.testing.assert_close(owner_sharded_experts.expert.weight.grad, torch.full((4,), 70.0 + rank))
+        torch.distributed.barrier()
+
+        model_owned_shard = _ModelOwnedShardedParameterModel(rank, world_size)
+        model_owned_shard.weight.grad = torch.full_like(model_owned_shard.weight, 100.0 + rank)
+        assert broadcast_tp_replicas([model_owned_shard], tp_mesh) == 0
+        assert synchronize_tp_replica_gradients([model_owned_shard], tp_mesh) == 0
+        torch.testing.assert_close(model_owned_shard.weight, torch.full((4,), 80.0 + rank))
+        torch.testing.assert_close(model_owned_shard.weight.grad, torch.full((4,), 100.0 + rank))
+        torch.distributed.barrier()
+
+        partial_gradient_model = _PartialGradientModel(rank, tp_mesh)
+        partial_gradient_model.weight.grad = DTensor.from_local(
+            torch.tensor([110.0 + rank]),
+            tp_mesh,
+            (Partial(),),
+            run_check=False,
+        )
+        assert synchronize_tp_replica_gradients([partial_gradient_model], tp_mesh) == 0
+        assert isinstance(partial_gradient_model.weight.grad.placements[0], Partial)
+        torch.testing.assert_close(
+            partial_gradient_model.weight.grad.to_local(),
+            torch.tensor([110.0 + rank]),
+        )
+        torch.distributed.barrier()
+
+        inconsistent_gradient_model = _PartialGradientModel(rank, tp_mesh)
+        gradient_placement = (Replicate(),) if rank == 0 else (Partial(),)
+        inconsistent_gradient_model.weight.grad = DTensor.from_local(
+            torch.tensor([115.0 + rank]),
+            tp_mesh,
+            gradient_placement,
+            run_check=False,
+        )
+        try:
+            synchronize_tp_replica_gradients([inconsistent_gradient_model], tp_mesh)
+        except RuntimeError as error:
+            assert "Gradient placements differ across TP replicas" in str(error)
+        else:
+            raise AssertionError("Asymmetric TP gradient placements must fail on every rank")
+        torch.distributed.barrier()
+
+        bfloat_replica = _ParameterHolder(nn.Parameter(torch.tensor([120.0 + rank], dtype=torch.bfloat16)))
+        bfloat_replica.weight.grad = torch.tensor([1.0 + rank], dtype=torch.bfloat16)
+        original_all_reduce = torch.distributed.all_reduce
+        with patch(
+            "nemo_automodel.shared.tp_replicas.dist.all_reduce",
+            wraps=original_all_reduce,
+        ) as all_reduce:
+            assert synchronize_tp_replica_gradients([bfloat_replica], tp_mesh) == 1
+        assert [call.args[0].dtype for call in all_reduce.call_args_list] == [torch.int32, torch.float32]
+        torch.testing.assert_close(bfloat_replica.weight.grad, torch.tensor([1.5], dtype=torch.bfloat16))
         torch.distributed.barrier()
 
         rank_ordered_buffers = _RankOrderedBufferModel(rank)

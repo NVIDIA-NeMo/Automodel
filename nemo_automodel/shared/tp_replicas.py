@@ -24,6 +24,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
 
 _TP_REPLICA_GRAD_REDUCTION_ATTR = "_nemo_tp_replica_grad_reduction"
+_MODEL_OWNED_GRAD_DIVISOR_ATTR = "_nemo_model_owned_grad_divisor"
 _MAX_FLAT_BUFFER_BYTES = 256 * 1024 * 1024
 
 
@@ -118,7 +119,7 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
 def _iter_unique_parameters(
     model_parts: list[torch.nn.Module],
 ) -> Iterator[tuple[torch.nn.Parameter, Literal["mean", "sum"]]]:
-    """Yield parameters once, together with their module-owned reduction semantic."""
+    """Yield unmarked parameters once with their module reduction semantic."""
     seen: dict[int, Literal["mean", "sum"]] = {}
     for model_part in model_parts:
         for module in model_part.modules():
@@ -128,6 +129,8 @@ def _iter_unique_parameters(
             if reduction not in ("mean", "sum"):
                 raise ValueError(f"Unsupported TP replica gradient reduction: {reduction!r}")
             for parameter in module.parameters(recurse=False):
+                if getattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, None) is not None:
+                    continue
                 parameter_id = id(parameter)
                 prior_reduction = seen.get(parameter_id)
                 if prior_reduction is not None:
@@ -186,9 +189,11 @@ def broadcast_tp_replicas(
 ) -> int:
     """Broadcast replicated parameters and buffers from the first TP rank.
 
-    Intended TP shards are excluded by their DTensor placement. The collective
-    operates on each tensor's rank-local storage, whose shape is identical within
-    a TP group even when another mesh axis shards the global tensor.
+    Intended TP shards are excluded by their DTensor placement, and model-owned
+    shards are excluded by their explicit parameter or module marker. The
+    collective operates on each tensor's rank-local storage, whose shape is
+    identical within a TP group even when another mesh axis shards the global
+    tensor.
 
     Args:
         model_parts: Local pipeline-stage modules containing tensors of arbitrary
@@ -241,11 +246,22 @@ def broadcast_tp_replicas(
 
 
 def _gradient_chunks(gradients: list[torch.Tensor]) -> Iterator[list[torch.Tensor]]:
-    """Split same-device, same-dtype gradients into bounded communication buffers."""
+    """Split gradients into bounded communication buffers.
+
+    Args:
+        gradients: Dense rank-local gradients of arbitrary shape on one device
+            with one dtype. Low-precision elements are budgeted at their FP32
+            communication size.
+
+    Yields:
+        Lists of gradients whose flattened communication buffer is at most 256
+        MiB, except when one individual gradient exceeds that limit.
+    """
     chunk: list[torch.Tensor] = []
     chunk_bytes = 0
     for gradient in gradients:
-        gradient_bytes = gradient.numel() * gradient.element_size()
+        communication_element_size = 4 if gradient.dtype in (torch.bfloat16, torch.float16) else gradient.element_size()
+        gradient_bytes = gradient.numel() * communication_element_size
         if chunk and chunk_bytes + gradient_bytes > _MAX_FLAT_BUFFER_BYTES:
             yield chunk
             chunk = []
@@ -254,6 +270,11 @@ def _gradient_chunks(gradients: list[torch.Tensor]) -> Iterator[list[torch.Tenso
         chunk_bytes += gradient_bytes
     if chunk:
         yield chunk
+
+
+def _gradient_reduce_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Return an FP32 communication dtype for low-precision gradients."""
+    return torch.float32 if dtype in (torch.bfloat16, torch.float16) else dtype
 
 
 @torch.no_grad()
@@ -269,7 +290,9 @@ def synchronize_tp_replica_gradients(
     contributions are sum-reduced. Gradients are flattened into bounded buffers
     by reduction, device, and dtype before communication. DTensor gradients are
     reduced through rank-local storage while retaining their global shape and
-    placements. Parameters sharded or partial on the TP axis are untouched.
+    placements. Model-owned shards and parameters or gradients sharded or partial
+    on the TP axis are untouched. Low-precision gradients are reduced in FP32 and
+    cast back to their storage dtype after synchronization.
 
     Args:
         model_parts: Local pipeline-stage modules whose gradients have arbitrary
@@ -313,23 +336,50 @@ def synchronize_tp_replica_gradients(
         return 0
 
     tp_size = tp_mesh.size()
-    gradient_presence = torch.tensor(
-        [parameter.grad is not None for parameter, _ in replicated_parameters],
+    gradient_present = []
+    gradient_sync_eligible = []
+    for parameter, _ in replicated_parameters:
+        gradient = parameter.grad
+        gradient_present.append(gradient is not None)
+        if not isinstance(gradient, DTensor):
+            gradient_sync_eligible.append(gradient is not None)
+            continue
+        cache_key = (id(gradient.device_mesh), tuple(gradient.placements))
+        if cache_key not in placement_cache:
+            placement_cache[cache_key] = _is_tp_replicated(
+                gradient,
+                tp_group_ranks,
+                current_rank,
+                tp_axis_name,
+            )
+        gradient_sync_eligible.append(placement_cache[cache_key])
+
+    gradient_metadata = torch.tensor(
+        [gradient_present, gradient_sync_eligible],
         dtype=torch.int32,
         device=tp_mesh.device_type,
     )
-    dist.all_reduce(gradient_presence, op=dist.ReduceOp.SUM, group=group)
-    presence_counts = gradient_presence.cpu().tolist()
+    dist.all_reduce(gradient_metadata, op=dist.ReduceOp.SUM, group=group)
+    presence_counts, sync_eligible_counts = gradient_metadata.cpu().tolist()
     partially_present = sum(0 < count < tp_size for count in presence_counts)
     if partially_present:
         raise RuntimeError(
             f"Gradient presence differs across TP replicas for {partially_present} parameter(s); "
             "all TP ranks must execute the same trainable graph"
         )
+    inconsistent_placements = sum(
+        presence_count == tp_size and sync_eligible_count not in (0, tp_size)
+        for presence_count, sync_eligible_count in zip(presence_counts, sync_eligible_counts)
+    )
+    if inconsistent_placements:
+        raise RuntimeError(
+            f"Gradient placements differ across TP replicas for {inconsistent_placements} parameter(s); "
+            "all TP ranks must use compatible DTensor placements"
+        )
 
     grouped_gradients: dict[tuple[str, torch.device, torch.dtype], list[torch.Tensor]] = {}
-    for (parameter, reduction), presence_count in zip(replicated_parameters, presence_counts):
-        if presence_count == 0:
+    for (parameter, reduction), sync_eligible_count in zip(replicated_parameters, sync_eligible_counts):
+        if sync_eligible_count == 0:
             continue
         assert parameter.grad is not None
         gradient = _local_tensor(parameter.grad)
@@ -341,16 +391,15 @@ def synchronize_tp_replica_gradients(
     for (reduction, _, _), gradients in grouped_gradients.items():
         for chunk in _gradient_chunks(gradients):
             flat_gradient = torch.cat([gradient.detach().reshape(-1) for gradient in chunk])
-            communication_tensor = (
-                flat_gradient
-                if flat_gradient.device.type == tp_mesh.device_type
-                else flat_gradient.to(device=tp_mesh.device_type)
+            communication_tensor = flat_gradient.to(
+                device=tp_mesh.device_type,
+                dtype=_gradient_reduce_dtype(flat_gradient.dtype),
             )
             dist.all_reduce(communication_tensor, op=dist.ReduceOp.SUM, group=group)
             if reduction == "mean":
                 communication_tensor.div_(tp_size)
             if communication_tensor is not flat_gradient:
-                flat_gradient.copy_(communication_tensor.to(device=flat_gradient.device))
+                flat_gradient.copy_(communication_tensor.to(device=flat_gradient.device, dtype=flat_gradient.dtype))
 
             offset = 0
             for gradient in chunk:
