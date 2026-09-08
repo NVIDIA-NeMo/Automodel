@@ -123,16 +123,34 @@ def _iter_unique_parameters(
                 yield parameter, reduction
 
 
+def _iter_unique_parameters_by_name(
+    model_parts: list[torch.nn.Module],
+) -> Iterator[tuple[torch.nn.Parameter, Literal["mean", "sum"]]]:
+    """Yield parameters once in rank-stable fully qualified name order."""
+    parameter_names: dict[int, tuple[int, str]] = {}
+    for part_index, model_part in enumerate(model_parts):
+        for name, parameter in model_part.named_parameters(remove_duplicate=False):
+            parameter_id = id(parameter)
+            parameter_name = (part_index, name)
+            parameter_names[parameter_id] = min(parameter_name, parameter_names.get(parameter_id, parameter_name))
+
+    yield from sorted(_iter_unique_parameters(model_parts), key=lambda entry: parameter_names[id(entry[0])])
+
+
 def _iter_unique_buffers(model_parts: list[torch.nn.Module]) -> Iterator[torch.Tensor]:
-    """Yield model buffers once in deterministic module traversal order."""
+    """Yield model buffers once in rank-stable fully qualified name order."""
+    named_buffers = [
+        (part_index, name, buffer)
+        for part_index, model_part in enumerate(model_parts)
+        for name, buffer in model_part.named_buffers(remove_duplicate=False)
+    ]
     seen: set[int] = set()
-    for model_part in model_parts:
-        for buffer in model_part.buffers():
-            buffer_id = id(buffer)
-            if buffer_id in seen:
-                continue
-            seen.add(buffer_id)
-            yield buffer
+    for _, _, buffer in sorted(named_buffers, key=lambda entry: (entry[0], entry[1])):
+        buffer_id = id(buffer)
+        if buffer_id in seen:
+            continue
+        seen.add(buffer_id)
+        yield buffer
 
 
 @torch.no_grad()
@@ -180,7 +198,7 @@ def broadcast_tp_replicas(
         return placement_cache[cache_key]
 
     synchronized = 0
-    parameters = (parameter for parameter, _ in _iter_unique_parameters(model_parts))
+    parameters = (parameter for parameter, _ in _iter_unique_parameters_by_name(model_parts))
     for tensor in chain(parameters, _iter_unique_buffers(model_parts)):
         if not is_replicated(tensor):
             continue

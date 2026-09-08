@@ -22,13 +22,13 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.tp_replicas import (
     _is_tp_replicated,
     broadcast_tp_replicas,
     mark_tp_replica_gradient_reduction,
     synchronize_tp_replica_gradients,
 )
-from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
 
 class _ParameterHolder(nn.Module):
@@ -68,6 +68,20 @@ class _ReplicaModel(nn.Module):
         self.unused = _ParameterHolder(nn.Parameter(torch.tensor([5.0 + rank])))
         self.frozen = _ParameterHolder(nn.Parameter(torch.tensor([6.0 + rank]), requires_grad=False))
         self.register_buffer("running_value", torch.tensor([7.0 + rank]))
+
+
+class _RankOrderedBufferModel(nn.Module):
+    """Register differently sized buffers in opposite orders on the two ranks."""
+
+    def __init__(self, rank: int) -> None:
+        super().__init__()
+        buffers = (
+            ("full_attention_inv_freq", torch.full((64,), 10.0 + rank)),
+            ("sliding_attention_inv_freq", torch.full((32,), 20.0 + rank)),
+        )
+        ordered_buffers = buffers if rank == 0 else reversed(buffers)
+        for name, buffer in ordered_buffers:
+            self.register_buffer(name, buffer)
 
 
 def _replicated_dtensor_gradient(local_gradient: torch.Tensor, tp_mesh) -> DTensor:
@@ -113,6 +127,13 @@ def _run_replica_sync_worker(rank: int, world_size: int, init_file: str) -> None
             stride=(1,),
         )
         assert not _is_tp_replicated(folded_tp_shard, tuple(range(world_size)), rank, "tp")
+
+        rank_ordered_buffers = _RankOrderedBufferModel(rank)
+        synchronized = broadcast_tp_replicas([rank_ordered_buffers], tp_mesh)
+        assert synchronized == 2
+        torch.testing.assert_close(rank_ordered_buffers.full_attention_inv_freq, torch.full((64,), 10.0))
+        torch.testing.assert_close(rank_ordered_buffers.sliding_attention_inv_freq, torch.full((32,), 20.0))
+        torch.distributed.barrier()
 
         for accumulation_steps in (1, 2):
             _run_replica_sync_case(rank, world_size, accumulation_steps, tp_mesh)
