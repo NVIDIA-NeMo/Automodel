@@ -28,7 +28,12 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 )
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
-from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.components.moe.state_dict_mixin import (
+    _PARAMWRAPPER_LAYOUT_LEGACY,
+    _PARAMWRAPPER_LAYOUT_METADATA_KEY,
+    _PARAMWRAPPER_LAYOUT_MODERN,
+    MoESplitExpertsStateDictMixin,
+)
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
@@ -268,6 +273,12 @@ class PeftAddon:
         process_group = kwargs.get("process_group")
         hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
         automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
+        adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        layout_stamp = _get_paramwrapper_layout_stamp(
+            adapter, v4_compatible, kwargs.get("legacy_paramwrapper_layout", False)
+        )
+        if layout_stamp is not None:
+            automodel_peft_metadata[_PARAMWRAPPER_LAYOUT_METADATA_KEY] = layout_stamp
         if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             model_part = model_state.model[0] if model_state is not None else None
@@ -352,6 +363,19 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     if target_parameters:
         config["target_parameters"] = target_parameters
     return config
+
+
+def _get_paramwrapper_layout_stamp(adapter, v4_compatible: bool, legacy_paramwrapper_layout: bool) -> "str | None":
+    """Which fused expert LoRA layout this PEFT save uses, for the metadata stamp.
+
+    peft flipped the ParamWrapper layout in 0.19.1 (huggingface/peft#3165);
+    stamping the layout into automodel_peft_config.json lets the loader
+    resolve it from metadata instead of tensor shapes. Returns None for
+    adapters that don't emit fused (v5 ParamWrapper) expert LoRA at all.
+    """
+    if v4_compatible or not getattr(adapter, "_v5_peft_target_parameters", ()):
+        return None
+    return _PARAMWRAPPER_LAYOUT_LEGACY if legacy_paramwrapper_layout else _PARAMWRAPPER_LAYOUT_MODERN
 
 
 def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
