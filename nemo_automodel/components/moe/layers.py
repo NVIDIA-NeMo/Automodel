@@ -896,7 +896,12 @@ class MoE(nn.Module):
             y = self.experts(x_latent, token_mask, weights, indices)
 
         if self.fc2_latent_proj is not None:
-            y = self.fc2_latent_proj(y)
+            # ``self.experts`` is its own FSDP unit; an ``output_dtype`` in the FSDP
+            # MixedPrecisionPolicy (NeMo-RL uses float32) casts its output above the
+            # block's compute dtype, and TE/torch linears reject an input dtype that
+            # differs from the (param_dtype-cast) weight. Re-enter the compute dtype
+            # of the latent input before the back-projection.
+            y = self.fc2_latent_proj(y.to(x_latent.dtype))
         if z is not None:
             y = y + z
         return y.view(shape)
