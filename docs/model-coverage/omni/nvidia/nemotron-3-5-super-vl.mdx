@@ -53,12 +53,12 @@ states for them, so the 121B model trains on 2 nodes × 8 H100 (`cp_size 2`, `ep
 | | |
 |---|---|
 | LoRA targets | 272 linear projections: Mamba `in_proj`/`out_proj`, attention `q/k/v/o_proj`, MoE `fc1/fc2_latent_proj` and shared experts (routed experts, vision tower, projector, `lm_head` frozen) |
-| Trainable parameters | 177M (0.15%), rank 64, alpha 128, lr 2e-4 |
+| Trainable parameters | 177M (0.15%), rank 64, alpha 128; TE `FusedAdam` with fp32 master weights, lr 2e-4 |
 | Peak memory | 22.2 GiB/GPU (2 nodes); 15.1 GiB/GPU with `cp_size 4`, `ep_size 32` on 4 nodes |
 | Adapter checkpoint | 355 MB (`adapter_model.safetensors` + `adapter_config.json`) |
-| Training | 400 steps (global batch 8, 4 epochs of the 800 training receipts) in 19 min on 2 nodes; train loss 0.51 → 0.01 |
-| Validation loss | 0.045 / 0.040 / 0.042 / 0.046 at steps 99 / 199 / 299 / 399 |
-| Field extraction (first 20 validation receipts, greedy, adapter merged into the base model) | step 199 (`LOWEST_VAL`): 9/20 exact match, mean similarity 0.952, 20/20 structured outputs; step 399: 8/20, 0.955, 20/20 |
+| Training | 400 steps (global batch 8, 4 epochs of the 800 training receipts) in 18 min on 2 nodes; train loss 0.51 → 0.01 |
+| Validation loss | 0.045 / 0.040 / 0.044 / 0.040 at steps 99 / 199 / 299 / 399 |
+| Field extraction (first 20 validation receipts, greedy, adapter merged into the base model) | step 199 (`LOWEST_VAL`): 10/20 exact match, mean similarity 0.958, 20/20 structured outputs; step 399: 8/20, 0.965, 20/20 |
 
 ## Try with NeMo AutoModel
 
