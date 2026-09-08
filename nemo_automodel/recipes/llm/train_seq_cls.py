@@ -229,6 +229,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
+        # Each backward() adds to .grad, so accumulating N micro-batch means
+        # gives N x the mean over the full accumulated batch. Divide it back out
+        # so gradients do not depend on how a global batch is split.
+        num_batches = len(batches)
+
         for batch in batches:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
@@ -245,7 +250,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds.detach())
             all_labels.append(labels.view(-1).detach())
-            (loss * self._get_dp_group_size(include_cp=True)).backward()
+            (loss * self._get_dp_group_size(include_cp=True) / num_batches).backward()
 
         # Calculate gradient norm (distributed-aware)
         grad_norm = clip_grad_norm(
