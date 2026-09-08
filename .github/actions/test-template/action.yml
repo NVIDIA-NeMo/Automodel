@@ -118,7 +118,7 @@ runs:
 
           . /opt/venv/env.sh
 
-          if [[ "${{ inputs.runner }}" == "nemo-ci-gcp-gpu-x2" ]]; then
+          if [[ "${{ contains(inputs.runner, 'gcp') }}" == "true" ]]; then
             export NCCL_ENV_PLUGIN=none
             export NCCL_NET_PLUGIN=none
             export NCCL_NET=Socket
