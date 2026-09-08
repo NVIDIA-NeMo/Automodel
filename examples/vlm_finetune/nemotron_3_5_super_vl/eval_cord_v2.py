@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True, help="Consolidated HF checkpoint dir (or base model id/path).")
+    parser.add_argument(
+        "--adapter",
+        default=None,
+        help="LoRA checkpoint dir (adapter_model.safetensors + adapter_config.json) to merge into --checkpoint before decoding.",
+    )
     parser.add_argument("--dataset", default="naver-clova-ix/cord-v2")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--num-samples", type=int, default=5)
@@ -94,6 +99,47 @@ def load_model(checkpoint: str):
 
 
 @torch.no_grad()
+def merge_lora_adapter(model, adapter_dir: str) -> None:
+    """Fold a NeMo AutoModel LoRA checkpoint into the HF base weights (W += (B @ A) * alpha / r).
+
+    Adapters are saved under the training wrapper's FQNs (``language_model.model.layers.N...``), which
+    match the loaded HF module tree; the ``language_model.backbone.`` spelling used by the checkpoint
+    keys is tried as a fallback. Module names inside a layer (``in_proj``, ``q_proj``,
+    ``shared_experts.up_proj``, ``fc1_latent_proj``, ...) are identical in both implementations.
+    """
+    import re
+
+    from safetensors import safe_open
+
+    cfg = json.loads((Path(adapter_dir) / "adapter_config.json").read_text())
+    scale = cfg["lora_alpha"] / cfg["r"]
+    pairs: dict[str, dict[str, torch.Tensor]] = {}
+    with safe_open(str(Path(adapter_dir) / "adapter_model.safetensors"), framework="pt") as f:
+        for key in f.keys():
+            match = re.match(r"^(?:base_model\.model\.)?(.+)\.lora_(A|B)\.weight$", key)
+            if match:
+                pairs.setdefault(match.group(1), {})[match.group(2)] = f.get_tensor(key)
+    modules = dict(model.named_modules())
+    merged, missing = 0, []
+    for wrapper_fqn, ab in pairs.items():
+        candidates = (wrapper_fqn, wrapper_fqn.replace("language_model.model.", "language_model.backbone.", 1))
+        module = next((modules[c] for c in candidates if c in modules), None)
+        if module is None or not hasattr(module, "weight") or "A" not in ab or "B" not in ab:
+            missing.append(wrapper_fqn)
+            continue
+        weight = module.weight
+        delta = (ab["B"].to(weight.device, torch.float32) @ ab["A"].to(weight.device, torch.float32)) * scale
+        weight.add_(delta.to(weight.dtype))
+        merged += 1
+    print(
+        f"merged LoRA adapter from {adapter_dir}: r={cfg['r']} alpha={cfg['lora_alpha']} -> {merged} modules updated, {len(missing)} unmatched",
+        flush=True,
+    )
+    if missing:
+        print("  unmatched:", missing[:8], flush=True)
+
+
+@torch.no_grad()
 def predict(model, processor, prompt: str, image, max_new_tokens: int) -> str:
     """Greedy-decode one receipt image and return the generated text (special tokens stripped)."""
     inputs = processor(text=prompt, images=[image], return_tensors="pt")
@@ -110,6 +156,8 @@ def main() -> None:
     args = parse_args()
     sys.stdout.reconfigure(line_buffering=True)  # progress shows up in redirected logs as it happens
     model, processor = load_model(args.checkpoint)
+    if args.adapter:
+        merge_lora_adapter(model, args.adapter)
     prompt = build_prompt(processor.tokenizer)
     dataset = load_dataset(args.dataset, split=args.split)
     n = min(args.num_samples, len(dataset))
@@ -150,6 +198,7 @@ def main() -> None:
             json.dumps(
                 {
                     "checkpoint": args.checkpoint,
+                    "adapter": args.adapter,
                     "split": args.split,
                     "exact_match_rate": exact_rate,
                     "mean_similarity": mean_sim,

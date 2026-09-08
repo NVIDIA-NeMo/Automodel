@@ -3,17 +3,17 @@ title: "Nemotron 3.5 Super VL"
 description: ""
 position: 15
 ---
-**A step-by-step guide for fine-tuning Nemotron 3.5 Super VL (67B hybrid Mamba+Attention MoE VLM)
+**A step-by-step guide for fine-tuning Nemotron 3.5 Super VL (121B hybrid Mamba+Attention MoE VLM)
 to extract structured receipt data from scanned images using
-[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel). Full SFT on 8 nodes, then
-inference and evaluation on the CORD-v2 validation split.**
+[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel). Full SFT on 8 nodes or LoRA on 2 nodes,
+then inference and evaluation on the CORD-v2 validation split.**
 
 ---
 
 ## What is Nemotron 3.5 Super VL?
 
 Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`,
-architecture `NemotronH_Omni_Reasoning_V3`) is the 67B member of the Nemotron 3.5 family.
+architecture `NemotronH_Omni_Reasoning_V3`) is the 121B member of the Nemotron 3.5 family.
 It reuses the NemotronOmni wrapper, vision tower and state-dict adapter of the 33B
 NemotronOmni; only the LLM backbone scale differs.
 
@@ -27,7 +27,7 @@ Key architectural details:
 
 ## Fine-Tune for Receipt Field Extraction
 
-As in the [NemotronOmni guide](/guides/vlm/nemotron-omni), we fine-tune on **CORD-v2**
+As in the [NemotronOmni guide](/recipes-e2e-examples/nemotron-omni), we fine-tune on **CORD-v2**
 (Consolidated Receipt Dataset) to extract structured fields from scanned receipts:
 
 | Field | Example |
@@ -45,8 +45,8 @@ The **base model** produces free-form descriptions. After fine-tuning, it output
 |------|-------------|
 | **Step 0** | Environment setup |
 | **Step 1** | Explore the CORD-v2 dataset |
-| **Step 2** | Training configuration |
-| **Step 3** | Launch fine-tuning (8 nodes) |
+| **Step 2** | Training configuration (full SFT and LoRA) |
+| **Step 3** | Launch fine-tuning (8 nodes for SFT, 2 nodes for LoRA) |
 | **Step 4** | Run inference and evaluation on the fine-tuned model |
 | **Step 5** | Results |
 
@@ -54,14 +54,13 @@ The **base model** produces free-form descriptions. After fine-tuning, it output
 
 - **8 nodes x 8 H100 80 GB** (512 experts sharded with
   `ep_size=32`; `cp_size=8` so the 8-sample global batch is one sample per data-parallel rank)
-- **SFT memory**: ~31.8 GiB per GPU (fp32 master weights, bf16 Adam moments, activation checkpointing).
-  On 4 nodes the same recipe runs at ~63.5 GiB per GPU and repeatedly ran out of memory on the step
-  right after a validation-time checkpoint save, so the guide uses 8 nodes. (`checkpoint.cpu_offload: true`
-  is not an option for this model yet: the RADIO state-dict export concatenates sharded tensors and fails
-  on CPU-staged DTensors.)
+- **SFT memory**: ~31.8 GiB per GPU (fp32 master weights, bf16 Adam moments, activation checkpointing),
+  leaving headroom for the validation-time checkpoint saves.
 - **Training time**: ~26 min on 8x8 H100 for 400 steps (4 epochs of the 800 training samples), including four
   validation passes with checkpoint saves and the final consolidated export (~1 min); about 32 min wall clock
   with model loading
+- **LoRA PEFT**: 2 nodes x 8 H100 (`cp_size 2` / `ep_size 16`, ~22 GiB per GPU); 4 nodes with `cp_size 4` /
+  `ep_size 32` run at ~15 GiB per GPU. The frozen base needs no fp32 master copy or optimizer state.
 
 ---
 
@@ -203,7 +202,53 @@ optimizer:
 
 Compared with the 33B NemotronOmni recipe: `ep_size` grows from 8 to 32 (512 experts),
 `cp_size=8` on 64 GPUs maps the 8-sample global batch to one sample per rank, the optimizer keeps **fp32 master weights** with
-bf16 Adam moments, and the learning rate is lowered to 5e-5 for full-parameter SFT of a 67B.
+bf16 Adam moments, and the learning rate is lowered to 5e-5 for full-parameter SFT of a 121B model.
+
+### LoRA PEFT Config
+
+**Config file**: `examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml`
+
+Same data pipeline and schedule; the base model stays frozen and rank-64 LoRA adapters are trained on
+the LLM's linear projections (Mamba `in_proj`/`out_proj`, attention `q/k/v/o_proj`, MoE latent
+projections and shared-expert MLPs). The vision tower, projector and `lm_head` are excluded:
+
+```yaml
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  exclude_modules:
+    - "*vision_tower*"
+    - "*vision_model*"
+    - "*vision_projector*"
+    - "*audio*"
+    - "*sound*"
+    - "*lm_head*"
+    - "*mlp1*"
+  dim: 64
+  alpha: 128
+  use_triton: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft
+  model_save_format: safetensors
+  save_consolidated: false    # LoRA checkpoints hold the adapter weights only
+
+distributed:
+  strategy: fsdp2
+  cp_size: 2            # dp 8 on 16 GPUs -> one sample per rank per step
+  ep_size: 16
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+```
+
+Without fp32 master weights and optimizer state for the frozen 121B parameters, LoRA fits on
+**2 nodes x 8 H100** (~22 GiB per GPU; 4 nodes with `cp_size 4` / `ep_size 32` run at ~15 GiB per GPU).
+177M trainable parameters (0.15%).
 
 ### Collate function
 
@@ -228,6 +273,38 @@ srun --nodes=8 --ntasks-per-node=8 --gpus-per-node=8 \
 or with the launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 8`.
 W&B logging is opt-in: add `--wandb.enable=true --wandb.entity=<entity> --wandb.project=<project>` to either command.
 
+### LoRA PEFT
+
+```bash
+srun --nodes=2 --ntasks-per-node=8 --gpus-per-node=8 \
+    python examples/vlm_finetune/finetune.py \
+    -c examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml
+```
+
+### Training log — LoRA PEFT
+
+```
+Trainable parameters: 177,012,736
+Trainable parameters percentage: 0.15%
+
+step    0 | loss 0.5051 | grad_norm  1.96 | lr 2.00e-04 | mem 22.18 GiB
+step   10 | loss 0.1096 | grad_norm  0.72 | lr 2.00e-04 | mem 22.25 GiB
+step   50 | loss 0.0566 | grad_norm  0.37 | lr 2.00e-04 | mem 22.25 GiB
+step  100 | loss 0.0314 | grad_norm  1.03 | lr 2.00e-04 | mem 22.25 GiB
+step  200 | loss 0.0112 | grad_norm  0.16 | lr 2.00e-04 | mem 22.25 GiB
+step  300 | loss 0.0144 | grad_norm  0.22 | lr 2.00e-04 | mem 22.25 GiB
+step  399 | loss 0.0030 | grad_norm  0.10 | lr 2.00e-04 | mem 22.25 GiB
+
+Validation:
+  step  99 | val_loss 0.0447
+  step 199 | val_loss 0.0401  <-- LOWEST_VAL
+  step 299 | val_loss 0.0423
+  step 399 | val_loss 0.0458
+```
+
+400 steps take ~19 min on 2x8 H100. Each checkpoint holds the adapter only (~355 MB), so
+`vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/` stays small even with a checkpoint per validation step.
+
 ### Training log — Full SFT
 
 ```
@@ -251,7 +328,7 @@ Validation:
 
 As with the 33B model, training loss keeps falling through epoch 4 while validation loss is lowest
 after the first epoch and then drifts up slowly — the 800-receipt training set is small enough for a
-67B to start memorizing it.
+121B model to start memorizing it.
 
 ### Checkpoints saved
 
@@ -307,6 +384,20 @@ python examples/vlm_finetune/nemotron_3_5_super_vl/eval_cord_v2.py \
 
 Passing the base checkpoint id instead of the fine-tuned export scores the un-tuned model the same way.
 
+### LoRA PEFT inference
+
+LoRA checkpoints contain only `adapter_model.safetensors` + `adapter_config.json`, saved under the
+training wrapper's module names (`language_model.model.layers.N.mixer.in_proj`, ...), which match the
+HF module tree. `eval_cord_v2.py --adapter` folds the adapters into the base weights
+(`W += (B @ A) * alpha / r`) before decoding:
+
+```bash
+python examples/vlm_finetune/nemotron_3_5_super_vl/eval_cord_v2.py \
+    --checkpoint nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained \
+    --adapter vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/LOWEST_VAL/model \
+    --split validation --num-samples 20
+```
+
 **Resources** — one node with 8x H100 (bf16 weights spread over the GPUs).
 **Runtime** — ~2-4 min to load the 227 GB export, then ~26 s per receipt (greedy, up to 1024 new
 tokens); 20 samples take about 13 min. The un-tuned base model is slower (~55 s per sample) because
@@ -323,6 +414,8 @@ its free-form descriptions run to the token limit.
 | Base (`NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`) | 0/20 | 0.048 | 0/20 (free-form description of the photo) |
 | Full SFT, step 99 (`LOWEST_VAL`, val loss 0.061) | **8/20** | **0.956** (median 0.995; 17/20 above 0.9) | 20/20 |
 | Full SFT, step 399 (`LATEST`, lr=5e-5, 400 steps) | 6/20 | 0.889 (median 0.985; 15/20 above 0.9) | 20/20 |
+| LoRA PEFT, step 199 (`LOWEST_VAL`, val loss 0.040) | **9/20** | 0.952 (median 0.994; 17/20 above 0.9) | 20/20 |
+| LoRA PEFT, step 399 (`LATEST`, lr=2e-4, 400 steps) | 8/20 | 0.955 (median 0.996; 15/20 above 0.9) | 20/20 |
 
 The checkpoint with the lowest validation loss also decodes best, so evaluate `LOWEST_VAL` (run its
 `model/consolidate.sh` first; the final step is the only one exported inline).
@@ -347,13 +440,13 @@ dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or
 
 ### Summary
 
-| | Full SFT |
-|---|---|
-| Trainable params | 120.7B (99.31%) |
-| Learning rate | 5e-5 |
-| GPU memory | ~31.8 GiB / GPU (64 GPUs) |
-| Training time (8x8 H100) | ~26 min (~32 min wall clock with model loading) |
-| Best val loss | 0.061 (step 99) |
-| Final train loss | 0.0046 (step 399; mean of last 10 steps 0.029) |
-| Checkpoint size (consolidated bf16) | ~227 GB |
-| Exact matches (20 val) | 8/20 at step 99 (`LOWEST_VAL`, mean similarity 0.96); 6/20 at step 399 (0.89) |
+| | Full SFT | LoRA PEFT |
+|---|---|---|
+| Trainable params | 120.7B (99.31%) | 177M (0.15%) |
+| Learning rate | 5e-5 | 2e-4 |
+| GPU memory | ~31.8 GiB / GPU (64 GPUs) | ~22 GiB / GPU (16 GPUs) |
+| Training time | ~26 min on 8x8 H100 (~32 min wall clock) | ~19 min on 2x8 H100 |
+| Best val loss | 0.061 (step 99) | 0.040 (step 199) |
+| Final train loss | 0.0046 (step 399; mean of last 10 steps 0.029) | 0.0030 (step 399; mean of last 10 steps 0.011) |
+| Checkpoint size | ~227 GB (consolidated bf16) | ~355 MB (adapter only) |
+| Exact matches (20 val) | 8/20 at step 99 (`LOWEST_VAL`, mean similarity 0.96); 6/20 at step 399 (0.89) | 9/20 at step 199 (`LOWEST_VAL`, mean similarity 0.95); 8/20 at step 399 (0.96) |
