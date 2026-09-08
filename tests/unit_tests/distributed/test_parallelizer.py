@@ -31,6 +31,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGener
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
     _extract_model_layer_groups,
@@ -1101,6 +1102,7 @@ class TestGetHfTpShardPlan:
             "layer3": "colwise_rep",
             "layer4": "rowwise_rep",
             "layer5": "sequence_parallel",
+            "layer6": "replicated_with_grad_allreduce",
         }
         model.config.tie_word_embeddings = True
 
@@ -1111,6 +1113,7 @@ class TestGetHfTpShardPlan:
         assert isinstance(result["layer3"], ColwiseParallel)
         assert isinstance(result["layer4"], RowwiseParallel)
         assert isinstance(result["layer5"], SequenceParallel)
+        assert isinstance(result["layer6"], ReplicatedWithGradAllReduce)
 
     def test_no_tp_plan_error(self):
         """Test error when no TP plan is found."""

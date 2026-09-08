@@ -585,6 +585,14 @@ def _parallelize_phi(
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
 
+    if model.config.qk_layernorm:
+        base_model_tp_plan.update(
+            {
+                "model.layers.*.self_attn.q_layernorm": ReplicatedWithGradAllReduce(),
+                "model.layers.*.self_attn.k_layernorm": ReplicatedWithGradAllReduce(),
+            }
+        )
+
     if sequence_parallel:
         base_model_sp_plan: dict[str, ParallelStyle] = {
             "model.embed_tokens": VocabParallelEmbedding(

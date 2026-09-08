@@ -23,6 +23,7 @@ import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.tp_replicas import (
@@ -136,6 +137,18 @@ class _PartialGradientModel(nn.Module):
         self.weight = nn.Parameter(parameter)
 
 
+class _DraftReplica(nn.Module):
+    """Tiny draft whose DDP group excludes its tensor-parallel peer."""
+
+    def __init__(self, rank: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.full((1, 2), 1.0 + rank))
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Apply the draft weight to inputs of shape [batch, hidden]."""
+        return inputs @ self.weight.t()
+
+
 def _replicated_dtensor_gradient(local_gradient: torch.Tensor, tp_mesh) -> DTensor:
     """Wrap a rank-local gradient as a replicated DTensor without checking peers."""
     return DTensor.from_local(local_gradient, tp_mesh, (Replicate(),), run_check=False)
@@ -170,6 +183,24 @@ def _run_replica_sync_worker(rank: int, world_size: int, init_file: str) -> None
             (1, world_size),
             mesh_dim_names=("ep_shard", "ep"),
         )
+
+        # Speculative and diffusion recipes wrap replicas only over DP. With
+        # dp_size=1 that DDP group cannot align independently initialized TP
+        # copies, so the explicit TP broadcast must do so before optimization.
+        dp_groups = [torch.distributed.new_group([peer]) for peer in range(world_size)]
+        draft = DistributedDataParallel(_DraftReplica(rank), process_group=dp_groups[rank])
+        torch.testing.assert_close(draft.module.weight, torch.full((1, 2), 1.0 + rank))
+        assert broadcast_tp_replicas([draft], tp_mesh) == 1
+        torch.testing.assert_close(draft.module.weight, torch.ones(1, 2))
+
+        optimizer = torch.optim.SGD(draft.parameters(), lr=0.1)
+        draft(torch.full((1, 2), 1.0 + rank)).sum().backward()
+        assert synchronize_tp_replica_gradients([draft], tp_mesh) == 1
+        torch.testing.assert_close(draft.module.weight.grad, torch.full((1, 2), 1.5))
+        optimizer.step()
+        torch.testing.assert_close(draft.module.weight, torch.full((1, 2), 0.85))
+        torch.distributed.barrier()
+
         folded_tp_shard = DTensor.from_local(
             torch.tensor([rank + 1.0]),
             folded_mesh,

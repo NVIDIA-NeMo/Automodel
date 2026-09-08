@@ -43,6 +43,7 @@ from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.import_utils import safe_import_from
+from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.shared.utils import dtype_from_str
 
 # Removed diffusion-only YAML keys and their standard replacements. The diffusion
@@ -693,6 +694,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
+        # LoRA and random-pretraining parameters are initialized before TP is
+        # applied. Align their replicated local storage before the optimizer
+        # captures the sharded model parameters.
+        broadcast_tp_replicas([self.model], self.device_mesh)
 
         # FSDP2's MixedPrecisionPolicy is what casts parameters to compute_dtype, and
         # parallelization is skipped entirely on a single-rank mesh. Autocast covers

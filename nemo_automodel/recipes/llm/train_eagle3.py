@@ -78,6 +78,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     should_sync_grads,
 )
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
+from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas
 
 logger = logging.getLogger(__name__)
 
@@ -727,6 +728,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 process_group=dp_process_group,
             )
         self.trainer_module = trainer_module
+        # DDP broadcasts only inside the DP subgroup. The draft is replicated
+        # across TP, so align those independently initialized copies before the
+        # optimizer captures them and TP replica gradients are averaged.
+        broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)

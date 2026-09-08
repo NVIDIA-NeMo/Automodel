@@ -42,6 +42,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     _get_class_qualname,
     _parallelize_gemma3,
     _parallelize_llama,
+    _parallelize_phi,
     _parallelize_qwen,
 )
 from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
@@ -387,6 +388,23 @@ class TestParallelizeFunctions:
         q_norm = torch.nn.LayerNorm(4)
         result["model.layers.*.self_attn.q_norm"]._apply(q_norm, MockDeviceMesh())
         assert q_norm._nemo_tp_replica_grad_reduction == "sum"
+
+    @pytest.mark.parametrize("qk_layernorm", [False, True])
+    def test_parallelize_phi_marks_optional_qk_layernorms(self, qk_layernorm):
+        """Head-local Phi Q/K norms sum their partial TP gradients when enabled."""
+        model = SimpleNamespace(config=SimpleNamespace(qk_layernorm=qk_layernorm))
+
+        result = _parallelize_phi(model, sequence_parallel=False)
+
+        norm_keys = {
+            "model.layers.*.self_attn.q_layernorm",
+            "model.layers.*.self_attn.k_layernorm",
+        }
+        if qk_layernorm:
+            assert norm_keys <= result.keys()
+            assert all(isinstance(result[key], ReplicatedWithGradAllReduce) for key in norm_keys)
+        else:
+            assert norm_keys.isdisjoint(result)
 
 
 class TestParallelizeFunctionsMapping:

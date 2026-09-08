@@ -382,6 +382,33 @@ def test_diffusion_recipe_does_not_reseed_rng_without_cp(monkeypatch):
     init_all_rng.assert_not_called()
 
 
+def test_diffusion_recipe_broadcasts_tp_replicas_before_optimizer_setup(monkeypatch):
+    """Diffusion aligns pre-parallelization initialization before optimization."""
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    transformer = nn.Linear(1, 1)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=transformer), None)),
+    )
+    broadcast = MagicMock()
+    monkeypatch.setattr(diffusion_train, "broadcast_tp_replicas", broadcast)
+
+    recipe = TrainDiffusionRecipe(
+        _minimal_diffusion_recipe_cfg(
+            adapter_type="simple",
+            attention_backend=None,
+            optimize_hunyuan_flash_varlen_mask=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="checkpoint config is required"):
+        recipe.setup()
+
+    broadcast.assert_called_once_with([transformer], None)
+    assert recipe.optimizer is not None
+
+
 class _TinyTransformer(nn.Module):
     def __init__(self):
         super().__init__()

@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor.parallel import ParallelStyle
 
 _TP_REPLICA_GRAD_REDUCTION_ATTR = "_nemo_tp_replica_grad_reduction"
 _MODEL_OWNED_GRAD_DIVISOR_ATTR = "_nemo_model_owned_grad_divisor"
@@ -40,6 +41,15 @@ def mark_tp_replica_gradient_reduction(
             disjoint partial contributions.
     """
     setattr(module, _TP_REPLICA_GRAD_REDUCTION_ATTR, reduction)
+
+
+class ReplicatedWithGradAllReduce(ParallelStyle):
+    """Keep parameters local while sum-reducing their partial TP gradients."""
+
+    def _apply(self, module: torch.nn.Module, device_mesh: DeviceMesh) -> torch.nn.Module:
+        """Mark a replicated module whose ranks compute disjoint gradient contributions."""
+        mark_tp_replica_gradient_reduction(module, "sum")
+        return module
 
 
 def exclude_from_tp_replica_sync(module: torch.nn.Module) -> None:
