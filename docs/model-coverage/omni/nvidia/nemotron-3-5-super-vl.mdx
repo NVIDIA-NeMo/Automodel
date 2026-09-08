@@ -70,10 +70,10 @@ cd Automodel
 uv sync --locked --all-groups --all-extras --extra vlm-media
 ```
 
-**2. Run a recipe** from inside the repo (8x H100 example):
+**2. Run the vision recipe** from inside the repo (8 nodes × 8 H100):
 
 ```bash
-uv run automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_medpix_100steps.yaml --nproc-per-node 8
+uv run automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_medpix_100steps.yaml --nnodes 8 --nproc-per-node 8
 ```
 
 **3. LoRA on 2 nodes** (adapter-only checkpoints, ~22 GiB/GPU):

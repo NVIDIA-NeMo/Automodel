@@ -22,7 +22,7 @@
 # run (nemotron_3_5_super_vl_tulu3_text_100steps.yaml) in this same directory.
 #
 # Run:
-#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_medpix_100steps.yaml --nproc-per-node 8
+#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_medpix_100steps.yaml --nnodes 8 --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 

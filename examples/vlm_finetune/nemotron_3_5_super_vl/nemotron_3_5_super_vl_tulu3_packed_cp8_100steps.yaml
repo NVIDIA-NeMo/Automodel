@@ -138,6 +138,6 @@ wandb:
 
 ci:
   recipe_owner: HuiyingLi
-  nodes: 32
+  nodes: 4
   time: "01:00:00"
   max_steps: 2
