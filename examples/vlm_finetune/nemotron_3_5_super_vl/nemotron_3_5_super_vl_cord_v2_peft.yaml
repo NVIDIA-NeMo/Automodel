@@ -20,13 +20,13 @@
 # the vision tower, vision projector and lm_head are excluded.
 #
 # Sizing: with the base weights frozen there are no fp32 master weights or
-# optimizer states for the base model, so the recipe fits on 2 nodes x 8 H100
-# (~22 GiB/GPU): 512 experts -> ep_size 16; global_batch_size 8 with cp_size 2
-# gives dp=8 -> one sample per rank per optimizer step. Checkpoints hold the
-# adapter weights only (adapter_model.safetensors + adapter_config.json).
+# optimizer states for the base model, so the recipe fits on a single node of
+# 8 H100 (~39 GiB/GPU): 512 experts -> ep_size 8; global_batch_size 8 with
+# cp_size 1 gives dp=8 -> one sample per rank per optimizer step. Checkpoints
+# hold the adapter weights only (adapter_model.safetensors + adapter_config.json).
 #
-# Run (2 nodes):
-#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml --nproc-per-node 8 --nnodes 2
+# Run:
+#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 
@@ -90,10 +90,10 @@ checkpoint:
 distributed:
   strategy: fsdp2
   tp_size: 1
-  # cp_size 2 -> dp 8 on 16 GPUs -> one 1-sample microbatch per rank per optimizer step.
-  cp_size: 2
+  # cp_size 1 -> dp 8 on 8 GPUs -> one 1-sample microbatch per rank per optimizer step.
+  cp_size: 1
   pp_size: 1
-  ep_size: 16
+  ep_size: 8
   sequence_parallel: false
   activation_checkpointing: true
   reshard_after_forward: true
@@ -152,6 +152,6 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
-  nodes: 2
-  time: "01:30:00"
+  nodes: 1
+  time: "01:00:00"
   max_steps: 2
