@@ -36,6 +36,7 @@ def test_glm5_next_medpix_ep72_cp2_recipe_contract():
     assert recipe["distributed"]["tp_size"] == 1
     assert recipe["distributed"]["defer_fsdp_grad_sync"] is False
     assert recipe["distributed"]["moe"]["wrap_outer_model"] is True
+    assert "freeze_embeddings" not in recipe["freeze_config"]
     assert recipe["packed_sequence"]["packing_format"] == "neat"
     assert recipe["packed_sequence"]["max_length"] == 2048
     assert recipe["packed_sequence"]["pack_size"] == 2048
