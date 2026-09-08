@@ -262,6 +262,7 @@ class BinaryDataWriter:
             )
             tokens = tokens.astype(self.dtype)
 
+        token_offset = self.items_written
         pos = self.bin_fp.tell()
         assert pos + tokens.size * self.dtype.itemsize < 2**32 - 1, "token count too large"
         # write chunk tokens
@@ -269,25 +270,26 @@ class BinaryDataWriter:
         self.bin_fp.write(tok_bytes)
 
         # write BOS index
-        self.idx_fp.write((pos + np.where(tokens == self.bos_token_id)[0].astype(np.int32)).tobytes())
+        bos_positions = token_offset + np.where(tokens == self.bos_token_id)[0].astype(np.int32)
+        self.idx_fp.write(bos_positions.tobytes())
         self.bytes_written += len(tok_bytes)
         return len(tok_bytes)
 
-    def __del__(self):
-        """
-        Close the binary and index files.
-
-        Writes the number of tokens written to the header.
-        """
+    def close(self):
+        """Finalize the shard header and close the binary and index files."""
         if self.bin_fp is not None:
-            # Write the number of tokens written to the header
             self.bin_fp.seek(2 * 4, 0)
-            b = np.zeros(1, dtype=np.int32)
-            b[0] = self.items_written
-            self.bin_fp.write(b.tobytes())
+            token_count = np.array([self.items_written], dtype=np.int32)
+            self.bin_fp.write(token_count.tobytes())
             self.bin_fp.close()
+            self.bin_fp = None
         if self.idx_fp is not None:
             self.idx_fp.close()
+            self.idx_fp = None
+
+    def __del__(self):
+        """Finalize open files when the writer is garbage-collected."""
+        self.close()
 
     @property
     def items_written(self):

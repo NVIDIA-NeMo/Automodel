@@ -38,7 +38,7 @@ New format (nanogpt_data_processor.py)::
 Optionally, a corresponding .bos.idx file can exist alongside each .bin file::
 
     int32[n_bos_tokens] bos_positions
-        # Array of absolute byte positions where BOS tokens occur in the .bin file
+        # Array of zero-based token offsets where BOS tokens occur
 
 The dataset streams one contiguous *seq_len* token slice at a time and
 returns the pair ``(inputs, labels)`` where ``labels`` is shifted by one
@@ -289,6 +289,9 @@ class NanogptDataset(IterableDataset):
             Requires ``bos_token`` to be provided.
         bos_token : int, optional, default None.
             Token ID marking beginning-of-document.
+        repeat : bool, default True
+            Repeat shards indefinitely for training. Set to ``False`` for a
+            finite validation pass.
     """
 
     def __init__(
@@ -299,6 +302,7 @@ class NanogptDataset(IterableDataset):
         bos_token: int | None = None,
         shuffle_files: bool = False,
         align_to_bos: bool = False,
+        repeat: bool = True,
     ) -> None:
         super().__init__()
         if isinstance(file_pattern, (str, Path)):
@@ -310,6 +314,7 @@ class NanogptDataset(IterableDataset):
         self.seq_len = int(seq_len)
         self.shuffle_files = shuffle_files
         self.align_to_bos = align_to_bos
+        self.repeat = repeat
         if self.align_to_bos and bos_token is None:
             raise ValueError("bos_token must be provided when align_to_bos is True")
         self.bos_token = bos_token
@@ -430,6 +435,8 @@ class NanogptDataset(IterableDataset):
             for file in worker_files:
                 yield from self._process_file_tokens(file, split_single_file, file_start_pos, file_end_pos)
 
+            if not self.repeat:
+                return
             # Start a new epoch, optionally reshuffle
             if self.shuffle_files:
                 rng.shuffle(worker_files)

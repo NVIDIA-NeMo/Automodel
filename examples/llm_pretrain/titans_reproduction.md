@@ -63,3 +63,55 @@ A full-scale run may start only after:
 - state carried across two calls matches one concatenated causal call;
 - the configured parameter count matches the intended scale;
 - a one-GPU smoke and one-node distributed smoke produce finite loss.
+
+## Preflight status
+
+Validated on 2026-09-08 with RTX 6000 Ada GPUs:
+
+- The deterministic 760,784-parameter smoke model completed two training and
+  validation steps on one GPU, wrote DCP checkpoints, and resumed from
+  `LATEST` for a third step.
+- The same smoke completed one FSDP2 step on two GPUs, including validation
+  and checkpointing. Titans uses a dtype-aware FSDP strategy so its fp32 decay
+  parameters are isolated from bf16 parameters.
+- The full 173,597,376-parameter model completed one forward/backward optimizer
+  step at sequence length 128 on one GPU. It allocated 6.68 GiB and processed
+  180.7 tokens/s. This is a short-sequence viability probe, not an estimate
+  that establishes 4096-token fit.
+- The NanoGPT writer/reader round trip now records BOS locations consistently
+  as token offsets. Validation datasets use `repeat: false`; otherwise the
+  iterable validation loop never terminates.
+
+The next execution gate is a full-shape, 4096-token, one-node FSDP2 smoke on
+the target cluster. Do not start the 15B-token run until that job establishes
+memory headroom and step throughput.
+
+### cw-dfw H100 gate
+
+The preferred workflow uses the configured `cw-dfw` profile from `slurm-cli`.
+From a clean, pushed AutoModel branch:
+
+```bash
+tools/submit_titans_cwdfw.sh
+# Or submit, monitor to a terminal state, and print the final log:
+tools/submit_titans_cwdfw.sh --wait
+```
+
+The wrapper verifies that local `HEAD` equals the pushed branch, clones or
+fast-forwards the Lustre checkout through `slurm-cli shell`, submits through
+`slurm-cli job submit`, and prints reproducible status/log commands. It refuses
+dirty or unpushed source trees.
+
+Defaults:
+
+- account: `coreai_dlalgo_compeval`;
+- partition: `batch`;
+- allocation: one node with eight GPUs for one hour;
+- image: `nvcr.io#nvidia/nemo-automodel:26.04`;
+- work root:
+  `/lustre/fsw/portfolios/coreai/users/ffrujeri/titans-automodel`.
+
+Override `AUTOMODEL_CHECKOUT`, `TITANS_WORK_ROOT`, or `TITANS_IMAGE` with
+exported environment variables when the checkout, storage root, or approved
+container differs. Success requires a finite train and validation loss plus
+the logged peak memory and tokens/s from all eight workers.

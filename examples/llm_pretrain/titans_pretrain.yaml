@@ -7,7 +7,7 @@
 # momentum: false below to recover the exact GDN baseline.
 #
 # To run this recipe (single node):
-#   automodel pretrain llm -c examples/llm_pretrain/titans_pretrain.yaml --nproc-per-node 1
+#   automodel examples/llm_pretrain/titans_pretrain.yaml --nproc-per-node 1
 # Point `dataset.file_pattern` at your tokenized *.bin shards first. The optimizer
 # is plain torch AdamW so this runs without Transformer Engine.
 

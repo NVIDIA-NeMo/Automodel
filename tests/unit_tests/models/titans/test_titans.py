@@ -190,21 +190,23 @@ def test_state_dict_adapter_roundtrip():
     adapter = TitansStateDictAdapter(cfg)
     sd = {
         "model.embed_tokens.weight": torch.randn(256, 128),
-        "model.layers.0.memory.A_log": torch.zeros(4, dtype=torch.bfloat16),
-        "model.layers.0.memory.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+        "model.layers.0.memory._fp32_params.A_log": torch.zeros(4, dtype=torch.bfloat16),
+        "model.layers.0.memory._fp32_params.dt_bias": torch.ones(4, dtype=torch.bfloat16),
         "model.layers.0.memory.q_proj.weight": torch.randn(128, 128, dtype=torch.bfloat16),
     }
     hf = adapter.to_hf(sd)
+    assert "model.layers.0.memory.A_log" in hf
+    assert "model.layers.0.memory.dt_bias" in hf
     back = adapter.from_hf(hf)
     assert set(back.keys()) == set(sd.keys())
     # decay-gate params upcast to fp32, others preserved
-    assert back["model.layers.0.memory.A_log"].dtype == torch.float32
-    assert back["model.layers.0.memory.dt_bias"].dtype == torch.float32
+    assert back["model.layers.0.memory._fp32_params.A_log"].dtype == torch.float32
+    assert back["model.layers.0.memory._fp32_params.dt_bias"].dtype == torch.float32
     assert back["model.layers.0.memory.q_proj.weight"].dtype == torch.bfloat16
     forced = adapter.forced_hf_dtype_mapping(sd)
     assert forced == {
-        "model.layers.0.memory.A_log": "F32",
-        "model.layers.0.memory.dt_bias": "F32",
+        "model.layers.0.memory._fp32_params.A_log": "F32",
+        "model.layers.0.memory._fp32_params.dt_bias": "F32",
     }
 
 
@@ -327,6 +329,7 @@ def test_170m_lmm_recipe_matches_paper_scale():
     assert model["memory_expansion_factor"] == 4
     assert model["qkv_conv_kernel_size"] == 4
     assert model["chunk_size"] == 16
+    assert model["torch_dtype"] == "float32"
     assert recipe["dataset"]["seq_len"] == 4096
 
     config_values = {key: value for key, value in model.items() if key not in {"_target_", "architectures"}}

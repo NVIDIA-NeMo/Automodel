@@ -1,28 +1,26 @@
-# First full-scale gate for reproducing the Titans proceedings paper.
-# This is the memory-only LMM, not MAC/MAG/MAL.
+# End-to-end preflight for the Titans reproduction pipeline.
 #
-# Required inputs:
-#   TITANS_DATA_ROOT=/shared/fineweb_edu_llama2
-#   TITANS_CHECKPOINT_ROOT=/shared/checkpoints/titans-170m-lmm
-#
-# 128 sequences * 4096 tokens = 524,288 tokens per optimizer step.
-# 28,610 steps process 14,999,879,680 tokens (approximately 15B).
+# From the repository root:
+#   python tools/make_titans_smoke_data.py \
+#     --output-dir examples/llm_pretrain/data/titans_smoke
+#   automodel examples/llm_pretrain/titans_smoke.yaml \
+#     --nproc-per-node 1
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1111
 
 step_scheduler:
-  global_batch_size: 128
+  global_batch_size: 1
   local_batch_size: 1
-  ckpt_every_steps: 250
-  val_every_steps: 250
-  log_remote_every_steps: 10
+  ckpt_every_steps: 1
+  val_every_steps: 1
+  log_remote_every_steps: 1
   num_epochs: 1
-  max_steps: 28610
+  max_steps: 2
 
 dist_env:
   backend: nccl
-  timeout_minutes: 30
+  timeout_minutes: 10
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -34,14 +32,14 @@ model:
   config:
     _target_: nemo_automodel.components.models.titans.config.TitansConfig
     architectures: [TitansForCausalLM]
-    vocab_size: 32000
-    hidden_size: 768
-    num_hidden_layers: 12
-    num_attention_heads: 16
-    head_dim: 48
-    intermediate_size: 3072
+    vocab_size: 512
+    hidden_size: 128
+    num_hidden_layers: 2
+    num_attention_heads: 4
+    head_dim: 32
+    intermediate_size: 512
     hidden_act: silu
-    max_position_embeddings: 4096
+    max_position_embeddings: 128
     rms_norm_eps: 1.0e-6
     momentum: true
     forget: true
@@ -52,19 +50,19 @@ model:
     chunk_size: 16
     tie_word_embeddings: false
     initializer_range: 0.02
-    # Keep fp32 master weights; FSDP2 casts parameters to bf16 for compute.
-    torch_dtype: float32
+    torch_dtype: bfloat16
     pad_token_id: 0
     bos_token_id: 1
     eos_token_id: 2
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
-  file_pattern: "${TITANS_DATA_ROOT}/train/fineweb_edu_*.bin"
-  seq_len: 4096
-  shuffle_files: true
+  file_pattern: "examples/llm_pretrain/data/titans_smoke/train/*.bin"
+  seq_len: 128
+  shuffle_files: false
   align_to_bos: true
   bos_token: 1
+  repeat: true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -73,8 +71,8 @@ dataloader:
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
-  file_pattern: "${TITANS_DATA_ROOT}/validation/fineweb_edu_*.bin"
-  seq_len: 4096
+  file_pattern: "examples/llm_pretrain/data/titans_smoke/validation/*.bin"
+  seq_len: 128
   shuffle_files: false
   align_to_bos: true
   bos_token: 1
@@ -90,14 +88,9 @@ loss_fn:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 3.0e-3
+  lr: 3.0e-4
   betas: [0.9, 0.95]
   weight_decay: 0.1
-
-lr_scheduler:
-  lr_decay_style: cosine
-  lr_warmup_steps: 286
-  min_lr: 0.0
 
 distributed:
   strategy: fsdp2
@@ -106,24 +99,11 @@ distributed:
   cp_size: 1
   pp_size: 1
   sequence_parallel: false
-  activation_checkpointing: true
-  mp_policy:
-    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
-    param_dtype: bfloat16
-    reduce_dtype: float32
-    output_dtype: bfloat16
-    cast_forward_inputs: true
+  activation_checkpointing: false
 
 checkpoint:
   enabled: true
-  checkpoint_dir: "${TITANS_CHECKPOINT_ROOT}"
+  checkpoint_dir: "examples/llm_pretrain/outputs/titans_smoke"
   model_save_format: safetensors
   save_consolidated: false
-  is_async: true
-
-# Uncomment for remote logging.
-# wandb:
-#   project: titans-paper-reproduction
-#   name: titans-170m-lmm
-#   group: lmm-170m
-#   dir: "${TITANS_CHECKPOINT_ROOT}/wandb"
+  is_async: false

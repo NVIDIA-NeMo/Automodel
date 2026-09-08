@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""State-dict adapter for the linear-memory Titans model.
+"""State-dict adapter for the Titans model.
 
-The native parameter names already match a flat HuggingFace layout 1:1, so the
-conversion is an identity remap. Its real job is the precision contract: the
-decay-gate params ``A_log`` / ``dt_bias`` are intrinsically fp32 (``A_log`` is
-exponentiated), so they are upcast to fp32 on load and exported as ``F32``.
+Decay-gate parameters live under an internal ``_fp32_params`` module so FSDP2
+can shard them as a dtype-uniform group. Hugging Face checkpoints keep the
+stable flat names ``A_log`` / ``dt_bias``. The adapter also preserves their
+intrinsic fp32 precision.
 """
 
 from __future__ import annotations
@@ -32,10 +32,22 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 
 # Intrinsically-fp32 decay-gate params (per neural-memory head).
 _FP32_PARAM_NAMES = ("A_log", "dt_bias")
+_NATIVE_FP32_TOKEN = ".memory._fp32_params."
+_HF_FP32_TOKEN = ".memory."
 
 
 def _is_fp32_param_key(key: str) -> bool:
     return key.endswith(_FP32_PARAM_NAMES) and ".memory." in key
+
+
+def _to_native_key(key: str) -> str:
+    if _is_fp32_param_key(key) and _NATIVE_FP32_TOKEN not in key:
+        return key.replace(_HF_FP32_TOKEN, _NATIVE_FP32_TOKEN)
+    return key
+
+
+def _to_hf_key(key: str) -> str:
+    return key.replace(_NATIVE_FP32_TOKEN, _HF_FP32_TOKEN)
 
 
 def _maybe_upcast(key: str, tensor: Any) -> Any:
@@ -67,13 +79,13 @@ class TitansStateDictAdapter(StateDictAdapter):
     def from_hf(
         self, hf_state_dict: dict[str, Any], device_mesh: Optional["DeviceMesh"] = None, **kwargs
     ) -> dict[str, Any]:
-        return {key: _maybe_upcast(key, value) for key, value in hf_state_dict.items()}
+        return {_to_native_key(key): _maybe_upcast(key, value) for key, value in hf_state_dict.items()}
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
         if exclude_key_regex and re.match(exclude_key_regex, fqn):
             return []
-        return [(fqn, _maybe_upcast(fqn, tensor))]
+        return [(_to_hf_key(fqn), _maybe_upcast(fqn, tensor))]
 
     def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
         """Force ``F32`` export dtype for the intrinsically-fp32 decay-gate params."""

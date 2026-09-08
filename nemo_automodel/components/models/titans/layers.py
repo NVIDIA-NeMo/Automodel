@@ -73,6 +73,19 @@ class NeuralMemoryState:
     qkv_history: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
+class _FP32DecayGateParameters(nn.Module):
+    """Isolate decay parameters in a dtype-uniform FSDP2 subtree."""
+
+    def __init__(self, num_heads: int) -> None:
+        super().__init__()
+        self.A_log = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
+
+    def forward(self, a: torch.Tensor) -> torch.Tensor:
+        """Evaluate the decay gate while FSDP owns parameter unsharding."""
+        return -self.A_log.exp() * F.softplus(a.float() + self.dt_bias)
+
+
 def titans_delta_rule_recurrence(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -243,8 +256,7 @@ class NeuralMemory(nn.Module):
 
         # Intrinsically-fp32 decay-gate params (per head). g = -exp(A_log)*softplus(a+dt_bias).
         if forget:
-            self.A_log = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
-            self.dt_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
+            self._fp32_params = _FP32DecayGateParameters(num_heads)
 
         # Deep (mem_depth>=2) memory: a per-head MLP whose weights ARE the memory,
         # updated online by test-time gradient descent. These nn.Parameters are the
@@ -275,7 +287,17 @@ class NeuralMemory(nn.Module):
         """Compute the log-decay gate ``g`` in fp32. Returns ``[B, S, H]`` (``g <= 0``)."""
         if not self.forget:
             return torch.zeros_like(a, dtype=torch.float32)
-        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        return self._fp32_params(a)
+
+    @property
+    def A_log(self) -> torch.Tensor:
+        """Per-head log decay rate, stored in the fp32 FSDP subtree."""
+        return self._fp32_params.A_log
+
+    @property
+    def dt_bias(self) -> torch.Tensor:
+        """Per-head decay-controller bias, stored in the fp32 FSDP subtree."""
+        return self._fp32_params.dt_bias
 
     def _apply_causal_conv(
         self,

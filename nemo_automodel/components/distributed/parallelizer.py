@@ -678,6 +678,45 @@ class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
         )
 
 
+class TitansParallelizationStrategy(DefaultParallelizationStrategy):
+    """Keep Titans' fp32 decay gates in dtype-uniform FSDP2 groups."""
+
+    def parallelize(self, model, device_mesh, **kwargs):
+        fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
+
+        def _fully_shard_titans(
+            module,
+            *,
+            mesh,
+            mp_policy,
+            offload_policy=None,
+            reshard_after_forward=None,
+        ):
+            if module is model:
+                return fully_shard(
+                    module,
+                    mesh=mesh,
+                    mp_policy=mp_policy,
+                    offload_policy=offload_policy,
+                    reshard_after_forward=reshard_after_forward,
+                )
+            return parallelizer_utils.fully_shard_by_dtype(
+                module,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                fp32_compute_module_names=fp32_compute_module_names,
+                reshard_after_forward=reshard_after_forward,
+            )
+
+        return super().parallelize(
+            model,
+            device_mesh,
+            fully_shard_fn=_fully_shard_titans,
+            **kwargs,
+        )
+
+
 class WanParallelizationStrategy(ParallelizationStrategy):
     """Parallelization strategy for Wan-style transformer modules used in Diffusers.
 
@@ -851,6 +890,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
+    "TitansForCausalLM": TitansParallelizationStrategy(),
     "DeepseekV4ForCausalLM": DeepseekV4ParallelizationStrategy(),
     "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),

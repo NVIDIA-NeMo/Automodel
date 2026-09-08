@@ -11,24 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
-from torch.utils.data import get_worker_info
 
 from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
-    NanogptDataset,
     MAGIC,
     VERSION,
-    load_bin_shard,
-    _get_start_end_pos_single_file,
+    NanogptDataset,
     _get_next_bos_position,
-    _get_worker_id_and_total_workers
+    _get_start_end_pos_single_file,
+    _get_worker_id_and_total_workers,
+    load_bin_shard,
 )
+from tools.nanogpt_data_processor import BinaryDataWriter
 
 
 def _make_fake_shard(tmpdir: Path, tokens: np.ndarray) -> Path:
@@ -79,7 +78,22 @@ def test_nanogpt_dataset_iteration():
         # Check shifting logic: labels[0] should equal input_ids[1] in original token stream
         assert labels[0] == 1 and labels[-1] == 4
         assert input_ids == [bos, 1, 2, 3]  # BOS + first 3 tokens
-        assert labels == [1, 2, 3, 4]       # Next 4 tokens (shifted by 1)
+        assert labels == [1, 2, 3, 4]  # Next 4 tokens (shifted by 1)
+
+
+def test_binary_writer_bos_index_round_trip(tmp_path):
+    """The public writer's BOS index uses offsets consumed by the dataset."""
+    bos = 1
+    shard = tmp_path / "shard.bin"
+    writer = BinaryDataWriter(str(shard), bos_token_id=bos, vocab_size=32_000)
+    writer.write([bos, 2, 3])
+    writer.write([bos, 4, 5, 6, 7])
+    writer.close()
+
+    assert np.fromfile(shard.with_suffix(".bos.idx"), dtype=np.int32).tolist() == [0, 3]
+    sample = next(iter(NanogptDataset(str(shard), seq_len=4, align_to_bos=True, bos_token=bos)))
+    assert sample["input_ids"] == [bos, 2, 3, bos]
+    assert sample["labels"] == [2, 3, bos, 4]
 
 
 def test_nanogpt_dataset_len():
@@ -95,6 +109,16 @@ def test_nanogpt_dataset_len():
             assert False, "Should have raised NotImplementedError"
         except NotImplementedError:
             pass  # Expected
+
+
+def test_nanogpt_dataset_can_stop_after_one_pass(tmp_path):
+    """Validation datasets can make one finite pass over their shards."""
+    tokens = np.arange(10, dtype=np.uint16)
+    shard = _make_fake_shard(tmp_path, tokens)
+
+    samples = [sample for sample in NanogptDataset(str(shard), seq_len=4, repeat=False)]
+
+    assert len(samples) == 2
 
 
 def test_load_bin_shard():
@@ -139,7 +163,7 @@ def test_nanogpt_dataset_error_conditions():
 
         # Test that align_to_bos=True requires bos_token
         try:
-            ds = NanogptDataset(str(shard_path), seq_len=4, align_to_bos=True, bos_token=None)
+            NanogptDataset(str(shard_path), seq_len=4, align_to_bos=True, bos_token=None)
             assert False, "Should have raised ValueError"
         except ValueError as e:
             assert "bos_token must be provided when align_to_bos is True" in str(e)
@@ -148,7 +172,7 @@ def test_nanogpt_dataset_error_conditions():
 def test_nanogpt_dataset_no_files_error():
     """Test FileNotFoundError when no files match pattern."""
     try:
-        ds = NanogptDataset("/nonexistent/path/*.bin", seq_len=4)
+        NanogptDataset("/nonexistent/path/*.bin", seq_len=4)
         assert False, "Should have raised FileNotFoundError"
     except FileNotFoundError as e:
         assert "No files matched pattern" in str(e)
@@ -257,7 +281,7 @@ def test_get_worker_id_and_total_workers():
     mock_worker.num_workers = 1
     mock_worker.id = 0
 
-    with patch('torch.distributed.is_initialized', return_value=False):
+    with patch("torch.distributed.is_initialized", return_value=False):
         worker_id, total_workers = _get_worker_id_and_total_workers(mock_worker)
         assert worker_id == 0
         assert total_workers == 1
@@ -266,7 +290,7 @@ def test_get_worker_id_and_total_workers():
     mock_worker.num_workers = 4
     mock_worker.id = 2
 
-    with patch('torch.distributed.is_initialized', return_value=False):
+    with patch("torch.distributed.is_initialized", return_value=False):
         worker_id, total_workers = _get_worker_id_and_total_workers(mock_worker)
         assert worker_id == 2
         assert total_workers == 4
@@ -275,9 +299,11 @@ def test_get_worker_id_and_total_workers():
     mock_worker.num_workers = 1
     mock_worker.id = 0
 
-    with patch('torch.distributed.is_initialized', return_value=True), \
-         patch('torch.distributed.get_world_size', return_value=3), \
-         patch('torch.distributed.get_rank', return_value=1):
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=3),
+        patch("torch.distributed.get_rank", return_value=1),
+    ):
         worker_id, total_workers = _get_worker_id_and_total_workers(mock_worker)
         assert worker_id == 1  # rank 1 * 1 DL worker + 0 DL worker id
         assert total_workers == 3  # 3 ranks * 1 DL worker each
@@ -286,15 +312,17 @@ def test_get_worker_id_and_total_workers():
     mock_worker.num_workers = 2
     mock_worker.id = 1
 
-    with patch('torch.distributed.is_initialized', return_value=True), \
-         patch('torch.distributed.get_world_size', return_value=3), \
-         patch('torch.distributed.get_rank', return_value=2):
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=3),
+        patch("torch.distributed.get_rank", return_value=2),
+    ):
         worker_id, total_workers = _get_worker_id_and_total_workers(mock_worker)
         assert worker_id == 5  # rank 2 * 2 DL workers + 1 DL worker id = 5
         assert total_workers == 6  # 3 ranks * 2 DL workers each = 6
 
     # Test case 5: No worker info (single-threaded DataLoader)
-    with patch('torch.distributed.is_initialized', return_value=False):
+    with patch("torch.distributed.is_initialized", return_value=False):
         worker_id, total_workers = _get_worker_id_and_total_workers(None)
         assert worker_id == 0
         assert total_workers == 1
@@ -305,11 +333,11 @@ def test_get_worker_id_and_total_workers():
 
     # Mock the import to raise an exception
     def mock_import(name, *args, **kwargs):
-        if name == 'torch.distributed':
+        if name == "torch.distributed":
             raise ImportError("No module named 'torch.distributed'")
-        return __builtins__['__import__'](name, *args, **kwargs)
+        return __builtins__["__import__"](name, *args, **kwargs)
 
-    with patch('builtins.__import__', side_effect=mock_import):
+    with patch("builtins.__import__", side_effect=mock_import):
         worker_id, total_workers = _get_worker_id_and_total_workers(mock_worker)
         assert worker_id == 1  # Should fall back to DL worker id
         assert total_workers == 2  # Should fall back to DL num workers
@@ -318,7 +346,7 @@ def test_get_worker_id_and_total_workers():
     mock_worker.num_workers = 3
     mock_worker.id = 2
 
-    with patch('torch.distributed.is_initialized', return_value=False):
+    with patch("torch.distributed.is_initialized", return_value=False):
         worker_id, total_workers = _get_worker_id_and_total_workers(mock_worker)
         assert worker_id == 2
         assert total_workers == 3
