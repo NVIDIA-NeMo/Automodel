@@ -2627,6 +2627,56 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert "1 output file, world_size=64" in caplog.text
         assert "~64.0 GiB" in caplog.text
 
+    def test_non_rank_0_skips_size_estimation_entirely(self, tmp_path, monkeypatch):
+        """Only rank 0 logs, so no other rank should pay for the estimate.
+
+        Both helpers are local (a file read and a state-dict walk), so every
+        rank was opening the same HF index on shared storage and walking its
+        state dict on every save, only for all but one to discard the result.
+        """
+        import nemo_automodel.components.checkpoint.checkpointing as ckpt_mod
+
+        monkeypatch.setenv("WORLD_SIZE", "256")
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+
+        calls = {"index": 0, "walk": 0}
+
+        def _count_index(_config):
+            calls["index"] += 1
+            return None
+
+        def _count_walk(_state_dict):
+            calls["walk"] += 1
+            return 0
+
+        monkeypatch.setattr(ckpt_mod, "is_rank_0", lambda: False)
+        monkeypatch.setattr(ckpt_mod, "_get_original_hf_index_total_size", _count_index)
+        monkeypatch.setattr(ckpt_mod, "estimate_state_dict_bytes", _count_walk)
+
+        _warn_if_large_inline_consolidation(checkpointer.config, {"w": object()}, {"w": 1})
+
+        assert calls == {"index": 0, "walk": 0}
+
+    def test_rank_0_still_estimates(self, tmp_path, monkeypatch):
+        """The guard must not silence the warning on the rank that emits it."""
+        import nemo_automodel.components.checkpoint.checkpointing as ckpt_mod
+
+        monkeypatch.setenv("WORLD_SIZE", "256")
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+
+        calls = {"index": 0}
+
+        def _count_index(_config):
+            calls["index"] += 1
+            return 64 * 1024**3
+
+        monkeypatch.setattr(ckpt_mod, "is_rank_0", lambda: True)
+        monkeypatch.setattr(ckpt_mod, "_get_original_hf_index_total_size", _count_index)
+
+        _warn_if_large_inline_consolidation(checkpointer.config, {"w": object()}, {"w": 1})
+
+        assert calls["index"] == 1
+
 
 class TestOfflineHFConsolidationTool:
     """Focused tests for the root offline consolidation tool."""
