@@ -82,6 +82,9 @@ class AutoPipeline:
         scale_grads_in_schedule: bool = False,
         # Shape inference optimization
         pp_seq_len: int | None = None,
+        # P2P recv-buffer pooling (see components.distributed.pipelining.recv_buffer_pool)
+        pp_recv_buffer_pool: bool = False,
+        pp_recv_buffer_pool_slack: int = 2,
     ):
         # Validation
         if pp_schedule_csv is None and pp_schedule is None:
@@ -115,6 +118,8 @@ class AutoPipeline:
         self.dtype = dtype
         self.scale_grads_in_schedule = scale_grads_in_schedule
         self.pp_seq_len = pp_seq_len
+        self.pp_recv_buffer_pool = pp_recv_buffer_pool
+        self.pp_recv_buffer_pool_slack = pp_recv_buffer_pool_slack
 
         self.pp_mesh: DeviceMesh = self.world_mesh[pp_axis_name]
 
@@ -142,6 +147,23 @@ class AutoPipeline:
         assert isinstance(model, nn.Module), "model must be a PyTorch module"
 
         validate_hf_model_for_pipeline_support(model)
+
+        if self.pp_recv_buffer_pool:
+            from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
+                install_recv_buffer_pool,
+                schedule_supports_recv_pool,
+            )
+
+            # Only 1F1B's bounded in-flight depth makes the ring size proof valid;
+            # schedules with unbounded in-flight microbatches would silently
+            # corrupt gradients through reused recv buffers.
+            if self.pp_schedule_csv is None and schedule_supports_recv_pool(self.pp_schedule):
+                install_recv_buffer_pool(slack=self.pp_recv_buffer_pool_slack)
+            else:
+                logger.warning(
+                    "pp_recv_buffer_pool ignored: schedule %s has no bounded in-flight depth proof",
+                    self.pp_schedule_csv or self.pp_schedule,
+                )
 
         pp_schedule_obj, model_parts, pp_has_first_stage, pp_has_last_stage, stages = pipeline_model(
             model,
