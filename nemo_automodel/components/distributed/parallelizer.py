@@ -26,6 +26,7 @@ import transformers
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
+    CheckpointWrapper,
     checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
@@ -678,10 +679,21 @@ class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
         )
 
 
+def _apply_titans_activation_checkpointing(model: nn.Module) -> None:
+    """Checkpoint the neural-memory path that dominates Titans activations."""
+    for layer in _extract_model_layers(model):
+        memory = getattr(layer, "memory", None)
+        if memory is not None and not isinstance(memory, CheckpointWrapper):
+            layer.memory = checkpoint_wrapper(memory, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+
+
 class TitansParallelizationStrategy(DefaultParallelizationStrategy):
     """Keep Titans' fp32 decay gates in dtype-uniform FSDP2 groups."""
 
     def parallelize(self, model, device_mesh, **kwargs):
+        if kwargs.get("activation_checkpointing", False):
+            _apply_titans_activation_checkpointing(model)
+
         fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
         def _fully_shard_titans(

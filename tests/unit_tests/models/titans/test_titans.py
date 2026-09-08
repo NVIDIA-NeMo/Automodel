@@ -35,7 +35,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 import yaml
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
+from nemo_automodel.components.distributed.parallelizer import _apply_titans_activation_checkpointing
 from nemo_automodel.components.models.titans.config import TitansConfig
 from nemo_automodel.components.models.titans.layers import (
     NeuralMemory,
@@ -62,6 +64,14 @@ def _tiny_config(**overrides):
     c = TitansConfig(**cfg)
     c.architectures = ["TitansForCausalLM"]
     return c
+
+
+def test_titans_activation_checkpointing_wraps_neural_memory():
+    model = TitansForCausalLM(_tiny_config(mem_depth=2))
+
+    _apply_titans_activation_checkpointing(model)
+
+    assert all(isinstance(layer.memory, CheckpointWrapper) for layer in model.model.layers)
 
 
 # --------------------------------------------------------------------------- #
