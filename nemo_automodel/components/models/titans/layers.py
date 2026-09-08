@@ -53,6 +53,8 @@ see ``_keep_in_fp32_modules`` on the model and ``state_dict_adapter.py``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -60,6 +62,15 @@ from torch import nn
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAVE_FLA, _fla = safe_import("fla.ops.gated_delta_rule")
+
+
+@dataclass
+class NeuralMemoryState:
+    """Recurrent state carried between chunk-aligned deep-memory calls."""
+
+    weights: tuple[torch.Tensor, ...]
+    momentum: tuple[torch.Tensor, ...]
+    qkv_history: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 def titans_delta_rule_recurrence(
@@ -154,6 +165,12 @@ class NeuralMemory(nn.Module):
         num_heads: Number of memory heads. Defaults to ``dim // mem_dim``.
         mem_depth: Memory depth. ``1`` is the linear matrix memory; ``>=2`` is a
             deep MLP memory updated by test-time gradient descent.
+        expansion_factor: Hidden-width multiplier for intermediate deep-memory
+            layers.
+        memory_residual_norm: Add the memory input to an RMS-normalized MLP
+            output, with the norm scale included in the fast weights.
+        qkv_conv_kernel_size: Width of the causal depthwise convolution after
+            Q/K/V projection. ``0`` disables it.
         chunk_size: Chunk size. For ``mem_depth==1`` it is the hint forwarded to the
             fla GDN kernel; for ``mem_depth>=2`` it is the test-time-GD chunk length
             (``1`` is exact per-token GD, larger re-anchors the gradient per chunk).
@@ -170,6 +187,9 @@ class NeuralMemory(nn.Module):
         mem_dim: int = 64,
         num_heads: int | None = None,
         mem_depth: int = 1,
+        expansion_factor: float = 4.0,
+        memory_residual_norm: bool = True,
+        qkv_conv_kernel_size: int = 4,
         chunk_size: int = 16,
         momentum: bool = True,
         forget: bool = True,
@@ -187,6 +207,9 @@ class NeuralMemory(nn.Module):
         self.mem_dim = mem_dim
         self.num_heads = num_heads
         self.mem_depth = mem_depth
+        self.expansion_factor = expansion_factor
+        self.memory_residual_norm = memory_residual_norm
+        self.qkv_conv_kernel_size = qkv_conv_kernel_size
         self.chunk_size = chunk_size
         self.momentum = momentum
         self.forget = forget
@@ -196,6 +219,18 @@ class NeuralMemory(nn.Module):
         self.q_proj = nn.Linear(dim, self.inner_dim, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(dim, self.inner_dim, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(dim, self.inner_dim, bias=False, dtype=dtype)
+        if qkv_conv_kernel_size > 0:
+            conv_kwargs = {
+                "in_channels": self.inner_dim,
+                "out_channels": self.inner_dim,
+                "kernel_size": qkv_conv_kernel_size,
+                "groups": self.inner_dim,
+                "bias": False,
+                "dtype": dtype,
+            }
+            self.q_conv = nn.Conv1d(**conv_kwargs)
+            self.k_conv = nn.Conv1d(**conv_kwargs)
+            self.v_conv = nn.Conv1d(**conv_kwargs)
         # Per-head scalar gates: beta (delta step), a (feeds decay gate), eta (momentum).
         self.b_proj = nn.Linear(dim, num_heads, bias=False, dtype=dtype)
         self.a_proj = nn.Linear(dim, num_heads, bias=False, dtype=dtype)
@@ -214,15 +249,18 @@ class NeuralMemory(nn.Module):
         # Deep (mem_depth>=2) memory: a per-head MLP whose weights ARE the memory,
         # updated online by test-time gradient descent. These nn.Parameters are the
         # learnable *initial* weights (the chunk-0 anchor, re-used each forward); the
-        # inner loop updates a per-sequence copy. Square hidden layers (mem_dim wide).
+        # inner loop updates a per-sequence copy.
         if mem_depth >= 2:
-            layer_dims = (mem_dim,) * (mem_depth + 1)
+            hidden_dim = max(1, int(mem_dim * expansion_factor))
+            layer_dims = (mem_dim, *((hidden_dim,) * (mem_depth - 1)), mem_dim)
             self.mem_weights = nn.ParameterList(
                 [
                     nn.Parameter(torch.empty(num_heads, d_in, d_out, dtype=dtype))
                     for d_in, d_out in zip(layer_dims[:-1], layer_dims[1:])
                 ]
             )
+            if memory_residual_norm:
+                self.mem_norm_weight = nn.Parameter(torch.ones(num_heads, mem_dim, dtype=dtype))
             self._init_mem_weights()
 
     def _init_mem_weights(self) -> None:
@@ -230,12 +268,34 @@ class NeuralMemory(nn.Module):
         for w in self.mem_weights:
             for h in range(self.num_heads):
                 nn.init.xavier_uniform_(w[h])
+        if self.memory_residual_norm:
+            nn.init.ones_(self.mem_norm_weight)
 
     def _decay_gate(self, a: torch.Tensor) -> torch.Tensor:
         """Compute the log-decay gate ``g`` in fp32. Returns ``[B, S, H]`` (``g <= 0``)."""
         if not self.forget:
             return torch.zeros_like(a, dtype=torch.float32)
         return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+
+    def _apply_causal_conv(
+        self,
+        x: torch.Tensor,
+        conv: nn.Conv1d,
+        history: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply a depthwise convolution and return its streaming history."""
+        x = x.transpose(1, 2)
+        history_size = self.qkv_conv_kernel_size - 1
+        if history is None:
+            history = x.new_zeros(x.shape[0], x.shape[1], history_size)
+        if history.shape != (x.shape[0], x.shape[1], history_size):
+            raise ValueError(
+                "Invalid QKV convolution history shape: "
+                f"expected {(x.shape[0], x.shape[1], history_size)}, got {tuple(history.shape)}."
+            )
+        joined = torch.cat((history, x), dim=-1)
+        next_history = joined[:, :, -history_size:] if history_size > 0 else joined[:, :, :0]
+        return conv(joined).transpose(1, 2), next_history
 
     # ------------------------------------------------------------------ #
     # Deep (mem_depth>=2) memory: per-head MLP + chunkwise test-time GD.  #
@@ -255,20 +315,30 @@ class NeuralMemory(nn.Module):
         for w in self.mem_weights:
             wd = w.to(dtype)  # [H, in, out]; autograd flows back to the nn.Parameter
             out.append(wd.unsqueeze(0).expand(batch, *wd.shape).reshape(batch * self.num_heads, *wd.shape[1:]))
+        if self.memory_residual_norm:
+            norm = self.mem_norm_weight.to(dtype)
+            out.append(norm.unsqueeze(0).expand(batch, *norm.shape).reshape(batch * self.num_heads, self.mem_dim))
         return out
 
-    @staticmethod
-    def _mem_forward(x: torch.Tensor, weights: list[torch.Tensor]) -> torch.Tensor:
+    def _mem_forward(self, x: torch.Tensor, weights: list[torch.Tensor]) -> torch.Tensor:
         """Apply the memory MLP. ``x``: ``[N, c, mem_dim]``; weights: ``[N, in, out]``."""
+        residual = x
+        mlp_weights = weights
+        norm_weight = None
+        if self.memory_residual_norm:
+            *mlp_weights, norm_weight = weights
+
         h = x
-        for i, w in enumerate(weights):
+        for i, w in enumerate(mlp_weights):
             if i > 0:
                 h = F.gelu(h)
             h = torch.einsum("ncm,nmo->nco", h, w)
+        if norm_weight is not None:
+            inv_rms = torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            h = residual + h * inv_rms * norm_weight[:, None, :]
         return h
 
-    @staticmethod
-    def _mem_grads(k: torch.Tensor, v: torch.Tensor, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+    def _mem_grads(self, k: torch.Tensor, v: torch.Tensor, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         """Analytic per-token gradients of ``(1/m)||M_W(k) - v||^2`` w.r.t. each weight.
 
         Args:
@@ -279,31 +349,50 @@ class NeuralMemory(nn.Module):
         Returns:
             Per-token gradients, one tensor per layer shaped ``[N, c, in, out]``.
         """
+        mlp_weights = weights
+        norm_weight = None
+        if self.memory_residual_norm:
+            *mlp_weights, norm_weight = weights
+
         layer_inputs: list[torch.Tensor] = []  # matmul input of each layer
         pre_acts: list[torch.Tensor] = []  # matmul outputs (pre next-layer GELU)
         h = k
-        for i, w in enumerate(weights):
+        for i, w in enumerate(mlp_weights):
             if i > 0:
                 h = F.gelu(h)
             layer_inputs.append(h)
             h = torch.einsum("ncm,nmo->nco", h, w)
             pre_acts.append(h)
-        out = h
+        raw_out = h
+        if norm_weight is not None:
+            inv_rms = torch.rsqrt(raw_out.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            normalized = raw_out * inv_rms
+            out = k + normalized * norm_weight[:, None, :]
+        else:
+            out = raw_out
 
         m = out.shape[-1]
         delta = (2.0 / m) * (out - v)  # dL/d(out)  [N, c, mem_dim]
+        norm_grad = None
+        if norm_weight is not None:
+            norm_grad = delta * normalized
+            scaled_delta = delta * norm_weight[:, None, :]
+            projection = (scaled_delta * raw_out).mean(dim=-1, keepdim=True)
+            delta = scaled_delta * inv_rms - raw_out * projection * inv_rms.pow(3)
         # Exact derivative of (erf) GELU, for backprop through hidden activations.
         sqrt2 = 2.0**0.5
         sqrt2pi = (2.0 * torch.pi) ** 0.5
 
-        grads: list[torch.Tensor] = [torch.empty(0)] * len(weights)
-        for i in reversed(range(len(weights))):
+        grads: list[torch.Tensor] = [torch.empty(0)] * len(mlp_weights)
+        for i in reversed(range(len(mlp_weights))):
             grads[i] = torch.einsum("ncm,nco->ncmo", layer_inputs[i], delta)
             if i > 0:
-                delta = torch.einsum("nco,nmo->ncm", delta, weights[i])
+                delta = torch.einsum("nco,nmo->ncm", delta, mlp_weights[i])
                 pre = pre_acts[i - 1]
                 dgelu = 0.5 * (1.0 + torch.erf(pre / sqrt2)) + pre * torch.exp(-0.5 * pre * pre) / sqrt2pi
                 delta = delta * dgelu
+        if norm_grad is not None:
+            grads.append(norm_grad)
         return grads
 
     @staticmethod
@@ -357,13 +446,14 @@ class NeuralMemory(nn.Module):
         new_weights: list[torch.Tensor] = []
         new_momentum: list[torch.Tensor] = []
         for s, w0, s0 in zip(surprise, weight_carry, momentum_carry):
+            carry_shape = (s.shape[0], s.shape[1], *((1,) * (s.ndim - 2)))
             if self.momentum:
-                S = torch.einsum("ntj,njmo->ntmo", m_eta, s)
-                S = S + eta_prefix[:, :, None, None] * s0[:, None]
+                S = torch.einsum("ntj,nj...->nt...", m_eta, s)
+                S = S + eta_prefix.reshape(carry_shape) * s0[:, None]
             else:
                 S = s  # no momentum: surprise passes straight through
-            W = torch.einsum("ntj,njmo->ntmo", m_keep, S)
-            W = W + keep_prefix[:, :, None, None] * w0[:, None]
+            W = torch.einsum("ntj,nj...->nt...", m_keep, S)
+            W = W + keep_prefix.reshape(carry_shape) * w0[:, None]
             new_weights.append(W[:, -1])
             new_momentum.append(S[:, -1])
         return new_weights, new_momentum
@@ -376,7 +466,9 @@ class NeuralMemory(nn.Module):
         theta: torch.Tensor,
         g: torch.Tensor,
         eta: torch.Tensor | None,
-    ) -> torch.Tensor:
+        past_state: tuple[list[torch.Tensor], list[torch.Tensor]] | None = None,
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[list[torch.Tensor], list[torch.Tensor]]]:
         """Chunkwise test-time gradient descent on the per-head deep MLP memory.
 
         Maps the Phase-1 gates onto the deep update: the learning rate ``theta_t``
@@ -434,8 +526,13 @@ class NeuralMemory(nn.Module):
         keepc = keepf.reshape(N, n_chunks, c)
         etac = etaf.reshape(N, n_chunks, c)
 
-        weights = self._deep_init_weights(B, compute_dtype)  # chunk anchor, each [N, in, out]
-        momentum = [torch.zeros_like(w) for w in weights]
+        if past_state is None:
+            weights = self._deep_init_weights(B, compute_dtype)  # chunk anchor, each [N, ...]
+            momentum = [torch.zeros_like(w) for w in weights]
+        else:
+            weights, momentum = past_state
+            weights = [w.to(device=q.device, dtype=compute_dtype) for w in weights]
+            momentum = [m.to(device=q.device, dtype=compute_dtype) for m in momentum]
 
         retrieved_chunks = []
         for i in range(n_chunks):
@@ -443,28 +540,68 @@ class NeuralMemory(nn.Module):
             retrieved_chunks.append(self._mem_forward(qc[:, i], weights))
             # surprise = -theta * grad, evaluated at the anchor weights
             grads = self._mem_grads(kc[:, i], vc[:, i], weights)
-            surprise = [-thetac[:, i, :, None, None] * gr for gr in grads]
+            surprise = [-thetac[:, i].reshape(N, c, *((1,) * (gr.ndim - 2))) * gr for gr in grads]
             # advance memory: momentum + forget recurrence within the chunk
             weights, momentum = self._deep_chunk_update(surprise, etac[:, i], keepc[:, i], weights, momentum)
 
         retrieved = torch.cat(retrieved_chunks, dim=1)[:, :S]  # [N, S, D]
-        return retrieved.reshape(B, H, S, D).transpose(1, 2).reshape(B, S, H, D)
+        retrieved = retrieved.reshape(B, H, S, D).transpose(1, 2).reshape(B, S, H, D)
+        if return_state:
+            return retrieved, (weights, momentum)
+        return retrieved
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_state: NeuralMemoryState | None = None,
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, NeuralMemoryState]:
         """Map ``x: [B, S, dim]`` to retrieved memory output ``[B, S, dim]``."""
         B, S, _ = x.shape
         H, D = self.num_heads, self.mem_dim
+        if (past_state is not None or return_state) and self.mem_depth < 2:
+            raise NotImplementedError("Streaming state is currently supported only for deep memory (mem_depth >= 2).")
+        if (past_state is not None or return_state) and S % self.chunk_size != 0:
+            raise ValueError(
+                f"Streaming calls must be chunk-aligned: sequence length {S} is not divisible by {self.chunk_size}."
+            )
 
-        q = self.q_proj(x).view(B, S, H, D)
-        k = self.k_proj(x).view(B, S, H, D)
-        v = self.v_proj(x).view(B, S, H, D)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        next_qkv_history: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        if self.qkv_conv_kernel_size > 0:
+            histories = past_state.qkv_history if past_state is not None else (None, None, None)
+            q, q_history = self._apply_causal_conv(q, self.q_conv, histories[0])
+            k, k_history = self._apply_causal_conv(k, self.k_conv, histories[1])
+            v, v_history = self._apply_causal_conv(v, self.v_conv, histories[2])
+            next_qkv_history = (q_history, k_history, v_history)
+        q = q.view(B, S, H, D)
+        k = k.view(B, S, H, D)
+        v = v.view(B, S, H, D)
         beta = self.b_proj(x).sigmoid()  # [B,S,H]
         g = self._decay_gate(self.a_proj(x))  # [B,S,H] fp32, <= 0
 
         if self.mem_depth >= 2:
             # Deep MLP memory updated by chunkwise test-time gradient descent.
             eta = self.m_proj(x).sigmoid() if self.momentum else None
-            core = self._deep_recurrence(q, k, v, beta, g, eta)
+            deep_past = None
+            if past_state is not None:
+                deep_past = (list(past_state.weights), list(past_state.momentum))
+            deep_result = self._deep_recurrence(
+                q,
+                k,
+                v,
+                beta,
+                g,
+                eta,
+                past_state=deep_past,
+                return_state=return_state,
+            )
+            if return_state:
+                core, (next_weights, next_momentum) = deep_result
+            else:
+                core = deep_result
         else:
             # Linear matrix memory (gated delta rule + momentum).
             # L2-normalize q,k (matches fla use_qk_l2norm_in_kernel=True).
@@ -488,11 +625,25 @@ class NeuralMemory(nn.Module):
         gate = self.g_proj(x).view(B, S, H, D)
         core = self.norm(core, gate)  # gated RMSNorm, per head
         core = core.reshape(B, S, self.inner_dim).type_as(self.o_proj.weight)
-        return self.o_proj(core)
+        output = self.o_proj(core)
+        if return_state:
+            if next_qkv_history is None:
+                empty = x.new_empty(B, self.inner_dim, 0)
+                next_qkv_history = (empty, empty, empty)
+            state = NeuralMemoryState(
+                weights=tuple(next_weights),
+                momentum=tuple(next_momentum),
+                qkv_history=next_qkv_history,
+            )
+            return output, state
+        return output
 
     def init_weights(self, init_std: float = 0.02):
         for lin in (self.q_proj, self.k_proj, self.v_proj, self.b_proj, self.a_proj, self.g_proj, self.o_proj):
             nn.init.trunc_normal_(lin.weight, mean=0.0, std=init_std)
+        if self.qkv_conv_kernel_size > 0:
+            for conv in (self.q_conv, self.k_conv, self.v_conv):
+                nn.init.trunc_normal_(conv.weight, mean=0.0, std=init_std)
         if self.momentum:
             nn.init.trunc_normal_(self.m_proj.weight, mean=0.0, std=init_std)
         if self.mem_depth >= 2:
@@ -532,6 +683,9 @@ class TitansBlock(nn.Module):
             mem_dim=config.head_dim,
             num_heads=config.num_attention_heads,
             mem_depth=config.mem_depth,
+            expansion_factor=config.memory_expansion_factor,
+            memory_residual_norm=config.memory_residual_norm,
+            qkv_conv_kernel_size=config.qkv_conv_kernel_size,
             chunk_size=config.chunk_size,
             momentum=config.momentum,
             forget=config.forget,

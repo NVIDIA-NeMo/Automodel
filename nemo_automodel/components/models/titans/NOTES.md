@@ -11,6 +11,11 @@ mixer supports two memory kinds behind a shared API:
   **chunkwise test-time gradient descent** with the same momentum + forget gates
   (see the *Deep memory* section below).
 
+The deep-memory path follows the paper's default expansion factor of 4 and
+wraps the MLP output in a residual RMSNorm whose scale is itself a fast weight.
+All memory kinds apply causal depthwise convolutions of width 4 after Q/K/V
+projection by default.
+
 ## What this is
 
 The token mixer is `NeuralMemory` (`layers.py`): a per-head matrix memory
@@ -88,9 +93,10 @@ Implementation (ported from the validated standalone kernel in
 - **Per head via batch-folding.** q,k,v `[B,S,H,D]` and gates `[B,S,H]` fold the
   head axis into the batch (`B*H`) so the MLP recurrence runs per head in parallel.
 - **Learnable initial weights.** The MLP's initial weights are `nn.Parameter`s
-  (`mem_weights`, one `[H, in, out]` per layer, square `mem_dim`-wide hidden
-  layers, Xavier init). They are the **outer-loop** params and the **chunk-0
-  anchor** re-used each forward; the inner loop updates a per-sequence copy.
+  (`mem_weights`, one `[H, in, out]` per layer, expanded hidden layers, Xavier
+  init) together with `mem_norm_weight`. They are the **outer-loop** params and
+  the **chunk-0 anchor** re-used each forward; the inner loop updates a
+  per-sequence copy.
 - **Analytic gradients (no `torch.func`).** `_mem_grads` computes the exact
   per-token MLP gradient by hand (cached layer inputs + exact erf-GELU
   derivative). `_deep_chunk_update` runs the within-chunk momentum+forget scan in
@@ -106,6 +112,10 @@ Implementation (ported from the validated standalone kernel in
   forward/inference; under training the masked `exp(diff)` can overflow to `inf`
   and `0·inf` produces `nan` in the backward pass. Log-space masking keeps both
   passes finite without changing the forward values.
+- **Streaming state.** Deep memory can return a `NeuralMemoryState` and consume
+  it on the next call. The state carries memory weights, momentum, and Q/K/V
+  convolution history. Calls are currently required to end on a memory-chunk
+  boundary.
 
 The deep path reuses the shared output tail (gated RMSNorm + `o_proj`), so
 `model.py` / `TitansBlock` are untouched. `mem_depth=1` (linear) is byte-for-byte

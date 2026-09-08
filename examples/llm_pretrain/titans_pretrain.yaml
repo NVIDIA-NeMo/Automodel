@@ -42,6 +42,9 @@ model:
     momentum: true             # Titans data-dependent momentum (false => Gated DeltaNet)
     forget: true               # data-dependent decay/forget gate (A_log/dt_bias, fp32)
     mem_depth: 1               # linear memory (Phase 1); >=2 is deep memory (Phase 2)
+    memory_expansion_factor: 4 # hidden width for deep memory (paper default)
+    memory_residual_norm: true # paper's residual + normalized memory MLP
+    qkv_conv_kernel_size: 4    # causal depthwise convolution after Q/K/V
     chunk_size: 16
     tie_word_embeddings: true
     initializer_range: 0.02

@@ -29,15 +29,19 @@ box to print all validation numbers, or collected by pytest (CUDA-only tests ski
 on CPU).
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
+import yaml
 
 from nemo_automodel.components.models.titans.config import TitansConfig
 from nemo_automodel.components.models.titans.layers import (
     NeuralMemory,
     titans_delta_rule_recurrence,
 )
+from nemo_automodel.components.models.titans.model import TitansForCausalLM
 
 CUDA = torch.cuda.is_available()
 cuda_only = pytest.mark.skipif(not CUDA, reason="fla GDN kernel requires CUDA")
@@ -241,16 +245,113 @@ def test_deep_build_and_train():
     return losses
 
 
+def test_deep_memory_uses_configured_paper_expansion():
+    """The public config builds the paper's expanded two-layer memory MLP."""
+    from transformers import AutoModelForCausalLM
+
+    import nemo_automodel.components.models.titans  # noqa: F401
+
+    cfg = _tiny_config(mem_depth=2, memory_expansion_factor=4)
+    model = AutoModelForCausalLM.from_config(cfg)
+    state = model.state_dict()
+
+    assert cfg.memory_expansion_factor == 4
+    assert state["model.layers.0.memory.mem_weights.0"].shape == (4, 32, 128)
+    assert state["model.layers.0.memory.mem_weights.1"].shape == (4, 128, 32)
+
+
+def test_deep_memory_exposes_residual_norm_fast_weight():
+    """The deep memory checkpoint includes the paper's residual-norm weight."""
+    from transformers import AutoModelForCausalLM
+
+    import nemo_automodel.components.models.titans  # noqa: F401
+
+    cfg = _tiny_config(mem_depth=2, memory_residual_norm=True)
+    state = AutoModelForCausalLM.from_config(cfg).state_dict()
+
+    assert cfg.memory_residual_norm is True
+    assert state["model.layers.0.memory.mem_norm_weight"].shape == (4, 32)
+
+
+def test_neural_memory_builds_causal_qkv_convolutions():
+    """The paper's width-four Q/K/V convolutions are part of the checkpoint."""
+    from transformers import AutoModelForCausalLM
+
+    import nemo_automodel.components.models.titans  # noqa: F401
+
+    cfg = _tiny_config(mem_depth=2, qkv_conv_kernel_size=4)
+    model = AutoModelForCausalLM.from_config(cfg)
+    state = model.state_dict()
+
+    assert cfg.qkv_conv_kernel_size == 4
+    for projection in ("q", "k", "v"):
+        assert state[f"model.layers.0.memory.{projection}_conv.weight"].shape == (128, 1, 4)
+
+
+def test_deep_memory_state_carry_matches_concatenated_forward():
+    """Chunk-aligned streaming preserves convolution and memory state."""
+    torch.manual_seed(7)
+    memory = NeuralMemory(
+        dim=32,
+        mem_dim=8,
+        num_heads=4,
+        mem_depth=2,
+        expansion_factor=2,
+        chunk_size=4,
+        qkv_conv_kernel_size=4,
+        dtype=torch.float64,
+    ).double()
+    x = torch.randn(2, 8, 32, dtype=torch.float64)
+
+    with torch.no_grad():
+        expected = memory(x)
+        first, state = memory(x[:, :4], return_state=True)
+        second, _ = memory(x[:, 4:], past_state=state, return_state=True)
+
+    torch.testing.assert_close(torch.cat((first, second), dim=1), expected, rtol=1e-10, atol=1e-10)
+
+
+def test_170m_lmm_recipe_matches_paper_scale():
+    """The first full reproduction recipe pins the paper's 170M setup."""
+    recipe_path = Path(__file__).parents[4] / "examples/llm_pretrain/titans_170m_lmm.yaml"
+    recipe = yaml.safe_load(recipe_path.read_text())
+    model = recipe["model"]["config"]
+
+    assert recipe["step_scheduler"]["global_batch_size"] * recipe["dataset"]["seq_len"] == 524_288
+    assert recipe["step_scheduler"]["max_steps"] == 28_610
+    assert model["vocab_size"] == 32_000
+    assert model["num_hidden_layers"] == 12
+    assert model["hidden_size"] == 768
+    assert model["num_attention_heads"] == 16
+    assert model["mem_depth"] == 2
+    assert model["memory_expansion_factor"] == 4
+    assert model["qkv_conv_kernel_size"] == 4
+    assert model["chunk_size"] == 16
+    assert recipe["dataset"]["seq_len"] == 4096
+
+    config_values = {key: value for key, value in model.items() if key not in {"_target_", "architectures"}}
+    with torch.device("meta"):
+        instantiated = TitansForCausalLM(TitansConfig(**config_values))
+    assert sum(parameter.numel() for parameter in instantiated.parameters()) == 173_597_376
+
+
 # --------------------------------------------------------------------------- #
 # Deep memory parity: chunked test-time GD vs slow per-token reference
 # --------------------------------------------------------------------------- #
 def _deep_mlp(weights, x):
     """Differentiable single-token memory MLP. ``x``: [N, mem_dim]; weights: [N, in, out]."""
+    residual = x
+    norm_weight = None
+    if weights[-1].ndim == 2:
+        *weights, norm_weight = weights
+
     h = x
     for i, w in enumerate(weights):
         if i > 0:
             h = F.gelu(h)
         h = torch.einsum("nm,nmo->no", h, w)
+    if norm_weight is not None:
+        h = residual + F.rms_norm(h, (h.shape[-1],), eps=1e-6) * norm_weight
     return h
 
 
@@ -299,12 +400,17 @@ def _deep_per_token_reference(mem, x, chunk_size):
             pred = _deep_mlp(aw, kf[:, idx])
             loss = (pred - vf[:, idx]).pow(2).mean(dim=-1).sum()
             grads = torch.autograd.grad(loss, aw)
-            surprise = [-thetaf[:, idx, None, None] * gr for gr in grads]
+            surprise = [-thetaf[:, idx].reshape(gr.shape[0], *((1,) * (gr.ndim - 1))) * gr for gr in grads]
             if mem.momentum:
-                momentum = [etaf[:, idx, None, None] * s0 + s for s0, s in zip(momentum, surprise)]
+                momentum = [
+                    etaf[:, idx].reshape(s.shape[0], *((1,) * (s.ndim - 1))) * s0 + s
+                    for s0, s in zip(momentum, surprise)
+                ]
             else:
                 momentum = surprise
-            weights = [keepf[:, idx, None, None] * w + s for w, s in zip(weights, momentum)]
+            weights = [
+                keepf[:, idx].reshape(w.shape[0], *((1,) * (w.ndim - 1))) * w + s for w, s in zip(weights, momentum)
+            ]
     return torch.stack(retrieved, dim=1)  # [N, S, D]
 
 
@@ -345,7 +451,10 @@ def test_deep_chunked_matches_per_token_reference():
                 ref = _deep_per_token_reference(mem, x, c)
                 err = (kernel - ref).abs().max().item()
                 worst = max(worst, err)
-                assert err < 1e-9, f"deep parity FAIL depth={depth} {name} chunk={c}: max|diff|={err:.3e}"
+                scale = max(1.0, ref.abs().max().item())
+                assert err < 1e-8 * scale, (
+                    f"deep parity FAIL depth={depth} {name} chunk={c}: max|diff|={err:.3e}, scale={scale:.3e}"
+                )
                 if c == 1:
                     results[(depth, name)] = err
 

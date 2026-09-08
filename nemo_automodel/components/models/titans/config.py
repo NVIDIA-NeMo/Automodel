@@ -53,6 +53,12 @@ class TitansConfig(PretrainedConfig):
         mem_depth: Memory depth. ``1`` is the linear (matrix) memory; ``>=2`` is a
             deep MLP memory updated by chunkwise test-time gradient descent. Both
             share the :class:`NeuralMemory` API (see ``NOTES.md``).
+        memory_expansion_factor: Hidden-width multiplier for intermediate layers
+            of a deep memory MLP.
+        memory_residual_norm: Wrap the deep memory in the paper's residual RMSNorm.
+            The norm weight is part of the test-time-updated fast weights.
+        qkv_conv_kernel_size: Width of the causal depthwise convolution applied
+            after each Q/K/V projection. ``0`` disables the convolutions.
         chunk_size: Chunk size hint for the (future) chunked momentum kernel and
             for the fla GDN kernel reduction path.
         tie_word_embeddings: Whether ``lm_head`` shares weights with ``embed_tokens``.
@@ -77,6 +83,9 @@ class TitansConfig(PretrainedConfig):
         momentum: bool = True,
         forget: bool = True,
         mem_depth: int = 1,
+        memory_expansion_factor: float = 4.0,
+        memory_residual_norm: bool = True,
+        qkv_conv_kernel_size: int = 4,
         chunk_size: int = 16,
         tie_word_embeddings: bool = True,
         initializer_range: float = 0.02,
@@ -99,12 +108,21 @@ class TitansConfig(PretrainedConfig):
         self.momentum = momentum
         self.forget = forget
         self.mem_depth = mem_depth
+        self.memory_expansion_factor = memory_expansion_factor
+        self.memory_residual_norm = memory_residual_norm
+        self.qkv_conv_kernel_size = qkv_conv_kernel_size
         self.chunk_size = chunk_size
         self.initializer_range = initializer_range
         self.torch_dtype = torch_dtype
 
         if mem_depth < 1:
             raise ValueError(f"TitansConfig: mem_depth must be >= 1 (1 = linear, >=2 = deep MLP); got {mem_depth}.")
+        if memory_expansion_factor <= 0:
+            raise ValueError(
+                f"TitansConfig: memory_expansion_factor must be greater than zero; got {memory_expansion_factor}."
+            )
+        if qkv_conv_kernel_size < 0:
+            raise ValueError(f"TitansConfig: qkv_conv_kernel_size must be non-negative; got {qkv_conv_kernel_size}.")
 
         super().__init__(
             pad_token_id=pad_token_id,
