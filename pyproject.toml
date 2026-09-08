@@ -528,6 +528,9 @@ modules = [
 ignore_imports = [
     # Dion needs the FSDP DP mesh resolver so its optimizer mesh matches parameter sharding.
     "nemo_automodel.components.optim.dion -> nemo_automodel.components.distributed.mesh_utils",
+    # Grad clipping needs the same resolver to find the EP process group, because a
+    # flattened ep axis is absent from mesh_dim_names and cannot be indexed directly.
+    "nemo_automodel.components.training.utils -> nemo_automodel.components.distributed.mesh_utils",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.mistral3_vlm.model",
 ]

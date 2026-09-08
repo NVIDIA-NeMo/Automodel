@@ -14,12 +14,12 @@
 
 """Grad clipping must compute ONE global norm with TE grouped experts under EP.
 
-TE grouped expert parameters don't carry the EP axis on their own mesh: with
+TE grouped expert parameters do not carry the EP axis on their own mesh: with
 ep_size equal to the non-pp world they stay plain tensors, and with
 ep_shard > 1 they are DTensors sharded only over the ep_shard mesh. Without an
 extra reduction over the EP axis every EP group computes a different "global"
 norm and clips its shards of the same logical dense FSDP parameter by a
-different coefficient. These tests drive the real
+different coefficient. These scenarios drive the real
 ``scale_grads_and_clip_grad_norm`` across gloo ranks and assert every rank
 agrees on the correct global norm and applies the identical clip everywhere.
 
@@ -28,7 +28,14 @@ Expert modules are identified structurally through the
 construction, so identification is independent of parameter names, of the MoE
 block's attribute name, and of this step's gradient state (collective
 participation must be rank-uniform).
+
+Every scenario shares a single ``mp.spawn`` of ``_WORLD`` ranks. Process
+start-up dominates the cost of a spawned test (~10 s each, mostly re-importing
+torch), so one process group running all scenarios in sequence keeps this file
+affordable for the CPU unit-test budget.
 """
+
+import time
 
 import pytest
 import torch
@@ -41,6 +48,10 @@ from torch.distributed.tensor import DTensor, Shard
 pytestmark = pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required")
 
 MAX_NORM = 1.0
+_WORLD = 4
+# Bounds a deadlock: without it a regression that hangs the collectives would
+# burn the whole job timeout instead of reporting a failed test.
+_JOIN_TIMEOUT_S = 300.0
 
 
 def _expert_model(expert: nn.Parameter, attribute: str = "mlp") -> nn.Module:
@@ -82,8 +93,9 @@ def _clip(model: nn.Module, moe_mesh: DeviceMesh | None, **kwargs) -> float:
 def _add_dense(model: nn.Module, mesh: DeviceMesh) -> nn.Parameter:
     """Attach a dense param: one logical FSDP tensor sharded across all ranks.
 
-    Local shard shape is ``[2, 4]``; the grad is all-ones so any
-    rank-inconsistent clip coefficient shows up as differing shard values.
+    Local shard shape is ``[2, 4]``, so the logical tensor is ``[2 * world, 4]``;
+    the grad is all-ones so any rank-inconsistent clip coefficient shows up as
+    differing shard values.
     """
     dense = nn.Parameter(DTensor.from_local(torch.zeros(2, 4), mesh, [Shard(0)]))
     dense.grad = DTensor.from_local(torch.ones(2, 4), mesh, [Shard(0)])
@@ -91,190 +103,171 @@ def _add_dense(model: nn.Module, mesh: DeviceMesh) -> nn.Parameter:
     return dense
 
 
-def _run_plain_expert_rank(rank: int, world: int, store_path: str) -> None:
+def _scenario_plain_experts(rank: int) -> None:
     """ep_size == world (ep_shard == 1): experts stay plain tensors.
 
     Passes dp_group_size like the recipes do, so the EP grad scaling
-    (division by dp_group_size / ep_shard_size == 2) runs before clipping.
+    (division by dp_group_size / ep_shard_size == 4) runs before clipping.
     """
-    dist.init_process_group("gloo", rank=rank, world_size=world, init_method=f"file:///{store_path}")
-    try:
-        dp_mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard_cp",))
-        moe_mesh = init_device_mesh("cpu", (1, world), mesh_dim_names=("ep_shard", "ep"))
+    dp_mesh = init_device_mesh("cpu", (_WORLD,), mesh_dim_names=("dp_shard_cp",))
+    moe_mesh = init_device_mesh("cpu", (1, _WORLD), mesh_dim_names=("ep_shard", "ep"))
 
-        expert = nn.Parameter(torch.zeros(2, 8))
-        expert.grad = torch.full((2, 8), 20.0 if rank == 0 else 0.2)
-        model = _expert_model(expert)
-        dense = _add_dense(model, dp_mesh)
+    expert = nn.Parameter(torch.zeros(2, 8))
+    expert.grad = torch.full((2, 8), 40.0 if rank == 0 else 0.4)
+    model = _expert_model(expert)
+    dense = _add_dense(model, dp_mesh)
 
-        total_norm = _clip(model, moe_mesh, dp_group_size=world)
+    total_norm = _clip(model, moe_mesh, dp_group_size=_WORLD)
 
-        # after ep scaling the expert grads are 10.0 / 0.1:
-        # dense 16 * 1 + rank-0 experts 16 * 100 + rank-1 experts 16 * 0.01
-        correct = (16 * 1.0 + 16 * 100.0 + 16 * 0.01) ** 0.5
-        coef = MAX_NORM / (correct + 1e-6)
-        torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
-        torch.testing.assert_close(dense.grad.to_local(), torch.full((2, 4), coef))
-        expected_expert = torch.full((2, 8), (10.0 if rank == 0 else 0.1) * coef)
-        torch.testing.assert_close(expert.grad, expected_expert)
-    finally:
-        dist.destroy_process_group()
+    # after ep scaling the expert grads are 10.0 on rank 0 and 0.1 elsewhere:
+    # dense 8 * world * 1 + rank-0 experts 16 * 100 + each other rank 16 * 0.01
+    correct = (8 * _WORLD * 1.0 + 16 * 100.0 + (_WORLD - 1) * 16 * 0.01) ** 0.5
+    coef = MAX_NORM / (correct + 1e-6)
+    torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
+    torch.testing.assert_close(dense.grad.to_local(), torch.full((2, 4), coef))
+    expected_expert = torch.full((2, 8), (10.0 if rank == 0 else 0.1) * coef)
+    torch.testing.assert_close(expert.grad, expected_expert)
 
 
-def _run_ep_shard_expert_rank(rank: int, world: int, store_path: str) -> None:
+def _scenario_ep_shard_experts(rank: int) -> None:
     """ep_size < world (ep_shard > 1): experts are DTensors on the ep_shard mesh only.
 
     Uses the ``moe`` attribute name to pin attribute-name independence.
     """
-    dist.init_process_group("gloo", rank=rank, world_size=world, init_method=f"file:///{store_path}")
-    try:
-        dp_mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard_cp",))
-        moe_mesh = DeviceMesh(
-            "cpu",
-            mesh=torch.tensor([[0, 1], [2, 3]], dtype=torch.int64),
-            mesh_dim_names=("ep_shard", "ep"),
-        )
-        ep_shard_mesh = moe_mesh["ep_shard"]
-        ep_index = rank % 2
+    dp_mesh = init_device_mesh("cpu", (_WORLD,), mesh_dim_names=("dp_shard_cp",))
+    moe_mesh = DeviceMesh(
+        "cpu",
+        mesh=torch.tensor([[0, 1], [2, 3]], dtype=torch.int64),
+        mesh_dim_names=("ep_shard", "ep"),
+    )
+    ep_shard_mesh = moe_mesh["ep_shard"]
+    ep_index = rank % 2
 
-        gval = 10.0 if ep_index == 0 else 0.1
-        expert = nn.Parameter(DTensor.from_local(torch.zeros(2, 4), ep_shard_mesh, [Shard(1)]))
-        expert.grad = DTensor.from_local(torch.full((2, 4), gval), ep_shard_mesh, [Shard(1)])
-        model = _expert_model(expert, attribute="moe")
-        dense = _add_dense(model, dp_mesh)
+    gval = 10.0 if ep_index == 0 else 0.1
+    expert = nn.Parameter(DTensor.from_local(torch.zeros(2, 4), ep_shard_mesh, [Shard(1)]))
+    expert.grad = DTensor.from_local(torch.full((2, 4), gval), ep_shard_mesh, [Shard(1)])
+    model = _expert_model(expert, attribute="moe")
+    dense = _add_dense(model, dp_mesh)
 
-        total_norm = _clip(model, moe_mesh)
+    total_norm = _clip(model, moe_mesh)
 
-        # dense 32 * 1 + ep-group-0 experts 16 * 100 + ep-group-1 experts 16 * 0.01
-        correct = (32 * 1.0 + 16 * 100.0 + 16 * 0.01) ** 0.5
-        coef = MAX_NORM / (correct + 1e-6)
-        torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
-        torch.testing.assert_close(dense.grad.to_local(), torch.full((2, 4), coef))
-        torch.testing.assert_close(expert.grad.to_local(), torch.full((2, 4), gval * coef))
-    finally:
-        dist.destroy_process_group()
+    # dense 8 * world * 1 + ep-group-0 experts 16 * 100 + ep-group-1 experts 16 * 0.01
+    correct = (8 * _WORLD * 1.0 + 16 * 100.0 + 16 * 0.01) ** 0.5
+    coef = MAX_NORM / (correct + 1e-6)
+    torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
+    torch.testing.assert_close(dense.grad.to_local(), torch.full((2, 4), coef))
+    torch.testing.assert_close(expert.grad.to_local(), torch.full((2, 4), gval * coef))
 
 
-def _run_asymmetric_grads_rank(rank: int, world: int, store_path: str) -> None:
-    """One rank has no expert grads at all: must neither hang nor disagree."""
-    dist.init_process_group("gloo", rank=rank, world_size=world, init_method=f"file:///{store_path}")
-    try:
-        dp_mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard_cp",))
-        moe_mesh = init_device_mesh("cpu", (1, world), mesh_dim_names=("ep_shard", "ep"))
+def _scenario_rank_without_expert_grads(rank: int) -> None:
+    """Only one rank has expert grads: must neither hang nor disagree."""
+    dp_mesh = init_device_mesh("cpu", (_WORLD,), mesh_dim_names=("dp_shard_cp",))
+    moe_mesh = init_device_mesh("cpu", (1, _WORLD), mesh_dim_names=("ep_shard", "ep"))
 
-        expert = nn.Parameter(torch.zeros(2, 8))
-        if rank == 0:
-            expert.grad = torch.full((2, 8), 10.0)
-        model = _expert_model(expert)
-        dense = _add_dense(model, dp_mesh)
+    expert = nn.Parameter(torch.zeros(2, 8))
+    if rank == 0:
+        expert.grad = torch.full((2, 8), 10.0)
+    model = _expert_model(expert)
+    dense = _add_dense(model, dp_mesh)
 
-        total_norm = _clip(model, moe_mesh)
+    total_norm = _clip(model, moe_mesh)
 
-        # dense 16 * 1 + rank-0 experts 16 * 100; rank 1 contributes nothing
-        correct = (16 * 1.0 + 16 * 100.0) ** 0.5
-        coef = MAX_NORM / (correct + 1e-6)
-        torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
-        torch.testing.assert_close(dense.grad.to_local(), torch.full((2, 4), coef))
-        if rank == 1:
-            assert expert.grad is None
-    finally:
-        dist.destroy_process_group()
+    # dense 8 * world * 1 + rank-0 experts 16 * 100; the other ranks contribute nothing
+    correct = (8 * _WORLD * 1.0 + 16 * 100.0) ** 0.5
+    coef = MAX_NORM / (correct + 1e-6)
+    torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
+    torch.testing.assert_close(dense.grad.to_local(), torch.full((2, 4), coef))
+    if rank != 0:
+        assert expert.grad is None
 
 
-def _run_torch_fast_path_rank(rank: int, world: int, store_path: str) -> None:
+def _scenario_torch_fast_path(rank: int) -> None:
     """use_torch_clip_grad_norm must not bypass the EP reduction."""
-    dist.init_process_group("gloo", rank=rank, world_size=world, init_method=f"file:///{store_path}")
-    try:
-        moe_mesh = init_device_mesh("cpu", (1, world), mesh_dim_names=("ep_shard", "ep"))
+    moe_mesh = init_device_mesh("cpu", (1, _WORLD), mesh_dim_names=("ep_shard", "ep"))
 
-        expert = nn.Parameter(torch.zeros(2, 8))
-        expert.grad = torch.full((2, 8), 10.0 if rank == 0 else 0.1)
-        model = _expert_model(expert)
+    expert = nn.Parameter(torch.zeros(2, 8))
+    expert.grad = torch.full((2, 8), 10.0 if rank == 0 else 0.1)
+    model = _expert_model(expert)
 
-        total_norm = _clip(model, moe_mesh, use_torch_clip_grad_norm=True)
+    total_norm = _clip(model, moe_mesh, use_torch_clip_grad_norm=True)
 
-        correct = (16 * 100.0 + 16 * 0.01) ** 0.5
-        torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
-    finally:
-        dist.destroy_process_group()
+    correct = (16 * 100.0 + (_WORLD - 1) * 16 * 0.01) ** 0.5
+    torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
 
 
-def _run_inf_norm_rank(rank: int, world: int, store_path: str) -> None:
+def _scenario_inf_norm(rank: int) -> None:
     """The inf-norm path must take the EP-wide max, not the rank-local one."""
-    dist.init_process_group("gloo", rank=rank, world_size=world, init_method=f"file:///{store_path}")
-    try:
-        moe_mesh = init_device_mesh("cpu", (1, world), mesh_dim_names=("ep_shard", "ep"))
+    from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
-        expert = nn.Parameter(torch.zeros(2, 8))
-        expert.grad = torch.full((2, 8), 10.0 if rank == 0 else 0.1)
-        model = _expert_model(expert)
+    moe_mesh = init_device_mesh("cpu", (1, _WORLD), mesh_dim_names=("ep_shard", "ep"))
 
-        from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+    expert = nn.Parameter(torch.zeros(2, 8))
+    expert.grad = torch.full((2, 8), 10.0 if rank == 0 else 0.1)
+    model = _expert_model(expert)
 
-        total_norm = float(
-            scale_grads_and_clip_grad_norm(
-                MAX_NORM,
-                [model],
-                norm_type=float("inf"),
-                moe_mesh=moe_mesh,
-                ep_axis_name="ep",
-                foreach=None,
-            )
+    total_norm = float(
+        scale_grads_and_clip_grad_norm(
+            MAX_NORM,
+            [model],
+            norm_type=float("inf"),
+            moe_mesh=moe_mesh,
+            ep_axis_name="ep",
+            foreach=None,
         )
+    )
 
-        torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(10.0))
-    finally:
-        dist.destroy_process_group()
+    torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(10.0))
 
 
-def _run_ep_size_one_rank(rank: int, world: int, store_path: str) -> None:
+def _scenario_ep_size_one(rank: int) -> None:
     """An ep axis of size 1 must behave exactly like moe_mesh=None."""
+    moe_mesh = init_device_mesh("cpu", (_WORLD, 1), mesh_dim_names=("ep_shard", "ep"))
+
+    expert = nn.Parameter(torch.zeros(4, 4))
+    expert.grad = torch.full((4, 4), 2.0)
+    with_mesh = _clip(_expert_model(expert), moe_mesh)
+
+    expert2 = nn.Parameter(torch.zeros(4, 4))
+    expert2.grad = torch.full((4, 4), 2.0)
+    without_mesh = _clip(_expert_model(expert2), None)
+
+    torch.testing.assert_close(torch.tensor(with_mesh), torch.tensor(without_mesh))
+    torch.testing.assert_close(torch.tensor(with_mesh), torch.tensor(8.0))
+
+
+# Every rank walks this list in the same order, so the collectives each scenario
+# issues stay rank-uniform.
+_SCENARIOS = (
+    _scenario_plain_experts,
+    _scenario_ep_shard_experts,
+    _scenario_rank_without_expert_grads,
+    _scenario_torch_fast_path,
+    _scenario_inf_norm,
+    _scenario_ep_size_one,
+)
+
+
+def _run_scenarios(rank: int, world: int, store_path: str) -> None:
     dist.init_process_group("gloo", rank=rank, world_size=world, init_method=f"file:///{store_path}")
     try:
-        moe_mesh = init_device_mesh("cpu", (1, 1), mesh_dim_names=("ep_shard", "ep"))
-
-        expert = nn.Parameter(torch.zeros(4, 4))
-        expert.grad = torch.full((4, 4), 2.0)
-        with_mesh = _clip(_expert_model(expert), moe_mesh)
-
-        expert2 = nn.Parameter(torch.zeros(4, 4))
-        expert2.grad = torch.full((4, 4), 2.0)
-        without_mesh = _clip(_expert_model(expert2), None)
-
-        torch.testing.assert_close(torch.tensor(with_mesh), torch.tensor(without_mesh))
-        torch.testing.assert_close(torch.tensor(with_mesh), torch.tensor(8.0))
+        for scenario in _SCENARIOS:
+            scenario(rank)
     finally:
         dist.destroy_process_group()
 
 
-def test_plain_te_experts_clip_with_one_global_norm(tmp_path):
+def test_ep_grad_clip_agrees_across_ranks(tmp_path):
+    """All EP clipping scenarios, one process group, one spawn."""
     store = str(tmp_path / "s").replace("\\", "/")
-    mp.spawn(_run_plain_expert_rank, args=(2, store), nprocs=2, join=True)
+    context = mp.spawn(_run_scenarios, args=(_WORLD, store), nprocs=_WORLD, join=False)
 
-
-def test_ep_shard_te_experts_clip_with_one_global_norm(tmp_path):
-    store = str(tmp_path / "s").replace("\\", "/")
-    mp.spawn(_run_ep_shard_expert_rank, args=(4, store), nprocs=4, join=True)
-
-
-def test_rank_without_expert_grads_neither_hangs_nor_diverges(tmp_path):
-    store = str(tmp_path / "s").replace("\\", "/")
-    mp.spawn(_run_asymmetric_grads_rank, args=(2, store), nprocs=2, join=True)
-
-
-def test_torch_fast_path_does_not_bypass_ep_reduction(tmp_path):
-    store = str(tmp_path / "s").replace("\\", "/")
-    mp.spawn(_run_torch_fast_path_rank, args=(2, store), nprocs=2, join=True)
-
-
-def test_inf_norm_takes_the_ep_wide_max(tmp_path):
-    store = str(tmp_path / "s").replace("\\", "/")
-    mp.spawn(_run_inf_norm_rank, args=(2, store), nprocs=2, join=True)
-
-
-def test_ep_size_one_falls_back_to_plain_behavior(tmp_path):
-    store = str(tmp_path / "s").replace("\\", "/")
-    mp.spawn(_run_ep_size_one_rank, args=(1, store), nprocs=1, join=True)
+    deadline = time.monotonic() + _JOIN_TIMEOUT_S
+    while not context.join(timeout=5.0):
+        if time.monotonic() > deadline:
+            for process in context.processes:
+                if process.is_alive():
+                    process.terminate()
+            pytest.fail(f"ranks did not finish within {_JOIN_TIMEOUT_S:.0f}s; the clip collectives deadlocked")
 
 
 def test_moe_mesh_none_keeps_single_process_behavior():
