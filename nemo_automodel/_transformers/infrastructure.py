@@ -114,25 +114,24 @@ def _validate_safe_moe_tp_weight_source(
 ) -> None:
     """Fail closed when replicated MoE-TP paths cannot start from identical weights.
 
-    The conservative plan intentionally leaves attention/router/norm modules
-    replicated across TP ranks. Keep its stricter pretrained, non-PEFT contract
-    until the combined TP/EP path has dedicated replica-sync parity coverage;
-    the generic synchronization must not silently broaden model support.
+    The supported custom-MoE TP contract is pretrained, full-parameter training
+    without PEFT. Replica synchronization keeps the dense token path consistent,
+    but does not define adapter or initialization ownership across combined TP/EP,
+    so those unsupported sources must fail before model surgery.
     """
     parts = _safe_moe_tp_parts(model)
     if not parts:
         return
     if peft_config is not None:
         raise ValueError(
-            "Safe custom-MoE tensor parallelism does not support PEFT yet: "
-            "the combined TP/EP adapter ownership contract lacks parity coverage."
+            "Safe custom-MoE tensor parallelism does not support PEFT: "
+            "adapter ownership is undefined across the combined TP/EP mesh."
         )
     if not checkpoint_source_available:
         raise ValueError(
             "Safe custom-MoE tensor parallelism requires pretrained weights on every TP rank. "
             "from_config/random initialization and load_base_model=False are unsupported; "
-            "use from_pretrained (or an explicitly preloaded shared checkpoint) until the combined TP/EP path "
-            "has replica-sync parity coverage."
+            "use from_pretrained (or an explicitly preloaded shared checkpoint)."
         )
 
 
