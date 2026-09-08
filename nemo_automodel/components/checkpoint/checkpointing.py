@@ -1101,7 +1101,7 @@ class Checkpointer:
         model_state.load_state_dict(
             state_dict,
             strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
-            broadcast_from_rank0=self.process_group is None,
+            broadcast_from_rank0=self.process_group is None and torch.distributed.is_initialized(),
         )
         install_complete = time.monotonic()
         requested_gb = requested_bytes / (1 << 30)
@@ -2091,8 +2091,8 @@ def _ensure_shared_dirs(*dirs: str | None, process_group: torch.distributed.Proc
 
 
 def _is_model_checkpoint_path(path: str) -> bool:
-    """Return whether a checkpoint path names the model directory."""
-    return Path(path.rstrip("/")).name == "model"
+    """Return whether a checkpoint path identifies model weights."""
+    return Path(path.rstrip("/")).name == "model" or os.path.isfile(_adapter_path(path))
 
 
 def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
