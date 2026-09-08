@@ -60,5 +60,6 @@ srun \
       --step_scheduler.global_batch_size=8 \
       --step_scheduler.local_batch_size=1 \
       --step_scheduler.max_steps=1 \
+      --lr_scheduler.lr_warmup_steps=0 \
       --checkpoint.enabled=false
   "
