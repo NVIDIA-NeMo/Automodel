@@ -1833,8 +1833,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"layer.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_state_dict_metadata",
+                return_value={"layer.weight": object()},
             ),
             patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
         ):
@@ -1872,8 +1872,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"unrelated.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_state_dict_metadata",
+                return_value={"unrelated.weight": object()},
             ),
         ):
             mock_model_state = mock_model_state_cls.return_value
@@ -1903,8 +1903,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"language_model.layer.weight", "vision_tower.block.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_state_dict_metadata",
+                return_value={"language_model.layer.weight": object(), "vision_tower.block.weight": object()},
             ),
         ):
             mock_model_state = mock_model_state_cls.return_value
@@ -1940,8 +1940,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: {**state_dict, "stray.weight": torch.ones(1)},
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"layer.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_state_dict_metadata",
+                return_value={"layer.weight": object()},
             ),
             patch.object(checkpointer, "_do_load", side_effect=lambda state_dict, *args, **kwargs: state_dict),
         ):
@@ -1981,7 +1981,7 @@ class TestLoadModelExtraState:
         model = torch.nn.Module()
         initial_state_dict = {
             "layer.weight": torch.zeros(2, 2),
-            "layer._extra_state": torch.empty(0),
+            "layer._extra_state": torch.empty(0, dtype=torch.uint8),
         }
         captured = {}
 
@@ -2003,8 +2003,8 @@ class TestLoadModelExtraState:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"layer.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_state_dict_metadata",
+                return_value={"layer.weight": object()},
             ),
             patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
         ):
@@ -2017,6 +2017,195 @@ class TestLoadModelExtraState:
         assert captured["requested_keys"] == {"layer.weight"}
         assert "module _extra_state keys" in caplog.text
         mock_model_state.load_state_dict.assert_called_once()
+        # The withheld extra-state entry must be re-inserted after the DCP load so a
+        # strict module load still receives every key it expects.
+        loaded_state_dict = mock_model_state.load_state_dict.call_args.args[0]
+        assert "layer._extra_state" in loaded_state_dict
+
+    @pytest.mark.parametrize("checkpoint_format", ["dcp", "safetensors"])
+    @pytest.mark.parametrize("saved_size,current_size", [(5, 0), (5, 2), (2, 5), (5, 5), (0, 5)])
+    def test_tensor_extra_state_round_trip(self, tmp_path, saved_size, current_size, checkpoint_format):
+        """Restore serialized state even when a fresh module has a different-sized placeholder."""
+
+        class StatefulLayer(torch.nn.Linear):
+            def __init__(self, size):
+                super().__init__(2, 2, bias=False)
+                self.extra = torch.arange(size, dtype=torch.uint8)
+
+            def get_extra_state(self):
+                """Return a CPU byte tensor of shape [serialized_bytes]."""
+                return self.extra
+
+            def set_extra_state(self, state):
+                """Install the serialized module state.
+
+                Args:
+                    state: CPU byte tensor of shape [serialized_bytes]; the length
+                        is checkpoint-owned and may differ from the initial state.
+                """
+                self.extra = state.clone()
+
+        source = torch.nn.Sequential(StatefulLayer(saved_size))
+        destination = torch.nn.Sequential(StatefulLayer(current_size))
+        with torch.no_grad():
+            source[0].weight.fill_(7)
+            destination[0].weight.zero_()
+        destination[0].extra.zero_()
+        if checkpoint_format == "safetensors":
+            save_file(source.state_dict(), tmp_path / "model.safetensors")
+        else:
+            dcp.save(source.state_dict(), checkpoint_id=tmp_path)
+
+        checkpointer = self._make_checkpointer()
+        checkpointer.load_model(destination, model_path=str(tmp_path))
+
+        torch.testing.assert_close(destination[0].weight, source[0].weight)
+        torch.testing.assert_close(destination[0].extra, source[0].extra)
+
+    @pytest.mark.parametrize(
+        ("model_save_format", "save_consolidated"),
+        [("torch_save", False), ("safetensors", False), ("safetensors", True)],
+    )
+    def test_tensor_extra_state_round_trip_with_state_dict_adapter(
+        self, tmp_path, model_save_format, save_consolidated
+    ):
+        """Keep native module state outside adapter key conversion during save and resume."""
+        from transformers import LlamaConfig
+
+        from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
+
+        class StatefulLayer(torch.nn.Linear):
+            def __init__(self, size):
+                super().__init__(2, 2, bias=False)
+                self.extra = torch.arange(size, dtype=torch.uint8)
+
+            def get_extra_state(self):
+                """Return a CPU byte tensor of shape [serialized_bytes]."""
+                return self.extra
+
+            def set_extra_state(self, state):
+                """Install serialized module state.
+
+                Args:
+                    state: CPU byte tensor of shape [serialized_bytes].
+                """
+                self.extra = state.clone()
+
+        class AdapterModel(torch.nn.Module):
+            def __init__(self, size):
+                super().__init__()
+                self.model = StatefulLayer(size)
+                self.state_dict_adapter = LlamaStateDictAdapter(LlamaConfig(tie_word_embeddings=False))
+
+        source = AdapterModel(size=5)
+        destination = AdapterModel(size=0)
+        with torch.no_grad():
+            source.model.weight.fill_(7)
+            destination.model.weight.zero_()
+
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format=model_save_format,
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=save_consolidated,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+        checkpoint_path = tmp_path / "step_1"
+        checkpointer.save_model(source, str(checkpoint_path))
+        if save_consolidated:
+            exported_state_dict = _load_hf_safetensors_checkpoint(str(checkpoint_path / "model" / "consolidated"))
+            assert exported_state_dict is not None
+            assert set(exported_state_dict) == {"model.weight"}
+        checkpointer.load_model(destination, model_path=str(checkpoint_path / "model"))
+
+        torch.testing.assert_close(destination.model.weight, source.model.weight)
+        torch.testing.assert_close(destination.model.extra, source.model.extra)
+
+    @pytest.mark.parametrize("dtype,shape", [(torch.float32, (5,)), (torch.uint8, (2, 3))])
+    def test_non_serialized_extra_state_shape_mismatch_is_not_dropped(self, tmp_path, dtype, shape):
+        """Ordinary tensor extra state must retain DCP's shape validation."""
+
+        class StatefulLayer(torch.nn.Linear):
+            def get_extra_state(self):
+                return torch.zeros(1, dtype=dtype)
+
+            def set_extra_state(self, state):
+                """Accept extra state.
+
+                Args:
+                    state: Tensor of shape [1] using the test's dtype.
+                """
+                raise AssertionError("Mismatched state must fail before module installation")
+
+        model = StatefulLayer(2, 2, bias=False)
+        saved = model.state_dict()
+        saved["_extra_state"] = torch.ones(shape, dtype=dtype)
+        dcp.save(saved, checkpoint_id=tmp_path)
+        with pytest.raises(dcp.CheckpointException, match="Size mismatch"):
+            self._make_checkpointer().load_model(model, model_path=str(tmp_path))
+
+    @pytest.mark.parametrize("allow_checkpoint_key_subset", [False, True])
+    def test_dict_extra_state_round_trip(self, tmp_path, allow_checkpoint_key_subset):
+        """DCP-flattened dictionary state must not be mistaken for missing state."""
+
+        class StatefulLayer(torch.nn.Linear):
+            def __init__(self, counter):
+                super().__init__(2, 2, bias=False)
+                self.counter = counter
+
+            def get_extra_state(self):
+                return {"counter": self.counter}
+
+            def set_extra_state(self, state):
+                self.counter = state["counter"]
+
+        source = torch.nn.Sequential(StatefulLayer(17))
+        destination = torch.nn.Sequential(StatefulLayer(0))
+        dcp.save(source.state_dict(), checkpoint_id=tmp_path)
+        self._make_checkpointer().load_model(
+            destination,
+            model_path=str(tmp_path),
+            allow_checkpoint_key_subset=allow_checkpoint_key_subset,
+        )
+        assert destination[0].counter == 17
+        torch.testing.assert_close(destination[0].weight, source[0].weight)
+
+    @pytest.mark.parametrize("required", [False, True])
+    def test_missing_extra_state_real_strict_load(self, tmp_path, required):
+        """Only empty serialized placeholders tolerate absent state on resume."""
+
+        class StatefulLayer(torch.nn.Linear):
+            def __init__(self):
+                super().__init__(2, 2, bias=False)
+                self.extra = torch.tensor([3, 4] if required else [], dtype=torch.uint8)
+
+            def get_extra_state(self):
+                return self.extra
+
+            def set_extra_state(self, state):
+                """Install extra state.
+
+                Args:
+                    state: CPU byte tensor of shape [serialized_bytes].
+                """
+                self.extra = state.clone()
+
+        model = StatefulLayer()
+        expected_extra = model.extra.clone()
+        expected_weight = torch.full_like(model.weight, 7)
+        dcp.save({"weight": expected_weight}, checkpoint_id=tmp_path)
+        if required:
+            with pytest.raises(RuntimeError, match="missing required module extra state"):
+                self._make_checkpointer().load_model(model, model_path=str(tmp_path))
+            return
+        self._make_checkpointer().load_model(model, model_path=str(tmp_path))
+        torch.testing.assert_close(model.weight, expected_weight)
+        torch.testing.assert_close(model.extra, expected_extra)
 
 
 # =============================================================================

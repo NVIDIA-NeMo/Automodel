@@ -773,6 +773,10 @@ def _write_overall_metadata_file_from_shards(
     weight_map = {}
 
     for fqn, (tensor_shape, dtype_str) in fqn_to_size_mapping.items():
+        # Adapter-owned module state is resume-only and intentionally omitted
+        # from the consolidated Hugging Face mapping.
+        if fqn not in fqn_to_index_mapping and "_extra_state" in fqn.split("."):
+            continue
         output_dtype, _ = _resolve_output_dtype(
             fqn,
             dtype_str,
