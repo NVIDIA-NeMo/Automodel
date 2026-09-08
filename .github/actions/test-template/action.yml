@@ -118,6 +118,12 @@ runs:
 
           . /opt/venv/env.sh
 
+          if [[ "${{ inputs.runner }}" == "nemo-ci-gcp-gpu-x2" ]]; then
+            export NCCL_ENV_PLUGIN=none
+            export NCCL_NET_PLUGIN=none
+            export NCCL_NET=Socket
+          fi
+
           bash tests/run_test.sh --UNIT_TEST=${{ inputs.is-unit-test }} --CPU=${{ inputs.cpu-only}} --TEST_NAME=${{ inputs.test-folder }} --SHARD_ID=${{ inputs.shard-id }} --NUM_SHARDS=${{ inputs.num-shards }}
 
         '
