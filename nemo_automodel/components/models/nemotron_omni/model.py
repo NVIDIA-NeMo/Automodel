@@ -944,6 +944,22 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         per-document partition) while the media encoders ran on every image /
         clip, so ``features`` is ordered by GLOBAL placeholder position. Map each
         local token to its global position, then to its feature row.
+
+        Args:
+            features: Tensor of shape [num_global_media_tokens, hidden], ordered by
+                media-placeholder position in the global packed sequence.
+            global_mask: Boolean Tensor of shape [global_tokens], flattened from the
+                global packed sequence, with true entries at media placeholders.
+            local_selected: Boolean Tensor of shape [local_tokens], with true entries
+                at media placeholders in this rank's TE THD partition.
+            cu_seqlens: Int32 Tensor of shape [num_documents + 1] containing cumulative
+                unpadded document boundaries for the global packed sequence.
+            cp_size: Number of context-parallel ranks.
+            cp_rank: This rank's zero-based index in the context-parallel group.
+
+        Returns:
+            Tensor of shape [num_local_media_tokens, hidden] containing this rank's
+            media-feature rows in local placeholder order.
         """
         import transformer_engine_torch as tex  # noqa: PLC0415
 
@@ -1036,7 +1052,24 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             and int(kwargs.get("cp_size", 1)) > 1
         )
 
-        def _local_media(features, global_mask, selected):
+        def _local_media(
+            features: torch.Tensor,
+            global_mask: torch.Tensor | None,
+            selected: torch.Tensor,
+        ) -> torch.Tensor:
+            """Select local packed-THD media rows when context parallelism is active.
+
+            Args:
+                features: Tensor of shape [num_global_media_tokens, hidden].
+                global_mask: Optional Boolean Tensor of shape [global_tokens] marking
+                    media placeholders in the global packed sequence.
+                selected: Boolean Tensor of shape [local_tokens] marking media
+                    placeholders in this rank's local sequence.
+
+            Returns:
+                Tensor of shape [num_local_media_tokens, hidden] for packed THD CP,
+                or ``features`` unchanged outside that path.
+            """
             if not _thd_cp or global_mask is None:
                 return features
             return self._select_local_media_features(
@@ -1099,7 +1132,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 # Packed samples carry pixel_values without tile flags: every image is real.
                 n_imgs = len(pixel_values) if isinstance(pixel_values, (list, tuple)) else pixel_values.shape[0]
                 image_flags = torch.ones(n_imgs, dtype=torch.long, device=inputs_embeds.device)
-            image_flags = image_flags.squeeze(-1)
+            image_flags = image_flags.reshape(-1)
 
             _embeds_shape = inputs_embeds.shape  # [B, N, C] or THD-flattened [T, C]
             C = _embeds_shape[-1]
