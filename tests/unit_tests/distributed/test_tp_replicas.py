@@ -84,6 +84,20 @@ class _RankOrderedBufferModel(nn.Module):
             self.register_buffer(name, buffer)
 
 
+class _RankOrderedParameterModel(nn.Module):
+    """Register differently sized parameters in opposite orders on the two ranks."""
+
+    def __init__(self, rank: int) -> None:
+        super().__init__()
+        parameters = (
+            ("full_weight", nn.Parameter(torch.full((64,), 30.0 + rank))),
+            ("sliding_weight", nn.Parameter(torch.full((32,), 40.0 + rank))),
+        )
+        ordered_parameters = parameters if rank == 0 else reversed(parameters)
+        for name, parameter in ordered_parameters:
+            self.register_parameter(name, parameter)
+
+
 def _replicated_dtensor_gradient(local_gradient: torch.Tensor, tp_mesh) -> DTensor:
     """Wrap a rank-local gradient as a replicated DTensor without checking peers."""
     return DTensor.from_local(local_gradient, tp_mesh, (Replicate(),), run_check=False)
@@ -127,6 +141,13 @@ def _run_replica_sync_worker(rank: int, world_size: int, init_file: str) -> None
             stride=(1,),
         )
         assert not _is_tp_replicated(folded_tp_shard, tuple(range(world_size)), rank, "tp")
+
+        rank_ordered_parameters = _RankOrderedParameterModel(rank)
+        synchronized = broadcast_tp_replicas([rank_ordered_parameters], tp_mesh)
+        assert synchronized == 2
+        torch.testing.assert_close(rank_ordered_parameters.full_weight, torch.full((64,), 30.0))
+        torch.testing.assert_close(rank_ordered_parameters.sliding_weight, torch.full((32,), 40.0))
+        torch.distributed.barrier()
 
         rank_ordered_buffers = _RankOrderedBufferModel(rank)
         synchronized = broadcast_tp_replicas([rank_ordered_buffers], tp_mesh)
