@@ -1062,7 +1062,12 @@ class TrainDiffusionRecipe(BaseRecipe):
                     if microbatch_idx == 0:
                         prepare_after_first_microbatch()
 
-                grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
+                grad_norm = clip_grad_norm(
+                    self.clip_grad_max_norm,
+                    [self.model],
+                    device_mesh=getattr(self, "device_mesh", None),
+                    foreach=self.grad_clip_foreach,
+                )
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                 # ── LoRA gradient diagnostic (step 1 only) ───────────────────

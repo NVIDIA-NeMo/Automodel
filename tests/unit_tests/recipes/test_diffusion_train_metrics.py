@@ -719,6 +719,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     ]
     recipe.lr_scheduler = [SimpleNamespace(step=MagicMock())]
     recipe.model = model
+    recipe.device_mesh = object()
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32
     recipe.check_loss = True
@@ -758,7 +759,12 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
         call(model, False, defer_fsdp_grad_sync=True),
         call(model, True, defer_fsdp_grad_sync=True),
     ]
-    diffusion_train.clip_grad_norm.assert_called_once_with(0.5, [model], foreach=False)
+    diffusion_train.clip_grad_norm.assert_called_once_with(
+        0.5,
+        [model],
+        device_mesh=recipe.device_mesh,
+        foreach=False,
+    )
     recipe.optimizer[0].zero_grad.assert_called_once_with(set_to_none=True)
     recipe.optimizer[0].step.assert_called_once()
     recipe.lr_scheduler[0].step.assert_called_once_with(1)

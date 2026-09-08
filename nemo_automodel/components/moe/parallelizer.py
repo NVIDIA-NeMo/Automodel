@@ -360,6 +360,12 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
         # skip distribute_module entirely and just initialize token dispatcher.
         if isinstance(moe_module.experts, GroupedExpertsTE):
             moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+            # TE creates rank-local parameters for the experts owned by this EP
+            # rank. A combined MoE mesh may fold physical TP peers into EP, so
+            # these plain tensors are different expert shards, not TP replicas.
+            from nemo_automodel.shared.tp_replicas import exclude_from_tp_replica_sync
+
+            exclude_from_tp_replica_sync(moe_module.experts)
         else:
             parallelize_module(
                 module=moe_module.experts,

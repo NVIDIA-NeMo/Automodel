@@ -41,6 +41,22 @@ def mark_tp_replica_gradient_reduction(
     setattr(module, _TP_REPLICA_GRAD_REDUCTION_ATTR, reduction)
 
 
+def exclude_from_tp_replica_sync(module: torch.nn.Module) -> None:
+    """Exclude an owner-sharded module subtree from TP replica synchronization.
+
+    Some parameter owners use a mesh that folds physical TP ranks into another
+    logical axis. Their local tensors are different shards, even though they are
+    not DTensors carrying an explicit ``tp`` placement. Marking the complete
+    subtree keeps both parameter and buffer synchronization from treating those
+    owner-local tensors as TP replicas.
+
+    Args:
+        module: Owner-sharded module whose current subtree must remain local.
+    """
+    for child in module.modules():
+        setattr(child, _TP_REPLICA_GRAD_REDUCTION_ATTR, "skip")
+
+
 def _get_tp_mesh(device_mesh: DeviceMesh | None, tp_axis_name: str) -> DeviceMesh | None:
     """Return a non-trivial TP submesh when one is present."""
     if not isinstance(device_mesh, DeviceMesh) or tp_axis_name not in (device_mesh.mesh_dim_names or ()):
@@ -107,6 +123,8 @@ def _iter_unique_parameters(
     for model_part in model_parts:
         for module in model_part.modules():
             reduction = getattr(module, _TP_REPLICA_GRAD_REDUCTION_ATTR, "mean")
+            if reduction == "skip":
+                continue
             if reduction not in ("mean", "sum"):
                 raise ValueError(f"Unsupported TP replica gradient reduction: {reduction!r}")
             for parameter in module.parameters(recurse=False):
@@ -139,6 +157,13 @@ def _iter_unique_parameters_by_name(
 
 def _iter_unique_buffers(model_parts: list[torch.nn.Module]) -> Iterator[torch.Tensor]:
     """Yield model buffers once in rank-stable fully qualified name order."""
+    excluded_buffer_ids = {
+        id(buffer)
+        for model_part in model_parts
+        for module in model_part.modules()
+        if getattr(module, _TP_REPLICA_GRAD_REDUCTION_ATTR, "mean") == "skip"
+        for buffer in module.buffers(recurse=False)
+    }
     named_buffers = [
         (part_index, name, buffer)
         for part_index, model_part in enumerate(model_parts)
@@ -147,7 +172,7 @@ def _iter_unique_buffers(model_parts: list[torch.nn.Module]) -> Iterator[torch.T
     seen: set[int] = set()
     for _, _, buffer in sorted(named_buffers, key=lambda entry: (entry[0], entry[1])):
         buffer_id = id(buffer)
-        if buffer_id in seen:
+        if buffer_id in seen or buffer_id in excluded_buffer_ids:
             continue
         seen.add(buffer_id)
         yield buffer
@@ -269,7 +294,7 @@ def synchronize_tp_replica_gradients(
     current_rank = dist.get_rank()
     placement_cache: dict[tuple[int, tuple[object, ...]], bool] = {}
     replicated_parameters = []
-    for parameter, reduction in _iter_unique_parameters(model_parts):
+    for parameter, reduction in _iter_unique_parameters_by_name(model_parts):
         if not parameter.requires_grad:
             continue
         if isinstance(parameter, DTensor):

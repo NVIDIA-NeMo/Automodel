@@ -26,6 +26,7 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 from nemo_automodel.shared.tp_replicas import (
     _is_tp_replicated,
     broadcast_tp_replicas,
+    exclude_from_tp_replica_sync,
     mark_tp_replica_gradient_reduction,
     synchronize_tp_replica_gradients,
 )
@@ -98,6 +99,18 @@ class _RankOrderedParameterModel(nn.Module):
             self.register_parameter(name, parameter)
 
 
+class _OwnerShardedExpertModel(nn.Module):
+    """Plain local tensors owned by different experts on folded TP/EP ranks."""
+
+    def __init__(self, rank: int, owner_mesh) -> None:
+        super().__init__()
+        self.owner_mesh = owner_mesh
+        self.expert = nn.Module()
+        self.expert.weight = nn.Parameter(torch.full((4,), 50.0 + rank))
+        self.expert.register_buffer("scale", torch.full((2,), 60.0 + rank))
+        exclude_from_tp_replica_sync(self.expert)
+
+
 def _replicated_dtensor_gradient(local_gradient: torch.Tensor, tp_mesh) -> DTensor:
     """Wrap a rank-local gradient as a replicated DTensor without checking peers."""
     return DTensor.from_local(local_gradient, tp_mesh, (Replicate(),), run_check=False)
@@ -147,6 +160,23 @@ def _run_replica_sync_worker(rank: int, world_size: int, init_file: str) -> None
         assert synchronized == 2
         torch.testing.assert_close(rank_ordered_parameters.full_weight, torch.full((64,), 30.0))
         torch.testing.assert_close(rank_ordered_parameters.sliding_weight, torch.full((32,), 40.0))
+        torch.distributed.barrier()
+
+        rank_ordered_parameters.full_weight.grad = torch.full((64,), 1.0 + rank)
+        rank_ordered_parameters.sliding_weight.grad = torch.full((32,), 10.0 + rank)
+        synchronized = synchronize_tp_replica_gradients([rank_ordered_parameters], tp_mesh)
+        assert synchronized == 2
+        torch.testing.assert_close(rank_ordered_parameters.full_weight.grad, torch.full((64,), 1.5))
+        torch.testing.assert_close(rank_ordered_parameters.sliding_weight.grad, torch.full((32,), 10.5))
+        torch.distributed.barrier()
+
+        owner_sharded_experts = _OwnerShardedExpertModel(rank, folded_mesh)
+        owner_sharded_experts.expert.weight.grad = torch.full_like(owner_sharded_experts.expert.weight, 70.0 + rank)
+        assert broadcast_tp_replicas([owner_sharded_experts], tp_mesh) == 0
+        assert synchronize_tp_replica_gradients([owner_sharded_experts], tp_mesh) == 0
+        torch.testing.assert_close(owner_sharded_experts.expert.weight, torch.full((4,), 50.0 + rank))
+        torch.testing.assert_close(owner_sharded_experts.expert.scale, torch.full((2,), 60.0 + rank))
+        torch.testing.assert_close(owner_sharded_experts.expert.weight.grad, torch.full((4,), 70.0 + rank))
         torch.distributed.barrier()
 
         rank_ordered_buffers = _RankOrderedBufferModel(rank)

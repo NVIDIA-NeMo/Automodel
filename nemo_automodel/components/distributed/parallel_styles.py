@@ -22,11 +22,13 @@ from torch.distributed.tensor import (
 )
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
+    ParallelStyle,
     RowwiseParallel,
     SequenceParallel,
 )
 
 from nemo_automodel.shared.tp_linear import tp_linear_forward
+from nemo_automodel.shared.tp_replicas import mark_tp_replica_gradient_reduction
 
 
 def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
@@ -37,6 +39,15 @@ def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
     )
     assert dist_param.requires_grad == param.requires_grad
     _module.register_parameter(name, dist_param)
+
+
+class ReplicatedWithGradAllReduce(ParallelStyle):
+    """Keep parameters local while sum-reducing their partial TP gradients."""
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        """Mark a replicated module whose ranks compute disjoint gradient contributions."""
+        mark_tp_replica_gradient_reduction(module, "sum")
+        return module
 
 
 class TPLinear(nn.Linear):

@@ -24,6 +24,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     PARALLELIZE_FUNCTIONS,
     _parallelize_qwen3_5_vlm,
 )
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 from nemo_automodel.components.distributed.parallelizer import (
     translate_to_torch_parallel_style,
 )
@@ -31,11 +32,13 @@ from nemo_automodel.components.distributed.parallelizer import (
 
 class TestTranslateToTorchParallelStyleReplicatedWithGradAllreduce:
     """Regression coverage for the 'replicated_with_grad_allreduce' style added
-    to translate_to_torch_parallel_style. Must return None so get_hf_tp_shard_plan
-    skips the entry (safe under FSDP+TP where the TP mesh replication is natural)."""
+    to translate_to_torch_parallel_style."""
 
-    def test_returns_none_for_replicated_with_grad_allreduce(self):
-        assert translate_to_torch_parallel_style("replicated_with_grad_allreduce") is None
+    def test_returns_concrete_style_for_replicated_with_grad_allreduce(self):
+        assert isinstance(
+            translate_to_torch_parallel_style("replicated_with_grad_allreduce"),
+            ReplicatedWithGradAllReduce,
+        )
 
     def test_known_styles_still_return_concrete_objects(self):
         # spot-check that the translator still works for existing styles
@@ -48,9 +51,8 @@ class TestTranslateToTorchParallelStyleReplicatedWithGradAllreduce:
             translate_to_torch_parallel_style("definitely_not_a_real_style")
 
 
-class TestGetHfTpShardPlanSkipsNoneStyles:
-    """get_hf_tp_shard_plan must filter out dict entries where the translator
-    returns None (the new 'replicated_with_grad_allreduce' case), not crash."""
+class TestGetHfTpShardPlanReplicatedStyles:
+    """The HF plan keeps replicated-gradient semantics as a real style."""
 
     def _build_model_with_inner_plan(self, plan):
         """Create a minimal model exposing an inner ``.model._tp_plan`` attribute."""
@@ -61,7 +63,7 @@ class TestGetHfTpShardPlanSkipsNoneStyles:
         model.model = inner
         return model
 
-    def test_none_styled_entry_is_skipped(self):
+    def test_replicated_styled_entry_is_kept(self):
         model = self._build_model_with_inner_plan(
             {
                 "layers.0.self_attn.q_proj": "colwise",
@@ -70,9 +72,9 @@ class TestGetHfTpShardPlanSkipsNoneStyles:
         )
         plan = parallelizer.get_hf_tp_shard_plan(model)
         assert "model.layers.0.self_attn.q_proj" in plan
-        assert "model.layers.0.self_attn.q_norm" not in plan
+        assert isinstance(plan["model.layers.0.self_attn.q_norm"], ReplicatedWithGradAllReduce)
 
-    def test_none_styled_module_is_marked_for_sum_reduction(self):
+    def test_replicated_style_marks_module_when_applied(self):
         model = self._build_model_with_inner_plan(
             {
                 "q_norm": "replicated_with_grad_allreduce",
@@ -80,7 +82,8 @@ class TestGetHfTpShardPlanSkipsNoneStyles:
         )
         model.model.q_norm = nn.LayerNorm(4)
 
-        parallelizer.get_hf_tp_shard_plan(model)
+        plan = parallelizer.get_hf_tp_shard_plan(model)
+        plan["model.q_norm"]._apply(model.model.q_norm, device_mesh=object())
 
         assert model.model.q_norm._nemo_tp_replica_grad_reduction == "sum"
 

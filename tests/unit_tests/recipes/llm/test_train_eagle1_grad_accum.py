@@ -129,7 +129,7 @@ def _build_recipe(num_batches: int, grad_accum: int, trainer_module: nn.Module |
     recipe.val_dataloader = None
     recipe.runtime = SimpleNamespace(global_step=0)
     recipe.grad_accumulation_steps = grad_accum
-    # Large clip threshold so clip_grad_norm_ never rescales the captured grad.
+    # Large clip threshold so gradient clipping never rescales the captured grad.
     recipe.max_grad_norm = 1e9
     recipe.num_epochs = 1
     recipe.log_every_steps = 1

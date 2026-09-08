@@ -646,6 +646,35 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+def test_apply_ep_excludes_te_owned_experts_from_tp_replica_sync(monkeypatch):
+    """TE's plain local expert tensors remain owned by the folded EP mesh."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    class DummyGroupedExpertsTE:
+        def __init__(self):
+            self.init_token_dispatcher = MagicMock()
+
+    experts = DummyGroupedExpertsTE()
+    moe = DummyMoE()
+    moe.experts = experts
+    block = DummyBlock(mlp=moe)
+    model = DummyModel([block])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+    moe_mesh = object()
+
+    monkeypatch.setattr(P, "GroupedExpertsTE", DummyGroupedExpertsTE)
+    exclude_mock = MagicMock()
+    tp_replicas_stub = types.ModuleType("nemo_automodel.shared.tp_replicas")
+    tp_replicas_stub.exclude_from_tp_replica_sync = exclude_mock
+    monkeypatch.setitem(sys.modules, "nemo_automodel.shared.tp_replicas", tp_replicas_stub)
+
+    P.apply_ep(model, ep_mesh, moe_mesh=moe_mesh)
+
+    experts.init_token_dispatcher.assert_called_once_with(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+    exclude_mock.assert_called_once_with(experts)
+
+
 def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
     """Diffusion Gemma exposes the MoE branch as block.moe, not block.mlp."""
     P = _import_parallelizer_with_stubs(monkeypatch)

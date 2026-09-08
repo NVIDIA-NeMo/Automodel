@@ -264,8 +264,7 @@ def _clip_grad_norm_impl(
     return total_norm
 
 
-@torch.no_grad()
-def clip_grad_norm(
+def _clip_grad_norm_without_tp_sync(
     max_grad_norm: float | None,
     model_parts: list[torch.nn.Module],
     *,
@@ -276,7 +275,7 @@ def clip_grad_norm(
     foreach: bool = True,
     use_torch_clip_grad_norm: bool = False,
 ) -> torch.Tensor | float:
-    """Common gradient clipping helper.
+    """Apply common gradient clipping after caller-owned synchronization.
 
     Handles all parallelism strategies (TP, PP, EP/MoE) with automatic sharding-aware grouping.
     Returns the gradient norm as a scalar tensor on the gradients' device, or 0.0 if clipping is skipped.
@@ -344,6 +343,46 @@ def clip_grad_norm(
         )
 
     return grad_norm
+
+
+@torch.no_grad()
+def clip_grad_norm(
+    max_grad_norm: float | None,
+    model_parts: list[torch.nn.Module],
+    *,
+    norm_type: float = 2.0,
+    pp_enabled: bool = False,
+    device_mesh: DeviceMesh | None = None,
+    pp_axis_name: str | None = None,
+    foreach: bool = True,
+    use_torch_clip_grad_norm: bool = False,
+) -> torch.Tensor | float:
+    """Synchronize TP replicas, then apply sharding-aware gradient clipping.
+
+    Args:
+        max_grad_norm: Maximum gradient norm. If None, synchronize only.
+        model_parts: Model modules whose gradients are ready for an optimizer update.
+        norm_type: Type of norm to use.
+        pp_enabled: Whether pipeline parallelism is enabled.
+        device_mesh: Root device mesh for TP and PP synchronization.
+        pp_axis_name: Pipeline-parallel mesh-axis name.
+        foreach: Whether to use foreach clipping operations.
+        use_torch_clip_grad_norm: Use PyTorch's regular-tensor fast path when possible.
+
+    Returns:
+        The pre-clip gradient norm, or 0.0 when clipping is disabled.
+    """
+    synchronize_tp_replica_gradients(model_parts, device_mesh)
+    return _clip_grad_norm_without_tp_sync(
+        max_grad_norm,
+        model_parts,
+        norm_type=norm_type,
+        pp_enabled=pp_enabled,
+        device_mesh=device_mesh,
+        pp_axis_name=pp_axis_name,
+        foreach=foreach,
+        use_torch_clip_grad_norm=use_torch_clip_grad_norm,
+    )
 
 
 def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
@@ -507,7 +546,7 @@ def scale_grads_and_clip_grad_norm(
                         p.grad.div_(ep_ratio)
 
     # Clip with the existing PP/EP-aware helper
-    return clip_grad_norm(
+    return _clip_grad_norm_without_tp_sync(
         max_grad_norm,
         model_parts,
         norm_type=norm_type,

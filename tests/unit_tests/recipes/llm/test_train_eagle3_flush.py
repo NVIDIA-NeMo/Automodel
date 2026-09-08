@@ -53,7 +53,7 @@ class _FakeDraftModel(nn.Module):
 
 class _FakeTrainerModule(nn.Module):
     """Minimal trainer module whose forward returns fake metrics with a
-    gradient-bearing loss so ``backward()`` and ``clip_grad_norm_`` work."""
+    gradient-bearing loss so ``backward()`` and gradient clipping work."""
 
     def __init__(self):
         super().__init__()

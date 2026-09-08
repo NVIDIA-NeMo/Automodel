@@ -19,7 +19,6 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import contextmanager
-from fnmatch import fnmatchcase
 from functools import lru_cache
 from types import FunctionType
 from typing import Any, Dict, Generator, List, Sequence, Tuple, Union
@@ -130,9 +129,8 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_decilm_nemotron_tp_plan,
     get_llama_nemotron_super_tp_plan,
 )
-from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce, translate_to_lora
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
-from nemo_automodel.shared.tp_replicas import mark_tp_replica_gradient_reduction
 
 _MEGATRON_FSDP_050_REQUIRED_MSG = (
     "megatron_fsdp.MixedPrecisionPolicy could not be imported: NeMo Automodel requires megatron-fsdp==0.5.0"
@@ -1470,16 +1468,7 @@ def get_hf_tp_shard_plan(model):
         if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
             translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
-            style = translate_to_torch_parallel_style(v)
-            if v == "replicated_with_grad_allreduce":
-                for module_name, module in model.named_modules():
-                    if fnmatchcase(module_name, k):
-                        mark_tp_replica_gradient_reduction(module, "sum")
-            # The optimizer-boundary replica synchronization owns styles that
-            # intentionally leave parameters unwrapped.
-            if style is None:
-                continue
-            translated_plan[k] = style
+            translated_plan[k] = translate_to_torch_parallel_style(v)
 
     logger.info(f"Hugging Face tp plan: {translated_plan}")
     return translated_plan
@@ -1545,9 +1534,7 @@ def translate_to_torch_parallel_style(style: str):
     elif style == "sequence_parallel":
         return SequenceParallel()
     elif style == "replicated_with_grad_allreduce":
-        # get_hf_tp_shard_plan marks the owning module so the shared optimizer
-        # boundary performs the required sum across partial-head gradients.
-        return None
+        return ReplicatedWithGradAllReduce()
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 

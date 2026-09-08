@@ -21,6 +21,7 @@ import torch
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
+    clip_grad_norm,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
@@ -374,6 +375,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
+                    clip_grad_norm(
+                        None,
+                        self.model_parts,
+                        device_mesh=self.device_mesh,
+                    )
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")

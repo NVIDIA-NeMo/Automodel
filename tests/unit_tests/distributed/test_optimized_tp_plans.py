@@ -44,6 +44,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     _parallelize_llama,
     _parallelize_qwen,
 )
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
 
@@ -219,6 +220,8 @@ class TestParallelizeFunctions:
         # Check parallel styles
         assert isinstance(result["model.layers.*.self_attn.q_proj"], ColwiseParallel)
         assert isinstance(result["model.layers.*.self_attn.o_proj"], RowwiseParallel)
+        assert isinstance(result["model.layers.*.self_attn.q_norm"], ReplicatedWithGradAllReduce)
+        assert isinstance(result["model.layers.*.self_attn.k_norm"], ReplicatedWithGradAllReduce)
 
     def test_parallelize_gemma3_conditional_basic(self):
         """Test _parallelize_gemma3 with Gemma3ForConditionalGeneration."""
@@ -377,10 +380,13 @@ class TestParallelizeFunctions:
 
         result = _parallelize_qwen(model, sequence_parallel=True)
 
-        # Qwen3 has q_norm/k_norm inside attention, but those should remain unwrapped.
-        # Wrapping them with SequenceParallel can incorrectly tag head-sharded activations as sequence-sharded.
-        assert "model.layers.*.self_attn.q_norm" not in result
-        assert "model.layers.*.self_attn.k_norm" not in result
+        # These norms stay local on head-sharded activations, but their replicated
+        # parameters receive partial-head gradients that must be summed.
+        assert isinstance(result["model.layers.*.self_attn.q_norm"], ReplicatedWithGradAllReduce)
+        assert isinstance(result["model.layers.*.self_attn.k_norm"], ReplicatedWithGradAllReduce)
+        q_norm = torch.nn.LayerNorm(4)
+        result["model.layers.*.self_attn.q_norm"]._apply(q_norm, MockDeviceMesh())
+        assert q_norm._nemo_tp_replica_grad_reduction == "sum"
 
 
 class TestParallelizeFunctionsMapping:
@@ -466,6 +472,7 @@ class TestParallelPlanStructure:
             PrepareModuleInput,
             PrepareModuleOutput,
             RotaryEmbedParallel,
+            ReplicatedWithGradAllReduce,
         )
 
         for model, func in mock_models:
