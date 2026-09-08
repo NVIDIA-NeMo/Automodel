@@ -803,6 +803,9 @@ class Gemma4MoETextModelBackend(nn.Module):
                 mm_token_type_ids.to(device=inputs_embeds.device),
                 dtype=inputs_embeds.dtype,
                 sliding_window=getattr(self.config, "sliding_window", None),
+                # HF eager attention adds the mask to the logits, so it must be additive; a bool
+                # mask would be read as +1/+0 and mask nothing.
+                as_additive=getattr(self.config, "_attn_implementation", None) == "eager",
                 as_block_mask=getattr(self.config, "_attn_implementation", None) == "flex_attention",
                 flex_block_size=(32, 32) if full_attention_head_dim > 256 else 128,
             )

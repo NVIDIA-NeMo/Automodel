@@ -15,6 +15,7 @@
 from dataclasses import dataclass
 
 import pytest
+import torch
 from transformers import ProcessorMixin
 
 from nemo_automodel.components.config.loader import ConfigNode
@@ -25,6 +26,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
 )
 from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig, PreTokenizedDatasetWrapperConfig
 from nemo_automodel.components.datasets.vlm.loader import (
+    _COMPACT_MASK_BACKENDS,
     VlmCollatorConfig,
     VlmDataloaderConfig,
     VlmProcessorConfig,
@@ -58,6 +60,40 @@ class BuildContext:
 
     def __exit__(self, *_):
         self.events.append("exit")
+
+
+@pytest.fixture
+def build_packed_dataloader(monkeypatch):
+    """Build a VLM dataloader with dataset construction stubbed out, leaving collater selection real.
+
+    Dataset, pretokenization and packing are stubbed because only the collater ``build`` selects is
+    under test. Returns a callable taking ``packing=`` (defaults to a NEAT ``NeatPackConfig``) plus
+    any ``VlmDataloaderConfig.build`` keyword; the kwargs packing was built with are recorded on
+    ``.packing_kwargs``.
+    """
+    packing_kwargs = {}
+
+    def _stub_packing_build(self, dataset, **kwargs):
+        packing_kwargs.update(kwargs)
+        return dataset
+
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", _stub_packing_build)
+
+    def _build(*, packing=None, **build_kwargs):
+        config = VlmDataloaderConfig(
+            dataset_config=StaticDatasetConfig([]),
+            processor_config=VlmProcessorConfig(factory=DummyProcessor),
+            pretokenization=PreTokenizedDatasetWrapperConfig(),
+            packing=NeatPackConfig() if packing is None else packing,
+            shuffle=False,
+        )
+        return config.build(
+            pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=2, **build_kwargs
+        )
+
+    _build.packing_kwargs = packing_kwargs
+    return _build
 
 
 def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
@@ -241,61 +277,87 @@ def test_recipe_config_resolves_nested_vlm_video_processor():
     }
 
 
-def test_vlm_dataloader_selects_thd_collater(monkeypatch):
-    processor = DummyProcessor()
-    packing_kwargs = {}
-
-    def _build_packing(self, dataset, **kwargs):
-        packing_kwargs.update(kwargs)
-        return dataset
-
-    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
-    monkeypatch.setattr(NeatPackConfig, "build", _build_packing)
-    config = VlmDataloaderConfig(
-        dataset_config=StaticDatasetConfig([]),
-        processor_config=VlmProcessorConfig(factory=lambda: processor),
-        pretokenization=PreTokenizedDatasetWrapperConfig(),
-        packing=NeatPackConfig(packing_format="thd"),
-        shuffle=False,
-    )
-
-    result = config.build(
-        pretrained_model_name_or_path="unused",
-        dp_rank=0,
-        dp_world_size=1,
-        batch_size=2,
-        cp_size=4,
-    )
+def test_vlm_dataloader_selects_thd_collater(build_packed_dataloader):
+    result = build_packed_dataloader(packing=NeatPackConfig(packing_format="thd"), cp_size=4)
 
     assert result.dataloader.collate_fn.func is packed_sequence_thd_vlm_collater
     assert result.dataloader.collate_fn.keywords == {"padding_idx": 0, "max_length": None}
-    assert packing_kwargs["cp_size"] == 4
+    assert build_packed_dataloader.packing_kwargs["cp_size"] == 4
 
 
-def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
-    processor = DummyProcessor()
-    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
-    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
-    config = VlmDataloaderConfig(
-        dataset_config=StaticDatasetConfig([]),
-        processor_config=VlmProcessorConfig(factory=lambda: processor),
-        pretokenization=PreTokenizedDatasetWrapperConfig(),
-        packing=NeatPackConfig(),
-        shuffle=False,
-    )
+# The value space of ``packing_attn_implementation``: every ``BackendConfig.attn`` name, every
+# Transformers dispatch key packing resolves, ``None``, and a string from neither vocabulary. Not
+# every row is reachable from a shipped VLM recipe today -- the point is that the rule is total over
+# the value space. ``None`` is reachable: the validation dataloader is built without the argument
+# (``recipes/vlm/finetune.py``). The ``cp_size=8`` rows guard behaviour that predates this change --
+# ``flash_attention_2`` there is what ``minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml`` resolves to
+# through ``packed_sequence.attn_implementation`` -- while the decision this change makes is at
+# ``cp_size=1``.
+_DENSE_MASK_CASES = (
+    ("te", 1, False),
+    ("flash_attention_2", 1, False),
+    ("flash_attention_3", 1, False),
+    ("flash_attention_4", 1, False),
+    ("sdpa", 1, True),
+    ("eager", 1, True),
+    ("cudnn", 1, True),
+    ("flex", 1, True),
+    ("magi", 1, True),
+    ("tilelang", 1, True),
+    ("torch", 1, True),
+    (None, 1, True),
+    ("not-a-backend", 1, True),
+    ("te", 8, False),
+    ("sdpa", 8, False),
+    ("flash_attention_2", 8, False),
+)
 
-    result = config.build(
-        pretrained_model_name_or_path="unused",
-        dp_rank=0,
-        dp_world_size=1,
-        batch_size=2,
-        packing_attn_implementation="sdpa",
-        cp_size=32,
-    )
 
-    assert result.dataloader.collate_fn.func is neat_packed_vlm_collater
-    assert result.dataloader.collate_fn.keywords["attn_implementation"] == "sdpa"
-    assert result.dataloader.collate_fn.keywords["materialize_4d_mask"] is False
+@pytest.mark.parametrize(("attn_implementation", "cp_size", "dense"), _DENSE_MASK_CASES)
+def test_vlm_dataloader_builds_the_dense_mask_only_for_backends_that_read_it(
+    build_packed_dataloader, attn_implementation, cp_size, dense
+):
+    """Only a backend that reads the mask is handed the quadratic one.
+
+    Flash attention rebuilds ``cu_seqlens`` from the indexed ``[batch, sequence]`` document map and
+    Transformer Engine drops ``cu_seqlens`` as soon as a mask is non-None, so neither ever reads the
+    dense ``[batch, 1, sequence, sequence]`` tensor that building it costs. A backend from neither
+    vocabulary keeps the dense mask, the representation this collater has always produced for it.
+    The one-document pack below also pins the second half of the contract: whenever the dense mask
+    is skipped, the compact map has to reach the model as ``_packed_seq_ids``, because nothing else
+    carries document bounds. What the mask *contains* is the collater's own contract and is pinned
+    by ``test_collate_fns.py``; this test only decides which representation the collater is asked for.
+    """
+    result = build_packed_dataloader(packing_attn_implementation=attn_implementation, cp_size=cp_size)
+    collate_fn = result.dataloader.collate_fn
+    assert collate_fn.func is neat_packed_vlm_collater
+    assert collate_fn.keywords["attn_implementation"] == attn_implementation
+
+    # One pack holding one document: the dense mask is [1, 1, 8, 8] and the compact map is [1, 8].
+    pack = {
+        "input_ids": torch.zeros(8, dtype=torch.long),
+        "labels": torch.zeros(8, dtype=torch.long),
+        "attention_mask": torch.ones(8, dtype=torch.long),
+        "position_ids": torch.arange(8),
+    }
+    batch = collate_fn([pack])
+
+    assert batch["attention_mask"].shape == ((1, 1, 8, 8) if dense else (1, 8))
+    # One document is the case that can see this change: a multi-document pack emits
+    # ``_packed_seq_ids`` on either path, so only here does the key track the representation.
+    assert ("_packed_seq_ids" in batch) is not dense
+
+
+def test_compact_mask_backends_covers_every_flash_attention_name():
+    """Every flash-attention name packing knows about has to be in the compact-mask set.
+
+    ``datasets/`` imports nothing from ``models/``, so the set repeats those names as literals.
+    A name added to ``_FLASH_ATTN_IMPLEMENTATIONS`` alone would silently go back to receiving the
+    dense mask that flash attention cannot use.
+    """
+    from nemo_automodel.components.models.common.packing import _FLASH_ATTN_IMPLEMENTATIONS
+
+    assert set(_FLASH_ATTN_IMPLEMENTATIONS) <= _COMPACT_MASK_BACKENDS
 
 
 class _NoEosProcessor(ProcessorMixin):

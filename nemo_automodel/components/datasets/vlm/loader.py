@@ -150,6 +150,19 @@ class VlmDataloaderBuild:
     processor: ProcessorMixin | None
 
 
+# Attention backends the packed collater must hand the compact ``[batch, sequence]`` document map
+# instead of a dense block-causal mask, because a dense mask is not a usable input for them: flash
+# attention rebuilds ``cu_seqlens`` from the compact map (``models/common/packing.get_unpad_data``),
+# and Transformer Engine reduces any non-None mask to a padding mask and drops ``cu_seqlens``
+# (``attention/utils.preprocess_args_and_kwargs_for_attn``), so document isolation has to reach it
+# through the model instead. A ``te`` model that does not rebuild its mask from ``_packed_seq_ids``
+# cannot honour the map either way; this set is about which representation a backend can use, not
+# about whether one arrives.
+_COMPACT_MASK_BACKENDS: frozenset[str] = frozenset(
+    {"flash_attention_2", "flash_attention_3", "flash_attention_4", "te"}
+)
+
+
 @dataclass
 class VlmDataloaderConfig:
     """Typed construction config for the complete VLM input pipeline."""
@@ -295,11 +308,12 @@ class VlmDataloaderConfig:
                     max_length=self.packing.collate_max_length,
                 )
             else:
-                materialize_4d_mask = cp_size <= 1
+                materialize_4d_mask = cp_size <= 1 and packing_attn_implementation not in _COMPACT_MASK_BACKENDS
                 if not materialize_4d_mask:
                     logger.info(
-                        "Skipping the dense packed VLM attention mask at cp_size=%d; "
-                        "the CP path rebuilds it from compact document IDs",
+                        "Skipping the dense packed VLM attention mask (attn_implementation=%r, "
+                        "cp_size=%d); document boundaries travel as the compact _packed_seq_ids map",
+                        packing_attn_implementation,
                         cp_size,
                     )
                 collate_fn = partial(
