@@ -34,6 +34,7 @@ from torch.nn.parallel import DistributedDataParallel
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _DIFFUSERS_INDEX_FN,
     _extract_file_index_with_status,
+    _is_integrated_cuda_device,
     get_fqn_to_dtype_mapping,
     get_fqn_to_file_index_mapping,
 )
@@ -79,6 +80,25 @@ from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_a
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
+
+
+@pytest.mark.parametrize(
+    ("device_type", "is_integrated", "expected"),
+    [
+        pytest.param("cpu", True, False, id="cpu-never-stages"),
+        pytest.param("cuda", False, False, id="discrete-cuda-keeps-mmap"),
+        pytest.param("cuda", True, True, id="integrated-cuda-stages"),
+    ],
+)
+def test_integrated_cuda_device_detection(device_type, is_integrated, expected):
+    device = torch.device(device_type)
+    with patch(
+        "nemo_automodel.components.checkpoint._backports.hf_storage.torch.cuda.get_device_properties",
+        return_value=SimpleNamespace(is_integrated=is_integrated),
+    ) as get_properties:
+        assert _is_integrated_cuda_device(device) is expected
+
+    assert get_properties.call_count == (1 if device_type == "cuda" else 0)
 
 
 def test_load_on_global_ranks_falls_back_to_legacy_rng_state(tmp_path, caplog):
@@ -331,6 +351,22 @@ def test_load_indexed_safetensors_opens_each_shard_once(tmp_path):
     assert set(loaded) == set(expected)
     for key, tensor in expected.items():
         torch.testing.assert_close(loaded[key], tensor)
+
+
+def test_prefault_safetensors_reads_tensor_without_replacing_returned_view(tmp_path):
+    checkpoint_path = tmp_path / "model.safetensors"
+    checkpoint_path.touch()
+    tensor = MagicMock(spec=torch.Tensor)
+    safe_handle = MagicMock()
+    safe_handle.__enter__.return_value = safe_handle
+    safe_handle.keys.return_value = ["weight"]
+    safe_handle.get_tensor.return_value = tensor
+
+    with patch("safetensors.safe_open", return_value=safe_handle):
+        loaded = _load_hf_safetensors_checkpoint(str(checkpoint_path), prefault_mmap=True)
+
+    assert loaded == {"weight": tensor}
+    tensor.clone.assert_called_once_with()
 
 
 def test_get_fqn_to_dtype_mapping_reads_safetensors_headers_and_applies_key_mapping(tmp_path):

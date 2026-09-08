@@ -644,14 +644,27 @@ def _report_training_reproducibility(
 
 
 def _optimizer_step_summary(optimizers: object) -> list[dict[str, int]]:
-    """Summarize per-parameter optimizer step counters without persisting optimizer tensors."""
+    """Summarize per-parameter optimizer step counters without persisting optimizer tensors.
+
+    Adam initializes parameter state lazily. Treat an absent Adam/AdamW state entry as
+    effective step zero so the pre-save representation matches a checkpoint that
+    materializes explicit zero state for serialization.
+    """
     if not isinstance(optimizers, (list, tuple)):
         optimizers = [optimizers]
     summaries: list[dict[str, int]] = []
     for optimizer in optimizers:
         counter: Counter[str] = Counter()
-        for state in optimizer.state.values():
+        if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+            states = (
+                optimizer.state.get(parameter, {}) for group in optimizer.param_groups for parameter in group["params"]
+            )
+        else:
+            states = optimizer.state.values()
+        for state in states:
             step = state.get("step") if isinstance(state, dict) else None
+            if step is None and isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                step = 0.0
             if isinstance(step, torch.Tensor):
                 step = step.item()
             if step is not None:

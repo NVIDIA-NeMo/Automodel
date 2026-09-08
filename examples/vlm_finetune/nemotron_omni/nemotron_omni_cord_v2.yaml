@@ -59,7 +59,6 @@ distributed:
   sequence_parallel: false
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false

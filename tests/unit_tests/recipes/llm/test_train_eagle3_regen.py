@@ -184,6 +184,7 @@ def test_build_train_dataloader_forwards_config(tmp_path, monkeypatch):
             "num_workers": 3,
             "shuffle_seed": 7,
             "mask_reasoning_content": True,
+            "mask_generation_prompt": True,
             "packed_sequence_size": 128,
         }.get(k, d),
     )
@@ -201,6 +202,8 @@ def test_build_train_dataloader_forwards_config(tmp_path, monkeypatch):
     assert seen["shuffle"] is False
     assert seen["distributed"] is True  # world_size=4 > 1
     assert seen["packed_sequence_size"] == 128
+    assert seen["mask_reasoning_content"] is True
+    assert seen["mask_generation_prompt"] is True
     assert seen["tokenizer"] is recipe.tokenizer
     assert seen["dp_mesh"] is recipe.dp_mesh
 
