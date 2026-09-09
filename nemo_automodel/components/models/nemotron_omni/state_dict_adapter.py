@@ -185,17 +185,19 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
     """
 
     @property
-    def supports_write_through_checkpoint_load(self) -> bool:
-        """Whether the embedded language adapter and all wrapper renames preserve storage.
+    def supports_low_memory_dcp_load(self) -> bool:
+        """Whether the embedded adapters can load through DCP without model-sized temporaries.
 
-        False when the vision tower needs the native-RadioModel remap: the fused
-        ``attn.qkv`` <-> split query/key/value conversion changes tensor cardinality
-        (1 checkpoint tensor <-> 3 module tensors), which `convert_single_tensor_to_hf`
-        cannot do correctly one tensor at a time.
+        Native RadioModel checkpoints require converting one fused ``attn.qkv``
+        tensor into three model tensors, so that vision layout cannot use the
+        low-memory path.
         """
-        return self._llm_adapter.supports_write_through_checkpoint_load and not getattr(
-            self, "vision_uses_native_radio", False
-        )
+        return self._llm_adapter.supports_low_memory_dcp_load and not self.vision_uses_native_radio
+
+    @property
+    def view_loaded_native_keys(self) -> set[str]:
+        """Language-model keys loaded through model-backed checkpoint views."""
+        return {f"language_model.{key}" for key in self._llm_adapter.view_loaded_native_keys}
 
     def __init__(
         self,

@@ -123,6 +123,18 @@ def test_from_hf_routes_llm_through_v3_adapter_with_prefix(adapter):
     assert not any(k.startswith("language_model.") for k in delegated)
 
 
+def test_view_loaded_llm_keys_restore_outer_prefix(adapter):
+    adapter._llm_adapter.view_loaded_native_keys = {
+        "model.layers.0.mixer.experts.gate_and_up_projs",
+        "model.layers.0.mixer.experts.down_projs",
+    }
+
+    assert adapter.view_loaded_native_keys == {
+        "language_model.model.layers.0.mixer.experts.gate_and_up_projs",
+        "language_model.model.layers.0.mixer.experts.down_projs",
+    }
+
+
 # ---------------------------------------------------------------------------
 # to_hf — Automodel layout -> HF layout (round-trip)
 # ---------------------------------------------------------------------------
@@ -294,7 +306,7 @@ def test_native_radio_round_trip(native_adapter):
         assert torch.equal(round_tripped[key], value)
 
 
-def test_supports_write_through_checkpoint_load_false_for_native_radio(native_adapter):
-    """Native RadioModel's fused-qkv split changes cardinality; write-through must be disabled."""
-    native_adapter._llm_adapter.supports_write_through_checkpoint_load = True
-    assert native_adapter.supports_write_through_checkpoint_load is False
+def test_supports_low_memory_dcp_load_false_for_native_radio(native_adapter):
+    """Native RadioModel's fused-qkv split requires a materializing conversion."""
+    native_adapter._llm_adapter.supports_low_memory_dcp_load = True
+    assert native_adapter.supports_low_memory_dcp_load is False
