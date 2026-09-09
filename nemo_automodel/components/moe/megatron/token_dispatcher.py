@@ -372,6 +372,7 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_sms_preprocessing: int | None = None,
         moe_hybridep_num_blocks_permute: int | None = None,
         moe_hybridep_num_blocks_unpermute: int | None = None,
+        benchmark_static_routing: bool = False,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -383,6 +384,9 @@ class _HybridEPManager(_DispatchManager):
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.moe_hybridep_num_blocks_permute = moe_hybridep_num_blocks_permute
         self.moe_hybridep_num_blocks_unpermute = moe_hybridep_num_blocks_unpermute
+        # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
+        # persist num_permuted_tokens across dispatches, see dispatch()/reset.
+        self.benchmark_static_routing = benchmark_static_routing
         self.num_permuted_tokens = None
 
         # Metadata
@@ -448,7 +452,13 @@ class _HybridEPManager(_DispatchManager):
         """Dispatch ``hidden_states[T, H]`` using compact top-k metadata when available."""
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
-        self.num_permuted_tokens = None
+        # Benchmark-only exception: with static routing every dispatch permutes the same
+        # count, so reusing the first dispatch's value keeps hybrid_ep_dispatch on its
+        # non-blocking path and removes a per-microbatch host wait on a device-side flag.
+        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is not None:
+            self.num_permuted_tokens = self._static_num_permuted_tokens
+        else:
+            self.num_permuted_tokens = None
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
 
@@ -492,6 +502,8 @@ class _HybridEPManager(_DispatchManager):
 
         self.tokens_per_expert = tokens_per_expert
         self.num_permuted_tokens = self.tokens_per_expert.sum()
+        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is None:
+            self._static_num_permuted_tokens = self.num_permuted_tokens
 
         return dispatched_hidden
 
@@ -583,6 +595,12 @@ class TokenDispatcherConfig:
 
     moe_deepep_async_dispatch: bool = False
     """Use asynchronous DeepEP/UCCL-EP dispatch/combine and communication-stream allocations."""
+
+    moe_benchmark_static_routing: bool = False
+    """Benchmark-only (mirrors BackendConfig.benchmark_static_routing, validated there):
+    routing is forced-balanced with no noise, so every dispatch permutes the same token
+    count. Persist num_permuted_tokens across dispatches to keep HybridEP on its
+    non-blocking size path instead of waiting on a device-side count per microbatch."""
 
 
 class MoEFlexTokenDispatcher:
@@ -689,6 +707,7 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                         moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                        benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
             else:
@@ -703,6 +722,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                     moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                    benchmark_static_routing=self.config.moe_benchmark_static_routing,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,
