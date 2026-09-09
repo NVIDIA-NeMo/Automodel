@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MXFP4-resident expert storage for frozen MoE experts.
+"""MXFP4-resident expert storage and model application for frozen MoE experts.
 
 ``GroupedExpertsMXFP4`` keeps the frozen routed-expert base weights packed as
 fp4-e2m1 + e8m0 block scales (the DeepSeek V4 Flash checkpoint format) and
@@ -25,6 +25,8 @@ so a future integer-int4 (e.g. GLM) variant can reuse the same module wiring by
 swapping the mixin's primitives.
 """
 
+import logging
+
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
@@ -32,6 +34,7 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    GroupedExpertsTE,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
 )
@@ -41,6 +44,8 @@ from nemo_automodel.components.quantization.mxfp4 import (
     dequantize_mxfp4,
     quantize_mxfp4,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _to_local(t):
@@ -395,3 +400,74 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
+
+
+def apply_mxfp4_to_moe_experts(model: nn.Module, *, passthrough: bool = False) -> nn.Module:
+    """Apply MXFP4-resident storage to the model's common routed-expert modules.
+
+    Call this after LoRA injection and before distributed sharding. LoRA-targeted
+    experts that are already MXFP4-resident are preserved; remaining plain
+    ``GroupedExperts`` and ``GroupedExpertsDeepEP`` modules are replaced in place.
+
+    When ``passthrough=True``, packed placeholders are registered before checkpoint
+    loading and every model state-dict adapter must explicitly opt into the MXFP4
+    expert storage format. This lets model-specific adapters translate their own
+    checkpoint layouts while this function owns the common model surgery.
+    """
+    model_parts = list(model.parts) if hasattr(model, "parts") else [model]
+
+    unsupported = [
+        name
+        for model_part in model_parts
+        for name, module in model_part.named_modules()
+        if isinstance(module, GroupedExpertsTE)
+    ]
+    if unsupported:
+        raise NotImplementedError(
+            "MXFP4-resident expert weights do not support Transformer Engine expert modules; "
+            "use backend.experts='torch_mm'."
+        )
+
+    if passthrough:
+        for model_part in model_parts:
+            adapter = getattr(model_part, "state_dict_adapter", None)
+            set_storage_format = getattr(adapter, "set_expert_storage_format", None)
+            if not callable(set_storage_format):
+                raise NotImplementedError(
+                    "MXFP4 checkpoint passthrough requires the model state-dict adapter to implement "
+                    "set_expert_storage_format()."
+                )
+            set_storage_format("mxfp4")
+
+    frozen_conversions = {
+        GroupedExperts: GroupedExpertsMXFP4,
+        GroupedExpertsDeepEP: GroupedExpertsDeepEPMXFP4,
+    }
+    num_converted = 0
+    for model_part in model_parts:
+        for name, module in list(model_part.named_modules()):
+            if isinstance(module, MXFP4ExpertStorageMixin):
+                continue
+            new_cls = frozen_conversions.get(type(module))
+            if new_cls is None:
+                continue
+            new_module = new_cls(module, passthrough=passthrough)
+            parent_name, _, child_name = name.rpartition(".")
+            parent = model_part.get_submodule(parent_name) if parent_name else model_part
+            setattr(parent, child_name, new_module)
+            num_converted += 1
+
+    logger.info("Applied MXFP4-resident storage to %d frozen expert module(s)", num_converted)
+    return model
+
+
+def pack_mxfp4_expert_base_weights(model: nn.Module) -> int:
+    """Pack any deferred MXFP4 expert base weights after checkpoint loading."""
+    num_packed = 0
+    model_parts = list(model.parts) if hasattr(model, "parts") else [model]
+    for model_part in model_parts:
+        for module in model_part.modules():
+            if isinstance(module, MXFP4ExpertStorageMixin) and not module._mxfp4_resident:
+                module.pack_base_weights()
+                num_packed += 1
+    return num_packed

@@ -24,12 +24,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_automodel.components._peft.lora import convert_frozen_experts_to_mxfp4, patch_moe_module
+from nemo_automodel.components._peft.lora import patch_moe_module
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA
 from nemo_automodel.components._peft.lora_experts_mxfp4 import GroupedExpertsDeepEPLoRAMXFP4
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
-from nemo_automodel.components.moe.quantized_experts import GroupedExpertsDeepEPMXFP4, GroupedExpertsMXFP4
+from nemo_automodel.components.moe.quantized_experts import (
+    GroupedExpertsDeepEPMXFP4,
+    GroupedExpertsMXFP4,
+    apply_mxfp4_to_moe_experts,
+)
 from nemo_automodel.components.quantization.mxfp4 import dequantize_mxfp4, quantize_mxfp4
 
 
@@ -180,7 +184,7 @@ def test_passthrough_deepep_registers_packed_params_on_meta(moe_config):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_convert_frozen_experts_to_mxfp4_handles_deepep(moe_config, device):
+def test_apply_mxfp4_to_moe_experts_handles_deepep(moe_config, device):
     import torch.nn as nn
 
     class TinyModel(nn.Module):
@@ -189,13 +193,14 @@ def test_convert_frozen_experts_to_mxfp4_handles_deepep(moe_config, device):
             self.experts = _make_deepep(moe_config, device)
 
     model = TinyModel()
-    n = convert_frozen_experts_to_mxfp4(model)
-    assert n == 1
+    assert apply_mxfp4_to_moe_experts(model) is model
     assert isinstance(model.experts, GroupedExpertsDeepEPMXFP4)
     # Not the torch-path class.
     assert not isinstance(model.experts, GroupedExpertsMXFP4)
     # Idempotent.
-    assert convert_frozen_experts_to_mxfp4(model) == 0
+    converted = model.experts
+    assert apply_mxfp4_to_moe_experts(model) is model
+    assert model.experts is converted
 
 
 # --- forward numerics (mock dispatcher) ---------------------------------------

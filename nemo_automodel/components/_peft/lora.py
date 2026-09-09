@@ -38,7 +38,6 @@ from nemo_automodel.components._peft.lora_kernel import (
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
-from nemo_automodel.components.moe.quantized_experts import GroupedExpertsMXFP4, MXFP4ExpertStorageMixin
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 from nemo_automodel.shared.tp_linear import tp_linear_forward
 from nemo_automodel.shared.utils import dtype_from_str
@@ -721,84 +720,6 @@ def apply_lora_to_linear_modules(
             logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
 
     return num_modules_matched
-
-
-def convert_frozen_experts_to_mxfp4(model: nn.Module, passthrough: bool = False) -> int:
-    """Swap frozen ``GroupedExperts`` modules to mxfp4-resident ``GroupedExpertsMXFP4``.
-
-    Applies to routed experts that are NOT LoRA-targeted (those that received a
-    LoRA adapter are already ``GroupedExpertsLoRAMXFP4``). This is the path that
-    delivers the storage win for the common case of LoRA on attention with frozen
-    experts. Must be called with the base weights frozen.
-
-    Args:
-        model: Model to convert in place.
-        passthrough: When True, build the new modules in packed-storage mode at
-            init (no bf16 weights) so a packed fp4 checkpoint loads straight in,
-            capping the load-time peak. The state-dict adapter must also be put in
-            ``expert_storage_format='mxfp4'`` so it emits packed keys. When False
-            (default), weights load as bf16 and pack after load (higher load peak,
-            but works with any checkpoint and is the validated path).
-
-    Returns:
-        Number of expert modules converted.
-    """
-    # Import here to avoid a hard dependency at module import time.
-    from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
-    from nemo_automodel.components.moe.quantized_experts import GroupedExpertsDeepEPMXFP4
-
-    # Exact-type → mxfp4-resident replacement. Exact `type(...) is` (not isinstance) so the
-    # LoRA-on-experts subclasses (already MXFP4ExpertStorageMixin, skipped above) and any
-    # bf16 LoRA experts are left untouched — only genuinely frozen modules are converted.
-    frozen_conversions = {
-        GroupedExperts: GroupedExpertsMXFP4,
-        GroupedExpertsDeepEP: GroupedExpertsDeepEPMXFP4,
-    }
-
-    num_converted = 0
-    unsupported = 0
-    for name, module in list(model.named_modules()):
-        # Already mxfp4-resident (frozen or LoRA-targeted) — skip.
-        if isinstance(module, MXFP4ExpertStorageMixin):
-            continue
-        if isinstance(module, GroupedExpertsTE):
-            unsupported += 1
-            continue
-        new_cls = frozen_conversions.get(type(module))
-        if new_cls is not None:
-            new_module = new_cls(module, passthrough=passthrough)
-            parent_name, _, child_name = name.rpartition(".")
-            parent = model.get_submodule(parent_name) if parent_name else model
-            setattr(parent, child_name, new_module)
-            num_converted += 1
-
-    if unsupported:
-        logger.warning(
-            "expert_weight_format='mxfp4' skipped %d Transformer Engine expert module(s); TE experts have no "
-            "packed variant. Use backend.experts='torch_mm' (with backend.dispatcher='torch' or 'deepep').",
-            unsupported,
-        )
-    return num_converted
-
-
-def pack_mxfp4_expert_base_weights(model: nn.Module) -> int:
-    """Pack any deferred mxfp4-resident expert modules after base weights are loaded.
-
-    Both ``GroupedExpertsLoRAMXFP4`` and frozen ``GroupedExpertsMXFP4`` modules
-    created on the meta device defer packing until their base weights are
-    materialized from the checkpoint. Call this after checkpoint load to convert
-    them; modules pack one at a time so the bf16 weights of at most one expert
-    module coexist with their packed copy.
-
-    Returns:
-        Number of modules packed.
-    """
-    num_packed = 0
-    for module in model.modules():
-        if isinstance(module, MXFP4ExpertStorageMixin) and not module._mxfp4_resident:
-            module.pack_base_weights()
-            num_packed += 1
-    return num_packed
 
 
 class LoRATritonFunction(torch.autograd.Function):

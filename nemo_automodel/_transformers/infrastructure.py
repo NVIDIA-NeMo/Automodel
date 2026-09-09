@@ -64,6 +64,7 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
+from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.compile_utils import compile_model
@@ -93,15 +94,6 @@ def _ensure_tied_lm_heads(model) -> None:
     model_parts = model.parts if hasattr(model, "parts") else [model]
     for model_part in model_parts:
         ensure_tied_lm_head(model_part)
-
-
-def _call_model_hook(model, hook_name: str, *args) -> None:
-    """Call an explicitly implemented hook on each model part, if present."""
-    model_parts = model.parts if hasattr(model, "parts") else [model]
-    for model_part in model_parts:
-        hook = getattr(type(model_part), hook_name, None)
-        if hook is not None:
-            hook(model_part, *args)
 
 
 def _safe_moe_tp_parts(model) -> list[torch.nn.Module]:
@@ -167,7 +159,8 @@ def _apply_peft_and_lower_precision(
             peft_config.use_triton = False
         # Skip freeze here - will do global freeze after checkpoint loading
         apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
-        _call_model_hook(model, "prepare_peft_checkpoint_load", peft_config)
+        if getattr(peft_config, "expert_weight_format", "bf16") == "mxfp4":
+            model = apply_mxfp4_to_moe_experts(model, passthrough=True)
 
     # FP8
     if fp8_config is not None:
@@ -799,9 +792,6 @@ def apply_model_infrastructure(
                 "The configured trainability policy left no trainable parameters; "
                 "check freeze_config and the PEFT configuration."
             )
-
-    if peft_config is not None:
-        _call_model_hook(model, "finalize_peft_checkpoint_load", peft_config)
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded

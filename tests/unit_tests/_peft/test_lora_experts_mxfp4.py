@@ -15,12 +15,12 @@
 import pytest
 import torch
 
-from nemo_automodel.components._peft.lora import convert_frozen_experts_to_mxfp4, patch_moe_module
+from nemo_automodel.components._peft.lora import patch_moe_module
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
 from nemo_automodel.components._peft.lora_experts_mxfp4 import GroupedExpertsLoRAMXFP4
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts
-from nemo_automodel.components.moe.quantized_experts import GroupedExpertsMXFP4
+from nemo_automodel.components.moe.quantized_experts import GroupedExpertsMXFP4, apply_mxfp4_to_moe_experts
 from nemo_automodel.components.quantization.mxfp4 import dequantize_mxfp4, quantize_mxfp4
 
 
@@ -332,8 +332,50 @@ def test_lora_passthrough_init_packed_base_with_trainable_adapters(moe_config):
     assert trainable == {"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"}
 
 
+def test_apply_mxfp4_passthrough_configures_adapter_and_storage(moe_config):
+    class Adapter:
+        def __init__(self):
+            self.expert_storage_format = "bf16"
+
+        def set_expert_storage_format(self, storage_format):
+            self.expert_storage_format = storage_format
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.state_dict_adapter = Adapter()
+            self.experts = GroupedExperts(moe_config)
+            self.experts.use_torch_mm = True
+
+    with torch.device("meta"):
+        model = TinyModel()
+        result = apply_mxfp4_to_moe_experts(model, passthrough=True)
+
+    assert result is model
+    assert model.state_dict_adapter.expert_storage_format == "mxfp4"
+    assert isinstance(model.experts, GroupedExpertsMXFP4)
+    assert model.experts._mxfp4_resident
+    assert not hasattr(model.experts, "gate_and_up_projs")
+    assert model.experts.gate_and_up_projs_packed.is_meta
+
+
+def test_apply_mxfp4_passthrough_requires_adapter_capability(moe_config):
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts(moe_config)
+            self.experts.use_torch_mm = True
+
+    with torch.device("meta"):
+        model = TinyModel()
+        with pytest.raises(NotImplementedError, match="set_expert_storage_format"):
+            apply_mxfp4_to_moe_experts(model, passthrough=True)
+
+    assert type(model.experts) is GroupedExperts
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_convert_frozen_experts_to_mxfp4(moe_config, device):
+def test_apply_mxfp4_to_moe_experts(moe_config, device):
     import torch.nn as nn
 
     class TinyModel(nn.Module):
@@ -347,8 +389,9 @@ def test_convert_frozen_experts_to_mxfp4(moe_config, device):
     with torch.no_grad():
         model.experts.init_weights(buffer_device=device)
 
-    n = convert_frozen_experts_to_mxfp4(model)
-    assert n == 1
+    assert apply_mxfp4_to_moe_experts(model) is model
     assert isinstance(model.experts, GroupedExpertsMXFP4)
     # Idempotent: an already-converted module is not re-wrapped.
-    assert convert_frozen_experts_to_mxfp4(model) == 0
+    converted = model.experts
+    assert apply_mxfp4_to_moe_experts(model) is model
+    assert model.experts is converted

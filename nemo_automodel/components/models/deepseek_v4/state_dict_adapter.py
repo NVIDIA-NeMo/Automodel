@@ -54,6 +54,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
     BLOCK_SIZE,
@@ -241,6 +242,17 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # experts are never materialized in bf16 (caps the load-time peak).
         self.expert_storage_format = expert_storage_format
         self._checkpoint_expert_quant_layout_cache: _ExpertQuantLayout | None = None
+
+    def set_expert_storage_format(self, storage_format: str) -> None:
+        """Select the routed-expert storage emitted during checkpoint loading."""
+        if storage_format not in ("bf16", "mxfp4"):
+            raise ValueError(f"Unsupported expert storage format: {storage_format}")
+        if storage_format == "mxfp4" and get_world_size_safe() == 1:
+            raise ValueError(
+                "MXFP4-resident DeepSeek-V4 experts require expert parallelism "
+                "(multi-GPU with distributed.ep_size>1); use ep_size>1 or BF16 expert storage."
+            )
+        self.expert_storage_format = storage_format
 
     # ------------------------------------------------------------------
     # from_hf

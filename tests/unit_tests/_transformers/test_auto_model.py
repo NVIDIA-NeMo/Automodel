@@ -35,7 +35,6 @@ from nemo_automodel._transformers.auto_model import (
 )
 from nemo_automodel._transformers.infrastructure import (
     _apply_peft_and_lower_precision,
-    _call_model_hook,
     instantiate_infrastructure,
 )
 from nemo_automodel._transformers.model_init import (
@@ -803,20 +802,23 @@ class TestApplyPeftAndLowerPrecision:
             assert mock_peft_config.use_triton is False
             assert "Disabling Triton with Pipeline Parallelism" in caplog.text
 
-    def test_apply_peft_calls_explicit_model_hook(self):
-        """Model-owned PEFT setup runs after generic LoRA patching."""
-
-        class HookedModel:
-            def __init__(self):
-                self.prepared_with = None
-
-            def prepare_peft_checkpoint_load(self, peft_config):
-                self.prepared_with = peft_config
-
-        model = HookedModel()
+    def test_apply_peft_applies_mxfp4_after_lora(self):
+        """MXFP4 expert storage is applied after LoRA module injection."""
+        model = MagicMock()
         peft_config = MagicMock()
+        peft_config.expert_weight_format = "mxfp4"
+        events = []
 
-        with patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as apply_lora:
+        with (
+            patch(
+                "nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules",
+                side_effect=lambda *args, **kwargs: events.append("lora"),
+            ) as apply_lora,
+            patch(
+                "nemo_automodel._transformers.infrastructure.apply_mxfp4_to_moe_experts",
+                side_effect=lambda model, **kwargs: events.append("mxfp4") or model,
+            ) as apply_mxfp4,
+        ):
             _apply_peft_and_lower_precision(
                 model,
                 tp_size=1,
@@ -828,25 +830,29 @@ class TestApplyPeftAndLowerPrecision:
             )
 
         apply_lora.assert_called_once()
-        assert model.prepared_with is peft_config
+        apply_mxfp4.assert_called_once_with(model, passthrough=True)
+        assert events == ["lora", "mxfp4"]
 
-    def test_model_hook_calls_each_explicit_pipeline_part(self):
-        """Model-owned post-load setup is preserved for pipeline model parts."""
+    def test_apply_peft_skips_mxfp4_for_bf16_experts(self):
+        model = MagicMock()
+        peft_config = MagicMock()
+        peft_config.expert_weight_format = "bf16"
 
-        class HookedPart:
-            def __init__(self):
-                self.finalized_with = None
+        with (
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"),
+            patch("nemo_automodel._transformers.infrastructure.apply_mxfp4_to_moe_experts") as apply_mxfp4,
+        ):
+            _apply_peft_and_lower_precision(
+                model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
 
-            def finalize_peft_checkpoint_load(self, peft_config):
-                self.finalized_with = peft_config
-
-        parts = [HookedPart(), HookedPart()]
-        model = types.SimpleNamespace(parts=parts)
-        peft_config = object()
-
-        _call_model_hook(model, "finalize_peft_checkpoint_load", peft_config)
-
-        assert all(part.finalized_with is peft_config for part in parts)
+        apply_mxfp4.assert_not_called()
 
     def test_apply_fp8_when_configured(self):
         """When fp8_config provided, calls apply_fp8_to_model."""

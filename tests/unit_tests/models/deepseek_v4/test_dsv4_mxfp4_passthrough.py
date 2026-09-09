@@ -59,6 +59,27 @@ def _make_adapter(expert_storage_format="bf16"):
     )
 
 
+def test_set_expert_storage_format_enables_mxfp4_on_multi_gpu(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.components.models.deepseek_v4.state_dict_adapter.get_world_size_safe", lambda: 8
+    )
+    adapter = _make_adapter()
+
+    adapter.set_expert_storage_format("mxfp4")
+
+    assert adapter.expert_storage_format == "mxfp4"
+
+
+def test_set_expert_storage_format_rejects_single_gpu_mxfp4(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.components.models.deepseek_v4.state_dict_adapter.get_world_size_safe", lambda: 1
+    )
+    adapter = _make_adapter()
+
+    with pytest.raises(ValueError, match="expert parallelism"):
+        adapter.set_expert_storage_format("mxfp4")
+
+
 def _synthetic_fp4_checkpoint(seed=0):
     """Per-expert packed fp4 (int8) weights + e8m0 scales for one MoE layer.
 
