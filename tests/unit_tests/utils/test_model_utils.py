@@ -159,6 +159,31 @@ def test_apply_parameter_freezing(dummy_model, freeze_cfg: Dict, expect: Dict):
     assert dummy_model.token_embed.weight.requires_grad is True
 
 
+def test_apply_parameter_freezing_delegates_score_head_freezing():
+    class DummyCrossEncoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.language_model = nn.Linear(4, 4)
+            self.score_head = nn.Sequential(nn.Linear(4, 2), nn.ReLU(), nn.Linear(2, 1))
+
+        def freeze_score_head(self) -> None:
+            for param in self.score_head.parameters():
+                param.requires_grad_(False)
+
+    model = DummyCrossEncoder()
+    model_utils.apply_parameter_freezing(
+        model,
+        {
+            "freeze_vision_tower": False,
+            "freeze_language_model": False,
+            "freeze_score_head": True,
+        },
+    )
+
+    assert _all_requires_grad(model.language_model)
+    assert not _any_requires_grad(model.score_head)
+
+
 def test_init_empty_weights_moves_params_to_meta_and_preserves_requires_grad():
     """
     Creating parameters inside the context should place them on meta device and

@@ -43,6 +43,10 @@ model:
   use_sdpa_patching: true
   torch_dtype: bfloat16
 
+freeze_config:
+  # Set to true when fine-tuning a pretrained reranker while keeping its scoring head fixed.
+  freeze_score_head: false
+
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B

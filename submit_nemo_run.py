@@ -325,7 +325,7 @@ def main():
             job_name_prefix=experiment_id,
             gpus_per_node=0 if args.partition == "cpu" else 8,
             symlink_from_remote_dir=remote_code_dir if args.use_remote_code_symlink else None,
-            # comment=IDLE_REAPER_COMMENT,
+            comment=IDLE_REAPER_COMMENT,
             **run_kwargs,
         )
         eval_executor = cluster_executor(
