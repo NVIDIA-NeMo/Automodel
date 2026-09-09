@@ -221,3 +221,19 @@ def test_forward_tile_branch_list_respects_image_flags():
     # Only the two flagged images contribute; the (16, 8) marker must not appear.
     expected_img = torch.cat([torch.full((_num_tokens(h, w) * 64,), _marker(h, w)) for h, w in sizes[:2]])
     torch.testing.assert_close(final[~text_mask].flatten().float(), expected_img)
+
+
+def test_forward_tile_branch_single_image_list_synthesizes_one_flag():
+    """A one-image variable-resolution pack works when image_flags is absent."""
+    img, txt = 18, 5
+    model = _make_model_stub(img_token_id=img, hidden=64)
+
+    input_ids = torch.tensor([[txt, img, img, img, img, txt]])
+    pixel_values = [torch.zeros(3, 8, 8)]
+
+    model(input_ids=input_ids, pixel_values=pixel_values)
+
+    final = model.language_model.captured_inputs_embeds
+    assert final is not None
+    assert final.shape == (1, 6, 64)
+    torch.testing.assert_close(final[0, 1:5].float(), torch.full((4, 64), _marker(8, 8)))

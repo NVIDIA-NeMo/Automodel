@@ -352,6 +352,9 @@ def test_example_diffusion_yamls_coerce_through_typed_configs(yaml_path):
 
     assert cfg.optimizer is not None
 
+    if "validation_dataloader" in (raw.get("data") or {}):
+        assert cfg.diffusion_validation_dataloader is not None
+
 
 def test_recipe_config_resolves_diffusion_builder_target_to_typed_config():
     config = RecipeConfig(
@@ -376,6 +379,32 @@ def test_recipe_config_resolves_diffusion_builder_target_to_typed_config():
     assert config.cache_dir == "/tmp/cache"
     assert config.base_resolution == (512, 512)
     assert config.num_workers == 0
+
+
+def test_recipe_config_resolves_diffusion_validation_dataloader_only_when_declared():
+    raw = {
+        "data": {
+            "dataloader": {
+                "_target_": (
+                    "nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader"
+                ),
+                "cache_dir": "/tmp/cache",
+            }
+        }
+    }
+
+    assert RecipeConfig(ConfigNode(raw)).diffusion_validation_dataloader is None
+
+    raw["data"]["validation_dataloader"] = {
+        "_target_": "nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader",
+        "cache_dir": "/tmp/val-cache",
+        "shuffle": False,
+    }
+    config = RecipeConfig(ConfigNode(raw)).diffusion_validation_dataloader
+
+    assert isinstance(config, TextToImageDataloaderConfig)
+    assert config.cache_dir == "/tmp/val-cache"
+    assert config.shuffle is False
 
 
 def test_recipe_config_rejects_unknown_diffusion_dataloader_field():

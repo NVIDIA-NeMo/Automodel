@@ -53,6 +53,33 @@ def test_ddp_manager_forwards_ddp_constructor_flags(monkeypatch):
     assert ddp_ctor.call_args.kwargs["gradient_as_bucket_view"] is True
 
 
+def test_ddp_manager_reapplies_trainability_before_constructor(monkeypatch):
+    monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 0, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 2, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_backend", lambda: "gloo", raising=True)
+
+    model = nn.Linear(2, 2)
+    model.weight.requires_grad_(False)
+    events = []
+
+    def reapply_trainability(module):
+        events.append("reapply")
+        module.weight.requires_grad_(True)
+
+    def construct_ddp(module, **_kwargs):
+        events.append("ddp")
+        assert module.weight.requires_grad
+        return "wrapped"
+
+    monkeypatch.setattr(ddp_mod, "DDP", construct_ddp, raising=True)
+    manager = ddp_mod.DDPManager(DDPConfig())
+
+    assert manager.parallelize(model, reapply_trainability=reapply_trainability) == "wrapped"
+    assert events == ["reapply", "ddp"]
+
+
 def test_ddp_manager_applies_selective_activation_checkpointing(monkeypatch):
     monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True, raising=True)
