@@ -202,10 +202,6 @@ optimizer:
   exp_avg_sq_dtype: torch.bfloat16
 ```
 
-Compared with the 33B NemotronOmni recipe: `ep_size` grows from 8 to 32 (512 experts),
-`cp_size=4` on 32 GPUs maps the 8-sample global batch to one sample per rank, the optimizer keeps **fp32 master weights** with
-bf16 Adam moments, and the learning rate is lowered to 5e-5 for full-parameter SFT of a 121B model.
-
 ### LoRA PEFT Config
 
 **Config file**: `examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml`
