@@ -27,7 +27,7 @@ Two-stage block-aligned padding layout::
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import torch
 
@@ -62,10 +62,10 @@ class DLLMCollator:
     def __init__(
         self,
         pad_token_id: int = 0,
-        eos_token_id: Optional[int] = None,
-        block_size: Optional[int] = None,
-        pad_seq_len_divisible: Optional[int] = None,
-        max_seq_len: Optional[int] = None,
+        eos_token_id: int | None = None,
+        block_size: int | None = None,
+        pad_seq_len_divisible: int | None = None,
+        max_seq_len: int | None = None,
         supervise_padding: bool = False,
         response_window: bool = False,
     ) -> None:

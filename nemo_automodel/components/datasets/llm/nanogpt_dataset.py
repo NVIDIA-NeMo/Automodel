@@ -58,6 +58,7 @@ from __future__ import annotations
 import glob
 import os
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Sequence
 
@@ -256,6 +257,32 @@ def _get_worker_id_and_total_workers(worker: get_worker_info) -> tuple[int, int]
     global_worker_id = dist_rank * dl_num_workers + dl_worker_id
 
     return global_worker_id, total_workers
+
+
+@dataclass
+class NanogptDatasetConfig:
+    """Construction-time configuration for :class:`NanogptDataset`."""
+
+    file_pattern: str | Sequence[str]
+    """Glob pattern or explicit list of ``.bin`` shard file paths."""
+    seq_len: int
+    """Length of each returned training sample (labels are ``inputs[1:]``)."""
+    bos_token: int | None = None
+    """Token id marking beginning-of-document (required when ``align_to_bos``)."""
+    shuffle_files: bool = False
+    """Shuffle the order of shards each epoch/iteration."""
+    align_to_bos: bool = False
+    """Ensure every returned slice starts at a ``bos_token`` boundary."""
+
+    def build(self) -> "NanogptDataset":
+        """Build a :class:`NanogptDataset` from this :class:`NanogptDatasetConfig`."""
+        return NanogptDataset(
+            file_pattern=self.file_pattern,
+            seq_len=self.seq_len,
+            bos_token=self.bos_token,
+            shuffle_files=self.shuffle_files,
+            align_to_bos=self.align_to_bos,
+        )
 
 
 class NanogptDataset(IterableDataset):

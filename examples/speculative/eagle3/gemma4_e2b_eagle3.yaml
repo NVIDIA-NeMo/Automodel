@@ -1,0 +1,65 @@
+recipe: TrainEagle3Recipe
+
+# EAGLE-3 draft training against a Gemma4 target (E2B-it).
+#
+# Gemma4 ships as a multimodal ``Gemma4ForConditionalGeneration`` whose text
+# decoder config is nested under ``config.text_config``; the EAGLE-3 draft is
+# built from that inner text config automatically (via ``config.get_text_config()``).
+# Two Gemma-specific knobs:
+#
+#   * ``target_force_hf: true`` -- load the stock HuggingFace text-capable
+#     ``Gemma4ForConditionalGeneration`` (the ``gemma4`` model_type maps to it in
+#     transformers' AutoModelForCausalLM registry). A text-only forward returns
+#     ``.logits`` and the draft hooks the decoder under
+#     ``model.language_model.layers``.
+#   * The draft flattens Gemma4's nested per-attention-type RoPE to a standard
+#     full-rotary Llama RoPE on the global (full-attention) base, so the saved
+#     checkpoint (``architectures: ["LlamaEagle3DraftModel"]``) loads into
+#     SGLang / vLLM with their existing EAGLE-3 Llama head.
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: google/gemma-4-E2B-it
+  target_force_hf: true
+  # Gemma4 interleaves sliding-window and full attention; sdpa handles both
+  # masks cleanly for the frozen target.
+  target_attn_implementation: sdpa
+  draft_attn_implementation: flash_attention_2
+  train_data_path: ./cache/dataset/perfectblend-gemma4-e2b-regen-messages
+  val_data_path: null
+  train_split: "train[:50]"
+  val_split: null
+  output_dir: ./outputs/eagle3_gemma4_e2b
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 7
+  # Gemma4 has a 262k vocab; compress the draft head to the most frequent 32k
+  # target ids (d2t/t2d remap tables are serialized into the checkpoint).
+  draft_vocab_size: 32000
+  freeze_embeddings: true
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+  # Sequence packing (EAGLE-3, colocated backend only). > 0 packs variable-length
+  # samples into rows of this width with per-document block-causal attention,
+  # removing padding waste. Set to seq_length (or larger); 0 disables.
+  packed_sequence_size: 4096
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle3_gemma4_e2b/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true

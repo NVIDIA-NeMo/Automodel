@@ -23,7 +23,7 @@ import mmap
 import os
 import queue
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
@@ -70,6 +70,14 @@ _DIFFUSERS_INDEX_FN = "diffusion_pytorch_model.safetensors.index.json"
 logger = logging.getLogger(__name__)
 
 
+def _is_integrated_cuda_device(device: torch.device) -> bool:
+    """Whether CUDA reports *device* as sharing physical memory with the host."""
+    if device.type != "cuda":
+        return False
+    properties = torch.cuda.get_device_properties(device)
+    return bool(getattr(properties, "is_integrated", False))
+
+
 def _maybe_rename_index_for_diffusers(consolidated_dir: str) -> None:
     """Rename the consolidated index file to the diffusers-expected name.
 
@@ -93,15 +101,15 @@ class _HuggingFaceStorageWriter(FsspecWriter):
     def __init__(
         self,
         path: str,
-        fqn_to_index_mapping: Optional[dict[str, int]] = None,
+        fqn_to_index_mapping: dict[str, int] | None = None,
         thread_count: int = 1,
-        token: Optional[str] = None,
+        token: str | None = None,
         save_sharded: bool = False,
-        consolidated_output_path: Optional[str] = None,
-        num_threads_consolidation: Optional[int] = None,
-        staging_dir: Optional[str] = None,
+        consolidated_output_path: str | None = None,
+        num_threads_consolidation: int | None = None,
+        staging_dir: str | None = None,
         diffusers_compatible: bool = False,
-        fqn_to_dtype_mapping: Optional[dict[str, str]] = None,
+        fqn_to_dtype_mapping: dict[str, str] | None = None,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -137,7 +145,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                 path=path,
                 serialization_format=SerializationFormat.SAFETENSORS,
             )
-        self._fqn_to_index_mapping: Optional[dict[str, int]] = fqn_to_index_mapping
+        self._fqn_to_index_mapping: dict[str, int] | None = fqn_to_index_mapping
         self._save_sharded = save_sharded
         self._consolidated_output_path = consolidated_output_path
         self._staging_dir = staging_dir
@@ -179,8 +187,8 @@ class _HuggingFaceStorageWriter(FsspecWriter):
 
         # storage_plan is a map from key to file index
         storage_data: dict[str, Any] = plan.storage_data
-        storage_plan: Optional[dict[str, int]] = None
-        shard_index: Optional[int] = None
+        storage_plan: dict[str, int] | None = None
+        shard_index: int | None = None
         if "fqn_to_index_mapping" in storage_data:
             storage_plan = storage_data["fqn_to_index_mapping"]
         if "shard_index" in storage_data:
@@ -200,13 +208,12 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         if self._save_sharded and not self._consolidated_output_path:
             return
         if self._save_sharded:
-            # Use staging for single-rank consolidation path
             consolidate_safetensors_files(
                 input_dir=self.path,
                 output_dir=self._consolidated_output_path,
                 num_threads=self._num_threads_consolidation,
                 fqn_to_index_mapping=self._fqn_to_index_mapping,
-                use_staging=True,
+                use_staging=self._staging_dir is not None,
                 staging_dir=self._staging_dir,
                 fqn_to_dtype_mapping=self._fqn_to_dtype_mapping,
             )
@@ -228,7 +235,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             json.dump(metadata_to_write, metadata_file, indent=2)
 
     def _split_by_storage_plan(
-        self, storage_plan: Optional[dict[str, int]], items: list[WriteItem]
+        self, storage_plan: dict[str, int] | None, items: list[WriteItem]
     ) -> dict[int, list[WriteItem]]:
         # storage_plan is a map from key to index
         if storage_plan is None:
@@ -258,7 +265,7 @@ class _HuggingFaceStorageReader(FsspecReader):
     Fsspec registration of the storage solution is required.
     """
 
-    def __init__(self, path: str, token: Optional[str] = None, key_mapping: Optional[dict[str, str]] = None) -> None:
+    def __init__(self, path: str, token: str | None = None, key_mapping: dict[str, str] | None = None) -> None:
         """
         Initialize the huggingface reader pointing to path.
 
@@ -322,17 +329,29 @@ class _HuggingFaceStorageReader(FsspecReader):
                             tensor = torch.frombuffer(
                                 view, dtype=item_md.dtype, count=numel, offset=item_md.offset
                             ).reshape(item_md.shape)
+                            # This view still faults pages from the file mmap.
+                            file_backed = True
                         else:
                             tensor = torch.frombuffer(
                                 bytearray(view[item_md.offset : item_md.offset + item_md.length]),
                                 dtype=item_md.dtype,
                             ).reshape(item_md.shape)
+                            # The alignment fallback already owns resident bytes.
+                            file_backed = False
                         tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
                         target_tensor = planner.resolve_tensor(req).detach()
 
                         assert target_tensor.size() == tensor.size(), (
                             f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
                         )
+
+                        # On integrated GPUs, copying a file-backed mmap directly to CUDA can
+                        # migrate it page-by-page and take minutes per tensor. Stage only this
+                        # requested slice in anonymous host memory; unlike the full-state loader,
+                        # peak host memory is bounded by one tensor. Discrete GPUs keep the
+                        # zero-copy mmap source used to avoid host OOM on very large checkpoints.
+                        if file_backed and _is_integrated_cuda_device(target_tensor.device):
+                            tensor = tensor.clone()
 
                         # copy_ from a pageable host buffer is synchronous, so the mmap can be
                         # released right after this loop without racing an in-flight H2D copy.
@@ -483,7 +502,7 @@ def _extract_file_index_with_status(filename: str) -> tuple[int, bool]:
 
 
 def get_fqn_to_file_index_mapping(
-    reference_model_path: str, key_mapping: Optional[dict[str, str]] = None
+    reference_model_path: str, key_mapping: dict[str, str] | None = None
 ) -> dict[str, int]:
     """
     Get the FQN to file index mapping from the metadata.
@@ -546,7 +565,7 @@ def get_fqn_to_file_index_mapping(
     return fqn_to_file_index_mapping
 
 
-def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: Optional[dict[str, str]] = None) -> dict[str, str]:
+def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: dict[str, str] | None = None) -> dict[str, str]:
     """
     Get the FQN to original safetensors dtype mapping from HF shard headers.
 
@@ -586,7 +605,7 @@ def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: Optional[di
 # the following function is taken from https://github.com/huggingface/transformers/blob/b85ed49e0a5f1bd9fd887f497d055b22b9319a12/src/transformers/modeling_utils.py#L4989-L5047
 def _get_key_renaming_mapping(
     key: str,
-    key_mapping: Optional[dict[str, str]] = None,
+    key_mapping: dict[str, str] | None = None,
 ) -> str:
     if key_mapping is None:
         return key

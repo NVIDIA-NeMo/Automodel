@@ -34,14 +34,13 @@ import os
 import threading
 import time
 from types import SimpleNamespace
-from typing import Optional
 
 import requests
 import torch
 
 from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
 from nemo_automodel.components.speculative.eagle.remote import protocol, wire
-from nemo_automodel.components.speculative.eagle.remote.transport import NCCLTransport
+from nemo_automodel.components.speculative.eagle.remote.transport import NCCLTransport, nccl_transport_available
 from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
 
 logger = logging.getLogger(__name__)
@@ -63,7 +62,7 @@ class _ServerClient:
         self._session.trust_env = False
         self._nccl_rank_offset = nccl_rank_offset
         self._nccl_enabled = os.environ.get("NEMO_EAGLE_ENABLE_NCCL", "1") == "1"
-        self._nccl: Optional[NCCLTransport] = None
+        self._nccl: NCCLTransport | None = None
         self._nccl_attempted = False
         self._nccl_lock = threading.Lock()
         # Serializes generate() per server; see its docstring. The executor in
@@ -86,7 +85,7 @@ class _ServerClient:
     def request(self, endpoint: str, payload: bytes, *, content_type: str = "application/octet-stream") -> bytes:
         """POST ``payload`` to ``endpoint`` with exponential-backoff retry."""
         url = f"{self.url}/{endpoint}"
-        last_exc: Optional[Exception] = None
+        last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
                 resp = self._session.post(
@@ -107,6 +106,17 @@ class _ServerClient:
             if self._nccl_attempted:
                 return False
             self._nccl_attempted = True
+
+            # Only ask the server to bring up NCCL if this process can actually
+            # join the group. A client without sglang (the common disaggregated
+            # case: sglang target server + sglang-free training client) cannot,
+            # and contacting the server anyway leaves it blocked on a rendezvous
+            # that never completes until it times out. Fall back to wire instead.
+            if not nccl_transport_available():
+                logger.info("NCCL unavailable in this process (sglang not importable); using wire format")
+                self._nccl = None
+                return False
+
             port = self._nccl_port()
             self._nccl = NCCLTransport(nccl_port=port, host=self._host(), is_server=False)
 
@@ -132,7 +142,7 @@ class _ServerClient:
                 return False
             return True
 
-    def generate(self, payload: bytes) -> dict[str, Optional[torch.Tensor]]:
+    def generate(self, payload: bytes) -> dict[str, torch.Tensor | None]:
         """POST /generate and return the supervision tensors (NCCL or wire).
 
         ``/generate`` is the per-step hot path, so a transient timeout / connection
@@ -188,7 +198,7 @@ class _AsyncHandle:
         self._future = future
         self._convert = convert
 
-    def result(self, timeout: Optional[float] = None) -> Eagle3TargetBatch:
+    def result(self, timeout: float | None = None) -> Eagle3TargetBatch:
         return self._convert(self._future.result(timeout=timeout))
 
     def cancel(self) -> bool:
@@ -206,8 +216,8 @@ class RemoteEagle3TargetModel(Eagle3TargetBackend):
         self._clients = [_ServerClient(u, timeout, max_retries, nccl_rank_offset=i) for i, u in enumerate(urls)]
         self._next = itertools.cycle(range(len(self._clients)))
         self._device = device
-        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-        self._embeddings: Optional[SimpleNamespace] = None
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._embeddings: SimpleNamespace | None = None
 
     @property
     def num_remote_servers(self) -> int:

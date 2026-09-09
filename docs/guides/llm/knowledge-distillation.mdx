@@ -17,11 +17,17 @@ predicted distributions. The student learns from both the ground-truth labels
 loss, **KD**):
 
 $$
-  \mathcal{L} = (1-\alpha) \cdot \mathcal{L}_{\textrm{CE}}(p^{s}, y) + \alpha \cdot \mathcal{KL}(p^{s}, p^{t})
+  \mathcal{L} = (1-\alpha) \cdot \mathcal{L}_{\mathrm{CE}}(p_s, y)
+  + \alpha T^2 \cdot \mathrm{KL}\!\left(p_{t,T} \parallel p_{s,T}\right)
 $$
 
-where $\(\alpha\)$ is the `kd_ratio`, $\(T\)$ softmax `temperature` and $y$ the labels. For the arguments p:
-$$p^{s} = softmax(z^{s}, T)$$.
+where $\alpha$ is the `kd_ratio`, $T$ is the softmax `temperature`, and $y$
+contains the labels. The temperature-scaled teacher and student distributions are
+
+$$
+  p_{t,T} = \operatorname{softmax}\!\left(\frac{z_t}{T}\right), \qquad
+  p_{s,T} = \operatorname{softmax}\!\left(\frac{z_s}{T}\right).
+$$
 
 ## Prepare the YAML Config
 
@@ -29,7 +35,7 @@ A ready-to-use example is provided at
 `examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml`.  Important sections:
 
 * `model` – the student to be fine-tuned (1 B parameters in the example)
-* `teacher_model` – a larger frozen model used for supervision (7 B)
+* `teacher_model` – a larger frozen model used for supervision (3 B)
 * `kd_ratio` – blend between CE and KD loss
 * `temperature` – softens probability distributions before KL-divergence
 * `peft` – **optional** LoRA config (commented). Uncomment to train only a
@@ -44,6 +50,8 @@ Feel free to tweak these values as required.
 # Run with:
 #   automodel examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 
+recipe: KnowledgeDistillationRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 1
@@ -55,10 +63,7 @@ dist_env:
   backend: nccl
   timeout_minutes: 1
 
-rng:
-  _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1111
-  ranked: true
+seed: 1111
 
 # Student
 model:
@@ -135,11 +140,14 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 ```
 
-### Current Limitations
+### Current Constraints
 
-* Pipeline parallelism (`pp_size > 1`) is not yet supported – planned for a future release.
-* Distilling Vision-Language models (`vlm` recipe) is currently not supported.
+* Pipeline parallelism requires `pp_microbatch_size` to equal `pp_batch_size` so each student microbatch uses the correct teacher logits.
 * Student and teacher models must share the same tokenizer for now; support for different tokenizers will be added in the future.
+
+For VLM knowledge distillation, use the `KnowledgeDistillationRecipeForVLM`
+recipe and the checked-in
+`examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd.yaml` config.
 
 ## Launch Training
 
@@ -161,12 +169,22 @@ torchrun --nproc-per-node $(nvidia-smi -L | wc -l) \
 
 ### Slurm Cluster
 
-The CLI seamlessly submits Slurm jobs when a `slurm` section is added to the
-YAML.  Refer to `docs/guides/installation.md` for cluster instructions.
+Copy the checked-in `slurm.sub` reference script, set its `CONFIG` variable to
+the knowledge-distillation YAML, adapt the cluster settings, and submit it
+directly:
+
+```bash
+cp slurm.sub kd.sub
+# Edit kd.sub to set CONFIG=examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
+# and configure the SBATCH directives, container, and mounts for your cluster.
+sbatch kd.sub
+```
+
+See [Run on a Cluster](/job-launchers/slurm-cluster) for the complete Slurm workflow.
 
 ## Monitoring
 
-Metrics such as *train_loss*, *kd_loss*, *learning_rate* and *tokens/sec* are
+Metrics such as `loss`, `ce_loss`, `kd_loss`, `lr`, and `tps` are
 logged to **WandB** when the corresponding section is enabled.
 
 ## Checkpoints and Inference
@@ -174,10 +192,33 @@ logged to **WandB** when the corresponding section is enabled.
 - Checkpoints are written under the directory configured in the `checkpoint.checkpoint_dir` field at every `ckpt_every_steps`.
 - The final student model is saved according to the `checkpoint` section (e.g., `model_save_format: safetensors`, consolidated weights if `save_consolidated: final` or `save_consolidated: every`).
 
-Load the distilled model:
+The example config saves sharded Safetensors. Consolidate the latest checkpoint
+before loading it with the Hugging Face-compatible model API:
+
+```bash
+bash checkpoints/LATEST/model/consolidate.sh
+```
+
+Then tokenize the prompt, generate token IDs, and decode them:
 
 ```python
+import torch
+from transformers import AutoTokenizer
+
 import nemo_automodel as am
-student = am.NeMoAutoModelForCausalLM.from_pretrained("checkpoints/final")
-print(student("Translate to French: I love coding!").text)
+
+checkpoint = "checkpoints/LATEST/model/consolidated"
+tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+student = am.NeMoAutoModelForCausalLM.from_pretrained(
+    checkpoint,
+    force_hf=True,
+    attn_implementation="sdpa",
+)
+student.eval()
+
+inputs = tokenizer("Translate to French: I love coding!", return_tensors="pt").to(student.device)
+with torch.inference_mode():
+    output_ids = student.generate(**inputs, max_new_tokens=32)
+
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
 ```

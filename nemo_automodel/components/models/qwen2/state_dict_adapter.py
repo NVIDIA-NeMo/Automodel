@@ -21,7 +21,7 @@ from_hf).
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 from transformers import Qwen2Config
 
@@ -67,7 +67,7 @@ class Qwen2StateDictAdapter:
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         # Model keys are already in HF format.

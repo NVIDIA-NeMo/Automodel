@@ -1,6 +1,7 @@
 ---
 title: "Phi-4-multimodal"
 description: ""
+slug: model-coverage/omni/microsoft/phi-4-multimodal
 ---
 [Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) is Microsoft's multimodal extension of Phi-4, supporting text, image, and audio inputs — making it suitable for speech, vision, and combined multimodal tasks.
 
@@ -37,23 +38,18 @@ description: ""
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install nemo-automodel
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
-**3. Run the recipe** from inside the repo:
+**2. Run the recipe** from inside the repo:
 
 ```bash
-automodel --nproc-per-node=8 examples/vlm_finetune/phi4/phi4_mm_cv17.yaml
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/phi4/phi4_mm_cv17.yaml
 ```
 
 <Accordion title="Run with Docker">

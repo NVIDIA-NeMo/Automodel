@@ -25,7 +25,7 @@ Downstream training code should be robust to both representations.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover
     _TENSOR_LIKE = (torch.Tensor,)
 
 
-def get_final_hidden_states(model_output: Any) -> Optional[Any]:
+def get_final_hidden_states(model_output: Any) -> Any | None:
     """Return the final hidden-states tensor from a HF-like model output.
 
     Supports both common layouts:

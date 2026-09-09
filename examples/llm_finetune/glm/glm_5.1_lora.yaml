@@ -110,3 +110,4 @@ ci:
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 16
+  time: "00:20:00"

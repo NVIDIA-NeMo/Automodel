@@ -14,7 +14,7 @@
 
 import logging
 import math
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -49,8 +49,8 @@ class SequentialBucketSampler(Sampler[List[int]]):
         shuffle_within_bucket: bool = True,
         dynamic_batch_size: bool = False,
         seed: int = 42,
-        num_replicas: Optional[int] = None,
-        rank: Optional[int] = None,
+        num_replicas: int | None = None,
+        rank: int | None = None,
     ):
         """
         Args:

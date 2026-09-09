@@ -142,6 +142,12 @@ dataset:
   truncation: true
   unshifted: true
   mask_history: true          # supervise only the final turn (single-turn SFT)
+  # The released DiffusionGemma chat template lacks {% generation %} tags, so answer-mask
+  # extraction falls back to prefix-length arithmetic and starts the supervised region at
+  # '<|turn>model\n' instead of after it -- teaching the model to re-emit the turn header.
+  # This copy adds the tags (rendering is byte-identical) so the tokenizer returns the
+  # assistant mask directly (supervises response + turn close).
+  chat_template: examples/dllm_sft/diffusion_gemma_chat_template.jinja
   tokenizer:
     pretrained_model_name_or_path: google/diffusiongemma-26B-A4B-it
 

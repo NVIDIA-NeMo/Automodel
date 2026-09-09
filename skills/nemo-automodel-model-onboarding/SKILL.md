@@ -15,7 +15,7 @@ metadata:
 ## Purpose
 
 This skill guides implementation of new model architectures in NeMo AutoModel. Follow the five phases in order.
-<!-- NVSkills signature refresh requested for AM-519. -->
+<!-- NVSkills signature refresh requested after PR #2998 (2026-07-31). -->
 
 ## Instructions
 
@@ -60,19 +60,7 @@ Use these compact answer patterns for common questions:
   Do not treat VLM onboarding as a pure causal-LM path or skip processor/image
   tests.
 
-For MoE state-dict questions, always include the safety checklist:
-
-- Map router tensors separately from expert tensors.
-- Preserve routed-expert index order; never sort, drop, merge, or silently
-  reshape expert weights to make loading pass.
-- Map gate, up, and down projections explicitly, including combined projection
-  layouts and shared experts when present.
-- Add adapter key-map tests and tiny-config numerical equivalence tests before
-  relying on full checkpoint loading.
-
-For VLM questions, explicitly check `vision_config`, `text_config`, the
-conditional-generation architecture, text backbone, vision tower, projector,
-processor assumptions, registry entry, and tiny image-text tests.
+For MoE state-dict and VLM questions, apply the checklists in Sections 2.4 and 2.5.
 
 ## Routing Boundary
 
@@ -104,7 +92,7 @@ Download the model's `config.json` from the HuggingFace Hub (or use `AutoConfig.
 - `model_type` -- used for custom config registration in `_CUSTOM_CONFIG_REGISTRATIONS` if HF does not have a built-in config class
 - `hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads` -- sizing
 - `vocab_size` -- needed for tiny test configs
-- `tie_word_embeddings` -- whether lm_head shares weights with embed_tokens
+- `tie_word_embeddings` -- the saved setting in each supported checkpoint; do not infer it from a bare config constructor
 - `hidden_act` -- activation function (e.g., `"silu"` for SwiGLU)
 
 ### 1.2 Determine model type
@@ -183,7 +171,9 @@ Implement files in dependency order:
 2. **rope_utils.py** (if needed) -- RoPE implementation
 3. **layers.py** (if needed) -- Attention, MLP, decoder block classes
 4. **model.py** -- The main `ForCausalLM` (or `ForConditionalGeneration`) class
-5. **state_dict_adapter.py** -- HF weight conversion
+5. **state_dict_adapter.py** -- HF weight conversion. Treat checkpoint I/O
+   performance as part of the implementation, and evaluate the low-memory DCP
+   capability as described in Section 2.6.
 6. **__init__.py** -- Re-export the main model class
 
 See the pattern files for detailed implementation guidance:
@@ -195,11 +185,47 @@ See the pattern files for detailed implementation guidance:
 
 ### 2.3 Causal LM weight tying
 
-For any CausalLM-style class whose config can enable `tie_word_embeddings`,
-make tying explicit: declare `_tied_weights_keys`, implement `tie_weights()`
-with the actual `lm_head` and input-embedding FQNs, and add tiny tests for
-tied and untied configs. Do not tie architectures with intentionally separate
-heads, asymmetric vocab sizes, or stages that do not own both tensors.
+Every registered model class with a causal `lm_head` must:
+
+- Declare `tie_word_embeddings_support: TieSupport` as `BOTH`, `TIED_ONLY`, or
+  `UNTIED_ONLY`.
+- Call `reject_unsupported_tie_word_embeddings(type(self), config)` at the top
+  of `__init__`, using the original config before unwrapping `text_config` or
+  `thinker_config`.
+
+Only classes with no causal LM head may be explicitly exempted from the registry
+test.
+
+Choose the policy from the implementation and the actual supported checkpoint
+configs, not from a bare config constructor:
+
+- `BOTH`: tied and untied configurations are both supported.
+- `TIED_ONLY`: only a tied configuration is supported.
+- `UNTIED_ONLY`: only an untied configuration is supported.
+
+Runtime helpers must treat `TIED_ONLY` and `UNTIED_ONLY` as authoritative and
+only resolve a per-checkpoint config flag for `BOTH`. All current `BOTH` VLMs
+honor the outer `tie_word_embeddings` flag, so do not add a model-specific
+resolver until a supported `BOTH` model actually requires another config path.
+
+For `BOTH` and `TIED_ONLY`, always declare `_tied_weights_keys` and implement
+`tie_weights()` with the actual `lm_head` and input-embedding FQNs. Do not rely
+on inherited Hugging Face tying, and re-tie after any language-model swap.
+
+Add policy-specific tests:
+
+- `BOTH`: tied aliases; untied does not alias.
+- `TIED_ONLY`: tied aliases; untied is rejected.
+- `UNTIED_ONLY`: weights stay separate; tied is rejected.
+
+Do not tie architectures with intentionally separate heads, asymmetric vocab
+sizes, or stages that do not own both tensors.
+
+For `from_pretrained`, the checkpoint's saved `tie_word_embeddings` value is
+authoritative, even for `BOTH`. The `NeMoAuto*` bridge rejects flips in either
+direction. A model-owned `from_pretrained` that bypasses that bridge must call
+`reject_tie_word_embeddings_flip(checkpoint_config, requested_config,
+model_class_name)`.
 
 ### 2.4 MoE state-dict adapter checklist
 
@@ -235,7 +261,38 @@ The implementation should explicitly cover:
 - Registration of the `ForConditionalGeneration` class in `_transformers/registry.py`.
 - Tiny tests that exercise image-text inputs and verify the adapter round-trip.
 
-### 2.6 Register in registry
+### 2.6 Checkpoint I/O performance
+
+Treat checkpoint performance as an implementation requirement, not a later
+optimization. For every new or materially changed state-dict adapter, evaluate
+both latency and peak host/device memory for loading and for any save or export
+path the change affects. In particular:
+
+- Avoid full-checkpoint or model-sized temporary copies when tensors can load
+  directly into final model storage or be transformed in bounded parts.
+- Keep distributed reads and conversions rank-local when a rank needs only its
+  shard; do not materialize a global tensor on every rank unnecessarily.
+- Avoid repeated tensor merges, copies, full-heap garbage collections, shard
+  scans, or file opens inside model-sized loops.
+- Record representative before/after latency and peak-memory evidence for an
+  optimized path, including the model, dtype, backend, and topology.
+
+Every adapter must evaluate `supports_low_memory_dcp_load`. Set
+`_supports_low_memory_dcp_load = True` only when most checkpoint tensors write
+directly into final model storage and every remaining allocating conversion has
+a small, bounded temporary footprint for every runtime variant that reports
+support. Keep it false when a backend, topology, dtype, quantization mode, or
+model option requires model-sized rebuilding. A false value selects the safe
+fallback; it does not mean checkpoint loading is unsupported.
+
+An opt-in needs focused tests that write sentinel values through direct
+destinations and prove the final model storage changes, bound any allocating
+conversions, and verify unsafe runtime variants report the capability as false.
+This storage test is also a correctness requirement: a false positive can cause
+the adapter to treat a temporary tensor as loaded in place and skip rebuilding
+the real parameter.
+
+### 2.7 Register in registry
 
 Add the model to `MODEL_ARCH_MAPPING` in `_transformers/registry.py`:
 
@@ -259,7 +316,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 }
 ```
 
-### 2.7 Declare capabilities and precision-sensitive params
+### 2.8 Declare capabilities and precision-sensitive params
 
 Every class registered in `MODEL_ARCH_MAPPING` must declare parallelism
 capabilities, either with a static nested `ModelCapabilities` dataclass or a
@@ -390,15 +447,20 @@ that only surface in a full parity comparison.
 - [ ] Implemented layers.py (if custom layers needed)
 - [ ] Implemented rope_utils.py (if custom RoPE needed)
 - [ ] Implemented model.py with `HFCheckpointingMixin`
-- [ ] Implemented state_dict_adapter.py
+- [ ] Implemented state_dict_adapter.py and evaluated checkpoint latency plus peak host/device memory per Section 2.6
+- [ ] Evaluated `supports_low_memory_dcp_load`; any opt-in proves direct destinations reach model storage, bounds
+  allocating conversions, and reports `False` for unsafe variants
 - [ ] Implemented __init__.py with re-export
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
 - [ ] Registered custom config in `_CUSTOM_CONFIG_REGISTRATIONS` (if applicable)
 - [ ] Declared `ModelCapabilities` nested dataclass (static) OR `get_capabilities(cls, config)` classmethod (variant dispatch, e.g. ERNIE-4.5 MoE vs dense) — never both, never neither
+- [ ] Declared `TieSupport` and called the constructor guard for every class with a causal `lm_head` (or added an explicit no-head exemption) -- see §2.3
+- [ ] Added explicit `_tied_weights_keys` and `tie_weights()` for `BOTH` / `TIED_ONLY`, plus policy-specific alias and rejection tests -- see §2.3
+- [ ] Guarded any model-owned `from_pretrained` that bypasses the `NeMoAuto*` bridge against checkpoint flips -- see §2.3
 - [ ] Created example YAML config
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)
-- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`, Mamba `D` when reference-fp32, MoE gate bias, attention-sink bias, `scale`, …) — see §2.7
+- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`, Mamba `D` when reference-fp32, MoE gate bias, attention-sink bias, `scale`, …) — see §2.8
 - [ ] Created layer equivalence tests for every rewritten layer (matching model dtype)
 - [ ] Created functional tests (training loss decreases)
 - [ ] Updated docs/model-coverage page

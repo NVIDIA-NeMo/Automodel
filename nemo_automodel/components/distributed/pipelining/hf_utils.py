@@ -15,7 +15,7 @@
 import logging
 import types
 from collections.abc import MutableMapping
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Union
 
 import torch
 import torch.nn as nn
@@ -92,7 +92,6 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
         "config": module.config,
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
-        "cache_position": cache_position,
         "past_key_values": None,  # Training-only: no KV cache
         "position_ids": position_ids,
     }
@@ -115,14 +114,14 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
 
     def pipeline_forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        causal_mask_mapping: Optional[dict] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        causal_mask_mapping: dict | None = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
         # For VLM models the text components (embed_tokens, layers, norm) live on a
@@ -221,19 +220,30 @@ def create_pipeline_forward_causal_lm() -> Callable:
 
     def pipeline_forward_causal_lm(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        """Pipeline-stage forward for a causal-LM wrapper.
+
+        B=microbatch, S=seq, H=hidden, V=vocab. Non-first stages take input
+        hidden states ``[B, S, H]`` via ``inputs_embeds`` (or ``input_ids`` when
+        already floating-point).
+
+        Returns hidden states ``[B, S, H]`` when ``self._pp_return_hidden_states``
+        is set (lm_head deferred to FusedLinearCrossEntropy); else logits
+        ``[B, S', V]`` when this stage owns ``lm_head`` (``S'`` = ``S`` sliced by
+        ``logits_to_keep``); else hidden states ``[B, S, H]`` for the next stage.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -266,6 +276,9 @@ def create_pipeline_forward_causal_lm() -> Callable:
                 raise ValueError("Expected hidden states as input for pipeline stage without inner model")
             outputs = None
 
+        if getattr(self, "_pp_return_hidden_states", False) is True:
+            return hidden_states
+
         if hasattr(self, "lm_head") and self.lm_head is not None:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -288,12 +301,12 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
     def pipeline_forward_gemma4_text(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        padding_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if inputs_embeds is None:
@@ -321,9 +334,8 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
         mask_kwargs = {
             "config": self.config,
-            "input_embeds": inputs_embeds,
+            "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "cache_position": cache_position,
             "past_key_values": None,
             "position_ids": position_ids,
         }
@@ -397,14 +409,14 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
 
     def pipeline_forward_gemma4_vlm(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        image_position_ids: Optional[torch.LongTensor] = None,
-        mm_token_type_ids: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        image_position_ids: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs,
     ):
         lang_model = self.model.language_model
@@ -440,7 +452,7 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
                 image_features = self.model.get_image_features(
                     pixel_values, image_position_ids=image_position_ids, return_dict=True
                 ).pooler_output
-                image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+                image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 
                 if mm_token_type_ids is not None:
                     special_image_mask = mm_token_type_ids == 1
@@ -505,14 +517,14 @@ def create_pipeline_forward_mistral3_vlm() -> Callable:
 
     def pipeline_forward_mistral3_vlm(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        image_sizes: Optional[torch.Tensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        image_sizes: torch.Tensor | None = None,
         vision_feature_layer=None,
-        cache_position: Optional[torch.LongTensor] = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs,
     ):
         inner = self.model
@@ -676,6 +688,7 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
             inner_model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), inner_model)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
+            model._pp_return_hidden_states_supported = True
     else:
         if patch_inner_model:
             model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model)
@@ -739,7 +752,9 @@ def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
             )
             if weights_tied:
                 issues.append(
-                    "tie_word_embeddings=True is not supported for pipelining. Use separate input/output embeddings."
+                    "Pipeline parallelism does not support tie_word_embeddings=True, and overriding "
+                    "it to tie_word_embeddings=False is not supported either. Train this model with "
+                    "another supported parallelism strategy (e.g., FSDP2) instead."
                 )
         if getattr(config, "is_encoder_decoder", False):
             issues.append("Encoder-Decoder models with cross-attention are not supported yet for pipeline parallelism.")

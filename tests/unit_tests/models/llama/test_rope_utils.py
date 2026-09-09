@@ -20,22 +20,31 @@ EAGLE TTT depth offsets (``arange + step_idx``), packed sequences, context
 parallelism -- silently receive the wrong rotary phase.
 """
 
+import logging
 from unittest.mock import patch
 
+import pytest
 import torch
 from transformers import LlamaConfig
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding
 
 
-def _build_rope(*, head_dim: int = 8, heads: int = 4, max_pos: int = 128) -> LlamaRotaryEmbedding:
+def _build_rope(
+    *,
+    head_dim: int = 8,
+    heads: int = 4,
+    max_pos: int = 128,
+    rope_fusion: bool = False,
+) -> LlamaRotaryEmbedding:
     config = LlamaConfig(
         hidden_size=head_dim * heads,
         num_attention_heads=heads,
         num_key_value_heads=heads,
         max_position_embeddings=max_pos,
     )
-    return LlamaRotaryEmbedding(config)
+    return LlamaRotaryEmbedding(config, rope_fusion=rope_fusion)
 
 
 def test_rope_arange_is_per_position_and_unchanged():
@@ -87,6 +96,32 @@ def test_rope_gathers_non_contiguous_positions():
         cos_p, sin_p = rope(x, torch.tensor([[p]]))
         torch.testing.assert_close(cos[0, i], cos_p[0, 0])
         torch.testing.assert_close(sin[0, i], sin_p[0, 0])
+
+
+def test_quack_backend_disables_fusion_and_gathers_non_contiguous_positions(caplog):
+    """QuACK must not inherit the CUDA/TE fused-RoPE default.
+
+    Passing ``rope_fusion=True`` reproduces the default on CUDA builds with
+    Transformer Engine. QuACK must override it so arbitrary position IDs select
+    their absolute rotary phases instead of a contiguous ``[0, seq_len)`` slice.
+    """
+    with caplog.at_level(logging.WARNING):
+        backend = BackendConfig(rope="quack", rope_fusion=True)
+
+    assert backend.rope_fusion is False
+    assert "rope='quack' is incompatible with rope_fusion=True" in caplog.text
+
+    rope = _build_rope(rope_fusion=backend.rope_fusion)
+    x = torch.zeros(1, 1, 8)
+    positions = torch.tensor([[0, 5, 2, 9]])
+    cos, sin = rope(x, positions)
+    contiguous_cos, _ = rope(x, torch.arange(positions.shape[-1]).unsqueeze(0))
+
+    assert not torch.equal(cos, contiguous_cos)
+    for sequence_index, position in enumerate(positions[0]):
+        cos_at_position, sin_at_position = rope(x, position.reshape(1, 1))
+        torch.testing.assert_close(cos[0, sequence_index], cos_at_position[0, 0])
+        torch.testing.assert_close(sin[0, sequence_index], sin_at_position[0, 0])
 
 
 def test_rope_position_exceeding_seq_len_grows_cache():
@@ -192,3 +227,62 @@ def test_bf16_model_cast_does_not_degrade_inv_freq():
     # Bit-for-bit: the cast module must still build its tables from float32 inv_freq.
     torch.testing.assert_close(cos_cast, cos_ref, rtol=0, atol=0)
     torch.testing.assert_close(sin_cast, sin_ref, rtol=0, atol=0)
+
+
+def _config_with_rope_scaling(rope_scaling: dict) -> LlamaConfig:
+    """Build a config carrying ``rope_scaling``, mirroring how the EAGLE recipe
+    seeds the draft config from ``target_config.to_dict()``."""
+    base = LlamaConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        num_hidden_layers=2,
+        max_position_embeddings=2048,
+    )
+    config_dict = base.to_dict()
+    config_dict["rope_scaling"] = rope_scaling
+    return LlamaConfig.from_dict(config_dict)
+
+
+def test_rope_yarn_matches_transformers_not_llama3_fallback():
+    """A ``yarn`` rope_type must use transformers' YaRN schedule, not silently
+    fall back to llama3 (the latent bug an EAGLE dense draft inherited from a
+    YaRN target's ``rope_scaling``)."""
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    from nemo_automodel.components.models.llama.rope_utils import _compute_llama3_inv_freq
+
+    config = _config_with_rope_scaling({"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 2048})
+    rope = LlamaRotaryEmbedding(config)
+
+    ref_inv_freq, ref_scaling = ROPE_INIT_FUNCTIONS["yarn"](config, torch.device("cpu"))
+    torch.testing.assert_close(rope.inv_freq, ref_inv_freq)
+    assert rope.attention_scaling == ref_scaling
+    assert rope.attention_scaling != 1.0  # YaRN applies an mscale; proves it ran
+
+    # The old behavior fell back to the llama3 NTK schedule; the fix must differ.
+    llama3_inv_freq, _ = _compute_llama3_inv_freq(config, torch.device("cpu"))
+    assert not torch.allclose(rope.inv_freq, llama3_inv_freq)
+
+
+def test_rope_linear_and_dynamic_resolve_via_transformers():
+    """``linear`` and ``dynamic`` schedules resolve through transformers without error."""
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    for rope_type in ("linear", "dynamic"):
+        config = _config_with_rope_scaling({"rope_type": rope_type, "factor": 4.0})
+        rope = LlamaRotaryEmbedding(config)
+        ref_inv_freq, _ = ROPE_INIT_FUNCTIONS[rope_type](config, torch.device("cpu"))
+        torch.testing.assert_close(rope.inv_freq, ref_inv_freq)
+
+
+def test_rope_unknown_type_raises():
+    """An unrecognised rope_type fails loudly instead of guessing a schedule."""
+    config = _config_with_rope_scaling({"rope_type": "default", "rope_theta": 10000.0})
+    # Inject a bogus type after construction to bypass HF config validation and
+    # reach the resolver. ``_get_rope_config`` reads ``rope_parameters`` first.
+    bogus = {"rope_type": "does_not_exist"}
+    config.rope_parameters = bogus
+    config.rope_scaling = bogus
+    with pytest.raises(ValueError, match="Unsupported RoPE rope_type"):
+        LlamaRotaryEmbedding(config)

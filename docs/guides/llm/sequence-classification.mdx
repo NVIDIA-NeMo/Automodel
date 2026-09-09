@@ -1,20 +1,20 @@
 ---
 title: "Sequence Classification (SFT/PEFT) with NeMo AutoModel"
-description: ""
+description: "Train a sequence classification model with NeMo AutoModel using GLUE MRPC, RoBERTa, and optional LoRA."
 position: 10
 ---
 ## Introduction
 
-Sequence classification tasks (e.g., sentiment analysis, topic classification, GLUE tasks) map input text to a discrete label. NeMo AutoModel provides a lightweight recipe specialized for this setting that integrates with popular pretrained model formats and dataset sources. Integration with Hugging Face is supported.
+Sequence classification tasks (for example, sentiment analysis, topic classification, and GLUE tasks) map input text to a discrete label. NeMo AutoModel provides a lightweight recipe specialized for this setting that integrates with popular pretrained model formats and dataset sources. Integration with Hugging Face is supported.
 
-This guide shows how to train a sequence classification model using the `TrainFinetuneRecipeForSequenceClassification` recipe, including optional Parameter-Efficient Fine-Tuning (LoRA).
+This guide shows how to train a sequence classification model using the `TrainFinetuneRecipeForSequenceClassification` recipe, including optional Parameter-Efficient Fine-Tuning (PEFT) with LoRA.
 
 ## Quickstart
 
-Use the example config for GLUE MRPC with RoBERTa-large + LoRA:
+Use the example config for GLUE MRPC with RoBERTa-large and LoRA:
 
 ```bash
-python3 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
+uv run automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
 ```
 
 - Loads `roberta-large` with `num_labels: 2`
@@ -66,6 +66,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
+  autocast_dtype: bfloat16
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -75,6 +76,10 @@ peft:
   dim: 8
   alpha: 16
   dropout: 0.1
+
+freeze_config:
+  unfreeze_modules:
+  - glob: "*classifier"
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.seq_cls.GLUE_MRPC
@@ -103,18 +108,20 @@ optimizer:
 
 ## Dataset Notes
 
-- For single-sentence datasets (e.g., `yelp_review_full`, `imdb`), use `YelpReviewFull` or `IMDB` from `nemo_automodel.components.datasets.llm.seq_cls`.
-- For GLUE MRPC (sentence-pair classification), use `GLUE_MRPC`, which tokenizes `(sentence1, sentence2)` with padding/truncation.
+- `nemo_automodel.components.datasets.llm.seq_cls` provides `GLUE_MRPC`, the implemented sentence-pair adapter. It tokenizes `(sentence1, sentence2)` with truncation; `default_collater` pads each batch.
+- For other datasets, including single-sentence datasets such as `yelp_review_full` or `imdb`, provide a custom dataset class or factory through `_target_`. Accept a `tokenizer` argument so the recipe can inject the model tokenizer, and return `input_ids`, `attention_mask`, a one-element `labels` list, and the `___PAD_TOKEN_IDS___` mapping used by `default_collater` for each sample. Use `GLUE_MRPC` as the adapter pattern.
 
 ## LoRA (PEFT) Settings
 
-- `target_modules`: glob to select linear layers (e.g., `"*.proj"`).
-- `dim` (rank), `alpha`, `dropout`: tune per model/compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
+- `target_modules`: Glob to select linear layers (for example, `"*.proj"`).
+- `dim` (rank), `alpha`, `dropout`: Tune per model and compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
+- `freeze_config.unfreeze_modules`: Keeps the classification head fully trainable while PEFT freezes other non-LoRA parameters.
+- `distributed.autocast_dtype`: Runs the forward pass in the selected compute dtype while trainable parameters retain their configured storage dtype, including when single-rank FSDP is skipped.
 - The recipe automatically applies the adapters; no additional code changes are required.
 
-## Running with torchrun
+## Running on Multiple GPUs
 
 ```bash
-torchrun --nproc-per-node=2 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
+uv run automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml --nproc-per-node 2
 ```
 You can adjust the number of GPUs as necessary using the `--nproc-per-node` knob.

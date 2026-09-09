@@ -13,20 +13,22 @@
 # limitations under the License.
 
 import logging
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
-)
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
+    apply_submodule_checkpointing,
+    detect_kv_sharing_and_maybe_disable_cache,
     is_selective_activation_checkpointing,
 )
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.parallelizer import (
-    _extract_model_layers,
+    _extract_model_layer_groups,
+    _filter_layer_groups_for_activation_checkpointing,
+    _should_use_hf_native_gradient_checkpointing,
     apply_selective_activation_checkpointing,
 )
 
@@ -56,6 +58,7 @@ class DDPManager:
 
         # Extract config fields for easy access
         self.activation_checkpointing = config.activation_checkpointing
+        self.activation_checkpointing_scope = config.activation_checkpointing_scope
         self.broadcast_buffers = config.broadcast_buffers
         self.find_unused_parameters = config.find_unused_parameters
         self.static_graph = config.static_graph
@@ -88,7 +91,11 @@ class DDPManager:
         else:
             self.device = torch.device("cpu")
 
-    def parallelize(self, model):
+    def parallelize(
+        self,
+        model: torch.nn.Module,
+        reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
+    ) -> torch.nn.Module:
         """
         Wraps the given model with DistributedDataParallel (DDP).
 
@@ -97,6 +104,8 @@ class DDPManager:
 
         Args:
             model (torch.nn.Module): The PyTorch model to be wrapped.
+            reapply_trainability: Optional callback that re-resolves parameter
+                trainability after model surgery and before DDP construction.
 
         Returns:
             torch.nn.parallel.DistributedDataParallel: The DDP-wrapped model.
@@ -108,37 +117,39 @@ class DDPManager:
                 model = model.to(torch.bfloat16)
             if self.activation_checkpointing:
                 if is_selective_activation_checkpointing(self.activation_checkpointing):
-                    apply_selective_activation_checkpointing(model)
-                elif hasattr(model, "gradient_checkpointing_enable"):
-                    model.gradient_checkpointing_enable()
+                    apply_selective_activation_checkpointing(
+                        model,
+                        activation_checkpointing_scope=self.activation_checkpointing_scope,
+                    )
                 else:
-                    logger.error("Model does not support gradient checkpointing. Skipping.")
+                    layer_groups = _extract_model_layer_groups(model)
+                    layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
+                        layer_groups,
+                        self.activation_checkpointing_scope,
+                    )
+                    if _should_use_hf_native_gradient_checkpointing(model, layer_groups, ac_scopes):
+                        model.gradient_checkpointing_enable()
+                    else:
+                        apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
+            if reapply_trainability is not None:
+                reapply_trainability(model)
             return model
 
         if self.activation_checkpointing:
-            # Disable KV caching during training to ensure deterministic
-            # shapes between forward and checkpoint recomputation.
-            if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
-                try:
-                    model.config.use_cache = False
-                except Exception:
-                    pass
+            has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
 
             if is_selective_activation_checkpointing(self.activation_checkpointing):
-                apply_selective_activation_checkpointing(model)
+                apply_selective_activation_checkpointing(
+                    model,
+                    activation_checkpointing_scope=self.activation_checkpointing_scope,
+                )
             else:
-                layers = _extract_model_layers(model)
-                for i, layer in enumerate(layers):
-                    if hasattr(layer, "mlp"):
-                        layers[i].mlp = checkpoint_wrapper(layer.mlp)
-                    if hasattr(layer, "self_attn"):
-                        layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)
-
-                    if hasattr(layer, "input_layernorm"):
-                        layers[i].input_layernorm = checkpoint_wrapper(layers[i].input_layernorm)
-
-                    if hasattr(layer, "post_attention_layernorm"):
-                        layers[i].post_attention_layernorm = checkpoint_wrapper(layers[i].post_attention_layernorm)
+                layer_groups = _extract_model_layer_groups(model)
+                layers, _ = _filter_layer_groups_for_activation_checkpointing(
+                    layer_groups,
+                    self.activation_checkpointing_scope,
+                )
+                apply_submodule_checkpointing(layers, has_kv_sharing)
 
         ddp_kwargs = {
             "device_ids": [self.device] if self.device.type == "cuda" else None,
@@ -150,4 +161,7 @@ class DDPManager:
         if self.bucket_cap_mb is not None:
             ddp_kwargs["bucket_cap_mb"] = self.bucket_cap_mb
 
-        return DDP(model.to(self.device), **ddp_kwargs)
+        model = model.to(self.device)
+        if reapply_trainability is not None:
+            reapply_trainability(model)
+        return DDP(model, **ddp_kwargs)

@@ -30,6 +30,16 @@ If no caption is found for a sample, the filename (with underscores replaced by 
 
 ## Preprocessing
 
+<Note>
+Preprocessing requires the `diffusion-media` extra (it uses OpenCV). For a released-package environment, create and activate a virtual environment, then install it with `uv pip install "nemo-automodel[diffusion,diffusion-media]"`. In the Docker container, run `cd /opt/Automodel && uv pip install ".[diffusion-media]"` first. See [Media Extras](/get-started/installation#media-extras-video--image-decode).
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel[diffusion,diffusion-media]"
+```
+</Note>
+
 NeMo AutoModel includes a unified preprocessing tool at [`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py) that encodes raw images and videos into cache files compatible with the multiresolution dataloader. It uses model-specific processors from `tools/diffusion/processors/` to handle VAE encoding, text embedding, and cache data formatting for each supported model.
 
 The tool automatically distributes work across all available GPUs using multiprocessing, with one worker per GPU.

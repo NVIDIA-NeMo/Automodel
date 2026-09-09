@@ -14,9 +14,24 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch.nn as nn
 
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
+import nemo_automodel.components.models.common.tie_word_embeddings as tie_utils
+from nemo_automodel.shared import tied_weights
+
+
+def test_checkpoint_utils_reexports_shared_tied_weight_helpers():
+    """Checkpoint callers retain their existing imports while shared code owns the helpers."""
+    assert checkpoint_utils.ensure_tied_lm_head is tied_weights.ensure_tied_lm_head
+    assert checkpoint_utils.has_local_tied_lm_head is tied_weights.has_local_tied_lm_head
+
+
+def test_model_tie_policy_reexports_shared_contract():
+    """Model policy and cross-component callers use one tie contract."""
+    assert tie_utils.TieSupport is tied_weights.TieSupport
+    assert tie_utils.get_controlling_tie_word_embeddings is tied_weights.get_controlling_tie_word_embeddings
 
 
 def test_is_tied_word_embeddings_prefers_top_level_value():
@@ -86,6 +101,44 @@ def test_is_tied_word_embeddings_handles_missing_config():
     assert checkpoint_utils.is_tied_word_embeddings(model) is False
 
 
+def test_is_tied_word_embeddings_uses_one_direction_policy_over_outer_config():
+    """A fixed model policy wins over a misleading composite outer flag."""
+
+    class UntiedOnlyModel(nn.Module):
+        tie_word_embeddings_support = tie_utils.TieSupport.UNTIED_ONLY
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(
+                tie_word_embeddings=True,
+                text_config=SimpleNamespace(tie_word_embeddings=False),
+            )
+
+    class TiedOnlyModel(nn.Module):
+        tie_word_embeddings_support = tie_utils.TieSupport.TIED_ONLY
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=False)
+
+    assert checkpoint_utils.is_tied_word_embeddings(UntiedOnlyModel()) is False
+    assert checkpoint_utils.is_tied_word_embeddings(TiedOnlyModel()) is True
+
+
+def test_is_tied_word_embeddings_both_follows_outer_config():
+    """A BOTH model still resolves its per-checkpoint top-level flag."""
+
+    class BothModel(nn.Module):
+        tie_word_embeddings_support = tie_utils.TieSupport.BOTH
+
+        def __init__(self, tied: bool) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=tied)
+
+    assert checkpoint_utils.is_tied_word_embeddings(BothModel(tied=True)) is True
+    assert checkpoint_utils.is_tied_word_embeddings(BothModel(tied=False)) is False
+
+
 def test_is_tied_word_embeddings_qwen3_omni_moe_follows_top_level():
     """Qwen3OmniMoeThinker reports its top-level config intent.
 
@@ -111,8 +164,8 @@ def test_get_controlling_tie_word_embeddings_top_level_first():
     cfg_top_false = SimpleNamespace(
         tie_word_embeddings=False, get_text_config=lambda: SimpleNamespace(tie_word_embeddings=True)
     )
-    assert checkpoint_utils.get_controlling_tie_word_embeddings(cfg_top_true, "SomeForCausalLM") is True
-    assert checkpoint_utils.get_controlling_tie_word_embeddings(cfg_top_false, "SomeForCausalLM") is False
+    assert tie_utils.get_controlling_tie_word_embeddings(cfg_top_true) is True
+    assert tie_utils.get_controlling_tie_word_embeddings(cfg_top_false) is False
 
 
 def test_get_controlling_tie_word_embeddings_falls_back_to_text_config():
@@ -122,7 +175,122 @@ def test_get_controlling_tie_word_embeddings_falls_back_to_text_config():
         def get_text_config(self):
             return SimpleNamespace(tie_word_embeddings=True)
 
-    assert checkpoint_utils.get_controlling_tie_word_embeddings(_NoTopFlag(), "SomeForCausalLM") is True
+    assert tie_utils.get_controlling_tie_word_embeddings(_NoTopFlag()) is True
+
+
+def _model_cls(name: str, support: tie_utils.TieSupport) -> type:
+    """Build a throwaway model class with the given name and TieSupport policy.
+
+    The class name selects the resolver's composite/omni special-casing and the
+    ``tie_word_embeddings_support`` attribute drives the guard, matching how real
+    registered model classes declare their policy.
+    """
+    return type(name, (), {"tie_word_embeddings_support": support})
+
+
+def test_reject_unsupported_tie_word_embeddings_untied_only_raises_when_tied():
+    """An UNTIED_ONLY (separate-head) class with tie_word_embeddings=True is rejected."""
+    cls = _model_cls("Qwen3MoeForCausalLM", tie_utils.TieSupport.UNTIED_ONLY)
+    config = SimpleNamespace(tie_word_embeddings=True)
+    with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=True"):
+        tie_utils.reject_unsupported_tie_word_embeddings(cls, config)
+
+
+def test_reject_unsupported_tie_word_embeddings_untied_only_noop_when_untied():
+    """The default (untied) config passes an UNTIED_ONLY guard without raising."""
+    cls = _model_cls("Qwen3MoeForCausalLM", tie_utils.TieSupport.UNTIED_ONLY)
+    tie_utils.reject_unsupported_tie_word_embeddings(cls, SimpleNamespace(tie_word_embeddings=False))  # no raise
+
+
+def test_reject_unsupported_tie_word_embeddings_uses_top_level_for_composite():
+    """Composite VLM configs read the controlling top-level flag, not nested text_config."""
+    cls = _model_cls("Qwen3VLMoeForConditionalGeneration", tie_utils.TieSupport.UNTIED_ONLY)
+    # top-level False (even with nested text True) -> not tied -> no raise
+    untied = SimpleNamespace(
+        tie_word_embeddings=False, get_text_config=lambda: SimpleNamespace(tie_word_embeddings=True)
+    )
+    tie_utils.reject_unsupported_tie_word_embeddings(cls, untied)
+    # top-level True -> tied -> raise
+    tied = SimpleNamespace(tie_word_embeddings=True, get_text_config=lambda: SimpleNamespace(tie_word_embeddings=False))
+    with pytest.raises(NotImplementedError):
+        tie_utils.reject_unsupported_tie_word_embeddings(cls, tied)
+
+
+def test_get_controlling_tie_word_embeddings_omni_wrapper_reads_thinker_config():
+    """Full Omni wrapper config nests the controlling flag under thinker_config.
+
+    Qwen2_5OmniConfig / Qwen3OmniMoeConfig do not expose tie_word_embeddings at the
+    top level; the controlling flag lives on config.thinker_config.
+    """
+    wrapper_tied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=True))
+    wrapper_untied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=False))
+    assert tie_utils.get_controlling_tie_word_embeddings(wrapper_tied) is True
+    assert tie_utils.get_controlling_tie_word_embeddings(wrapper_untied) is False
+    # When the thinker config itself is passed (no nested thinker_config), read its own flag.
+    direct = SimpleNamespace(tie_word_embeddings=True)
+    assert tie_utils.get_controlling_tie_word_embeddings(direct) is True
+
+
+def test_reject_unsupported_tie_word_embeddings_omni_wrapper_path():
+    """The guard raises for a full Omni wrapper whose thinker_config requests tying."""
+    tied_cls = _model_cls("Qwen2_5OmniThinkerForConditionalGeneration", tie_utils.TieSupport.UNTIED_ONLY)
+    wrapper = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=True))
+    with pytest.raises(NotImplementedError):
+        tie_utils.reject_unsupported_tie_word_embeddings(tied_cls, wrapper)
+    untied_cls = _model_cls("Qwen3OmniMoeThinkerForConditionalGeneration", tie_utils.TieSupport.UNTIED_ONLY)
+    wrapper_untied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=False))
+    tie_utils.reject_unsupported_tie_word_embeddings(untied_cls, wrapper_untied)  # no raise
+
+
+def test_reject_unsupported_tie_word_embeddings_tied_only_raises_when_untied():
+    """A TIED_ONLY model with tie_word_embeddings=False is rejected."""
+    cls = _model_cls("Gemma4ForConditionalGeneration", tie_utils.TieSupport.TIED_ONLY)
+    config = SimpleNamespace(tie_word_embeddings=False)
+    with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=False"):
+        tie_utils.reject_unsupported_tie_word_embeddings(cls, config)
+
+
+def test_reject_unsupported_tie_word_embeddings_tied_only_noop_when_tied():
+    """The default (tied) config passes a TIED_ONLY guard without raising."""
+    cls = _model_cls("Gemma4ForConditionalGeneration", tie_utils.TieSupport.TIED_ONLY)
+    tie_utils.reject_unsupported_tie_word_embeddings(cls, SimpleNamespace(tie_word_embeddings=True))  # no raise
+
+
+def test_reject_unsupported_tie_word_embeddings_both_is_noop():
+    """A BOTH class accepts either tying value without raising."""
+    cls = _model_cls("LlamaForCausalLM", tie_utils.TieSupport.BOTH)
+    tie_utils.reject_unsupported_tie_word_embeddings(cls, SimpleNamespace(tie_word_embeddings=True))  # no raise
+    tie_utils.reject_unsupported_tie_word_embeddings(cls, SimpleNamespace(tie_word_embeddings=False))  # no raise
+
+
+def test_reject_unsupported_tie_word_embeddings_defaults_to_both():
+    """A class that does not declare a policy defaults to BOTH (guard is a no-op)."""
+
+    class _Undeclared:
+        pass
+
+    tie_utils.reject_unsupported_tie_word_embeddings(_Undeclared, SimpleNamespace(tie_word_embeddings=True))
+    tie_utils.reject_unsupported_tie_word_embeddings(_Undeclared, SimpleNamespace(tie_word_embeddings=False))
+
+
+def test_reject_tie_word_embeddings_flip_raises_on_mismatch():
+    """from_pretrained flip guard rejects a requested tie value differing from the checkpoint's."""
+    tied = SimpleNamespace(tie_word_embeddings=True)
+    untied = SimpleNamespace(tie_word_embeddings=False)
+    # untied checkpoint, tied requested
+    with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+        tie_utils.reject_tie_word_embeddings_flip(untied, tied, "LlamaForCausalLM")
+    # tied checkpoint, untied requested (both directions rejected)
+    with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+        tie_utils.reject_tie_word_embeddings_flip(tied, untied, "LlamaForCausalLM")
+
+
+def test_reject_tie_word_embeddings_flip_noop_when_matching():
+    """No raise when the requested value matches the checkpoint's (either direction)."""
+    for tie in (True, False):
+        tie_utils.reject_tie_word_embeddings_flip(
+            SimpleNamespace(tie_word_embeddings=tie), SimpleNamespace(tie_word_embeddings=tie), "LlamaForCausalLM"
+        )
 
 
 class _DraftLikeModel(nn.Module):

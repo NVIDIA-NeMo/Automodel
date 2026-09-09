@@ -376,7 +376,10 @@ def _convert_grouped_to_hf_peft(grouped_sd):
     adapter = _Adapter()
     hf_sd = {}
     for fqn, tensor in grouped_sd.items():
-        converted = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+        # This helper exercises the legacy per-expert HF PEFT path. The
+        # production default is the fused transformers v5 ParamWrapper format,
+        # so keep the compatibility mode explicit here.
+        converted = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True)
         if converted:
             for k, v in converted:
                 hf_sd[k] = v

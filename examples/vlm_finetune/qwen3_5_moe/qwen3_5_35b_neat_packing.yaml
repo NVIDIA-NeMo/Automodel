@@ -130,9 +130,9 @@ optimizer:
   weight_decay: 0.1
 
 ci:
-  time: "00:15:00"
-  env_vars:
-    MAX_STEPS: 10
+  recipe_owner: HuiyingLi
+  max_steps: 10
+  time: "00:20:00"
 
 # wandb:
 #   project: <your_wandb_project>
