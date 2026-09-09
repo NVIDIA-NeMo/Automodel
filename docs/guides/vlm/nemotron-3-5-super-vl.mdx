@@ -54,9 +54,7 @@ The **base model** produces free-form descriptions. After fine-tuning, it output
 
 - **4 nodes x 8 H100 80 GB** (512 experts sharded with
   `ep_size=32`; `cp_size=4` so the 8-sample global batch is one sample per data-parallel rank)
-- **SFT memory**: ~65 GiB per GPU (fp32 master weights, bf16 Adam moments, activation checkpointing). The frozen
-  RADIO tower is replicated on every rank (`frozen_sharding: replicate`) and checkpoint state dicts are moved to
-  CPU before they are written (`checkpoint.cpu_offload: true`), so the validation-time saves need no GPU headroom.
+- **SFT memory**: ~65 GiB per GPU (fp32 master weights, bf16 Adam moments, activation checkpointing)
 - **Training time**: ~21 min on 4x8 H100 for 400 steps (4 epochs of the 800 training samples), including four
   validation passes with checkpoint saves; about 26 min wall clock with model loading and the final consolidated
   export

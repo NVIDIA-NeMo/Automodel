@@ -19,9 +19,7 @@
 #
 # Sizing: 4 nodes x 8 H100 (~65 GiB/GPU): 512 experts -> ep_size 32, global_batch_size 8 with
 # cp_size 4 gives dp=8 -> one sample per rank per step; 400 steps = 4 epochs of the 800-sample
-# train split. The frozen RADIO tower is replicated on every rank (frozen_sharding: replicate)
-# and checkpoint state dicts are moved to CPU before they are written (cpu_offload: true), so the
-# validation-time checkpoint saves need no extra GPU memory. The final checkpoint is exported as
+# train split. The final checkpoint is exported as
 # consolidated HuggingFace safetensors (save_consolidated: final) for the inference/eval step
 # in the CORD-v2 guide (docs/guides/vlm/nemotron-3-5-super-vl.mdx).
 #
