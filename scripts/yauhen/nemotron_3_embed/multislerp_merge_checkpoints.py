@@ -361,9 +361,7 @@ def _multislerp_mean_direction(
     if tangent_norm_value <= tolerance:
         return mean_direction
 
-    direction = (
-        torch.cos(tangent_norm) * mean_direction + (torch.sin(tangent_norm) / tangent_norm) * tangent
-    )
+    direction = torch.cos(tangent_norm) * mean_direction + (torch.sin(tangent_norm) / tangent_norm) * tangent
     direction_norm = torch.linalg.vector_norm(direction)
     if direction_norm.item() <= tolerance:
         return None

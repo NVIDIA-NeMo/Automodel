@@ -20,7 +20,6 @@ import logging
 import transformers
 from transformers import AutoTokenizer
 
-
 DEFAULT_REPOSITORIES = (
     "mistralai/Ministral-3-3B-Instruct-2512",
     # "mistralai/Ministral-3-3B-Instruct-2512-BF16",

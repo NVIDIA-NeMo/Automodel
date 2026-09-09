@@ -13,8 +13,8 @@ import torch.distributed
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.retrieval_types import PASSAGE_MODALITY_NAMES
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
@@ -25,6 +25,7 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe, _append_modality_loss_stats
 
 logger = logging.getLogger(__name__)
+
 
 def _build_or_none(cfg_section):
     if cfg_section is None:
@@ -198,8 +199,7 @@ def _repeat_queries_to_match_docs(
         return student_query, teacher_query
     if student_doc.shape[0] % student_query.shape[0] != 0:
         raise RuntimeError(
-            "Cannot align query/doc distillation batches: "
-            f"query={student_query.shape[0]}, doc={student_doc.shape[0]}"
+            f"Cannot align query/doc distillation batches: query={student_query.shape[0]}, doc={student_doc.shape[0]}"
         )
     repeats = student_doc.shape[0] // student_query.shape[0]
     return student_query.repeat_interleave(repeats, dim=0), teacher_query.repeat_interleave(repeats, dim=0)
@@ -268,8 +268,7 @@ def _embedding_distill_loss_per_query(
         q_mse = (F.normalize(s_q_proj.float(), dim=-1) - F.normalize(t_q_pool.float(), dim=-1)).pow(2).mean(dim=-1)
         d_mse = (F.normalize(s_d_proj.float(), dim=-1) - F.normalize(t_d_pool.float(), dim=-1)).pow(2).mean(dim=-1)
         per_query = per_query + loss_weights["normalized_mse"] * (
-            q_mse
-            + _mean_grouped_docs(d_mse, batch_size=batch_size, n_passages=n_passages, label="doc normalized mse")
+            q_mse + _mean_grouped_docs(d_mse, batch_size=batch_size, n_passages=n_passages, label="doc normalized mse")
         )
 
     return per_query
@@ -734,9 +733,7 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
                     self.loss_weights["distill"] > 0
                     or self.loss_weights["mse"] > 0
                     or self.loss_weights["normalized_mse"] > 0
-                ) and (
-                    t_q_pool.shape[-1] != s_q_proj.shape[-1] or t_d_pool.shape[-1] != s_d_proj.shape[-1]
-                ):
+                ) and (t_q_pool.shape[-1] != s_q_proj.shape[-1] or t_d_pool.shape[-1] != s_d_proj.shape[-1]):
                     raise RuntimeError(
                         "Cached teacher embedding dim does not match student projection dim: "
                         f"t_q={tuple(t_q_pool.shape)}, s_q_proj={tuple(s_q_proj.shape)}, "

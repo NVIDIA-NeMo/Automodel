@@ -25,7 +25,6 @@ import transformers
 from torch import nn
 from transformers import FineGrainedFP8Config, Mistral3ForConditionalGeneration
 
-
 FP8_MODEL_ID = "mistralai/Ministral-3-3B-Instruct-2512"
 BF16_MODEL_ID = "mistralai/Ministral-3-3B-Instruct-2512-BF16"
 
@@ -119,9 +118,7 @@ def _compare_parameters(
             left_parameter = left_parameters[name].detach()
             right_parameter = right_parameters[name].detach()
             if left_parameter.shape != right_parameter.shape:
-                shape_mismatches.append(
-                    f"{name}: {tuple(left_parameter.shape)} != {tuple(right_parameter.shape)}"
-                )
+                shape_mismatches.append(f"{name}: {tuple(left_parameter.shape)} != {tuple(right_parameter.shape)}")
                 continue
             if left_parameter.device.type == "meta" or right_parameter.device.type == "meta":
                 raise RuntimeError(f"Cannot compare meta parameter {name!r}")
@@ -152,13 +149,17 @@ def _compare_parameters(
                 left_squared_sum += left_float.square().sum(dtype=torch.float64).item()
                 right_squared_sum += right_float.square().sum(dtype=torch.float64).item()
                 exact_elements += (left_bf16 == right_bf16).sum().item()
-                close_elements += torch.isclose(
-                    left_float,
-                    right_float,
-                    atol=config.atol,
-                    rtol=config.rtol,
-                    equal_nan=True,
-                ).sum().item()
+                close_elements += (
+                    torch.isclose(
+                        left_float,
+                        right_float,
+                        atol=config.atol,
+                        rtol=config.rtol,
+                        equal_nan=True,
+                    )
+                    .sum()
+                    .item()
+                )
                 nonfinite_elements += (~torch.isfinite(left_float) | ~torch.isfinite(right_float)).sum().item()
                 compared_elements += chunk_elements
 
