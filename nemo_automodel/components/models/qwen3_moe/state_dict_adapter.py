@@ -81,7 +81,9 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
 
         When ``v4_compatible=False`` (the default), LoRA expert tensors are
         emitted in PEFT v0.18+ ParamWrapper format so that
-        ``PeftModel.from_pretrained()`` can load them directly.  When
+        ``PeftModel.from_pretrained()`` can load them directly; the layout
+        follows peft >= 0.19.1 unless ``legacy_paramwrapper_layout=True``
+        asks for the pre-flip layout (huggingface/peft#3165).  When
         ``v4_compatible=True``, the legacy per-expert split is used instead
         (via the parent mixin).
 
@@ -101,7 +103,9 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             expert_segment = self._expert_path_segment
             for suffix in _LORA_EXPERT_SUFFIXES:
                 if fqn.endswith(f".{suffix}") and f".{expert_segment}.{suffix}" in fqn:
-                    result = self._convert_lora_to_paramwrapper(fqn, tensor)
+                    result = self._convert_lora_to_paramwrapper(
+                        fqn, tensor, legacy_layout=kwargs.get("legacy_paramwrapper_layout", False)
+                    )
                     if exclude_key_regex:
                         result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
                     return result
