@@ -50,6 +50,7 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
     build_cached_eagle3_dataloader,
     read_manifest,
 )
+from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -214,39 +215,65 @@ def _validate_cp_gates(
     target_attn_implementation: str | None = None,
     seq_length: int | None = None,
     cp_zigzag: bool = False,
+    cp_mode: str = "ring",
 ) -> None:
-    """Reject context-parallel combinations the EAGLE-3 target path cannot honor.
+    """Reject context-parallel combinations the EAGLE-3 path cannot honor.
 
-    CP shards the target forward along the sequence and forces ``is_causal`` (the
-    self_attn hooks strip the attention_mask), so it is incompatible with sequence
-    packing (which needs the 4D block-causal mask) and with the remote backend
-    (whose target runs out-of-process). Under CP the frozen target must route
-    through HuggingFace ``F.scaled_dot_product_attention`` -- that is the call the
-    K/V-gather hook intercepts -- and the draft runs the flash-attn ring, so all of
-    the target-backend / kernel / divisibility preconditions are checked here so a
-    misconfig fails at setup rather than mid-forward.
+    Two CP compute modes are supported for the draft:
+
+    * ``"ring"`` shards the frozen target too and forces ``is_causal`` (the
+      self_attn K/V-gather hook strips the attention_mask), so it is incompatible
+      with sequence packing (which needs the 4D block-causal mask); it pins the
+      flash-attn 2.8.x ring kernels and needs the HF-SDPA target so the hook can
+      intercept ``F.scaled_dot_product_attention``.
+    * ``"ulysses"`` runs the draft attention as an all-to-all over the full
+      (gathered) sequence, so it composes with packing and leaves the target on its
+      normal forward -- only sequence divisibility by ``cp_size`` applies.
+
+    The remote backend is unsupported under CP in either mode (the target runs
+    out-of-process). Preconditions are checked here so a misconfig fails at setup
+    rather than mid-forward.
     """
-    if cp_size > 1 and backend == "remote":
+    if cp_size <= 1:
+        return
+    if cp_mode not in ("ring", "ulysses"):
+        raise ValueError(f"Unknown cp_mode={cp_mode!r}; expected 'ring' or 'ulysses'.")
+    if backend == "remote":
         raise NotImplementedError(
             "Context parallelism (cp_size>1) is only supported with the colocated target "
             "backend; the remote backend runs the target out-of-process."
         )
-    if cp_size > 1 and packed_sequence_size > 0:
+    if cp_mode == "ulysses":
+        if cp_zigzag:
+            raise NotImplementedError(
+                "cp_zigzag is a ring-only sharding layout; set cp_zigzag=false for "
+                "cp_mode=ulysses (the all-to-all path is inherently load-balanced)."
+            )
+        # Ulysses reuses the ring's flash-attn dense/varlen private kernels, pinned to
+        # the 2.8.x positional signature, so require that exact version (not just import).
+        from nemo_automodel.components.speculative.eagle.ring_attention import require_flash_attn_version
+
+        require_flash_attn_version()
+        if seq_length is not None and seq_length % cp_size != 0:
+            raise ValueError(
+                f"Context parallelism (ulysses) requires seq_length ({seq_length}) divisible by cp_size ({cp_size})."
+            )
+        return
+    # ring mode
+    if packed_sequence_size > 0:
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) is not yet supported with sequence packing; CP "
-            "strips the 4D block-causal mask that packing relies on. Set cp_size=1 or "
+            "Context parallelism cp_mode=ring is not supported with sequence packing; the ring is "
+            "single-document causal. Use cp_mode=ulysses for CP + packing, or set cp_size=1 / "
             "packed_sequence_size=0."
         )
-    if cp_size <= 1:
-        return
     if not target_force_hf:
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+            "Context parallelism (cp_mode=ring) requires recipe_args.target_force_hf=true so the "
             "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
         )
     if target_attn_implementation != "sdpa":
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa. "
+            "Context parallelism (cp_mode=ring) requires recipe_args.target_attn_implementation=sdpa. "
             "The K/V-gather hook intercepts F.scaled_dot_product_attention; any other backend "
             "(e.g. flash_attention_2, the HF auto-select default when flash-attn is installed) "
             "bypasses the hook, so each rank silently attends only its own shard."
@@ -295,6 +322,41 @@ def _best_effort(label: str, fn) -> None:
         fn()
     except Exception:
         logger.exception("error %s during cleanup", label)
+
+
+def _validate_cached_eagle3_manifest(
+    cache_dir: str, manifest: dict, draft_base_config, *, mask_reasoning_content: bool, mask_generation_prompt: bool
+) -> None:
+    """Validate that an EAGLE-3 offline cache matches the configured target and recipe options.
+
+    The cached trainer streams the precomputed aux features, draft-vocab targets
+    and ``loss_mask``/``position_mask`` as stored, so the target's vocabulary and
+    width and the recipe's mask options must be the ones the producer
+    (``precompute_eagle3``) ran with; a mismatch would otherwise crash
+    deep inside the draft or, for the mask, train silently on the wrong tokens.
+    """
+    if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
+        raise ValueError(
+            f"EAGLE-3 cache at {cache_dir} was built for target_vocab_size={manifest['target_vocab_size']}, "
+            f"but the configured target has {draft_base_config.vocab_size}. The cache does not match this target."
+        )
+    # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
+    # cache from a different-width target would otherwise crash deep inside
+    # ``fc`` with a confusing shape error.
+    expected_aux_dim = int(draft_base_config.hidden_size) * 3
+    if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
+        raise ValueError(
+            f"EAGLE-3 cache at {cache_dir} has aux_hidden_dim={manifest['aux_hidden_dim']}, but the configured "
+            f"target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 aux layers). "
+            "The cache was built for a different target."
+        )
+    ensure_supervision_options_match(
+        manifest,
+        {"mask_reasoning_content": mask_reasoning_content, "mask_generation_prompt": mask_generation_prompt},
+        cache_name="EAGLE-3",
+        cache_dir=cache_dir,
+        producer_name="precompute_eagle3",
+    )
 
 
 def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int, lk_loss_type=None) -> None:
@@ -526,6 +588,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # from device_mesh when a colocated target builds one (None otherwise).
         self.cp_mesh = None
         self.dp_mesh = None
+        # CP compute mode for the draft: "ring" (default) or "ulysses" (all-to-all,
+        # composes with sequence packing). Set from config in _setup_online_target.
+        self.cp_mode = "ring"
         if self.cached_target_path is None:
             selected_token_ids, selected_token_mask = self._setup_online_target(
                 recipe_cfg, target_path, draft_base_config
@@ -658,7 +723,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if self.cp_group is not None:
                 from nemo_automodel.components.speculative.eagle.draft_llama import attach_eagle3_cp_attention
 
-                attach_eagle3_cp_attention(self.draft_model, self.cp_group, zigzag=self.cp_zigzag)
+                if self.cp_mode == "ulysses":
+                    n_heads = self.draft_model.config.num_attention_heads
+                    if n_heads % self.cp_mesh.size() != 0:
+                        raise ValueError(
+                            f"cp_mode=ulysses requires the draft num_attention_heads ({n_heads}) divisible by "
+                            f"cp_size ({self.cp_mesh.size()}); the all-to-all splits heads across cp ranks."
+                        )
+                attach_eagle3_cp_attention(self.draft_model, self.cp_group, mode=self.cp_mode, zigzag=self.cp_zigzag)
             trainer_module = Eagle3TrainerModule(
                 self.draft_model,
                 selected_token_ids=selected_token_ids,
@@ -893,6 +965,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
             packed_sequence_size=recipe_cfg.get("packed_sequence_size", 0),
             dp_mesh=self.dp_mesh,
         )
@@ -976,6 +1049,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # submeshes are only built later, inside the colocated path).
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
+        self.cp_mode = recipe_cfg.get("cp_mode", "ring")
         _validate_cp_gates(
             cp_size,
             backend,
@@ -984,6 +1058,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             target_attn_implementation=recipe_cfg.get("target_attn_implementation", None),
             seq_length=int(recipe_cfg.get("seq_length", 0) or 0) or None,
             cp_zigzag=bool(recipe_cfg.get("cp_zigzag", False)),
+            cp_mode=self.cp_mode,
         )
         _validate_tp_gates(tp_size, backend, cp_size)
         # ``draft_base_config`` is None on the paths that never build a draft
@@ -1026,6 +1101,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                 packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )
@@ -1101,10 +1177,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # the draft trainer module). Mark the parameters explicitly so no future
         # code path accidentally trains the target -- matching EAGLE-1/2.
         self.target_model.requires_grad_(False)
+        # Ulysses CP shards only the draft (via the all-to-all attention): the target
+        # runs its normal full-sequence forward (block-causal under packing) and
+        # _maybe_shard_cp slices the gathered hidden states to the draft's shard. Ring
+        # CP instead shards the target here (cp_mesh drives run_target_cp_forward_and_gather).
+        target_cp_mesh = None if self.cp_mode == "ulysses" else self.cp_mesh
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
-            cp_mesh=self.cp_mesh,
+            cp_mesh=target_cp_mesh,
         )
 
     def _load_kimi_k3_target(self, recipe_cfg, target_path, text_config):
@@ -1276,22 +1357,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_model = None
         self.target_wrapper = None
         manifest = read_manifest(self.cached_target_path)
-        if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
-            raise ValueError(
-                f"EAGLE-3 cache at {self.cached_target_path} was built for target_vocab_size="
-                f"{manifest['target_vocab_size']}, but the configured target has {draft_base_config.vocab_size}. "
-                "The cache does not match this target."
-            )
-        # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
-        # cache from a different-width target would otherwise crash deep inside
-        # ``fc`` with a confusing shape error.
-        expected_aux_dim = int(draft_base_config.hidden_size) * 3
-        if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
-            raise ValueError(
-                f"EAGLE-3 cache at {self.cached_target_path} has aux_hidden_dim={manifest['aux_hidden_dim']}, "
-                f"but the configured target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 "
-                "aux layers). The cache was built for a different target."
-            )
+        _validate_cached_eagle3_manifest(
+            self.cached_target_path,
+            manifest,
+            draft_base_config,
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
+        )
         selected_token_ids = torch.tensor(manifest["selected_token_ids"], dtype=torch.long)
         selected_token_mask = torch.zeros(int(draft_base_config.vocab_size), dtype=torch.bool)
         selected_token_mask[selected_token_ids] = True
@@ -1317,10 +1389,20 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """Shard the draft supervision along the sequence for context parallelism.
 
         The target emits full-sequence aux/logits (gathered); the draft runs sharded,
-        so gather every ``[B, S, ...]`` tensor to this rank's cp shard (via a global
-        index) and inject the matching global ``position_ids``. The index is the
-        contiguous shard by default, or the load-balanced zig-zag layout (rank ``r``
-        owns chunks ``r`` and ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+        so every ``[batch, sequence, ...]`` tensor in ``inputs`` is index-selected to
+        this rank's cp shard (via a global index). Non-packed runs then get global
+        ``position_ids`` (the shard's indices); packed runs keep their sliced
+        per-document ``position_ids``. The index is the contiguous shard by default,
+        or the load-balanced zig-zag layout (rank ``r`` owns chunks ``r`` and
+        ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+
+        Args:
+            inputs: Trainer-input mapping; tensor values shaped
+                ``[batch, sequence, ...]`` (matching the full sequence length) are
+                sharded along the sequence axis, others pass through unchanged.
+
+        Returns:
+            The same mapping with sequence-length tensors replaced by their cp shard.
         """
         if getattr(self, "cp_group", None) is None:
             return inputs
@@ -1356,7 +1438,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
             for k, v in inputs.items()
         }
-        out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
+        # Synthesize position_ids only when the caller did not supply them: the
+        # non-packed path has none, so the shard's global indices are its positions.
+        # The packed path carries per-document position_ids (reset at each document
+        # boundary), already sliced to this shard above; overwriting them with a
+        # global arange would corrupt the packed RoPE.
+        if "position_ids" not in out:
+            out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
         return out
 
     def _all_reduce_draft_grads_over_cp(self) -> None:

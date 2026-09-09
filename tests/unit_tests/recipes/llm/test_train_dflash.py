@@ -70,6 +70,8 @@ def _bare_dflash_recipe():
         get_output_embeddings=lambda: torch.nn.Linear(_HIDDEN, _VOCAB, bias=False),
         get_input_embeddings=lambda: torch.nn.Embedding(_VOCAB, _HIDDEN),
     )
+    # Resolved by setup(), which these tests bypass.
+    recipe.draft_sliding_window = None
     return recipe
 
 
