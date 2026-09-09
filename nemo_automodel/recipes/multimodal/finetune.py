@@ -44,7 +44,12 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
+
+from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
@@ -981,8 +986,11 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # ------------------------------------------------------------------
     def _build_wandb(self):
         assert self.cfg.get("wandb", None) is not None
-        from wandb import Settings
-
+        _, _Settings = safe_import_from(
+            "wandb",
+            "Settings",
+            msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]",
+        )
         kwargs = self.cfg.wandb.to_dict()
         if kwargs.get("name", "") == "":
             # default name: model basename.
@@ -991,7 +999,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         run = wandb.init(
             **kwargs,
             config=self.cfg.to_dict(),
-            settings=Settings(silent=True),
+            settings=_Settings(silent=True),
         )
         return run
 
@@ -1001,7 +1009,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         if not self.step_scheduler.is_remote_logging_step:
             self.metric_logger_train.log(log_data)
             return
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
         self.metric_logger_train.log(log_data)
         logging.info(
