@@ -795,6 +795,79 @@ def test_fully_pruned_original_index_agrees_across_real_pp_processes(tmp_path):
     )
 
 
+def _run_partial_index_without_global_keys_pp_worker(
+    rank: int, world_size: int, init_file: str, checkpoint_dir: str
+) -> None:
+    """Verify PP ranks gather before evaluating a partially overlapping source index."""
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            model_save_format="safetensors",
+            model_cache_dir=os.path.join(checkpoint_dir, "cache"),
+            model_repo_id="example/extracted-pp-model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        checkpointer = Checkpointer(
+            config,
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=rank,
+            moe_mesh=None,
+            pp_group=torch.distributed.group.WORLD,
+        )
+        global_keys = [f"layers.{index}.weight" for index in range(4)]
+        local_keys = global_keys[rank * 2 : (rank + 1) * 2]
+        state_dict = {key: torch.empty(1) for key in local_keys}
+        model = SimpleNamespace(config=SimpleNamespace(model_type="example"))
+        model_state = SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+        source_mapping = {
+            "layers.0.weight": 2,
+            "unused.weight": 1,
+        }
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value=os.path.join(checkpoint_dir, "source"),
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                return_value=source_mapping,
+            ),
+            patch("nemo_automodel.components.checkpoint.checkpointing.is_rank_0", return_value=False),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+        expected_mapping = dict.fromkeys(global_keys, 2)
+        assert mapping == expected_mapping
+        gathered_mappings = [None] * world_size
+        torch.distributed.all_gather_object(gathered_mappings, mapping)
+        assert gathered_mappings == [expected_mapping] * world_size
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.run_only_on("CPU")
+def test_partially_matching_index_without_global_keys_agrees_across_real_pp_processes(tmp_path):
+    """Missing global key metadata cannot make PP ranks enter different collectives."""
+    torch.multiprocessing.spawn(
+        _run_partial_index_without_global_keys_pp_worker,
+        args=(2, str(tmp_path / "dist_init"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+
 def test_partially_pruned_original_index_preserves_source_mapping(tmp_path, caplog):
     config = CheckpointingConfig(
         enabled=True,

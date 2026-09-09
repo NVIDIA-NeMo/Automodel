@@ -1675,7 +1675,8 @@ fi
 
         Args:
             model_state: Wrapper exposing the primary model part.
-            state_dict: The state dict that will be saved.
+            state_dict: Current pipeline stage's subset of the exported state dict. Each value is a tensor of
+                arbitrary shape representing its full logical tensor, including when its per-rank storage is sharded.
 
         Returns:
             Mapping from FQN to shard index, or None when not consolidating.
@@ -1700,8 +1701,10 @@ fi
             pre_shard_hf_state_dict_keys = (
                 getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
             )
+            fallback_key_sizes = None
             if pre_shard_hf_state_dict_keys is None:
-                pre_shard_hf_state_dict_keys = list(state_dict.keys())
+                fallback_key_sizes = _collect_global_tensor_sizes(state_dict, self.pp_group)
+                pre_shard_hf_state_dict_keys = list(fallback_key_sizes)
             if model_type and requires_tensor_merging(model_type) and not hasattr(model_part, "state_dict_adapter"):
                 # in this case, Transformers performed weight conversion so we will save the converted format in the checkpoint
                 num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
@@ -1710,9 +1713,8 @@ fi
                 # Decide whether the size metadata collective is needed from inputs that are
                 # identical on every PP rank. Rank-local exclusions below must not control
                 # collective participation, or one stage could wait forever for another.
-                fallback_key_sizes = None
                 if set(fqn_to_file_index_mapping).isdisjoint(pre_shard_hf_state_dict_keys):
-                    fallback_key_sizes = _collect_global_tensor_sizes(state_dict, self.pp_group)
+                    fallback_key_sizes = fallback_key_sizes or _collect_global_tensor_sizes(state_dict, self.pp_group)
                 # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
                 # however, HF initializes buffers with persistent=False, so we need to make sure these
                 # buffer keys are not saved during checkpointing
@@ -2600,8 +2602,9 @@ def _divide_keys_by_size(
 
     Args:
         keys: Ordered tensor names to assign.
-        state_dict: Mapping of tensor names to tensors of arbitrary shape. Tensor values are read only for their
-            logical byte sizes when ``key_size_mapping`` is not provided.
+        state_dict: Mapping of tensor names to tensors of arbitrary shape. Each value represents its full logical
+            tensor, including when its per-rank storage is sharded, and is read only for its logical byte size when
+            ``key_size_mapping`` is not provided.
         target_shard_bytes: Positive target size for each shard in bytes.
         key_size_mapping: Optional mapping of tensor names to logical byte sizes, including tensors not present in
             the rank-local ``state_dict``.
@@ -2645,8 +2648,10 @@ def _collect_global_tensor_sizes(
     """Collect logical tensor sizes across pipeline stages without moving tensor data.
 
     Args:
-        state_dict: Mapping of tensor names to rank-local tensors of arbitrary shape. Tensors remain on their
-            existing devices and are inspected only for element count and element size.
+        state_dict: Current pipeline stage's key subset, mapping names to tensors of arbitrary shape. Each value must
+            report the full logical element count through ``numel()``; for example, a DTensor reports its global
+            logical size rather than its per-rank TP/FSDP shard size. Tensors remain on their existing devices and
+            their placements are not changed.
         process_group: Pipeline-parallel process group whose ranks collectively own the logical state dict, or
             ``None`` for a local-only size mapping.
 
