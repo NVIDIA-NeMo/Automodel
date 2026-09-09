@@ -546,6 +546,22 @@ def test_llama_nemotron_text_backbone_honors_attention_policy(is_causal):
         assert not torch.allclose(original[0, 0], changed[0, 0])
 
 
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_retrieval_attention_policy_is_scoped_to_llama_nemotron_text_tower(tiny_model, is_causal):
+    """Retrieval causality must never change the VL model's vision tower."""
+    from nemo_automodel._transformers.retrieval import _set_text_backbone_is_causal
+
+    tiny_model.language_model = LlamaBidirectionalModel(tiny_model.config.llm_config)
+    tiny_model.vision_model.is_causal = "vision-sentinel"
+
+    _set_text_backbone_is_causal(tiny_model, is_causal)
+
+    assert tiny_model.config.llm_config.is_causal is is_causal
+    assert all(layer.self_attn.is_causal is is_causal for layer in tiny_model.language_model.layers)
+    assert tiny_model.vision_model.is_causal == "vision-sentinel"
+    assert "is_causal" not in vars(tiny_model.config)
+
+
 def test_llama_nemotron_vl_config_builds_composed_subconfigs():
     config = LlamaNemotronVLConfig(
         vision_config=_tiny_vision_config(),
