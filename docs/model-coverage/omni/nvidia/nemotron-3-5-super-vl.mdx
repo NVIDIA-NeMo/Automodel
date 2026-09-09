@@ -48,7 +48,7 @@ there is no audio encoder / audio inputs are not supported on this checkpoint).
 (the same task as the [NemotronOmni CORD-v2 guide](/recipes-e2e-examples/nemotron-omni)) with LoRA adapters
 instead of full SFT. Because the base weights are frozen there are no fp32 master weights or optimizer
 states for them, so the 121B model trains on a single node of 8 H100 (`cp_size 1`, `ep_size 8`) instead of the
-8 nodes full SFT needs.
+4 nodes full SFT needs.
 
 | | |
 |---|---|
