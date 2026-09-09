@@ -421,30 +421,30 @@ its free-form descriptions run to the token limit.
 | Model | Exact match | Mean similarity | Structured output |
 |---|---|---|---|
 | Base (`NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`) | 0/20 | 0.048 | 0/20 (free-form description of the photo) |
+| Full SFT, step 299 (`LOWEST_VAL`, val loss 0.068) | **8/20** | **0.965** (median 0.997; 16/20 above 0.9) | 20/20 |
 | Full SFT, step 399 (`LATEST`, lr=5e-5, 400 steps) | 5/20 | 0.923 (median 0.989; 14/20 above 0.9) | 20/20 |
 | LoRA PEFT, step 199 (`LOWEST_VAL`, val loss 0.039) | 8/20 | 0.954 (median 0.997; 15/20 above 0.9) | 20/20 |
 
-Validation loss is lowest at step 299 (`LOWEST_VAL`); that checkpoint is stored sharded, so run its
-`model/consolidate.sh` and point `eval_cord_v2.py` at the export to score it the same way (the final step is the
-only one exported inline).
+The checkpoint with the lowest validation loss also decodes best, so evaluate `LOWEST_VAL` (run its
+`model/consolidate.sh` first; the final step is the only one exported inline).
 
 The base model answers `Describe this image.` with prose ("This is a photograph of a receipt from a
 restaurant, likely a pizzeria ..."). After fine-tuning every prediction is a well-formed
 `<s_total>...</s_total><s_menu>...</s_menu>` sequence; the remaining errors are field-level (a
 dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or OCR digits.
 
-### Sample predictions (fine-tuned, step 399 / `LATEST`)
+### Sample predictions (fine-tuned, step 299 / `LOWEST_VAL`)
 
 | Sample | Ground-truth menu items | Prediction vs. ground truth | Similarity |
 |--------|-------------------------|-----------------------------|------------|
 | 1 | `REAL GANACHE, EGG TART, PIZZA TOAST` | Exact match | 1.00 |
-| 2 | `Kopi Susu Kolonel` | Exact match | 1.00 |
-| 3 | `S-Ovaltine 50%` | Missing `<s_vatyn>`; items nested in an extra `<s_sub>` block | 0.72 |
-| 4 | `70%, Less Ice, M-Caramel Black Tea` | Same fields, one value differs | 0.99 |
-| 5 | `Sedang, BBQ Chicken` | `<s_menutype_cnt>` where the label has `<s_menuqty_cnt>` | 0.61 |
-| 6 | `LE MINERAL` | Extra menu item (`<s_nm>`, `<s_price>`, `<s_unitprice>`) | 0.61 |
+| 2 | `Kopi Susu Kolonel` | Same fields, one value differs | 1.00 |
+| 3 | `S-Ovaltine 50%` | Missing `<s_vatyn>` | 0.93 |
+| 4 | `70%, Less Ice, M-Caramel Black Tea` | Exact match | 1.00 |
+| 5 | `Sedang, BBQ Chicken` | Same fields, one value differs | 1.00 |
+| 6 | `LE MINERAL` | Same fields, one value differs | 0.99 |
 | 7 | `POTATO SAUSAGE BREAD, OREO GREEN TEA SPREAD, ...` | Exact match | 1.00 |
-| 8 | `Choco Devil` | Missing `<s_discountprice>`; extra menu item | 0.86 |
+| 8 | `Choco Devil` | Missing `<s_discountprice>`; an `<s_etc>` field where the label has none | 0.88 |
 
 ### Summary
 
@@ -457,4 +457,4 @@ dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or
 | Best val loss | 0.068 (step 299) | 0.039 (step 199) |
 | Final train loss | 0.0114 (step 399; mean of last 10 steps 0.029) | 0.0067 (step 399; mean of last 10 steps 0.014) |
 | Checkpoint size | ~227 GB (consolidated bf16) | ~355 MB (adapter only) |
-| Exact matches (20 val) | 5/20 at step 399 (`LATEST`, mean similarity 0.92) | 8/20 at step 199 (`LOWEST_VAL`, mean similarity 0.95) |
+| Exact matches (20 val) | 8/20 at step 299 (`LOWEST_VAL`, mean similarity 0.96); 5/20 at step 399 (0.92) | 8/20 at step 199 (`LOWEST_VAL`, mean similarity 0.95) |
