@@ -28,8 +28,6 @@ always dense, and GLM's sparse top-k machinery belongs to the target model, not
 this draft.
 """
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -42,6 +40,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
+from nemo_automodel.components.models.glm_moe_dsa.rope_utils import mla_softmax_scale
 from nemo_automodel.components.speculative.dspark._sampling import sample_tokens
 from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,
@@ -58,7 +57,7 @@ def _glm_5_2_eager_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: torch.Tensor | None,
     scaling: float,
 ) -> torch.Tensor:
     """Dense eager attention over an additive mask (no GQA repeat, no sink).
@@ -124,9 +123,12 @@ class Glm5_2DSparkAttention(nn.Module):
         self.kv_lora_rank = int(config.kv_lora_rank)
         self.qk_nope_head_dim = int(config.qk_nope_head_dim)
         self.qk_rope_head_dim = int(config.qk_rope_head_dim)
-        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # Same precedence as the target's GlmMoeDsaAttention: an explicit config
+        # ``qk_head_dim`` wins over the nope+rope sum, so the draft's q_b_proj width and
+        # softmax scale cannot drift from the target's on a config that carries it.
+        self.qk_head_dim = int(getattr(config, "qk_head_dim", self.qk_nope_head_dim + self.qk_rope_head_dim))
         self.v_head_dim = int(config.v_head_dim)
-        self.scaling = self.qk_head_dim**-0.5
+        self.scaling = mla_softmax_scale(config, self.qk_head_dim)
 
         self.q_a_proj = nn.Linear(config.hidden_size, self.q_lora_rank, bias=False)
         self.q_a_layernorm = initialize_rms_norm_module("torch_fp32", self.q_lora_rank, eps=config.rms_norm_eps)
@@ -144,9 +146,9 @@ class Glm5_2DSparkAttention(nn.Module):
         hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         freqs_cis: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         del kwargs
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden_states.shape[1]
@@ -197,13 +199,13 @@ class Glm5_2DSparkDecoderLayer(nn.Module):
 
     def forward(
         self,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[object] = None,
-        use_cache: Optional[bool] = False,
-        freqs_cis: Optional[torch.Tensor] = None,
+        target_hidden_states: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: object | None = None,
+        use_cache: bool | None = False,
+        freqs_cis: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del position_ids, past_key_value, use_cache, kwargs
@@ -261,16 +263,23 @@ class Glm5_2DSparkModel(nn.Module):
         self.norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps)
 
         # GLM reuses DeepSeek-V3's rotary: precompute the fp32 frequency table over the
-        # qk_rope_head_dim slice. rope_theta lives under config.rope_parameters (the HF
-        # GlmMoeDsaConfig has no top-level rope_theta); rope_scaling=None matches the
-        # released GLM-5.2 "default" rope_type.
-        rope_parameters = getattr(config, "rope_parameters", None) or {}
-        rope_theta = float(rope_parameters.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
+        # qk_rope_head_dim slice from the same inputs GlmMoeDsaModel uses, so the draft's
+        # positional encoding cannot drift from the target that supervises it. There is
+        # deliberately no rope_theta default (see the raise) and rope_scaling is read with
+        # the target's own expression, not the rope_parameters dict, so a YaRN-scaled
+        # target yields a YaRN-scaled draft.
+        rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
+        rope_theta = (rope_parameters or {}).get("rope_theta", getattr(config, "rope_theta", None))
+        if rope_theta is None:
+            raise ValueError(
+                "GLM-5.2 DSpark draft config carries no rope_theta (neither in rope_parameters / "
+                "rope_scaling nor as a top-level field); the draft's RoPE must match the target's."
+            )
         freqs = precompute_freqs_cis(
             qk_rope_head_dim=int(config.qk_rope_head_dim),
             max_seq_len=int(config.max_position_embeddings),
-            rope_theta=rope_theta,
-            rope_scaling=None,
+            rope_theta=float(rope_theta),
+            rope_scaling=getattr(config, "rope_scaling", None),
         )
         self.register_buffer("freqs", freqs.to(torch.float32), persistent=False)
 
@@ -355,8 +364,8 @@ class Glm5_2DSparkModel(nn.Module):
     def predict_confidence_step(
         self,
         hidden_states: torch.Tensor,
-        prev_token_ids: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+        prev_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         if self.confidence_head is None:
             return None
         if self.confidence_head_with_markov:
@@ -373,7 +382,7 @@ class Glm5_2DSparkModel(nn.Module):
         *,
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, proposal_len = base_logits.shape[:2]
         if proposal_len == 0:
@@ -399,7 +408,7 @@ class Glm5_2DSparkModel(nn.Module):
         *,
         prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert base_logits.ndim == 2, (
             f"sample_draft_token_step expects base_logits shaped [batch, vocab], got {tuple(base_logits.shape)}."
@@ -422,10 +431,10 @@ class Glm5_2DSparkModel(nn.Module):
         self,
         *,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        past_key_values: Optional[object] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden_states: torch.Tensor | None = None,
+        past_key_values: object | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -452,7 +461,7 @@ class Glm5_2DSparkModel(nn.Module):
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        target_last_hidden_states: Optional[torch.Tensor] = None,
+        target_last_hidden_states: torch.Tensor | None = None,
     ) -> DSparkForwardOutput:
         bsz, seq_len = input_ids.shape
         device = input_ids.device

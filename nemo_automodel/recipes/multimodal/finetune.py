@@ -39,12 +39,17 @@ import random
 import shutil
 import time
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
+
+from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
@@ -739,8 +744,8 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         # the per-token-averaged loss gradient on each side.
         ws = self.dist_env.world_size
         microbatch_loss = torch.zeros((), device=self.dist_env.device, dtype=torch.float32)
-        ce_logged: Optional[torch.Tensor] = None
-        mse_logged: Optional[torch.Tensor] = None
+        ce_logged: torch.Tensor | None = None
+        mse_logged: torch.Tensor | None = None
         if ce is not None and num_ce_tokens_global > 0:
             ce_term = ce.sum() * ws / max(num_ce_tokens_global, 1)
             microbatch_loss = microbatch_loss + ce_term
@@ -769,7 +774,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
 
         return data
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a training step; supports grad accumulation trivially.
 
         BAGEL packs variable token counts per microbatch. For gradient
@@ -777,7 +782,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         over the whole optimizer step, not by each microbatch independently.
         """
         device = self.dist_env.device
-        loss_buffer: List[Dict[str, Optional[torch.Tensor]]] = []
+        loss_buffer: List[Dict[str, torch.Tensor | None]] = []
         total_tokens = 0
         total_ce_tokens = 0
         total_mse_tokens = 0
@@ -934,7 +939,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         epoch: int,
         step: int,
         train_loss: float,
-        val_loss: Optional[Dict[str, float]] = None,
+        val_loss: Dict[str, float] | None = None,
         best_metric_key: str = "default",
     ) -> None:
         """Save BAGEL state and include the frozen VAE as a checkpoint sidecar."""
@@ -981,8 +986,11 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # ------------------------------------------------------------------
     def _build_wandb(self):
         assert self.cfg.get("wandb", None) is not None
-        from wandb import Settings
-
+        _, _Settings = safe_import_from(
+            "wandb",
+            "Settings",
+            msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]",
+        )
         kwargs = self.cfg.wandb.to_dict()
         if kwargs.get("name", "") == "":
             # default name: model basename.
@@ -991,7 +999,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         run = wandb.init(
             **kwargs,
             config=self.cfg.to_dict(),
-            settings=Settings(silent=True),
+            settings=_Settings(silent=True),
         )
         return run
 
@@ -1001,7 +1009,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         if not self.step_scheduler.is_remote_logging_step:
             self.metric_logger_train.log(log_data)
             return
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
         self.metric_logger_train.log(log_data)
         logging.info(
@@ -1029,7 +1037,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
 # ---------------------------------------------------------------------------
 
 
-def main(config_path: Optional[str] = None) -> None:
+def main(config_path: str | None = None) -> None:
     """Run the BAGEL multimodal training recipe from a YAML config path."""
     if config_path is None:
         config_path = "examples/multimodal_finetune/bagel/bagel_sft.yaml"

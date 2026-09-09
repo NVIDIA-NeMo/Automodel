@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Dict, Literal, Union
 
 from transformers import Qwen2Config
 from transformers.configuration_utils import PretrainedConfig
@@ -121,7 +121,7 @@ def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2C
     return cfg
 
 
-def _coerce_vision_config(cfg: Union[Dict[str, Any], SiglipVisionConfig, None]) -> Optional[SiglipVisionConfig]:
+def _coerce_vision_config(cfg: Union[Dict[str, Any], SiglipVisionConfig, None]) -> SiglipVisionConfig | None:
     """Coerce ``cfg`` into a ``SiglipVisionConfig`` (our ``rope``-flag variant)."""
     if cfg is None:
         return None
@@ -234,11 +234,11 @@ class BagelConfig(PretrainedConfig):
         self.text_config = value
 
     @property
-    def vit_config(self) -> Optional[SiglipVisionConfig]:
+    def vit_config(self) -> SiglipVisionConfig | None:
         return self.vision_config
 
     @vit_config.setter
-    def vit_config(self, value: Optional[SiglipVisionConfig]) -> None:
+    def vit_config(self, value: SiglipVisionConfig | None) -> None:
         self.vision_config = value
 
     # ------------------------------------------------------------------

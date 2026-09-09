@@ -57,6 +57,10 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.qwen3_5.packing import (
+    GatedDeltaPackedMetadata,
+    prepare_gated_delta_packed_metadata,
+)
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
@@ -197,6 +201,8 @@ class Qwen3_5DenseMTPSublayer(Qwen3_5DecoderLayer):
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__(_make_full_attention_config(config, layer_idx), layer_idx)
+        # Transformers 5.15 renamed this discriminator to ``block_type``.
+        self.layer_type = self.block_type
         self.has_fusion = has_fusion
         self.has_final_norm = has_final_norm
         if has_fusion:
@@ -343,8 +349,27 @@ class Qwen3_5DenseBlock(Block):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        packed_gdn_metadata: GatedDeltaPackedMetadata | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Run one dense Qwen3.5 decoder block.
+
+        Args:
+            x: Hidden states of shape [batch, sequence, hidden].
+            freqs_cis: Rotary frequencies of shape [axes, batch, sequence,
+                head_dim].
+            attention_mask: Optional validity, indexed document, or backend mask
+                of shape [batch, sequence] or [batch, 1, sequence, sequence].
+            padding_mask: Optional padding mask of shape [batch, sequence].
+            position_ids: Optional positions of shape [batch, sequence] or
+                [axes, batch, sequence].
+            packed_gdn_metadata: Optional model-forward-owned packing metadata;
+                tensor layouts are documented by :class:`GatedDeltaPackedMetadata`.
+            **attn_kwargs: Backend-specific attention arguments.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden].
+        """
         if self.layer_type != "linear_attention":
             attn_kwargs = dict(attn_kwargs)
             attn_kwargs.pop("seq_index", None)
@@ -357,24 +382,20 @@ class Qwen3_5DenseBlock(Block):
                 **attn_kwargs,
             )
 
-        from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
-
-        cu_seqlens: torch.Tensor | None = None
-        indices: torch.Tensor | None = None
         linear_attn_mask = attention_mask
-        packed_seq_ids = attn_kwargs.get("_packed_seq_ids")
-        if is_indexed_packed_mask(attention_mask):
-            packing_mask = attention_mask
-        elif is_indexed_packed_mask(packed_seq_ids):
-            packing_mask = packed_seq_ids
-        else:
-            packing_mask = None
+        from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
 
-        if packing_mask is not None:
-            indices_t, cu_seqlens_t, _ = get_unpad_data(packing_mask)
-            cu_seqlens = cu_seqlens_t.to(torch.long)
-            indices = indices_t
-            linear_attn_mask = packing_mask
+        if current_blockdiag_cp_state() is not None:
+            packed_gdn_metadata = None
+            linear_attn_mask = None
+        elif packed_gdn_metadata is None:
+            packed_gdn_metadata = prepare_gated_delta_packed_metadata(
+                attention_mask,
+                attn_kwargs.get("_packed_seq_ids"),
+            )
+
+        if packed_gdn_metadata is not None:
+            linear_attn_mask = packed_gdn_metadata.document_ids
 
         if linear_attn_mask is not None and padding_mask is None:
             padding_mask = linear_attn_mask.bool().logical_not()
@@ -385,8 +406,9 @@ class Qwen3_5DenseBlock(Block):
             attention_mask=linear_attn_mask,
             position_ids=position_ids,
             seq_index=attn_kwargs.get("seq_index"),
-            cu_seqlens=cu_seqlens,
-            indices=indices,
+            cu_seqlens=packed_gdn_metadata.cu_seqlens if packed_gdn_metadata is not None else None,
+            cu_seqlens_cpu=packed_gdn_metadata.cu_seqlens_cpu if packed_gdn_metadata is not None else None,
+            indices=packed_gdn_metadata.indices if packed_gdn_metadata is not None else None,
         )
         x = x + attn_out
         mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
@@ -452,6 +474,30 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> BaseModelOutputWithPast:
+        """Decode text tokens with model-forward-owned packed GDN metadata.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence].
+            inputs_embeds: Optional token embeddings of shape [batch, sequence,
+                hidden].
+            attention_mask: Optional validity, indexed document, or backend mask
+                of shape [batch, sequence] or [batch, 1, sequence, sequence].
+            position_ids: Optional positions of shape [batch, sequence] or
+                [axes, batch, sequence].
+            cache_position: Optional token positions of shape [sequence].
+            padding_mask: Optional padding mask of shape [batch, sequence].
+            past_key_values: Unsupported recurrent or KV cache.
+            use_cache: Whether to use a cache; only ``False`` or ``None`` is
+                supported.
+            output_hidden_states: Accepted for Hugging Face compatibility and
+                ignored.
+            **attn_kwargs: Backend-specific attention arguments, including optional
+                ``_packed_seq_ids`` of shape [batch, sequence].
+
+        Returns:
+            Model output whose ``last_hidden_state`` has shape [batch, sequence,
+            hidden].
+        """
         del output_hidden_states  # accepted for HF-forward compatibility; ignored
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache is not supported for the Qwen3.5 dense backend implementation.")
@@ -482,6 +528,12 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
+        packed_gdn_metadata = None
+        if not getattr(self, "_cp_enabled", False):
+            packed_gdn_metadata = prepare_gated_delta_packed_metadata(
+                attention_mask,
+                attn_kwargs.get("_packed_seq_ids"),
+            )
 
         for decoder_layer in self.layers.values():
             hidden_states = decoder_layer(
@@ -490,6 +542,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 position_ids=position_ids,
+                packed_gdn_metadata=packed_gdn_metadata,
                 **attn_kwargs,
             )
 

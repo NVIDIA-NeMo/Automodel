@@ -204,7 +204,9 @@ def merge_lora(
         qlora: If True, load the base model in 4-bit and dequantize before merging.
         dtype: Weight dtype for the merged model (``float16``, ``bfloat16``, ``float32``).
         device: ``auto``, ``cpu``, or ``cuda:N``.
-        save_tokenizer: Whether to save the tokenizer alongside the model.
+        save_tokenizer: Whether to save the tokenizer and any processor artifacts
+            available from the base model. If processor loading fails, tokenizer
+            saving is still attempted.
         trust_remote_code: Passed through to ``from_pretrained``.
         model_class: Explicit ``transformers`` Auto class name (e.g.
             ``"AutoModel"``, ``"AutoModelForCausalLM"``).  When ``None``
@@ -261,6 +263,24 @@ def merge_lora(
         _clean_quantization_config(output_dir)
 
     if save_tokenizer:
+        # Save available processor artifacts first so multimodal outputs remain
+        # loadable from the merged directory. Save the tokenizer last so its files
+        # take precedence if processor serialization writes overlapping files.
+        processor = None
+        try:
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=trust_remote_code)
+        except Exception as e:
+            logger.info("Could not load processor for %s; continuing without processor artifacts: %s", base_model, e)
+
+        if processor is not None:
+            try:
+                processor.save_pretrained(output_dir)
+                logger.info("Processor saved to %s", output_dir)
+            except Exception as e:
+                logger.warning("Could not save processor artifacts to %s: %s", output_dir, e)
+
         try:
             # Prefer NeMoAutoTokenizer: on transformers>=5 a plain
             # AutoTokenizer.save_pretrained re-serializes the tokenizer and
@@ -332,7 +352,7 @@ def parse_args() -> argparse.Namespace:
         "--no-save-tokenizer",
         action="store_true",
         default=False,
-        help="Skip saving the tokenizer.",
+        help="Skip saving the tokenizer and processor artifacts.",
     )
     parser.add_argument(
         "--trust-remote-code",

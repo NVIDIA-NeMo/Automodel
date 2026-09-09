@@ -37,11 +37,18 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
-from typing import Optional
 
-import mlflow
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_MLFLOW, mlflow = safe_import(
+    "mlflow",
+    msg="mlflow is not installed. To enable MLflow experiment tracking, run: uv add nemo-automodel[mlflow]. For the full MLflow stack: uv add nemo-automodel[mlflow-full]",
+)
 import torch
-import wandb
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -431,6 +438,9 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 num_diffusion_tokens=num_diffusion_tokens,
                 num_ar_tokens=num_ar_tokens if has_causal else None,
                 causal_logits=causal_logits,
+                # Mixed forward kernels (scdd) score the corrupted token itself,
+                # which noise_mask alone cannot recover; absorbing losses ignore it.
+                noisy_input_ids=noisy_input_ids,
             )
             microbatch_loss = loss_result.total_loss
             dllm_loss = loss_result.dllm_loss.detach().clone()
@@ -458,7 +468,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             num_diffusion_tokens = num_supervised_tokens
         return num_diffusion_tokens, num_supervised_tokens
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step with dLLM loss.
 
         Follows the parent pattern but uses loss_mask from the collate wrapper
@@ -599,7 +609,12 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 step_flops = self._dp_allreduce(
                     torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
                 ).item()
-                mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
+                mfu = calculate_mfu(
+                    step_flops / 1e12,
+                    self.dist_env.world_size,
+                    time_delta,
+                    reference_mfu=mfu_calculator.reference_mfu,
+                )
 
         total_loss = torch.sum(torch.stack(loss_buffer))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).cpu().item()
@@ -749,9 +764,9 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 k: sum(d[k] for d in _win) / len(_win) for k in _win[0] if k not in ("step", "epoch", "timestamp")
             }
             self._remote_log_window = []
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(remote_metrics, step=self.step_scheduler.step)
-            if mlflow.active_run() is not None:
+            if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(remote_metrics), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(remote_metrics, step=log_data.step)

@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
+    NeatPackConfig,
     _build_packed_vlm_sample,
     _compute_mrope_position_ids,
     _shift_sample,
@@ -133,6 +135,25 @@ class TestBuildPackedVlmSample:
         assert result["n_images"] == 3
         assert result["n_videos"] == 0
 
+    def test_variable_resolution_media_lists_are_preserved(self):
+        samples = [
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "labels": torch.tensor([10, 20]),
+                "pixel_values": [torch.randn(3, 8, 12)],
+            },
+            {
+                "input_ids": torch.tensor([3, 4]),
+                "labels": torch.tensor([30, 40]),
+                "pixel_values": [torch.randn(3, 16, 8)],
+            },
+        ]
+
+        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+
+        assert isinstance(result["pixel_values"], list)
+        assert [tuple(value.shape) for value in result["pixel_values"]] == [(3, 8, 12), (3, 16, 8)]
+
     def test_mm_token_type_ids_propagated(self):
         samples = [
             {
@@ -148,6 +169,25 @@ class TestBuildPackedVlmSample:
         ]
         result = _build_packed_vlm_sample(samples, pack_size=8, padding_idx=0)
         assert result["mm_token_type_ids"].tolist() == [0, 1, 0, 1, 1]
+
+    def test_sequence_alignment_pads_each_document_and_preserves_real_lengths(self):
+        samples = [
+            {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([11, 12, 13])},
+            {"input_ids": torch.tensor([4, 5]), "labels": torch.tensor([14, 15])},
+        ]
+
+        result = _build_packed_vlm_sample(
+            samples,
+            pack_size=8,
+            padding_idx=0,
+            sequence_alignment=4,
+        )
+
+        assert result["input_ids"].tolist() == [1, 2, 3, 0, 4, 5, 0, 0]
+        assert result["labels"].tolist() == [11, 12, 13, -100, 14, 15, -100, -100]
+        assert result["seq_lens"] == [3, 2]
+        assert result["seq_lens_padded"] == [4, 4]
+        assert result["position_ids"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
 
 
 class TestNeatPackDatasetVlm:
@@ -233,6 +273,60 @@ class TestNeatPackDatasetVlm:
             drop_long_samples=True,
         )
         assert len(packed) == 1
+
+    def test_alignment_is_included_in_knapsack_capacity_and_materialization(self):
+        samples = [_make_vlm_sample(4) for _ in range(3)]  # shifted real length 3 each
+        raw = [{"_text_tokens": 4, "conversation": []} for _ in samples]
+
+        packed = neat_pack_dataset_vlm(
+            _FakeDataset(samples),
+            ds_raw=raw,
+            pack_size=16,
+            padding_idx=0,
+            sequence_alignment=8,
+            balance_media_tokens=False,
+        )
+
+        # Raw lengths total 9 and would fit one pack. CP-aligned lengths total
+        # 24, so the planner must produce two packs instead of overflowing later.
+        assert len(packed) == 2
+        materialized_lengths = sorted(len(packed[i]["input_ids"]) for i in range(len(packed)))
+        assert materialized_lengths == [8, 16]
+        for i in range(len(packed)):
+            item = packed[i]
+            assert sum(item["seq_lens_padded"]) == len(item["input_ids"])
+            assert all(length % 8 == 0 for length in item["seq_lens_padded"])
+
+    def test_thd_config_derives_alignment_from_cp_size(self):
+        samples = [_make_vlm_sample(4)]
+        config = NeatPackConfig(pack_size=16, collate_max_length=16, packing_format="thd")
+
+        packed = config.build(
+            dataset=_FakeDataset(samples),
+            padding_idx=0,
+            ds_raw=[{"_text_tokens": 4, "conversation": []}],
+            cp_size=4,
+        )
+
+        assert packed.sequence_alignment == 8
+        assert packed[0]["seq_lens"] == [3]
+        assert packed[0]["seq_lens_padded"] == [8]
+
+    def test_thd_config_rejects_mrope_cp_and_unaligned_collate_length(self):
+        with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
+            NeatPackConfig(pack_size=16, packing_format="thd").build(
+                dataset=_FakeDataset([]),
+                padding_idx=0,
+                get_rope_index=lambda: None,
+                cp_size=2,
+            )
+
+        with pytest.raises(ValueError, match=r"collate_max_length must be divisible by 2 \* cp_size"):
+            NeatPackConfig(pack_size=10, collate_max_length=10, packing_format="thd").build(
+                dataset=_FakeDataset([]),
+                padding_idx=0,
+                cp_size=2,
+            )
 
 
 class TestNeatPackedVlmCollater:
@@ -490,3 +584,32 @@ def test_compute_mrope_position_ids_passes_sample_mm_token_type_ids_through():
 
     assert pos.shape == (3, 4)
     assert captured["mm"].tolist() == [[0, 1, 1, 0]]
+
+
+class TestVariableResolutionImagePacking:
+    def test_mismatched_image_shapes_are_kept_as_per_image_list(self):
+        samples = [
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "labels": torch.tensor([10, 20]),
+                "pixel_values": torch.randn(2, 3, 8, 8),  # two 8x8 images
+            },
+            {
+                "input_ids": torch.tensor([3]),
+                "labels": torch.tensor([30]),
+                "pixel_values": torch.randn(1, 3, 12, 4),  # one 12x4 image
+            },
+        ]
+        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+
+        assert isinstance(result["pixel_values"], list)
+        assert [tuple(v.shape) for v in result["pixel_values"]] == [(3, 8, 8), (3, 8, 8), (3, 12, 4)]
+
+    def test_matching_image_shapes_still_concatenate(self):
+        samples = [
+            {"input_ids": torch.tensor([1]), "labels": torch.tensor([10]), "pixel_values": torch.randn(2, 3, 8, 8)},
+            {"input_ids": torch.tensor([2]), "labels": torch.tensor([20]), "pixel_values": torch.randn(1, 3, 8, 8)},
+        ]
+        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+        assert isinstance(result["pixel_values"], torch.Tensor)
+        assert tuple(result["pixel_values"].shape) == (3, 3, 8, 8)

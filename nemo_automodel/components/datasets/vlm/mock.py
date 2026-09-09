@@ -33,7 +33,7 @@ sequence.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 from PIL import Image
@@ -103,8 +103,8 @@ def build_mock_vlm_dataset(
     num_images_per_sample: int = 1,
     image_size: Tuple[int, int] = (256, 256),
     prompt: str = "Describe this image.",
-    responses: Optional[List[str]] = None,
-    max_length: Optional[int] = None,
+    responses: List[str] | None = None,
+    max_length: int | None = None,
     seed: int = 0,
     **kwargs,
 ) -> list:

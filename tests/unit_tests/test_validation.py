@@ -81,6 +81,18 @@ class _WithKwargs(nn.Module):
         return input_ids
 
 
+class _ModelOwnedPackedCP(nn.Module):
+    _packed_cp_attn_backends = ("sdpa",)
+    _supports_sdpa = True
+
+    def __init__(self, backend_attn):
+        super().__init__()
+        self.backend = SimpleNamespace(attn=backend_attn)
+
+    def forward(self, input_ids, **kwargs):
+        return input_ids
+
+
 @dataclass(frozen=True)
 class _THDCapabilities:
     supports_tp: bool = False
@@ -104,6 +116,7 @@ class _DeepseekV4Like(nn.Module):
 
 class _GlmMoeDsaLike(nn.Module):
     ModelCapabilities = _THDCapabilities
+    _packed_cp_attn_backends = ("tilelang", "cudnn")
 
     def __init__(self, backend_attn="tilelang"):
         super().__init__()
@@ -155,6 +168,24 @@ def _make_moe_cls():
             return input_ids
 
     return _MoE
+
+
+def _make_owns_cp_cls(backend_attn="eager"):
+    """MoE model that ships its own CP transport (Kimi Linear style)."""
+    from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+
+    class _OwnsCP(MoEFSDPSyncMixin, nn.Module):
+        _owns_cp_attention = True
+        _owns_packed_attention = True
+
+        def __init__(self):
+            super().__init__()
+            self.backend = SimpleNamespace(attn=backend_attn)
+
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    return _OwnsCP
 
 
 def _make_moe_te_cls():
@@ -336,6 +367,12 @@ class TestModelSupportsCP:
         _attach(model)
         assert model.supports.supports_cp is False
 
+    def test_custom_true_when_model_owns_cp(self):
+        """A model owning its CP transport needs no TE/Magi attention backend."""
+        model = _make_owns_cp_cls()()
+        _attach(model)
+        assert model.supports.supports_cp is True
+
     def test_deepseek_v4_true_with_tilelang(self):
         model = _DeepseekV4Like(backend_attn="tilelang")
         _attach(model)
@@ -352,13 +389,14 @@ class TestModelSupportsCP:
         _attach(model)
         assert model.supports.supports_cp is False
 
-    def test_glm_moe_dsa_true_with_tilelang(self):
-        model = _GlmMoeDsaLike(backend_attn="tilelang")
+    @pytest.mark.parametrize("backend_attn", ["tilelang", "cudnn"])
+    def test_glm_moe_dsa_true_with_optimized_cp_backend(self, backend_attn):
+        model = _GlmMoeDsaLike(backend_attn=backend_attn)
         _attach(model)
         assert model.supports.supports_cp is True
 
     @pytest.mark.parametrize("backend_attn", ["te", "sdpa", "torch"])
-    def test_glm_moe_dsa_false_without_tilelang(self, backend_attn):
+    def test_glm_moe_dsa_false_without_optimized_cp_backend(self, backend_attn):
         model = _GlmMoeDsaLike(backend_attn=backend_attn)
         _attach(model)
         assert model.supports.supports_cp is False
@@ -377,6 +415,19 @@ class TestModelSupportsEP:
         assert model.supports.supports_ep is False
 
 
+class TestModelSupportsMTP:
+    def test_mtp_enabled_reflects_live_config(self):
+        model = _Bare()
+        model.mtp_config = SimpleNamespace(enabled=False)
+        _attach(model)
+
+        assert model.supports.mtp_enabled is False
+        model.mtp_config.enabled = True
+        assert model.supports.mtp_enabled is True
+        assert model.supports.supports_mtp_cp is False
+        assert model.supports.supports_mtp_cp_pp is False
+
+
 class TestModelSupportsSequencePacking:
     def test_true_with_seq_lens(self):
         model = _WithSeqLens()
@@ -392,6 +443,11 @@ class TestModelSupportsSequencePacking:
         model = _Bare()
         _attach(model)
         assert model.supports.supports_sequence_packing is False
+
+    def test_glm_moe_dsa_true_with_cudnn(self):
+        model = _GlmMoeDsaLike(backend_attn="cudnn")
+        _attach(model)
+        assert model.supports.supports_sequence_packing is True
 
 
 class TestModelSupportsGradientCheckpointing:
@@ -419,6 +475,21 @@ class TestModelSupportsGradientCheckpointing:
 
 
 class TestModelSupportsCPWithSequencePacking:
+    @pytest.mark.parametrize(("backend", "expected"), [("sdpa", True), ("te", False)])
+    def test_model_owned_packed_cp_backend_contract(self, backend, expected):
+        model = _ModelOwnedPackedCP(backend)
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+
+        assert model.supports.supports_cp_with_sequence_packing is expected
+
+    def test_model_owned_backend_contract_does_not_restrict_cp1_packing(self):
+        model = _ModelOwnedPackedCP("te")
+        _attach(model)
+        model._mesh = _mesh(cp=1)
+
+        assert model.supports.supports_cp_with_sequence_packing is True
+
     def test_cp1_seq_packing_supported(self):
         """When cp_size=1, just checks seq_lens support."""
         model = _WithSeqLens()
@@ -458,6 +529,13 @@ class TestModelSupportsCPWithSequencePacking:
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is False
 
+    def test_cp_gt1_sequence_packing_supported_when_model_owns_cp(self):
+        model = _make_owns_cp_cls()()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_sequence_packing is True
+        assert model.supports.supports_cp_with_sequence_packing is True
+
     def test_deepseek_v4_cp_gt1_sequence_packing_supported_with_tilelang(self):
         model = _DeepseekV4Like()
         _attach(model)
@@ -472,6 +550,12 @@ class TestModelSupportsCPWithSequencePacking:
 
     def test_glm_moe_dsa_cp_gt1_sequence_packing_supported_with_tilelang(self):
         model = _GlmMoeDsaLike(backend_attn="tilelang")
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_glm_moe_dsa_cp_gt1_sequence_packing_supported_with_cudnn(self):
+        model = _GlmMoeDsaLike(backend_attn="cudnn")
         _attach(model)
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is True
@@ -595,6 +679,11 @@ class TestValidateForMesh:
 
     def test_cp_passes_glm_moe_dsa_tilelang(self):
         model = _GlmMoeDsaLike(backend_attn="tilelang")
+        _attach(model)
+        validate_for_mesh(model, _mesh(cp=2))
+
+    def test_cp_passes_glm_moe_dsa_cudnn(self):
+        model = _GlmMoeDsaLike(backend_attn="cudnn")
         _attach(model)
         validate_for_mesh(model, _mesh(cp=2))
 

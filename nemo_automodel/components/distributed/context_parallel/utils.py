@@ -14,7 +14,7 @@
 
 import contextlib
 from functools import partial
-from typing import Any, List, Optional, Set
+from typing import Any, List, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -118,7 +118,7 @@ def create_context_parallel_ctx(
     cp_buffers: List[torch.Tensor],
     cp_seq_dims: List[int],
     cp_no_restore_buffers: Set[torch.Tensor],
-    cp_rotate_method: Optional[str] = None,
+    cp_rotate_method: str | None = None,
 ):
     """
     Create a context parallel context.
@@ -387,7 +387,7 @@ def _prepare_cp_sharder(
     num_chunks: int = 1,
     loss_mask: torch.Tensor | None = None,
     invoke_pre_embed: bool = True,
-    extra_seq_buffers: Optional[dict[str, int]] = None,
+    extra_seq_buffers: dict[str, int] | None = None,
 ) -> ContextParallelSharder:
     """Resolve and configure a CP sharder for its public constructor.
 
@@ -464,14 +464,14 @@ def _prepare_cp_sharder(
 
 def _resolve_cp_sharder(
     cp_mesh,
-    model_sharder: Optional[ContextParallelSharder],
+    model_sharder: ContextParallelSharder | None,
     *,
     magi,
     is_thd: bool,
     num_chunks: int,
     seq_lens_padding_value: int,
     model,
-    extra_seq_buffers: Optional[dict[str, int]] = None,
+    extra_seq_buffers: dict[str, int] | None = None,
 ) -> ContextParallelSharder:
     """Resolve the ContextParallelSharder for this forward: model-owned > magi > TE > generic > none.
 
@@ -616,8 +616,8 @@ def _make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
     magi=None,
     model=None,
-    cp_sharder: Optional[ContextParallelSharder] = None,
-    extra_seq_buffers: Optional[dict[str, int]] = None,
+    cp_sharder: ContextParallelSharder | None = None,
+    extra_seq_buffers: dict[str, int] | None = None,
 ):
     """
     Resolve a ContextParallelSharder and shard the batch; a no-op when no CP prep applies.
@@ -841,17 +841,26 @@ def _shard_thd_chunk_for_te(
         if key in batch:
             batch[key] = batch[key].index_select(0, local_indices)
 
+    # Keep model-owned payloads (for example VLM media) by default. Only remove
+    # source metadata that is invalid after the THD CP conversion; the update
+    # below replaces every transformed field with its authoritative local value.
+    output_batch = batch.copy()
+    output_batch.pop("attention_mask", None)
+    output_batch.pop("cu_seqlens_padded", None)
+
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
-    output_batch = {
-        "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
-        "labels": batch["labels"].to(torch.int64).contiguous(),
-        "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
-        "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
-        "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
-        "qkv_format": qkv_format,
-        "cp_size": cp_size,
-        "cp_rank": cp_rank,
-    }
+    output_batch.update(
+        {
+            "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
+            "labels": batch["labels"].to(torch.int64).contiguous(),
+            "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
+            "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
+            "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
+            "qkv_format": qkv_format,
+            "cp_size": cp_size,
+            "cp_rank": cp_rank,
+        }
+    )
 
     # Already partitioned above with the same local_indices as input_ids. Only
     # fall back to the token-value comparison when the caller supplied no mask;

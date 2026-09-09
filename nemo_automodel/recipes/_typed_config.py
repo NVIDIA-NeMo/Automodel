@@ -21,8 +21,8 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
 ``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
-``embedding_row_repair``/``domain_mixture`` map to component config dataclasses;
-the ``optimizer`` and ``loss_fn`` blocks resolve to a component
+``embedding_row_repair``/``mfu``/``domain_mixture`` map to component config
+dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -51,6 +51,7 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
+    from nemo_automodel._transformers.mfu import MFUConfig
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
@@ -376,6 +377,10 @@ class RecipeConfig:
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
+        # `tokenizer`/`processor` are runtime build args, not declarative dataset fields.
+        # Drop them here as the LLM path (`_resolve_dataloader`) does, so a `dataset.tokenizer`
+        # block (valid on the LLM path) does not reach the dataset config, which rejects unknown fields.
+        dataset_kwargs.pop("tokenizer", None)
         chat_template = dataset_kwargs.pop("chat_template", None)
         legacy_packing = dataset_kwargs.pop("packing", None)
         dataset_pretokenize = dataset_kwargs.pop("pretokenize", None)
@@ -556,6 +561,12 @@ class RecipeConfig:
         return self.resolve_diffusion_dataloader(node) if node is not None else None
 
     @cached_property
+    def diffusion_validation_dataloader(self) -> "DiffusionDataloaderConfig" | None:
+        """Typed diffusion validation dataloader config resolved from ``data.validation_dataloader``."""
+        node = self._raw.get("data.validation_dataloader", None)
+        return self.resolve_diffusion_dataloader(node) if node is not None else None
+
+    @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:
         """Typed packed-dataset and dataloader config for BAGEL recipes."""
         from nemo_automodel.components.datasets.multimodal.datasets import BagelDatasetConfig
@@ -615,6 +626,13 @@ class RecipeConfig:
 
         node = self._raw.get("prewarm", None)
         return PrewarmConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def mfu(self) -> "MFUConfig":
+        from nemo_automodel._transformers.mfu import MFUConfig
+
+        node = self._raw.get("mfu", None)
+        return MFUConfig(**_section_kwargs(node)) if node else MFUConfig()
 
     @cached_property
     def embedding_row_repair(self) -> "EmbeddingRowRepairConfig | None":

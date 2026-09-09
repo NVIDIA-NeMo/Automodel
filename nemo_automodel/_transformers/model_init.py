@@ -216,10 +216,16 @@ def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
     Returns:
         True if the config is compatible with our custom implementation, False otherwise
     """
-    # NemotronHForCausalLM: Our custom implementation is for v3 (MoE model)
-    # v3 requires n_routed_experts, v2 does not have this attribute
+    # NemotronHForCausalLM is shared by the MoE ("v3", has n_routed_experts) and the
+    # dense ("v2"-style, e.g. Nano 4B/9B/12B BF16) Nemotron-H variants. The custom
+    # implementation now handles both. Dense is recognized by its hybrid layer pattern:
+    # key off layers_block_type, which is what the custom model actually consumes. (A raw
+    # hybrid_override_pattern alone is not enough; the model never normalizes it, so a
+    # config with no layers_block_type falls back to HF instead of routing here.)
     if arch_name == "NemotronHForCausalLM":
-        return hasattr(config, "n_routed_experts") and config.n_routed_experts is not None
+        if getattr(config, "n_routed_experts", None) is not None:
+            return True
+        return bool(getattr(config, "layers_block_type", None))
 
     # All other architectures are assumed compatible
     return True
@@ -464,6 +470,288 @@ def _setup_bnb_loading_kwargs(kwargs: dict) -> None:
     logger.info("BnB loading: device_map=%s", kwargs["device_map"])
 
 
+# Fraction of TOTAL CUDA memory that the estimated BF16 footprint may occupy
+# before we refuse the load and point the user at the streaming workaround.
+# We budget against total (not free) memory so the verdict is deterministic
+# across ranks and unaffected by transient allocations from co-located
+# processes; the reserved remainder (~30%) covers the CUDA context, NCCL /
+# process-group buffers, loader scratch, and load-time activations.
+_FP8_PREFLIGHT_FOOTPRINT_THRESHOLD = 0.70
+_FP8_PREFLIGHT_DISABLE_ENV = "NEMO_AUTOMODEL_DISABLE_FP8_PREFLIGHT"
+
+
+def _get_quant_attr(quantization_config, key):
+    """Read ``key`` from a quant config that may be a dict or an object."""
+    if quantization_config is None:
+        return None
+    if isinstance(quantization_config, dict):
+        return quantization_config.get(key)
+    return getattr(quantization_config, key, None)
+
+
+def _quant_config_is_fp8_full_materialize(quantization_config) -> bool:
+    """True if this config asks HF to dequantize the FP8 checkpoint to BF16 in full.
+
+    Keys off the canonical ``dequantize`` flag set by transformers'
+    ``FineGrainedFP8Config`` (and by ``_maybe_dequantize_fp8_for_peft`` on the
+    native ``hf_config.quantization_config``). ``quant_method`` may be a plain
+    string or the ``QuantizationMethod.FP8`` enum, both of which compare equal
+    to ``"fp8"``.
+    """
+    if _get_quant_attr(quantization_config, "quant_method") != "fp8":
+        return False
+    return _get_quant_attr(quantization_config, "dequantize") is True
+
+
+def _param_count_from_local_safetensors(pretrained_model_name_or_path) -> int | None:
+    """Exact parameter count from an already-local safetensors checkpoint.
+
+    Sums the element count of every tensor by reading only safetensors headers
+    (no weight data is materialized), which is exact regardless of GQA, MoE,
+    tied embeddings, or on-disk dtype. For an FP8 checkpoint the stored element
+    count equals the dequantized BF16 element count, so multiplying by 2 bytes
+    downstream yields the true BF16 footprint (scale tensors are tiny and only
+    make the estimate marginally conservative).
+
+    Returns ``None`` — so the caller falls back to the coarse formula — when the
+    checkpoint is not already on disk (e.g. a not-yet-downloaded repo id), has no
+    safetensors files, or cannot be read.
+    """
+    if not pretrained_model_name_or_path:
+        return None
+    try:
+        model_dir = _resolve_model_dir(pretrained_model_name_or_path)
+    except Exception:
+        # Not cached locally (snapshot_download(local_files_only=True) raised) or
+        # otherwise unresolvable: defer to the formula.
+        return None
+    if not os.path.isdir(model_dir) or not _has_safetensors(model_dir):
+        return None
+
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+            shard_files = list(dict.fromkeys(index["weight_map"].values()))
+        except (OSError, ValueError, KeyError):
+            return None
+    else:
+        shard_files = ["model.safetensors"]
+
+    try:
+        from safetensors import safe_open
+
+        total = 0
+        for shard in shard_files:
+            with safe_open(os.path.join(model_dir, shard), framework="pt") as f:
+                for key in f.keys():
+                    n = 1
+                    for dim in f.get_slice(key).get_shape():
+                        n *= dim
+                    total += n
+    except Exception:
+        return None
+    return total or None
+
+
+def _get_hf_param_count_estimate(hf_config, pretrained_model_name_or_path=None) -> int | None:
+    """Best-effort parameter count, most accurate source first.
+
+    Order of preference:
+      1. Exact element count from an already-local safetensors checkpoint
+         (``_param_count_from_local_safetensors``) — dtype / GQA / MoE-agnostic.
+      2. An explicit ``hf_config.num_parameters`` override, if a caller set one.
+         (HF does not populate this on configs; it is only an escape hatch.)
+      3. A coarse transformer formula as a last resort, used when the checkpoint
+         is not yet on disk:
+         ``L * (attn + n_experts * 3*H*I) + V*H`` where the attention term is
+         ``2*H*(n_heads*head_dim) + 2*H*(n_kv*head_dim)`` so it tracks GQA and
+         collapses to ``4*H*H`` for multi-head attention. It assumes gated MLPs
+         and ignores biases / norms / routers, so it is approximate — a sanity
+         check, not a memory planner.
+
+    Sums over any text/vision/audio sub-configs for multimodal wrappers.
+    Returns ``None`` when no estimate can be formed.
+    """
+    exact = _param_count_from_local_safetensors(pretrained_model_name_or_path)
+    if exact:
+        return exact
+
+    if hf_config is None:
+        return None
+
+    explicit = getattr(hf_config, "num_parameters", None)
+    if isinstance(explicit, int) and explicit > 0:
+        return explicit
+
+    total = 0
+    seen: set[int] = set()
+
+    def _walk(cfg) -> None:
+        nonlocal total
+        if cfg is None or id(cfg) in seen:
+            return
+        seen.add(id(cfg))
+
+        # Multimodal wrappers (e.g. Gemma4, Mistral3-VLM) park real layer
+        # counts on text_config / vision_config / audio_config. Recurse into
+        # those and skip the wrapper itself so we don't double count.
+        sub_configs = [getattr(cfg, attr, None) for attr in ("text_config", "vision_config", "audio_config")]
+        sub_configs = [s for s in sub_configs if isinstance(s, PretrainedConfig)]
+        if sub_configs:
+            for sub in sub_configs:
+                _walk(sub)
+            return
+
+        layers = getattr(cfg, "num_hidden_layers", None) or getattr(cfg, "n_layer", None) or 0
+        hidden = getattr(cfg, "hidden_size", None) or getattr(cfg, "n_embd", None) or getattr(cfg, "d_model", None) or 0
+        vocab = getattr(cfg, "vocab_size", None) or 0
+        inter = getattr(cfg, "intermediate_size", None) or getattr(cfg, "ffn_hidden_size", None) or (4 * hidden)
+        n_experts = (
+            getattr(cfg, "num_local_experts", None)
+            or getattr(cfg, "num_experts", None)
+            or getattr(cfg, "n_routed_experts", None)
+            or 1
+        )
+
+        if not layers or not hidden:
+            return
+
+        # Attention: Q and O are H*(n_heads*head_dim); K and V are
+        # H*(n_kv*head_dim). For GQA n_kv < n_heads shrinks K/V; for plain
+        # multi-head attention (n_kv == n_heads, head_dim == H/n_heads) this
+        # collapses to the familiar 4*H*H.
+        n_heads = (
+            getattr(cfg, "num_attention_heads", None)
+            or getattr(cfg, "n_head", None)
+            or getattr(cfg, "num_heads", None)
+            or 0
+        )
+        n_kv = getattr(cfg, "num_key_value_heads", None) or getattr(cfg, "num_kv_heads", None) or n_heads
+        head_dim = getattr(cfg, "head_dim", None) or (hidden // n_heads if n_heads else 0)
+        if n_heads and head_dim:
+            attn = 2 * hidden * (n_heads * head_dim) + 2 * hidden * (n_kv * head_dim)
+        else:
+            attn = 4 * hidden * hidden  # head config unavailable: assume multi-head
+
+        per_layer = attn + n_experts * 3 * hidden * inter
+        total += layers * per_layer + vocab * hidden
+
+    _walk(hf_config)
+    return total if total > 0 else None
+
+
+def _has_streaming_fp8_checkpoint_load(hf_config) -> bool:
+    """Return whether the registered custom model owns this FP8 checkpoint load."""
+    model_cls = _resolve_custom_model_cls_for_config(hf_config)
+    if not getattr(model_cls, "_supports_streaming_fp8_checkpoint_load", False):
+        return False
+    native_quantization_config = getattr(hf_config, "quantization_config", None)
+    return (
+        _get_quant_attr(native_quantization_config, "quant_method") == "fp8"
+        and _get_quant_attr(native_quantization_config, "weight_block_size") is None
+    )
+
+
+def _check_fp8_dequantize_will_fit(
+    hf_config, quantization_config, pretrained_model_name_or_path, force_hf: bool = True
+) -> None:
+    """Refuse FP8-dequantize loads that won't fit in CUDA HBM.
+
+    The forced-HF and HF-fallback routes both materialize the entire model in
+    BF16 inside ``_from_pretrained_parent_class`` on every rank *before* any
+    Automodel sharding kicks in. For models > available HBM (Devstral 123B,
+    Mistral Medium 128B, ...) this OOMs deep inside the HF loader with no useful
+    log line. See https://github.com/NVIDIA-NeMo/Automodel/issues/2114.
+
+    This pre-flight estimates the BF16 footprint and compares it to a budget of
+    ``_FP8_PREFLIGHT_FOOTPRINT_THRESHOLD`` x TOTAL device memory. Budgeting
+    against total (not free) memory keeps the verdict deterministic across ranks
+    and immune to transient allocations from co-located processes; the reserved
+    remainder absorbs the CUDA context, NCCL buffers, loader scratch, and
+    load-time activations. The footprint prefers an exact count read from the
+    on-disk safetensors checkpoint, falling back to a coarse config formula, so
+    it neither systematically over- nor under-counts.
+
+    No-ops when CUDA isn't available, the config isn't an FP8 full-materialize
+    config, the param count can't be estimated, or
+    ``NEMO_AUTOMODEL_DISABLE_FP8_PREFLIGHT=1`` is set.
+
+    The guard runs from two load paths: the explicit ``force_hf=True`` branch
+    and the no-custom-class HF fallback. ``force_hf`` only picks the wording of
+    the diagnostic, since "drop force_hf" is not a useful suggestion on the
+    fallback path.
+
+    Raises:
+        RuntimeError: if the estimated BF16 footprint exceeds the safe budget.
+    """
+    if os.environ.get(_FP8_PREFLIGHT_DISABLE_ENV) == "1":
+        return None
+    if not _quant_config_is_fp8_full_materialize(quantization_config):
+        return None
+    if not torch.cuda.is_available():
+        return None
+
+    n_params = _get_hf_param_count_estimate(hf_config, pretrained_model_name_or_path)
+    if not n_params:
+        logger.warning(
+            "FP8 dequantize pre-flight: could not estimate parameter count for %s; skipping memory check.",
+            pretrained_model_name_or_path,
+        )
+        return None
+
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except (RuntimeError, AssertionError) as exc:
+        logger.warning(
+            "FP8 dequantize pre-flight: torch.cuda.mem_get_info() failed (%s); skipping memory check for %s.",
+            exc,
+            pretrained_model_name_or_path,
+        )
+        return None
+
+    bf16_bytes = n_params * 2
+    budget_bytes = int(total_bytes * _FP8_PREFLIGHT_FOOTPRINT_THRESHOLD)
+    if bf16_bytes <= budget_bytes:
+        return None
+
+    gib = 1024**3
+    route_explanation = (
+        "force_hf=True selects Transformers' full-materialize loader"
+        if force_hf
+        else "the custom-model route was unavailable, so Automodel fell back to Transformers' full-materialize loader"
+    )
+    if _has_streaming_fp8_checkpoint_load(hf_config):
+        force_hf_action = "Remove force_hf=True and " if force_hf else ""
+        recovery = (
+            "Automodel has a streaming FP8 checkpoint loader for this architecture. "
+            f"{force_hf_action}do not pass FineGrainedFP8Config(dequantize=True); leave the checkpoint's native "
+            "FP8 quantization_config unchanged so the custom path can dequantize each local shard."
+        )
+    else:
+        recovery = (
+            "Automodel has no streaming FP8 checkpoint loader registered for this architecture, so BF16 "
+            "dequantized loading is unsupported at this model size."
+        )
+    raise RuntimeError(
+        f"FP8 dequantize pre-flight failed for {pretrained_model_name_or_path!r}.\n"
+        f"  Estimated BF16 footprint: {bf16_bytes / gib:.1f} GiB "
+        f"(~{n_params / 1e9:.1f}B parameters x 2 bytes).\n"
+        f"  Total CUDA memory: {total_bytes / gib:.1f} GiB "
+        f"(safe budget at {int(_FP8_PREFLIGHT_FOOTPRINT_THRESHOLD * 100)}%: {budget_bytes / gib:.1f} GiB; "
+        f"free right now: {free_bytes / gib:.1f} GiB).\n"
+        f"  With quant_method='fp8' + dequantize=True, {route_explanation}. Transformers materializes the full "
+        f"BF16 model on every rank inside _from_pretrained_parent_class BEFORE Automodel sharding runs, so "
+        f"tensor parallelism cannot prevent the OOM for any "
+        f"model larger than one device's HBM.\n"
+        f"  Next step: {recovery}\n"
+        f"  Tracking issue: https://github.com/NVIDIA-NeMo/Automodel/issues/2114\n"
+        f"  Bypass (use only if you're sure the estimate is wrong): "
+        f"export {_FP8_PREFLIGHT_DISABLE_ENV}=1."
+    )
+
+
 def _resolve_model_dir(pretrained_model_name_or_path: str) -> str:
     """Resolve a HF repo id or local path to a local directory with model files."""
     if os.path.isdir(pretrained_model_name_or_path):
@@ -480,14 +768,15 @@ def _has_safetensors(model_dir: str) -> bool:
     return False
 
 
-def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
+def _stream_load_bnb_weights(model, model_dir, device, torch_dtype, *, disable_mmap: bool = False):
     """Load safetensor shards one-at-a-time, quantizing BnB Params4bit on the fly.
 
     Peak memory ≈ (accumulated quantized weights) + (one bf16 weight tensor)
     instead of (full bf16 model) with standard HF loading.
+    When disable_mmap=True, one tensor at a time is cloned to anonymous CPU
+    memory before CUDA transfer to avoid UMA page-migration stalls.
     """
     import bitsandbytes as bnb
-    from safetensors import safe_open
 
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
     if os.path.exists(index_path):
@@ -512,6 +801,50 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
     loaded_keys: set[str] = set()
     device = torch.device(device) if not isinstance(device, torch.device) else device
 
+    def consume_tensor(key: str, tensor: torch.Tensor) -> None:
+        """Install one checkpoint tensor into the target model.
+
+        Args:
+            key: Fully-qualified state-dict key. The key determines the tensor's rank and axis semantics.
+            tensor: Tensor from the active safetensors shard. This function takes ownership and may cast,
+                quantize, move, or install it as a parameter/buffer.
+
+        Returns:
+            None.
+        """
+        if key not in param_map:
+            logger.debug("Skipping key not in model: %s", key)
+            del tensor
+            return
+
+        mod, attr, old_param = param_map[key]
+
+        if isinstance(old_param, bnb.nn.Params4bit):
+            if torch_dtype is not None:
+                tensor = tensor.to(dtype=torch_dtype)
+            new_param = bnb.nn.Params4bit(
+                data=tensor,
+                requires_grad=False,
+                compress_statistics=old_param.compress_statistics,
+                quant_type=old_param.quant_type,
+                quant_storage=old_param.quant_storage,
+                module=mod if isinstance(mod, bnb.nn.Linear4bit) else None,
+                bnb_quantized=False,
+            )
+            del tensor
+            new_param._quantize(device)
+            mod._parameters[attr] = new_param
+        else:
+            target_dtype = torch_dtype if torch_dtype is not None else tensor.dtype
+            materialized = tensor.to(device=device, dtype=target_dtype)
+            del tensor
+            if isinstance(old_param, torch.nn.Parameter):
+                mod._parameters[attr] = torch.nn.Parameter(materialized, requires_grad=old_param.requires_grad)
+            else:
+                mod._buffers[attr] = materialized
+
+        loaded_keys.add(key)
+
     for shard_idx, shard_file in enumerate(shard_files):
         shard_path = os.path.join(model_dir, shard_file)
         logger.info(
@@ -521,42 +854,19 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
             shard_file,
         )
 
+        from safetensors import safe_open
+
         with safe_open(shard_path, framework="pt") as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
-
-                if key not in param_map:
-                    logger.debug("Skipping key not in model: %s", key)
+                if disable_mmap and key in param_map:
+                    # Avoid full-shard materialization while detaching the next
+                    # CUDA/quantization copy from mmap-backed checkpoint pages.
+                    tensor = tensor.clone()
+                try:
+                    consume_tensor(key, tensor)
+                finally:
                     del tensor
-                    continue
-
-                mod, attr, old_param = param_map[key]
-
-                if isinstance(old_param, bnb.nn.Params4bit):
-                    if torch_dtype is not None:
-                        tensor = tensor.to(dtype=torch_dtype)
-                    new_param = bnb.nn.Params4bit(
-                        data=tensor,
-                        requires_grad=False,
-                        compress_statistics=old_param.compress_statistics,
-                        quant_type=old_param.quant_type,
-                        quant_storage=old_param.quant_storage,
-                        module=mod if isinstance(mod, bnb.nn.Linear4bit) else None,
-                        bnb_quantized=False,
-                    )
-                    del tensor
-                    new_param._quantize(device)
-                    mod._parameters[attr] = new_param
-                else:
-                    target_dtype = torch_dtype if torch_dtype is not None else tensor.dtype
-                    materialized = tensor.to(device=device, dtype=target_dtype)
-                    del tensor
-                    if isinstance(old_param, torch.nn.Parameter):
-                        mod._parameters[attr] = torch.nn.Parameter(materialized, requires_grad=old_param.requires_grad)
-                    else:
-                        mod._buffers[attr] = materialized
-
-                loaded_keys.add(key)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -591,6 +901,22 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
         len(loaded_keys),
         len(param_map) - len(loaded_keys),
     )
+
+
+def _get_bnb_modules_to_not_convert(model, quantization_config):
+    """Mirror HF BnB's default skip-list semantics before streaming replacement."""
+    from transformers.quantizers.base import get_keys_to_not_convert
+
+    skip_modules = getattr(quantization_config, "llm_int8_skip_modules", None)
+    keep_in_fp32_modules = getattr(model, "_keep_in_fp32_modules", None)
+
+    modules_to_not_convert = get_keys_to_not_convert(model) if skip_modules is None else []
+    if skip_modules is not None:
+        modules_to_not_convert.extend(skip_modules)
+    if keep_in_fp32_modules is not None:
+        modules_to_not_convert.extend(keep_in_fp32_modules)
+
+    return list(set(modules_to_not_convert))
 
 
 def _streaming_bnb_supported(cls, hf_config) -> bool:
@@ -656,6 +982,7 @@ def _init_model_bnb_streaming(
     device = torch.cuda.current_device()
 
     # 1. Download weights if needed
+    disable_mmap = bool(kwargs.pop("disable_mmap", False))
     _download_model_weights(hf_config, pretrained_model_name_or_path)
 
     # 2. Resolve to local directory & verify safetensors
@@ -673,9 +1000,7 @@ def _init_model_bnb_streaming(
         )
 
     # 4. Replace nn.Linear → bnb.nn.Linear4bit (still on meta, no memory)
-    modules_to_not_convert = getattr(quantization_config, "llm_int8_skip_modules", None)
-    if modules_to_not_convert is None:
-        modules_to_not_convert = getattr(model, "_keep_in_fp32_modules", None)
+    modules_to_not_convert = _get_bnb_modules_to_not_convert(model, quantization_config)
     model = replace_with_bnb_linear(
         model,
         modules_to_not_convert=modules_to_not_convert,
@@ -683,7 +1008,7 @@ def _init_model_bnb_streaming(
     )
 
     # 5. Stream-load weights, quantizing each tensor on the fly
-    _stream_load_bnb_weights(model, model_dir, device, torch_dtype)
+    _stream_load_bnb_weights(model, model_dir, device, torch_dtype, disable_mmap=disable_mmap)
 
     # 6. Store quantization_config on the model (HF convention)
     model.config.quantization_config = quantization_config
@@ -892,6 +1217,20 @@ def __init_model(
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
+        # Refuse early if HF's loader would dequantize an FP8 checkpoint to a
+        # full BF16 model that won't fit in HBM (issue #2114). Both the
+        # user-supplied quant config and the one baked into the HF config
+        # (e.g. set by _maybe_dequantize_fp8_for_peft) can trigger this path.
+        # Only checked for from_pretrained: a from_config build never touches
+        # the checkpoint, so there's nothing to dequantize.
+        if is_pretrained_init:
+            _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_model_name_or_path, force_hf=True)
+            _check_fp8_dequantize_will_fit(
+                hf_config,
+                getattr(hf_config, "quantization_config", None),
+                pretrained_model_name_or_path,
+                force_hf=True,
+            )
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
             _setup_bnb_loading_kwargs(kwargs)
@@ -969,6 +1308,19 @@ def __init_model(
 
     # 3. fallback to HF model class wrapped with mixin
     model = None
+    # Same FP8-dequantize OOM guard as the force_hf branch (issue #2114): an
+    # fp8 checkpoint with dequantize=True but no custom streaming model class
+    # also reaches HF's full-materialize loader below (e.g. when PEFT set
+    # dequantize=True on the native config). Tensor parallelism can't save it.
+    # Skipped for from_config builds, which never materialize a checkpoint.
+    if is_pretrained_init:
+        _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_model_name_or_path, force_hf=False)
+        _check_fp8_dequantize_will_fit(
+            hf_config,
+            getattr(hf_config, "quantization_config", None),
+            pretrained_model_name_or_path,
+            force_hf=False,
+        )
     # Serialize HF custom-code cache population across ranks to avoid a partial-copy race.
     _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=process_group)
     if quantization_config is not None:

@@ -24,6 +24,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 
 try:
@@ -38,6 +39,74 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAVE_TRITON, triton = safe_import("triton")
+_HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
+_BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr(tl, "make_tensor_descriptor")
+
+
+def _allocate_triton_workspace(size: int, alignment: int, stream: int | None) -> torch.Tensor:
+    """Allocate device workspace required by Triton tensor descriptors.
+
+    Args:
+        size: Workspace size in bytes.
+        alignment: Required byte alignment. CUDA allocations already provide at least 256-byte alignment.
+        stream: CUDA stream pointer requesting the allocation, or ``None`` outside a stream.
+
+    Returns:
+        One-dimensional CUDA byte tensor with ``size`` elements.
+    """
+    del alignment, stream
+    return torch.empty(size, dtype=torch.int8, device=torch.device("cuda", torch.cuda.current_device()))
+
+
+if _BIAS_GRAD_TRITON_AVAILABLE:
+
+    @triton.jit
+    def _deterministic_bias_grad_kernel(
+        grad_output_ptr,
+        token_offsets_ptr,
+        grad_bias_ptr,
+        n_tokens,
+        hidden: tl.constexpr,
+        BLOCK_TOKENS: tl.constexpr,
+        BLOCK_HIDDEN: tl.constexpr,
+    ):
+        """Reduce one expert's contiguous token gradients without atomic writes.
+
+        ``grad_output_ptr`` is a contiguous row-major ``[tokens, hidden]`` allocation. The caller ensures its row
+        stride is descriptor-aligned and its token offsets fit in int32. Each program exclusively owns one
+        ``[expert, hidden block]`` output tile, so the reduction order is deterministic.
+        """
+        expert_idx = tl.program_id(0)
+        hidden_block_start = tl.program_id(1) * BLOCK_HIDDEN
+        hidden_offsets = hidden_block_start + tl.arange(0, BLOCK_HIDDEN)
+        token_start = tl.load(token_offsets_ptr + expert_idx).to(tl.int32)
+        token_end = tl.load(token_offsets_ptr + expert_idx + 1).to(tl.int32)
+        grad_output = tl.make_tensor_descriptor(
+            grad_output_ptr,
+            shape=[n_tokens, hidden],
+            strides=[hidden, 1],
+            block_shape=[BLOCK_TOKENS, BLOCK_HIDDEN],
+        )
+
+        total = tl.zeros((BLOCK_HIDDEN,), dtype=tl.float32)
+        compensation = tl.zeros((BLOCK_HIDDEN,), dtype=tl.float32)
+        for token_block_start in range(token_start, token_end, BLOCK_TOKENS):
+            token_offsets = token_block_start + tl.arange(0, BLOCK_TOKENS)
+            values = grad_output.load([token_block_start, hidden_block_start]).to(tl.float32)
+            values = tl.where(token_offsets[:, None] < token_end, values, 0.0)
+            block_sum = tl.sum(values, axis=0)
+
+            # Kahan compensation protects the serial accumulation of the balanced
+            # per-block reductions when positive and negative gradients cancel.
+            corrected = block_sum - compensation
+            updated = total + corrected
+            compensation = (updated - total) - corrected
+            total = updated
+
+        tl.store(grad_bias_ptr + expert_idx * hidden + hidden_offsets, total, mask=hidden_offsets < hidden)
 
 # ── EP variable-length collective helpers ──
 
@@ -97,6 +166,34 @@ def is_gated_activation(activation: str) -> bool:
     return activation in ("swiglu", "swigluoai", "quick_geglu", "geglu")
 
 
+def _resolve_m_splits(
+    tokens_per_expert: torch.Tensor | list | tuple,
+    static_routing: bool,
+    cached_m_splits: list | None,
+) -> list:
+    """Resolve the per-expert split sizes for TE's grouped GEMM.
+
+    Args:
+        tokens_per_expert: Per-local-expert token counts of shape [num_local_experts]
+            (CUDA tensor from the flex dispatcher, or an already-materialized sequence).
+        static_routing: Benchmark-only static-routing mode (see
+            ``BackendConfig.benchmark_static_routing``) under which the counts are
+            constant for every microbatch.
+        cached_m_splits: The first microbatch's split list, or None before it is known.
+
+    Returns:
+        The split sizes as a Python list. Under static routing with a warm cache the
+        cached list is returned as-is — skipping the per-call device-to-host
+        ``.tolist()`` sync (and its repeat under activation-checkpoint recompute);
+        otherwise the counts are materialized from ``tokens_per_expert``.
+    """
+    if static_routing and cached_m_splits is not None:
+        return cached_m_splits
+    if isinstance(tokens_per_expert, torch.Tensor):
+        return tokens_per_expert.tolist()
+    return list(tokens_per_expert)
+
+
 def _permute_tokens_for_grouped_mm(
     indices: torch.Tensor,
     weights: torch.Tensor,
@@ -152,6 +249,114 @@ def _permute_tokens_for_grouped_mm(
     return sorted_token_ids, sorted_weights, tokens_per_expert, offs
 
 
+def _reduce_bias_grad_fallback(grad_output: torch.Tensor, token_counts: torch.Tensor) -> torch.Tensor:
+    """Reduce grouped token gradients without requiring Triton.
+
+    Args:
+        grad_output: Tensor of shape [tokens, hidden], grouped contiguously by expert.
+        token_counts: Tensor of shape [experts] containing each contiguous segment length.
+
+    Returns:
+        Tensor of shape [experts, hidden] with one gradient sum per expert.
+    """
+    accumulation_dtype = (
+        torch.float64 if not grad_output.is_cuda and grad_output.dtype != torch.float64 else torch.float32
+    )
+    if grad_output.dtype == torch.float64:
+        accumulation_dtype = torch.float64
+    accumulation_input = grad_output.to(accumulation_dtype)
+    hidden = accumulation_input.shape[1]
+    flattened_by_hidden = accumulation_input.transpose(0, 1).contiguous().view(-1)
+    repeated_counts = token_counts.repeat(hidden)
+    grad_bias = torch.segment_reduce(
+        flattened_by_hidden,
+        "sum",
+        lengths=repeated_counts,
+        axis=0,
+        unsafe=True,
+    )
+    return grad_bias.view(hidden, token_counts.numel()).transpose(0, 1).contiguous().to(grad_output.dtype)
+
+
+def _reduce_bias_grad_triton(grad_output: torch.Tensor, token_counts: torch.Tensor) -> torch.Tensor:
+    """Reduce grouped CUDA token gradients with deterministic compensated FP32 sums.
+
+    Args:
+        grad_output: Contiguous CUDA tensor of shape [tokens, hidden], grouped by expert. Supported dtypes are
+            FP16, BF16, and FP32.
+        token_counts: Contiguous CUDA tensor of shape [experts] containing each segment length.
+
+    Returns:
+        CUDA tensor of shape [experts, hidden] and the same dtype as ``grad_output``.
+    """
+    grad_output = grad_output.contiguous()
+    hidden = grad_output.shape[1]
+    token_offsets = torch.cat((token_counts.new_zeros(1), token_counts.cumsum(dim=0)))
+    grad_bias = torch.empty((token_counts.numel(), hidden), dtype=torch.float32, device=grad_output.device)
+    block_hidden = 16
+    grid = (token_counts.numel(), triton.cdiv(hidden, block_hidden))
+    if not torch.compiler.is_compiling():
+        triton.set_allocator(_allocate_triton_workspace)
+    _deterministic_bias_grad_kernel[grid](
+        grad_output,
+        token_offsets,
+        grad_bias,
+        grad_output.shape[0],
+        hidden,
+        BLOCK_TOKENS=128,
+        BLOCK_HIDDEN=block_hidden,
+        num_warps=4,
+    )
+    return grad_bias.to(grad_output.dtype)
+
+
+class _DeterministicBiasRepeatInterleave(Function):
+    """Expand expert biases while reducing their gradients deterministically."""
+
+    @staticmethod
+    def forward(ctx, bias, token_counts, output_size):
+        """Expand each expert bias over its contiguous token group.
+
+        Args:
+            ctx: Autograd context used to retain the token counts for backward.
+            bias: Tensor of shape [experts, hidden].
+            token_counts: Tensor of shape [experts] containing nonnegative token counts.
+            output_size: Total number of grouped tokens.
+
+        Returns:
+            Tensor of shape [tokens, hidden], with each expert row repeated for its tokens.
+        """
+        ctx.save_for_backward(token_counts)
+        return torch.repeat_interleave(bias, token_counts, dim=0, output_size=output_size)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Reduce expanded bias gradients with one deterministic segmented reduction.
+
+        Args:
+            ctx: Autograd context containing the forward token counts.
+            grad_output: Tensor of shape [tokens, hidden].
+
+        Returns:
+            Tuple containing the bias gradient of shape [experts, hidden] and no gradients for token counts or size.
+        """
+        (token_counts,) = ctx.saved_tensors
+        use_triton = (
+            _BIAS_GRAD_TRITON_AVAILABLE
+            and grad_output.is_cuda
+            and grad_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and grad_output.shape[0] < 2**31
+            and grad_output.shape[1] * grad_output.element_size() % 16 == 0
+            and not torch.is_grad_enabled()
+        )
+        grad_bias = (
+            _reduce_bias_grad_triton(grad_output, token_counts)
+            if use_triton
+            else _reduce_bias_grad_fallback(grad_output, token_counts)
+        )
+        return grad_bias, None, None
+
+
 def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     """Apply per-expert bias to grouped GEMM output.
 
@@ -163,47 +368,32 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     Args:
         value: Output from grouped GEMM, shape [total_tokens, features].
         bias: Per-expert bias, shape [num_experts, features].
-        tokens_per_expert: Token counts per expert.
-        permuted_probs: If provided, bias is weighted by routing probs (for down projection).
+        tokens_per_expert: Token counts, shape [num_experts].
+        permuted_probs: Optional routing probabilities broadcastable to
+            [total_tokens, features], typically [total_tokens, 1].
+
+    Returns:
+        Grouped GEMM output with per-expert bias applied, shape
+        [total_tokens, features]. The inputs are not mutated.
     """
     if bias is None:
         return value
+    if not isinstance(bias, torch.Tensor):
+        bias = torch.stack(tuple(bias))
+
     shape = value.shape
-    if permuted_probs is not None:
-        output = (
-            torch.cat(
-                [
-                    t + b * p
-                    for t, b, p in zip(
-                        torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
-                        bias,
-                        torch.split(permuted_probs, tokens_per_expert.tolist()),
-                    )
-                ]
-            )
-            .view(shape)
-            .to(value.dtype)
-        )
+    flat_value = value.reshape(-1, shape[-1])
+    token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
+    if torch.is_grad_enabled() and bias.requires_grad:
+        bias_to_expand = bias
+        if permuted_probs is not None:
+            bias_to_expand = bias.to(torch.promote_types(bias.dtype, permuted_probs.dtype))
+        expanded_bias = _DeterministicBiasRepeatInterleave.apply(bias_to_expand, token_counts, flat_value.shape[0])
     else:
-        output = (
-            torch.cat(
-                [
-                    t + b
-                    for t, b in zip(
-                        torch.split(
-                            value.view(-1, shape[-1]),
-                            tokens_per_expert.tolist()
-                            if isinstance(tokens_per_expert, torch.Tensor)
-                            else tokens_per_expert,
-                        ),
-                        bias,
-                    )
-                ]
-            )
-            .view(shape)
-            .to(value.dtype)
-        )
-    return output
+        expanded_bias = torch.repeat_interleave(bias, token_counts, dim=0, output_size=flat_value.shape[0])
+    if permuted_probs is not None:
+        expanded_bias = expanded_bias * permuted_probs
+    return (flat_value + expanded_bias).view(shape).to(value.dtype)
 
 
 class GroupedExperts(nn.Module):
@@ -526,7 +716,7 @@ class GroupedExperts(nn.Module):
         )
         y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
-        if tokens_per_expert.sum() > 0:
+        if sorted_token_ids.numel() > 0:
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
             activation_probs = (
@@ -566,7 +756,9 @@ class GroupedExperts(nn.Module):
                 )
 
             if self.config.apply_router_weight_after_down:
-                output2 = output2.float() * permuted_probs.float()
+                # Chunked custom-autograd multiply (saves the raw inputs only);
+                # the fp32 output feeds the fp32 scatter_add unchanged.
+                output2 = _apply_router_weight_fp32(output2, permuted_probs, torch.float32)
                 scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
                 y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2.float())
             else:
@@ -696,6 +888,22 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
 
+def _stabilize_empty_routing_probs_dtype(permuted_probs: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
+    """Keep empty expert probabilities stable across checkpoint recomputation.
+
+    DeepEP may return an empty probability tensor in either the router dtype or
+    the activation dtype. With non-reentrant activation checkpointing, a later
+    recomputation can choose the other representation, and PyTorch checkpointing rejects
+    the resulting saved-tensor metadata change even though both tensors contain
+    zero elements. Empty probabilities have no numerical contribution, so
+    canonicalize only that case to the dispatched activation dtype. Non-empty
+    probabilities retain their original (normally FP32) router precision.
+    """
+    if permuted_probs.numel() == 0 and permuted_probs.dtype != compute_dtype:
+        return permuted_probs.to(compute_dtype)
+    return permuted_probs
+
+
 class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
@@ -732,7 +940,7 @@ class GroupedExpertsDeepEP(nn.Module):
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
-            dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
+            dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should run asynchronously.
         """
         super().__init__()
 
@@ -741,6 +949,10 @@ class GroupedExpertsDeepEP(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
+        # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): routing
+        # metadata is identical per microbatch, so host copies of it can be cached.
+        self.static_routing = backend is not None and backend.benchmark_static_routing
+        self._static_tokens_per_expert_cpu: torch.Tensor | None = None
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
@@ -780,6 +992,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_benchmark_static_routing=self.static_routing,
         )
 
         self.n_routed_experts = self.config.n_routed_experts
@@ -841,6 +1054,7 @@ class GroupedExpertsDeepEP(nn.Module):
             token_probs=weights,
             token_indices=indices,
         )
+        permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, self.config.dtype)
         permuted_probs = permuted_probs.unsqueeze(-1)
         activation_probs = (
             torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
@@ -855,7 +1069,10 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
-        if torch.count_nonzero(tokens_per_expert) > 0:
+        # With static routing (forced balance, no noise) every expert receives tokens by
+        # construction, so the count_nonzero device-to-host read (one per microbatch, and
+        # again per activation-checkpoint recompute) can be skipped.
+        if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
                 tokens_per_expert_gpu = tokens_per_expert.to(
                     device=permuted_local_hidden_states.device, non_blocking=True
@@ -896,7 +1113,15 @@ class GroupedExpertsDeepEP(nn.Module):
                         use_mxfp8=self.use_mxfp8,
                     )
             else:
-                tokens_per_expert = tokens_per_expert.to("cpu")
+                # ops.gmm sizes its launches from a CPU copy of tokens_per_expert; under
+                # static routing the first microbatch's copy is reused to avoid the
+                # per-microbatch device-to-host transfer.
+                if self.static_routing and self._static_tokens_per_expert_cpu is not None:
+                    tokens_per_expert = self._static_tokens_per_expert_cpu
+                else:
+                    tokens_per_expert = tokens_per_expert.to("cpu")
+                    if self.static_routing:
+                        self._static_tokens_per_expert_cpu = tokens_per_expert
                 output1 = ops.gmm(
                     permuted_local_hidden_states,
                     gate_and_up_projs,
@@ -927,7 +1152,9 @@ class GroupedExpertsDeepEP(nn.Module):
         if self.config.apply_router_weight_after_down:
             # HybridEP/DeepEP combine expects the expert activation dtype. Keep
             # the multiply in fp32, then cast each routed expert output back.
-            output2 = (output2.float() * permuted_probs.float()).to(compute_dtype)
+            # Chunked custom-autograd path: saves the raw inputs only, instead
+            # of the full-size fp32 intermediates autograd would keep alive.
+            output2 = _apply_router_weight_fp32(output2, permuted_probs, compute_dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -987,12 +1214,23 @@ class GroupedExpertsTE(nn.Module):
 
         Args:
             config: MoE configuration containing expert parameters.
-            backend: Backend configuration (reserved for future use).
+            backend: Backend configuration; reads ``benchmark_static_routing``
+                (cache the per-microbatch split list under forced-balanced routing).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
+        if config.apply_router_weight_after_down:
+            # GroupedExperts and GroupedExpertsDeepEP fold the router weight in after the
+            # down projection; this backend applies it inside the activation instead, which
+            # silently changes the numerics the flag exists to preserve. Fail loudly rather
+            # than train a model on the wrong reduction order.
+            raise ValueError(
+                "apply_router_weight_after_down is not supported by GroupedExpertsTE. "
+                "Use BackendConfig(experts='torch_mm') or the DeepEP expert backend."
+            )
+
         from transformer_engine.pytorch import GroupedLinear
 
         from nemo_automodel.components.models.common.utils import _patch_te_modules
@@ -1007,6 +1245,11 @@ class GroupedExpertsTE(nn.Module):
         self.dim = config.dim
         self.moe_inter_dim = config.moe_inter_dim
         self.is_gated = is_gated_activation(config.expert_activation)
+        # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): the
+        # per-microbatch tokens_per_expert.tolist() host sync is replaced by a cached
+        # first-microbatch copy, since forced-balanced routing makes it constant.
+        self.static_routing = backend is not None and backend.benchmark_static_routing
+        self._static_m_splits: list | None = None
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1061,7 +1304,7 @@ class GroupedExpertsTE(nn.Module):
             stacked = stacked.transpose(-1, -2)  # [num_experts, in, out]
         return stacked
 
-    def _get_stacked_bias(self, linear: "GroupedLinear") -> Optional[torch.Tensor]:
+    def _get_stacked_bias(self, linear: "GroupedLinear") -> torch.Tensor | None:
         if not linear.use_bias:
             return None
         biases = []
@@ -1095,7 +1338,7 @@ class GroupedExpertsTE(nn.Module):
         dtensor = create_dtensor_from_local(tensor, device_mesh, self.ep_rank if device_mesh is not None else None)
         return dtensor
 
-    def _normalize_moe_mesh(self, moe_mesh: Optional[DeviceMesh]) -> Optional[DeviceMesh]:
+    def _normalize_moe_mesh(self, moe_mesh: DeviceMesh | None) -> DeviceMesh | None:
         if moe_mesh is None:
             return None
         allowed_dims = ("ep", "ep_shard", "ep_replicate")
@@ -1106,7 +1349,7 @@ class GroupedExpertsTE(nn.Module):
             return moe_mesh
         return moe_mesh[dims]
 
-    def set_moe_mesh(self, moe_mesh: Optional[DeviceMesh]) -> None:
+    def set_moe_mesh(self, moe_mesh: DeviceMesh | None) -> None:
         self.moe_mesh = self._normalize_moe_mesh(moe_mesh)
 
     @property
@@ -1115,7 +1358,7 @@ class GroupedExpertsTE(nn.Module):
         return tensor
 
     @gate_and_up_projs.setter
-    def gate_and_up_projs(self, value: Optional[torch.Tensor]) -> None:
+    def gate_and_up_projs(self, value: torch.Tensor | None) -> None:
         if value is None:
             return
         if isinstance(value, DTensor):
@@ -1128,7 +1371,7 @@ class GroupedExpertsTE(nn.Module):
         return self._to_ep_dtensor(self._get_stacked_weight(self.down_linear, transpose=True))
 
     @down_projs.setter
-    def down_projs(self, value: Optional[torch.Tensor]) -> None:
+    def down_projs(self, value: torch.Tensor | None) -> None:
         if value is None:
             return
         if isinstance(value, DTensor):
@@ -1137,7 +1380,7 @@ class GroupedExpertsTE(nn.Module):
         self._weights_loaded_from_checkpoint = True
 
     @property
-    def gate_up_proj_bias(self) -> Optional[torch.Tensor]:
+    def gate_up_proj_bias(self) -> torch.Tensor | None:
         if not self.expert_bias:
             return None
         bias = self._get_stacked_bias(self.gate_up_linear)
@@ -1146,7 +1389,7 @@ class GroupedExpertsTE(nn.Module):
         return self._to_ep_dtensor(bias)
 
     @gate_up_proj_bias.setter
-    def gate_up_proj_bias(self, value: Optional[torch.Tensor]) -> None:
+    def gate_up_proj_bias(self, value: torch.Tensor | None) -> None:
         if not self.expert_bias or value is None:
             return
         if isinstance(value, DTensor):
@@ -1154,7 +1397,7 @@ class GroupedExpertsTE(nn.Module):
         self._set_stacked_bias(self.gate_up_linear, value)
 
     @property
-    def down_proj_bias(self) -> Optional[torch.Tensor]:
+    def down_proj_bias(self) -> torch.Tensor | None:
         if not self.expert_bias:
             return None
         bias = self._get_stacked_bias(self.down_linear)
@@ -1163,7 +1406,7 @@ class GroupedExpertsTE(nn.Module):
         return self._to_ep_dtensor(bias)
 
     @down_proj_bias.setter
-    def down_proj_bias(self, value: Optional[torch.Tensor]) -> None:
+    def down_proj_bias(self, value: torch.Tensor | None) -> None:
         if not self.expert_bias or value is None:
             return
         if isinstance(value, DTensor):
@@ -1265,7 +1508,7 @@ class GroupedExpertsTE(nn.Module):
             else:
                 missing_keys.append(down_bias_key)
 
-    def init_token_dispatcher(self, ep_mesh: DeviceMesh, moe_mesh: Optional[DeviceMesh] = None):
+    def init_token_dispatcher(self, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):
         """
         Initialize the token dispatcher for expert parallelism.
 
@@ -1321,6 +1564,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_benchmark_static_routing=self.static_routing,
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts
@@ -1373,10 +1617,9 @@ class GroupedExpertsTE(nn.Module):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        if isinstance(tokens_per_expert, torch.Tensor):
-            m_splits = tokens_per_expert.tolist()
-        else:
-            m_splits = list(tokens_per_expert)
+        m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
+        if self.static_routing and self._static_m_splits is None:
+            self._static_m_splits = m_splits
 
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 

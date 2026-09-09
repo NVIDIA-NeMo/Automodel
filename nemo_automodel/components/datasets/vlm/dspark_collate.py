@@ -37,7 +37,6 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     HAVE_QWEN_VL_UTILS,
-    MISSING_QWEN_VL_UTILS_MSG,
     _ensure_rgb,
     build_labels_from_template,
 )
@@ -46,6 +45,7 @@ from nemo_automodel.components.datasets.vlm.fake_image import (
     inject_fake_image_into_conversation,
     mask_fake_vision_tokens_batch,
 )
+from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
 
 
 def dspark_vlm_collate_fn(

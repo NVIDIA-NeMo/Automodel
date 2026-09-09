@@ -80,8 +80,8 @@ def _create_dtensor_from_local_or_reference(
     local_tensor: torch.Tensor,
     reference_dtensor: Optional["torch.Tensor"],
     device_mesh: Optional["DeviceMesh"] = None,
-    rank: Optional[int] = None,
-    placements_override: Optional[tuple] = None,
+    rank: int | None = None,
+    placements_override: tuple | None = None,
 ) -> torch.Tensor:
     """Create a DTensor from a local tensor.
 
@@ -148,7 +148,7 @@ class Step3p5StateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:

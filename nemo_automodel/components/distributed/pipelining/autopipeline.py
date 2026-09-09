@@ -14,7 +14,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal
 
 import torch
 import torch.nn as nn
@@ -42,11 +42,11 @@ class PipelineInfo:
     """Runtime state produced by pipeline-parallel setup."""
 
     enabled: bool
-    schedule: Optional[_PipelineSchedule]
+    schedule: _PipelineSchedule | None
     has_first_stage: bool
     has_last_stage: bool
-    model_parts: Optional[list[nn.Module]]
-    stages: Optional[list[PipelineStage]]
+    model_parts: list[nn.Module] | None
+    stages: list[PipelineStage] | None
 
 
 class AutoPipeline:
@@ -55,33 +55,36 @@ class AutoPipeline:
     def __init__(
         self,
         # Device Mesh
-        world_mesh: Optional[DeviceMesh] = None,
-        moe_mesh: Optional[DeviceMesh] = None,
+        world_mesh: DeviceMesh | None = None,
+        moe_mesh: DeviceMesh | None = None,
         pp_axis_name: str = "pp",
         dp_axis_names: tuple[str, ...] = ("dp",),
-        cp_axis_name: Optional[str] = None,
-        tp_axis_name: Optional[str] = None,
-        ep_axis_name: Optional[str] = None,
-        ep_shard_axis_names: Optional[tuple[str, ...]] = None,
+        cp_axis_name: str | None = None,
+        tp_axis_name: str | None = None,
+        ep_axis_name: str | None = None,
+        ep_shard_axis_names: tuple[str, ...] | None = None,
         # Pipeline Parallel
-        pp_schedule: Optional[str] = "1f1b",
-        pp_schedule_csv: Optional[str] = None,
+        pp_schedule: str | None = "1f1b",
+        pp_schedule_csv: str | None = None,
         pp_microbatch_size: int = 1,
         pp_batch_size: int = 1,
-        layers_per_stage: Optional[int] = None,
-        round_virtual_stages_to_pp_multiple: Optional[Literal["up", "down"]] = None,
-        module_fqns_per_model_part: Optional[list[list[str]]] = None,
+        layers_per_stage: int | None = None,
+        round_virtual_stages_to_pp_multiple: Literal["up", "down"] | None = None,
+        module_fqns_per_model_part: list[list[str]] | None = None,
         # Patching
         patch_inner_model: bool = True,
         patch_causal_lm_model: bool = True,
         patch_stage_backward_maybe_with_nosync: bool = False,
         defer_fsdp_grad_sync: bool = True,
         # Runtime
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
         scale_grads_in_schedule: bool = False,
         # Shape inference optimization
-        pp_seq_len: Optional[int] = None,
+        pp_seq_len: int | None = None,
+        # P2P recv-buffer pooling (see components.distributed.pipelining.recv_buffer_pool)
+        pp_recv_buffer_pool: bool = False,
+        pp_recv_buffer_pool_slack: int = 2,
     ):
         # Validation
         if pp_schedule_csv is None and pp_schedule is None:
@@ -115,6 +118,8 @@ class AutoPipeline:
         self.dtype = dtype
         self.scale_grads_in_schedule = scale_grads_in_schedule
         self.pp_seq_len = pp_seq_len
+        self.pp_recv_buffer_pool = pp_recv_buffer_pool
+        self.pp_recv_buffer_pool_slack = pp_recv_buffer_pool_slack
 
         self.pp_mesh: DeviceMesh = self.world_mesh[pp_axis_name]
 
@@ -127,14 +132,14 @@ class AutoPipeline:
             stages=None,
         )
         self._model_config = None
-        self._pp_current_seq_len: Optional[int] = None
+        self._pp_current_seq_len: int | None = None
 
     def build(
         self,
         model: nn.Module,
         *,
-        loss_fn: Optional[Callable] = None,
-        parallelize_fn: Optional[ParallelizeFnProtocol] = None,
+        loss_fn: Callable | None = None,
+        parallelize_fn: ParallelizeFnProtocol | None = None,
     ):
         """Build the pipeline: validate -> init meta -> split -> schedule."""
         # 0. Validation
@@ -142,6 +147,23 @@ class AutoPipeline:
         assert isinstance(model, nn.Module), "model must be a PyTorch module"
 
         validate_hf_model_for_pipeline_support(model)
+
+        if self.pp_recv_buffer_pool:
+            from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
+                install_recv_buffer_pool,
+                schedule_supports_recv_pool,
+            )
+
+            # Only 1F1B's bounded in-flight depth makes the ring size proof valid;
+            # schedules with unbounded in-flight microbatches would silently
+            # corrupt gradients through reused recv buffers.
+            if self.pp_schedule_csv is None and schedule_supports_recv_pool(self.pp_schedule):
+                install_recv_buffer_pool(slack=self.pp_recv_buffer_pool_slack)
+            else:
+                logger.warning(
+                    "pp_recv_buffer_pool ignored: schedule %s has no bounded in-flight depth proof",
+                    self.pp_schedule_csv or self.pp_schedule,
+                )
 
         pp_schedule_obj, model_parts, pp_has_first_stage, pp_has_last_stage, stages = pipeline_model(
             model,
@@ -327,7 +349,7 @@ class AutoPipeline:
             names_per_stage.append(names)
         return names_per_stage
 
-    def visualize_current_schedule(self, filename: Optional[str] = None) -> None:
+    def visualize_current_schedule(self, filename: str | None = None) -> None:
         from torch.distributed.pipelining._schedule_visualizer import get_schedule_ops, visualize_schedule
 
         schedule = self._info.schedule

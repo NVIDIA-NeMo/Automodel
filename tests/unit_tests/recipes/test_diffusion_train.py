@@ -25,6 +25,7 @@ from nemo_automodel.components.datasets.diffusion.collate_fns import TextToImage
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, OptimizerFromFactoryConfig
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion.train import (
+    TrainDiffusionRecipe,
     _build_diffusion_parallel_manager_args,
     _reject_removed_diffusion_keys,
     _resolve_model_dtypes,
@@ -89,6 +90,45 @@ def test_validate_precision_configuration_allows_matching_dtype_for_ddp_or_peft(
         ddp_cfg={"world_size": 1},
         peft_cfg=object(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Split-dtype autocast fallback when FSDP2 does not shard (issue #3578)
+# ---------------------------------------------------------------------------
+
+
+def _make_recipe_with_autocast_dtype(autocast_dtype):
+    """Build a bare recipe carrying only the attributes ``_autocast_context`` reads."""
+    recipe = TrainDiffusionRecipe.__new__(TrainDiffusionRecipe)
+    recipe._autocast_dtype = autocast_dtype
+    recipe.device = torch.device("cpu")
+    return recipe
+
+
+def test_autocast_context_is_inactive_when_fsdp_casts_parameters():
+    with _make_recipe_with_autocast_dtype(None)._autocast_context():
+        assert not torch.is_autocast_enabled("cpu")
+
+
+def test_autocast_context_runs_bf16_activations_through_fp32_weights():
+    """Reproduces #3578: bf16 inputs must survive fp32 conv weights on the unsharded path.
+
+    The conv mirrors the fp32 patch embedding that raised ``Input type (c10::BFloat16)
+    and bias type (float) should be the same``. Its input is a bf16 tensor of shape
+    [batch, channels, frames, height, width], matching what the flow-matching step
+    casts latents to before the transformer forward.
+    """
+    conv = torch.nn.Conv3d(2, 2, kernel_size=1, dtype=torch.float32)
+    latents = torch.randn(1, 2, 2, 2, 2, dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError):
+        conv(latents)
+
+    with _make_recipe_with_autocast_dtype(torch.bfloat16)._autocast_context():
+        output = conv(latents)
+
+    assert output.dtype is torch.bfloat16
+    assert conv.weight.dtype is torch.float32
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +352,9 @@ def test_example_diffusion_yamls_coerce_through_typed_configs(yaml_path):
 
     assert cfg.optimizer is not None
 
+    if "validation_dataloader" in (raw.get("data") or {}):
+        assert cfg.diffusion_validation_dataloader is not None
+
 
 def test_recipe_config_resolves_diffusion_builder_target_to_typed_config():
     config = RecipeConfig(
@@ -336,6 +379,32 @@ def test_recipe_config_resolves_diffusion_builder_target_to_typed_config():
     assert config.cache_dir == "/tmp/cache"
     assert config.base_resolution == (512, 512)
     assert config.num_workers == 0
+
+
+def test_recipe_config_resolves_diffusion_validation_dataloader_only_when_declared():
+    raw = {
+        "data": {
+            "dataloader": {
+                "_target_": (
+                    "nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader"
+                ),
+                "cache_dir": "/tmp/cache",
+            }
+        }
+    }
+
+    assert RecipeConfig(ConfigNode(raw)).diffusion_validation_dataloader is None
+
+    raw["data"]["validation_dataloader"] = {
+        "_target_": "nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader",
+        "cache_dir": "/tmp/val-cache",
+        "shuffle": False,
+    }
+    config = RecipeConfig(ConfigNode(raw)).diffusion_validation_dataloader
+
+    assert isinstance(config, TextToImageDataloaderConfig)
+    assert config.cache_dir == "/tmp/val-cache"
+    assert config.shuffle is False
 
 
 def test_recipe_config_rejects_unknown_diffusion_dataloader_field():

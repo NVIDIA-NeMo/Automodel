@@ -15,6 +15,7 @@
 import importlib.util
 import sys
 import types
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -240,6 +241,7 @@ class TestGlmMoeDsaModel:
         assert model.moe_config.n_activated_experts == config.num_experts_per_tok
         assert model.moe_config.score_func == "sigmoid"
         assert model.moe_config.softmax_before_topk is False
+        assert model.moe_config.router_weights_fp32 is True
         assert model.moe_config.route_scale == config.routed_scaling_factor
 
     def test_model_initializes_moe_config_with_expert_groups(self, config, backend_config):
@@ -439,7 +441,8 @@ class TestGlmMoeDsaClassmethods:
 
         assert isinstance(model, GlmMoeDsaForCausalLM)
         assert model.config == config
-        assert model.backend == backend_config
+        assert model.backend == replace(backend_config, gate_precision=torch.float32)
+        assert backend_config.gate_precision is None
 
     def test_from_pretrained_classmethod(self, config):
         with patch(
@@ -512,6 +515,21 @@ class TestIndexShare:
         # Layer 0 starts from None; each later layer receives the previous layer's returned selection.
         assert seen_prev == [None, "topk-0", "topk-1", "topk-2"]
 
+    def test_model_does_not_thread_topk_without_shared_layers(self, config, backend_config):
+        model = GlmMoeDsaModel(config, backend=backend_config)
+        input_ids = torch.randint(0, config.vocab_size, (1, 4))
+        seen_prev = []
+
+        def fake_forward(self, x, *, freqs_cis, attention_mask=None, padding_mask=None, prev_topk_indices=None, **kw):
+            seen_prev.append(prev_topk_indices)
+            return x, f"topk-{self.layer_idx}"
+
+        with patch.object(Block, "forward", new=fake_forward):
+            _hidden, out_topk = model(input_ids)
+
+        assert seen_prev == [None] * config.num_hidden_layers
+        assert out_topk is None
+
     def test_model_forward_seeds_and_returns_topk(self, config, backend_config):
         # GlmMoeDsaModel.forward must seed the loop from prev_topk_indices (PP carry-in) and
         # return the running selection (PP carry-out).
@@ -531,6 +549,7 @@ class TestIndexShare:
         assert out_topk == "carry-in"  # and it is returned for the next stage
 
     def test_get_pipeline_stage_metas_threads_topk(self, config, backend_config):
+        config.indexer_types = ["full", "shared", "full", "shared"]
         model = GlmMoeDsaForCausalLM(config, backend=backend_config)
         mbs, seq_len = 2, 16
         topk = min(config.index_topk, seq_len)
@@ -558,9 +577,23 @@ class TestIndexShare:
         assert mid_out[0].shape == (mbs, seq_len, config.hidden_size)
         assert mid_out[1].shape == (mbs, seq_len, topk) and mid_out[1].dtype == torch.float32
 
+    def test_get_pipeline_stage_metas_omit_topk_without_shared_layers(self, config, backend_config):
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        model.lm_head = None
+
+        inputs_meta, outputs_meta = model.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=2, seq_len=16, dtype=torch.bfloat16
+        )
+
+        assert len(inputs_meta) == 1
+        assert inputs_meta[0].shape == (2, 16, config.hidden_size)
+        assert len(outputs_meta) == 1
+        assert outputs_meta[0].shape == (2, 16, config.hidden_size)
+
     def test_pp_stage_topk_carry_dtype_roundtrip(self, config, backend_config):
         # A non-first/non-last PP stage receives a float32 carry, casts it to int64 before the
         # inner model, and emits the running selection back as float32.
+        config.indexer_types = ["full", "shared", "full", "shared"]
         model = GlmMoeDsaForCausalLM(config, backend=backend_config)
         model.model.embed_tokens = None  # not first stage
         model.lm_head = None  # not last stage
@@ -580,6 +613,17 @@ class TestIndexShare:
         assert captured["prev_dtype"] == torch.int64  # carry-in cast float32 -> int64 before model
         assert isinstance(out, tuple) and len(out) == 2
         assert out[1].dtype == torch.float32  # carry-out emitted as float32
+
+    def test_pp_stage_returns_only_hidden_without_shared_layers(self, config, backend_config):
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        model.model.embed_tokens = None
+        model.lm_head = None
+        hidden = torch.zeros(1, 4, config.hidden_size)
+
+        with patch.object(model.model, "forward", return_value=(hidden, None)):
+            out = model(hidden)
+
+        assert out is hidden
 
 
 class TestUpdateMoeGateBias:

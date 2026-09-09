@@ -135,6 +135,7 @@ def _sharded_forward_backward(
     targets: list[torch.Tensor],
     rank: int,
     world_size: int,
+    min_local_patch_rows: int = 0,
 ):
     """Drive ``maybe_distribute_visual`` with real collectives and backprop this rank's shard.
 
@@ -147,7 +148,11 @@ def _sharded_forward_backward(
     from nemo_automodel.components.distributed import cp_vision_frame_shard as vs
 
     visual.zero_grad(set_to_none=True)
-    config = vs.CpVisionFrameShardingConfig(enabled=True, min_tokens=0)
+    config = vs.CpVisionFrameShardingConfig(
+        enabled=True,
+        min_tokens=0,
+        min_local_patch_rows=min_local_patch_rows,
+    )
     token = vs.set_cp_vision_group(dist.group.WORLD, config=config)
     try:
         out = vs.maybe_distribute_visual(visual, pixel, grid)
@@ -221,6 +226,43 @@ def _pad_path_worker(rank: int, world_size: int, port: int) -> None:
             # would mean the dummy frame leaked gradient into the shared vision params.
             assert torch.count_nonzero(gb) == 0
             assert torch.count_nonzero(gw) == 0
+        dist.all_reduce(gw, op=dist.ReduceOp.SUM)
+        dist.all_reduce(gb, op=dist.ReduceOp.SUM)
+        torch.testing.assert_close(gw, gw_ref, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(gb, gb_ref, atol=1e-6, rtol=1e-6)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _local_patch_floor_worker(rank: int, world_size: int, port: int) -> None:
+    """Local patch-row floor: padded ViT work is removed before real collectives."""
+    try:
+        _init_gloo(rank, world_size, port)
+        torch.set_num_threads(1)
+        torch.manual_seed(0)
+        visual = _GlooVisual(n_deepstack=2)
+        grid = torch.tensor([[8, 2, 2]], dtype=torch.long)
+        gen = torch.Generator().manual_seed(7)
+        pixel = torch.randn(int(grid.prod(dim=-1).sum()), 8, generator=gen)
+
+        rep_pooler, rep_deepstack, targets, (gw_ref, gb_ref) = _replicated_reference(visual, pixel, grid)
+
+        out = _sharded_forward_backward(
+            visual,
+            pixel,
+            grid,
+            targets,
+            rank,
+            world_size,
+            min_local_patch_rows=32,
+        )
+        torch.testing.assert_close(out.pooler_output, rep_pooler, atol=1e-6, rtol=1e-6)
+        for got, exp in zip(out.deepstack_features, rep_deepstack):
+            torch.testing.assert_close(got, exp, atol=1e-6, rtol=1e-6)
+
+        gw = visual.proj.weight.grad.clone()
+        gb = visual.proj.bias.grad.clone()
         dist.all_reduce(gw, op=dist.ReduceOp.SUM)
         dist.all_reduce(gb, op=dist.ReduceOp.SUM)
         torch.testing.assert_close(gw, gw_ref, atol=1e-6, rtol=1e-6)
@@ -351,3 +393,8 @@ def test_cp_vision_frame_shard_two_rank_gloo_real_qwen3_5_tower_forward_parity()
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 def test_cp_vision_frame_shard_two_rank_gloo_pad_path_parity():
     mp.spawn(_pad_path_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
+def test_cp_vision_frame_shard_two_rank_gloo_local_patch_floor_parity():
+    mp.spawn(_local_patch_floor_worker, args=(2, _free_port()), nprocs=2, join=True)

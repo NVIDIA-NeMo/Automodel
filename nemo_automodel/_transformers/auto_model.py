@@ -43,6 +43,7 @@ from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
+    AutoModelForSeq2SeqLM,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
     AutoModelForTokenClassification,
@@ -131,7 +132,7 @@ def _reject_separate_distributed_kwargs(kwargs: dict) -> None:
 
 def _resolve_distributed_setup(
     *,
-    distributed_setup: Optional[DistributedSetup],
+    distributed_setup: DistributedSetup | None,
     device_mesh: Optional["DeviceMesh"] = None,
 ) -> DistributedSetup:
     """Return a setup, upcasting raw mesh inputs into topology-only setup."""
@@ -646,15 +647,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
+        sdpa_method: List[Union[SDPBackend, str]] | None = None,
         torch_dtype="auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
-        qat_config: Optional[QATConfig] = None,
-        peft_config: Optional[dict] = None,
+        qat_config: QATConfig | None = None,
+        peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
         **kwargs,
@@ -683,8 +684,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Accepts both SDPBackend enum values and string names (e.g.
                 ``["flash_attention", "efficient_attention"]``). When ``None``,
                 auto-selects based on CP and activation checkpointing.
-            torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
-                Data type passed to the underlying `from_pretrained` call.
+            torch_dtype (str | torch.dtype):
+                Data type passed to the underlying `from_pretrained` call. Defaults to `auto`.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
@@ -788,15 +789,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
+        sdpa_method: List[Union[SDPBackend, str]] | None = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
-        qat_config: Optional[QATConfig] = None,
-        peft_config: Optional[dict] = None,
+        qat_config: QATConfig | None = None,
+        peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
         **kwargs,
@@ -812,8 +813,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 The configuration object used to build the model.
                 If config is passed as a string (e.g., model-id / local checkpoint),
                 it will create a config internally using AutoConfig.
-            torch_dtype (str | torch.dtype, default="auto"):
-                Data type for model parameters. If "auto", defaults to ``torch.bfloat16``.
+            torch_dtype (str | torch.dtype):
+                Data type for model parameters. Defaults to `auto`, which selects ``torch.bfloat16``.
         """
         _reject_separate_distributed_kwargs(kwargs)
         setup = _resolve_distributed_setup(
@@ -1008,6 +1009,21 @@ class NeMoAutoModelForTokenClassification(_BaseNeMoAutoModelClass, AutoModelForT
     pass
 
 
+class NeMoAutoModelForSeq2SeqLM(_BaseNeMoAutoModelClass, AutoModelForSeq2SeqLM):
+    """Drop-in replacement for ``transformers.AutoModelForSeq2SeqLM`` with custom-kernels.
+
+    Resolves encoder-decoder (sequence-to-sequence) architectures such as T5,
+    mT5, BART, and Pegasus to their HF ``*ForConditionalGeneration`` classes via
+    the inherited ``AutoModelForSeq2SeqLM`` mapping. Like the other wrappers it
+    only overrides ``from_pretrained`` / ``from_config`` to add the optional
+    ``use_liger_kernel`` flag; the Liger patch only applies to decoder-only
+    architectures, so for encoder-decoder models it silently falls back and the
+    model is unchanged.
+    """
+
+    pass
+
+
 class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextToWaveform):
     """Drop-in replacement for ``transformers.AutoModelForTextToWaveform`` with custom-kernels.
 
@@ -1045,7 +1061,7 @@ class _NeMoAutoModelForRetrievalBase:
     from ``nemo_automodel._transformers.retrieval``.
     """
 
-    _ENCODER_CLS_NAME: Optional[str] = None  # "BiEncoderModel" or "CrossEncoderModel"
+    _ENCODER_CLS_NAME: str | None = None  # "BiEncoderModel" or "CrossEncoderModel"
 
     @classmethod
     def from_pretrained(
@@ -1054,12 +1070,12 @@ class _NeMoAutoModelForRetrievalBase:
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: List[SDPBackend] | None = None,
         torch_dtype="auto",
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        peft_config: Optional[dict] = None,
+        peft_config: dict | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
@@ -1216,8 +1232,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
+        pooling: str | None = None,
+        l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         **kwargs,
@@ -1225,12 +1241,15 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         """Load a bi-encoder model with infrastructure.
 
         Accepts all arguments from ``_NeMoAutoModelForRetrievalBase.from_pretrained``
-        plus the bi-encoder-specific parameters below.
+        plus the bi-encoder-specific parameters below. Sentence Transformers export
+        metadata is derived from effective model, tokenizer, and collator settings.
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
-            pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
-            l2_normalize: Whether to L2-normalize embeddings.
+            pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.). When omitted, standard
+                Sentence Transformers metadata is restored when available, otherwise defaults to ``'avg'``.
+            l2_normalize: Whether to L2-normalize embeddings. When omitted, the standard Sentence Transformers
+                module stack is restored when available, otherwise defaults to ``True``.
             do_distributed_inbatch_negative: Whether to gather passages across ranks for distributed in-batch
                 negatives during training.
             detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed

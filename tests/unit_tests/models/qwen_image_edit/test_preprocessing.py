@@ -266,3 +266,40 @@ def test_output_validation_allows_configured_materialization_tree(tmp_path: Path
     manifest_path.write_text("", encoding="utf-8")
 
     _validate_output_directory(output_dir, manifest_path=manifest_path)
+
+
+def test_load_pipeline_raises_when_diffusers_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lazy diffusers import surfaces a clear error when the extra is missing."""
+    from nemo_automodel.components.models.qwen_image_edit import preprocessing as preprocessing_module
+
+    encoder = QwenImageEditCacheEncoder(model_name="stub/qwen-image-edit", torch_dtype="float32")
+    monkeypatch.setattr(preprocessing_module, "safe_import", lambda name, msg=None: (False, None))
+
+    with pytest.raises(ImportError, match="requires diffusers"):
+        encoder._load_pipeline(torch.device("cpu"))
+
+
+def test_load_pipeline_loads_frozen_conditioning_stack(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_load_pipeline lazily imports diffusers and returns a frozen eval-mode VAE/text-encoder pair."""
+    diffusers = pytest.importorskip("diffusers")
+
+    fake_pipeline = SimpleNamespace(vae=torch.nn.Linear(2, 2), text_encoder=torch.nn.Linear(2, 2))
+    captured: dict[str, object] = {}
+
+    def fake_from_pretrained(model_name, transformer=None, torch_dtype=None):
+        captured.update(model_name=model_name, transformer=transformer, torch_dtype=torch_dtype)
+        return fake_pipeline
+
+    monkeypatch.setattr(diffusers.QwenImageEditPlusPipeline, "from_pretrained", fake_from_pretrained)
+
+    encoder = QwenImageEditCacheEncoder(model_name="stub/qwen-image-edit", torch_dtype="float32")
+    pipeline = encoder._load_pipeline(torch.device("cpu"))
+
+    assert pipeline is fake_pipeline
+    assert captured == {"model_name": "stub/qwen-image-edit", "transformer": None, "torch_dtype": torch.float32}
+    for module in (pipeline.vae, pipeline.text_encoder):
+        assert not module.training
+        parameters = list(module.parameters())
+        assert parameters
+        assert all(not p.requires_grad for p in parameters)
+        assert all(p.dtype == torch.float32 and p.device.type == "cpu" for p in parameters)

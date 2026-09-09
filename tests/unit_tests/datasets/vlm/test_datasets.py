@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import io
 import json
 from types import SimpleNamespace
 from typing import Dict, List
@@ -2007,3 +2008,169 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
         )
 
         assert wrapper.inject_fake_images is False
+
+
+def _shopify_hf_dataset(n=3):
+    """A real in-memory HF dataset so ``with_transform`` is actually exercised."""
+    import datasets as hfds
+
+    images = []
+    for i in range(n):
+        buf = io.BytesIO()
+        Image.new("RGB", (8 + i, 8), (i, i, i)).save(buf, format="PNG")
+        images.append({"bytes": buf.getvalue(), "path": None})
+
+    return hfds.Dataset.from_dict(
+        {
+            "product_image": images,
+            "ground_truth_category": [f"Root > Mid > Leaf {i}" for i in range(n)],
+        }
+    ).cast_column("product_image", hfds.Image())
+
+
+def test_make_shopify_product_catalogue_dataset(monkeypatch):
+    """Rows are emitted in the Automodel conversation schema."""
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(3))
+
+    result = ds.make_shopify_product_catalogue_dataset()
+
+    assert len(result) == 3
+    conversation = result[1]["conversation"]
+    user_turn, assistant_turn = conversation
+
+    assert user_turn["role"] == "user"
+    assert user_turn["content"][1] == {
+        "type": "text",
+        "text": ds.SHOPIFY_PRODUCT_CATALOGUE_PROMPT,
+    }
+    assert assistant_turn["role"] == "assistant"
+    assert assistant_turn["content"] == [{"type": "text", "text": "Root > Mid > Leaf 1"}]
+
+
+def test_make_shopify_product_catalogue_dataset_images_stay_undecoded(monkeypatch):
+    """Images arrive as lazy PIL handles, not eagerly decoded rasters.
+
+    The train split is 38,631 product photos, so eager decoding would pin every
+    image in memory.
+    """
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(2))
+
+    result = ds.make_shopify_product_catalogue_dataset()
+    image = result[0]["conversation"][0]["content"][0]["image"]
+
+    assert isinstance(image, Image.Image)
+    # PIL populates .size from the header but defers the pixel decode; a pending
+    # decode shows up as a non-empty tile list, which load() then clears.
+    assert image.size == (8, 8)
+    assert image.tile
+    image.load()
+    assert not image.tile
+
+
+def test_make_shopify_product_catalogue_dataset_limit(monkeypatch):
+    """``limit_dataset_samples`` truncates, and never over-selects a short split."""
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(5))
+    assert len(ds.make_shopify_product_catalogue_dataset(limit_dataset_samples=2)) == 2
+
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(3))
+    assert len(ds.make_shopify_product_catalogue_dataset(limit_dataset_samples=99)) == 3
+
+
+def test_shopify_product_catalogue_dataset_config_build(monkeypatch):
+    """The config dataclass forwards its fields to the builder."""
+    captured = {}
+
+    def _fake_load_dataset(path_or_dataset, split=None, **kwargs):
+        captured["path_or_dataset"] = path_or_dataset
+        captured["split"] = split
+        return _shopify_hf_dataset(4)
+
+    monkeypatch.setattr(ds, "load_dataset", _fake_load_dataset)
+
+    cfg = ds.ShopifyProductCatalogueDatasetConfig(split="test", limit_dataset_samples=2)
+    dataset = cfg.build()
+
+    assert captured == {"path_or_dataset": "Shopify/product-catalogue", "split": "test"}
+    assert len(dataset) == 2
+
+
+class _LengthByTextProcessor:
+    """Processor whose token count depends on the rendered text: ``LONG`` -> 10 tokens
+    (over the test max_length), anything else -> 4 tokens whose ids encode the sample."""
+
+    def apply_chat_template(self, conversations, tokenize=False):
+        return [conversations[0][0]["content"][0]["text"]]
+
+    def __call__(self, **kwargs):
+        import torch
+
+        text = kwargs["text"][0]
+        if text == "LONG":
+            ids = list(range(100, 110))
+        else:
+            ids = [int(text)] * 4
+        return {
+            "input_ids": torch.tensor([ids]),
+            "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+        }
+
+
+class TestPreTokenizedDatasetWrapperReplacementDeterminism:
+    """Over-long (or otherwise unusable) samples are replaced by a substitute chosen
+    from a per-sample RNG, never from the process-global ``random`` state.
+
+    Regression test: with the global RNG, ranks whose ``random`` stream had
+    advanced differently (e.g. the per-node dataset-building rank) substituted a
+    different document, so context-parallel ranks of one CP group saw different
+    packs / ``cu_seqlens`` for the same microbatch and TE's ring-attention gradient
+    accumulation produced inf/nan (or silently wrong) dk/dv.
+    """
+
+    def _stub_pipeline(self, monkeypatch):
+        import torch
+
+        import nemo_automodel.components.datasets.vlm.collate_fns as collate_fns
+        import nemo_automodel.components.datasets.vlm.fake_image as fake_image
+
+        monkeypatch.setattr(ds, "_preload_media", lambda example, processor, **kw: example)
+        monkeypatch.setattr(ds, "_build_video_metadata", lambda conversation: None)
+        monkeypatch.setattr(fake_image, "_conversation_has_media", lambda conversation: False)
+        monkeypatch.setattr(collate_fns, "_extract_media_from_conversations", lambda conversations: ([], []))
+        monkeypatch.setattr(
+            collate_fns,
+            "build_labels_from_template",
+            lambda input_ids, conversations, processor: torch.zeros_like(input_ids),
+        )
+
+    def _make_dataset(self, n=64):
+        def conv(text):
+            return {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": text}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                ]
+            }
+
+        return [conv("LONG")] + [conv(str(i)) for i in range(1, n)]
+
+    def test_substitute_is_independent_of_global_random_state(self, monkeypatch):
+        import random
+
+        self._stub_pipeline(monkeypatch)
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            self._make_dataset(), _LengthByTextProcessor(), max_length=4, truncate=False, inject_fake_images=False
+        )
+
+        random.seed(1)
+        first = wrapper[0]["input_ids"].tolist()
+        random.seed(2)
+        second = wrapper[0]["input_ids"].tolist()
+        random.seed(3)
+        third = wrapper[0]["input_ids"].tolist()
+
+        assert first != list(range(100, 110)), "the over-long sample must have been replaced"
+        assert first == second == third, "the substitute must not depend on the process-global RNG state"
+
+    def test_different_samples_get_different_substitute_streams(self):
+        draws = {ds._replacement_rng(idx).randint(0, 10**9) for idx in range(32)}
+        assert len(draws) > 1

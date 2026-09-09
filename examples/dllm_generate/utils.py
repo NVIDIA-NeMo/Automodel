@@ -136,13 +136,17 @@ def resolve_checkpoint(path: str) -> str:
     )
 
 
-def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
+def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada", mask_id_override: int | None = None):
     """Load model and tokenizer from an Automodel checkpoint.
 
     Args:
         checkpoint_path: Path to the HF-format checkpoint directory.
-        sampler_name: ``"llada"``, ``"llada2"``, ``"nemotron"``, or ``"gemma"``.
-            Adjusts tokenizer setup and model construction for the chosen family.
+        sampler_name: ``"llada"``, ``"scdd"``, ``"llada2"``, ``"nemotron"``,
+            ``"idlm"``, or ``"gemma"``. Adjusts tokenizer setup and model
+            construction kwargs for the chosen family.
+        mask_id_override: Explicit mask token id. Takes precedence over the
+            tokenizer/config lookup. Required for I-DLM, whose base Qwen3
+            tokenizer has no mask token (training reuses a reserved id).
 
     Returns:
         ``(model, tokenizer, mask_id, eos_id)``.
@@ -195,7 +199,9 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
 
         return model.eval(), tokenizer, None, tokenizer.eos_token_id
 
-    if sampler_name == "llada":
+    if sampler_name in ("llada", "scdd"):
+        # SCDD fine-tunes LLaDA-family checkpoints, whose tokenizer ships the
+        # mask token only in the model config.
         if tokenizer.mask_token is None:
             tokenizer.add_special_tokens({"mask_token": "<|mdm_mask|>"})
 
@@ -219,9 +225,12 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
     if not hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
-    mask_id = tokenizer.mask_token_id
-    if mask_id is None:
-        mask_id = getattr(model.config, "mask_token_id", None)
+    if mask_id_override is not None:
+        mask_id = mask_id_override
+    else:
+        mask_id = tokenizer.mask_token_id
+        if mask_id is None:
+            mask_id = getattr(model.config, "mask_token_id", None)
 
     eos_id = tokenizer.eos_token_id
     return model, tokenizer, mask_id, eos_id

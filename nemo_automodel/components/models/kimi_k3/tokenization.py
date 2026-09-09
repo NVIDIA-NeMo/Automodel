@@ -6,7 +6,7 @@ import os
 from logging import getLogger
 from pathlib import Path
 from shutil import copyfile
-from typing import Dict, Iterator, List, Optional, Tuple, Union, cast
+from typing import Dict, Iterator, List, Tuple, Union, cast
 
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
@@ -21,6 +21,35 @@ logger = getLogger(__name__)
 VOCAB_FILES_NAMES = {"vocab_file": "tiktoken.model"}
 
 
+def _build_kimi_k3_pat_str() -> str:
+    """Build the Kimi K3 tiktoken regex without exposing raw set intersections to autodoc."""
+
+    regex_set_intersection = chr(38) * 2
+    non_han_upper_or_mark = r"""[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}""" + regex_set_intersection + r"""[^\p{Han}]]"""
+    non_han_lower_or_mark = r"""[\p{Ll}\p{Lm}\p{Lo}\p{M}""" + regex_set_intersection + r"""[^\p{Han}]]"""
+
+    return "|".join(
+        [
+            r"""[\p{Han}]+""",
+            r"""[^\r\n\p{L}\p{N}]?"""
+            + non_han_upper_or_mark
+            + r"""*"""
+            + non_han_lower_or_mark
+            + r"""+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""[^\r\n\p{L}\p{N}]?"""
+            + non_han_upper_or_mark
+            + r"""+"""
+            + non_han_lower_or_mark
+            + r"""*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""\p{N}{1,3}""",
+            r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
+            r"""\s*[\r\n]+""",
+            r"""\s+(?!\S)""",
+            r"""\s+""",
+        ]
+    )
+
+
 class TikTokenTokenizer(PreTrainedTokenizer):
     """
     Tokenizing and encoding/decoding text using the Tiktoken tokenizer. See megatron/tokenizer/tiktoken_tokenizer.py.
@@ -31,15 +60,16 @@ class TikTokenTokenizer(PreTrainedTokenizer):
     Args:
         vocab_file (`str`):
             The path to the Tiktoken model file.
-        bos_token (`str` or `tokenizers.AddedToken`, *optional*, defaults to `"<|begin_of_text|>",`):
-            The beginning of sequence token that was used during pretraining. Can be used a sequence classifier token.
-        eos_token (`str` or `tokenizers.AddedToken`, *optional*, defaults to `"<|end_of_text|>"`):
-            The end of sequence token.
-        unk_token (`str` or `tokenizers.AddedToken`, *optional*, defaults to `"<|reserved_special_token_249|>"`):
+        bos_token (`str` or `tokenizers.AddedToken`, *optional*):
+            The beginning of sequence token that was used during pretraining. Defaults to `[BOS]`. Can be used as a
+            sequence classifier token.
+        eos_token (`str` or `tokenizers.AddedToken`, *optional*):
+            The end of sequence token. Defaults to `[EOS]`.
+        unk_token (`str` or `tokenizers.AddedToken`, *optional*):
             The unknown token. A token that is not in the vocabulary cannot be converted to an ID and is set to be this
-            token instead. The second to last item in special_tokens.
-        pad_token (`str` or `tokenizers.AddedToken`, *optional*, defaults to `"<|reserved_special_token_250|>"`):
-            The token used for padding, for example when batching sequences of different lengths.
+            token instead. Defaults to `None`.
+        pad_token (`str` or `tokenizers.AddedToken`, *optional*):
+            The token used for padding, for example when batching sequences of different lengths. Defaults to `None`.
         additional_special_tokens (list of `str`, *optional*):
             A tuple or a list of additional tokens, which will be marked as `special`, meaning that they will be
             skipped when decoding if `skip_special_tokens` is set to `True`.
@@ -53,19 +83,6 @@ class TikTokenTokenizer(PreTrainedTokenizer):
 
     num_reserved_special_tokens = 256
 
-    pat_str = "|".join(
-        [
-            r"""[\p{Han}]+""",
-            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
-            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
-            r"""\p{N}{1,3}""",
-            r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
-            r"""\s*[\r\n]+""",
-            r"""\s+(?!\S)""",
-            r"""\s+""",
-        ]
-    )
-
     def __init__(
         self,
         vocab_file,
@@ -74,7 +91,7 @@ class TikTokenTokenizer(PreTrainedTokenizer):
         unk_token: Union[str, AddedToken, None] = None,
         pad_token: Union[str, AddedToken, None] = None,
         additional_special_tokens: List[str] = None,
-        added_tokens_decoder: Optional[dict] = None,
+        added_tokens_decoder: dict | None = None,
         **kwargs,
     ):
         assert os.path.isfile(vocab_file), vocab_file
@@ -99,6 +116,7 @@ class TikTokenTokenizer(PreTrainedTokenizer):
         self.vocab_file = vocab_file
         mergeable_ranks = load_tiktoken_bpe(vocab_file)
         num_base_tokens = len(mergeable_ranks)
+        self.pat_str = _build_kimi_k3_pat_str()
         self.special_tokens = {
             special_tokens_mapping.get(i, f"<|reserved_token_{i}|>"): i
             for i in range(num_base_tokens, num_base_tokens + self.num_reserved_special_tokens)
@@ -274,7 +292,7 @@ class TikTokenTokenizer(PreTrainedTokenizer):
         return token_ids
 
     @staticmethod
-    def _truncate(ids: List[int], truncation: bool = False, max_length: Optional[int] = None) -> List[int]:
+    def _truncate(ids: List[int], truncation: bool = False, max_length: int | None = None) -> List[int]:
         if truncation and max_length is not None:
             return ids[:max_length]
         return ids
@@ -286,10 +304,10 @@ class TikTokenTokenizer(PreTrainedTokenizer):
         is_batched: bool,
         padding=False,
         truncation: bool = False,
-        max_length: Optional[int] = None,
+        max_length: int | None = None,
         return_tensors=None,
         return_dict: bool = False,
-        assistant_masks: Optional[List[List[int]]] = None,
+        assistant_masks: List[List[int]] | None = None,
     ):
         encoded_inputs = [self._truncate(ids, truncation=truncation, max_length=max_length) for ids in encoded_inputs]
         if assistant_masks is not None:
@@ -356,7 +374,7 @@ class TikTokenTokenizer(PreTrainedTokenizer):
         text = bytearray([self.byte_decoder[c] for c in text]).decode("utf-8", "replace")
         return text
 
-    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
+    def save_vocabulary(self, save_directory: str, filename_prefix: str | None = None) -> Tuple[str]:
         if not os.path.isdir(save_directory):
             raise ValueError(f"vocabulary path ({save_directory}) should be a directory")
         out_vocab_file = os.path.join(
@@ -371,13 +389,13 @@ class TikTokenTokenizer(PreTrainedTokenizer):
     def apply_chat_template(
         self,
         conversation,
-        tools: Optional[list[dict]] = None,
+        tools: list[dict] | None = None,
         tokenize: bool = False,
         add_generation_prompt: bool = False,
         thinking: bool = True,
         padding=False,
         truncation: bool = False,
-        max_length: Optional[int] = None,
+        max_length: int | None = None,
         return_tensors=None,
         return_dict: bool = False,
         return_assistant_tokens_mask: bool = False,
@@ -412,7 +430,7 @@ class TikTokenTokenizer(PreTrainedTokenizer):
             return rendered if is_batched else rendered[0]
 
         encoded_inputs: List[List[int]] = []
-        assistant_masks: Optional[List[List[int]]] = [] if return_assistant_tokens_mask else None
+        assistant_masks: List[List[int]] | None = [] if return_assistant_tokens_mask else None
         for segments in segment_batches:
             encoded = self._encode_chat_segments(
                 segments,

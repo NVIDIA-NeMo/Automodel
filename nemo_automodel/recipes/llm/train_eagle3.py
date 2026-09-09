@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-import json
+import copy
 import logging
 import os
 import pathlib
@@ -38,6 +38,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     load_hf_safetensors_state_dict,
     load_torch_ckpt,
     save_config,
+    save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -49,10 +50,13 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
     build_cached_eagle3_dataloader,
     read_manifest,
 )
+from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner, resolve_decode_eval_config
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
@@ -76,6 +80,84 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
 
 logger = logging.getLogger(__name__)
+
+# Kimi K3 text backbone. Dispatch keys on the *text* config, which both a text-only
+# checkpoint and the text sub-config of a vision-language one report as "kimi_linear".
+# Read it from the config class so a rename stays in sync.
+KIMI_K3_MODEL_TYPE = KimiK3TextConfig.model_type
+
+
+def _validate_kimi_k3_gates(
+    *,
+    backend: str,
+    cp_size: int,
+    tp_size: int,
+    pp_size: int,
+    packed_sequence_size: int,
+    parallel_drafting: bool,
+    target_force_hf: bool,
+) -> None:
+    """Reject the combinations a Kimi K3 target cannot serve, before it is loaded.
+
+    Args:
+        backend: ``recipe_args.target_model_backend``.
+        cp_size: ``distributed.cp_size``.
+        tp_size: ``distributed.tp_size``.
+        pp_size: ``distributed.pp_size``.
+        packed_sequence_size: ``recipe_args.packed_sequence_size``.
+        parallel_drafting: ``recipe_args.parallel_drafting`` (P-EAGLE).
+        target_force_hf: ``recipe_args.target_force_hf``.
+    """
+    if backend != "colocated":
+        # Only the colocated path builds K3 through its expert-parallel custom impl;
+        # SGLang / vLLM / serve_target have no Kimi K3 implementation to serve.
+        raise NotImplementedError(
+            f"Kimi K3 EAGLE-3 training requires target_model_backend='colocated', got {backend!r}."
+        )
+    if target_force_hf:
+        raise ValueError("target_force_hf is not supported for Kimi K3: there is no HuggingFace implementation.")
+    if cp_size > 1 or tp_size > 1:
+        # The EAGLE-3 CP path shards the target by intercepting its
+        # ``F.scaled_dot_product_attention`` call, which K3 does not make: it owns
+        # context parallelism end to end. K3 declares ``supports_tp=False``.
+        raise NotImplementedError(
+            "Kimi K3 EAGLE-3 training supports neither context nor tensor parallelism; "
+            "shard the target with expert parallelism (distributed.ep_size) and set cp_size=tp_size=1."
+        )
+    if pp_size > 1:
+        # Online supervision hooks one complete target forward: a pipelined target holds
+        # only its stage's layers (keyed by global index), so aux-layer capture either
+        # raises a KeyError or silently captures nothing.
+        raise NotImplementedError(
+            "Pipeline parallelism (distributed.pp_size > 1) is not supported for the Kimi K3 "
+            "EAGLE-3 target; the aux hidden states are captured from one non-pipelined forward."
+        )
+    if packed_sequence_size > 0:
+        # K3 owns packed attention itself (its document layout comes from the 2D mask /
+        # cu_seqlens), while the EAGLE-3 wrapper hands packed batches a [B, 1, T, T]
+        # block-causal mask that K3's forward does not accept.
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size > 0) is not supported for the Kimi K3 EAGLE-3 target."
+        )
+    if parallel_drafting:
+        raise NotImplementedError("Parallel drafting (P-EAGLE) is not implemented for the Kimi K3 draft.")
+
+
+def _build_kimi_k3_target_backend(recipe_cfg) -> BackendConfig:
+    """Build the backend used by the frozen expert-parallel Kimi K3 target."""
+    return BackendConfig(
+        attn=str(recipe_cfg.get("target_attn_backend", "eager")),
+        linear="torch",
+        rms_norm="torch_fp32",
+        rope_fusion=False,
+        # ``torch`` is the dispatcher K3's own SFT reference config runs expert parallelism
+        # with; the DeepEP-family dispatchers need a matching DeepEP build, so they are opt-in
+        # through ``target_dispatcher`` rather than the default.
+        dispatcher=str(recipe_cfg.get("target_dispatcher", "torch")),
+        experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+        enable_hf_state_dict_adapter=True,
+        enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+    )
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -133,39 +215,65 @@ def _validate_cp_gates(
     target_attn_implementation: str | None = None,
     seq_length: int | None = None,
     cp_zigzag: bool = False,
+    cp_mode: str = "ring",
 ) -> None:
-    """Reject context-parallel combinations the EAGLE-3 target path cannot honor.
+    """Reject context-parallel combinations the EAGLE-3 path cannot honor.
 
-    CP shards the target forward along the sequence and forces ``is_causal`` (the
-    self_attn hooks strip the attention_mask), so it is incompatible with sequence
-    packing (which needs the 4D block-causal mask) and with the remote backend
-    (whose target runs out-of-process). Under CP the frozen target must route
-    through HuggingFace ``F.scaled_dot_product_attention`` -- that is the call the
-    K/V-gather hook intercepts -- and the draft runs the flash-attn ring, so all of
-    the target-backend / kernel / divisibility preconditions are checked here so a
-    misconfig fails at setup rather than mid-forward.
+    Two CP compute modes are supported for the draft:
+
+    * ``"ring"`` shards the frozen target too and forces ``is_causal`` (the
+      self_attn K/V-gather hook strips the attention_mask), so it is incompatible
+      with sequence packing (which needs the 4D block-causal mask); it pins the
+      flash-attn 2.8.x ring kernels and needs the HF-SDPA target so the hook can
+      intercept ``F.scaled_dot_product_attention``.
+    * ``"ulysses"`` runs the draft attention as an all-to-all over the full
+      (gathered) sequence, so it composes with packing and leaves the target on its
+      normal forward -- only sequence divisibility by ``cp_size`` applies.
+
+    The remote backend is unsupported under CP in either mode (the target runs
+    out-of-process). Preconditions are checked here so a misconfig fails at setup
+    rather than mid-forward.
     """
-    if cp_size > 1 and backend == "remote":
+    if cp_size <= 1:
+        return
+    if cp_mode not in ("ring", "ulysses"):
+        raise ValueError(f"Unknown cp_mode={cp_mode!r}; expected 'ring' or 'ulysses'.")
+    if backend == "remote":
         raise NotImplementedError(
             "Context parallelism (cp_size>1) is only supported with the colocated target "
             "backend; the remote backend runs the target out-of-process."
         )
-    if cp_size > 1 and packed_sequence_size > 0:
+    if cp_mode == "ulysses":
+        if cp_zigzag:
+            raise NotImplementedError(
+                "cp_zigzag is a ring-only sharding layout; set cp_zigzag=false for "
+                "cp_mode=ulysses (the all-to-all path is inherently load-balanced)."
+            )
+        # Ulysses reuses the ring's flash-attn dense/varlen private kernels, pinned to
+        # the 2.8.x positional signature, so require that exact version (not just import).
+        from nemo_automodel.components.speculative.eagle.ring_attention import require_flash_attn_version
+
+        require_flash_attn_version()
+        if seq_length is not None and seq_length % cp_size != 0:
+            raise ValueError(
+                f"Context parallelism (ulysses) requires seq_length ({seq_length}) divisible by cp_size ({cp_size})."
+            )
+        return
+    # ring mode
+    if packed_sequence_size > 0:
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) is not yet supported with sequence packing; CP "
-            "strips the 4D block-causal mask that packing relies on. Set cp_size=1 or "
+            "Context parallelism cp_mode=ring is not supported with sequence packing; the ring is "
+            "single-document causal. Use cp_mode=ulysses for CP + packing, or set cp_size=1 / "
             "packed_sequence_size=0."
         )
-    if cp_size <= 1:
-        return
     if not target_force_hf:
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+            "Context parallelism (cp_mode=ring) requires recipe_args.target_force_hf=true so the "
             "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
         )
     if target_attn_implementation != "sdpa":
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa. "
+            "Context parallelism (cp_mode=ring) requires recipe_args.target_attn_implementation=sdpa. "
             "The K/V-gather hook intercepts F.scaled_dot_product_attention; any other backend "
             "(e.g. flash_attention_2, the HF auto-select default when flash-attn is installed) "
             "bypasses the hook, so each rank silently attends only its own shard."
@@ -214,6 +322,41 @@ def _best_effort(label: str, fn) -> None:
         fn()
     except Exception:
         logger.exception("error %s during cleanup", label)
+
+
+def _validate_cached_eagle3_manifest(
+    cache_dir: str, manifest: dict, draft_base_config, *, mask_reasoning_content: bool, mask_generation_prompt: bool
+) -> None:
+    """Validate that an EAGLE-3 offline cache matches the configured target and recipe options.
+
+    The cached trainer streams the precomputed aux features, draft-vocab targets
+    and ``loss_mask``/``position_mask`` as stored, so the target's vocabulary and
+    width and the recipe's mask options must be the ones the producer
+    (``precompute_eagle3``) ran with; a mismatch would otherwise crash
+    deep inside the draft or, for the mask, train silently on the wrong tokens.
+    """
+    if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
+        raise ValueError(
+            f"EAGLE-3 cache at {cache_dir} was built for target_vocab_size={manifest['target_vocab_size']}, "
+            f"but the configured target has {draft_base_config.vocab_size}. The cache does not match this target."
+        )
+    # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
+    # cache from a different-width target would otherwise crash deep inside
+    # ``fc`` with a confusing shape error.
+    expected_aux_dim = int(draft_base_config.hidden_size) * 3
+    if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
+        raise ValueError(
+            f"EAGLE-3 cache at {cache_dir} has aux_hidden_dim={manifest['aux_hidden_dim']}, but the configured "
+            f"target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 aux layers). "
+            "The cache was built for a different target."
+        )
+    ensure_supervision_options_match(
+        manifest,
+        {"mask_reasoning_content": mask_reasoning_content, "mask_generation_prompt": mask_generation_prompt},
+        cache_name="EAGLE-3",
+        cache_dir=cache_dir,
+        producer_name="precompute_eagle3",
+    )
 
 
 def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int, lk_loss_type=None) -> None:
@@ -445,6 +588,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # from device_mesh when a colocated target builds one (None otherwise).
         self.cp_mesh = None
         self.dp_mesh = None
+        # CP compute mode for the draft: "ring" (default) or "ulysses" (all-to-all,
+        # composes with sequence packing). Set from config in _setup_online_target.
+        self.cp_mode = "ring"
         if self.cached_target_path is None:
             selected_token_ids, selected_token_mask = self._setup_online_target(
                 recipe_cfg, target_path, draft_base_config
@@ -577,7 +723,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if self.cp_group is not None:
                 from nemo_automodel.components.speculative.eagle.draft_llama import attach_eagle3_cp_attention
 
-                attach_eagle3_cp_attention(self.draft_model, self.cp_group, zigzag=self.cp_zigzag)
+                if self.cp_mode == "ulysses":
+                    n_heads = self.draft_model.config.num_attention_heads
+                    if n_heads % self.cp_mesh.size() != 0:
+                        raise ValueError(
+                            f"cp_mode=ulysses requires the draft num_attention_heads ({n_heads}) divisible by "
+                            f"cp_size ({self.cp_mesh.size()}); the all-to-all splits heads across cp ranks."
+                        )
+                attach_eagle3_cp_attention(self.draft_model, self.cp_group, mode=self.cp_mode, zigzag=self.cp_zigzag)
             trainer_module = Eagle3TrainerModule(
                 self.draft_model,
                 selected_token_ids=selected_token_ids,
@@ -812,6 +965,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
             packed_sequence_size=recipe_cfg.get("packed_sequence_size", 0),
             dp_mesh=self.dp_mesh,
         )
@@ -895,6 +1049,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # submeshes are only built later, inside the colocated path).
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
+        self.cp_mode = recipe_cfg.get("cp_mode", "ring")
         _validate_cp_gates(
             cp_size,
             backend,
@@ -903,8 +1058,22 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             target_attn_implementation=recipe_cfg.get("target_attn_implementation", None),
             seq_length=int(recipe_cfg.get("seq_length", 0) or 0) or None,
             cp_zigzag=bool(recipe_cfg.get("cp_zigzag", False)),
+            cp_mode=self.cp_mode,
         )
         _validate_tp_gates(tp_size, backend, cp_size)
+        # ``draft_base_config`` is None on the paths that never build a draft
+        # (the non-colocated backends dispatch before reading it), so the K3
+        # gate has to tolerate its absence.
+        if getattr(draft_base_config, "model_type", None) == KIMI_K3_MODEL_TYPE:
+            _validate_kimi_k3_gates(
+                backend=backend,
+                cp_size=cp_size,
+                tp_size=tp_size,
+                pp_size=int(self.cfg.get("distributed.pp_size", 1) or 1),
+                packed_sequence_size=int(packed_sequence_size or 0),
+                parallel_drafting=bool(recipe_cfg.get("parallel_drafting", False)),
+                target_force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            )
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "sglang":
@@ -912,7 +1081,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         elif backend == "vllm":
             self._setup_vllm_target(recipe_cfg, target_path)
         else:  # colocated
-            self._setup_colocated_target(recipe_cfg, target_path)
+            self._setup_colocated_target(recipe_cfg, target_path, draft_base_config)
 
         self.train_dataloader = self._build_train_dataloader(
             recipe_cfg.train_data_path,
@@ -932,6 +1101,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                 packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )
@@ -960,7 +1130,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_wrapper.set_vocab_mapping(selected_token_ids, selected_token_mask)
         return selected_token_ids, selected_token_mask
 
-    def _setup_colocated_target(self, recipe_cfg, target_path):
+    def _setup_colocated_target(self, recipe_cfg, target_path, draft_base_config):
         """Load the target on this GPU and capture supervision in-process."""
         # Optional ``distributed:`` YAML section. Required for targets that do
         # not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). ``force_hf`` is
@@ -994,7 +1164,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             target_kwargs.update(
                 distributed_setup=self.dist_setup,
             )
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        if draft_base_config.model_type == KIMI_K3_MODEL_TYPE:
+            self.target_model = self._load_kimi_k3_target(recipe_cfg, target_path, draft_base_config)
+        else:
+            self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
         # re-trigger ``BaseRecipe.__setattr__`` state-tracking and raise.
         if self.dist_setup is None:
@@ -1004,10 +1177,59 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # the draft trainer module). Mark the parameters explicitly so no future
         # code path accidentally trains the target -- matching EAGLE-1/2.
         self.target_model.requires_grad_(False)
+        # Ulysses CP shards only the draft (via the all-to-all attention): the target
+        # runs its normal full-sequence forward (block-causal under packing) and
+        # _maybe_shard_cp slices the gathered hidden states to the draft's shard. Ring
+        # CP instead shards the target here (cp_mesh drives run_target_cp_forward_and_gather).
+        target_cp_mesh = None if self.cp_mode == "ulysses" else self.cp_mesh
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
-            cp_mesh=self.cp_mesh,
+            cp_mesh=target_cp_mesh,
+        )
+
+    def _load_kimi_k3_target(self, recipe_cfg, target_path, text_config):
+        """Load Kimi K3 as a frozen expert-parallel target.
+
+        Kimi K3 has no HuggingFace implementation and its 896 routed experts do not
+        fit on one GPU, so the target is built from the (possibly nested) text config
+        through AutoModel's custom path with an explicit expert-parallel backend
+        instead of the generic ``from_pretrained`` call. The EAGLE-3 draft only ever
+        consumes the text decoder's hidden states, so a vision-language checkpoint is
+        loaded as its text-only ``KimiK3ForCausalLM``.
+
+        Args:
+            recipe_cfg: ``recipe_args`` config node.
+            target_path: Checkpoint path or hub id of the frozen target.
+            text_config: The target's text config (``config.text_config`` when the
+                checkpoint is vision-language, otherwise the config itself).
+
+        Returns:
+            The frozen Kimi K3 target model.
+        """
+        if self.device.type != "cuda":
+            raise RuntimeError(
+                "Kimi K3 EAGLE-3 target requires CUDA: the target is loaded with the "
+                "expert-parallel / FSDP distributed path."
+            )
+        if self.dist_setup is None:
+            raise ValueError(
+                "Kimi K3 EAGLE-3 training requires a `distributed:` section (the target's "
+                "routed experts are sharded with expert parallelism); none was configured."
+            )
+        # The loaded target config is the recipe's own draft base config, so build the
+        # target from a copy: the draft config is serialized into the draft's config.json
+        # and must not inherit the target's architecture / checkpoint path.
+        target_config = copy.deepcopy(text_config)
+        target_config.architectures = ["KimiK3ForCausalLM"]
+        target_config.name_or_path = target_path
+        return NeMoAutoModelForCausalLM.from_config(
+            config=target_config,
+            backend=_build_kimi_k3_target_backend(recipe_cfg),
+            distributed_setup=self.dist_setup,
+            load_base_model=True,
+            torch_dtype=self.compute_dtype,
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
 
     def _setup_sglang_target(self, recipe_cfg, target_path):
@@ -1135,22 +1357,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_model = None
         self.target_wrapper = None
         manifest = read_manifest(self.cached_target_path)
-        if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
-            raise ValueError(
-                f"EAGLE-3 cache at {self.cached_target_path} was built for target_vocab_size="
-                f"{manifest['target_vocab_size']}, but the configured target has {draft_base_config.vocab_size}. "
-                "The cache does not match this target."
-            )
-        # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
-        # cache from a different-width target would otherwise crash deep inside
-        # ``fc`` with a confusing shape error.
-        expected_aux_dim = int(draft_base_config.hidden_size) * 3
-        if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
-            raise ValueError(
-                f"EAGLE-3 cache at {self.cached_target_path} has aux_hidden_dim={manifest['aux_hidden_dim']}, "
-                f"but the configured target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 "
-                "aux layers). The cache was built for a different target."
-            )
+        _validate_cached_eagle3_manifest(
+            self.cached_target_path,
+            manifest,
+            draft_base_config,
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
+        )
         selected_token_ids = torch.tensor(manifest["selected_token_ids"], dtype=torch.long)
         selected_token_mask = torch.zeros(int(draft_base_config.vocab_size), dtype=torch.bool)
         selected_token_mask[selected_token_ids] = True
@@ -1176,10 +1389,20 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """Shard the draft supervision along the sequence for context parallelism.
 
         The target emits full-sequence aux/logits (gathered); the draft runs sharded,
-        so gather every ``[B, S, ...]`` tensor to this rank's cp shard (via a global
-        index) and inject the matching global ``position_ids``. The index is the
-        contiguous shard by default, or the load-balanced zig-zag layout (rank ``r``
-        owns chunks ``r`` and ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+        so every ``[batch, sequence, ...]`` tensor in ``inputs`` is index-selected to
+        this rank's cp shard (via a global index). Non-packed runs then get global
+        ``position_ids`` (the shard's indices); packed runs keep their sliced
+        per-document ``position_ids``. The index is the contiguous shard by default,
+        or the load-balanced zig-zag layout (rank ``r`` owns chunks ``r`` and
+        ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+
+        Args:
+            inputs: Trainer-input mapping; tensor values shaped
+                ``[batch, sequence, ...]`` (matching the full sequence length) are
+                sharded along the sequence axis, others pass through unchanged.
+
+        Returns:
+            The same mapping with sequence-length tensors replaced by their cp shard.
         """
         if getattr(self, "cp_group", None) is None:
             return inputs
@@ -1215,7 +1438,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
             for k, v in inputs.items()
         }
-        out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
+        # Synthesize position_ids only when the caller did not supply them: the
+        # non-packed path has none, so the shard's global indices are its positions.
+        # The packed path carries per-document position_ids (reset at each document
+        # boundary), already sliced to this shard above; overwriting them with a
+        # global arange would corrupt the packed RoPE.
+        if "position_ids" not in out:
+            out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
         return out
 
     def _all_reduce_draft_grads_over_cp(self) -> None:
@@ -1398,8 +1627,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if checkpointer is None or not checkpointer.config.enabled:
             return
         self.checkpointer.async_wait()
-
-        self._complete_pending_checkpoint()
+        self.checkpointer.lifecycle.complete_pending()
 
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
@@ -1408,10 +1636,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
         best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
+        self.checkpointer.lifecycle.reserve(path)
+
         if is_rank_0:
-            if os.path.exists(path):
-                raise FileExistsError(f"Checkpoint directory {path} already exists")
-            os.makedirs(path, exist_ok=True)
             loss_dict: dict[str, float] = {}
             if train_loss is not None:
                 loss_dict["train_loss"] = float(train_loss)
@@ -1419,8 +1646,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 for k, v in val_loss.items():
                     loss_dict[k] = float(v)
             if loss_dict:
-                with open(os.path.join(path, "losses.json"), "w") as f:
-                    json.dump(loss_dict, f)
+                save_losses(loss_dict, path)
         if is_dist_initialized:
             dist.barrier()
 
@@ -1440,36 +1666,36 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             merged_dir = _export_merged_lora_draft(draft_model, path)
             logger.info("LoRA final checkpoint: merged consolidated draft exported to %s", merged_dir)
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
-        self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
+        self.checkpointer.save_on_global_ranks(self.rng, "rng", path)
 
-        if is_rank_0:
+        # Rank-0 writes followed by collectives, so they go through the same guard:
+        # a failure here must abort every rank rather than only this one.
+        def write_recipe_metadata() -> None:
             self._save_extra_state(path, epoch=epoch)
             try:
                 save_config(self.cfg.raw_config, path)
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
+
+        self.checkpointer.lifecycle.run_coordinator_step(
+            write_recipe_metadata,
+            description=f"write recipe metadata to {path}",
+        )
         if is_dist_initialized:
             dist.barrier()
 
         if getattr(self.checkpointer.config, "is_async", False):
-            setattr(self, "_last_pending_checkpoint_dir", path)
-            setattr(
-                self,
-                "_last_pending_best_checkpoint_info",
-                {
-                    "path": path,
-                    "val": float(best_val_metric) if best_val_metric is not None else None,
-                    "metric_key": best_metric_name,
-                },
+            self.checkpointer.lifecycle.defer_publication(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
             )
         else:
-            if is_rank_0:
-                self._update_latest_symlink(path)
-                if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
-                self._prune_old_checkpoints()
-            if is_dist_initialized:
-                dist.barrier()
+            self.checkpointer.lifecycle.publish(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
+            )
 
     def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
         """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
@@ -1596,7 +1822,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.checkpointer.load_model(draft_model, os.path.join(ckpt_dir, "model"))
         self.checkpointer.load_optimizer(self.optimizer, draft_model, ckpt_dir, self.lr_scheduler)
         try:
-            self.checkpointer.load_on_dp_ranks(self.rng, "rng", ckpt_dir)
+            self.checkpointer.load_on_global_ranks(self.rng, "rng", ckpt_dir)
         except FileNotFoundError:
             logger.warning("RNG state not found in %s; continuing without restoring RNG.", ckpt_dir)
 
@@ -1711,7 +1937,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         try:
             self._train_epochs(start_epoch, is_ddp, pbar)
             self._maybe_save_final_checkpoint(self.num_epochs)
-            self._finalize_pending_checkpoint()
+            checkpointer = getattr(self, "checkpointer", None)
+            if checkpointer is not None:
+                checkpointer.async_wait()
+                checkpointer.lifecycle.complete_pending()
             if self.dist_env.is_main:
                 logger.info("Training complete: global_step=%s", self.runtime.global_step)
         finally:
@@ -1734,8 +1963,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         process exit.
         """
         if getattr(self, "checkpointer", None) is not None:
-            _best_effort("finalizing pending checkpoint", self._finalize_pending_checkpoint)
-            _best_effort("closing checkpointer", self.checkpointer.close)
+            _best_effort("finalizing and closing checkpointer", self.checkpointer.finalize)
         if getattr(self, "target_wrapper", None) is not None:
             _best_effort("closing target backend", self.target_wrapper.close)
         if getattr(self, "decode_eval_runner", None) is not None:

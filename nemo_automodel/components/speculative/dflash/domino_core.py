@@ -42,7 +42,7 @@ model and are enabled via ``dflash_config.projector_type='domino'``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -129,7 +129,7 @@ class DominoTrainerModule(DFlashTrainerModule):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
-        loss_decay_gamma: Optional[float] = None,
+        loss_decay_gamma: float | None = None,
         shift_label: bool = False,
     ):
         super().__init__(

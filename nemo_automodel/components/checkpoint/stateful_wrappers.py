@@ -14,7 +14,7 @@
 
 import logging
 from functools import partial
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -64,6 +64,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_tied_word_embeddings,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _PREFIX = "model."
 _OPTIMIZER_PARTS_KEY = "optimizer_parts"
@@ -150,7 +151,7 @@ def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
         if param.requires_grad:
             # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
             # Without this, activation checkpointing causes key mismatches on reload.
-            name = name.replace("_checkpoint_wrapped_module.", "")
+            name = canonical_parameter_fqn(name)
             param = param.full_tensor() if hasattr(param, "full_tensor") else param
             state_dict[name] = param.detach().cpu()
     return state_dict
@@ -241,7 +242,7 @@ def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> 
 
     # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
     # Without this, activation checkpointing causes key mismatches on reload.
-    param_dict = {name.replace("_checkpoint_wrapped_module.", ""): param for name, param in model.named_parameters()}
+    param_dict = {canonical_parameter_fqn(name): param for name, param in model.named_parameters()}
     loaded, skipped = 0, 0
 
     for name, saved_tensor in state_dict.items():
@@ -319,7 +320,7 @@ def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
             sd[k[: -len(".lora_magnitude_vector")] + ".lora_magnitude"] = sd.pop(k)
 
 
-def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
+def _get_lm_head_weight_and_name(model: torch.nn.Module) -> tuple[torch.Tensor, str] | None:
     return get_lm_head_weight_and_name(model)
 
 
@@ -343,6 +344,8 @@ class ModelState:
         skip_task_head_prefixes: list[str] | None = None,
         cpu_offload: bool = False,
         pp_group: "torch.distributed.ProcessGroup | None" = None,
+        *,
+        has_expert_parallelism: bool = False,
     ):
         """
         Initialize a ModelState instance for distributed checkpointing.
@@ -369,6 +372,10 @@ class ModelState:
                 every PP stage's layers (not just the local stage's). Required
                 for correct PEFT saves under pipeline parallelism; ignored for
                 non-PEFT models and no-op when ``pp_size == 1``.
+            has_expert_parallelism: Whether the distributed topology uses expert
+                parallelism. This runtime topology signal keeps PEFT loading on
+                the same path across pipeline ranks, including stages without a
+                local expert module.
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.uses_tied_lm_head = is_tied_word_embeddings(self.model[0])
@@ -382,6 +389,7 @@ class ModelState:
         self.skip_task_head_prefixes = skip_task_head_prefixes or []
         self.cpu_offload = cpu_offload
         self.pp_group = pp_group
+        self.has_expert_parallelism = has_expert_parallelism
 
     def _refresh_local_tied_lm_head(self) -> None:
         """Refresh tied-head metadata after DCP has normalized module state."""
@@ -487,11 +495,14 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
-            # @akoumpa: I'm not sure about this code.
             # For EP models, DCP's set_model_state_dict silently skips EP-sharded
             # LoRA params (strict=False hides the FQN mismatch caused by custom
             # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.
-            if _has_expert_parallelism(self.model[0]):
+            # Use the global topology signal first: under PP, some ranks may not
+            # own an expert layer, and choosing from local modules would make
+            # ranks enter different DCP collectives. Inspect every local model
+            # part as a fallback for callers that do not provide the topology.
+            if self.has_expert_parallelism or any(_has_expert_parallelism(part) for part in self.model):
                 for model_part in self.model:
                     _set_peft_state_dict(model_part, state_dict)
                 return
@@ -565,7 +576,7 @@ class OptimizerState:
         self,
         model: torch.nn.Module | list[torch.nn.Module],
         optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
-        scheduler: Optional[Any] = None,
+        scheduler: Any | None = None,
         is_peft: bool = False,
         cpu_offload: bool = False,
         *,
@@ -631,9 +642,13 @@ class OptimizerState:
         # quantized frozen params (Params4bit/Int8Params) alongside trainable LoRA
         # params, or when expert weights are sharded across EP ranks (MoE+EP) and
         # the optimizer only tracks trainable params. Use native state_dict instead.
+        # Adam creates state lazily only after a parameter receives a gradient. Discrete routing/indexing parameters
+        # can remain trainable yet unused for a step, so normalize missing state before both native and flattened DCP
+        # serialization. This makes the save and subsequent load skeletons agree without changing a future first
+        # update: the materialized step and moment tensors are all zero.
+        for optimizer in self.optimizer:
+            _materialize_missing_adam_state(optimizer)
         if self._use_native_optimizer_state:
-            for optimizer in self.optimizer:
-                _materialize_missing_adam_state(optimizer)
             if self.optimizer_part_ids is None:
                 if len(self.optimizer) != 1:
                     raise ValueError(

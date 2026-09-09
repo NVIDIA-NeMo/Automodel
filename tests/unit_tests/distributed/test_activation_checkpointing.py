@@ -24,7 +24,7 @@ from packaging.version import Version
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper, checkpoint_wrapper
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.utils.checkpoint import CheckpointError
+from torch.utils.checkpoint import CheckpointError, CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed import activation_checkpointing as ac
 
@@ -131,6 +131,119 @@ def test_snapshot_context_fn_recompute_ctx_restores_captured_backend_set():
             assert _sdp_backend_state() == _MATH_ONLY
         # The backward-time ambient state is restored once the recompute exits.
         assert _sdp_backend_state() == (True, True, False, False)
+
+
+def test_selective_checkpointing_to_layers_preserves_transformer_engine_attention_cache(monkeypatch):
+    """The shared selective-AC wrapper must preserve TE's checkpoint op sequence."""
+    attention_cache = {"attention_params": None, "backend": None}
+    monkeypatch.setattr(ac, "_get_transformer_engine_attention_backend_cache", lambda: attention_cache)
+    monkeypatch.setattr(
+        ac,
+        "_SELECTIVE_AC_MUST_SAVE_OPS",
+        ac._SELECTIVE_AC_MUST_SAVE_OPS | {torch.ops.aten.ne.Tensor},
+    )
+
+    class Attention(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Run a cache-dependent attention stand-in.
+
+            Args:
+                x: Tensor of shape [features].
+
+            Returns:
+                Tensor of shape [features].
+            """
+            params = x.detach()
+            if attention_cache["attention_params"] is None or params != attention_cache["attention_params"]:
+                attention_cache["attention_params"] = params
+                attention_cache["backend"] = "fused"
+            return x.sin()
+
+    model = nn.Module()
+    model.attention = Attention()
+    layers = [model.attention]
+    ac.apply_selective_checkpointing_to_layers(model, layers, has_kv_sharing=False)
+    assert isinstance(model.attention, CheckpointWrapper)
+    assert layers[0] is model.attention
+
+    x = torch.randn(8, requires_grad=True)
+    out = model.attention(x)
+    cache_after_forward = dict(attention_cache)
+
+    out.sum().backward()
+
+    assert torch.allclose(x.grad, x.detach().cos())
+    assert attention_cache["attention_params"] is cache_after_forward["attention_params"]
+    assert attention_cache["backend"] == cache_after_forward["backend"]
+
+
+def test_recompute_only_fsdp_unshard_op_bypasses_selective_ac_replay(monkeypatch):
+    """FSDP prefetch may make unshard ops recompute-only; they must bypass SAC indexing."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives  # noqa: F401
+
+    fsdp_copy_in = torch.ops.fsdp.all_gather_copy_in.default
+    fsdp_empty = torch.ops.aten.empty.memory_format
+    fsdp_empty_like = torch.ops.aten.empty_like.default
+    fsdp_view = torch.ops.aten.view.default
+    sac_ignored = set(torch.utils.checkpoint.SAC_IGNORED_OPS)
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored)
+    ac.ensure_fsdp_ops_sac_ignored()
+
+    def policy(ctx, func, *args, **kwargs):
+        if func in (fsdp_copy_in, fsdp_empty, fsdp_empty_like, fsdp_view):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    def selective_context_fn():
+        return create_selective_checkpoint_contexts(policy)
+
+    fsdp_state = {"unsharded": False}
+
+    def checkpointed_module(x: torch.Tensor) -> torch.Tensor:
+        """Run a checkpointed FSDP-unshard stand-in.
+
+        Args:
+            x: Tensor of shape [features].
+
+        Returns:
+            Tensor of shape [features].
+        """
+        if fsdp_state["unsharded"]:
+            all_gather_output = torch.empty_like(x)
+            torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            fsdp_copy_in([x.detach()], all_gather_output, [x.numel()], x.numel(), 0)
+            x = x.view(-1)
+        fsdp_state["unsharded"] = True
+        return x.sin()
+
+    x = torch.randn(8, requires_grad=True)
+    out = checkpoint(checkpointed_module, x, use_reentrant=False, context_fn=selective_context_fn)
+    out.sum().backward()
+
+    assert torch.allclose(x.grad, x.detach().cos())
+
+
+def test_fsdp_runtime_ops_are_all_ignored_by_selective_ac(monkeypatch):
+    """FSDP2 copy and all-gather ops must bypass SAC replay accounting."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives  # noqa: F401
+    import torch.distributed.fsdp._fully_shard._fsdp_param  # noqa: F401
+
+    sac_ignored = set()
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored)
+
+    ac.ensure_fsdp_ops_sac_ignored()
+
+    expected = {
+        torch.ops.fsdp.all_gather_copy_in.default,
+        torch.ops.fsdp.split_with_sizes_copy.default,
+        torch.ops.fsdp.chunk_cat.default,
+        torch.ops.fsdp.copy_.default,
+        torch.ops.c10d._allgather_base_.default,
+        torch.ops.aten.empty.memory_format,
+        torch.ops.aten.empty_like.default,
+        torch.ops.aten.view.default,
+    }
+    assert expected <= sac_ignored
 
 
 def test_submodule_checkpointing_with_snapshot_context_reruns_recompute_under_forward_backends():
@@ -398,6 +511,15 @@ def _sac_context_factory():
         return CheckpointPolicy.PREFER_RECOMPUTE
 
     return lambda: create_selective_checkpoint_contexts(policy)
+
+
+def test_ignore_sac_ops_adds_available_ops(monkeypatch):
+    sac_ignored = set()
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored, raising=False)
+
+    ac.ignore_sac_ops([torch.ops.aten.sin.default, None, torch.ops.aten.cos.default])
+
+    assert sac_ignored == {torch.ops.aten.sin.default, torch.ops.aten.cos.default}
 
 
 def test_profiler_ops_sac_ignore_skips_before_torch_2_13(monkeypatch):

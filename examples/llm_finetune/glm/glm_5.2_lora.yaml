@@ -13,7 +13,7 @@ seed: 42
 longalign: false
 
 step_scheduler:
-  global_batch_size: 32
+  global_batch_size: 128
   local_batch_size: 1
   ckpt_every_steps: 25
   val_every_steps: 5
@@ -29,7 +29,7 @@ distributed:
   ep_size: 128
   sequence_parallel: false
   activation_checkpointing: true
-  reshard_after_forward: false
+  reshard_after_forward: true
   moe:
     reshard_after_forward: true
     wrap_outer_model: false
@@ -41,7 +41,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ${oc.env:GLM52_MODEL_PATH,zai-org/GLM-5.2}
+  pretrained_model_name_or_path: zai-org/GLM-5.2
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -50,7 +50,6 @@ model:
     rms_norm: torch_fp32
     rope_fusion: false
     experts: torch_mm
-    experts_storage: fp8
     dispatcher: hybridep
     gate_precision: float32
     fake_balanced_gate: false
@@ -95,8 +94,8 @@ dataset:
   path_or_dataset_id: allenai/tulu-3-sft-mixture
   split: train[:100000]
   shuffle_seed: 42
-  truncation: false
-  seq_length: 200704
+  truncation: true
+  seq_length: 4096
   padding: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
@@ -107,21 +106,19 @@ validation_dataset:
   path_or_dataset_id: allenai/tulu-3-sft-mixture
   split: train[100000:100064]
   shuffle_seed: 42
-  truncation: false
-  seq_length: 200704
+  truncation: true
+  seq_length: 4096
   padding: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: zai-org/GLM-5.2
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 4096
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
-    pad_seq_len_divisible: 4096
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
   drop_last: false
   num_workers: 0
@@ -129,9 +126,7 @@ dataloader:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
-    pad_seq_len_divisible: 4096
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: false
   drop_last: false
   num_workers: 0
@@ -159,6 +154,9 @@ lr_scheduler:
 
 ci:
   # cp_size(1) with ep_size(128) => 128 GPUs => 16 nodes (8 H100/node).
-  recipe_owner: shahafwa
+  recipe_owner: HuiyingLi
   nodes: 16
-  time: "00:20:00"
+  time: "00:25:00"
+  release:
+    step_scheduler.max_steps: 20
+    packed_sequence.max_packs: 2560

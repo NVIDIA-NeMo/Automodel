@@ -22,7 +22,7 @@ model-owned CP sharder -- so it lives here rather than in the shared
 ``components/distributed/context_parallel/utils`` surface.
 """
 
-from typing import Callable, List, Optional
+from typing import Callable, List
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -122,7 +122,7 @@ def run_target_cp_forward_and_gather(
     input_ids: torch.Tensor,
     forward_kwargs: dict,
     collect: Callable[[object], List[torch.Tensor]],
-    position_ids: Optional[torch.Tensor] = None,
+    position_ids: torch.Tensor | None = None,
     filter_kwargs: bool = False,
 ) -> tuple:
     """Run a frozen target under context parallelism and gather its outputs.

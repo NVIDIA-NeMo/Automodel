@@ -37,10 +37,10 @@ PIL_AVAILABLE, Image = safe_import(
     "PIL.Image",
     msg="Qwen image-edit preprocessing requires Pillow from the diffusion media dependencies",
 )
-DIFFUSERS_AVAILABLE, diffusers = safe_import(
-    "diffusers",
-    msg="Qwen image-edit preprocessing requires the diffusion optional dependencies",
-)
+# diffusers is imported lazily in _load_pipeline: importing it initializes the
+# CUDA driver, and this module is pulled in by the tools.diffusion.processors
+# package, whose importers (e.g. the preprocessing CLI parent process) must
+# stay CUDA-free so their multiprocessing workers can initialize CUDA.
 
 logger = logging.getLogger(__name__)
 
@@ -321,7 +321,11 @@ class QwenImageEditCacheEncoder:
 
     def _load_pipeline(self, device: torch.device):
         """Load only upstream VAE and Qwen2.5-VL conditioning components."""
-        if not DIFFUSERS_AVAILABLE:
+        diffusers_available, diffusers = safe_import(
+            "diffusers",
+            msg="Qwen image-edit preprocessing requires the diffusion optional dependencies",
+        )
+        if not diffusers_available:
             raise ImportError("Qwen image-edit preprocessing requires diffusers")
 
         dtype = _DTYPES[self.torch_dtype]

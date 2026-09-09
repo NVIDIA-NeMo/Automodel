@@ -24,6 +24,8 @@ that behavior for both the tied and untied configs.
 Runs on CPU (no CUDA / TE / DeepEP required).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -103,6 +105,23 @@ def test_tied_lm_head_survives_initialize_weights():
     lm_head = model.lm_head.weight
     assert lm_head is embed
     assert lm_head.dtype == torch.bfloat16
+
+
+def test_tied_lm_head_casts_fp32_hidden_after_logits_slicing(monkeypatch):
+    model = _build(tie_word_embeddings=True).to(torch.bfloat16)
+    hidden = torch.randn(1, 4, model.config.text_config.hidden_size, dtype=torch.float32)
+
+    def fake_language_model_forward(*_args, **_kwargs):
+        return SimpleNamespace(last_hidden_state=hidden)
+
+    monkeypatch.setattr(model.model.language_model, "forward", fake_language_model_forward)
+    outputs = model(
+        inputs_embeds=torch.randn(1, 4, model.config.text_config.hidden_size, dtype=torch.bfloat16),
+        logits_to_keep=2,
+    )
+
+    assert outputs.logits.shape == (1, 2, model.config.text_config.vocab_size)
+    assert outputs.logits.dtype == torch.bfloat16
 
 
 def test_untied_construction_is_rejected():

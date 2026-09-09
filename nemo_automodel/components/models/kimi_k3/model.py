@@ -53,11 +53,18 @@ from nemo_automodel.components.models.kimi_k3.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
+from nemo_automodel.components.models.kimi_k3.situ import (
+    _apply_attn_res,
+    _compile_norm_core,
+    _compile_situ_cores,
+    _rms_norm,
+    _weighted_situ,
+)
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import Gate, MoE
+from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -223,6 +230,12 @@ def _pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch_size: i
     return output.reshape(batch_size, seq_len, *hidden_states.shape[1:])
 
 
+# One cached upper-triangular mask per (dtype, device), grown on demand and
+# sliced per call, so repeated microbatches skip rebuilding the [S, S] mask on
+# the hot path while the cache stays bounded to a single largest-size entry.
+_CAUSAL_MASK_CACHE: dict[tuple[torch.dtype, torch.device], torch.Tensor] = {}
+
+
 def _make_causal_mask(
     inputs_embeds: torch.Tensor,
     packed_context: "KimiPackedContext | None",
@@ -249,10 +262,14 @@ def _make_causal_mask(
             q_global_start=0,
             dtype=dtype,
         )
-    min_value = torch.finfo(dtype).min
-    mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
-    mask = torch.triu(mask, diagonal=1)
-    return mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+    cache_key = (dtype, inputs_embeds.device)
+    mask = _CAUSAL_MASK_CACHE.get(cache_key)
+    if mask is None or mask.shape[0] < seq_len:
+        min_value = torch.finfo(dtype).min
+        mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
+        mask = torch.triu(mask, diagonal=1)
+        _CAUSAL_MASK_CACHE[cache_key] = mask
+    return mask[None, None, :seq_len, :seq_len].expand(batch_size, 1, -1, -1)
 
 
 def _packed_context_from_inputs(
@@ -298,11 +315,7 @@ class KimiRMSNorm(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return _rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
     def reset_parameters(self) -> None:
         nn.init.ones_(self.weight)
@@ -973,24 +986,6 @@ class KimiDeltaAttention(nn.Module):
                 self.o_norm.reset_parameters()
 
 
-def _weighted_situ(
-    gate_up: torch.Tensor,
-    routing_weights: torch.Tensor,
-    *,
-    beta: float,
-    linear_beta: float | None,
-) -> torch.Tensor:
-    """Apply SiTU and routing weights to ``[tokens, 2 * intermediate]`` projections."""
-    input_dtype = gate_up.dtype
-    gate, up = gate_up.chunk(2, dim=-1)
-    gate = gate.float()
-    up = up.float()
-    activated = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-    if linear_beta is not None:
-        up = linear_beta * torch.tanh(up / linear_beta)
-    return (activated * up * routing_weights.float()).to(input_dtype)
-
-
 class KimiK3Gate(Gate):
     """K3's fp32 sigmoid router with correction-bias-only expert selection."""
 
@@ -1000,7 +995,21 @@ class KimiK3Gate(Gate):
         token_mask: torch.Tensor,
         cp_mesh: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
-        """Route ``[tokens, hidden]`` states and return fp32 top-k weights."""
+        """Route local token states and return fp32 top-k weights.
+
+        Args:
+            hidden_states: Tensor of shape [tokens, hidden] containing this rank's
+                local token states.
+            token_mask: Boolean tensor of shape [tokens]. Kimi K3 currently routes
+                every supplied token, so this mask is unused.
+            cp_mesh: Optional context-parallel mesh. Kimi K3 currently operates on
+                already-local token states, so this mesh is unused.
+
+        Returns:
+            Tuple containing fp32 routing weights of shape
+            [tokens, activated_experts], expert indices of shape
+            [tokens, activated_experts], and ``None`` for auxiliary loss.
+        """
         del token_mask, cp_mesh
         logits = F.linear(hidden_states.float(), self.weight.float(), None)
         if self.score_func == "sigmoid_with_bias":
@@ -1011,8 +1020,9 @@ class KimiK3Gate(Gate):
             raise ValueError(f"Kimi K3 requires a correction-bias router, got {self.score_func!r}.")
 
         scores_for_choice = scores
-        if self.e_score_correction_bias is not None:
-            scores_for_choice = scores_for_choice + self.e_score_correction_bias.unsqueeze(0)
+        correction_bias = self._local_score_correction_bias()
+        if correction_bias is not None:
+            scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
         if self.n_groups > 1 and self.n_groups > self.topk_groups:
             grouped = scores_for_choice.view(hidden_states.shape[0], self.n_groups, -1)
             group_scores = grouped.topk(2, dim=-1)[0].sum(dim=-1)
@@ -1037,7 +1047,17 @@ class KimiK3MoE(MoE):
         self.dim = moe_config.dim
         self.n_routed_experts = moe_config.n_routed_experts
         self.n_activated_experts = moe_config.n_activated_experts
-        self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        if backend.fake_balanced_gate:
+            # Mirror the base MoE: with random-init weights the learned gate's
+            # near-equal scores make topk pick experts [0..topk) for every token,
+            # collapsing all traffic onto each EP group's first rank.
+            self.gate = FakeBalancedGate(moe_config, noise=backend.fake_gate_noise)
+        else:
+            self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        if backend.compile_situ:
+            _compile_situ_cores()
+        if backend.compile_norm:
+            _compile_norm_core()
         expert_activation = partial(
             _weighted_situ,
             beta=config.activation_situ_beta or 1.0,
@@ -1164,22 +1184,6 @@ class KimiK3MoE(MoE):
                 self.routed_expert_norm.reset_parameters()
         if self.shared_experts is not None:
             self.shared_experts.init_weights(buffer_device, init_std)
-
-
-def _apply_attn_res(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    projection: nn.Linear,
-    norm: KimiRMSNorm,
-) -> torch.Tensor:
-    """Mix ``[tokens, hidden]`` with prior ``[tokens, blocks, hidden]`` residuals."""
-    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    values_fp32 = values.float()
-    variance = values_fp32.pow(2).mean(-1, keepdim=True)
-    keys = values_fp32 * torch.rsqrt(variance + norm.variance_epsilon)
-    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
-    probabilities = (keys * score_weight).sum(-1).softmax(-1).unsqueeze(1)
-    return torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
 
 
 class KimiDecoderLayer(nn.Module):
@@ -1495,7 +1499,11 @@ class KimiK3TextModel(nn.Module):
         Returns:
             Binary padding mask tensor of shape [batch, sequence], or None when no KDA mask is needed.
         """
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+        if attention_mask is None:
+            # Both branches below return None for this input; returning early skips
+            # a per-microbatch device-to-host sync on cache_position[0].
+            return None
+        if cache_position[0] > 0 or torch.all(attention_mask == 1):
             return None
         return attention_mask
 

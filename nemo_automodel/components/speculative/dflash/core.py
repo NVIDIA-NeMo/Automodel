@@ -38,7 +38,7 @@ Two training objectives are supported via ``loss_type``:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn as nn
@@ -81,10 +81,12 @@ def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
 class NoValidAnchorsError(ValueError):
     """Raised when a batch has no sample long enough to form a DFlash block.
 
-    A DFlash anchor needs at least ``block_size + 1`` supervised tokens (the
-    anchor plus its block). Datasets always contain some short conversations;
-    the training loop catches this and skips the offending micro-batch rather
-    than aborting the run.
+    A DFlash anchor is a supervised position (``loss_mask=1``) that still has a
+    full block ahead of it, i.e. one in ``[0, seq_len - block_size]`` (and, when
+    packing, with at least ``block_size - 1`` further real tokens in its own
+    document). Datasets always contain some short conversations; the training
+    loop catches this and skips the offending micro-batch rather than aborting
+    the run.
     """
 
 
@@ -178,9 +180,10 @@ class DFlashTrainerModule(nn.Module):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
-        loss_decay_gamma: Optional[float] = None,
+        loss_decay_gamma: float | None = None,
         loss_type: str = "dflash",
         prefix_weight_base: float = 0.9,
+        sliding_window: int | None = None,
     ):
         super().__init__()
         if loss_type not in _DFLASH_LOSS_TYPES:
@@ -200,6 +203,13 @@ class DFlashTrainerModule(nn.Module):
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
+        # Bounds how far back a block reads the target context. ``None`` keeps the
+        # full prefix (plain DFlash); the published DFlash 2 drafters train and
+        # serve their ``sliding_attention`` layers with a finite window, which also
+        # keeps the flex BlockMask sparse on long sequences.
+        if sliding_window is not None and sliding_window < 1:
+            raise ValueError(f"sliding_window must be >= 1 when set, got {sliding_window}.")
+        self.sliding_window = sliding_window
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.prefix_weight_base = float(prefix_weight_base)
@@ -222,7 +232,7 @@ class DFlashTrainerModule(nn.Module):
         seq_len: int,
         loss_mask: torch.Tensor,
         device: torch.device,
-        doc_remaining: Optional[torch.Tensor] = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Randomly sample anchor positions per sample; returns ``(anchors, keep_mask)``.
 
@@ -254,9 +264,11 @@ class DFlashTrainerModule(nn.Module):
         # richest sample has exactly one valid anchor and always drop one otherwise.
         max_n = min(self.num_anchors, int(valid_counts.max().item()))
         if max_n <= 0:
+            doc_note = " with block_size-1 further real tokens in its document" if doc_remaining is not None else ""
             raise NoValidAnchorsError(
-                "No valid anchor positions in this batch; every sample has fewer than "
-                f"block_size+1 ({bs + 1}) supervised tokens."
+                f"No valid anchor positions in this batch: no sample has a supervised token "
+                f"(loss_mask=1) in [0, seq_len - block_size] = [0, {max_anchor}]{doc_note} "
+                f"(seq_len={seq_len}, block_size={bs})."
             )
 
         indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
@@ -296,7 +308,7 @@ class DFlashTrainerModule(nn.Module):
         return samples.view(bsz, n_blocks) + min_prefix
 
     def _create_position_ids(
-        self, anchor_positions: torch.Tensor, context_position_ids: Optional[torch.Tensor] = None
+        self, anchor_positions: torch.Tensor, context_position_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Position ids for the parallel draft blocks (anchor position + offset).
 
@@ -415,9 +427,7 @@ class DFlashTrainerModule(nn.Module):
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
         causal: bool = False,
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, "torch.Tensor | BlockMask", Optional[torch.Tensor]
-    ]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, "torch.Tensor | BlockMask", torch.Tensor | None]:
         """Shared block-drafting prologue: anchors, noise embedding, positions, mask.
 
         Centralises the sequence-packing handling for every block-wise trainer
@@ -488,6 +498,7 @@ class DFlashTrainerModule(nn.Module):
                 causal=causal,
                 ctx_doc_id=ctx_doc_id,
                 anchor_doc_id=anchor_doc_id,
+                sliding_window=self.sliding_window,
             )
         else:
             attn_mask = create_dflash_sdpa_mask(
@@ -500,6 +511,7 @@ class DFlashTrainerModule(nn.Module):
                 causal=causal,
                 ctx_doc_id=ctx_doc_id,
                 anchor_doc_id=anchor_doc_id,
+                sliding_window=self.sliding_window,
             )
         return anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, prefix_lengths
 

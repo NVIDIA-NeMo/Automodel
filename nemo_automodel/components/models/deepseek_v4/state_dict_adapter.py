@@ -88,6 +88,10 @@ _FP4_E2M1_TABLE = torch.tensor(
 
 # HF V4 key -> internal key  (simple renames; expert & FP8 handled separately)
 _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
+    # Optional native vision modules and sentinel embeddings.
+    (re.compile(r"^vision\.(.+)$"), r"model.vision.\1"),
+    (re.compile(r"^aligner\.(.+)$"), r"model.aligner.\1"),
+    (re.compile(r"^(image_start|image_end|image_newline|image_pad)$"), r"model.\1"),
     # Top-level
     (re.compile(r"^embed\.(.+)$"), r"model.embed_tokens.\1"),
     (re.compile(r"^norm\.(.+)$"), r"model.norm.\1"),
@@ -513,6 +517,11 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         form (``model.layers.{i}.mlp.gate.e_score_correction_bias``) or the
         post-rename HF form (``layers.{i}.ffn.gate.bias``).
         """
+        # Vision checkpoints include a normal text correction bias even in
+        # hash layers because visual tokens in those layers route by scores.
+        if int(getattr(self.config, "vision_n_layers", 0) or 0) > 0:
+            return state_dict
+
         # Prefer the checkpoint's own num_hash_layers over the (possibly YAML
         # overridden) model config — we need to match the on-disk layout.
         num_hash_layers = self._checkpoint_num_hash_layers()
@@ -532,6 +541,9 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
 
     # Internal -> HF name table (inverse of _HF_TO_INTERNAL_RENAMES)
     _INTERNAL_TO_HF_RENAMES: list[tuple[re.Pattern, str]] = [
+        (re.compile(r"^model\.vision\.(.+)$"), r"vision.\1"),
+        (re.compile(r"^model\.aligner\.(.+)$"), r"aligner.\1"),
+        (re.compile(r"^model\.(image_start|image_end|image_newline|image_pad)$"), r"\1"),
         (re.compile(r"^model\.embed_tokens\.(.+)$"), r"embed.\1"),
         (re.compile(r"^model\.norm\.(.+)$"), r"norm.\1"),
         (re.compile(r"^lm_head\.(.+)$"), r"head.\1"),
@@ -774,6 +786,10 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         return value.to(torch.float8_e4m3fn)
 
     _NON_QUANTIZED_PATTERNS = [
+        # The released vision tower and aligner are plain BF16 and have no
+        # companion scale tensors in the native checkpoint.
+        "vision.",
+        "aligner.",
         "attn_norm.weight",
         "ffn_norm.weight",
         "norm.weight",

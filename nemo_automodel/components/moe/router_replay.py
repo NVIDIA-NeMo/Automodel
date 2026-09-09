@@ -53,7 +53,7 @@ model in the same process.
 
 from contextlib import contextmanager
 from enum import Enum
-from typing import Iterator, List, Optional
+from typing import Iterator, List
 
 import torch
 
@@ -80,9 +80,9 @@ class RouterReplay:
 
     def __init__(self) -> None:
         """Create a handle and register it in construction (i.e. layer) order."""
-        self.mode: Optional[RouterReplayMode] = None
-        self.recorded_indices: Optional[torch.Tensor] = None
-        self.target_indices: Optional[torch.Tensor] = None
+        self.mode: RouterReplayMode | None = None
+        self.recorded_indices: torch.Tensor | None = None
+        self.target_indices: torch.Tensor | None = None
         RouterReplay._registry.append(self)
 
     def apply(self, indices: torch.Tensor) -> torch.Tensor:
@@ -135,7 +135,7 @@ class RouterReplay:
         return RouterReplay._registry
 
     @staticmethod
-    def set_mode(mode: Optional[RouterReplayMode]) -> None:
+    def set_mode(mode: RouterReplayMode | None) -> None:
         """Set the mode on every registered instance (``None`` disables replay)."""
         for inst in RouterReplay._registry:
             inst.mode = mode
@@ -220,7 +220,7 @@ class RouterReplay:
                 inst.target_indices = None
 
 
-def replay_selection(router_replay: Optional[RouterReplay], indices: torch.Tensor) -> torch.Tensor:
+def replay_selection(router_replay: RouterReplay | None, indices: torch.Tensor) -> torch.Tensor:
     """Route ``indices`` through ``router_replay`` when routing replay is enabled.
 
     Returns ``indices`` unchanged when ``router_replay`` is ``None`` (replay disabled)

@@ -1966,10 +1966,10 @@ class TestActivationCheckpointingKVSharing:
             rejects non-Module values when replacing a registered child module.
             """
 
-            def __init__(self, inner, context_fn=None):
+            def __init__(self, inner, **kwargs):
                 super().__init__()
                 self._inner = inner
-                self._context_fn = context_fn
+                self.kwargs = kwargs
 
             @property
             def _checkpoint_wrapped_module(self):
@@ -1982,7 +1982,7 @@ class TestActivationCheckpointingKVSharing:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
-            lambda module, **kwargs: _Wrapped(module),
+            lambda module, **kwargs: _Wrapped(module, **kwargs),
         )
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
@@ -2427,12 +2427,20 @@ class TestActivationCheckpointingKVSharing:
             assert not hasattr(layer, "mlp")
 
     # ------------------------------------------------------------------ #
-    # HF native gradient-checkpointing path
+    # HF-native gradient-checkpointing candidates
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _setup_hf_native_model(monkeypatch, num_kv_shared_layers):
-        """Helper: configure a model + fake transformers module for the HF native path."""
+    def _setup_hf_native_model(monkeypatch, num_kv_shared_layers, replay_safe_kv_sharing=False):
+        """Helper: configure a model + fake transformers module for the HF native path.
+
+        Args:
+            monkeypatch: pytest monkeypatch fixture.
+            num_kv_shared_layers: Value placed on the text config; > 0 marks the
+                model as KV-shared.
+            replay_safe_kv_sharing: Whether the model declares its shared-K/V store
+                safe under whole-block checkpoint replay, as Gemma4 E2B/E4B do.
+        """
         import types
 
         class _FakeGradLayer(_FakeLayer):
@@ -2449,25 +2457,59 @@ class TestActivationCheckpointingKVSharing:
             model.model.layers[i] = _FakeGradLayer()
         model.supports_gradient_checkpointing = True  # type: ignore[attr-defined]
         model.gradient_checkpointing_enable = MagicMock()  # type: ignore[attr-defined]
+        if replay_safe_kv_sharing:
+            model.kv_sharing_survives_checkpoint_replay = True  # type: ignore[attr-defined]
         return model
 
-    def test_hf_native_grad_ckpt_preserves_use_cache_with_kv_sharing(self, monkeypatch):
-        """Even when the HF native path is taken, use_cache stays True for KV-shared models."""
+    def test_hf_native_candidate_with_replay_safe_kv_sharing_uses_full_layer_checkpointing(self, monkeypatch):
+        """A model that declares its shared-K/V store replay-safe keeps whole-block wrapping.
+
+        ``apply_submodule_checkpointing`` leaves ``self_attn`` unwrapped for
+        KV-shared models, so routing Gemma4 E2B/E4B there drops attention
+        activations from checkpointing and inflates peak memory. The cache
+        contract is unchanged: ``use_cache`` still stays on.
+        """
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20, replay_safe_kv_sharing=True)
+        self._run_parallelize(model)
+
+        assert model.config.use_cache is True
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert all(isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        # Whole-block wrapping, not the sub-module fallback that skips self_attn.
+        inner_layers = [layer._checkpoint_wrapped_module for layer in model.model.layers]
+        assert all(not isinstance(inner.mlp, self._Wrapped) for inner in inner_layers)
+        assert all(not isinstance(inner.self_attn, self._Wrapped) for inner in inner_layers)
+
+    def test_hf_native_candidate_with_plain_kv_sharing_uses_submodule_checkpointing(self, monkeypatch):
+        """A KV-shared model that does not opt in stays off whole-block checkpointing.
+
+        Native HF KV-shared models (e.g. ``Gemma3nForCausalLM``) keep an
+        accumulating ``DynamicCache`` while ``use_cache=True``. Replaying a whole
+        block calls ``Cache.update()`` a second time and backward dies with a
+        ``CheckpointError`` about changed K/V metadata, so they must stay on the
+        sub-module path that leaves ``self_attn`` unwrapped.
+        """
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20)
         self._run_parallelize(model)
 
         assert model.config.use_cache is True
-        model.gradient_checkpointing_enable.assert_called_once()
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert all(not isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        assert all(isinstance(layer.mlp, self._Wrapped) for layer in model.model.layers)
+        assert all(not isinstance(layer.self_attn, self._Wrapped) for layer in model.model.layers)
 
-    def test_hf_native_grad_ckpt_disables_use_cache_without_kv_sharing(self, monkeypatch):
-        """HF native path + no KV sharing: use_cache is set to False."""
+    def test_hf_native_candidate_uses_non_reentrant_full_layer_checkpointing(self, monkeypatch):
+        """HF-native candidates use full-layer checkpoint wrappers instead of the HF API."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
         self._run_parallelize(model)
 
         assert model.config.use_cache is False
-        model.gradient_checkpointing_enable.assert_called_once_with(
-            gradient_checkpointing_kwargs={"use_reentrant": True}
-        )
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert all(isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        assert all(layer.kwargs["checkpoint_impl"] is CheckpointImpl.NO_REENTRANT for layer in model.model.layers)
+        assert all(layer.kwargs["preserve_rng_state"] is True for layer in model.model.layers)
 
     def test_hf_native_grad_ckpt_skips_frozen_layers(self, monkeypatch):
         """Frozen layers force scoped submodule wrapping instead of whole-model HF native GC."""
@@ -2675,6 +2717,32 @@ class TestSingleGpuActivationCheckpointing:
             assert not isinstance(layer, CheckpointWrapper)
             assert isinstance(layer.mlp, CheckpointWrapper)
             assert isinstance(layer.self_attn, CheckpointWrapper)
+
+
+class TestFsdp2ShardingEnabled:
+    """`fsdp2_sharding_enabled` reports whether fully_shard — and its mixed-precision casts — apply."""
+
+    def test_disabled_on_single_rank_world(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
+
+        # The mesh is never inspected once the world is single-rank.
+        assert fsdp2_mod.fsdp2_sharding_enabled(MagicMock()) is False
+
+    def test_disabled_on_single_element_mesh(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 4)
+
+        assert fsdp2_mod.fsdp2_sharding_enabled(SimpleNamespace(size=lambda: 1)) is False
+
+    def test_enabled_on_multi_rank_mesh(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 4)
+
+        assert fsdp2_mod.fsdp2_sharding_enabled(SimpleNamespace(size=lambda: 4)) is True
 
 
 class TestSelectiveCheckpointSaveOps:
