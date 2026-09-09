@@ -117,7 +117,9 @@ class _ListLoader:
         return len(self._batches)
 
 
-def _build_recipe(num_batches: int, grad_accum: int, trainer_module: nn.Module | None = None) -> TrainEagle1Recipe:
+def _build_recipe(
+    num_batches: int, grad_accum: int, trainer_module: nn.Module | None = None, *, lr: float = 0.0
+) -> TrainEagle1Recipe:
     recipe = TrainEagle1Recipe.__new__(TrainEagle1Recipe)
     recipe.device = torch.device("cpu")
     recipe.dist_env = SimpleNamespace(is_main=True, world_size=1)
@@ -135,24 +137,27 @@ def _build_recipe(num_batches: int, grad_accum: int, trainer_module: nn.Module |
     recipe.num_epochs = 1
     recipe.log_every_steps = 1
     recipe.total_optim_steps = -(-num_batches // grad_accum)
-    recipe.optimizer = torch.optim.SGD(recipe.trainer_module.parameters(), lr=0.0)
+    recipe.optimizer = torch.optim.SGD(recipe.trainer_module.parameters(), lr=lr)
     recipe.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(recipe.optimizer, lambda s: 1.0)
     return recipe
 
 
+@pytest.mark.parametrize("max_grad_norm", [1e9, 0.5])
 @pytest.mark.parametrize(
     "num_batches,accum,expected_steps",
     [
+        (3, 1, 3),  # no accumulation
         (4, 3, 2),  # one full window (3) + trailing window of 1
         (5, 3, 2),  # one full window (3) + trailing window of 2
         (2, 4, 1),  # entire epoch is a single trailing window of 2
     ],
 )
-def test_trailing_flush_rescales_gradient_to_full_window_scale(monkeypatch, num_batches, accum, expected_steps):
-    """Every optimizer step -- full window and trailing flush alike -- sees a
-    unit gradient. Without the trailing rescale the final step would see
-    ``pending / accum * ones`` and this assertion would fail."""
-    recipe = _build_recipe(num_batches, accum)
+def test_trailing_flush_rescales_gradient_to_full_window_scale(
+    monkeypatch, num_batches, accum, expected_steps, max_grad_norm
+):
+    """Full and trailing windows produce the same clipped gradient and SGD update."""
+    recipe = _build_recipe(num_batches, accum, lr=0.1)
+    recipe.max_grad_norm = max_grad_norm
     module = recipe.trainer_module
 
     captured: list[torch.Tensor] = []
@@ -164,9 +169,9 @@ def test_trailing_flush_rescales_gradient_to_full_window_scale(monkeypatch, num_
     )
 
     def _pre_step_hook(optimizer, args, kwargs):
-        # Fires right before each optimizer step, after the trailing rescale and
-        # the (no-op, max_grad_norm=1e9) clip -- so it reflects exactly the
-        # gradient the step consumes. A pre-hook avoids overriding ``step`` and
+        # Fires right before each optimizer step, after rescaling and clipping,
+        # so it reflects exactly the gradient the step consumes.
+        # A pre-hook avoids overriding ``step`` and
         # the spurious LR-scheduler ordering warning that would cause.
         captured.append(module.w.grad.detach().clone())
 
@@ -176,8 +181,11 @@ def test_trailing_flush_rescales_gradient_to_full_window_scale(monkeypatch, num_
     assert recipe.runtime.global_step == expected_steps
     assert len(captured) == expected_steps
     assert sync_calls == [([module], None)] * expected_steps
+    # Four unit-gradient elements have L2 norm 2 before clipping.
+    expected_grad = torch.full_like(module.w, min(1.0, max_grad_norm / (2.0 + 1e-6)))
     for grad in captured:
-        torch.testing.assert_close(grad, torch.ones_like(grad))
+        torch.testing.assert_close(grad, expected_grad)
+    torch.testing.assert_close(module.w, -0.1 * expected_steps * expected_grad)
 
 
 # ---------------------------------------------------------------------------

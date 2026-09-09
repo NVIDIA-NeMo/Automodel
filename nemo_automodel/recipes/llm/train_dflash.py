@@ -58,7 +58,6 @@ from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_targe
 from nemo_automodel.components.speculative.dflash.registry import DFlashDraftSpec, resolve_dflash_draft_spec
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel, resolve_text_config
 from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
@@ -1098,11 +1097,7 @@ class TrainDFlashRecipe(BaseRecipe):
                             [self.trainer_module],
                             getattr(self, "device_mesh", None),
                         )
-                        clip_grad_norm(
-                            self.max_grad_norm,
-                            [self.trainer_module],
-                            device_mesh=getattr(self, "device_mesh", None),
-                        )
+                        torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
                         self.lr_scheduler.step()
@@ -1167,11 +1162,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     for p in self.trainer_module.parameters():
                         if p.grad is not None:
                             p.grad.mul_(scale)
-                    clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.trainer_module],
-                        device_mesh=getattr(self, "device_mesh", None),
-                    )
+                    torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
