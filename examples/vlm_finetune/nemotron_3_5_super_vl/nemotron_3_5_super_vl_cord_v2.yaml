@@ -23,7 +23,7 @@
 # and checkpoint state dicts are moved to CPU before they are written (cpu_offload: true), so the
 # validation-time checkpoint saves need no extra GPU memory. The final checkpoint is exported as
 # consolidated HuggingFace safetensors (save_consolidated: final) for the inference/eval step
-# (see examples/vlm_finetune/nemotron_3_5_super_vl/eval_cord_v2.py).
+# in the CORD-v2 guide (docs/guides/vlm/nemotron-3-5-super-vl.mdx).
 #
 # Run (4 nodes):
 #   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 4
