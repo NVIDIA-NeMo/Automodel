@@ -89,7 +89,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
     Note: NemotronV3 uses 'mixer' instead of 'mlp' in layer paths.
     """
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,
@@ -105,7 +105,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
-        self._uses_model_prefix = True
+        self._uses_model_prefix = False
 
         # Mapping for expert weights (HF split → internal merged)
         self.from_hf_map = {
@@ -115,8 +115,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
     @property
     def _hf_prefix(self) -> str:
-        """NemotronV3 HF format uses 'backbone.' prefix."""
-        return "backbone."
+        """Return the source checkpoint's public Nemotron-H model prefix."""
+        return "model." if self._uses_model_prefix else "backbone."
 
     @property
     def _expert_path_segment(self) -> str:
@@ -128,22 +128,38 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """Nemotron V3 exposes fused non-gated expert parameters in Transformers v5."""
         return ("mixer.experts.up_proj", "mixer.experts.down_proj")
 
-    @staticmethod
-    def _native_key_to_hf(key: str) -> str:
+    def _native_key_to_hf(self, key: str) -> str:
         """Normalize a native Nemotron V3 key to its public HF namespace."""
         key = _strip_mamba_fp32_holder_key(key)
-        key = re.sub(r"^model\.", "backbone.", key)
-        key = re.sub(r"^backbone\.norm\.weight$", "backbone.norm_f.weight", key)
-        key = re.sub(r"^backbone\.embed_tokens\.weight$", "backbone.embeddings.weight", key)
+        key = re.sub(
+            r"^(?P<outer>base_model\.model\.)?model\.",
+            lambda match: f"{match.group('outer') or ''}{self._hf_prefix}",
+            key,
+        )
+        hf_root = re.escape(self._hf_prefix.rstrip("."))
+        key = re.sub(rf"^{hf_root}\.norm\.weight$", f"{self._hf_prefix}norm_f.weight", key)
+        key = re.sub(rf"^{hf_root}\.embed_tokens\.weight$", f"{self._hf_prefix}embeddings.weight", key)
         return key
 
-    @staticmethod
-    def _hf_key_to_native(key: str) -> str:
+    def map_peft_target_module_to_hf(self, module_name: str) -> str:
+        """Map native PEFT target modules to the public Nemotron-H namespace."""
+        return self._native_key_to_hf(module_name)
+
+    def _hf_key_to_native(self, key: str) -> str:
         """Normalize a public HF Nemotron V3 key to its native namespace."""
-        key = re.sub(r"^((?:base_model\.model\.)?backbone)\.norm_f\.weight$", r"\1.norm.weight", key)
-        key = re.sub(r"^((?:base_model\.model\.)?backbone)\.embeddings\.weight$", r"\1.embed_tokens.weight", key)
+        hf_root = re.escape(self._hf_prefix.rstrip("."))
+        key = re.sub(
+            rf"^(?P<outer>base_model\.model\.)?{hf_root}\.norm_f\.weight$",
+            lambda match: f"{match.group('outer') or ''}model.norm.weight",
+            key,
+        )
+        key = re.sub(
+            rf"^(?P<outer>base_model\.model\.)?{hf_root}\.embeddings\.weight$",
+            lambda match: f"{match.group('outer') or ''}model.embed_tokens.weight",
+            key,
+        )
         return re.sub(
-            r"^(?P<outer>base_model\.model\.)?backbone\.",
+            rf"^(?P<outer>base_model\.model\.)?{hf_root}\.",
             lambda match: f"{match.group('outer') or ''}model.",
             key,
         )
@@ -216,11 +232,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             else:
                 backbone_state_dict[key] = value
 
-        # Detect if HF checkpoint uses 'backbone' or 'model' prefix. Only
-        # look at backbone keys; MTP keys never carry a backbone/model prefix.
+        # Detect whether the source checkpoint uses the remote-code ``backbone``
+        # namespace or Transformers v5's native ``model`` namespace. MTP keys
+        # never carry either prefix.
         for key in backbone_state_dict.keys():
-            if ".mixer.experts." in key:
-                self._uses_model_prefix = not key.startswith("backbone.")
+            bare_key = key.removeprefix("base_model.model.")
+            if bare_key.startswith("backbone."):
+                self._uses_model_prefix = False
+                break
+            if bare_key.startswith("model."):
+                self._uses_model_prefix = True
                 break
 
         # First, rename backbone → model and norm_f → norm
@@ -251,14 +272,18 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             # reset_view_loaded_keys=False: this is the second merge of a single from_hf (after the
             # backbone merge above), so accumulate MTP view-loaded keys onto the backbone's record.
             prior_view_keys = set(self.view_loaded_native_keys)
-            merged_mtp = self._from_hf_w_merged_experts(stripped, device_mesh, reset_view_loaded_keys=False)
+            merged_mtp = (
+                stripped
+                if self.moe_config is None
+                else self._from_hf_w_merged_experts(stripped, device_mesh, reset_view_loaded_keys=False)
+            )
             for key, value in merged_mtp.items():
                 merged[f"mtp.{key}"] = value
             # The merge loop records view-loaded keys in mtp.-stripped form (it only ever sees
             # stripped keys); re-prefix them so the checkpoint loader's key-diff matches them
             # against the model's real mtp.* parameter names instead of flagging them as
             # missing/unexpected.
-            new_view_keys = self._view_loaded_native_keys - prior_view_keys
+            new_view_keys = self.view_loaded_native_keys - prior_view_keys
             self._view_loaded_native_keys = prior_view_keys | {f"mtp.{key}" for key in new_view_keys}
 
         return merged
@@ -281,7 +306,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # emitted HF keys stay under ``mtp.`` instead of ``backbone.``.
         if fqn.startswith("mtp."):
             fqn = _strip_mamba_fp32_holder_key(fqn)
-            expert_split = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, prefix_override="mtp.")
+            expert_split = (
+                None
+                if self.moe_config is None
+                else self._convert_single_merged_expert_to_hf_split_experts(
+                    fqn,
+                    tensor,
+                    prefix_override="mtp.",
+                    **kwargs,
+                )
+            )
             result = expert_split if expert_split is not None else [(fqn, tensor)]
             result = [(key, _upcast_mamba_fp32_state_tensor(key, value)) for key, value in result]
             if exclude_key_regex:

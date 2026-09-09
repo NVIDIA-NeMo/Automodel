@@ -31,7 +31,15 @@ except ImportError:
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
-from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
+from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import (
+    _GLM_TRITON_AVAILABLE,
+    GlmMoeDsaStateDictAdapter,
+    _dequantize_glm_fp8,
+    _dequantize_glm_with_torch_offsets,
+    _dequantize_glm_with_triton_offsets,
+    _slice_glm_scale_for_dtensor,
+    should_quantize_key,
+)
 from nemo_automodel.components.moe.config import MoEConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -45,6 +53,10 @@ def config():
     cfg.intermediate_size = 128
     cfg.num_attention_heads = 4
     cfg.num_experts = 4
+    cfg.quantization_config = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
     return cfg
 
 
@@ -189,9 +201,11 @@ class TestConvertSingleTensorToHfQuantization:
         with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
-            assert len(result) == 1
+            assert len(result) == 2
             assert result[0][0] == fqn
             assert result[0][1].dtype == torch.float8_e4m3fn
+            assert result[1][0] == fqn + "_scale_inv"
+            assert result[1][1].shape == (1, 1)
 
     def test_quantization_skips_non_weight_keys(self, adapter):
         tensor = torch.randn(64)
@@ -244,9 +258,44 @@ class TestConvertSingleTensorToHfQuantization:
         with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
-            assert len(result) == 1
+            assert len(result) == 2
             assert result[0][0] == fqn
             assert result[0][1].dtype == torch.float8_e4m3fn
+            assert result[1][0] == fqn + "_scale_inv"
+
+    @pytest.mark.parametrize(
+        "fqn",
+        [
+            "model.embed_tokens.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.self_attn.q_a_layernorm.weight",
+            "model.layers.0.mlp.gate.weight",
+            "model.layers.78.eh_proj.weight",
+            "model.layers.78.enorm.weight",
+            "lm_head.weight",
+        ],
+    )
+    def test_quantization_skips_unscaled_glm53_weights(self, adapter, fqn):
+        tensor = torch.randn(64, 64)
+
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        assert len(result) == 1
+        assert result[0][0] == fqn
+        assert result[0][1] is tensor
+
+    def test_quantization_is_not_enabled_for_bf16_checkpoint(self, adapter):
+        adapter.config.quantization_config = None
+        tensor = torch.randn(64, 64)
+        fqn = "model.layers.0.self_attn.q_a_proj.weight"
+
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        assert len(result) == 1
+        assert result[0][0] == fqn
+        assert result[0][1] is tensor
 
     def test_without_quantization_preserves_dtype(self, adapter):
         tensor = torch.randn(64, 64)
@@ -269,3 +318,109 @@ class TestConvertSingleTensorToHfQuantization:
             )
 
             assert len(result) == 0
+
+
+class TestGlm53Fp8Dequantization:
+    @pytest.mark.parametrize(
+        ("key", "expected"),
+        [
+            ("model.layers.0.self_attn.q_a_proj.weight", True),
+            ("model.layers.10.mlp.experts.3.down_proj.weight", True),
+            ("model.layers.0.self_attn.indexer.wq_b.weight", True),
+            ("model.layers.0.input_layernorm.weight", False),
+            ("model.layers.0.self_attn.indexer.k_norm.weight", False),
+            ("model.layers.0.self_attn.indexer.weights_proj.weight", False),
+            ("model.layers.10.mlp.gate.weight", False),
+            ("model.layers.78.eh_proj.weight", False),
+            ("model.layers.78.enorm.weight", False),
+            ("model.embed_tokens.weight", False),
+            ("lm_head.weight", False),
+        ],
+    )
+    def test_should_quantize_key_matches_glm53_checkpoint(self, key, expected):
+        assert should_quantize_key(key) is expected
+
+    def test_dequantize_applies_scale_and_removes_scale_tensor(self, adapter):
+        weight = torch.full((128, 128), 2.0).to(torch.float8_e4m3fn)
+        scale_inv = torch.full((1, 1), 0.25)
+        state_dict = {
+            "model.layers.0.self_attn.q_a_proj.weight": weight,
+            "model.layers.0.self_attn.q_a_proj.weight_scale_inv": scale_inv,
+            "model.layers.0.input_layernorm.weight": torch.ones(128),
+        }
+
+        result = adapter._dequantize(state_dict)
+
+        assert result["model.layers.0.self_attn.q_a_proj.weight"].dtype == torch.float32
+        assert torch.all(result["model.layers.0.self_attn.q_a_proj.weight"] == 0.5)
+        assert "model.layers.0.self_attn.q_a_proj.weight_scale_inv" not in result
+        assert "model.layers.0.input_layernorm.weight" in result
+
+    def test_unaligned_shard_slices_scales_from_checkpoint_metadata(self):
+        """A 72-row shard starting at row 72 spans two global 128-row blocks."""
+        from torch.distributed.checkpoint.metadata import ChunkStorageMetadata
+
+        class FakeDTensor:
+            def __create_chunk_list__(self):
+                return [ChunkStorageMetadata(offsets=torch.Size((72, 0)), sizes=torch.Size((72, 128)))]
+
+        scale_inv = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
+        weight_local = torch.ones((72, 128), dtype=torch.float8_e4m3fn)
+
+        result = _slice_glm_scale_for_dtensor(scale_inv, FakeDTensor(), weight_local)
+
+        torch.testing.assert_close(result, scale_inv[:2])
+
+    def test_torch_dequant_preserves_global_block_boundaries(self):
+        """Rows 72..143 use 56 values from block 0 and 16 from block 1."""
+        weight = torch.ones((72, 128), dtype=torch.float8_e4m3fn)
+        scale_inv = torch.tensor([[2.0], [4.0]], dtype=torch.float32)
+
+        result = _dequantize_glm_with_torch_offsets(
+            weight,
+            scale_inv,
+            torch.float32,
+            128,
+            offsets_within_first_block=(72, 0),
+        )
+
+        assert torch.all(result[:56] == 2.0)
+        assert torch.all(result[56:] == 4.0)
+
+    def test_full_dtensor_path_uses_global_block_offsets(self):
+        local_weight = torch.ones((72, 128), dtype=torch.float8_e4m3fn)
+        global_scale = torch.tensor([[2.0], [4.0], [6.0], [8.0], [10.0]])
+        mock_weight = Mock()
+        mock_weight.to_local.return_value = local_weight
+        mock_weight.device_mesh = Mock()
+        mock_weight.placements = [Mock()]
+
+        with (
+            patch(
+                "nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter.is_dtensor",
+                side_effect=lambda value: value is mock_weight,
+            ),
+            patch(
+                "nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter._glm_dtensor_local_offsets",
+                return_value=(72, 0),
+            ),
+            patch(
+                "torch.distributed._tensor.DTensor.from_local",
+                side_effect=lambda local, *_args: local,
+            ),
+        ):
+            result = _dequantize_glm_fp8(mock_weight, global_scale, dtype=torch.float32)
+
+        assert torch.all(result[:56] == 2.0)
+        assert torch.all(result[56:] == 4.0)
+
+    @pytest.mark.skipif(not _GLM_TRITON_AVAILABLE, reason="Triton is required")
+    def test_triton_offset_dequant_matches_torch(self):
+        weight = torch.ones((72, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        scale_inv = torch.tensor([[2.0], [4.0]], dtype=torch.float32, device="cuda")
+        offsets = (72, 0)
+
+        expected = _dequantize_glm_with_torch_offsets(weight, scale_inv, torch.float32, 128, offsets)
+        actual = _dequantize_glm_with_triton_offsets(weight, scale_inv, torch.float32, 128, offsets)
+
+        torch.testing.assert_close(actual, expected)

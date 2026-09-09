@@ -122,24 +122,17 @@ optimizer:
 ci:
   recipe_owner: hemildesai
   node_multiplier: true
-  time: "00:20:00"
+  # The full 2K source/reload matrix completes inside 20 minutes, but the
+  # default native-resume phase needs additional setup and continuation time.
+  time: "00:30:00"
   vllm_deploy: true
   vllm_smoke_test: true
   checkpoint_robustness:
-    check_source_load_parity: true
-    # Exact-stack runs measured max/mean KL up to 0.0167/0.00437 and cosine down to 0.99750.
-    source_load_kl_threshold: 3e-2
-    source_load_mean_kl_threshold: 6e-3
-    source_load_cosine_threshold: 0.997
-    # Same-process CI reached KL 0.2667, while controlled fresh-process reloads were stable at 0.0199.
-    hf_kl_threshold: 5e-2
-    # Derive isolated source, train/save, and reload phases from the standard
-    # check/skip options below; no resume phases are selected.
-    process_isolation: true
+    # Long-context mean, p95, and cosine metrics fit the shared standard profile.
+    # Max KL remains diagnostic rather than using the former per-model max-only overrides.
     tokenizer_name: Qwen/Qwen3-30B-A3B
     # Match the other Qwen3-MoE references and avoid the real-device fallback
     # selected by trust_remote_code when no HF device map is provided.
     trust_remote_code: true
     hf_device_map_auto: true
-    no_check_resume: true
     dataset.num_samples_limit: 500

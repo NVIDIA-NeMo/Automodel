@@ -107,14 +107,12 @@ ci:
   time: "00:40:00"
   nodes: 2
   checkpoint_robustness:
-    check_source_load_parity: true
-    hf_kl_threshold: 1e-2
-    source_load_kl_threshold: 1e-2
-    source_load_cosine_threshold: 0.9995
+    # PP buffers are fixed to the 1024-token packed-sequence size.
+    parity_sequence_length: 1024
     tokenizer_name: mistralai/Mixtral-8x7B-v0.1
     trust_remote_code: true
     hf_device_map_auto: true
-    no_check_resume: true
+    skip_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
   release:
