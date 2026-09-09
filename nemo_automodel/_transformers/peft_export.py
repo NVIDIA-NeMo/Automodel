@@ -54,7 +54,22 @@ def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
             f"(examples={dtensor_keys[:5]})"
         )
 
-    lora_modules = [module for module in model.modules() if isinstance(module, (GroupedExpertsLoRA, LinearLoRA))]
+    lora_modules = []
+    supported_prefixes = []
+    for name, module in model.named_modules():
+        if isinstance(module, (GroupedExpertsLoRA, LinearLoRA)):
+            lora_modules.append(module)
+            supported_prefixes.append(f"{name}." if name else "")
+    unsupported_lora_keys = [
+        key
+        for key in state_dict
+        if _is_lora_state_key(key) and not any(key.startswith(prefix) for prefix in supported_prefixes)
+    ]
+    if unsupported_lora_keys:
+        raise RuntimeError(
+            "The model contains LoRA tensors that the merged exporter does not support "
+            f"(examples={unsupported_lora_keys[:5]})"
+        )
     if not lora_modules:
         raise ValueError("The model contains no supported AutoModel LoRA modules to merge")
 
@@ -120,6 +135,7 @@ def export_merged_peft_checkpoint(
     Raises:
         FileNotFoundError: If the adapter weights do not exist.
         ValueError: If the model is sharded or contains no supported LoRA modules.
+        RuntimeError: If the model contains unsupported LoRA tensors.
     """
     adapter_dir = Path(adapter_path)
     adapter_weights = adapter_dir / "adapter_model.safetensors"
