@@ -241,7 +241,8 @@ def test_from_pretrained_retries_without_sdpa(monkeypatch):
     _assert_retries_without_sdpa(monkeypatch, BiEncoderModel, am.NeMoAutoModelBiEncoder)
 
 
-def test_cross_encoder_from_pretrained(monkeypatch):
+@pytest.mark.parametrize("is_causal", [None, False, True], ids=["native", "bidirectional", "causal"])
+def test_cross_encoder_from_pretrained(monkeypatch, is_causal):
     calls = {"build": 0}
     last_kwargs = {}
 
@@ -260,13 +261,16 @@ def test_cross_encoder_from_pretrained(monkeypatch):
     monkeypatch.setattr(am, "_patch_attention", lambda m, _: m)
     monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
 
-    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model")
+    policy_kwargs = {} if is_causal is None else {"is_causal": is_causal}
+    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model", "eager", **policy_kwargs)
     assert isinstance(model, DummyModel)
     assert calls["build"] == 1
     # CrossEncoder build should NOT receive pooling or l2_normalize
     assert "pooling" not in last_kwargs
     assert "l2_normalize" not in last_kwargs
     assert last_kwargs["model_name_or_path"] == "mock-model"
+    assert last_kwargs["attn_implementation"] == "eager"
+    assert last_kwargs["is_causal"] is is_causal
 
 
 def test_cross_encoder_retries_without_liger(monkeypatch):

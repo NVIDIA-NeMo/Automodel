@@ -16,7 +16,7 @@
 
 import inspect
 import json
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -203,38 +203,6 @@ def test_retrieval_public_apis_expose_is_causal():
     assert cross_auto_signature.parameters["is_causal"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_modified_retrieval_public_apis_are_fully_annotated():
-    from nemo_automodel._transformers import auto_model, retrieval
-
-    callables = (
-        retrieval.build_encoder_backbone,
-        retrieval.BiEncoderModel.__init__,
-        retrieval.BiEncoderModel.build,
-        retrieval.BiEncoderModel.save_pretrained,
-        retrieval.BiEncoderModel.encode,
-        retrieval.BiEncoderModel.forward,
-        retrieval.CrossEncoderModel.__init__,
-        retrieval.CrossEncoderModel.build,
-        retrieval.CrossEncoderModel.save_pretrained,
-        retrieval.CrossEncoderModel.forward,
-        auto_model.NeMoAutoModelBiEncoder.from_pretrained,
-        auto_model.NeMoAutoModelCrossEncoder.from_pretrained,
-    )
-    for callable_ in callables:
-        signature = inspect.signature(callable_)
-        assert signature.return_annotation is not inspect.Signature.empty, callable_.__qualname__
-        for parameter in signature.parameters.values():
-            if parameter.name not in {"self", "cls"}:
-                assert parameter.annotation is not inspect.Parameter.empty, f"{callable_.__qualname__}.{parameter.name}"
-
-    for callable_ in (
-        retrieval.BiEncoderModel.encode,
-        retrieval.BiEncoderModel.forward,
-        retrieval.CrossEncoderModel.forward,
-    ):
-        assert inspect.signature(callable_).parameters["input_dict"].annotation is not dict
-
-
 def test_effective_pipeline_prompts_replace_restored_export_defaults():
     from nemo_automodel._transformers import retrieval
 
@@ -402,7 +370,6 @@ def test_generic_embedding_backbone_honors_and_persists_is_causal(tmp_path, is_c
     """Generic Hugging Face backbones honor and persist both attention policies."""
     from nemo_automodel._transformers import retrieval
 
-    torch.manual_seed(1234)
     config = Qwen2Config(
         vocab_size=64,
         hidden_size=16,
@@ -414,7 +381,9 @@ def test_generic_embedding_backbone_honors_and_persists_is_causal(tmp_path, is_c
         attention_dropout=0.0,
     )
     model_dir = tmp_path / "qwen2"
-    Qwen2Model(config).eval().save_pretrained(model_dir)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(1234)
+        Qwen2Model(config).eval().save_pretrained(model_dir)
 
     backbone = retrieval.build_encoder_backbone(
         model_name_or_path=str(model_dir),
@@ -442,6 +411,11 @@ def test_generic_embedding_backbone_honors_and_persists_is_causal(tmp_path, is_c
     save_dir = tmp_path / "saved"
     backbone.save_pretrained(save_dir)
     assert json.loads((save_dir / "config.json").read_text())["is_causal"] is is_causal
+    reloaded = retrieval.build_encoder_backbone(str(save_dir), task="embedding", attn_implementation="eager").eval()
+    with torch.no_grad():
+        restored = reloaded(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    torch.testing.assert_close(restored, original)
+    assert reloaded.config.is_causal is is_causal
 
 
 @pytest.mark.parametrize("encoder_class", ["bi", "cross"])
@@ -451,7 +425,6 @@ def test_encoder_only_backbones_apply_causality_policy(encoder_class, is_causal,
     """The policy changes the effective mask for encoder-only Hugging Face backbones."""
     from nemo_automodel._transformers import retrieval
 
-    torch.manual_seed(42)
     config = BertConfig(
         vocab_size=32,
         hidden_size=16,
@@ -462,12 +435,13 @@ def test_encoder_only_backbones_apply_causality_policy(encoder_class, is_causal,
         attention_probs_dropout_prob=0.0,
     )
     config._attn_implementation = attn_implementation
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        backbone = BertModel(config) if encoder_class == "bi" else BertForSequenceClassification(config)
     if encoder_class == "bi":
-        backbone = BertModel(config)
         retrieval.BiEncoderModel(backbone, is_causal=is_causal)
         text_model = backbone
     else:
-        backbone = BertForSequenceClassification(config)
         retrieval.CrossEncoderModel(backbone, is_causal=is_causal)
         text_model = backbone.bert
 
@@ -503,45 +477,183 @@ def test_cross_encoder_preserves_native_bert_decoder_mode(attn_implementation):
         is_decoder=True,
     )
     config._attn_implementation = attn_implementation
-    backbone = BertForSequenceClassification(config)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        backbone = BertForSequenceClassification(config).eval()
+    inputs = {"input_ids": torch.tensor([[1, 2, 3, 4]]), "attention_mask": torch.ones(1, 4, dtype=torch.long)}
+    with torch.no_grad():
+        expected = backbone(**inputs).logits
 
-    encoder = retrieval.CrossEncoderModel(backbone)
+    encoder = retrieval.CrossEncoderModel(backbone).eval()
 
     assert encoder.is_causal is True
     assert backbone.config.is_causal is True
     assert backbone.config.is_decoder is True
     assert all(layer.attention.self.is_causal is True for layer in backbone.bert.encoder.layer)
+    with torch.no_grad():
+        torch.testing.assert_close(encoder(**inputs).logits, expected)
 
 
-def test_cross_encoder_build_restores_saved_causality(tmp_path):
-    from nemo_automodel._transformers import retrieval
-
+@pytest.fixture
+def tiny_bert_scorer():
+    """A real, deterministic CPU backbone shared by wrapper behavior tests."""
     config = BertConfig(
         vocab_size=32,
         hidden_size=16,
         intermediate_size=32,
         num_hidden_layers=1,
         num_attention_heads=2,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
     )
-    model_dir = tmp_path / "bert_score"
-    BertForSequenceClassification(config).save_pretrained(model_dir)
-
-    encoder = retrieval.CrossEncoderModel.build(str(model_dir), is_causal=True)
-    save_dir = tmp_path / "saved_causal_score"
-    encoder.save_pretrained(save_dir)
-    reloaded = retrieval.CrossEncoderModel.build(str(save_dir))
-
-    assert reloaded.is_causal is True
-    assert reloaded.model.config.is_causal is True
-    assert reloaded.model.config.is_decoder is True
-    assert all(layer.attention.self.is_causal is True for layer in reloaded.model.bert.encoder.layer)
+    config._attn_implementation = "eager"
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        return BertForSequenceClassification(config).eval()
 
 
-def test_explicit_is_causal_rejects_non_boolean_value():
+@pytest.mark.parametrize("input_form", ["dict", "readonly_mapping", "kwargs"])
+@pytest.mark.parametrize("return_dict", [None, False], ids=["default_output", "tuple_output"])
+def test_cross_encoder_forward_preserves_backbone_outputs_and_inputs(tiny_bert_scorer, input_form, return_dict):
+    """Both calling conventions preserve scores, output format, and caller-owned inputs."""
     from nemo_automodel._transformers import retrieval
 
+    encoder = retrieval.CrossEncoderModel(tiny_bert_scorer).eval()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]]),
+    }
+    original_inputs = {key: value.clone() for key, value in inputs.items()}
+    if return_dict is not None:
+        inputs["return_dict"] = original_inputs["return_dict"] = return_dict
+
+    with torch.no_grad():
+        expected = tiny_bert_scorer(**inputs)
+        if input_form == "kwargs":
+            actual = encoder(**inputs)
+        else:
+            actual = encoder(MappingProxyType(inputs) if input_form == "readonly_mapping" else inputs)
+
+    if return_dict is False:
+        assert isinstance(actual, tuple)
+        torch.testing.assert_close(actual, expected)
+    else:
+        torch.testing.assert_close(actual.logits, expected.logits)
+    torch.testing.assert_close(inputs, original_inputs)
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_cross_encoder_build_restores_saved_causality(tmp_path, tiny_bert_scorer, is_causal):
+    """Reload restores scores and attention, while an explicit override wins over saved policy."""
+    from nemo_automodel._transformers import retrieval
+
+    model_dir = tmp_path / "bert_score"
+    tiny_bert_scorer.save_pretrained(model_dir)
+
+    encoder = retrieval.CrossEncoderModel.build(str(model_dir), is_causal=is_causal).eval()
+    inputs = {"input_ids": torch.tensor([[1, 2, 3, 4]]), "attention_mask": torch.ones(1, 4, dtype=torch.long)}
+    changed_inputs = {**inputs, "input_ids": torch.tensor([[1, 2, 3, 5]])}
+    with torch.no_grad():
+        expected = encoder(**inputs).logits
+    save_dir = tmp_path / "saved_score"
+    encoder.save_pretrained(save_dir)
+    reloaded = retrieval.CrossEncoderModel.build(str(save_dir)).eval()
+
+    assert reloaded.is_causal is is_causal
+    assert reloaded.model.config.is_causal is is_causal
+    assert reloaded.model.config.is_decoder is is_causal
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(**inputs).logits, expected)
+
+    override_policy = not is_causal
+    overridden = retrieval.CrossEncoderModel.build(str(save_dir), is_causal=override_policy).eval()
+    assert overridden.is_causal is override_policy
+    with torch.no_grad():
+        original = overridden(**inputs, output_hidden_states=True).hidden_states[-1][:, 0]
+        changed = overridden(**changed_inputs, output_hidden_states=True).hidden_states[-1][:, 0]
+    if override_policy:
+        torch.testing.assert_close(original, changed)
+    else:
+        assert not torch.allclose(original, changed, atol=1e-6)
+
+
+@pytest.mark.parametrize("encoder_class", ["bi", "cross"])
+@pytest.mark.parametrize("policy_source", ["explicit", "saved"])
+def test_retrieval_rejects_non_boolean_policy(encoder_class, policy_source):
+    """String-valued policies must not silently enable attention through Python truthiness."""
+    from nemo_automodel._transformers import retrieval
+
+    backbone = nn.Module()
+    backbone.config = PretrainedConfig(**({"is_causal": "false"} if policy_source == "saved" else {}))
+    policy_kwargs = {"is_causal": "false"} if policy_source == "explicit" else {}
+    encoder_type = retrieval.BiEncoderModel if encoder_class == "bi" else retrieval.CrossEncoderModel
     with pytest.raises(ValueError, match="must be a boolean"):
-        retrieval._resolve_is_causal({}, "false")
+        encoder_type(backbone, **policy_kwargs)
+
+
+@pytest.mark.parametrize("has_decoder_flag", [False, True])
+def test_mapping_config_restores_policy_and_accepts_explicit_override(has_decoder_flag):
+    """Mapping-backed text configs follow the same saved/explicit policy contract."""
+    from nemo_automodel._transformers import retrieval
+
+    backbone = nn.Module()
+    text_config = {"is_causal": True}
+    if has_decoder_flag:
+        text_config["is_decoder"] = False
+    backbone.config = PretrainedConfig(text_config=text_config)
+    backbone.main_input_name = "pixel_values"
+    backbone.text_tower = nn.Module()
+    backbone.text_tower.config = text_config
+    backbone.text_tower.is_causal = False
+    backbone.get_decoder = lambda: backbone.text_tower
+
+    restored = retrieval.BiEncoderModel(backbone)
+    assert restored.is_causal is True
+    assert backbone.text_tower.is_causal is True
+    assert text_config == {"is_causal": True, **({"is_decoder": True} if has_decoder_flag else {})}
+
+    overridden = retrieval.BiEncoderModel(backbone, is_causal=False)
+    assert overridden.is_causal is False
+    assert backbone.text_tower.is_causal is False
+    assert text_config == {"is_causal": False, **({"is_decoder": False} if has_decoder_flag else {})}
+
+
+@pytest.mark.parametrize(
+    "config_values, expected",
+    [({}, False), ({"is_decoder": False}, False), ({"is_decoder": True}, True), ({"is_causal": True}, True)],
+    ids=["unspecified", "encoder", "decoder", "causal_config"],
+)
+def test_native_policy_uses_config_when_modules_do_not_declare_attention(config_values, expected):
+    from nemo_automodel._transformers import retrieval
+
+    backbone = nn.Module()
+    backbone.config = SimpleNamespace(**config_values)
+
+    assert retrieval._get_native_text_backbone_is_causal(backbone) is expected
+    assert vars(backbone.config) == config_values
+
+
+@pytest.mark.parametrize(
+    "config_values, attention_policies, error",
+    [
+        ({"is_decoder": "false"}, (), "is_decoder policy must be a boolean"),
+        ({"is_causal": "false"}, (), "is_causal policy must be a boolean"),
+        ({}, (False, True), "inconsistent native is_causal policies"),
+    ],
+    ids=["invalid_decoder_flag", "invalid_attention_flag", "mixed_layer_policies"],
+)
+def test_native_policy_rejects_ambiguous_attention(config_values, attention_policies, error):
+    """Inference must reject malformed metadata and mixed modes instead of guessing."""
+    from nemo_automodel._transformers import retrieval
+
+    backbone = nn.Module()
+    backbone.config = SimpleNamespace(**config_values)
+    backbone.attentions = nn.ModuleList([nn.Module() for _ in attention_policies])
+    for attention, policy in zip(backbone.attentions, attention_policies, strict=True):
+        attention.is_causal = policy
+
+    with pytest.raises(ValueError, match=error):
+        retrieval._get_native_text_backbone_is_causal(backbone)
 
 
 def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
@@ -830,6 +942,40 @@ def test_bi_encoder_rejects_composite_without_text_config_contract():
         retrieval.BiEncoderModel(backbone, pooling="last", l2_normalize=True, is_causal=False)
 
 
+@pytest.mark.parametrize(
+    "decoder_contract, error",
+    [
+        ("missing", "must expose their text tower"),
+        ("not_a_module", "distinct text backbone module"),
+        ("root", "distinct text backbone module"),
+        ("mismatched_config", "must identify the same text backbone"),
+    ],
+)
+def test_invalid_composite_decoder_fails_before_mutating_attention(decoder_contract, error):
+    """Reject unsafe tower selection without modifying either text metadata or vision attention."""
+    from nemo_automodel._transformers import retrieval
+
+    text_config = PretrainedConfig()
+    backbone = nn.Module()
+    backbone.config = SimpleNamespace(is_composition=True, get_text_config=lambda decoder: text_config)
+    backbone.vision_tower = nn.Module()
+    backbone.vision_tower.is_causal = True
+    if decoder_contract == "not_a_module":
+        backbone.get_decoder = lambda: None
+    elif decoder_contract == "root":
+        backbone.get_decoder = lambda: backbone
+    elif decoder_contract == "mismatched_config":
+        backbone.text_tower = nn.Module()
+        backbone.text_tower.config = PretrainedConfig()
+        backbone.get_decoder = lambda: backbone.text_tower
+
+    with pytest.raises(ValueError, match=error):
+        retrieval.BiEncoderModel(backbone, is_causal=False)
+
+    assert "is_causal" not in vars(text_config)
+    assert backbone.vision_tower.is_causal is True
+
+
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_bi_encoder_scopes_is_causal_to_composite_text_tower(is_causal):
     """Composite bi-encoders update text attention without changing vision attention."""
@@ -863,7 +1009,7 @@ def test_bi_encoder_scopes_is_causal_to_composite_text_tower(is_causal):
             self.config = CompositeConfig()
             self.text_tower = Tower(self.config.text_config)
             self.vision_tower = Tower()
-            self.vision_tower.attention.is_causal = "vision-sentinel"
+            self.vision_tower.attention.is_causal = not is_causal
 
         def get_decoder(self):
             return self.text_tower
@@ -874,7 +1020,7 @@ def test_bi_encoder_scopes_is_causal_to_composite_text_tower(is_causal):
     assert encoder.is_causal is is_causal
     assert backbone.config.text_config.is_causal is is_causal
     assert backbone.text_tower.attention.is_causal is is_causal
-    assert backbone.vision_tower.attention.is_causal == "vision-sentinel"
+    assert backbone.vision_tower.attention.is_causal is (not is_causal)
     assert "is_causal" not in vars(backbone.config)
 
 

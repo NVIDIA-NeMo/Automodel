@@ -118,8 +118,10 @@ def test_ministral3_causal_attention_blocks_future_token_influence():
     """Causal Ministral3 prevents a future token from changing an earlier position."""
     cfg = tiny_bidirectional_config()
     cfg.is_causal = True
-    model = Ministral3BidirectionalModel(cfg).eval()
-    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        model = Ministral3BidirectionalModel(cfg).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
     modified = input_ids.clone()
     modified[0, -1] = (modified[0, -1] + 1) % cfg.vocab_size
 
