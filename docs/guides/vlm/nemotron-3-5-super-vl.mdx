@@ -76,7 +76,7 @@ uv sync --locked --all-groups --all-extras
 
 <Note>
 Nemotron 3.5 Super VL requires `mamba_ssm` and `causal_conv1d` (the `cuda` extra, pre-built in the
-NeMo AutoModel container), Transformer Engine (`attn: te`, `linear: te`) and DeepEP for
+NeMo AutoModel container), Transformer Engine (`attn: te`, `linear: te`), and DeepEP for
 expert dispatch. The checkpoint is ~227 GB in bf16 (63 safetensors shards); download it into
 `$HF_HOME` before launching so that all 32 ranks read from the shared cache.
 </Note>
