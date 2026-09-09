@@ -1499,6 +1499,28 @@ def test_mistral3_vlm_runs_dummy_vision_inside_model_forward(monkeypatch):
     assert torch.equal(outputs["input_ids"], input_ids)
     assert outputs["inputs_embeds"] is None
 
+    model.eval()
+
+    events.clear()
+    outputs = model(
+        input_ids=torch.tensor([[1, 2]]),
+        attention_mask=torch.ones(1, 2, dtype=torch.long),
+        force_dummy_vision=True,
+    )
+
+    assert events == ["vision", "projector", "parent"]
+    assert outputs["inputs_embeds"].shape == (1, 2, 4)
+
+    # An eval-mode caller that does not opt in must still skip the vision tower, so bi-encoder
+    # training, cross-encoder SFT, and offline eval keep their current behavior.
+    input_ids = torch.tensor([[5, 6]])
+    for eval_kwargs in ({}, {"run_dummy_vision": True}):
+        events.clear()
+        outputs = model(input_ids=input_ids, **eval_kwargs)
+
+        assert events == ["parent"]
+        assert torch.equal(outputs["input_ids"], input_ids)
+
 
 def test_mistral3_vlm_crossencoder_scores_vision_inputs_and_backpropagates():
     config = Mistral3BidirectionalConfig(
