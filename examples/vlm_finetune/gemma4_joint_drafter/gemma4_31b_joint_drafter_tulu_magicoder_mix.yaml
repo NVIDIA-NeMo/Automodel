@@ -143,7 +143,6 @@ freeze_config:
   # The drafter consumes the base's token embeddings via its pre_projection
   # input at EVERY recurrent round, so embeddings must stay trainable for
   # gradient flow from the drafter loss back to the base.
-  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false

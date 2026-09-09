@@ -77,6 +77,12 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  # The mounted offline 4B snapshot omits tokenizer artifacts. The 30B family
+  # checkpoint uses the same tokenizer and 131072-token vocabulary.
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    trust_remote_code: true
   dataset_name: rajpurkar/squad
   split: train
 
@@ -112,15 +118,13 @@ lr_scheduler:
 ci:
   vllm_deploy: true
   recipe_owner: akoumpa  # stanley1208 original committer
-  time: "00:25:00"
+  time: "00:30:00"
   nodes: 1
   checkpoint_robustness:
     vllm_merge_lora: true  # vLLM can't serve LoRA on fused mamba layers; deploy the merged adapter instead
-    kl_threshold: 5e-3
-    hf_kl_threshold: 5e-3
     # tp_size stays at the base value (1): the dense Nemotron-H custom path is FSDP2-only.
-    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+    # Use the same cached family tokenizer for the long parity document.
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     trust_remote_code: true
-    no_check_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
