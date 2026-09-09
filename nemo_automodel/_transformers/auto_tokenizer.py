@@ -116,8 +116,8 @@ class NeMoAutoTokenizer:
         Args:
             pretrained_model_name_or_path: Model identifier or path
             force_default: Legacy flag equivalent to ``tokenizer_backend="nemo_wrapped_auto"``. It may be combined
-                with ``tokenizer_backend=None``, ``"nemo_auto"``, or ``"nemo_wrapped_auto"`` for backward
-                compatibility; when set, it selects the wrapped AutoTokenizer route.
+                with ``tokenizer_backend=None`` or ``"nemo_wrapped_auto"``; contradictory backend selections raise
+                ``ValueError``.
             force_hf: Backward-compatible alias for ``tokenizer_backend="transformers_auto"``.
             tokenizer_backend: Tokenizer loading route. ``"nemo_auto"`` preserves the default NeMo dispatch,
                 ``"nemo_wrapped_auto"`` uses Transformers AutoTokenizer with NeMo's compatibility wrapper while
@@ -134,7 +134,7 @@ class NeMoAutoTokenizer:
             raise ValueError(f"tokenizer_backend must be one of {sorted(valid_backends)}, got {tokenizer_backend!r}")
         if force_default and force_hf:
             raise ValueError("force_default=True and force_hf=True are mutually exclusive.")
-        if force_default and tokenizer_backend not in (None, "nemo_auto", "nemo_wrapped_auto"):
+        if force_default and tokenizer_backend not in (None, "nemo_wrapped_auto"):
             raise ValueError(
                 "force_default=True is equivalent to tokenizer_backend='nemo_wrapped_auto' and cannot be combined "
                 f"with tokenizer_backend={tokenizer_backend!r}."

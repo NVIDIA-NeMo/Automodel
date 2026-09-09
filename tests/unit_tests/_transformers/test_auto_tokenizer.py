@@ -14,8 +14,9 @@
 
 import json
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
-from typing import Any, get_type_hints
 from unittest.mock import patch
 
 import pytest
@@ -90,8 +91,24 @@ class _Ministral3Config:
 
 
 class TestNeMoAutoTokenizerFromPretrained:
-    def test_runtime_return_annotation_resolves_without_eager_transformers_import(self):
-        assert get_type_hints(NeMoAutoTokenizer.from_pretrained)["return"] is Any
+    def test_import_is_lightweight_and_runtime_return_annotation_resolves(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys\n"
+                    "from typing import Any, get_type_hints\n"
+                    "from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer\n"
+                    'assert "transformers" not in sys.modules\n'
+                    'assert get_type_hints(NeMoAutoTokenizer.from_pretrained)["return"] is Any\n'
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
 
     @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_auto"])
     def test_default_preserves_tokenizer_special_token_behavior(self, tokenizer_backend):
@@ -457,7 +474,7 @@ class TestNeMoAutoTokenizerFromPretrained:
 
         assert tokenizer is stub
 
-    @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_auto", "nemo_wrapped_auto"])
+    @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_wrapped_auto"])
     def test_force_default_accepts_compatible_backend_and_selects_wrapped_auto(self, tokenizer_backend):
         stub = _StubHFTokenizer()
         with (
@@ -487,7 +504,7 @@ class TestNeMoAutoTokenizerFromPretrained:
                 tokenizer_backend=tokenizer_backend,
             )
 
-    @pytest.mark.parametrize("tokenizer_backend", ["transformers_auto", "tokenizers"])
+    @pytest.mark.parametrize("tokenizer_backend", ["nemo_auto", "transformers_auto", "tokenizers"])
     def test_force_default_rejects_conflicting_backend(self, tokenizer_backend):
         with pytest.raises(ValueError, match="force_default=True"):
             NeMoAutoTokenizer.from_pretrained(

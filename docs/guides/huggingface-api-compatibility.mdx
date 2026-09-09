@@ -13,11 +13,11 @@ This page summarizes Hugging Face compatibility in NeMo AutoModel, outlines key 
 
 ## Transformers Version Compatibility
 
-NeMo AutoModel defaults to Hugging Face Transformers v5 while maintaining interoperability with v4 environments to balance access to new models with downstream stability.
+NeMo AutoModel defaults to Hugging Face Transformers v5. Saved checkpoints and tokenizer artifacts target Transformers v5 and later unless you opt into an experimental compatibility path.
 
 ### Transformers v5 Support
 
-NeMo AutoModel currently pins Hugging Face Transformers to the v5 major line (see `pyproject.toml`, currently `transformers==5.5.0`).
+NeMo AutoModel currently pins Hugging Face Transformers to the v5 major line. Refer to `pyproject.toml` for the exact version.
 
 This means:
 
@@ -26,16 +26,16 @@ This means:
 
 ### Transformers v4 Interoperability
 
-Some downstream environments may still run Transformers v4, while NeMo AutoModel development and tests now target Transformers v5.
+Some downstream environments may still run Transformers v4. NeMo AutoModel development, tests, and default saved artifacts target Transformers v5 and later.
 
 NeMo AutoModel keeps v4 interoperability where practical:
 
 - **Compatibility shims**: Apply small compatibility patches automatically through built-in recipes to smooth over known API differences (for example, cache utility method names).
 - **Code backports**: Vendor or backport Hugging Face code for specific model families to allow users to run models even if their upstream integration has changed between major Transformers releases.
-- **Stable artifact format**: Write checkpoints in Hugging Face-compatible `save_pretrained` layouts (config, tokenizer, and safetensors) for standard loading APIs and non-Transformers tools.
+- **Artifact format**: Write checkpoints in Hugging Face-compatible `save_pretrained` layouts (config, tokenizer, and safetensors). Default exports target Transformers v5 and later.
 
 <Note>
-If you need to consume NeMo AutoModel-produced consolidated checkpoints in a Transformers v4 environment, validate that specific model family and downstream tool path. For details on the checkpoint layouts, see [Checkpointing](/development/checkpointing).
+The experimental `checkpoint.v4_compatible` option preserves selected v4 metadata, but compatibility remains model- and artifact-specific. Validate that path before using a consolidated checkpoint in a v4 environment. For checkpoint layouts, refer to [Checkpointing](/development/checkpointing).
 
 </Note>
 
@@ -259,7 +259,7 @@ tok = NeMoAutoTokenizer.from_pretrained(
 
 The legacy `force_default=True` option is equivalent to `tokenizer_backend="nemo_wrapped_auto"`, and
 `force_hf=True` is equivalent to `tokenizer_backend="transformers_auto"`.
-Contradictory route selections raise `ValueError` instead of silently choosing one.
+Equivalent legacy flags and explicit routes can be combined. Contradictory route selections raise `ValueError`.
 
 ## Save Checkpoints in NeMo AutoModel and Load Everywhere
 
