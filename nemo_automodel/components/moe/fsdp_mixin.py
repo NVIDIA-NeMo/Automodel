@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Iterator, Optional
+import logging
+from typing import Any, Callable, Iterator
 
 import torch
 from torch.distributed.fsdp import FSDPModule, fully_shard
@@ -21,9 +22,28 @@ from torch.distributed.pipelining._backward import stage_backward, stage_backwar
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.models.common.utils import get_is_optim_step
+from nemo_automodel.shared.multimodal_fsdp import iter_multimodal_modules
+
+logger = logging.getLogger(__name__)
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
+    """Yield every FSDP unit whose backward state this mixin must drive, deduplicated.
+
+    A unit that is not yielded here never receives ``set_is_last_backward`` /
+    ``set_reshard_after_backward`` / ``set_requires_gradient_sync``, so it drops
+    out of the gradient-accumulation state machine and, under pipeline
+    parallelism, out of ``patched_backward_maybe_with_nosync``.
+    """
+    seen: set[int] = set()
+    for candidate in _iter_fsdp_module_candidates(module):
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        yield candidate
+
+
+def _iter_fsdp_module_candidates(module: torch.nn.Module) -> Iterator[FSDPModule]:
     if isinstance(module, FSDPModule):
         yield module
 
@@ -40,12 +60,20 @@ def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
     if hasattr(module, "lm_head") and isinstance(module.lm_head, FSDPModule):
         yield module.lm_head
 
-    # TODO: properly handle all possible multimodal component names
-    if hasattr(module, "audio_tower") and isinstance(module.audio_tower, FSDPModule):
-        yield module.audio_tower
-
-    if hasattr(module, "visual") and isinstance(module.visual, FSDPModule):
-        yield module.visual
+    # Multimodal towers/projectors. ``moe/parallelizer.apply_fsdp`` gives every
+    # recognized *trainable* multimodal module its own FSDP unit, and under the
+    # ``per_layer`` frozen policy it shards their layer containers instead of the
+    # module itself -- so walk the module and its descendants rather than testing
+    # only the top-level attribute. Uses the same shared taxonomy as the
+    # parallelizer so unit creation and unit enumeration cannot drift apart:
+    # e.g. Kimi-K2.5-VL LoRA (`examples/vlm_benchmark/kimi/kimi25vl_lora.yaml`,
+    # target_modules ["*"] -> trainable vision_tower, wrap_outer_model=false, pp_size 4)
+    # previously created a vision_tower root that this function never found.
+    for _, mm_module in iter_multimodal_modules(module):
+        subs = mm_module.modules() if isinstance(mm_module, torch.nn.Module) else (mm_module,)
+        for sub in subs:
+            if isinstance(sub, FSDPModule):
+                yield sub
 
     # Check experts in each layer (Qwen-style: block.mlp.experts; Gemma4-style: block.moe.experts)
     if hasattr(_model, "layers"):
@@ -87,11 +115,37 @@ def _configure_fsdp_module(
 
 
 def _run_post_backward_hooks(fsdp_module: FSDPModule) -> Callable:
+    """Run post-backward for every FSDP state and return the root final callback.
+
+    Both the per-state ``post_backward()`` calls and the returned callback
+    tolerate FSDP modules that never ran forward in this step. With
+    ``FusedLinearCrossEntropy`` under pipeline parallelism the ``lm_head``
+    weight is consumed inside the loss function, so its FSDP module never
+    runs forward and its ``FSDPCommContext`` is never lazily initialized;
+    ``post_backward()`` then raises ``AttributeError`` (``'FSDPCommContext'
+    object has no attribute 'post_forward_order'``). A never-forwarded group
+    has no gradients to reduce, so it is safe to skip.
+    """
     fsdp_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
     for state in fsdp_state._state_ctx.all_states:
         if state._fsdp_param_group:
-            state._fsdp_param_group.post_backward()
-    return fsdp_state._root_post_backward_final_callback
+            try:
+                state._fsdp_param_group.post_backward()
+            except AttributeError as exc:
+                if "post_forward_order" not in str(exc):
+                    raise
+                logger.debug("Skipping post_backward for never-forwarded FSDP group: %s", exc)
+                continue
+
+    def _final_callback() -> None:
+        try:
+            fsdp_state._root_post_backward_final_callback()
+        except AttributeError as exc:
+            if "post_forward_order" not in str(exc):
+                raise
+            logger.debug("Skipping root post-backward callback for never-forwarded FSDP root: %s", exc)
+
+    return _final_callback
 
 
 class MoEFSDPSyncMixin:
@@ -198,7 +252,7 @@ def patched_backward_maybe_with_nosync(
     backward_type,
     bwd_kwargs: dict,
     last_backward: bool = False,
-) -> tuple[tuple[Optional[torch.Tensor], ...], Optional[list[dict[str, Any]]]]:
+) -> tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]] | None]:
     """
     Whether using PP with FSDP or DDP, there are some runtime differences between the last backward step and the
     other steps.  Namely, we need to accumulate gradients on previous steps and reduce them on the last step, but
@@ -210,7 +264,7 @@ def patched_backward_maybe_with_nosync(
         backward_type,
     ) -> Callable[
         [],
-        tuple[tuple[Optional[torch.Tensor], ...], Optional[list[dict[str, Any]]]],
+        tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]] | None],
     ]:
         if backward_type == "full":
             return lambda: (

@@ -30,7 +30,7 @@ module never pulls in vLLM.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Sequence
 
 import torch
 
@@ -49,8 +49,8 @@ class VLLMEagle3TargetModel(RunnerEagle3TargetModel):
         cls,
         model_path: str,
         *,
-        aux_layer_ids: Optional[Sequence[int]] = None,
-        dtype: Optional[torch.dtype] = None,
+        aux_layer_ids: Sequence[int] | None = None,
+        dtype: torch.dtype | None = None,
         tp_size: int = 1,
         trust_remote_code: bool = False,
         **vllm_kwargs,

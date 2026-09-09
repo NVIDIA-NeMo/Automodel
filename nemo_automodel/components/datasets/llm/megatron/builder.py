@@ -20,7 +20,7 @@ import os
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, Iterable, List, Tuple, Type, Union
 
 import numpy
 import torch
@@ -53,7 +53,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         self,
         datasets: List[GPTDataset],
         weights: List[Union[int, float]],
-        size: Optional[int],
+        size: int | None,
         config: GPTDatasetConfig,
     ) -> None:
         assert len(datasets) == len(weights)
@@ -223,7 +223,7 @@ class BlendedMegatronDatasetBuilder:
         sizes: list[int],
         is_built_on_rank: Callable,
         config: GPTDatasetConfig,
-        enabled_splits: Optional[list[str]] = None,
+        enabled_splits: list[str] | None = None,
     ):
         self.sizes = sizes
         self.is_built_on_rank = is_built_on_rank
@@ -240,7 +240,7 @@ class BlendedMegatronDatasetBuilder:
             if gb_rank == 0:
                 assert self.is_built_on_rank(), "is_built_on_rank must return True when global rank = 0"
 
-    def build(self) -> List[Optional[GPTDataset]]:
+    def build(self) -> List[GPTDataset | None]:
         """Build all dataset splits according to the provided blend(s)
 
         This method is distributed-aware and must be called on all ranks.
@@ -299,7 +299,7 @@ class BlendedMegatronDatasetBuilder:
 
         return datasets
 
-    def _build_blended_dataset_splits(self) -> List[Optional[GPTDataset]]:
+    def _build_blended_dataset_splits(self) -> List[GPTDataset | None]:
         """Build all dataset splits according to the provided blend(s)
 
         See the BlendedMegatronDatasetBuilder.build alias for more information.
@@ -463,11 +463,11 @@ class BlendedMegatronDatasetBuilder:
 
     def _build_megatron_dataset_splits(
         self,
-        dataset_path: Optional[str],
+        dataset_path: str | None,
         split: List[float],
         sizes: List[int],
         synchronize_ranks: bool = True,
-    ) -> List[Optional[GPTDataset]]:
+    ) -> List[GPTDataset | None]:
         """Build each MidLevelDataset split from a single LowLevelDataset
 
         Args:
@@ -529,7 +529,7 @@ class BlendedMegatronDatasetBuilder:
 
     def _build_megatron_datasets_parallel(
         self, prefixes: List[str], split: List[float], sizes_per_dataset: List[List[int]]
-    ) -> List[List[Optional[GPTDataset]]]:
+    ) -> List[List[GPTDataset | None]]:
         """Build the megatron datasets for a list of prefixes in parallel
 
         Args:
@@ -547,7 +547,7 @@ class BlendedMegatronDatasetBuilder:
 
         # Helper function to wrap the threading logic
         def _threading_helper(
-            megatron_datasets: List[List[Optional[GPTDataset]]],
+            megatron_datasets: List[List[GPTDataset | None]],
             num_workers: int,
             prefixes: List[str],
             split: List[float],
@@ -611,7 +611,7 @@ class BlendedMegatronDatasetBuilder:
         is_built_on_rank: Callable,
         synchronize_ranks: bool,
         *args: Any,
-    ) -> Optional[Union[GPTDataset | BlendedDataset, Iterable]]:
+    ) -> Union[GPTDataset | BlendedDataset, Iterable] | None:
         """Build the GPTDataset or BlendedDataset
 
         Return None if and only if the underlying dataset class is not built on the current rank
@@ -674,7 +674,7 @@ class BlendedMegatronDatasetBuilder:
         name_map = {Split.train.value: "train", Split.valid.value: "validation", Split.test.value: "test"}
         return name_map.get(idx) in self.enabled_splits_names
 
-    def _masked_split_matrix(self, split_matrix: List[Optional[tuple]]) -> List[Optional[tuple]]:
+    def _masked_split_matrix(self, split_matrix: List[tuple | None]) -> List[tuple | None]:
         """Mask splits that are not enabled by setting their bookends to None.
 
         This preserves the original split ratios while skipping construction for disabled splits.

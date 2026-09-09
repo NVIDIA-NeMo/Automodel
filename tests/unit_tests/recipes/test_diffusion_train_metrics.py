@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion import train as diffusion_train
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
@@ -28,7 +30,7 @@ from nemo_automodel.recipes.diffusion.train import (
     _calculate_throughput_metrics,
     _count_local_batch_group_samples,
     _get_diffusion_microbatch_size,
-    build_model_and_optimizer,
+    build_diffusion_pipeline,
 )
 
 
@@ -93,90 +95,6 @@ def test_calculate_throughput_metrics_clamps_invalid_inputs():
     assert metrics["samples_per_step"] == pytest.approx(0.0)
     assert metrics["log_window_steps"] == pytest.approx(0.0)
     assert metrics["log_window_samples"] == pytest.approx(0.0)
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("bf16", torch.bfloat16),
-        ("torch.float32", torch.float32),
-        ("unknown", "unknown"),
-        (0.125, 0.125),
-    ],
-)
-def test_normalize_optimizer_value_converts_dtype_aliases(value, expected):
-    assert diffusion_train._normalize_optimizer_value(value) == expected
-
-
-def test_resolve_optimizer_class_handles_default_callable_and_imported_targets(monkeypatch):
-    class CustomOptimizer:
-        pass
-
-    def fake_safe_import_from(module_name, symbol_name, msg):
-        assert module_name == "custom.optim"
-        assert symbol_name == "CustomOptimizer"
-        assert "custom.optim.CustomOptimizer" in msg
-        return True, CustomOptimizer
-
-    monkeypatch.setattr(diffusion_train, "safe_import_from", fake_safe_import_from)
-
-    assert diffusion_train._resolve_optimizer_class("torch.optim.AdamW") is torch.optim.AdamW
-    assert diffusion_train._resolve_optimizer_class(CustomOptimizer) is CustomOptimizer
-    assert diffusion_train._resolve_optimizer_class("custom.optim.CustomOptimizer") is CustomOptimizer
-
-
-@pytest.mark.parametrize("target", ["AdamW", object()])
-def test_resolve_optimizer_class_rejects_invalid_targets(target):
-    with pytest.raises(ValueError, match="Optimizer target must be"):
-        diffusion_train._resolve_optimizer_class(target)
-
-
-def test_resolve_optimizer_class_raises_when_import_fails(monkeypatch):
-    monkeypatch.setattr(diffusion_train, "safe_import_from", lambda *_args, **_kwargs: (False, None))
-
-    with pytest.raises(ImportError, match="could not be imported"):
-        diffusion_train._resolve_optimizer_class("missing.optim.CustomOptimizer")
-
-
-def test_filter_optimizer_kwargs_keeps_only_supported_parameters():
-    class OptimizerWithoutKwargs:
-        def __init__(self, params, lr=0.1, *, beta=0.9):
-            self.params = params
-            self.lr = lr
-            self.beta = beta
-
-    optimizer_kwargs = {"lr": 0.01, "beta": 0.95, "weight_decay": 0.1}
-
-    assert diffusion_train._filter_optimizer_kwargs(
-        "custom.OptimizerWithoutKwargs", OptimizerWithoutKwargs, optimizer_kwargs
-    ) == {"lr": 0.01, "beta": 0.95}
-
-
-def test_filter_optimizer_kwargs_passes_all_kwargs_when_target_accepts_var_kwargs():
-    class OptimizerWithKwargs:
-        def __init__(self, params, **kwargs):
-            self.params = params
-            self.kwargs = kwargs
-
-    optimizer_kwargs = {"lr": 0.01, "weight_decay": 0.1}
-
-    assert (
-        diffusion_train._filter_optimizer_kwargs("custom.OptimizerWithKwargs", OptimizerWithKwargs, optimizer_kwargs)
-        is optimizer_kwargs
-    )
-
-
-def test_filter_optimizer_kwargs_passes_all_kwargs_when_signature_cannot_be_inspected(monkeypatch):
-    optimizer_kwargs = {"lr": 0.01, "weight_decay": 0.1}
-
-    def raise_value_error(_target):
-        raise ValueError("no signature")
-
-    monkeypatch.setattr(diffusion_train.inspect, "signature", raise_value_error)
-
-    assert (
-        diffusion_train._filter_optimizer_kwargs("custom.NoSignature", object(), optimizer_kwargs) is optimizer_kwargs
-    )
 
 
 def test_build_transformer_engine_fp8_recipe_dispatches_recipe_names(monkeypatch):
@@ -301,25 +219,33 @@ def _minimal_diffusion_recipe_cfg(
     adapter_type="hunyuan",
     attention_backend="flash_varlen",
     optimize_hunyuan_flash_varlen_mask=True,
+    fsdp=None,
+    checkpoint=None,
+    val_every_steps=None,
 ):
-    return ConfigNode(
-        {
-            "model": {
-                "pretrained_model_name_or_path": "dummy-model",
-                "attention_backend": attention_backend,
-                "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
-            },
-            "flow_matching": {"adapter_type": adapter_type},
-            "optim": {"learning_rate": 1.0e-4},
-            "performance": {},
-            "step_scheduler": {
-                "num_epochs": 1,
-                "local_batch_size": 1,
-                "global_batch_size": 1,
-                "ckpt_every_steps": 1,
-            },
-        }
-    )
+    cfg = {
+        "model": {
+            "pretrained_model_name_or_path": "dummy-model",
+            "attention_backend": attention_backend,
+            "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
+        },
+        "flow_matching": {"adapter_type": adapter_type},
+        "optimizer": {"_target_": "torch.optim.AdamW", "lr": 1.0e-4},
+        "performance": {},
+        "step_scheduler": {
+            "num_epochs": 1,
+            "local_batch_size": 1,
+            "global_batch_size": 1,
+            "ckpt_every_steps": 1,
+        },
+    }
+    if fsdp is not None:
+        cfg["fsdp"] = fsdp
+    if checkpoint is not None:
+        cfg["checkpoint"] = checkpoint
+    if val_every_steps is not None:
+        cfg["step_scheduler"]["val_every_steps"] = val_every_steps
+    return ConfigNode(cfg)
 
 
 def _patch_lightweight_diffusion_recipe_setup(monkeypatch):
@@ -346,8 +272,8 @@ def test_diffusion_recipe_validates_hunyuan_flash_varlen_mask_requirements(
     expected_error,
 ):
     _patch_lightweight_diffusion_recipe_setup(monkeypatch)
-    build_model_and_optimizer_mock = MagicMock()
-    monkeypatch.setattr(diffusion_train, "build_model_and_optimizer", build_model_and_optimizer_mock)
+    build_diffusion_pipeline_mock = MagicMock()
+    monkeypatch.setattr(diffusion_train, "build_diffusion_pipeline", build_diffusion_pipeline_mock)
 
     recipe = TrainDiffusionRecipe(
         _minimal_diffusion_recipe_cfg(adapter_type=adapter_type, attention_backend=attention_backend)
@@ -356,15 +282,15 @@ def test_diffusion_recipe_validates_hunyuan_flash_varlen_mask_requirements(
     with pytest.raises(ValueError, match=expected_error):
         recipe.setup()
 
-    build_model_and_optimizer_mock.assert_not_called()
+    build_diffusion_pipeline_mock.assert_not_called()
 
 
 def test_diffusion_recipe_raises_when_hunyuan_flash_varlen_mask_optimization_fails(monkeypatch):
     _patch_lightweight_diffusion_recipe_setup(monkeypatch)
     monkeypatch.setattr(
         diffusion_train,
-        "build_model_and_optimizer",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), object(), None)),
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
     )
 
     from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
@@ -384,8 +310,8 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
     _patch_lightweight_diffusion_recipe_setup(monkeypatch)
     monkeypatch.setattr(
         diffusion_train,
-        "build_model_and_optimizer",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), object(), None)),
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
     )
 
     from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
@@ -399,6 +325,61 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
         recipe.setup()
 
     enable_optimization.assert_called_once_with()
+
+
+def test_diffusion_recipe_reseeds_rng_by_dp_rank_when_cp_enabled(monkeypatch):
+    """With cp_size > 1 all CP peers must draw identical noise/timesteps: the
+    recipe re-seeds every RNG with seed + dp_rank (unranked) after the mesh is
+    built, so CP peers match while DP ranks stay decorrelated."""
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+    )
+    init_all_rng = MagicMock()
+    monkeypatch.setattr(diffusion_train, "init_all_rng", init_all_rng)
+
+    recipe = TrainDiffusionRecipe(
+        _minimal_diffusion_recipe_cfg(
+            adapter_type="simple",
+            attention_backend=None,
+            optimize_hunyuan_flash_varlen_mask=False,
+            fsdp={"cp_size": 2},
+        )
+    )
+
+    with pytest.raises(ValueError, match="checkpoint config is required"):
+        recipe.setup()
+
+    assert recipe.cp_size == 2
+    # dist is not initialized in the harness, so dp_rank resolves to 0.
+    init_all_rng.assert_called_once_with(recipe.seed + 0, ranked=False)
+
+
+def test_diffusion_recipe_does_not_reseed_rng_without_cp(monkeypatch):
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+    )
+    init_all_rng = MagicMock()
+    monkeypatch.setattr(diffusion_train, "init_all_rng", init_all_rng)
+
+    recipe = TrainDiffusionRecipe(
+        _minimal_diffusion_recipe_cfg(
+            adapter_type="simple",
+            attention_backend=None,
+            optimize_hunyuan_flash_varlen_mask=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="checkpoint config is required"):
+        recipe.setup()
+
+    assert recipe.cp_size == 1
+    init_all_rng.assert_not_called()
 
 
 class _TinyTransformer(nn.Module):
@@ -508,7 +489,7 @@ def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
     }
 
 
-def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(monkeypatch):
+def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
     manager = SimpleNamespace(device_mesh="mesh")
     calls = {}
@@ -525,10 +506,9 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
     )
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
-    _, optimizer, device_mesh = build_model_and_optimizer(
+    built_pipe, device_mesh = build_diffusion_pipeline(
         model_id="dummy-model",
         finetune_mode=True,
-        learning_rate=0.125,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
         fsdp_cfg={
@@ -549,14 +529,6 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
         transformer_engine_fp8_safe_only=True,
         fuse_qkv_projections=True,
         compact_fused_qkv_projections=True,
-        optimizer_cfg={
-            "weight_decay": 0.25,
-            "betas": [0.8, 0.95],
-            "eps": 1e-7,
-            "amsgrad": True,
-            "foreach": False,
-            "maximize": True,
-        },
     )
 
     manager_args = calls["parallel_scheme"]["transformer"]
@@ -574,18 +546,14 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
     assert calls["transformer_engine_fp8_safe_only"] is True
     assert calls["fuse_qkv_projections"] is True
     assert calls["compact_fused_qkv_projections"] is True
-    assert pipe.transformer.attention_backend == "flash"
+    # attention_backend is forwarded to from_pretrained, which applies it via
+    # set_attention_backend before sharding (required for context parallelism).
+    assert calls["attention_backend"] == "flash"
+    assert built_pipe is pipe
     assert device_mesh == "mesh"
-    assert optimizer.defaults["lr"] == pytest.approx(0.125)
-    assert optimizer.defaults["weight_decay"] == pytest.approx(0.25)
-    assert optimizer.defaults["betas"] == (0.8, 0.95)
-    assert optimizer.defaults["eps"] == pytest.approx(1e-7)
-    assert optimizer.defaults["amsgrad"] is True
-    assert optimizer.defaults["foreach"] is False
-    assert optimizer.defaults["maximize"] is True
 
 
-def test_build_model_and_optimizer_rejects_foreach_and_fused_together(monkeypatch):
+def test_build_diffusion_pipeline_raises_when_lora_params_missing(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
     manager = SimpleNamespace(device_mesh=None)
 
@@ -594,16 +562,17 @@ def test_build_model_and_optimizer_rejects_foreach_and_fused_together(monkeypatc
         "from_pretrained",
         staticmethod(lambda *_args, **_kwargs: (pipe, {"transformer": manager})),
     )
+    monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
-    with pytest.raises(ValueError, match="foreach=True and fused=True"):
-        build_model_and_optimizer(
+    with pytest.raises(RuntimeError, match="no LoRA params found"):
+        build_diffusion_pipeline(
             model_id="dummy-model",
             finetune_mode=True,
-            learning_rate=0.125,
             device=torch.device("cpu"),
             dtype=torch.bfloat16,
             fsdp_cfg={"dp_size": 1},
-            optimizer_cfg={"foreach": True, "fused": True},
+            peft_cfg=SimpleNamespace(dim=4, alpha=8),
+            model_type="wan",
         )
 
 
@@ -691,11 +660,13 @@ class _FakeProgressBar:
 
 
 class _FakeStepScheduler:
-    def __init__(self, batch_group):
+    def __init__(self, batch_group, is_val_step=False):
         self.step = 0
         self.epochs = [0]
         self.dataloader = None
         self.is_ckpt_step = False
+        self.is_val_step = is_val_step
+        self.log_remote_every_steps = 1
         self._batch_group = batch_group
 
     def __iter__(self):
@@ -722,24 +693,30 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
     monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    sync_ctx_mock = MagicMock(wraps=diffusion_train.get_sync_ctx)
+    monkeypatch.setattr(diffusion_train, "get_sync_ctx", sync_ctx_mock)
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(diffusion_train, "is_main_process", lambda: True)
     monkeypatch.setattr(diffusion_train.wandb, "run", None, raising=False)
 
+    recipe.dist_env = SimpleNamespace(is_main=True)
     recipe.global_batch_size = 5
     recipe.local_batch_size = 2
     recipe.num_nodes = 1
     recipe.dp_size = 1
+    recipe.cp_size = 1
     recipe.world_size = 1
     recipe.num_epochs = 1
     recipe.sampler = SimpleNamespace(set_epoch=MagicMock())
     recipe.dataloader = [object()]
     recipe.step_scheduler = _FakeStepScheduler(batch_group)
-    recipe.optimizer = SimpleNamespace(
-        zero_grad=MagicMock(),
-        step=MagicMock(),
-        param_groups=[{"lr": 0.01}],
-    )
+    recipe.val_dataloader = None
+    recipe.optimizer = [
+        SimpleNamespace(
+            zero_grad=MagicMock(),
+            step=MagicMock(),
+            param_groups=[{"lr": 0.01}],
+        )
+    ]
     recipe.lr_scheduler = [SimpleNamespace(step=MagicMock())]
     recipe.model = model
     recipe.device = torch.device("cpu")
@@ -747,9 +724,10 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.check_loss = True
     recipe.clip_grad_max_norm = 0.5
     recipe.grad_clip_foreach = False
+    recipe.defer_fsdp_grad_sync = True
     recipe.transformer_engine_fp8 = False
+    recipe._autocast_dtype = None
     recipe.peft_cfg = None
-    recipe.log_every = 1
     recipe._elapsed_seconds_since = MagicMock(return_value=(2.0, 10.0))
     recipe._count_global_samples = MagicMock(return_value=5)
     recipe._get_memory_metrics = MagicMock(
@@ -776,9 +754,13 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     diffusion_train.prepare_for_grad_accumulation.assert_called_once_with([model], pp_enabled=False)
     diffusion_train.prepare_for_final_backward.assert_called_once_with([model], pp_enabled=False)
     diffusion_train.prepare_after_first_microbatch.assert_called_once()
+    assert sync_ctx_mock.call_args_list == [
+        call(model, False, defer_fsdp_grad_sync=True),
+        call(model, True, defer_fsdp_grad_sync=True),
+    ]
     diffusion_train.clip_grad_norm.assert_called_once_with(0.5, [model], foreach=False)
-    recipe.optimizer.zero_grad.assert_called_once_with(set_to_none=True)
-    recipe.optimizer.step.assert_called_once()
+    recipe.optimizer[0].zero_grad.assert_called_once_with(set_to_none=True)
+    recipe.optimizer[0].step.assert_called_once()
     recipe.lr_scheduler[0].step.assert_called_once_with(1)
     recipe._count_global_samples.assert_called_once_with(5)
     recipe.save_checkpoint.assert_not_called()
@@ -792,3 +774,286 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
         "s/s": "2.5",
         "s/s/gpu": "2.50",
     }
+
+
+class _FakeValidationPipeline:
+    """Flow-matching stub recording how each validation batch was executed."""
+
+    def __init__(self, losses):
+        self.losses = list(losses)
+        self.calls = 0
+        self.grad_enabled = []
+        self.model_was_training = []
+        self.random_draws = []
+        self.autocast_dtypes = []
+
+    def step(self, *, model, batch, device, dtype, global_step, collect_metrics, check_loss):
+        self.grad_enabled.append(torch.is_grad_enabled())
+        self.model_was_training.append(model.training)
+        self.autocast_dtypes.append(
+            torch.get_autocast_dtype(device.type) if torch.is_autocast_enabled(device.type) else None
+        )
+        # Flow matching draws timesteps and noise per step; record the draw to check repeatability.
+        self.random_draws.append(float(torch.rand(())))
+        self.calls += 1
+        return None, self.losses[(self.calls - 1) % len(self.losses)], None, {}
+
+
+def _make_validation_recipe(losses, num_batches=2, dp_rank=0):
+    recipe = object.__new__(TrainDiffusionRecipe)
+    recipe.model = nn.Linear(1, 1)
+    recipe.model.train()
+    recipe.device = torch.device("cpu")
+    recipe.compute_dtype = torch.float32
+    recipe._autocast_dtype = None
+    recipe.seed = 1234
+    recipe._get_dp_rank = MagicMock(return_value=dp_rank)
+    recipe.val_dataloader = [{"video_latents": torch.zeros(1, 1)} for _ in range(num_batches)]
+    recipe.flow_matching_pipeline = _FakeValidationPipeline(losses)
+    return recipe
+
+
+class _StopSetupAfterDataloaders(Exception):
+    """Ends ``setup()`` right after the dataloader section; the rest needs a real model."""
+
+
+def _patch_setup_dataloaders(monkeypatch, *, validation_batches=1, with_validation=True):
+    """Run ``setup()`` through the dataloader section with stub typed configs.
+
+    Returns the validation config stub so tests can assert how ``build`` was called.
+    """
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+    )
+
+    validation_config = None
+    if with_validation:
+        validation_config = SimpleNamespace(
+            build=MagicMock(
+                return_value=SimpleNamespace(dataloader=[object()] * validation_batches, sampler="val-sampler")
+            )
+        )
+
+    def _stop(self):
+        raise _StopSetupAfterDataloaders
+
+    monkeypatch.setattr(RecipeConfig, "checkpoint", property(lambda self: SimpleNamespace(build=MagicMock())))
+    monkeypatch.setattr(
+        RecipeConfig,
+        "diffusion_dataloader",
+        property(
+            lambda self: SimpleNamespace(
+                build=MagicMock(return_value=SimpleNamespace(dataloader=[object()], sampler="train-sampler"))
+            )
+        ),
+    )
+    monkeypatch.setattr(RecipeConfig, "diffusion_validation_dataloader", property(lambda self: validation_config))
+    monkeypatch.setattr(RecipeConfig, "step_scheduler", property(_stop))
+    return validation_config
+
+
+def _setup_cfg(**kwargs):
+    return _minimal_diffusion_recipe_cfg(
+        adapter_type="simple",
+        attention_backend=None,
+        optimize_hunyuan_flash_varlen_mask=False,
+        checkpoint={"enabled": False},
+        **kwargs,
+    )
+
+
+def test_setup_shards_the_validation_dataloader_like_the_training_one(monkeypatch):
+    validation_config = _patch_setup_dataloaders(monkeypatch)
+    recipe = TrainDiffusionRecipe(_setup_cfg(val_every_steps=5))
+
+    with pytest.raises(_StopSetupAfterDataloaders):
+        recipe.setup()
+
+    # dist is not initialized in the harness, so the data-parallel group is rank 0 of 1.
+    validation_config.build.assert_called_once_with(dp_rank=0, dp_world_size=1, batch_size=1)
+    assert recipe.val_sampler == "val-sampler"
+    assert len(recipe.val_dataloader) == 1
+
+
+def test_setup_rejects_an_empty_validation_dataloader(monkeypatch):
+    _patch_setup_dataloaders(monkeypatch, validation_batches=0)
+    recipe = TrainDiffusionRecipe(_setup_cfg(val_every_steps=5))
+
+    with pytest.raises(RuntimeError, match="Validation dataloader is empty"):
+        recipe.setup()
+
+
+@pytest.mark.parametrize(
+    ("with_validation", "val_every_steps", "expected_warning"),
+    [
+        (True, None, "without step_scheduler.val_every_steps"),
+        (False, 100, "no data.validation_dataloader is configured"),
+    ],
+)
+def test_setup_warns_when_the_loader_and_the_cadence_disagree(
+    monkeypatch, caplog, with_validation, val_every_steps, expected_warning
+):
+    _patch_setup_dataloaders(monkeypatch, with_validation=with_validation)
+    recipe = TrainDiffusionRecipe(_setup_cfg(val_every_steps=val_every_steps))
+
+    with caplog.at_level(logging.WARNING), pytest.raises(_StopSetupAfterDataloaders):
+        recipe.setup()
+
+    assert expected_warning in caplog.text
+
+
+def test_run_validation_epoch_averages_batch_losses_in_eval_mode(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(2.0), torch.tensor(4.0)])
+
+    val_loss = recipe._run_validation_epoch(global_step=7)
+
+    assert val_loss == pytest.approx(3.0)
+    assert recipe.flow_matching_pipeline.grad_enabled == [False, False]
+    assert recipe.flow_matching_pipeline.model_was_training == [False, False]
+    assert recipe.model.training is True
+
+
+def test_run_validation_epoch_runs_under_the_training_autocast(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(2.0)], num_batches=1)
+    # Split-dtype configs leave parameters in model_dtype when FSDP2 skips sharding; the
+    # validation forward needs the same cast the training forward gets.
+    recipe._autocast_dtype = torch.bfloat16
+
+    recipe._run_validation_epoch(global_step=0)
+
+    assert recipe.flow_matching_pipeline.autocast_dtypes == [torch.bfloat16]
+
+
+def test_run_validation_epoch_restores_train_mode_when_a_batch_fails(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(2.0)])
+    recipe.flow_matching_pipeline.step = MagicMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        recipe._run_validation_epoch(global_step=0)
+
+    assert recipe.model.training is True
+
+
+def test_run_validation_epoch_repeats_sampling_and_leaves_training_rng_untouched(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(1.0), torch.tensor(3.0)])
+
+    torch.manual_seed(7)
+    expected_train_draw = float(torch.rand(()))
+
+    torch.manual_seed(7)
+    recipe._run_validation_epoch(global_step=0)
+    first_draws = list(recipe.flow_matching_pipeline.random_draws)
+    train_draw = float(torch.rand(()))
+    recipe.flow_matching_pipeline.random_draws.clear()
+    recipe._run_validation_epoch(global_step=1)
+
+    assert recipe.flow_matching_pipeline.random_draws == first_draws
+    assert train_draw == pytest.approx(expected_train_draw)
+
+
+def test_run_validation_epoch_raises_when_the_loader_yields_no_batches(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(1.0)], num_batches=0)
+
+    with pytest.raises(RuntimeError, match="Validation produced no batches"):
+        recipe._run_validation_epoch(global_step=0)
+
+
+def test_run_validation_epoch_decorrelates_sampling_across_dp_ranks(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    losses = [torch.tensor(1.0), torch.tensor(3.0)]
+    # Ranks hold different shards, so drawing the same timesteps and noise everywhere would
+    # correlate the estimate; training offsets its seed by the data rank for the same reason.
+    rank0 = _make_validation_recipe(losses, dp_rank=0)
+    rank1 = _make_validation_recipe(losses, dp_rank=1)
+
+    rank0._run_validation_epoch(global_step=0)
+    rank1._run_validation_epoch(global_step=0)
+
+    assert rank0.flow_matching_pipeline.random_draws != rank1.flow_matching_pipeline.random_draws
+
+
+def test_run_validation_epoch_reduces_sum_and_count_over_dp_group(monkeypatch):
+    recipe = _make_validation_recipe([torch.tensor(2.0), torch.tensor(4.0)])
+    recipe._get_dp_group = MagicMock(return_value="dp-group")
+    all_reduce_calls = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        all_reduce_calls.append((op, group, tensor.tolist()))
+        # Emulate a second data-parallel rank holding an identical shard.
+        tensor.mul_(2)
+
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(diffusion_train.dist, "get_backend", lambda: "gloo")
+    monkeypatch.setattr(diffusion_train.dist, "all_reduce", fake_all_reduce)
+
+    val_loss = recipe._run_validation_epoch(global_step=0)
+
+    assert all_reduce_calls == [(diffusion_train.dist.ReduceOp.SUM, "dp-group", [6.0, 2.0])]
+    # 12.0 summed loss over 4 summed batches: the mean is invariant to the rank count.
+    assert val_loss == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize("with_val_dataloader", [True, False])
+def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypatch, with_val_dataloader):
+    batch_group = [{"video_latents": torch.zeros(2, 1), "text_embeddings": torch.zeros(2, 1)}]
+
+    monkeypatch.setitem(sys.modules, "tqdm", SimpleNamespace(tqdm=lambda iterable, desc: iterable))
+    monkeypatch.setattr(diffusion_train, "prepare_for_grad_accumulation", MagicMock())
+    monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
+    monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
+    monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
+    wandb_log = MagicMock()
+    monkeypatch.setattr(diffusion_train.wandb, "run", MagicMock(), raising=False)
+    monkeypatch.setattr(diffusion_train.wandb, "log", wandb_log, raising=False)
+
+    recipe = object.__new__(TrainDiffusionRecipe)
+    recipe.dist_env = SimpleNamespace(is_main=True)
+    recipe.global_batch_size = 2
+    recipe.local_batch_size = 2
+    recipe.num_nodes = 1
+    recipe.dp_size = 1
+    recipe.cp_size = 1
+    recipe.world_size = 1
+    recipe.num_epochs = 1
+    recipe.sampler = None
+    recipe.dataloader = [object()]
+    recipe.step_scheduler = _FakeStepScheduler(batch_group, is_val_step=True)
+    recipe.optimizer = [SimpleNamespace(zero_grad=MagicMock(), step=MagicMock(), param_groups=[{"lr": 0.01}])]
+    recipe.lr_scheduler = None
+    recipe.model = nn.Linear(1, 1)
+    recipe.device = torch.device("cpu")
+    recipe.compute_dtype = torch.float32
+    recipe.check_loss = False
+    recipe.clip_grad_max_norm = 0.5
+    recipe.grad_clip_foreach = False
+    recipe.defer_fsdp_grad_sync = True
+    recipe.transformer_engine_fp8 = False
+    recipe._autocast_dtype = None
+    recipe.peft_cfg = None
+    recipe._elapsed_seconds_since = MagicMock(return_value=(2.0, 10.0))
+    recipe._count_global_samples = MagicMock(return_value=2)
+    recipe._get_memory_metrics = MagicMock(return_value={"mem": 0.0, "max_memory_allocated_gb": 0.0})
+    recipe.save_checkpoint = MagicMock()
+    recipe.val_dataloader = [{"video_latents": torch.zeros(1, 1)}] if with_val_dataloader else None
+    recipe._run_validation_epoch = MagicMock(return_value=1.25)
+    recipe.flow_matching_pipeline = SimpleNamespace(
+        step=MagicMock(return_value=(None, torch.tensor(2.0, requires_grad=True), None, {}))
+    )
+
+    recipe.run_train_validation_loop()
+
+    if with_val_dataloader:
+        recipe._run_validation_epoch.assert_called_once_with(1)
+        assert call({"val_loss": 1.25}, step=1) in wandb_log.call_args_list
+    else:
+        recipe._run_validation_epoch.assert_not_called()
+        assert all(call_args.args[0].keys() != {"val_loss"} for call_args in wandb_log.call_args_list)

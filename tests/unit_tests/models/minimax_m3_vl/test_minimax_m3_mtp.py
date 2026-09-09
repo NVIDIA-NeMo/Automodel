@@ -99,6 +99,77 @@ def test_mtp_adapter_roundtrip_and_naming(mtp_model):
         assert torch.allclose(native[key].float(), back[key].float(), atol=1e-6), key
 
 
+def test_mtp_view_loaded_keys_keep_backbone_and_native_mtp_names(mtp_model, monkeypatch):
+    adapter = mtp_model.state_dict_adapter
+    native_backbone = {
+        "model.layers.0.mlp.experts.gate_and_up_projs",
+        "model.layers.0.mlp.experts.down_projs",
+    }
+    temporary_mtp = {
+        "layers.0.mlp.experts.gate_and_up_projs",
+        "layers.0.mlp.experts.down_projs",
+    }
+    native_mtp = {
+        "model.mtp.layers.0.transformer_layer.mlp.experts.gate_and_up_projs",
+        "model.mtp.layers.0.transformer_layer.mlp.experts.down_projs",
+    }
+    model_state = mtp_model.state_dict()
+    native = {key: model_state[key] for key in native_backbone | native_mtp}
+
+    def split_local_experts(weight: torch.Tensor, n_experts: int) -> list[torch.Tensor]:
+        """Expose per-expert views of grouped checkpoint storage.
+
+        Args:
+            weight: Tensor of shape [experts, ...], with arbitrary trailing dimensions.
+            n_experts: Number of experts on the leading axis.
+
+        Returns:
+            List of tensors of shape [...], one view per expert.
+        """
+        adapter._last_expert_ids = list(range(n_experts))
+        return [weight[expert_id] for expert_id in range(n_experts)]
+
+    monkeypatch.setattr(adapter, "_split_experts_weights", split_local_experts)
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.state_dict_utils.is_dtensor",
+        lambda tensor: isinstance(tensor, torch.Tensor) and tensor.ndim == 3,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.state_dict_utils.validate_dtensor_expert_sharding",
+        lambda *args, **kwargs: None,
+    )
+
+    hf = adapter.to_hf(native, for_checkpoint_load=True)
+
+    assert adapter._inplace_loaded_native_keys == native_backbone | temporary_mtp
+    assert any(key.startswith("model.layers.0.block_sparse_moe.experts.") for key in hf)
+    assert any(key.startswith("model.mtp.layers.0.transformer_layer.block_sparse_moe.experts.") for key in hf)
+    with torch.no_grad():
+        for key, destination in hf.items():
+            destination.fill_(3.0 if key.startswith("model.layers.0.") else 7.0)
+    assert torch.all(native["model.layers.0.mlp.experts.gate_and_up_projs"] == 3.0)
+    assert torch.all(native["model.layers.0.mlp.experts.down_projs"] == 3.0)
+    assert torch.all(native["model.mtp.layers.0.transformer_layer.mlp.experts.gate_and_up_projs"] == 7.0)
+    assert torch.all(native["model.mtp.layers.0.transformer_layer.mlp.experts.down_projs"] == 7.0)
+
+    converted = adapter.from_hf(hf)
+
+    assert not native_backbone & converted.keys()
+    assert not native_mtp & converted.keys()
+    assert adapter.view_loaded_native_keys == native_backbone | native_mtp
+    assert adapter._inplace_loaded_native_keys == set()
+
+
+def test_from_hf_preserves_unrecognized_mtp_keys(mtp_model):
+    adapter = mtp_model.state_dict_adapter
+    key = "model.mtp.auxiliary.weight"
+    tensor = torch.randn(4, 4)
+
+    converted = adapter.from_hf({key: tensor})
+
+    assert converted[key] is tensor
+
+
 def test_from_hf_drops_mtp_when_disabled(model):
     """A model without MTP (num_mtp_modules=0) drops any MTP tensors on load."""
     adapter = model.state_dict_adapter

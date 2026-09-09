@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import logging
-from typing import Optional
+from collections.abc import Callable
 
+from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
@@ -33,6 +34,25 @@ from nemo_automodel.components.distributed.parallelizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def fsdp2_sharding_enabled(device_mesh: DeviceMesh) -> bool:
+    """Report whether :meth:`FSDP2Manager.parallelize` shards the model for this mesh.
+
+    Parallelization is skipped on a single-rank world or a single-element mesh, which
+    also skips every side effect of ``fully_shard`` — most importantly the
+    ``MixedPrecisionPolicy`` cast of parameters to the compute dtype. Callers that
+    depend on that cast must check this instead of assuming FSDP2 is active.
+
+    Args:
+        device_mesh: Device mesh the ``FSDP2Manager`` was constructed with.
+
+    Returns:
+        True when ``fully_shard`` is applied, False when parallelization is skipped.
+    """
+    if get_world_size_safe() == 1 or device_mesh.size() == 1:
+        return False
+    return True
 
 
 def _patch_is_packed_sequence_for_training() -> None:
@@ -91,7 +111,7 @@ class FSDP2Manager:
         self,
         config: FSDP2Config,
         device_mesh: DeviceMesh,
-        moe_mesh: Optional[DeviceMesh] = None,
+        moe_mesh: DeviceMesh | None = None,
     ):
         self.config = config
         self.device_mesh = device_mesh
@@ -111,18 +131,25 @@ class FSDP2Manager:
         self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
         self.fsdp2_backward_prefetch_depth = config.fsdp2_backward_prefetch_depth
         self.fsdp2_forward_prefetch_depth = config.fsdp2_forward_prefetch_depth
+        self.frozen_multimodal_sharding = config.multimodal.frozen_sharding
 
-    def parallelize(self, model):
+    def parallelize(
+        self,
+        model: nn.Module,
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
+    ) -> nn.Module:
         """
         Parallelizes the given model using FSDP2 and TP sharding strategies.
 
         Args:
             model (nn.Module): The model to be parallelized.
+            reapply_trainability: Optional callback that re-resolves parameter
+                trainability after model surgery and before FSDP construction.
 
         Returns:
             The parallelized model.
         """
-        if get_world_size_safe() == 1 or self.device_mesh.size() == 1:
+        if not fsdp2_sharding_enabled(self.device_mesh):
             logger.info("World size or FSDP mesh size is 1, skipping parallelization.")
             if self.activation_checkpointing:
                 if is_selective_activation_checkpointing(self.activation_checkpointing):
@@ -149,6 +176,8 @@ class FSDP2Manager:
                         model.gradient_checkpointing_enable()
                     else:
                         apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
+            if reapply_trainability is not None:
+                reapply_trainability(model)
             return model
 
         if self.config.patch_is_packed_sequence:
@@ -169,6 +198,8 @@ class FSDP2Manager:
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
             reshard_after_forward=self.reshard_after_forward,
             activation_checkpointing_scope=self.activation_checkpointing_scope,
+            frozen_multimodal_sharding=self.frozen_multimodal_sharding,
+            reapply_trainability=reapply_trainability,
         )
 
         return model

@@ -222,31 +222,13 @@ def build_dsv4_cp_causal_padding_mask(
 # ---------------------------------------------------------------------------
 # Model-owned CP batch sharding (Miles-style contiguous query shard).
 #
-# main's ``cp_utils.make_cp_batch_and_ctx`` delegates manual all-gather CP to the
-# model via a ``_cp_make_batch_fn`` callable attached to the batch (see Gemma4's
-# ``make_contiguous_shard_cp_batch_and_ctx``). DSV4 attaches the function below:
-# it pads + contiguously shards the sequence per CP rank and hands the CP process
-# group to the forward (``_dsv4_cp_group``) so DSV4 attention can all-gather K/V.
+# ``ContextParallelSharder`` construction delegates manual all-gather CP to the model
+# via the ``ContextParallelSharder`` returned by ``prepare_model_inputs_for_cp``. DSV4's
+# sharder pads + contiguously shards the sequence per CP rank (via the shared
+# contiguous implementation in ``components/distributed/context_parallel/sharder.py``) and
+# hands the CP process group to the forward (``_dsv4_cp_group``) so DSV4
+# attention can all-gather K/V.
 # ---------------------------------------------------------------------------
-
-
-def _pad_tensor_seq_dim_(tensor: torch.Tensor, seq_dim: int, pad_len: int, value) -> torch.Tensor:
-    if pad_len <= 0:
-        return tensor
-    pad_shape = list(tensor.shape)
-    pad_shape[seq_dim] = pad_len
-    pad = torch.full(pad_shape, value, dtype=tensor.dtype, device=tensor.device)
-    return torch.cat((tensor, pad), dim=seq_dim)
-
-
-def _pad_position_ids_seq_dim_(position_ids: torch.Tensor, seq_dim: int, pad_len: int) -> torch.Tensor:
-    if pad_len <= 0:
-        return position_ids
-    last = position_ids.select(seq_dim, position_ids.shape[seq_dim] - 1).unsqueeze(seq_dim)
-    inc_shape = [1] * position_ids.ndim
-    inc_shape[seq_dim] = pad_len
-    inc = torch.arange(1, pad_len + 1, device=position_ids.device, dtype=position_ids.dtype).view(inc_shape)
-    return torch.cat((position_ids, last + inc), dim=seq_dim)
 
 
 def _valid_packed_lengths(row: torch.Tensor, padding_value: int = _SEQ_LENS_PADDING_VALUE) -> list[int]:
@@ -272,7 +254,7 @@ def _repad_dsv4_packed_batch(
     padding_token_id: int,
     sync_packed_length: bool = False,
     loss_mask: torch.Tensor | None = None,
-) -> tuple[dict, torch.Tensor | None]:
+) -> tuple[dict, torch.Tensor | None, torch.Tensor]:
     """Insert DSV4 compression-safe padding into packed BSHD rows before CP slicing.
 
     The generic packed dataset may pad each packed sequence only for TE CP. DSV4
@@ -305,6 +287,10 @@ def _repad_dsv4_packed_batch(
         raise KeyError("DSV4 context parallelism requires `labels` in the batch.")
 
     batch_size = primary.shape[0]
+    # Per-row map from input position to rebuilt-row column (-1 = input pad
+    # slot whose token was dropped); the ContextParallelSharder token verbs restore the
+    # caller's coordinates through it.
+    input_positions = torch.full((batch_size, primary.shape[1]), -1, dtype=torch.long, device=primary.device)
     rebuilt_primary = []
     rebuilt_labels = []
     rebuilt_loss_mask = [] if loss_mask is not None else None
@@ -330,6 +316,7 @@ def _repad_dsv4_packed_batch(
         row_seq_lens = []
         row_padded_lens = []
         old_offset = 0
+        new_offset = 0
 
         for doc_idx, real_len in enumerate(real_lengths):
             old_padded_len = max(padded_lengths[doc_idx], real_len)
@@ -368,9 +355,15 @@ def _repad_dsv4_packed_batch(
                 )
             )
             seq_id_parts.append(torch.full((new_padded_len,), doc_idx + 1, dtype=torch.long, device=primary.device))
+            # Input->output position map for this document's real tokens; the
+            # dropped input pad slots keep -1 (see input_positions init).
+            input_positions[batch_idx, old_offset : old_offset + real_len] = torch.arange(
+                new_offset, new_offset + real_len, device=primary.device
+            )
             row_seq_lens.append(real_len)
             row_padded_lens.append(new_padded_len)
             old_offset += old_padded_len
+            new_offset += new_padded_len
 
         rebuilt_primary.append(torch.cat(primary_parts, dim=0))
         rebuilt_labels.append(torch.cat(label_parts, dim=0))
@@ -425,7 +418,7 @@ def _repad_dsv4_packed_batch(
 
     if loss_mask is not None and rebuilt_loss_mask is not None:
         loss_mask = _right_pad_rows(rebuilt_loss_mask, 0)
-    return batch, loss_mask
+    return batch, loss_mask, input_positions
 
 
 def make_dsv4_contiguous_shard_cp_batch_and_ctx(
@@ -440,8 +433,8 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
 ):
     """Contiguously shard a batch for DeepSeek V4 Miles-style context parallelism.
 
-    Attached to the batch as ``_cp_make_batch_fn`` (via ``functools.partial`` to bind
-    ``pad_multiple``) and invoked by ``cp_utils.make_cp_batch_and_ctx``. HybridEP can
+    Exposed as ``ContextParallelSharder.shard_batch`` (via ``functools.partial`` to bind
+    ``pad_multiple``) and invoked by the CP dispatch. HybridEP can
     first max-reduce packed lengths so every rank contributes a uniform token count.
     Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
     K/V across CP ranks during forward. Returns ``(nullcontext, batch)``.
@@ -454,6 +447,12 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     """
     import contextlib
 
+    from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+        ShardLayout,
+        convert_attention_mask_to_padding_mask,
+        shard_batch_contiguous,
+    )
+
     cp_size = cp_mesh.size()
     packed = batch.get("qkv_format") == "thd" or "seq_lens" in batch or "cu_seqlens" in batch
     if cp_size <= 1:
@@ -463,10 +462,9 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             batch["labels"] = loss_mask
         elif loss_mask is not None:
             batch["loss_mask"] = loss_mask
-        return contextlib.nullcontext, batch
+        return contextlib.nullcontext, batch, None
 
     local_multiple = max(int(pad_multiple or 2), 2)
-    divisor = cp_size * local_multiple
 
     if "cu_seqlens" in batch and "seq_lens" not in batch:
         raise NotImplementedError(
@@ -474,18 +472,12 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             "pre-flattened `cu_seqlens` batches should use the TE CP path."
         )
 
-    # attention_mask -> padding_mask (True == pad) so CP attention can rebuild the
-    # local-query/global-key mask after K/V is all-gathered.
-    attention_mask = batch.pop("attention_mask", None)
-    if attention_mask is not None and "padding_mask" not in batch:
-        if attention_mask.ndim == 4:
-            diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
-            batch["padding_mask"] = diagonal.logical_not() if attention_mask.dtype == torch.bool else diagonal != 0
-        else:
-            batch["padding_mask"] = attention_mask.bool().logical_not()
-
+    input_positions = None
     if packed:
-        batch, loss_mask = _repad_dsv4_packed_batch(
+        # Preserve the packed-document boundaries while the shared contiguous
+        # sharder handles the common padding/slicing mechanics.
+        convert_attention_mask_to_padding_mask(batch)
+        batch, loss_mask, input_positions = _repad_dsv4_packed_batch(
             batch,
             cp_size=cp_size,
             pad_multiple=local_multiple,
@@ -494,75 +486,24 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             loss_mask=loss_mask,
         )
 
-    has_inputs_embeds = "inputs_embeds" in batch
-    has_input_ids = "input_ids" in batch
-    assert has_inputs_embeds ^ has_input_ids, (
-        "make_dsv4_contiguous_shard_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    ctx, batch, layout = shard_batch_contiguous(
+        cp_mesh,
+        tp_mesh,
+        batch,
+        loss_mask=loss_mask,
+        padding_token_id=padding_token_id,
+        pad_multiple=local_multiple,
+        extra_seq_keys={"packed_seq_ids": 1} if packed else None,
+        extra_pad_values={"packed_seq_ids": 0} if packed else None,
     )
-    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
-    seq_len = batch[primary_key].shape[1]
-    batch_size = batch[primary_key].shape[0]
-
-    if "position_ids" not in batch:
-        batch["position_ids"] = (
-            torch.arange(0, seq_len, device=batch[primary_key].device).unsqueeze(0).expand(batch_size, -1).contiguous()
+    if packed:
+        # The repad rebuilt the rows, so no single original length exists; the
+        # caller's coordinates are restored through the position map instead.
+        layout = ShardLayout(
+            padded_seq_len=layout.padded_seq_len,
+            input_token_stream_positions=input_positions,
         )
-    position_ids = batch["position_ids"]
-    pos_seq_dim = 2 if position_ids.ndim == 3 else 1
-
-    labels = batch.get("labels")
-    if labels is None and loss_mask is not None:
-        labels, loss_mask = loss_mask, None
-    if labels is None:
-        raise KeyError("DSV4 context parallelism requires `labels` in the batch, or labels passed as `loss_mask`.")
-
-    pad_len = (-seq_len) % divisor
-    if pad_len:
-        if "input_ids" in batch:
-            batch["input_ids"] = _pad_tensor_seq_dim_(batch["input_ids"], 1, pad_len, padding_token_id)
-        if "inputs_embeds" in batch:
-            batch["inputs_embeds"] = _pad_tensor_seq_dim_(batch["inputs_embeds"], 1, pad_len, 0)
-        labels = _pad_tensor_seq_dim_(labels, 1, pad_len, -100)
-        position_ids = _pad_position_ids_seq_dim_(position_ids, pos_seq_dim, pad_len)
-        batch["position_ids"] = position_ids
-        if "padding_mask" in batch:
-            batch["padding_mask"] = _pad_tensor_seq_dim_(batch["padding_mask"], 1, pad_len, True)
-        if loss_mask is not None:
-            loss_mask = _pad_tensor_seq_dim_(loss_mask, 1, pad_len, 0)
-
-    batch["labels"] = labels
-
-    if dist.is_available() and dist.is_initialized():
-        cp_rank = dist.get_rank(group=cp_mesh.get_group())
-    else:
-        cp_rank = getattr(cp_mesh, "get_local_rank", lambda: 0)()
-
-    seq_len = batch[primary_key].shape[1]
-    if seq_len % cp_size != 0:
-        raise ValueError(
-            f"DSV4 CP sequence length must be divisible by cp_size after padding, got {seq_len=} {cp_size=}"
-        )
-    local_seq_len = seq_len // cp_size
-    seq_start = cp_rank * local_seq_len
-    seq_end = seq_start + local_seq_len
-
-    def _slice_seq(key: str, seq_dim: int = 1) -> None:
-        if key not in batch:
-            return
-        slices = [slice(None)] * batch[key].ndim
-        slices[seq_dim] = slice(seq_start, seq_end)
-        batch[key] = batch[key][tuple(slices)].contiguous()
-
-    _slice_seq("input_ids", 1)
-    _slice_seq("inputs_embeds", 1)
-    _slice_seq("labels", 1)
-    _slice_seq("position_ids", pos_seq_dim)
-    _slice_seq("padding_mask", 1)
-    _slice_seq("packed_seq_ids", 1)
-    if loss_mask is not None:
-        batch["loss_mask"] = loss_mask[:, seq_start:seq_end].contiguous()
-
     # Hand the CP process group to the model forward (read from attn_kwargs) so
     # DSV4 attention all-gathers K/V across CP ranks. Not a tensor -> not sharded.
     batch["_dsv4_cp_group"] = cp_mesh.get_group()
-    return contextlib.nullcontext, batch
+    return ctx, batch, layout

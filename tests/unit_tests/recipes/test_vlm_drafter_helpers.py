@@ -16,7 +16,10 @@
 
 Covers the small additions in ``recipes/vlm/finetune.py``:
   * ``_shift_labels_left`` -- builds drafter-step targets.
-  * ``_is_gemma4_joint_target`` -- detects the composite's classmethod target.
+  * ``_is_recipe_target`` / ``_accepted_targets`` -- allowlist-backed gate
+    that decides whether a YAML ``_target_`` can receive the recipe's
+    infrastructure kwargs. The allowlist is recipe-side (recipes are
+    allowed to import components, but not vice versa).
   * ``FinetuneRecipeForVLM._maybe_add_drafter_loss`` -- adds the
     ``lambda * sum_k CE(drafter_logits[k], shifted_labels_k)`` term to the
     base loss when the model returns a non-empty ``drafter_logits``.
@@ -31,7 +34,8 @@ import torch
 
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
-    _is_gemma4_joint_target,
+    _accepted_targets,
+    _is_recipe_target,
     _shift_labels_left,
 )
 
@@ -130,38 +134,166 @@ class TestShiftLabelsLeft:
         assert out.dtype == labels.dtype
 
 
-class TestIsGemma4JointTarget:
-    """The composite's classmethod is recognized so the recipe's build_model
-    accepts it the same way it accepts the NeMoAutoModel classmethods."""
+class TestIsRecipeTarget:
+    """``_is_recipe_target`` is the gate ``build_model`` uses to decide
+    whether a YAML ``_target_`` can receive the recipe's infrastructure
+    kwargs (``device_mesh``, ``distributed_config``, ``peft_config``,
+    ``freeze_config``, ``pipeline_config``).
+
+    The contract is an explicit recipe-side allowlist
+    (``_accepted_targets()``) populated with the wrapper-layer entrypoints
+    that know how to absorb those kwargs. Components do NOT carry any
+    marker for the recipe -- the allowlist lives entirely in
+    ``recipes/vlm/finetune.py`` so the layering ``recipes/ -> components/``
+    stays one-directional.
+
+    Targets accepted today:
+      * ``NeMoAutoModelForCausalLM.from_pretrained`` / ``.from_config``
+      * ``NeMoAutoModelForImageTextToText.from_pretrained`` / ``.from_config``
+      * ``NeMoAutoModelForMultimodalLM.from_pretrained`` / ``.from_config``
+      * ``Gemma4WithDrafter.from_pretrained`` (optional dep, added lazily)
+    """
 
     def test_none_returns_false(self):
-        assert _is_gemma4_joint_target(None) is False
+        assert _is_recipe_target(None) is False
 
-    def test_unrelated_target_returns_false(self):
-        # Any callable that is clearly not the composite's classmethod.
+    def test_unrelated_class_returns_false(self):
+        """A plain ``nn.Module`` subclass is not an accepted entrypoint."""
         from torch import nn
 
-        assert _is_gemma4_joint_target(nn.Linear) is False
-        assert _is_gemma4_joint_target(lambda: None) is False
+        assert _is_recipe_target(nn.Linear) is False
+
+    def test_lambda_returns_false(self):
+        assert _is_recipe_target(lambda: None) is False
+
+    def test_unrelated_classmethod_returns_false(self):
+        """A classmethod that *looks* like a wrapper entrypoint but isn't
+        on the allowlist must be rejected -- this catches the failure mode
+        where someone points ``_target_`` at, e.g., a raw HF class's
+        ``from_pretrained``."""
+
+        class _Plain:
+            @classmethod
+            def from_pretrained(cls):
+                return cls()
+
+        assert _is_recipe_target(_Plain.from_pretrained) is False
+
+    def test_bare_class_returns_false(self):
+        """The allowlist contains bound classmethods (``.from_pretrained``
+        / ``.from_config``), not bare classes. Pointing ``_target_`` at a
+        bare class is rejected even when that class IS on the allowlist
+        via its classmethods -- forcing YAML configs to use the explicit
+        entrypoint."""
+        from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+
+        assert _is_recipe_target(NeMoAutoModelForCausalLM) is False
 
     def test_composite_classmethod_returns_true(self):
+        """End-to-end check against the real composite class. Also
+        exercises the lazy-import branch of ``_accepted_targets()`` --
+        the composite is added behind a try/except for the optional
+        ``transformers.models.gemma4_assistant`` dep."""
         from nemo_automodel.components.models.gemma4_drafter.composite import (
             Gemma4WithDrafter,
         )
 
-        # Bound classmethods aren't identity-stable; the helper must use
-        # equality, which is why we go through ``in (...)``-style comparison.
-        # Re-access the classmethod to make sure the helper handles the
-        # non-identity case correctly.
-        target = Gemma4WithDrafter.from_pretrained
-        assert _is_gemma4_joint_target(target) is True
-        assert _is_gemma4_joint_target(Gemma4WithDrafter.from_pretrained) is True
+        assert _is_recipe_target(Gemma4WithDrafter.from_pretrained) is True
 
-    def test_subclass_classmethod_does_not_match(self):
-        """Sanity: an unrelated classmethod must not falsely match."""
+    def test_nemo_auto_model_classmethods_return_true(self):
+        """Every ``NeMoAutoModelFor*`` entrypoint the VLM recipe historically
+        accepted is still accepted via the allowlist."""
+        from nemo_automodel._transformers import (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        )
+
+        for cls in (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        ):
+            assert _is_recipe_target(cls.from_pretrained) is True, (
+                f"{cls.__name__}.from_pretrained must pass the recipe-target gate"
+            )
+            assert _is_recipe_target(cls.from_config) is True, (
+                f"{cls.__name__}.from_config must pass the recipe-target gate"
+            )
+
+    def test_bound_classmethod_equality_not_identity(self):
+        """Bound classmethods are not identity-stable across accesses --
+        each ``Cls.from_pretrained`` returns a fresh ``MethodType`` object.
+        Set membership relies on ``__eq__`` / ``__hash__`` (which compare
+        ``(__self__, __func__)``), so the allowlist must accept the
+        classmethod re-accessed independently of how the allowlist was
+        populated. This is the property that makes the plain-set allowlist
+        work."""
         from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 
-        assert _is_gemma4_joint_target(NeMoAutoModelForCausalLM.from_pretrained) is False
+        a = NeMoAutoModelForCausalLM.from_pretrained
+        b = NeMoAutoModelForCausalLM.from_pretrained
+        # Sanity: separate accesses are NOT identity-equal but ARE ==
+        # (this is the language-level invariant the allowlist relies on).
+        assert a is not b
+        assert a == b
+        # Whichever instance we hand to the gate, the answer is the same.
+        assert _is_recipe_target(a) is True
+        assert _is_recipe_target(b) is True
+
+
+class TestAcceptedTargets:
+    """``_accepted_targets`` is the small, explicit recipe-side allowlist
+    that ``_is_recipe_target`` checks against. Locking down the *contents*
+    here protects against silent regressions when someone edits the set."""
+
+    def test_contains_all_nemo_auto_model_entrypoints(self):
+        """Every NeMoAuto wrapper the recipe historically accepted is
+        present, in both ``.from_pretrained`` and ``.from_config`` form."""
+        from nemo_automodel._transformers import (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        )
+
+        targets = _accepted_targets()
+        for cls in (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        ):
+            assert cls.from_pretrained in targets
+            assert cls.from_config in targets
+
+    def test_contains_gemma4_composite_when_dep_available(self):
+        """The composite is added behind a lazy import. When the optional
+        ``transformers.models.gemma4_assistant`` module is importable
+        (which it is in the test environment, see the conftest fixture
+        that gates the gemma4_drafter unit tests), the composite's
+        ``from_pretrained`` must be in the set."""
+        from nemo_automodel.components.models.gemma4_drafter.composite import (
+            Gemma4WithDrafter,
+        )
+
+        assert Gemma4WithDrafter.from_pretrained in _accepted_targets()
+
+    def test_returns_a_set(self):
+        """``_accepted_targets`` returns a ``set`` (not a list / tuple) so
+        the ``in`` check in ``_is_recipe_target`` is O(1) and the call
+        site can rely on set semantics."""
+        assert isinstance(_accepted_targets(), set)
+
+    def test_does_not_contain_vanilla_hf_autoclass(self):
+        """Vanilla ``transformers.AutoModelForCausalLM.from_pretrained``
+        does not absorb the recipe's infrastructure kwargs and must be
+        rejected by the gate. This is the main reason the allowlist
+        exists -- to fail fast at the recipe boundary rather than blow
+        up deep inside HF."""
+        from transformers import AutoModelForCausalLM
+
+        targets = _accepted_targets()
+        assert AutoModelForCausalLM.from_pretrained not in targets
+        assert _is_recipe_target(AutoModelForCausalLM.from_pretrained) is False
 
 
 @dataclass

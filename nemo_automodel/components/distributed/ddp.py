@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
@@ -90,7 +91,11 @@ class DDPManager:
         else:
             self.device = torch.device("cpu")
 
-    def parallelize(self, model):
+    def parallelize(
+        self,
+        model: torch.nn.Module,
+        reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
+    ) -> torch.nn.Module:
         """
         Wraps the given model with DistributedDataParallel (DDP).
 
@@ -99,6 +104,8 @@ class DDPManager:
 
         Args:
             model (torch.nn.Module): The PyTorch model to be wrapped.
+            reapply_trainability: Optional callback that re-resolves parameter
+                trainability after model surgery and before DDP construction.
 
         Returns:
             torch.nn.parallel.DistributedDataParallel: The DDP-wrapped model.
@@ -124,6 +131,8 @@ class DDPManager:
                         model.gradient_checkpointing_enable()
                     else:
                         apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
+            if reapply_trainability is not None:
+                reapply_trainability(model)
             return model
 
         if self.activation_checkpointing:
@@ -152,4 +161,7 @@ class DDPManager:
         if self.bucket_cap_mb is not None:
             ddp_kwargs["bucket_cap_mb"] = self.bucket_cap_mb
 
-        return DDP(model.to(self.device), **ddp_kwargs)
+        model = model.to(self.device)
+        if reapply_trainability is not None:
+            reapply_trainability(model)
+        return DDP(model, **ddp_kwargs)

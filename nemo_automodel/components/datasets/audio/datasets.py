@@ -22,6 +22,7 @@ usable inside environments that do not ship ``torchcodec``.
 
 import io
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,32 @@ import soundfile as sf
 from datasets import Audio, Dataset, load_dataset
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Cv17DatasetConfig:
+    """Construction-time configuration for the CommonVoice 17 dataset."""
+
+    path_or_dataset: str = "ysdede/commonvoice_17_tr_fixed"
+    """HuggingFace dataset id or local path."""
+    split: str = "train"
+    """Dataset split to load."""
+    sampling_rate: int = 16000
+    """Target audio sampling rate in Hz."""
+    audio_column: str = "audio"
+    """Name of the audio column."""
+    text_column: str = "transcription"
+    """Name of the transcript column."""
+
+    def build(self) -> Dataset:
+        """Build the lazily decoded CommonVoice 17 dataset."""
+        return make_cv17_dataset(
+            path_or_dataset=self.path_or_dataset,
+            split=self.split,
+            sampling_rate=self.sampling_rate,
+            audio_column=self.audio_column,
+            text_column=self.text_column,
+        )
 
 
 def make_cv17_dataset(

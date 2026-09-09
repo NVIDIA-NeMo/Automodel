@@ -43,7 +43,6 @@ seed: 42
 
 wandb:
   enable: false
-  entity: joc
   project: dflash-sft
   name: dflash-qwen3-4b-run
 

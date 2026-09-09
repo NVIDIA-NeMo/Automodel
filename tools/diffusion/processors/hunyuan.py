@@ -23,7 +23,7 @@ Handles HunyuanVideo-1.5 video models with:
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -219,7 +219,7 @@ class HunyuanVideoProcessor(BaseVideoProcessor):
         self,
         video_path: str,
         target_size: Tuple[int, int],
-        num_frames: Optional[int] = None,
+        num_frames: int | None = None,
         resize_mode: str = "bilinear",
         center_crop: bool = True,
         **kwargs,

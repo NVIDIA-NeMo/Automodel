@@ -38,11 +38,14 @@ Two training objectives are supported via ``loss_type``:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
 
 from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_block_mask,
@@ -78,20 +81,88 @@ def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
 class NoValidAnchorsError(ValueError):
     """Raised when a batch has no sample long enough to form a DFlash block.
 
-    A DFlash anchor needs at least ``block_size + 1`` supervised tokens (the
-    anchor plus its block). Datasets always contain some short conversations;
-    the training loop catches this and skips the offending micro-batch rather
-    than aborting the run.
+    A DFlash anchor is a supervised position (``loss_mask=1``) that still has a
+    full block ahead of it, i.e. one in ``[0, seq_len - block_size]`` (and, when
+    packing, with at least ``block_size - 1`` further real tokens in its own
+    document). Datasets always contain some short conversations; the training
+    loop catches this and skips the offending micro-batch rather than aborting
+    the run.
     """
 
 
 @dataclass
 class DFlashStepMetrics:
-    """Per-step training outputs for the DFlash draft."""
+    """Per-step training outputs for the DFlash draft.
+
+    Attributes:
+        loss: Scalar tensor containing the differentiable training loss.
+        loss_weight: Scalar tensor containing the effective loss denominator.
+        accuracy: Scalar tensor containing greedy token accuracy.
+        valid_tokens: Scalar tensor containing the supervised-token count.
+        correct_tokens: Scalar tensor containing the greedy-correct token count.
+        accept_len: Scalar tensor containing mean bonus-token-inclusive acceptance length.
+        accept_len_sum: Scalar tensor containing the additive acceptance-length sum.
+        valid_blocks: Scalar tensor containing the number of evaluated draft blocks.
+
+    The count and sum fields retain the additive statistics needed for
+    token-weighted, distributed validation. Averaging ``accuracy`` or
+    ``accept_len`` per micro-batch would bias batches with fewer valid tokens or blocks.
+    """
 
     loss: torch.Tensor
+    loss_weight: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    correct_tokens: torch.Tensor
+    accept_len: torch.Tensor
+    accept_len_sum: torch.Tensor
+    valid_blocks: torch.Tensor
+
+
+def compute_accept_len(
+    pred_ids_4d: torch.Tensor,
+    target_ids_4d: torch.Tensor,
+    valid_mask_4d: torch.Tensor,
+) -> torch.Tensor:
+    """Count consecutive accepted predictions for every draft block.
+
+    Args:
+        pred_ids_4d: Long tensor of shape ``[batch, blocks, depth]``.
+        target_ids_4d: Long tensor of shape ``[batch, blocks, depth]``.
+        valid_mask_4d: Bool tensor of shape ``[batch, blocks, depth]``.
+
+    Returns:
+        Float tensor of shape ``[batch, blocks]`` containing the accepted draft
+        tokens before the first mismatch. Invalid positions do not truncate the
+        prefix and do not contribute to its length.
+    """
+    correct = (pred_ids_4d == target_ids_4d) | (~valid_mask_4d)
+    accept_prefix = correct.long().cumprod(dim=2) * valid_mask_4d.long()
+    return accept_prefix.sum(dim=2).float()
+
+
+def compute_acceptance_stats(
+    pred_ids_4d: torch.Tensor,
+    target_ids_4d: torch.Tensor,
+    valid_mask_4d: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return mean, sum, and count for bonus-token-inclusive acceptance length.
+
+    Args:
+        pred_ids_4d: Long tensor of shape ``[batch, blocks, depth]``.
+        target_ids_4d: Long tensor of shape ``[batch, blocks, depth]``.
+        valid_mask_4d: Bool tensor of shape ``[batch, blocks, depth]``.
+
+    Returns:
+        Three scalar tensors: mean acceptance length, its additive sum, and the
+        number of blocks containing at least one valid drafted token.
+    """
+    block_accept = compute_accept_len(pred_ids_4d, target_ids_4d, valid_mask_4d)
+    valid_block_mask = valid_mask_4d.any(dim=2)
+    valid_blocks = valid_block_mask.sum()
+    accept_len_sum = ((block_accept + 1.0) * valid_block_mask).sum()
+    accept_len = accept_len_sum / valid_blocks.clamp_min(1).float()
+    return accept_len, accept_len_sum, valid_blocks
 
 
 _DFLASH_LOSS_TYPES = ("dflash", "variable_prefix")
@@ -109,9 +180,10 @@ class DFlashTrainerModule(nn.Module):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
-        loss_decay_gamma: Optional[float] = None,
+        loss_decay_gamma: float | None = None,
         loss_type: str = "dflash",
         prefix_weight_base: float = 0.9,
+        sliding_window: int | None = None,
     ):
         super().__init__()
         if loss_type not in _DFLASH_LOSS_TYPES:
@@ -131,6 +203,13 @@ class DFlashTrainerModule(nn.Module):
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
+        # Bounds how far back a block reads the target context. ``None`` keeps the
+        # full prefix (plain DFlash); the published DFlash 2 drafters train and
+        # serve their ``sliding_attention`` layers with a finite window, which also
+        # keeps the flex BlockMask sparse on long sequences.
+        if sliding_window is not None and sliding_window < 1:
+            raise ValueError(f"sliding_window must be >= 1 when set, got {sliding_window}.")
+        self.sliding_window = sliding_window
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.prefix_weight_base = float(prefix_weight_base)
@@ -153,7 +232,7 @@ class DFlashTrainerModule(nn.Module):
         seq_len: int,
         loss_mask: torch.Tensor,
         device: torch.device,
-        doc_remaining: Optional[torch.Tensor] = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Randomly sample anchor positions per sample; returns ``(anchors, keep_mask)``.
 
@@ -185,9 +264,11 @@ class DFlashTrainerModule(nn.Module):
         # richest sample has exactly one valid anchor and always drop one otherwise.
         max_n = min(self.num_anchors, int(valid_counts.max().item()))
         if max_n <= 0:
+            doc_note = " with block_size-1 further real tokens in its document" if doc_remaining is not None else ""
             raise NoValidAnchorsError(
-                "No valid anchor positions in this batch; every sample has fewer than "
-                f"block_size+1 ({bs + 1}) supervised tokens."
+                f"No valid anchor positions in this batch: no sample has a supervised token "
+                f"(loss_mask=1) in [0, seq_len - block_size] = [0, {max_anchor}]{doc_note} "
+                f"(seq_len={seq_len}, block_size={bs})."
             )
 
         indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
@@ -227,7 +308,7 @@ class DFlashTrainerModule(nn.Module):
         return samples.view(bsz, n_blocks) + min_prefix
 
     def _create_position_ids(
-        self, anchor_positions: torch.Tensor, context_position_ids: Optional[torch.Tensor] = None
+        self, anchor_positions: torch.Tensor, context_position_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Position ids for the parallel draft blocks (anchor position + offset).
 
@@ -309,45 +390,82 @@ class DFlashTrainerModule(nn.Module):
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
         seq_len: int,
+        label_start: int = 0,
+        doc_remaining: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per-block ground-truth tokens and the supervised-position mask.
 
         Returns ``(label_indices, target_ids, block_mask)`` each of shape
         ``[B, N, block_size]``. ``label_indices[..., k]`` is the sequence position
-        block position ``k`` predicts (``anchor + k``); ``block_mask`` is the product
-        of block validity, in-bounds, and the gathered loss mask. Shared by the
-        block-wise trainers (DFlash here, JetSpec) so the label/mask gathering lives
-        in one place.
+        block position ``k`` predicts (``anchor + label_start + k``); ``block_mask``
+        is the product of block validity, in-bounds, and the gathered loss mask.
+        Shared by the block-wise trainers (DFlash, JetSpec, and Domino, which passes
+        ``label_start=1`` for ``shift_label``) so the label/mask gathering lives in
+        one place. Under packing, ``doc_remaining`` ``[B, S]`` truncates labels at
+        the anchor's document boundary: anchor sampling only keeps offsets up to
+        ``block_size - 1`` inside the anchor's document, and a shifted label window
+        (``label_start > 0``) reaches one past that guarantee.
         """
         n = anchor_positions.size(1)
-        label_indices = anchor_positions.unsqueeze(-1) + self._block_offsets  # [B, N, bs]
+        label_offsets = self._block_offsets + label_start  # [1, 1, bs]
+        label_indices = anchor_positions.unsqueeze(-1) + label_offsets  # [B, N, bs]
         valid_label_mask = label_indices < seq_len
+        if doc_remaining is not None:
+            doc_rem_at_anchor = torch.gather(doc_remaining, 1, anchor_positions.clamp(min=0)).unsqueeze(-1)
+            valid_label_mask = valid_label_mask & (label_offsets <= doc_rem_at_anchor)
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
         target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)
         gathered_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)
         block_mask = block_keep_mask.unsqueeze(-1).float() * valid_label_mask.float() * gathered_loss_mask
         return label_indices, target_ids, block_mask
 
-    def forward(
+    def _prepare_block_inputs(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        doc_remaining: Optional[torch.Tensor] = None,
-    ) -> DFlashStepMetrics:
-        """Parallel block-wise training forward pass.
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
+        causal: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, "torch.Tensor | BlockMask", torch.Tensor | None]:
+        """Shared block-drafting prologue: anchors, noise embedding, positions, mask.
 
-        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
-        ``seq_lens`` ``[B, max_docs]`` document lengths, ``doc_remaining`` ``[B, S]``)
-        keeps every block inside one document: anchors are constrained so the block
-        does not cross a boundary, the block's context prefix attends only within the
-        anchor's document, and the draft's RoPE uses the per-document positions.
+        Centralises the sequence-packing handling for every block-wise trainer
+        (DFlash and its Domino / JetSpec subclasses): anchors are sampled so each
+        block stays inside one document, the block's context prefix is restricted
+        to its anchor's document, and the draft RoPE uses per-document positions.
+
+        Under ``loss_type="variable_prefix"`` the block embedding shows a sampled
+        real-token prefix (``_create_vp_noise_embed``) instead of the single anchor
+        token, and the sampled ``prefix_lengths`` are returned for the loss; every
+        other ``loss_type`` returns ``prefix_lengths=None``.
+
+        Args:
+            input_ids:     ``[B, S]`` context token ids (long).
+            loss_mask:     ``[B, S]`` supervised-token mask.
+            position_ids:  ``[B, S]`` per-document reset positions (packing), or ``None``.
+            seq_lens:      ``[B, max_docs]`` packed document lengths, or ``None`` (unpacked).
+            doc_remaining: ``[B, S]`` remaining real tokens of each position's document.
+            causal:        When True, build the in-block-causal (JetSpec) mask instead
+                of the bidirectional (DFlash / Domino) one.
+
+        Returns:
+            ``(anchor_positions [B, N], block_keep_mask [B, N], noise_embedding
+            [B, N*block_size, H], full_position_ids [B, S + N*block_size],
+            attention mask, prefix_lengths [B, N] or None)``; the mask is a flex
+            ``BlockMask`` or a dense additive ``[B, 1, N*block_size, S + N*block_size]``
+            tensor, per backend.
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         packed = seq_lens is not None
+        if packed and (position_ids is None or doc_remaining is None):
+            # A partial set would silently drop the in-document anchor constraint
+            # (cross-document supervision) or the per-document RoPE positions.
+            raise ValueError(
+                "Sequence packing requires position_ids, seq_lens, and doc_remaining together; "
+                "got seq_lens without the other packing metadata."
+            )
 
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device, doc_remaining=doc_remaining if packed else None
@@ -356,6 +474,7 @@ class DFlashTrainerModule(nn.Module):
             prefix_lengths = self._sample_prefix_lengths(bsz, anchor_positions.shape[1], device)
             noise_embedding = self._create_vp_noise_embed(input_ids, anchor_positions, block_keep_mask, prefix_lengths)
         else:
+            prefix_lengths = None
             noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
 
         if packed:
@@ -370,26 +489,56 @@ class DFlashTrainerModule(nn.Module):
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
         if self.attention_backend == "flex_attention":
-            dflash_attn_mask = create_dflash_block_mask(
+            attn_mask = create_dflash_block_mask(
                 anchor_positions,
                 block_keep_mask,
                 seq_len,
                 self.block_size,
                 device,
+                causal=causal,
                 ctx_doc_id=ctx_doc_id,
                 anchor_doc_id=anchor_doc_id,
+                sliding_window=self.sliding_window,
             )
         else:
-            dflash_attn_mask = create_dflash_sdpa_mask(
+            attn_mask = create_dflash_sdpa_mask(
                 anchor_positions,
                 block_keep_mask,
                 seq_len,
                 self.block_size,
                 device,
                 dtype=noise_embedding.dtype,
+                causal=causal,
                 ctx_doc_id=ctx_doc_id,
                 anchor_doc_id=anchor_doc_id,
+                sliding_window=self.sliding_window,
             )
+        return anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, prefix_lengths
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
+    ) -> DFlashStepMetrics:
+        """Parallel block-wise training forward pass.
+
+        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
+        ``seq_lens`` ``[B, max_docs]`` document lengths, ``doc_remaining`` ``[B, S]``)
+        keeps every block inside one document: anchors are constrained so the block
+        does not cross a boundary, the block's context prefix attends only within the
+        anchor's document, and the draft's RoPE uses the per-document positions.
+        """
+        bsz, seq_len = input_ids.shape
+
+        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, prefix_lengths = (
+            self._prepare_block_inputs(
+                input_ids, loss_mask, position_ids=position_ids, seq_lens=seq_lens, doc_remaining=doc_remaining
+            )
+        )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
@@ -422,12 +571,33 @@ class DFlashTrainerModule(nn.Module):
         assert loss_fn is not None, "loss_fn is always constructed for loss_type='dflash'"
         loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs)
 
+        loss_weights = pred_mask.view(bsz, n, bs - 1)
+        if self.loss_decay_gamma is not None:
+            depth_weights = torch.exp(
+                -torch.arange(bs - 1, device=pred_mask.device, dtype=pred_mask.dtype) / self.loss_decay_gamma
+            )
+            loss_weights = loss_weights * depth_weights
+        loss_weight = loss_weights.sum()
+
         count_per_pos = loss_out.draft_count_per_pos
         valid_tokens = count_per_pos.sum()
-        accuracy = loss_out.draft_correct_per_pos.sum() / (valid_tokens + 1e-6)
+        correct_tokens = loss_out.draft_correct_per_pos.sum()
+        accuracy = correct_tokens / valid_tokens.clamp_min(1)
+        accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(
+            pred_logits.argmax(dim=-1).view(bsz, n, bs - 1),
+            pred_targets.view(bsz, n, bs - 1),
+            pred_mask.view(bsz, n, bs - 1).bool(),
+        )
 
         return DFlashStepMetrics(
-            loss=loss_out.total_loss, accuracy=accuracy.detach(), valid_tokens=valid_tokens.detach()
+            loss=loss_out.total_loss,
+            loss_weight=loss_weight.detach(),
+            accuracy=accuracy.detach(),
+            valid_tokens=valid_tokens.detach(),
+            correct_tokens=correct_tokens.detach(),
+            accept_len=accept_len.detach(),
+            accept_len_sum=accept_len_sum.detach(),
+            valid_blocks=valid_blocks.detach(),
         )
 
     def _variable_prefix_loss(
@@ -482,6 +652,17 @@ class DFlashTrainerModule(nn.Module):
         loss = (token_nll * weights).sum() / (weights.sum() + 1e-6)
 
         valid_tokens = supervised.sum()
-        correct = ((logits.argmax(dim=-1) == target_ids).float() * supervised).sum()
-        accuracy = correct / (valid_tokens + 1e-6)
-        return DFlashStepMetrics(loss=loss, accuracy=accuracy.detach(), valid_tokens=valid_tokens.detach())
+        pred_ids = logits.argmax(dim=-1)
+        correct = ((pred_ids == target_ids).float() * supervised).sum()
+        accuracy = correct / valid_tokens.clamp_min(1)
+        accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(pred_ids, target_ids, supervised.bool())
+        return DFlashStepMetrics(
+            loss=loss,
+            loss_weight=weights.sum().detach(),
+            accuracy=accuracy.detach(),
+            valid_tokens=valid_tokens.detach(),
+            correct_tokens=correct.detach(),
+            accept_len=accept_len.detach(),
+            accept_len_sum=accept_len_sum.detach(),
+            valid_blocks=valid_blocks.detach(),
+        )

@@ -1,6 +1,7 @@
 ---
 title: "ERNIE 4.5"
 description: ""
+slug: model-coverage/large-language-models/baidu/ernie-4-5
 ---
 [ERNIE 4.5](https://huggingface.co/baidu) is Baidu's dense and Mixture-of-Experts language model family with long-context text checkpoints on Hugging Face.
 
@@ -42,29 +43,24 @@ description: ""
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install nemo-automodel
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
-**3. Run a dense recipe** from inside the repo:
+**2. Run a dense recipe** from inside the repo:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
+uv run automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
 ```
 
 **4. Run the MoE recipe** from inside the repo:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml
+uv run automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml
 ```
 
 <Accordion title="Run with Docker">

@@ -23,7 +23,6 @@ is the binary :mod:`wire` blob instead.
 from __future__ import annotations
 
 import json
-from typing import Optional
 
 import torch
 
@@ -50,7 +49,7 @@ SUPERVISION_KEYS = ["aux_hidden_states", "target_probs", "position_mask", "input
 
 
 def encode_nccl_metadata(
-    tensor_dict: dict[str, Optional[torch.Tensor]],
+    tensor_dict: dict[str, torch.Tensor | None],
     keys_order: list[str],
 ) -> bytes:
     """Encode tensor metadata (dtype code + shape) as a JSON HTTP body.
@@ -58,7 +57,7 @@ def encode_nccl_metadata(
     Only metadata is encoded -- no tensor data. The client uses it to allocate
     the receive buffers before the NCCL recv.
     """
-    metadata: dict[str, Optional[dict]] = {}
+    metadata: dict[str, dict | None] = {}
     for key in keys_order:
         tensor = tensor_dict.get(key)
         if tensor is None:
@@ -68,7 +67,7 @@ def encode_nccl_metadata(
     return json.dumps({"keys_order": keys_order, "metadata": metadata}).encode("utf-8")
 
 
-def decode_nccl_metadata(raw: bytes) -> tuple[list[str], dict[str, Optional[dict]]]:
+def decode_nccl_metadata(raw: bytes) -> tuple[list[str], dict[str, dict | None]]:
     """Decode the JSON metadata body into ``(keys_order, metadata)``."""
     payload = json.loads(raw.decode("utf-8"))
     return payload["keys_order"], payload["metadata"]

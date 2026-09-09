@@ -43,13 +43,13 @@ peft:
     - "*.ff_context.net.0.proj"
     - "*.ff_context.net.2"
 
-optim:
-  learning_rate: 2e-5
-  optimizer:
-    weight_decay: 0.01
-    betas: [0.9, 0.999]
-    foreach: false
-    fused: true
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  foreach: false
+  fused: true
 
 lr_scheduler:
   lr_decay_style: cosine
@@ -84,9 +84,9 @@ step_scheduler:
   local_batch_size: 6
   global_batch_size: 48
   ckpt_every_steps: 500
-  log_every: 1
+  log_remote_every_steps: 1
   # max_steps: null  # Set to limit training to a specific number of steps
-  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
+  save_checkpoint_every_epoch: false
 
 data:
   dataloader:

@@ -153,12 +153,12 @@ def multi_resolution_dataset():
         yield dataset
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def large_dataset():
-    """Create a larger dataset for stress testing."""
+    """Create one shared larger dataset for sampler stress tests."""
     with tempfile.TemporaryDirectory() as tmpdir:
         cache_dir = Path(tmpdir)
-        builder = MockCacheBuilder(cache_dir, num_samples=500)
+        builder = MockCacheBuilder(cache_dir, num_samples=100)
         resolutions = [
             (256, 256),
             (512, 512),

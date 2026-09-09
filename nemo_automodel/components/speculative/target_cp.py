@@ -19,10 +19,10 @@ along the sequence and gather its captured hidden states / logits back to the
 full sequence before handing them to the draft. That flow is specific to
 speculative decoding -- it needs no gradients through the target and no
 model-owned CP sharder -- so it lives here rather than in the shared
-``components/distributed/cp_utils`` surface.
+``components/distributed/context_parallel/utils`` surface.
 """
 
-from typing import Callable, List, Optional
+from typing import Callable, List
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -33,7 +33,7 @@ def make_target_cp_ctx(cp_mesh: DeviceMesh, input_ids, position_ids=None):
 
     Shards ``input_ids`` (and ``position_ids``) along the sequence dim across
     ``cp_mesh`` so the target's self-attention runs as ring attention. Unlike
-    :func:`make_cp_batch_and_ctx`, this does not require ``labels`` and is meant
+    the CP dispatch, this does not require ``labels`` and is meant
     for the EAGLE-3 target wrapper, which gathers the aux/logits back to the full
     sequence (see :func:`gather_cp_seq`) before handing them to the draft.
 
@@ -122,7 +122,7 @@ def run_target_cp_forward_and_gather(
     input_ids: torch.Tensor,
     forward_kwargs: dict,
     collect: Callable[[object], List[torch.Tensor]],
-    position_ids: Optional[torch.Tensor] = None,
+    position_ids: torch.Tensor | None = None,
     filter_kwargs: bool = False,
 ) -> tuple:
     """Run a frozen target under context parallelism and gather its outputs.

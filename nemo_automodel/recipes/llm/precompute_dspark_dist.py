@@ -79,6 +79,9 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     GLM_5_2_MODEL_TYPE as _GLM_5_2_MODEL_TYPE,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
+    KIMI_K3_MODEL_TYPES as _KIMI_K3_MODEL_TYPES,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
     MINIMAX_M3_MODEL_TYPES as _MINIMAX_M3_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
@@ -90,7 +93,9 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
+    build_kimi_k3_target,
     gather_full_weight_module,
+    validate_dspark_parallelism_axes,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,8 +156,9 @@ def _build_target(
 ):
     """Build the frozen target for capture, dispatching on model type.
 
-    DeepSeek V4 / GLM-5.2 load through the sharded EP/FSDP path; other single-process
-    text targets (Qwen3, Gemma4) load replicated for data-parallel throughput.
+    DeepSeek V4 / GLM-5.2 / Kimi K3 load through the sharded EP/FSDP path; other
+    single-process text targets (Qwen3, Gemma4) load replicated for data-parallel
+    throughput.
     Returns ``(target_config, target_model)``.
     """
     if model_type in _MINIMAX_M3_MODEL_TYPES:
@@ -173,6 +179,17 @@ def _build_target(
         return target_config, target_model
     if model_type == _GLM_5_2_MODEL_TYPE:
         target_config, target_model, _ = build_glm_5_2_target(
+            cfg=cfg,
+            world_size=world_size,
+            device=device,
+            compute_dtype=compute_dtype,
+            target_path=target_path,
+            recipe_cfg=recipe_cfg,
+            trust_remote_code=trust_remote_code,
+        )
+        return target_config, target_model
+    if model_type in _KIMI_K3_MODEL_TYPES:
+        target_config, target_model, _ = build_kimi_k3_target(
             cfg=cfg,
             world_size=world_size,
             device=device,
@@ -213,6 +230,9 @@ def _make_sync_max_steps(world_size: int, device: torch.device):
 
 def run(cfg) -> int:
     """Load the (possibly sharded) target and write the distributed DSpark cache."""
+    # The precompute runs the same forward-hook capture and rank-sharded data split as
+    # training, so it rejects the same model-parallel axes, before any weights load.
+    validate_dspark_parallelism_axes(cfg)
     dist_env = initialize_distributed(
         backend=cfg.get("dist_env", {}).get("backend", "nccl"),
         timeout_minutes=cfg.get("dist_env", {}).get("timeout_minutes", 30),
@@ -260,6 +280,7 @@ def run(cfg) -> int:
     train_split = recipe_cfg.get("train_split", None)
     shuffle_seed = int(recipe_cfg.get("shuffle_seed", 42))
     mask_reasoning_content = bool(recipe_cfg.get("mask_reasoning_content", False))
+    mask_generation_prompt = bool(recipe_cfg.get("mask_generation_prompt", False))
     dataloader = build_eagle3_dataloader(
         data_path=recipe_cfg.train_data_path,
         tokenizer=tokenizer,
@@ -271,6 +292,7 @@ def run(cfg) -> int:
         distributed=False,
         shuffle_seed=shuffle_seed,
         mask_reasoning_content=mask_reasoning_content,
+        mask_generation_prompt=mask_generation_prompt,
     )
     num_samples = len(dataloader.dataset)
 
@@ -288,6 +310,7 @@ def run(cfg) -> int:
         shuffle_seed=shuffle_seed,
         mask_reasoning_content=mask_reasoning_content,
         chat_template_sha256=tokenizer_chat_template_sha256(tokenizer),
+        mask_generation_prompt=mask_generation_prompt,
     )
 
     # Gather the (possibly DTensor-sharded) target embed_tokens / lm_head to full

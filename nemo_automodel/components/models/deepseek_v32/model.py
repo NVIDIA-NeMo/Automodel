@@ -19,19 +19,22 @@ These classes subclass from DeepSeek V3, with the main difference being
 the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 """
 
-from dataclasses import dataclass
-from typing import Any, Optional, Union
+from dataclasses import dataclass, replace
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
     get_rope_config,
     initialize_rms_norm_module,
+)
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,
@@ -132,6 +135,10 @@ class DeepseekV32Model(DeepseekV3Model):
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
+            # Same policy as V3: HF returns topk_weights gathered from the fp32
+            # scores with no cast back. V3.2 builds its own moe_defaults, so the
+            # V3 line does not reach it and the default is repeated here.
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -166,6 +173,8 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
 
     Subclasses V3 ForCausalLM, using DeepseekV32Model and DeepSeekV32StateDictAdapter.
     """
+
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -209,8 +218,15 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         from nemo_automodel.components.models.common import initialize_linear_module
 
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
-        self.backend = backend or BackendConfig()
+        reject_unsupported_tie_word_embeddings(type(self), config)
+        # This __init__ calls nn.Module.__init__ directly rather than super(), so
+        # DeepseekV3ForCausalLM's gate_precision default never runs for V3.2 and is
+        # repeated here. replace() rather than in-place: the caller's BackendConfig
+        # may be shared with other models, which must not inherit this default.
+        resolved_backend = backend or BackendConfig()
+        if resolved_backend.gate_precision is None:
+            resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
+        self.backend = resolved_backend
         # Use V3.2 Model instead of V3 Model
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = DeepseekV32Model(
@@ -249,7 +265,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass returning :class:`CausalLMOutputWithPast`.

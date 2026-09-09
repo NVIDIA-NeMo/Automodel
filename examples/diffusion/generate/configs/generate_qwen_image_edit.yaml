@@ -1,0 +1,30 @@
+model:
+  pretrained_model_name_or_path: "Qwen/Qwen-Image-Edit-2511"
+  checkpoint: null
+
+inference:
+  num_inference_steps: 20
+  height: 1024
+  width: 1024
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "Add mountains in the background"
+  input_images:
+    - "./source.png"
+  pipeline_kwargs:
+    negative_prompt: " "
+    true_cfg_scale: 4.0
+    max_sequence_length: 512
+
+output:
+  output_dir: "./inference_outputs"
+
+distributed: null
+
+vae:
+  enable_slicing: false
+  enable_tiling: false
+  enable_cpu_offload: true
+
+seed: 42

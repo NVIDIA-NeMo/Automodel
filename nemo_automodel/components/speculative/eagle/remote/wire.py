@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import ctypes
 import struct
-from typing import Optional
 
 import torch
 
@@ -70,14 +69,14 @@ _NBYTES_FMT = struct.Struct("<Q")  # uint64
 _FLAG_NONE = 0x01
 
 
-def encode(tensor_dict: dict[str, Optional[torch.Tensor]]) -> bytearray:
+def encode(tensor_dict: dict[str, torch.Tensor | None]) -> bytearray:
     """Encode a dict of CPU tensors into the wire format.
 
     ``None`` values are preserved. The caller is responsible for moving tensors
     to CPU first; CUDA tensors are rejected to keep the data path explicit.
     """
     total_size = _HEADER_FMT.size
-    entries: list[tuple[bytes, Optional[torch.Tensor], int]] = []
+    entries: list[tuple[bytes, torch.Tensor | None, int]] = []
     for key, tensor in tensor_dict.items():
         key_bytes = key.encode("utf-8")
         entry_size = _KEYLEN_FMT.size + len(key_bytes) + _FLAG_FMT.size
@@ -130,12 +129,12 @@ def encode(tensor_dict: dict[str, Optional[torch.Tensor]]) -> bytearray:
     return buf
 
 
-def encode_to_bytes(tensor_dict: dict[str, Optional[torch.Tensor]]) -> bytes:
+def encode_to_bytes(tensor_dict: dict[str, torch.Tensor | None]) -> bytes:
     """Encode and return immutable ``bytes`` (HTTP body)."""
     return bytes(encode(tensor_dict))
 
 
-def decode(raw: bytes, map_location: str = "cpu") -> dict[str, Optional[torch.Tensor]]:
+def decode(raw: bytes, map_location: str = "cpu") -> dict[str, torch.Tensor | None]:
     """Decode a wire-format blob back into a dict of tensors on ``map_location``."""
     target_device = torch.device(map_location)
 
@@ -146,7 +145,7 @@ def decode(raw: bytes, map_location: str = "cpu") -> dict[str, Optional[torch.Te
     if magic != MAGIC:
         raise ValueError(f"Bad wire-format magic: 0x{magic:08x} (expected 0x{MAGIC:08x})")
 
-    result: dict[str, Optional[torch.Tensor]] = {}
+    result: dict[str, torch.Tensor | None] = {}
     while pos < len(mv):
         key_len = _KEYLEN_FMT.unpack_from(mv, pos)[0]
         pos += _KEYLEN_FMT.size

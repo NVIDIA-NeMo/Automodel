@@ -34,7 +34,6 @@ import logging
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
 
 import torch
 
@@ -95,11 +94,11 @@ class TargetModelServer:
         self._target = target_wrapper
         self._host = host
         self._nccl_port = nccl_port
-        self._selected_token_ids: Optional[torch.Tensor] = None
-        self._selected_token_mask: Optional[torch.Tensor] = None
+        self._selected_token_ids: torch.Tensor | None = None
+        self._selected_token_mask: torch.Tensor | None = None
         self._nccl_enabled = os.environ.get("NEMO_EAGLE_ENABLE_NCCL", "1") == "1"
-        self._nccl: Optional[NCCLTransport] = None
-        self._pending_nccl_send: Optional[tuple[dict, list[str]]] = None
+        self._nccl: NCCLTransport | None = None
+        self._pending_nccl_send: tuple[dict, list[str]] | None = None
         # ``ThreadingHTTPServer`` handles requests concurrently, but /generate
         # is not reentrant: the supervision forward captures aux hidden states
         # through hooks registered on the shared model, and the NCCL path
@@ -232,7 +231,7 @@ def _make_request_handler(server_logic: TargetModelServer):
             length = int(self.headers.get("Content-Length", 0))
             return self.rfile.read(length) if length else b""
 
-        def _send(self, body: bytes, *, content_type: str, extra_headers: Optional[dict] = None) -> None:
+        def _send(self, body: bytes, *, content_type: str, extra_headers: dict | None = None) -> None:
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))

@@ -43,6 +43,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoModelForCausalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCausalLM"),
     "NeMoAutoModelForImageTextToText": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForImageTextToText"),
     "NeMoAutoModelForMultimodalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForMultimodalLM"),
+    "NeMoAutoModelForSeq2SeqLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForSeq2SeqLM"),
     "NeMoAutoModelForSequenceClassification": (
         "nemo_automodel._transformers.auto_model",
         "NeMoAutoModelForSequenceClassification",
@@ -58,6 +59,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoDiffusionPipeline": ("nemo_automodel._diffusers.auto_diffusion_pipeline", "NeMoAutoDiffusionPipeline"),
     "ModelCapabilities": ("nemo_automodel._transformers.model_capabilities", "ModelCapabilities"),
     "query_capabilities": ("nemo_automodel._transformers.model_capabilities", "query_capabilities"),
+    "register_architecture": ("nemo_automodel._transformers.registry", "register_architecture"),
 }
 
 __all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.keys()])

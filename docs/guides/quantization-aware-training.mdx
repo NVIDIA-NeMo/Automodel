@@ -3,52 +3,53 @@ title: "Quantization-Aware Training (QAT) in NeMo Automodel"
 description: ""
 position: 18
 ---
-NeMo Automodel supports Quantization-Aware Training (QAT) for Supervised Fine-Tuning (SFT) using [TorchAO](https://github.com/pytorch/ao). QAT simulates quantization effects during the training process, allowing models to adapt to lower precision representations while learning. This approach produces quantized models that maintain significantly higher accuracy compared to applying quantization after training is complete.
+NeMo Automodel supports Quantization-Aware Training (QAT) for Supervised Fine-Tuning (SFT) using [TorchAO](https://github.com/pytorch/ao). QAT simulates quantization effects during training so model weights can adapt to the selected lower-precision scheme. Whether QAT improves task quality over post-training quantization (PTQ), and whether the converted model improves deployment efficiency, depends on the model, task, hardware, and inference backend; measure both approaches on the target workload.
 
 ## What is Quantization-Aware Training?
 
-Quantization-Aware Training simulates the effects of quantization during the training process. By introducing fake quantization operations in the forward pass, the model learns to adapt to lower precision representations, maintaining better accuracy when deployed with actual quantization.
+Quantization-Aware Training introduces fake-quantization operations in the forward pass while keeping model weights trainable. This gives the model an opportunity to adapt to quantization error before the weights are converted to an actual quantized representation.
 
 ### Benefits of QAT
 
-- **Better accuracy**: Models trained with QAT maintain higher accuracy when quantized compared to post-training quantization
-- **Efficient deployment**: Quantized models require less memory and compute resources
-- **Edge device support**: Enables deployment on resource-constrained devices
-- **Production optimization**: Reduces inference costs while maintaining model quality
+- **Adaptation during training**: Model weights are optimized while fake quantization is active
+- **A PTQ alternative**: QAT can be evaluated when PTQ does not meet the workload's quality target
+- **Deployment experimentation**: Converted models can be benchmarked with quantized kernels on the intended hardware and backend
+- **Explicit trade-off measurement**: Validation quality, latency, throughput, and memory can be compared against BF16 and PTQ baselines
 
 ### QAT vs. Post-Training Quantization
 
 | Aspect | QAT | Post-Training Quantization |
 |--------|-----|---------------------------|
-| **Accuracy** | Higher - model adapts during training | Lower - no adaptation |
+| **Accuracy** | Model weights can adapt to fake quantization; measure the result | No adaptation step; measure the result |
 | **Training time** | Longer - requires retraining | None - applied after training |
-| **Use case** | Production deployments requiring best accuracy | Quick prototyping or less critical applications |
-| **Flexibility** | Can fine-tune quantization parameters | Limited to fixed quantization schemes |
+| **Use case** | Consider when PTQ misses a measured quality target | Establish a quantized baseline before adding QAT training |
+| **Trainable state** | Fine-tunes model weights through fake quantizers | Quantizes fixed model weights after training |
 
 ## Requirements
 
 To use QAT in NeMo Automodel, you need:
 
-- **Software**: TorchAO library must be installed
-- **Hardware**: Compatible NVIDIA GPU (recommended: A100 or newer)
-- **Model**: Any supported model architecture for SFT
+- **Software**: Use the repository's locked environment, which includes TorchAO
+- **Hardware**: An NVIDIA GPU and software stack supported by the selected TorchAO training and deployment kernels
+- **Training mode**: Full-parameter BF16 SFT; the current recipe rejects QAT with PEFT and rejects models containing non-BF16 parameters
+- **Model dimensions**: The model's target `nn.Linear` layers must satisfy the selected TorchAO quantizer's group and kernel shape constraints
 
 ## Install TorchAO
 
-Make sure you have TorchAO installed. Follow the [installation guide](https://github.com/pytorch/ao?tab=readme-ov-file#-installation) for TorchAO.
+TorchAO is a project dependency. Install the repository's locked environment:
 
 ```bash
-pip install torchao
+uv sync --locked
 ```
 
 ## How QAT Works in NeMo Automodel
 
 NeMo Automodel integrates TorchAO's QAT quantizers into the training pipeline. During training:
 
-1. **Model preparation**: The quantizer prepares the model by inserting fake quantization operations
-2. **Forward pass**: Weights and activations are quantized using fake quantization
+1. **Model preparation**: The quantizer replaces eligible linear layers with TorchAO QAT linear modules
+2. **Forward pass**: Eligible weights, and activations for 8da4w, pass through fake quantization
 3. **Backward pass**: Gradients flow through the fake quantization operations
-4. **Weight updates**: Model learns to minimize loss while accounting for quantization effects
+4. **Weight updates**: The optimizer updates the model weights; the current prepared modules do not add a separate set of trainable quantization parameters
 
 ### Supported Quantization Schemes
 
@@ -58,15 +59,15 @@ NeMo Automodel supports two TorchAO QAT quantizers:
 - **Quantizer**: `Int8DynActInt4WeightQATQuantizer`
 - **Activations**: INT8 with dynamic quantization
 - **Weights**: INT4 quantization
-- **Use case**: Balanced accuracy and efficiency
-- **Memory savings**: ~4x compared to FP16/BF16
+- **Layer constraint**: With the current default `padding_allowed=False`, eligible linear layers must have `in_features` divisible by `groupsize`; incompatible layers remain unmodified
 
 #### Int4 Weight-Only (4w-qat)
 - **Quantizer**: `Int4WeightOnlyQATQuantizer`
-- **Activations**: Full precision
+- **Activations**: BF16 in the current integration
 - **Weights**: INT4 quantization
-- **Use case**: Maximum memory savings with minimal accuracy loss
-- **Memory savings**: ~4x for weights only
+- **Layer constraint**: TorchAO targets bias-free linear layers; preparation requires compatible input dimensions, and conversion requires `out_features` divisible by 8
+
+The current `QATConfig` sets both model-weight precision and weight-scale precision to BF16. For the documented group sizes, a target layer's `in_features` must be divisible by `groupsize`; the 4w path also requires divisibility by `inner_k_tiles * 16` (128 with the default `inner_k_tiles=8`). Layers left unmodified by a quantizer remain BF16, so inspect the prepared model rather than assuming every linear layer was quantized.
 
 ## Configuration
 
@@ -78,8 +79,9 @@ To enable QAT in your training configuration, you need to specify the quantizer 
 # Enable QAT with Int8 Dynamic Activation + Int4 Weight quantization
 qat:
   enabled: true
-  quantizer:
-    _target_: torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer
+  qat_config:
+    _target_: nemo_automodel.components.quantization.qat.QATConfig
+    quantizer_type: int8_dynact_int4weight
     groupsize: 256
 ```
 
@@ -89,8 +91,9 @@ qat:
 # Enable QAT with Int4 Weight-Only quantization
 qat:
   enabled: true
-  quantizer:
-    _target_: torchao.quantization.qat.Int4WeightOnlyQATQuantizer
+  qat_config:
+    _target_: nemo_automodel.components.quantization.qat.QATConfig
+    quantizer_type: int4_weight_only
     groupsize: 256
 ```
 
@@ -99,20 +102,23 @@ qat:
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `enabled` | bool | Enable or disable QAT |
-| `quantizer._target_` | str | Fully qualified class name of the TorchAO quantizer |
-| `quantizer.groupsize` | int | Group size for weight quantization (typically 128 or 256) |
+| `fake_quant_after_n_steps` | int | Requested fake-quant activation step read by the recipe; use `0` in the current revision |
+| `qat_config._target_` | str | Fully qualified class name of the NeMo AutoModel QAT configuration |
+| `qat_config.quantizer_type` | str | QAT scheme: `int8_dynact_int4weight` or `int4_weight_only` |
+| `qat_config.groupsize` | int | Group size for weight quantization (typically 128 or 256) |
 
-### Delayed Fake Quantization
+### Fake Quantization Start Step
 
-You can optionally delay the activation of fake quantization to allow the model to train normally for a few steps before introducing quantization effects:
+The recipe accepts `fake_quant_after_n_steps` as the requested activation threshold. In the current revision, however, the enable and disable helpers are called on top-level model parts without traversing their nested TorchAO QAT linear modules. Positive values therefore do not reliably delay fake quantization in those nested layers. Use `0` and do not rely on delayed activation until that traversal is implemented.
 
 ```yaml
 qat:
   enabled: true
-  quantizer:
-    _target_: torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer
+  fake_quant_after_n_steps: 0
+  qat_config:
+    _target_: nemo_automodel.components.quantization.qat.QATConfig
+    quantizer_type: int8_dynact_int4weight
     groupsize: 256
-  delay_fake_quant_steps: 1000  # Enable fake quant after 1000 steps
 ```
 
 ## Training Workflow
@@ -122,21 +128,56 @@ qat:
 Create a YAML configuration file with QAT enabled:
 
 ```yaml
-model:
-  model_name: meta-llama/Llama-3.2-1B
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
-task:
-  type: sft
-  
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 8
+  max_steps: 10000
+  ckpt_every_steps: 1000
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+
 qat:
   enabled: true
-  quantizer:
-    _target_: torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer
+  fake_quant_after_n_steps: 0
+  qat_config:
+    _target_: nemo_automodel.components.quantization.qat.QATConfig
+    quantizer_type: int8_dynact_int4weight
     groupsize: 256
 
-trainer:
-  max_steps: 10000
-  val_check_interval: 500
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 2.0e-5
+  weight_decay: 0
+
+checkpoint:
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: final
 ```
 
 ### 2. Run Training
@@ -144,13 +185,13 @@ trainer:
 Launch training with your QAT-enabled configuration:
 
 ```bash
-automodel --nproc-per-node=8 your_qat_config.yaml
+uv run automodel your_qat_config.yaml --nproc-per-node 8
 ```
 
 ### 3. Monitor Training
 
 During training, the model will:
-- Apply fake quantization to weights and activations
+- Apply fake quantization to eligible weights and, for 8da4w, activations
 - Learn to minimize loss while accounting for quantization effects
 - Produce checkpoints that can be converted to actual quantized models
 
@@ -159,51 +200,66 @@ During training, the model will:
 After training, convert the QAT checkpoint to a fully quantized model for deployment:
 
 ```python
-from torchao.quantization import quantize_
+from pathlib import Path
 
-# Load your trained model
-model = load_model_from_checkpoint(checkpoint_path)
+import torch
+
+from torchao.quantization import Int8DynamicActivationInt4WeightConfig, quantize_
+from transformers import AutoModelForCausalLM
+
+# Resolve the final checkpoint selected by the recipe. On filesystems without
+# symlink support, AutoModel writes the relative target to LATEST.txt instead.
+checkpoint_root = Path("checkpoints")
+latest_link = checkpoint_root / "LATEST"
+if latest_link.is_symlink():
+    checkpoint_dir = latest_link.resolve(strict=True)
+else:
+    latest_pointer = checkpoint_root / "LATEST.txt"
+    checkpoint_dir = (checkpoint_root / latest_pointer.read_text().strip()).resolve(strict=True)
+
+checkpoint_path = checkpoint_dir / "model" / "consolidated"
+if not checkpoint_path.is_dir():
+    raise FileNotFoundError(f"Consolidated checkpoint not found: {checkpoint_path}")
+
+model = AutoModelForCausalLM.from_pretrained(checkpoint_path, dtype=torch.bfloat16)
+model.eval()
 
 # Apply actual quantization (not fake quantization)
-quantize_(model, int8_dynamic_activation_int4_weight())
-
-# Deploy the quantized model
-model.eval()
+quantize_(model, Int8DynamicActivationInt4WeightConfig(group_size=256))
 ```
 
 ## Performance Considerations
 
 ### Training Performance
 
-- **Training time**: QAT adds overhead during training due to fake quantization operations
-- **Memory usage**: Similar to full-precision training during the training phase
-- **Convergence**: May require slightly more training steps to converge compared to full-precision training
+- **Training time**: Fake-quantization operations add work to each forward pass; benchmark step time against the BF16 baseline
+- **Memory usage**: QAT modules change the training graph and state; measure peak allocated and reserved memory for the selected model and topology
+- **Convergence**: Tune training duration and learning rate from validation results rather than assuming BF16 hyperparameters transfer unchanged
 
 ### Inference Performance
 
-After converting to actual quantization:
+After converting to actual quantization, benchmark the exact inference stack you plan to deploy. The encoded weights use lower precision, but scales, metadata, unmodified layers, kernel availability, and runtime packing all affect the end-to-end result.
 
-- **Speed**: 2-4x faster inference depending on hardware and model size
-- **Memory**: ~4x reduction in model size
-- **Accuracy**: Minimal degradation compared to full-precision models (typically &lt;1% difference)
+- **Speed**: Report latency and throughput on the target hardware and backend; quantized storage alone does not guarantee faster kernels
+- **Memory**: Measure serialized size and runtime peak memory because they include more than packed weight bits
+- **Accuracy**: Evaluate the same task metrics for BF16, PTQ, and QAT checkpoints
 
 ### When to Use QAT
 
-QAT is most beneficial when:
+Consider QAT when:
 
-- **Deploying to production**: Where inference efficiency is critical
-- **Edge devices**: Resource-constrained environments
-- **Large-scale serving**: Reducing infrastructure costs
-- **Accuracy is important**: When post-training quantization causes unacceptable accuracy loss
+- **PTQ misses a target**: A measured PTQ quality result is below the workload requirement
+- **Training is available**: You can run and validate an additional full-parameter SFT job
+- **The deployment stack supports the scheme**: The target hardware and backend have compatible quantized kernels
 
 ### When Not to Use QAT
 
-Consider alternatives when:
+Prefer a simpler baseline when:
 
-- **Quick prototyping**: Post-training quantization is faster
-- **Small models**: Quantization overhead may not be worth it
-- **Limited training resources**: QAT requires retraining the model
-- **Accuracy is not critical**: Post-training quantization may be sufficient
+- **Establishing feasibility**: PTQ can test the deployment scheme without another training run
+- **The backend lacks compatible kernels**: Conversion would not exercise the intended quantized implementation
+- **Training resources are limited**: QAT requires another full-parameter training run
+- **PTQ already meets the measured targets**: Additional QAT training may not be justified
 
 ## Best Practices
 
@@ -212,26 +268,37 @@ Consider alternatives when:
 Before investing in QAT, try post-training quantization to establish a baseline:
 
 ```python
-# Quick post-training quantization test
-from torchao.quantization import quantize_
-quantize_(model, int8_dynamic_activation_int4_weight())
+import torch
+
+from torchao.quantization import Int8DynamicActivationInt4WeightConfig, quantize_
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    dtype=torch.bfloat16,
+)
+model.eval()
+
+quantize_(model, Int8DynamicActivationInt4WeightConfig(group_size=256))
 ```
 
 If accuracy is acceptable, you may not need QAT.
 
 ### 2. Choose the Right Quantization Scheme
 
-- **8da4w-qat**: Best balance of accuracy and efficiency for most use cases
-- **4w-qat**: Use when memory is the primary constraint and activations can remain full precision
+- **8da4w-qat**: Fake-quantizes eligible activations to INT8 and weights to INT4
+- **4w-qat**: Fake-quantizes eligible weights to INT4 while activations remain BF16
+
+Train and benchmark both only when their layer-shape constraints and deployment kernels match your model; neither scheme is categorically more accurate or faster for every workload.
 
 ### 3. Tune Group Size
 
 The `groupsize` parameter affects the granularity of quantization:
 
-- **Smaller groups (128)**: Better accuracy, slightly more memory
-- **Larger groups (256)**: More efficient, may have minor accuracy impact
+- **Smaller groups (128)**: Finer weight quantization granularity with more scale metadata
+- **Larger groups (256)**: Coarser granularity with fewer scales
 
-Start with 256 and reduce to 128 if accuracy is insufficient.
+Both values must divide the target linear layer's `in_features`. Compare validation metrics and deployment measurements before choosing one.
 
 ### 4. Monitor Validation Metrics
 
@@ -239,46 +306,49 @@ Track validation metrics closely during QAT training:
 
 - Compare against full-precision baseline
 - Watch for convergence issues
-- Adjust learning rate if needed (QAT may benefit from slightly lower learning rates)
+- Compare learning-rate choices using the same validation protocol
 
-### 5. Use Delayed Fake Quantization
+### 5. Start Fake Quantization Immediately
 
-For better convergence, consider delaying fake quantization:
+Use immediate fake quantization in the current revision:
 
 ```yaml
 qat:
-  delay_fake_quant_steps: 1000  # Let model train normally first
+  fake_quant_after_n_steps: 0
 ```
 
-This allows the model to learn basic patterns before introducing quantization constraints.
+Positive values are accepted by the recipe, but the current direct helper calls do not traverse nested TorchAO QAT linear modules, so they must not be relied upon to delay activation.
 
 ## Accuracy vs. Efficiency Trade-offs
 
-### Expected Accuracy Impact
+### Measure the Trade-off
 
-| Quantization Method | Typical Accuracy Loss | Memory Savings |
-|---------------------|----------------------|----------------|
-| Full Precision (BF16) | Baseline | Baseline |
-| Post-Training Quantization | 1-3% | 4x |
-| QAT (8da4w) | &lt;1% | 4x |
-| QAT (4w) | &lt;1.5% | 4x (weights only) |
+Do not assume a fixed accuracy loss, compression ratio, or inference speedup. Record the following for BF16, PTQ, and each QAT scheme you evaluate:
+
+| Measurement | What to keep constant |
+|-------------|-----------------------|
+| Task quality | Dataset, preprocessing, decoding, and metric implementation |
+| Serialized size | Checkpoint contents and serialization format |
+| Runtime memory | Batch size, sequence length, cache settings, and backend |
+| Latency and throughput | Hardware, quantized kernels, warm-up, and concurrency |
 
 ### Optimization Strategies
 
 If accuracy is below expectations:
 
-1. **Increase training steps**: QAT may need more training to converge
-2. **Reduce learning rate**: Lower learning rates can help with quantization constraints
-3. **Use 8da4w instead of 4w**: Better accuracy with minimal additional cost
-4. **Reduce group size**: Smaller groups provide finer-grained quantization
-5. **Delay fake quantization**: Give the model time to learn before quantizing
+1. **Tune training duration**: Use validation curves to decide whether more steps help
+2. **Tune learning rate**: Compare a small set of learning rates against the BF16 training baseline
+3. **Compare schemes**: Evaluate 8da4w and 4w when both satisfy the model and backend constraints
+4. **Compare group sizes**: Smaller groups provide finer-grained quantization but add scale metadata
 
 ## Limitations and Known Issues
 
 ### Current Limitations
 
 - **SFT only**: QAT is currently supported for Supervised Fine-Tuning tasks only
-- **Model compatibility**: Not all model architectures may be compatible with TorchAO quantizers
+- **BF16 only**: The infrastructure rejects QAT when any model parameter is not BF16
+- **No PEFT**: The fine-tuning recipe rejects configurations that combine QAT and PEFT
+- **Model compatibility**: TorchAO only prepares eligible `nn.Linear` layers, and the 4w path has stricter bias and shape constraints
 - **Training overhead**: QAT adds computational overhead during training
 
 ### Troubleshooting
@@ -286,23 +356,22 @@ If accuracy is below expectations:
 #### Issue: Training diverges or doesn't converge
 
 **Solution**: Try these approaches:
-- Reduce learning rate by 2-5x
-- Increase `delay_fake_quant_steps` to 2000-5000
-- Use a smaller group size (128 instead of 256)
+- Compare lower learning rates against the BF16 baseline
+- Compare supported group sizes whose values divide the target layer dimensions
 - Verify your baseline model trains successfully without QAT
 
 #### Issue: Accuracy is significantly worse than expected
 
 **Solution**:
 - Ensure you're comparing against the same baseline (same training steps, data, etc.)
-- Try 8da4w quantization instead of 4w
-- Reduce group size to 128
-- Increase training steps by 20-30%
+- Compare 8da4w quantization with 4w if both are supported by the deployment backend
+- Compare supported group sizes whose values divide the target layer dimensions
+- Use the validation curve to decide whether additional training steps help
 
 #### Issue: Out of memory during training
 
 **Solution**:
-- QAT should have similar memory usage to full-precision training
+- Measure peak memory against the BF16 run to determine the added cost for this model
 - Reduce batch size if needed
 - Use gradient accumulation to maintain effective batch size
 
