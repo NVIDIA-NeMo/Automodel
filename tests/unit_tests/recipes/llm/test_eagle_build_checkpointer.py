@@ -61,7 +61,7 @@ def _bare_recipe_for_checkpointer(cls, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@patch("nemo_automodel.recipes.llm.train_eagle1.Checkpointer")
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle1_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer, tmp_path):
     """_build_checkpointer must populate model_state_dict_keys from the draft model."""
     recipe = _bare_recipe_for_checkpointer(TrainEagle1Recipe, tmp_path)
@@ -73,7 +73,7 @@ def test_eagle1_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer,
     assert recipe.checkpoint_config.model_state_dict_keys == expected_keys
 
 
-@patch("nemo_automodel.recipes.llm.train_eagle1.Checkpointer")
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle1_build_checkpointer_user_none_override_falls_back(mock_checkpointer, tmp_path):
     """If user config explicitly sets model_state_dict_keys=None, the fallback restores draft keys."""
     user_ckpt_cfg = SimpleNamespace(
@@ -93,7 +93,7 @@ def test_eagle1_build_checkpointer_user_none_override_falls_back(mock_checkpoint
 # ---------------------------------------------------------------------------
 
 
-@patch("nemo_automodel.recipes.llm.train_eagle3.Checkpointer")
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle3_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer, tmp_path):
     """EAGLE-3 _build_checkpointer must also populate model_state_dict_keys."""
     recipe = _bare_recipe_for_checkpointer(TrainEagle3Recipe, tmp_path)
@@ -105,7 +105,7 @@ def test_eagle3_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer,
     assert recipe.checkpoint_config.model_state_dict_keys == expected_keys
 
 
-@patch("nemo_automodel.recipes.llm.train_eagle3.Checkpointer")
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle3_build_checkpointer_user_none_override_falls_back(mock_checkpointer, tmp_path):
     """EAGLE-3: user config model_state_dict_keys=None triggers fallback to draft keys."""
     user_ckpt_cfg = SimpleNamespace(
@@ -118,6 +118,39 @@ def test_eagle3_build_checkpointer_user_none_override_falls_back(mock_checkpoint
 
     expected_keys = list(recipe.draft_model.state_dict().keys())
     assert recipe.checkpoint_config.model_state_dict_keys == expected_keys
+
+
+# ---------------------------------------------------------------------------
+# EAGLE-3: _build_checkpointer flips to adapter-only checkpoints under LoRA
+# ---------------------------------------------------------------------------
+
+
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
+def test_eagle3_build_checkpointer_defaults_without_peft(mock_checkpointer, tmp_path):
+    """Without a peft config the draft saves full consolidated checkpoints."""
+    from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
+
+    recipe = _bare_recipe_for_checkpointer(TrainEagle3Recipe, tmp_path)
+
+    recipe._build_checkpointer(target_path="/fake/target")
+
+    assert recipe.checkpoint_config.is_peft is False
+    assert recipe.checkpoint_config.save_consolidated == SaveConsolidatedMode.EVERY
+
+
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
+def test_eagle3_build_checkpointer_adapter_only_with_peft(mock_checkpointer, tmp_path):
+    """With a peft config the checkpointer saves adapters only (no consolidated export)."""
+    from nemo_automodel.components._peft.lora import PeftConfig
+    from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
+
+    recipe = _bare_recipe_for_checkpointer(TrainEagle3Recipe, tmp_path)
+    recipe.peft_config = PeftConfig(target_modules=["q_proj"])
+
+    recipe._build_checkpointer(target_path="/fake/target")
+
+    assert recipe.checkpoint_config.is_peft is True
+    assert recipe.checkpoint_config.save_consolidated == SaveConsolidatedMode.FALSE
 
 
 # ---------------------------------------------------------------------------

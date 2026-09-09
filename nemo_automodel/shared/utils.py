@@ -29,6 +29,16 @@ def dtype_from_str(val, default=torch.bfloat16):
 
     if isinstance(val, torch.dtype):
         return val
+
+    # val must be a recognized dtype string below; anything else (e.g. a
+    # Mock attribute auto-created in tests that build configs with
+    # unittest.mock.Mock) falls back to the default so a call site like
+    # get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16) stays
+    # safe instead of crashing deep inside str concatenation.
+    if not isinstance(val, str):
+        assert isinstance(default, torch.dtype), default
+        return default
+
     lut = {
         "torch.float": torch.float,
         "torch.float32": torch.float,

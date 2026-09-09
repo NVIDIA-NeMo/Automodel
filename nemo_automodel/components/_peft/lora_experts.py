@@ -15,12 +15,16 @@
 import math
 
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
-from torch.distributed.tensor import DTensor, Partial, Shard
+import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    _AllGatherConcatVarlenFn,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
 )
@@ -35,6 +39,21 @@ except ImportError:
 def _to_local(proj):
     """Convert DTensor to local tensor, or return as-is."""
     return proj.to_local() if isinstance(proj, DTensor) else proj
+
+
+def _to_grouped_mm_operand(proj, dtype: torch.dtype):
+    """Convert a projection tensor to the dtype/layout expected by grouped MM."""
+    return _to_local(proj).to(dtype).contiguous()
+
+
+def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad LoRA rank tensors so grouped-mm strides are 16-byte aligned."""
+    rank = lora_A.size(-1)
+    alignment = max(1, 16 // lora_A.element_size())
+    padding = (-rank) % alignment
+    if padding == 0:
+        return lora_A, lora_B
+    return F.pad(lora_A, (0, padding)), F.pad(lora_B, (0, 0, 0, padding))
 
 
 class GroupedExpertsLoRA(GroupedExperts):
@@ -156,28 +175,51 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         assert self.n_routed_experts % ep_size == 0
 
-        gate_and_up_projs = _to_local(self.gate_and_up_projs)
-        down_projs = _to_local(self.down_projs)
-        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
-        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
-        lora_down_A = _to_local(self.lora_down_A)
-        lora_down_B = _to_local(self.lora_down_B)
+        compute_dtype = x.dtype
+        gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
+        down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
+        lora_gate_and_up_A = _to_grouped_mm_operand(self.lora_gate_and_up_A, compute_dtype)
+        lora_gate_and_up_B = _to_grouped_mm_operand(self.lora_gate_and_up_B, compute_dtype)
+        lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
+        lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
+        local_num_tokens = x.size(0)
         if ep_size > 1:
-            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+            # Variable-length EP gather, mirroring GroupedExperts.forward.
+            # DTensor.from_local(..., Shard(0)).full_tensor() assumes identical local shapes on
+            # every EP rank; with ragged (unpacked / unpadded) batches each rank infers a different
+            # global shape and the all_gather never completes. Exchange lengths, pad, gather, narrow.
+            ep_group = ep_mesh.get_group()
+            local_len_t = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
+            gathered_len_t = [torch.zeros_like(local_len_t) for _ in range(ep_size)]
+            dist.all_gather(gathered_len_t, local_len_t, group=ep_group)
+            gathered_lens = [int(t.item()) for t in gathered_len_t]
+            max_len = max(gathered_lens)
+
+            def _gather_var(t: torch.Tensor, *, differentiable: bool) -> torch.Tensor:
+                if differentiable:
+                    return _AllGatherConcatVarlenFn.apply(t, ep_group, gathered_lens, max_len)
+                if max_len > t.size(0):
+                    pad = torch.zeros((max_len - t.size(0),) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
+                    t = torch.cat([t, pad], dim=0)
+                gathered = [torch.empty_like(t) for _ in range(ep_size)]
+                dist.all_gather(gathered, t, group=ep_group)
+                return torch.cat([g[:n] for g, n in zip(gathered, gathered_lens)], dim=0)
+
+            x = _gather_var(x, differentiable=True)
+            weights = _gather_var(weights.float(), differentiable=True)
+            indices = _gather_var(indices, differentiable=False)
+            token_mask = _gather_var(token_mask, differentiable=False)
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
         experts_end_idx = experts_start_idx + n_local_experts
 
         if self.use_torch_mm:
+            lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
+                lora_gate_and_up_A, lora_gate_and_up_B
+            )
+            lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
             y = self._forward_grouped_mm(
                 x,
                 token_mask,
@@ -210,8 +252,12 @@ class GroupedExpertsLoRA(GroupedExperts):
             )
 
         if ep_size > 1:
-            y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
-            y = y.redistribute(placements=[Shard(0)]).to_local()
+            # Ragged-aware combine, mirroring GroupedExperts.forward:
+            # redistribute(Shard(0)) would split the gathered output into equal chunks.
+            y.add_(x.sum(dtype=torch.float32) * 0.0)  # keep the differentiable gather attached
+            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
+            start = sum(gathered_lens[:ep_rank])
+            y = y.narrow(0, start, local_num_tokens).contiguous()
 
         return y.to(input_dtype)
 
@@ -307,7 +353,7 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
 
-        if tokens_per_expert.sum() > 0:
+        if sorted_token_ids.numel() > 0:
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
 
@@ -370,7 +416,13 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     def __init__(
         self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
     ):
-        super().__init__(orig_module.config)
+        super().__init__(
+            orig_module.config,
+            dispatcher_backend=orig_module.dispatcher_backend,
+            dispatcher_num_sms=orig_module.dispatcher_num_sms,
+            dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
+            dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
+        )
 
         self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
         self.down_projs.data.copy_(orig_module.down_projs.data)
@@ -385,6 +437,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.ep_rank = getattr(orig_module, "ep_rank", 0)
         self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
         self.use_torch_mm = getattr(orig_module, "use_torch_mm", False)
+        self.use_mxfp8 = getattr(orig_module, "use_mxfp8", False)
 
         GroupedExpertsDeepEPLoRA._init_adapter(
             self,
@@ -458,7 +511,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
-    ):
+    ) -> torch.Tensor:
         """Forward pass for GroupedExpertsDeepEPLoRA with LoRA injection.
 
         Mirrors GroupedExpertsDeepEP.forward but injects LoRA computations
@@ -477,15 +530,20 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        gate_and_up_projs = _to_local(self.gate_and_up_projs)
-        down_projs = _to_local(self.down_projs)
-        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
-        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
-        lora_down_A = _to_local(self.lora_down_A)
-        lora_down_B = _to_local(self.lora_down_B)
+        compute_dtype = x.dtype
+        gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
+        down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
+        lora_gate_and_up_A = _to_grouped_mm_operand(self.lora_gate_and_up_A, compute_dtype)
+        lora_gate_and_up_B = _to_grouped_mm_operand(self.lora_gate_and_up_B, compute_dtype)
+        lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
+        lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
+                lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
+                    lora_gate_and_up_A, lora_gate_and_up_B
+                )
+                lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
                 tokens_per_expert_gpu = tokens_per_expert.to(
                     device=permuted_local_hidden_states.device, non_blocking=True
                 )

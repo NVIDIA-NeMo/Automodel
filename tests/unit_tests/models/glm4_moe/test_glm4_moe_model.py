@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -171,7 +172,7 @@ class TestBlock:
         padding_mask = torch.tensor([[0, 0, 1]], dtype=torch.bool, device=device)
 
         with (
-            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)),
             patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask, padding_mask=padding_mask)
@@ -236,6 +237,8 @@ class TestGlm4MoeModel:
         assert model.moe_config.n_activated_experts == glm_config.num_experts_per_tok
         assert model.moe_config.score_func == "sigmoid"  # GLM4 uses sigmoid
         assert model.moe_config.softmax_before_topk is False
+        assert model.moe_config.apply_router_weight_after_down is True
+        assert model.moe_config.router_weights_fp32 is True
         assert model.moe_config.route_scale == glm_config.routed_scaling_factor
 
     def test_model_initializes_moe_config_with_expert_groups(self, glm_config, backend_config):
@@ -291,7 +294,7 @@ class TestGlm4MoeModel:
                     mock_freqs.return_value = torch.randn(
                         batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor)
                     )
-                    out = model(input_ids)
+                    model(input_ids)
 
         # Verify position_ids_to_freqs_cis was called
         mock_freqs.assert_called_once()
@@ -374,8 +377,9 @@ class TestGlm4MoeForCausalLM:
             "forward",
             return_value=torch.randn(batch, seq_len, glm_config.hidden_size, device=device).to(torch.bfloat16),
         ):
-            logits = model(input_ids)
+            out = model(input_ids)
 
+        logits = out.logits
         assert logits.shape == (batch, seq_len, glm_config.vocab_size)
 
     def test_forward_with_thd_format_squeezes_input(self, glm_config, backend_config, device):
@@ -394,8 +398,9 @@ class TestGlm4MoeForCausalLM:
             ),
         ):
             mock_squeeze.return_value = (input_ids.squeeze(0), None, None, {"qkv_format": "thd"})
-            logits = model(input_ids, qkv_format="thd")
+            out = model(input_ids, qkv_format="thd")
 
+        logits = out.logits
         mock_squeeze.assert_called_once()
         # Output should be unsqueezed back to batch dimension
         assert logits.shape == (batch, seq_len, glm_config.vocab_size)
@@ -470,7 +475,8 @@ class TestGlm4MoeModelClassmethods:
 
         assert isinstance(model, Glm4MoeForCausalLM)
         assert model.config == glm_config
-        assert model.backend == backend_config
+        assert model.backend == replace(backend_config, gate_precision=torch.float32)
+        assert backend_config.gate_precision is None
 
     def test_from_pretrained_classmethod(self):
         """Ensure classmethod from_pretrained builds config then delegates to from_config."""

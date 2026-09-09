@@ -33,7 +33,8 @@ Example (YAML)::
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import List, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -48,6 +49,12 @@ from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
+from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 logger = logging.get_logger(__name__)
 
@@ -169,12 +176,12 @@ class Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Tuple[torch.Tensor] | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor | None, Tuple[torch.Tensor] | None]:
         bsz, q_len, _ = hidden_states.size()
 
         proj = self.W_pack(hidden_states)
@@ -218,11 +225,11 @@ class DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Tuple[torch.Tensor] | None = None,
+        output_attentions: bool | None = False,
+        use_cache: bool | None = False,
     ) -> Tuple[torch.FloatTensor, ...]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -337,14 +344,14 @@ class BaichuanModel(BaichuanPreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: List[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
         **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -472,9 +479,22 @@ class BaichuanModel(BaichuanPreTrainedModel):
 # Causal LM head
 # ---------------------------------------------------------------------------
 class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    # lm_head is a weight-normalizing NormHead, so tying it to embed_tokens is
+    # semantically wrong; all shipped Baichuan checkpoints are untied.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     def __init__(self, config: BaichuanConfig, **model_kwargs):
+        warn_deprecated_model_class("BaichuanForCausalLM")
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = BaichuanModel(config)
         self.lm_head = NormHead(config.hidden_size, config.vocab_size, bias=False)
@@ -501,15 +521,16 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: List[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -518,6 +539,8 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Run the backbone with return_dict so we can reliably access the final
+        # hidden states regardless of the caller's return_dict preference.
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -527,11 +550,12 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True,
         )
 
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        hidden_states = outputs.last_hidden_state
+
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
@@ -545,15 +569,20 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
                 softmax_normalizer = shift_logits.max(-1).values ** 2
                 loss = loss + z_loss_weight * softmax_normalizer.mean()
 
+        # Carry the FINAL hidden states (the input to lm_head) when requested so
+        # the recipe's FusedLinearCrossEntropy path can recompute logits cheaply.
+        out_hidden_states = hidden_states if output_hidden_states else None
+
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            extras = (out_hidden_states, outputs.attentions) if output_hidden_states else ()
+            output = (logits,) + tuple(v for v in (outputs.past_key_values, *extras) if v is not None)
             return (loss,) + output if loss is not None else output
 
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            hidden_states=out_hidden_states,
             attentions=outputs.attentions,
         )
 

@@ -14,13 +14,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import replace
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.ernie4_5.configuration_ernie4_5 import Ernie4_5Config
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     postprocess_output_for_attn,
@@ -28,10 +31,16 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import (
     BackendConfig,
+    compute_lm_head_logits,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.ernie4_5.rope_utils import Ernie4_5RotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.ernie4_5.state_dict_adapter import (
     Ernie4_5_MoeStateDictAdapter,
@@ -320,6 +329,11 @@ class Ernie4_5_MoeModel(nn.Module):
     ):
         super().__init__()
         self.config = config
+        # HF disables autocast for ERNIE's router projection and computes the
+        # routing probabilities in fp32. Keep the same default while preserving
+        # an explicit backend override.
+        if backend.gate_precision is None:
+            backend = replace(backend, gate_precision=torch.float32)
         self.backend = backend
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
@@ -408,6 +422,8 @@ class Ernie4_5_MoeModel(nn.Module):
 class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     """Dense ERNIE 4.5 causal language model."""
 
+    # Both shipped ERNIE-4.5 checkpoints are tied; untied is not a validated path.
+    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
     _skip_init_weights_on_load = True
     _nemo_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -441,6 +457,7 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         self.model = Ernie4_5Model(config, self.backend)
         self.vocab_size = config.vocab_size
@@ -479,10 +496,18 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -495,23 +520,43 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        if not (isinstance(logits_to_keep, int) and logits_to_keep == 0):
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            hidden = hidden[:, slice_indices, :]
-        logits = self.lm_head(hidden)
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            logits = logits.unsqueeze(0)
-        return logits
+
+        return compute_lm_head_logits(
+            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
+        )
 
 
 class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """ERNIE 4.5 MoE causal language model with AutoModel EP support."""
 
+    # Both shipped ERNIE-4.5 checkpoints are tied; untied is not a validated path.
+    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
     _skip_init_weights_on_load = True
     _nemo_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
+    _keep_in_fp32_modules = ["rotary_emb"]
+
+    @classmethod
+    def get_capabilities(cls, config) -> ModelCapabilities:
+        """Return parallelism capabilities for a specific ERNIE-4.5 config.
+
+        ERNIE-4.5 ships in two flavors that share this class file but exercise
+        different code paths:
+
+        1. ``baidu/ERNIE-4.5-21B-A3B-PT`` -- MoE variant (this NeMo custom
+           class). ``moe_num_experts > 0`` in the HF config.
+           Demonstrated by examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml
+           (ep_size=8).
+        2. ``baidu/ERNIE-4.5-0.3B-PT`` -- dense variant. No expert config.
+           Demonstrated by examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
+           (tp/cp/pp/ep all 1).
+        """
+        if getattr(config, "moe_num_experts", 0) > 0:
+            return ModelCapabilities(supports_ep=True)
+        return ModelCapabilities()
 
     @classmethod
     def from_config(
@@ -542,6 +587,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Ernie4_5_MoeModel(
@@ -560,6 +606,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         )
         if getattr(config, "tie_word_embeddings", True):
             self.lm_head.weight = self.model.embed_tokens.weight
+        cast_model_to_dtype(self, _config_dtype(config))
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Ernie4_5_MoeStateDictAdapter(
                 self.config,
@@ -591,10 +638,18 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -607,13 +662,10 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        if not (isinstance(logits_to_keep, int) and logits_to_keep == 0):
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            hidden = hidden[:, slice_indices, :]
-        logits = self.lm_head(hidden)
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            logits = logits.unsqueeze(0)
-        return logits
+
+        return compute_lm_head_logits(
+            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
+        )
 
 
 ModelClass = Ernie4_5_MoeForCausalLM

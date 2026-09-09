@@ -1,0 +1,129 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Benchmarking config for Qwen3 MoE 30B (A3B) bf16, attn=sdpa + torch.compile(attention) + experts=te, GB200.
+#
+# WAVE 13: generalizes the DeepSeek MLA compile win to standard GQA attention. Single-variable
+# delta vs qwen3_moe_30b_te_deepep_gb200.yaml (attn:te/experts:te, 9.183 s / 26.27% MFU@2500):
+# switch the attention path to attn:sdpa + compile_attn:true (+ linear/rms_norm:torch,
+# rope_fusion:false so no TE submodules inside the compiled region). experts:te kept (the
+# shipping bf16 expert backend) — only the attention module changes. Expect a SMALL win or
+# wash (GQA is far fewer ops than MLA, and the MoE experts dominate compute).
+#
+# GB200 deltas vs the generic qwen3_moe_30b_te_deepep.yaml:
+#   - peak_tflops: 2500  (GB200 BF16 dense peak; generic recipe uses H100 989)
+#   - num_nodes/ci.nodes: 1 -> 2  (2 nodes x 4 GB200 = 8 GPUs)
+#   - local_batch_size: 4 -> 16
+#
+# Parallelism: ep_size=8, tp=pp=cp=1. With dp_size=8 (world=8) and
+# global_batch_size=512, lbs=16 gives 512 / (8 * 16) = 4 gradient-accumulation
+# micro-batches. seq_len=4096. lbs=16 matches the qwen3_moe_30b_te_mxfp8_gb200
+# operating point so the bf16 vs mxfp8 comparison is a precision-only delta.
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+seed: 1234
+
+benchmark:
+  warmup_steps: 10
+  peak_tflops: 2500  # GB200 BF16 dense peak TFLOPs
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 2
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 512
+  local_batch_size: 16
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 30
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa     # WAVE 13: compilable attention backend (TE attn not fullgraph-traceable)
+    linear: torch  # WAVE 13: TE Linear is @torch.compiler.disable'd -> breaks attn fullgraph
+    rms_norm: torch  # WAVE 13: TE RMSNorm also compiler-disabled
+    rope_fusion: false  # WAVE 13: fused RoPE is a TE compiler-disabled op
+    compile_attn: true  # WAVE 13: torch.compile(fullgraph) the GQA attention forward
+    experts: te  # TE GroupedLinear bf16 (no fp8) — fastest bf16 expert backend (bake-off: te 26.27% > gmm 26.12% > torch_mm 25.45%)
+    dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
+    fake_balanced_gate: true
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 4096
+  num_samples: 100000
+
+dataloader:
+  batch_size: null  # Dataset already yields batches
+  _target_: torch.utils.data.DataLoader
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
+  foreach: false  # ep8==world8: TE experts plain-tensor vs DTensor; per-param Adam avoids _foreach_lerp_ mix
+
+
+ci:
+  time: "00:40:00"
+  nodes: 2
+  cluster_tag: gb200
+  ep_size: 8

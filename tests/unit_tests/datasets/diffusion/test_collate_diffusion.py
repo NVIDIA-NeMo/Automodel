@@ -24,6 +24,7 @@ import torch
 
 from nemo_automodel.components.datasets.diffusion.collate_fns import (
     build_text_to_image_multiresolution_dataloader,
+    collate_fn_production,
     collate_fn_text_to_image,
 )
 
@@ -140,6 +141,37 @@ class TestCollateFnTextToImage:
         assert "crop_resolution" in meta
         assert "original_resolution" in meta
         assert "crop_offset" in meta
+
+
+class TestCollateFnProduction:
+    """Tests for collate_fn_production."""
+
+    def test_variable_length_prompt_embeds_are_padded(self):
+        first_prompt_embeds = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        second_prompt_embeds = torch.arange(20, dtype=torch.bfloat16).reshape(5, 4)
+        batch = []
+        for index, prompt_embeds in enumerate((first_prompt_embeds, second_prompt_embeds)):
+            batch.append(
+                {
+                    "latent": torch.full((16, 64, 64), index, dtype=torch.bfloat16),
+                    "crop_resolution": torch.tensor([512, 512]),
+                    "original_resolution": torch.tensor([512, 512]),
+                    "crop_offset": torch.tensor([0, 0]),
+                    "prompt": f"prompt {index}",
+                    "image_path": f"/path/img_{index}.png",
+                    "bucket_id": "512x512",
+                    "aspect_ratio": 1.0,
+                    "prompt_embeds": prompt_embeds,
+                }
+            )
+
+        result = collate_fn_production(batch)
+
+        assert result["prompt_embeds"].shape == (2, 8, 4)
+        torch.testing.assert_close(result["prompt_embeds"][0, :3], first_prompt_embeds)
+        assert torch.count_nonzero(result["prompt_embeds"][0, 3:]) == 0
+        torch.testing.assert_close(result["prompt_embeds"][1, :5], second_prompt_embeds)
+        assert torch.count_nonzero(result["prompt_embeds"][1, 5:]) == 0
 
 
 # =============================================================================

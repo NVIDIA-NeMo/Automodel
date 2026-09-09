@@ -92,6 +92,7 @@ def test_batchify_adds_batch_dimension() -> None:
     assert out.ndim == 2
     assert torch.equal(out, torch.tensor([[1, 2, 3]]))
 
+
 def test_batchify_adds_batch_dimension_default_tensor_cls() -> None:
     """`batchify` must insert dim-0 in-place when given a 1-D tensor."""
     vec = [1, 2, 3]
@@ -150,7 +151,7 @@ def test_default_collater_shapes() -> None:
             "___PAD_TOKEN_IDS___": {
                 "input_ids": 0,
                 "labels": -100,
-            }
+            },
         },
         {
             "input_ids": [3],
@@ -160,7 +161,7 @@ def test_default_collater_shapes() -> None:
             "___PAD_TOKEN_IDS___": {
                 "input_ids": 0,
                 "labels": -100,
-            }
+            },
         },
     ]
 
@@ -178,7 +179,7 @@ def test_default_collater_shapes() -> None:
     # Verify returned values
     attention_mask = torch.tensor([[1, 1], [1, 0]])
     input_ids = torch.tensor([[1, 2], [3, 0]])
-    labels = torch.tensor([[ 101,  102], [ 103, -100]])
+    labels = torch.tensor([[101, 102], [103, -100]])
     loss_mask = torch.tensor([[1, 1], [1, 0]])
 
     assert torch.equal(collated["attention_mask"], attention_mask)
@@ -199,6 +200,56 @@ def test_default_collater_shapes() -> None:
     # # Sanity on dtype
     # for tensor in collated.values():
     #     assert tensor.dtype == torch.long
+
+
+def test_default_collater_padding_mask_prefers_attention_mask() -> None:
+    """padding_mask must follow attention_mask, not input_ids == pad_token value.
+
+    Regression test: when pad_token_id collides with a content token value (e.g.
+    pad_token_id == eos_token_id), keying padding off the input_ids *value* flags real
+    tokens as padding, which masks them out of the MoE experts -> near-random outputs on
+    chat data. The collater must instead derive padding_mask from the real attention_mask.
+    """
+    # pad_token value 1 also appears as a real content token: the trailing eos of row 0
+    # and the leading token of row 1. Neither is padding.
+    raw_batch = [
+        {
+            "input_ids": [5, 6, 1],
+            "attention_mask": [1, 1, 1],
+            "labels": [5, 6, 1],
+            "___PAD_TOKEN_IDS___": {"input_ids": 1, "labels": -100},
+        },
+        {
+            "input_ids": [1, 7],
+            "attention_mask": [1, 1],
+            "labels": [1, 7],
+            "___PAD_TOKEN_IDS___": {"input_ids": 1, "labels": -100},
+        },
+    ]
+
+    collated = sftp.default_collater(raw_batch)
+
+    # Row 1 is padded 2->3 with pad_token 1; only that trailing slot is real padding.
+    expected = torch.tensor([[False, False, False], [False, False, True]])
+    assert torch.equal(collated["padding_mask"], expected)
+
+    # The buggy value-based mask would flag every input_ids == 1 (the real eos/leading tokens).
+    value_based = collated["input_ids"] == 1
+    assert not torch.equal(collated["padding_mask"], value_based)
+
+
+def test_default_collater_padding_mask_fallback_without_attention_mask() -> None:
+    """Without an attention_mask, padding_mask falls back to input_ids == pad_token."""
+    raw_batch = [
+        {"input_ids": [5, 6, 7], "___PAD_TOKEN_IDS___": {"input_ids": 0}},
+        {"input_ids": [5, 6], "___PAD_TOKEN_IDS___": {"input_ids": 0}},
+    ]
+
+    collated = sftp.default_collater(raw_batch)
+
+    assert "attention_mask" not in collated
+    expected = torch.tensor([[False, False, False], [False, False, True]])
+    assert torch.equal(collated["padding_mask"], expected)
 
 
 def test_tokenize_function_strips_special_tokens(dummy_tokenizer: DummyTokenizer) -> None:
@@ -304,6 +355,7 @@ def test_full_process_pipeline(dummy_tokenizer: DummyTokenizer) -> None:
     first_len = len(processed[0]["input_ids"])
     assert all(len(r["input_ids"]) == first_len for r in processed)
 
+
 @pytest.mark.parametrize(
     "lst,value,expected",
     [
@@ -320,6 +372,7 @@ def test_full_process_pipeline(dummy_tokenizer: DummyTokenizer) -> None:
 )
 def test_find_last_non_pad_token(lst, value, expected):
     assert sftp.find_last_non_pad_token(lst, value) == expected
+
 
 @pytest.mark.parametrize(
     "val,expected",
@@ -771,3 +824,93 @@ class TestPackedSequenceTHDCollater:
         # Sum across batch should equal total_tokens
         total_tokens = batch_size * max_len
         assert result["seq_lens_padded"].sum().item() == total_tokens
+
+
+class TestPackedSequenceTHDCollaterVlm:
+    """Tests for the packed_sequence_thd_collater_vlm adapter (VLM-recipe call convention)."""
+
+    @staticmethod
+    def _batch() -> list[dict[str, list[int]]]:
+        return [
+            {
+                "input_ids": [1, 2, 3, 4, 5],
+                "labels": [1, 2, 3, 4, 5],
+                "position_ids": [0, 1, 2, 3, 4],
+                "seq_lens": [5],
+                "seq_lens_padded": [5],
+            }
+        ]
+
+    @staticmethod
+    def _assert_same_as_direct(adapter_out: dict[str, Any], direct_out: dict[str, Any]) -> None:
+        assert adapter_out.keys() == direct_out.keys()
+        for key, value in direct_out.items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(adapter_out[key], value)
+            else:
+                assert adapter_out[key] == value
+
+    def test_forwards_batch_unchanged(self) -> None:
+        """(a) The adapter forwards the batch to packed_sequence_thd_collater and returns its result."""
+        batch = self._batch()
+        adapter_out = sftp.packed_sequence_thd_collater_vlm(batch)
+        direct_out = sftp.packed_sequence_thd_collater(batch)
+        self._assert_same_as_direct(adapter_out, direct_out)
+
+    def test_accepts_and_ignores_processor_and_extra_kwargs(self) -> None:
+        """(b) The adapter accepts (and ignores) processor= and extra kwargs, per the VLM build_dataloader convention."""
+        batch = self._batch()
+        # recipes/vlm/finetune.py calls the collate as (examples=..., processor=...); extra kwargs must be tolerated.
+        adapter_out = sftp.packed_sequence_thd_collater_vlm(
+            examples=batch, processor=object(), some_extra="ignored", another=123
+        )
+        direct_out = sftp.packed_sequence_thd_collater(batch)
+        self._assert_same_as_direct(adapter_out, direct_out)
+
+
+class TestPackFeaturesForThd:
+    """Tests for pack_features_for_thd."""
+
+    def test_concatenates_and_restarts_positions(self):
+        record = sftp.pack_features_for_thd(
+            [
+                {"input_ids": [10, 11, 12], "labels": [11, 12, -100]},
+                {"input_ids": [20, 21], "labels": [21, 22]},
+            ]
+        )
+        assert record["input_ids"] == [10, 11, 12, 20, 21]
+        assert record["labels"] == [11, 12, -100, 21, 22]
+        assert record["position_ids"] == [0, 1, 2, 0, 1]
+        assert record["seq_lens"] == [3, 2]
+        assert record["seq_lens_padded"] == [3, 2]
+
+    def test_missing_labels_fill_ignore_index(self):
+        record = sftp.pack_features_for_thd([{"input_ids": [1, 2]}, {"input_ids": [3], "labels": [4]}])
+        assert record["labels"] == [-100, -100, 4]
+
+    def test_accepts_tensor_fields(self):
+        record = sftp.pack_features_for_thd([{"input_ids": torch.tensor([1, 2]), "labels": torch.tensor([2, 3])}])
+        assert record["input_ids"] == [1, 2]
+        assert record["labels"] == [2, 3]
+
+    def test_label_length_mismatch_raises(self):
+        with pytest.raises(ValueError, match="does not match"):
+            sftp.pack_features_for_thd([{"input_ids": [1, 2], "labels": [2]}])
+
+    def test_empty_inputs_raise(self):
+        with pytest.raises(ValueError, match="at least one"):
+            sftp.pack_features_for_thd([])
+        with pytest.raises(ValueError, match="empty sequence"):
+            sftp.pack_features_for_thd([{"input_ids": []}])
+
+    def test_round_trips_through_thd_collater(self):
+        record = sftp.pack_features_for_thd(
+            [
+                {"input_ids": [10, 11, 12], "labels": [11, 12, -100]},
+                {"input_ids": [20, 21], "labels": [21, 22]},
+            ]
+        )
+        batch = sftp.packed_sequence_thd_collater([record])
+        assert batch["qkv_format"] == "thd"
+        assert batch["input_ids"].shape == (1, 5)
+        assert batch["seq_lens"][0].tolist() == [3, 2]

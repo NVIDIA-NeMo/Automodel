@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -305,8 +305,24 @@ class TestMistral4ForCausalLM:
     def test_forward_shape(self, text_config, backend, device):
         model = Mistral4ForCausalLM(text_config, backend=backend).to(device).to(torch.bfloat16)
         input_ids = torch.randint(0, 256, (1, 8), device=device)
-        logits = model(input_ids)
+        logits = model(input_ids).logits
         assert logits.shape == (1, 8, 256)
+
+    def test_forward_thd_hidden_states_match_logits_layout(self, text_config, backend, device):
+        model = Mistral4ForCausalLM(text_config, backend=backend).to(device).to(torch.bfloat16)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, text_config.vocab_size, (batch, seq), device=device)
+        position_ids = torch.arange(seq, device=device).unsqueeze(0)
+        hidden = torch.randn(seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
+        with patch.object(model.model, "forward", return_value=hidden):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, text_config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, text_config.hidden_size)
 
     def test_model_class_export(self):
         assert ModelClass is Mistral4ForCausalLM
@@ -642,6 +658,18 @@ class TestMistral3Model:
 
 @_skip_no_hf_mistral3
 class TestMistral3ForConditionalGeneration:
+    def test_checkpoint_tie_policy_ignores_outer_wrapper_default(self, multimodal_config, backend):
+        from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
+        from nemo_automodel.components.models.mistral4.model import (
+            Mistral3ForConditionalGeneration as OurMistral3ForCG,
+        )
+
+        model = OurMistral3ForCG(multimodal_config, backend=backend)
+
+        assert multimodal_config.tie_word_embeddings is True
+        assert multimodal_config.text_config.tie_word_embeddings is False
+        assert is_tied_word_embeddings(model) is False
+
     def test_init(self, multimodal_config, backend):
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,

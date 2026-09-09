@@ -1,0 +1,112 @@
+recipe: TrainEagle3Recipe
+
+# P-EAGLE (parallel-drafting EAGLE-3) MVP recipe. Trains the same Llama-style
+# EAGLE-3 draft as ``llama_eagle3_mvp_flash_attn.yaml`` but in *parallel
+# drafting* mode. Following the vLLM P-EAGLE implementation
+# (https://github.com/vllm-project/speculators/pull/480), the draft predicts all
+# ``num_depths`` tokens in a SINGLE forward over a flat, COD-subsampled sequence
+# (depth 0 keeps every position; depth d keeps a geometrically decaying
+# ``down_sample_ratio**d`` fraction). Masked depths condition on a learnable
+# ``mask_hidden`` placeholder and the reserved ``mask_token_id`` token. Cross-depth
+# visibility is enforced by a flex-attention COD mask -- this is NOT EAGLE-3's
+# autoregressive TTT recurrence.
+#
+# IMPORTANT -- inference runtime. P-EAGLE inference is implemented in vLLM via
+# the speculators format. The checkpoint this recipe produces saves the
+# learnable ``mask_hidden`` tensor (shape ``[1, 1, 3*hidden_size]``) and writes
+# ``mask_token_id`` / ``num_depths`` / the COD ratios into the draft
+# ``config.json`` so vLLM loads it unchanged. SGLang does not serve a P-EAGLE
+# head today, so the ``serve_sglang`` entry point cannot serve this draft.
+# Training and the on-disk format are validated by CPU unit tests; acceptance /
+# speedup numbers can only be measured by running the head under vLLM on a GPU.
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-8B
+
+  # ``jihwan1205/perfectblend-qwen3-8b-regen`` is
+  # distributed with a ``conversations`` column, but ChatDataset expects
+  # ``messages``. Before pointing the recipe at the dataset, rename the
+  # column locally (one-liner shown below) and pass the rewritten
+  # directory or HF dataset ID here.
+  #
+  # uv run python -c "from pathlib import Path; import pandas as pd; from huggingface_hub import list_repo_files, hf_hub_download; repo='jihwan1205/perfectblend-qwen3-8b-regen'; \
+  # dst=Path('./cache/dataset/perfectblend-qwen3-8b-regen-messages'); dst.mkdir(parents=True, exist_ok=True); \
+  # files=sorted(f for f in list_repo_files(repo, repo_type='dataset') if f.startswith('data/train-') and f.endswith('.parquet')); \
+  # [pd.read_parquet(hf_hub_download(repo_id=repo, repo_type='dataset', filename=f)).rename(columns={'conversations':'messages'}).to_parquet(dst / Path(f).name, index=False) for f in files]; \
+  # print(f'wrote {len(files)} shards to {dst}')"
+
+  train_data_path: ./cache/dataset/perfectblend-qwen3-8b-regen-messages
+  val_data_path: null
+
+  train_split: "train[:70000]"
+  val_split: null
+
+  output_dir: ./outputs/peagle_qwen3_8b_perfectblend
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 8
+  num_epochs: 20
+  draft_vocab_size: 151936
+  selected_token_ids_path: ./outputs/peagle_qwen3_8b_perfectblend/draft_token_map_151936.pt
+  freeze_embeddings: false
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 50
+  max_grad_norm: 1.0
+  # mask_reasoning_content: true   # exclude <think>...</think> reasoning traces from loss
+
+  # ----------------------------------------------------------------------
+  # P-EAGLE knobs.
+  #
+  # ``parallel_drafting: true`` switches the recipe from the EAGLE-3 TTT
+  # trainer to the COD parallel-drafting trainer and registers the learnable
+  # ``mask_hidden`` placeholder on the draft.
+  #
+  # ``num_depths`` is K -- the number of parallel COD prediction depths
+  # (P-EAGLE's analogue of ``ttt_steps``). It must match the vLLM
+  # ``num_speculative_tokens`` used at inference.
+  #
+  # ``num_draft_layers`` is the number of stacked draft decoder layers (the
+  # fused first layer + vanilla Llama layers). The speculators reference trains
+  # 4; unlike EAGLE-3 TTT (always single-layer) P-EAGLE benefits from depth.
+  #
+  # ``down_sample_ratio`` / ``down_sample_ratio_min`` control COD geometric
+  # subsampling of deeper depths (retention ``max(r**d, r_min)``); the
+  # speculators defaults are 0.7 / 0.2.
+  #
+  # ``mask_token_id`` is REQUIRED (no default): the reserved token id placed at
+  # every masked multi-token-prediction slot. Its ``embed_tokens`` row serves as
+  # the masked token embedding, so pick a token that does NOT carry meaning in
+  # your data -- a reserved / unused id, not a frequent token like 0. The recipe
+  # range-checks it and writes it into the draft ``config.json``; vLLM reads it
+  # back at inference, so the value here and at serve time MUST match. For
+  # Qwen3-8B, 151669 is the first unused embedding slot
+  # (len(tokenizer)=151669, vocab_size=151936).
+  # ----------------------------------------------------------------------
+  parallel_drafting: true
+  num_depths: 8
+  num_draft_layers: 4
+  down_sample_ratio: 0.8
+  down_sample_ratio_min: 0.2
+  mask_token_id: 151669
+  #
+  # ``sequence_partitions`` (S, default 1) is a training-only memory knob. With
+  # S > 1 the trainer splits each sequence into S segments by dependency lineage
+  # and runs a separate forward+backward per segment, accumulating gradients, so
+  # only one segment's activations are resident at a time (P-EAGLE Algorithm 1,
+  # arXiv:2602.01469). The loss and the saved checkpoint are unchanged -- it only
+  # trades recomputation for lower peak memory, letting the flat COD forward
+  # train on long contexts that would otherwise OOM. Leave at 1 until you hit a
+  # memory wall, then raise it (e.g. 2/4/8).
+  sequence_partitions: 1
+
+optimizer:
+  lr: 1e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0
+  warmup_ratio: 0.015

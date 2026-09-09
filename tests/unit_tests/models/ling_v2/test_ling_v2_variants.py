@@ -135,7 +135,7 @@ def test_tiny_variant_forward(variant):
     torch.manual_seed(0)
     ids = torch.randint(0, cfg.vocab_size, (1, 16), device="cuda:0")
     with torch.no_grad():
-        logits = model(ids)
+        logits = model(ids).logits
 
     assert logits.shape == (1, 16, cfg.vocab_size)
     assert torch.isfinite(logits).all(), f"{variant}: non-finite logits"

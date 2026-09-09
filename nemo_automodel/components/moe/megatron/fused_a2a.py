@@ -110,8 +110,30 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
         or _buffer.num_nvl_bytes < num_nvl_bytes
         or _buffer.num_rdma_bytes < num_rdma_bytes
     ):
-        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
+        # explicitly_destroy=True lets callers free the NVSHMEM/cpp runtime via
+        # ``_buffer.destroy()`` (see free_buffer()). Without an explicit teardown the DeepEP
+        # state lingers on the GPUs for the lifetime of the process / Slurm allocation and
+        # corrupts later forwards (e.g. a checkpoint-robustness HF reload after training).
+        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, explicitly_destroy=True)
     return _buffer
+
+
+def free_buffer() -> None:
+    """Destroy the global DeepEP ``Buffer`` and release its NVSHMEM/cpp runtime.
+
+    DeepEP keeps a process-global communication buffer backed by NVSHMEM symmetric memory.
+    It is normally never torn down (``destroy_process_group`` hangs on DeepEP's NCCL
+    sub-groups, so cleanup is skipped), but that leftover GPU state survives process exit for
+    the whole Slurm allocation and corrupts subsequent forwards. Destroying the buffer first
+    frees the runtime and lets a clean ``destroy_process_group`` follow without hanging.
+    """
+    global _buffer
+    if _buffer is not None:
+        try:
+            _buffer.destroy()
+        except Exception:  # pragma: no cover - best effort
+            pass
+        _buffer = None
 
 
 class FusedDispatch(torch.autograd.Function):

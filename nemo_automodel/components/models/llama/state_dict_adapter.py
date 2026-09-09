@@ -21,15 +21,20 @@ handling is applied in from_hf).
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 from transformers import LlamaConfig
+
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 
 logger = logging.getLogger(__name__)
 
 
-class LlamaStateDictAdapter:
+class LlamaStateDictAdapter(StateDictAdapter):
     """State dict adapter for Llama models.
+
+    Subclassing the common interface makes the adapter checkpoint-compatible;
+    load-path policy remains entirely inside the checkpoint package.
 
     Uses separate projections that match HuggingFace key names exactly, so
     from_hf / to_hf are simple passthroughs (only tied-weight handling in
@@ -56,7 +61,8 @@ class LlamaStateDictAdapter:
         # HF keys match model keys directly.
         # Only need to handle tied lm_head weights.
         custom_state_dict = dict(hf_state_dict)
-        if getattr(self.config, "tie_word_embeddings", True):
+        # Default False to match __init__/tie_weights (config always carries the flag).
+        if getattr(self.config, "tie_word_embeddings", False):
             embed_key = "model.embed_tokens.weight"
             lm_head_key = "lm_head.weight"
             if lm_head_key not in custom_state_dict and embed_key in custom_state_dict:
@@ -67,10 +73,26 @@ class LlamaStateDictAdapter:
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         # Model keys are already in HF format.
         if exclude_key_regex is not None:
             return {k: v for k, v in state_dict.items() if not re.search(exclude_key_regex, k)}
         return dict(state_dict)
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Return one Llama tensor under its unchanged HF state-dict key.
+
+        Args:
+            fqn: Fully-qualified HF state-dict key. The key determines the tensor's rank and axis order.
+            tensor: Tensor/value to export. This passthrough does not copy or transform it.
+            **kwargs: Optional controls, including ``exclude_key_regex`` to skip matching keys.
+
+        Returns:
+            A single ``(fqn, tensor)`` tuple, or an empty list when filtered. The returned tensor aliases the input.
+        """
+        exclude_key_regex = kwargs.get("exclude_key_regex")
+        if exclude_key_regex is not None and re.search(exclude_key_regex, fqn):
+            return []
+        return [(fqn, tensor)]

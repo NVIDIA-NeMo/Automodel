@@ -15,8 +15,12 @@
 # Fine-tuning Gemma4 E4B with TransformerEngine DotProductAttention (FlashAttention-3).
 # attn_implementation: te  injects TE into all self_attn modules post-init,
 # enabling FA3 kernels without any model-specific code changes.
-#
-# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py \
+
+# PR 2237 changed the default reduce_dtype from bfloat16 to fp32, which causes OOMs on E4B with 2 GPUs.
+# Although it can be made to run on 2 GPUs by setting reduce_dtype back to bfloat16 and AC=True, its still very 
+# tight. Hence, using 8 GPUs to run this recipe.
+
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
 #   -c examples/vlm_finetune/gemma4/gemma4_4b_te.yaml
 
 recipe: FinetuneRecipeForVLM
@@ -96,7 +100,6 @@ optimizer:
   betas: [0.9, 0.95]
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -107,4 +110,5 @@ freeze_config:
 #   name: <your-run-name>
 
 ci:
+  time: "00:15:00"
   recipe_owner: khazic

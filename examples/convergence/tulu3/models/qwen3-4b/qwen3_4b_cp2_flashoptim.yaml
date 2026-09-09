@@ -23,6 +23,9 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  # FusedLinearCrossEntropy fuses the lm_head projection with cross-entropy and
+  # needs the final hidden state instead of the full [bsz, seq, vocab] logits.
+  output_hidden_states: true
   pretrained_model_name_or_path: Qwen/Qwen3-4B-Base
   force_hf: true
 
@@ -30,7 +33,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints_convergence/qwen3_4b_tulu3_cp2/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -55,7 +58,9 @@ autocast:
   dtype: bfloat16
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  # Avoids the full bf16->fp32 logit upcast that OOMs MaskedCrossEntropy on long
+  # tulu3 samples (truncation: false) on 8xH100-80GB. See PR #1554.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset

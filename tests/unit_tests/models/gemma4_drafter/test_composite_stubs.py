@@ -534,6 +534,13 @@ class TestSaveLoadPretrained:
         assert base_call.kwargs["peft_config"] == peft
         assert drafter_call.kwargs["peft_config"] is None
 
+    def test_save_forwards_final_checkpoint_flag_to_both_submodels(self, tmp_path):
+        comp, _, _ = _make_composite()
+        ckpt = MagicMock()
+        comp.save_pretrained(str(tmp_path), checkpointer=ckpt, is_final_checkpoint=True)
+        assert ckpt.save_model.call_count == 2
+        assert all(call.kwargs["is_final_checkpoint"] is True for call in ckpt.save_model.call_args_list)
+
     def test_load_requires_checkpointer(self, tmp_path):
         comp, _, _ = _make_composite()
         with pytest.raises(ValueError, match="checkpointer"):
@@ -697,14 +704,19 @@ class TestFromPretrainedHappyPath:
         assert captured["image_kwargs"]["text_config"] == {"use_cache": True}
         assert "text_config" not in captured["causal_kwargs"]
 
-    def test_pipeline_config_forced_none_for_both_sides(self, monkeypatch):
-        """Even without an explicit ``pipeline_config``, both loaders must be
-        called with ``pipeline_config=None`` so PP is disabled per-side."""
+    def test_distributed_setup_forwarded_without_separate_kwargs(self, monkeypatch):
+        """Distributed settings flow through ``distributed_setup``; the composite
+        must NOT forward the separate ``pipeline_config`` / ``moe_mesh`` /
+        ``distributed_config`` kwargs that ``from_pretrained`` now rejects."""
         captured: dict = {}
         self._patch_loaders(monkeypatch, _StubBase(), _StubDrafter(), captured)
         Gemma4WithDrafter.from_pretrained(base_path="x", drafter_path="y")
-        assert captured["image_kwargs"]["pipeline_config"] is None
-        assert captured["causal_kwargs"]["pipeline_config"] is None
+        for side in ("image_kwargs", "causal_kwargs"):
+            kw = captured[side]
+            assert kw["distributed_setup"] is None
+            assert "pipeline_config" not in kw
+            assert "moe_mesh" not in kw
+            assert "distributed_config" not in kw
 
     def test_freeze_config_only_passes_to_base(self, monkeypatch):
         """``freeze_config`` is recipe-level and applies to the base. The

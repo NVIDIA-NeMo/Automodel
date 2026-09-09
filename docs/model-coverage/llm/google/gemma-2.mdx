@@ -1,0 +1,34 @@
+---
+title: "Gemma 2"
+description: "Supported Gemma 2 checkpoints and NeMo AutoModel recipes."
+slug: model-coverage/large-language-models/google/gemma-2
+---
+
+[Gemma 2](https://huggingface.co/google/gemma-2-9b-it) is Google's second-generation Gemma language model family.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `Gemma2ForCausalLM` |
+| **Parameters** | 2B, 9B, 27B |
+| **HF Org** | [google](https://huggingface.co/google) |
+
+</Info>
+
+## Example Models and Recipes
+
+| Model | Recipe |
+|---|---|
+| [`google/gemma-2-9b-it`](https://huggingface.co/google/gemma-2-9b-it) | [Full SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml) |
+| [`google/gemma-2-9b-it`](https://huggingface.co/google/gemma-2-9b-it) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_squad_peft.yaml) |
+| [`google/gemma-2-9b-it`](https://huggingface.co/google/gemma-2-9b-it) | [FP8 HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_hellaswag_fp8.yaml) |
+
+## Run the Recipe
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml
+```
+
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).

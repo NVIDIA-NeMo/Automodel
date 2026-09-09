@@ -19,6 +19,7 @@ import torch
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.gemma4_moe.parallelization import _get_attention_head_counts
 from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4ForConditionalGeneration,
     Gemma4Gate,
@@ -26,6 +27,8 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4MoEDecoderLayer,
     Gemma4MoEModel,
     Gemma4MoETextModelBackend,
+    _build_packed_gemma4_causal_mask_mapping,
+    _build_unpacked_gemma4_causal_mask_mapping,
     _derive_padding_mask,
 )
 from nemo_automodel.components.moe.config import MoEConfig
@@ -154,7 +157,8 @@ class TestGemma4Gate:
 
     def test_scale_initialized_to_ones(self, text_config):
         gate = Gemma4Gate(text_config)
-        torch.testing.assert_close(gate.scale, torch.ones(text_config.hidden_size))
+        # scale storage dtype follows config.torch_dtype; assert the value, not dtype.
+        torch.testing.assert_close(gate.scale, torch.ones(text_config.hidden_size, dtype=gate.scale.dtype))
 
     def test_forward_output_shapes(self, text_config):
         gate = Gemma4Gate(text_config)
@@ -192,6 +196,40 @@ class TestGemma4Gate:
 
         assert (indices >= 0).all()
         assert (indices < text_config.num_experts).all()
+
+    def test_routing_computed_in_fp32_under_bf16_storage(self, text_config, monkeypatch):
+        # Contract: the routing linear + softmax must run in fp32 regardless of
+        # bf16 parameter storage and bf16 activations, so bf16 rounding cannot
+        # flip top-k expert selection. text_config defaults to bf16 storage.
+        import torch.nn.functional as F
+
+        gate = Gemma4Gate(text_config)
+        assert gate.proj.weight.dtype == torch.bfloat16
+        assert gate.scale.dtype == torch.bfloat16
+
+        seen = {}
+        real_linear, real_softmax = F.linear, F.softmax
+
+        def linear_spy(inp, weight, *args, **kwargs):
+            seen["linear_in"] = inp.dtype
+            seen["linear_w"] = weight.dtype
+            return real_linear(inp, weight, *args, **kwargs)
+
+        def softmax_spy(inp, *args, **kwargs):
+            seen["softmax_in"] = inp.dtype
+            return real_softmax(inp, *args, **kwargs)
+
+        monkeypatch.setattr(F, "linear", linear_spy)
+        monkeypatch.setattr(F, "softmax", softmax_spy)
+
+        x = torch.randn(2, 4, text_config.hidden_size, dtype=torch.bfloat16)
+        weights, _, _ = gate(x)
+
+        assert seen["linear_in"] == torch.float32
+        assert seen["linear_w"] == torch.float32
+        assert seen["softmax_in"] == torch.float32
+        # weights are cast back to the input dtype for the downstream experts
+        assert weights.dtype == torch.bfloat16
 
     def test_init_weights_is_noop(self, text_config):
         gate = Gemma4Gate(text_config)
@@ -323,8 +361,8 @@ class TestGemma4MoEDecoderLayer:
         batch, seq = 2, 4
         x = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
         pos_emb = (
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
         )
 
         with (
@@ -347,8 +385,8 @@ class TestGemma4MoEDecoderLayer:
         batch, seq = 2, 4
         x = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
         pos_emb = (
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
         )
         # Sentinel distinguishable by value — what pre_feedforward_layernorm_2 returns.
         sentinel = torch.full_like(x, 7.0)
@@ -447,6 +485,83 @@ class TestDerivePaddingMask:
         assert _derive_padding_mask(mask).tolist() == [[False, True, False]]
 
 
+class TestPackedGemma4MaskMapping:
+    pytestmark = []
+
+    def test_sliding_only_adds_same_image_bidirectional_edges(self):
+        packed_seq_ids = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 0]])
+        mm_token_type_ids = torch.tensor([[0, 1, 1, 0, 0, 1, 1, 0]])
+
+        mapping = _build_packed_gemma4_causal_mask_mapping(
+            packed_seq_ids,
+            mm_token_type_ids,
+            dtype=torch.float32,
+            sliding_window=2,
+        )
+        full_allowed = mapping["full_attention"]
+        sliding_allowed = mapping["sliding_attention"]
+
+        assert not full_allowed[0, 0, 1, 2]
+        assert sliding_allowed[0, 0, 1, 2]
+
+        assert not sliding_allowed[0, 0, 3, 0]
+        assert not sliding_allowed[0, 0, 5, 1]
+        assert not sliding_allowed[0, 0, 7, 7]
+
+    def test_unpacked_mask_uses_legacy_mapping_when_available(self, monkeypatch):
+        from transformers.models.gemma4 import modeling_gemma4
+
+        expected = {"full_attention": object(), "sliding_attention": object()}
+        legacy_mapping = MagicMock(return_value=expected)
+        monkeypatch.setattr(modeling_gemma4, "create_causal_mask_mapping", legacy_mapping, raising=False)
+        inputs_embeds = torch.zeros(1, 4, 8)
+        mm_token_type_ids = torch.zeros(1, 4, dtype=torch.long)
+
+        actual = _build_unpacked_gemma4_causal_mask_mapping(
+            MagicMock(),
+            inputs_embeds,
+            None,
+            None,
+            None,
+            mm_token_type_ids,
+            None,
+            is_training=False,
+        )
+
+        assert actual is expected
+        assert legacy_mapping.call_args.kwargs["mm_token_type_ids"] is mm_token_type_ids
+
+    def test_unpacked_mask_uses_block_ids_when_legacy_mapping_is_unavailable(self, monkeypatch):
+        from transformers import masking_utils
+        from transformers.models.gemma4 import modeling_gemma4
+
+        full_mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+        sliding_mask = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
+        create_full = MagicMock(return_value=full_mask)
+        create_sliding = MagicMock(return_value=sliding_mask)
+        monkeypatch.setattr(modeling_gemma4, "create_causal_mask_mapping", None, raising=False)
+        monkeypatch.setattr(masking_utils, "create_causal_mask", create_full)
+        monkeypatch.setattr(masking_utils, "create_sliding_window_causal_mask", create_sliding)
+        inputs_embeds = torch.zeros(1, 4, 8)
+        mm_token_type_ids = torch.tensor([[0, 1, 1, 0]])
+
+        actual = _build_unpacked_gemma4_causal_mask_mapping(
+            MagicMock(),
+            inputs_embeds,
+            None,
+            None,
+            None,
+            mm_token_type_ids,
+            None,
+            is_training=False,
+        )
+
+        assert actual == {"full_attention": full_mask, "sliding_attention": sliding_mask}
+        expected_block_ids = torch.tensor([[-1, 0, 0, -1]])
+        torch.testing.assert_close(create_full.call_args.kwargs["block_sequence_ids"], expected_block_ids)
+        torch.testing.assert_close(create_sliding.call_args.kwargs["block_sequence_ids"], expected_block_ids)
+
+
 # ---------------------------------------------------------------------------
 # Gemma4ForConditionalGeneration tests
 # ---------------------------------------------------------------------------
@@ -520,9 +635,10 @@ class TestGemma4ForConditionalGeneration:
                 last_hidden_state=torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
             ),
         ):
-            logits = model(input_ids)
+            out = model(input_ids)
 
-        assert logits.shape == (batch, seq, text_config.vocab_size)
+        # MoE forward now returns a CausalLMOutputWithPast (cut-CE support); read .logits.
+        assert out.logits.shape == (batch, seq, text_config.vocab_size)
 
     def test_forward_applies_logit_softcapping(self, backend_config, device):
         cfg = _make_gemma4_config(final_logit_softcapping=30.0)
@@ -540,9 +656,9 @@ class TestGemma4ForConditionalGeneration:
             "forward",
             return_value=MagicMock(last_hidden_state=large_hidden),
         ):
-            logits = model(input_ids)
+            out = model(input_ids)
 
-        assert logits.abs().max() <= 30.0 + 1e-2
+        assert out.logits.abs().max() <= 30.0 + 1e-2
 
     def test_forward_generates_cache_position(self, gemma4_config, backend_config, device):
         model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
@@ -568,6 +684,67 @@ class TestGemma4ForConditionalGeneration:
             captured["cache_position"],
             torch.arange(seq, device=device),
         )
+
+    def test_cp_sunk_prepare_inputs_merges_image_features(self, gemma4_config, backend_config, device):
+        # Sunk CP: the forward (not the hook) embeds + splices vision per microbatch.
+        # cp_mesh is None here, so the contiguous slice is the identity and the full
+        # spliced sequence is returned -- the splice math is unchanged.
+        gemma4_config.image_token_id = 42
+        model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
+        model = model.to(device).to(torch.bfloat16)
+
+        text_config = gemma4_config.text_config
+        input_ids = torch.tensor([[1, gemma4_config.image_token_id, 3, 4]], device=device)
+        pixel_values = torch.randn(1, 3, 8, 8, device=device, dtype=torch.bfloat16)
+        image_features = torch.randn(1, text_config.hidden_size, device=device, dtype=torch.bfloat16)
+        base_embeds = model.model.get_input_embeddings()(input_ids)
+
+        with patch.object(
+            model.model,
+            "get_image_features",
+            return_value=MagicMock(pooler_output=image_features),
+        ):
+            prepared = model._cp_sunk_prepare_inputs(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_position_ids=None,
+                mm_token_type_ids=None,
+            )
+
+        torch.testing.assert_close(prepared["inputs_embeds"][:, 0, :], base_embeds[:, 0, :])
+        torch.testing.assert_close(prepared["inputs_embeds"][:, 1, :], image_features)
+        torch.testing.assert_close(prepared["inputs_embeds"][:, 2:, :], base_embeds[:, 2:, :])
+        assert prepared["_gemma4_has_vision_tokens"] is True
+
+    def test_dense_cp_forward_calls_text_model_with_inputs_embeds(self, dense_config, backend_config, device):
+        model = Gemma4ForConditionalGeneration(dense_config, backend=backend_config)
+        model = model.to(device).to(torch.bfloat16)
+        model._cp_enabled = True
+
+        text_config = dense_config.text_config
+        batch, seq = 1, 4
+        inputs_embeds = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
+        per_layer_inputs = torch.randn(batch, seq, 2, device=device, dtype=torch.bfloat16)
+        hidden = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
+
+        with patch.object(
+            model.model.language_model,
+            "forward",
+            return_value=MagicMock(
+                last_hidden_state=hidden,
+                past_key_values=None,
+                hidden_states=None,
+                attentions=None,
+            ),
+        ) as mock_forward:
+            out = model(inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs, labels=torch.ones(batch, seq))
+
+        call_kwargs = mock_forward.call_args.kwargs
+        assert call_kwargs["input_ids"] is None
+        assert call_kwargs["inputs_embeds"] is inputs_embeds
+        assert call_kwargs["per_layer_inputs"] is per_layer_inputs
+        assert out.loss is None
+        assert out.logits.shape == (batch, seq, text_config.vocab_size)
 
     def test_initialize_weights_dense_only_casts_dtype(self, dense_config, backend_config):
         model = Gemma4ForConditionalGeneration(dense_config, backend=backend_config)
@@ -662,3 +839,18 @@ class TestGemma4MoEModel:
     def test_norm_property(self, gemma4_config, backend_config):
         model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
         assert model.model.norm is model.model.language_model.norm
+
+
+def test_attention_head_counts_use_per_layer_config():
+    """Gemma4 TP validation must account for heterogeneous KV-head counts."""
+    config = _make_text_config(
+        enable_moe_block=False,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        num_global_key_value_heads=2,
+        attention_k_eq_v=True,
+        layer_types=["sliding_attention", "full_attention"],
+        num_hidden_layers=2,
+    )
+
+    assert _get_attention_head_counts(config) == {(8, 4), (8, 2)}

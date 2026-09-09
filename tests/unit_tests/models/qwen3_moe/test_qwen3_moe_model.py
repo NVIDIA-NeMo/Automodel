@@ -18,11 +18,10 @@ import pytest
 import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_moe.model import Block, Qwen3MoeForCausalLM, Qwen3MoeModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
-from nemo_automodel.components.models.common import BackendConfig
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -118,8 +117,10 @@ class TestBlock:
         x = torch.randn(batch, seq_len, qwen_config.hidden_size, device=device)
         freqs_cis = torch.randn(batch, seq_len, qwen_config.head_dim, device=device)
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             out = block(x, freqs_cis=freqs_cis)
 
         assert out.shape == x.shape
@@ -134,8 +135,10 @@ class TestBlock:
         freqs_cis = torch.randn(1, 3, qwen_config.head_dim, device=device)
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
         mock_attn.assert_called_once()
@@ -156,10 +159,12 @@ class TestBlock:
     def test_init_weights_resets_sublayers(self, qwen_config, backend_config):
         block = Block(layer_idx=0, config=qwen_config, moe_config=magic_moe_config(qwen_config), backend=backend_config)
 
-        with patch.object(block.input_layernorm, "reset_parameters") as mock_in, \
-            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post, \
-            patch.object(block.self_attn, "init_weights") as mock_attn, \
-            patch.object(block.mlp, "init_weights") as mock_mlp:
+        with (
+            patch.object(block.input_layernorm, "reset_parameters") as mock_in,
+            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post,
+            patch.object(block.self_attn, "init_weights") as mock_attn,
+            patch.object(block.mlp, "init_weights") as mock_mlp,
+        ):
             block.init_weights(torch.device("cpu"))
 
         mock_in.assert_called_once()
@@ -186,7 +191,9 @@ class TestQwen3MoeModel:
         freqs_mock = MagicMock(return_value=(1.0, torch.ones(qwen_config.head_dim // 2)))
 
         with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", freqs_mock):
-            with patch.object(Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq_len, qwen_config.hidden_size)) as mock_block:
+            with patch.object(
+                Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq_len, qwen_config.hidden_size)
+            ) as mock_block:
                 out = model(input_ids)
 
         assert out.shape == (batch, seq_len, qwen_config.hidden_size)
@@ -198,7 +205,11 @@ class TestQwen3MoeModel:
         input_ids = torch.randint(0, qwen_config.vocab_size, (batch, seq_len))
         position_ids = torch.arange(seq_len).unsqueeze(0)
 
-        with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", return_value=(1.0, torch.ones(qwen_config.head_dim // 2))):
+        with patch.object(
+            model.rotary_emb,
+            "_compute_concentration_and_inv_freq",
+            return_value=(1.0, torch.ones(qwen_config.head_dim // 2)),
+        ):
             with patch.object(Block, "forward", return_value=torch.zeros(batch, seq_len, qwen_config.hidden_size)):
                 out = model(input_ids, position_ids=position_ids)
 
@@ -208,8 +219,10 @@ class TestQwen3MoeModel:
         model = Qwen3MoeModel(qwen_config, backend=backend_config)
         original = model.embed_tokens.weight.clone()
 
-        with patch.object(model.norm, "reset_parameters") as mock_norm, \
-            patch.object(Block, "init_weights") as mock_layer_init:
+        with (
+            patch.object(model.norm, "reset_parameters") as mock_norm,
+            patch.object(Block, "init_weights") as mock_layer_init,
+        ):
             model.init_weights(torch.device("cpu"))
 
         mock_norm.assert_called_once()
@@ -225,9 +238,14 @@ class TestQwen3MoeForCausalLM:
         batch, seq_len = 2, 6
         input_ids = torch.randint(0, qwen_config.vocab_size, (batch, seq_len), device=device)
 
-        with patch.object(model.model, "forward", return_value=torch.randn(batch, seq_len, qwen_config.hidden_size, device=device).to(torch.bfloat16)):
-            logits = model(input_ids)
+        with patch.object(
+            model.model,
+            "forward",
+            return_value=torch.randn(batch, seq_len, qwen_config.hidden_size, device=device).to(torch.bfloat16),
+        ):
+            out = model(input_ids)
 
+        logits = getattr(out, "logits", out)
         assert logits.shape == (batch, seq_len, qwen_config.vocab_size)
 
     def test_initialize_weights_invokes_submodules(self, qwen_config, backend_config):
@@ -287,10 +305,14 @@ class TestQwen3MoeModelFromPretrainedAndExport:
             num_experts_per_tok=1,
         )
 
-        with patch("transformers.models.qwen3_moe.configuration_qwen3_moe.Qwen3MoeConfig.from_pretrained") as mock_from_pretrained:
+        with patch(
+            "transformers.models.qwen3_moe.configuration_qwen3_moe.Qwen3MoeConfig.from_pretrained"
+        ) as mock_from_pretrained:
             mock_from_pretrained.return_value = cfg
 
-            with patch.object(Qwen3MoeForCausalLM, "from_config", wraps=Qwen3MoeForCausalLM.from_config) as mock_from_config:
+            with patch.object(
+                Qwen3MoeForCausalLM, "from_config", wraps=Qwen3MoeForCausalLM.from_config
+            ) as mock_from_config:
                 model = Qwen3MoeForCausalLM.from_pretrained("qwen3/model")
                 assert isinstance(model, Qwen3MoeForCausalLM)
                 mock_from_pretrained.assert_called_once_with("qwen3/model")

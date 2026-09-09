@@ -73,12 +73,41 @@ class DummyDefaultProcessor:
         truncation=False,
         return_tensors,
         return_dict=True,
+        processor_kwargs=None,
     ):
         assert tokenize and return_tensors == "pt" and return_dict
         batch_size = len(conv_list)
         input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
         pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
         return {"input_ids": input_ids, "pixel_values": pixel_values}
+
+
+class DummyVariableResolutionProcessor(DummyDefaultProcessor):
+    def apply_chat_template(
+        self,
+        conv_list,
+        *,
+        tokenize,
+        add_generation_prompt=True,
+        padding=False,
+        truncation=False,
+        return_tensors,
+        return_dict=True,
+        processor_kwargs=None,
+    ):
+        assert tokenize and return_tensors == "pt" and return_dict
+        assert len(conv_list) == 1
+        return {
+            "input_ids": torch.arange(1, 5).unsqueeze(0),
+            "pixel_values": [
+                torch.ones(3, 32, 48, dtype=torch.float32),
+                torch.ones(3, 48, 32, dtype=torch.float32),
+            ],
+            "pixel_values_videos": [
+                torch.ones(6, 24, 40, dtype=torch.float32),
+                torch.ones(6, 40, 24, dtype=torch.float32),
+            ],
+        }
 
 
 class DummyQwen3OmniProcessor:
@@ -599,8 +628,8 @@ def test_qwen25_collate_shapes(collate_mod, monkeypatch):
     assert torch.all(batch["labels"][:, -1] == -100)
 
 
-def test_default_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
-    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+def test_default_collate_shapes_without_qwen_vl_utils(collate_mod, monkeypatch):
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
 
     processor = DummyDefaultProcessor()
     batch = collate_mod.default_collate_fn([{"conversation": CONVERSATION} for _ in range(2)], processor)
@@ -608,6 +637,19 @@ def test_default_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
     assert batch["input_ids"].shape == (2, 3)
     assert batch["labels"].shape == (2, 3)
     assert batch["pixel_values"].dtype == torch.bfloat16
+
+
+def test_default_collate_preserves_variable_resolution_pixel_value_list(collate_mod, fake_qwen_utils, monkeypatch):
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+    processor = DummyVariableResolutionProcessor()
+    batch = collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor)
+
+    assert [tuple(value.shape) for value in batch["pixel_values"]] == [(3, 32, 48), (3, 48, 32)]
+    assert all(value.dtype == torch.bfloat16 for value in batch["pixel_values"])
+    assert [tuple(value.shape) for value in batch["pixel_values_videos"]] == [(6, 24, 40), (6, 40, 24)]
+    assert all(value.dtype == torch.bfloat16 for value in batch["pixel_values_videos"])
+    assert "num_patches" not in batch
 
 
 def test_qwen3_omni_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
@@ -631,7 +673,10 @@ def test_nemotron_parse_collate_shifts_and_casts(collate_mod, monkeypatch):
         assert input_ids.shape == (1, 4)
         return labels_stub
 
-    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+    # nemotron_parse_collate_fn builds labels via build_labels_from_template;
+    # stub that (the function the collate actually calls) rather than the inner
+    # build_labels.
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
 
     examples = [
         {
@@ -662,14 +707,11 @@ def test_nemotron_parse_collate_shifts_and_casts(collate_mod, monkeypatch):
     assert torch.equal(batch["decoder_attention_mask"], torch.tensor([[1, 1, 1]]))
 
 
-@pytest.mark.parametrize("fn_name", ["default_collate_fn", "qwen3_omni_collate_fn"])
-def test_import_error_when_qwen_utils_missing(collate_mod, fn_name, monkeypatch):
-    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
+def test_import_error_when_qwen_omni_utils_missing(collate_mod, monkeypatch):
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", False, raising=True)
-    func = getattr(collate_mod, fn_name)
 
     with pytest.raises(ImportError):
-        func([], None)
+        collate_mod.qwen3_omni_collate_fn([], None)
 
 
 def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkeypatch):
@@ -691,9 +733,11 @@ def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkey
     processor = MaxLengthProcessor()
     collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor, max_length=512)
 
-    assert captured_kwargs.get("max_length") == 512
-    assert captured_kwargs.get("padding") == "max_length"
-    assert captured_kwargs.get("truncation") is True
+    # processing kwargs are now nested under processor_kwargs (transformers>=5)
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert proc_kwargs.get("max_length") == 512
+    assert proc_kwargs.get("padding") == "max_length"
+    assert proc_kwargs.get("truncation") is True
 
 
 def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, monkeypatch):
@@ -715,8 +759,9 @@ def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, mon
     processor = NoMaxLengthProcessor()
     collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor)
 
-    assert "max_length" not in captured_kwargs
-    assert captured_kwargs.get("padding") is True
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert "max_length" not in proc_kwargs
+    assert proc_kwargs.get("padding") is True
 
 
 def test_kimi_vl_collate_fn_registered(collate_mod):
@@ -1410,9 +1455,7 @@ def test_kimi_k25_vl_collate_fn_truncation_drops_image_data(collate_mod, monkeyp
     assert (batch["input_ids"] == MEDIA_TOKEN_ID).sum().item() == 0
 
 
-def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_text_only_mix(
-    collate_mod, monkeypatch
-):
+def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_text_only_mix(collate_mod, monkeypatch):
     """Mixed batch (text-only + image): n_images_per_sample length must equal batch_size.
 
     Regression: previously image_counts was derived from all_grid_thws only, so
@@ -1466,8 +1509,7 @@ def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_text_only
 
     assert "n_images_per_sample" in batch
     assert batch["n_images_per_sample"].shape == (2,), (
-        f"n_images_per_sample length must equal batch_size=2, "
-        f"got shape {batch['n_images_per_sample'].shape}"
+        f"n_images_per_sample length must equal batch_size=2, got shape {batch['n_images_per_sample'].shape}"
     )
     # text-only sample → 0; image sample → 1
     assert batch["n_images_per_sample"].tolist() == [0, 1]
@@ -1504,9 +1546,7 @@ def test_wrap_vlm_collate_for_pp_prepares_media_chunks():
     assert torch.equal(media["image_grid_hws"][1], image_grid_thw[1:])
 
 
-def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_truncation_orphan(
-    collate_mod, monkeypatch
-):
+def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_truncation_orphan(collate_mod, monkeypatch):
     """Mixed batch (truncated image + intact image): n_images_per_sample length must equal batch_size.
 
     Regression: a sample whose image region got orphaned by truncation was
@@ -1576,8 +1616,7 @@ def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_truncatio
     assert batch["input_ids"].shape[0] == 2
     assert "n_images_per_sample" in batch
     assert batch["n_images_per_sample"].shape == (2,), (
-        f"n_images_per_sample length must equal batch_size=2, "
-        f"got shape {batch['n_images_per_sample'].shape}"
+        f"n_images_per_sample length must equal batch_size=2, got shape {batch['n_images_per_sample'].shape}"
     )
     # First sample's image survives → 1; second sample is orphaned → 0
     assert batch["n_images_per_sample"].tolist() == [1, 0]
@@ -2715,9 +2754,10 @@ def test_default_collate_fn_truncation_by_default(collate_mod, fake_qwen_utils, 
         max_length=512,
     )
 
-    assert captured_kwargs.get("truncation") is True
-    assert captured_kwargs.get("max_length") == 512
-    assert captured_kwargs.get("padding") == "max_length"
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert proc_kwargs.get("truncation") is True
+    assert proc_kwargs.get("max_length") == 512
+    assert proc_kwargs.get("padding") == "max_length"
 
 
 def test_default_collate_fn_no_truncation_with_drop_overlong(collate_mod, fake_qwen_utils, monkeypatch):
@@ -2748,9 +2788,10 @@ def test_default_collate_fn_no_truncation_with_drop_overlong(collate_mod, fake_q
         drop_overlong=True,
     )
 
-    assert captured_kwargs.get("truncation") is False
-    assert captured_kwargs.get("max_length") == 512
-    assert captured_kwargs.get("padding") == "max_length"
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert proc_kwargs.get("truncation") is False
+    assert proc_kwargs.get("max_length") == 512
+    assert proc_kwargs.get("padding") == "max_length"
 
 
 def test_estimate_media_tokens_with_pil_image(collate_mod):
@@ -3085,6 +3126,31 @@ class TestNeatPackedVlmCollaterAttnImpl:
         # SDPA produces 4D block-causal mask
         assert result["attention_mask"].ndim == 4
 
+    def test_sdpa_cp_keeps_compact_document_ids(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(16, 0)]
+        result = neat_packed_vlm_collater(
+            batch,
+            max_length=32,
+            attn_implementation="sdpa",
+            materialize_4d_mask=False,
+        )
+
+        assert result["attention_mask"].shape == (1, 32)
+        assert torch.equal(result["_packed_seq_ids"], result["attention_mask"])
+        assert result["_packed_seq_ids"][0, 16:].eq(0).all()
+
+    def test_single_sequence_omits_packed_seq_ids(self):
+        """A single (unpacked) sequence carries no ``_packed_seq_ids``; the all-gather
+        CP path synthesizes the trivial one-document map downstream (see
+        ``context_parallel.utils._synthesize_single_document_seq_ids``)."""
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(4, 0)]
+        result = neat_packed_vlm_collater(batch, max_length=6, attn_implementation="sdpa")
+        assert "_packed_seq_ids" not in result
+
     def test_fixed_max_length_pads_to_max(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
@@ -3177,230 +3243,132 @@ def test_gemma4_inject_thinking_prefix_accepts_processor_or_tokenizer(collate_mo
     assert torch.equal(out_proc["input_ids"], out_tok["input_ids"])
 
 
-# ---------------------------------------------------------------------------
-# Qwen3-Omni ASR collate (no qwen_omni_utils)
-# ---------------------------------------------------------------------------
-import io as _io
+def _thd_vlm_make_sample(doc_lens, n_img_patches=0):
+    import torch
 
-import numpy as _np
-import soundfile as _sf
-
-
-_ASR_USER_TEXT = "<system>"
-_ASR_ASSISTANT_TEXT = "你好"
-
-
-def _asr_conversation(transcript=_ASR_ASSISTANT_TEXT):
-    waveform = _np.zeros(800, dtype=_np.float32)
-    return [
-        {"role": "system", "content": "Transcribe."},
-        {"role": "user", "content": [{"type": "audio", "audio": waveform}]},
-        {"role": "assistant", "content": [{"type": "text", "text": transcript}]},
-    ]
+    seq = sum(doc_lens)
+    input_ids = torch.arange(1, seq + 1, dtype=torch.long)
+    labels = input_ids.clone()
+    attention_mask = torch.cat([torch.full((d,), i + 1, dtype=torch.long) for i, d in enumerate(doc_lens)])
+    position_ids = torch.cat([torch.arange(d) for d in doc_lens]).unsqueeze(0).expand(3, -1).contiguous()
+    sample = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+    if n_img_patches:
+        sample["pixel_values"] = torch.randn(n_img_patches, 8)
+        sample["image_grid_thw"] = torch.tensor([[1, 2, 2]])
+    return sample
 
 
-class DummyQwen3OmniAsrProcessor:
-    """Mock that mimics Qwen3OmniMoeProcessor.__call__ for ASR usage.
+def test_thd_vlm_collater_mrope_shapes_and_seq_lens():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
 
-    Returns deterministic ``input_ids`` and audio-feature tensors keyed by the
-    audio kwarg the new collate is required to pass. Tracks every call so tests
-    can assert what was forwarded.
-    """
-
-    def __init__(self):
-        self.tokenizer = DummyTokenizer(pad_token_id=0)
-        self.call_kwargs = []
-
-    def apply_chat_template(self, conversation, *, add_generation_prompt, tokenize, **kwargs):
-        assert add_generation_prompt is False, "ASR collate must call apply_chat_template(add_generation_prompt=False)"
-        assert tokenize is False
-        return "chat"
-
-    def __call__(self, *, text, return_tensors, padding, audio=None, **kwargs):
-        assert return_tensors == "pt"
-        assert padding is True
-        self.call_kwargs.append({"text": list(text), "audio": audio, "padding_side": kwargs.get("padding_side")})
-        batch_size = len(text)
-        input_ids = torch.arange(1, 7).unsqueeze(0).repeat(batch_size, 1)
-        attn_mask = torch.ones_like(input_ids)
-        num_audios = 0 if audio is None else len(audio)
-        if num_audios == 0:
-            num_audios = batch_size
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attn_mask,
-            "input_features": torch.zeros(num_audios, 128, 32, dtype=torch.float32),
-            "feature_attention_mask": torch.ones(num_audios, 32, dtype=torch.long),
-        }
+    batch = [_thd_vlm_make_sample([3, 2], 4), _thd_vlm_make_sample([4], 4)]
+    out = packed_sequence_thd_vlm_collater(batch, padding_idx=0)
+    assert tuple(out["input_ids"].shape) == (2, 5)
+    assert tuple(out["position_ids"].shape) == (3, 2, 5)
+    assert out["seq_lens"].tolist() == [[3, 2], [4, -1000]]
+    assert out["seq_lens_padded"].tolist() == [[3, 2], [5, -1000]]
+    assert out["qkv_format"] == "thd"
+    assert tuple(out["pixel_values"].shape) == (8, 8)
+    assert tuple(out["image_grid_thw"].shape) == (2, 3)
+    thd_in = {k: out[k] for k in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded", "qkv_format")}
+    thd = process_input_for_thd(thd_in)
+    assert tuple(thd["input_ids"].shape) == (10,)
+    assert tuple(thd["position_ids"].shape) == (3, 1, 10)
+    assert thd["cu_seqlens"].tolist() == [0, 3, 5, 10]
 
 
-def test_qwen3_omni_asr_registry_guard(collate_mod):
-    """The global registry must still point at the original Omni collate."""
-    assert collate_mod.COLLATE_FNS["Qwen3OmniMoeProcessor"] is collate_mod.qwen3_omni_collate_fn
-    assert collate_mod.COLLATE_FNS["Qwen3OmniMoeProcessor"] is not collate_mod.qwen3_omni_asr_collate_fn
+def test_thd_vlm_collater_preserves_variable_resolution_media_lists():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+
+    first = _thd_vlm_make_sample([3])
+    second = _thd_vlm_make_sample([2])
+    first["pixel_values"] = [torch.randn(3, 8, 12)]
+    second["pixel_values"] = [torch.randn(3, 16, 8)]
+
+    out = packed_sequence_thd_vlm_collater([first, second], padding_idx=0)
+
+    assert isinstance(out["pixel_values"], list)
+    assert [tuple(value.shape) for value in out["pixel_values"]] == [(3, 8, 12), (3, 16, 8)]
+    assert all(value.dtype == torch.bfloat16 for value in out["pixel_values"])
 
 
-def test_qwen3_omni_asr_extract_audios_from_conversation(collate_mod):
-    """Audio payloads must be pulled from any user-turn ``{type:audio,audio:...}`` item."""
-    conv = _asr_conversation()
-    audios = collate_mod._extract_audios_from_conversation(conv)
-    assert len(audios) == 1
-    assert isinstance(audios[0], _np.ndarray)
+def test_thd_vlm_collater_both_padded_pad_between_seqs():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+
+    out = packed_sequence_thd_vlm_collater([_thd_vlm_make_sample([2]), _thd_vlm_make_sample([3])], padding_idx=0)
+    assert out["seq_lens"].tolist() == [[2], [3]]
+    assert out["seq_lens_padded"].tolist() == [[3], [3]]
+    thd_in = {k: out[k] for k in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded", "qkv_format")}
+    thd = process_input_for_thd(thd_in)
+    assert thd["cu_seqlens"].tolist() == [0, 2, 5]
+    assert thd["cu_seqlens_padded"].tolist() == [0, 3, 6]
 
 
-def test_qwen3_omni_asr_collate_shapes_and_kwargs(collate_mod, monkeypatch):
-    """The collate must produce shifted labels, slice same-shape tensors, and pass audio=."""
-    labels_stub = torch.tensor([[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]], dtype=torch.long)
+def test_thd_vlm_collater_1d_position_ids():
+    import torch
 
-    def fake_build_labels(input_ids, conversations, processor_arg):
-        assert input_ids.shape == (2, 6)
-        assert len(conversations) == 2
-        return labels_stub
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
 
-    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+    sample = _thd_vlm_make_sample([3, 2])
+    sample["position_ids"] = torch.arange(5)
+    out = packed_sequence_thd_vlm_collater([sample], padding_idx=0)
+    assert tuple(out["position_ids"].shape) == (1, 5)
 
-    processor = DummyQwen3OmniAsrProcessor()
-    batch = collate_mod.qwen3_omni_asr_collate_fn(
-        [{"conversation": _asr_conversation()} for _ in range(2)],
-        processor,
+
+def test_thd_vlm_collater_fixed_max_length_pads():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+
+    out = packed_sequence_thd_vlm_collater([_thd_vlm_make_sample([3])], padding_idx=0, max_length=8)
+    assert tuple(out["input_ids"].shape) == (1, 8)
+    assert tuple(out["position_ids"].shape) == (3, 1, 8)
+    assert out["seq_lens"].tolist() == [[3]]
+    assert out["seq_lens_padded"].tolist() == [[8]]
+
+
+def test_thd_vlm_collater_preserves_materialized_cp_document_padding():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+
+    first = _thd_vlm_make_sample([8])
+    first["seq_lens"] = [3, 2]
+    first["seq_lens_padded"] = [4, 4]
+    first["position_ids"] = torch.arange(8)
+    second = _thd_vlm_make_sample([4])
+    second["seq_lens"] = [4]
+    second["seq_lens_padded"] = [4]
+    second["position_ids"] = torch.arange(4)
+
+    out = packed_sequence_thd_vlm_collater([first, second], padding_idx=0)
+
+    assert out["seq_lens"].tolist() == [[3, 2], [4, -1000]]
+    assert out["seq_lens_padded"].tolist() == [[4, 4], [8, -1000]]
+    thd = process_input_for_thd(
+        {key: out[key] for key in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded")}
     )
-
-    # The audio kwarg must have been forwarded with one waveform per sample.
-    assert len(processor.call_kwargs) == 1
-    assert processor.call_kwargs[0]["audio"] is not None
-    assert len(processor.call_kwargs[0]["audio"]) == 2
-    # The collate must pin padding_side="right" to align with recipe token accounting.
-    assert processor.call_kwargs[0]["padding_side"] == "right"
-
-    # Pre-shifted labels and same-shape tensors sliced to [:, :-1] (length 5).
-    assert batch["input_ids"].shape == (2, 5)
-    assert batch["attention_mask"].shape == (2, 5)
-    assert batch["labels"].shape == (2, 5)
-    # Same-shape labels[:, 1:] of length-6 labels_stub == values at columns 1..5.
-    assert torch.equal(batch["labels"], labels_stub[:, 1:])
-
-    # Audio feature tensors must NOT be sliced (their shape differs from input_ids).
-    assert batch["input_features"].shape == (2, 128, 32)
-    assert batch["feature_attention_mask"].shape == (2, 32)
+    assert thd["cu_seqlens"].tolist() == [0, 3, 5, 9]
+    assert thd["cu_seqlens_padded"].tolist() == [0, 4, 8, 16]
 
 
-def test_qwen3_omni_asr_raises_when_no_assistant_turn(collate_mod):
-    """An assistant-less conversation must error rather than yield NaN loss."""
-    processor = DummyQwen3OmniAsrProcessor()
-    bad = [
-        {"role": "system", "content": "Transcribe."},
-        {"role": "user", "content": [{"type": "audio", "audio": _np.zeros(800, dtype=_np.float32)}]},
-    ]
-    with pytest.raises(ValueError, match="assistant"):
-        collate_mod.qwen3_omni_asr_collate_fn([{"conversation": bad}], processor)
+def test_thd_vlm_collater_empty_batch():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+
+    assert packed_sequence_thd_vlm_collater([]) == {}
 
 
-def test_qwen3_omni_asr_raises_when_assistant_text_empty(collate_mod):
-    """A whitespace-only assistant turn must error."""
-    processor = DummyQwen3OmniAsrProcessor()
-    bad_conv = _asr_conversation(transcript="  ")
-    with pytest.raises(ValueError, match="assistant"):
-        collate_mod.qwen3_omni_asr_collate_fn([{"conversation": bad_conv}], processor)
+def test_merge_media_values_flattens_mixed_tensor_and_list_packs():
+    from nemo_automodel.components.datasets.vlm.collate_fns import _merge_media_values
 
+    stacked = torch.randn(2, 3, 8, 8)  # one pack with uniform images
+    ragged = [torch.randn(3, 12, 4), torch.randn(3, 6, 6)]  # another pack with variable resolution
+    merged = _merge_media_values([stacked, ragged])
 
-def test_qwen3_omni_asr_works_when_qwen_omni_utils_missing(collate_mod, monkeypatch):
-    """The collate must NOT depend on qwen_omni_utils, even when it is missing/poisoned."""
-    # Poison the qwen_omni_utils slot so any accidental import would fail.
-    monkeypatch.setitem(sys.modules, "qwen_omni_utils", None)
-    monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", False, raising=True)
-
-    labels_stub = torch.tensor([[100, 101, 102, 103, 104, 105]], dtype=torch.long)
-    monkeypatch.setattr(
-        collate_mod,
-        "build_labels_from_template",
-        lambda input_ids, conversations, processor_arg: labels_stub,
-        raising=True,
-    )
-
-    processor = DummyQwen3OmniAsrProcessor()
-    batch = collate_mod.qwen3_omni_asr_collate_fn([{"conversation": _asr_conversation()}], processor)
-    assert batch["input_ids"].shape == (1, 5)
-    assert torch.equal(batch["labels"], labels_stub[:, 1:])
-
-
-def test_qwen3_omni_asr_function_body_does_not_import_qwen_omni_utils(collate_mod):
-    """Static guard: the ASR collate must not import qwen_omni_utils or call process_mm_info.
-
-    Parses the function body via AST so the explanatory docstring (which intentionally
-    explains *why* this collate avoids qwen_omni_utils) does not trip the check.
-    """
-    import ast
-    import inspect
-    import textwrap
-
-    src = textwrap.dedent(inspect.getsource(collate_mod.qwen3_omni_asr_collate_fn))
-    tree = ast.parse(src)
-    func_def = tree.body[0]
-    assert isinstance(func_def, (ast.FunctionDef, ast.AsyncFunctionDef))
-
-    body = list(func_def.body)
-    if (
-        body
-        and isinstance(body[0], ast.Expr)
-        and isinstance(getattr(body[0], "value", None), ast.Constant)
-        and isinstance(body[0].value.value, str)
-    ):
-        body = body[1:]
-    body_src = "\n".join(ast.unparse(node) for node in body)
-    assert "qwen_omni_utils" not in body_src
-    assert "process_mm_info" not in body_src
-
-
-def test_qwen3_omni_asr_validate_helper_coerces_float64_to_float32(collate_mod):
-    """A 1-D float64 waveform must be coerced to float32 (no raise)."""
-    waveform = _np.zeros(400, dtype=_np.float64)
-    coerced = collate_mod._validate_and_coerce_audio_payload(waveform, sample_index=0)
-    assert isinstance(coerced, _np.ndarray)
-    assert coerced.dtype == _np.float32
-    assert coerced.ndim == 1
-    assert coerced.shape == (400,)
-
-
-def test_qwen3_omni_asr_validate_helper_rejects_2d_audio(collate_mod):
-    """A non-1-D audio payload must raise ValueError naming sample index and shape/dtype."""
-    waveform_2d = _np.zeros((2, 400), dtype=_np.float32)
-    with pytest.raises(ValueError, match=r"sample\[3\] audio payload must be 1-D"):
-        collate_mod._validate_and_coerce_audio_payload(waveform_2d, sample_index=3)
-
-
-def test_qwen3_omni_asr_collate_coerces_float64_inputs(collate_mod, monkeypatch):
-    """End-to-end: the collate must accept a float64 waveform and forward it as float32."""
-
-    labels_stub = torch.tensor([[10, 11, 12, 13, 14, 15]], dtype=torch.long)
-    monkeypatch.setattr(
-        collate_mod,
-        "build_labels_from_template",
-        lambda input_ids, conversations, processor_arg: labels_stub,
-        raising=True,
-    )
-
-    processor = DummyQwen3OmniAsrProcessor()
-    conv = [
-        {"role": "system", "content": "Transcribe."},
-        {"role": "user", "content": [{"type": "audio", "audio": _np.zeros(400, dtype=_np.float64)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
-    ]
-    collate_mod.qwen3_omni_asr_collate_fn([{"conversation": conv}], processor)
-
-    # The collate must have coerced the float64 waveform to float32 BEFORE passing to the processor.
-    forwarded_audio = processor.call_kwargs[0]["audio"]
-    assert forwarded_audio is not None and len(forwarded_audio) == 1
-    assert forwarded_audio[0].dtype == _np.float32
-    assert forwarded_audio[0].ndim == 1
-
-
-def test_qwen3_omni_asr_collate_rejects_2d_audio(collate_mod):
-    """End-to-end: a 2-D waveform inside the conversation must raise during collation."""
-    processor = DummyQwen3OmniAsrProcessor()
-    conv = [
-        {"role": "system", "content": "Transcribe."},
-        {"role": "user", "content": [{"type": "audio", "audio": _np.zeros((2, 400), dtype=_np.float32)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
-    ]
-    with pytest.raises(ValueError, match=r"sample\[0\].*1-D"):
-        collate_mod.qwen3_omni_asr_collate_fn([{"conversation": conv}], processor)
+    assert isinstance(merged, list)
+    assert [tuple(v.shape) for v in merged] == [(3, 8, 8), (3, 8, 8), (3, 12, 4), (3, 6, 6)]
+    assert all(v.dtype == torch.bfloat16 for v in merged)

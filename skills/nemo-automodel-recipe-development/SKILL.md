@@ -11,6 +11,7 @@ metadata:
 ---
 
 # NeMo AutoModel Recipe Development
+<!-- NVSkills signature refresh requested for AM-519. -->
 
 ## Instructions
 
@@ -32,9 +33,9 @@ Use these compact answer patterns for common questions:
 - New finetuning recipe variant: start from the closest file under
   `nemo_automodel/recipes/`, update the model, dataset or dataloader,
   optimizer, loss, LR scheduler, step scheduler, and checkpoint builders,
-  register a CLI route only if adding a command or domain alias, add example
+  register a recipe alias only if adding a new recipe class, add example
   YAML under `examples/`, then add a tiny CPU-compatible unit test and run
-  `automodel finetune llm -c <config.yaml>`.
+  `automodel <config.yaml>`.
 - `_target_` fields: describe `_target_` as the fully qualified Python callable,
   explain that sibling keys become keyword arguments, show optimizer and dataset
   examples, and mention nested CLI overrides such as `--optimizer.lr`.
@@ -67,8 +68,8 @@ asking how those choices appear inside an AutoModel recipe YAML.
 ### Execution Flow
 
 ```
-CLI (automodel finetune llm -c config.yaml)
-  -> app.py parses command + domain + config
+CLI (automodel config.yaml)
+  -> app.py resolves the config's recipe target
     -> recipe script (e.g. train_ft.py) main(config_path)
       -> Recipe class .setup() builds all components
         -> .run_train_validation_loop() executes training
@@ -88,10 +89,10 @@ All components are constructed through dedicated builder functions:
 - `build_model()` -- instantiates the model from config
 - `build_optimizer()` -- creates optimizer (AdamW, etc.)
 - `build_dataloader()` -- sets up train and validation dataloaders
-- `build_loss_fn()` -- creates the loss function
+- `build_loss_module()` -- creates the loss function
 - `build_lr_scheduler()` -- creates the learning rate scheduler
 - `build_step_scheduler()` -- creates the step scheduler controlling training progression
-- `build_checkpoint_config()` -- configures checkpointing
+- `CheckpointingConfig` -- configures checkpointing (built directly from the YAML `checkpoint:` block via `RecipeConfig.checkpoint`)
 
 ### Infrastructure Application Order
 
@@ -194,7 +195,7 @@ This is equivalent to: `torch.optim.AdamW(lr=2e-5, weight_decay=0.01)`.
 Any config value can be overridden from the command line:
 
 ```bash
-automodel finetune llm -c config.yaml \
+automodel config.yaml \
   --optimizer.lr 1e-4 \
   --step_scheduler.max_steps 500 \
   --distributed.tp_size 2
@@ -328,7 +329,7 @@ restore_from:
 |---|---|---|
 | Silent config errors | Typo in `_target_` value | The class path must be a valid, importable Python callable. Double-check the module path and class name. |
 | Training crashes at first step | `global_batch_size` not divisible by `local_batch_size * dp_size * grad_accumulation_steps` | Ensure the batch size math is consistent across all dimensions. |
-| New recipe not accessible via CLI | Missing CLI command alias registration | Register the new route in the CLI app so `automodel <command> <domain>` resolves correctly. |
+| New recipe not accessible via CLI | Config is missing a resolvable `recipe` target | Set the config's `recipe` key to a discoverable recipe class name or a full dotted `_target_` path. |
 | Shape mismatch at forward pass | Dataset collate function output does not match model input signature | Verify that the collate function returns tensors with the keys and shapes the model expects. |
 | OOM during validation | Validation batch size too large or gradients not disabled | Wrap validation in `torch.no_grad()` and consider a smaller validation batch size. |
 | Checkpoint restore fails | Mismatched model architecture between checkpoint and config | Ensure the model config matches the checkpoint exactly (layer count, hidden dim, vocab size). |

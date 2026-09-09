@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from tools.diffusion.processors.wan import (
+    Wan22Processor,
     WanProcessor,
     _basic_clean,
     _prompt_clean,
@@ -403,3 +404,72 @@ class TestWanRegistry:
         from tools.diffusion.processors.registry import ProcessorRegistry
 
         assert ProcessorRegistry.get_class("wan") is ProcessorRegistry.get_class("wan2.1")
+
+
+# ---------------------------------------------------------------------------
+# Wan2.2 subclass
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def wan22_processor():
+    return Wan22Processor()
+
+
+class TestWan22Properties:
+    def test_model_type(self, wan22_processor):
+        assert wan22_processor.model_type == "wan22"
+
+    def test_model_version(self, wan22_processor):
+        assert wan22_processor.model_version == "wan2.2"
+
+    def test_default_model_name(self, wan22_processor):
+        assert wan22_processor.default_model_name == "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+
+    def test_inherits_max_sequence_length(self, wan22_processor):
+        # Wan2.2 reuses UMT5; sequence length cap is the same as Wan2.1.
+        assert wan22_processor.MAX_SEQUENCE_LENGTH == WanProcessor.MAX_SEQUENCE_LENGTH
+
+    def test_inherits_quantization(self, wan22_processor):
+        assert wan22_processor.quantization == 16
+
+    def test_is_wan_processor_subclass(self):
+        # Confirms the subclass relationship — inherits encode_video / encode_text.
+        assert issubclass(Wan22Processor, WanProcessor)
+
+
+class TestWan22Registry:
+    def test_registered_under_wan22_alias(self):
+        from tools.diffusion.processors.registry import ProcessorRegistry
+
+        assert ProcessorRegistry.is_registered("wan2.2")
+
+    def test_get_returns_wan22_instance(self):
+        from tools.diffusion.processors.registry import ProcessorRegistry
+
+        proc = ProcessorRegistry.get("wan2.2")
+        assert isinstance(proc, Wan22Processor)
+
+    def test_wan22_class_distinct_from_wan21(self):
+        from tools.diffusion.processors.registry import ProcessorRegistry
+
+        # The "wan2.2" alias must resolve to the Wan22Processor subclass, not
+        # the Wan2.1 WanProcessor that backs "wan" / "wan2.1".
+        assert ProcessorRegistry.get_class("wan2.2") is Wan22Processor
+        assert ProcessorRegistry.get_class("wan2.2") is not ProcessorRegistry.get_class("wan")
+
+
+class TestWan22CacheData:
+    def test_cache_data_records_wan22_model_version(self, wan22_processor):
+        """The whole point of the subclass: cache entries must be tagged wan2.2 so
+        a downstream consumer can tell a Wan2.1 cache apart from a Wan2.2 cache."""
+        latent = torch.randn(1, 16, 3, 8, 8)
+        text_encodings = {"text_embeddings": torch.randn(1, 226, 1024)}
+        metadata = {"first_frame": None, "prompt": "test prompt"}
+
+        result = wan22_processor.get_cache_data(latent, text_encodings, metadata)
+
+        assert result["model_type"] == "wan22"
+        assert result["model_version"] == "wan2.2"
+        # All other cache fields keep the WanProcessor contract.
+        assert result["video_latents"] is latent
+        assert result["text_embeddings"] is text_encodings["text_embeddings"]
+        assert result["prompt"] == "test prompt"

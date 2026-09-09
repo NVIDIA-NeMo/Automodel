@@ -21,16 +21,47 @@ expected batch format.
 
 import functools
 import logging
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
+
 from .sampler import SequentialBucketSampler
-from .text_to_image_dataset import TextToImageDataset
-from .text_to_video_dataset import TextToVideoDataset, collate_optional_video_fields
+from .text_to_image_dataset import TextToImageDatasetConfig
+from .text_to_video_dataset import TextToVideoDatasetConfig, collate_optional_video_fields
 
 logger = logging.getLogger(__name__)
+
+
+def _stack_or_pad_text_tensors(tensors: List[torch.Tensor], sequence_length_multiple: int = 1) -> torch.Tensor:
+    """Stack text tensors, padding variable sequence lengths on the first dimension."""
+    shapes = [tuple(tensor.shape) for tensor in tensors]
+    if len(set(shapes)) == 1 and (
+        sequence_length_multiple <= 1 or tensors[0].ndim == 0 or tensors[0].shape[0] % sequence_length_multiple == 0
+    ):
+        return torch.stack(tensors)
+
+    first = tensors[0]
+    if first.ndim == 0:
+        raise RuntimeError(f"Cannot pad scalar text tensors with shapes: {shapes}")
+
+    trailing_shape = tuple(first.shape[1:])
+    if any(tensor.ndim != first.ndim or tuple(tensor.shape[1:]) != trailing_shape for tensor in tensors):
+        raise RuntimeError(f"Cannot collate text tensors with incompatible shapes: {shapes}")
+
+    max_sequence_length = max(tensor.shape[0] for tensor in tensors)
+    if sequence_length_multiple > 1:
+        max_sequence_length = (
+            (max_sequence_length + sequence_length_multiple - 1) // sequence_length_multiple
+        ) * sequence_length_multiple
+    padded = first.new_zeros((len(tensors), max_sequence_length, *trailing_shape))
+    for index, tensor in enumerate(tensors):
+        padded[index, : tensor.shape[0], ...] = tensor
+
+    return padded
 
 
 def collate_fn_production(batch: List[Dict]) -> Dict:
@@ -63,9 +94,15 @@ def collate_fn_production(batch: List[Dict]) -> Dict:
     }
 
     # Handle text encodings — model-agnostic: stack whichever keys are present
+    variable_length_text_keys = {"clip_hidden", "prompt_embeds", "clip_tokens", "t5_tokens"}
     for key in ("clip_hidden", "pooled_prompt_embeds", "prompt_embeds", "clip_tokens", "t5_tokens"):
         if key in batch[0]:
-            output[key] = torch.stack([item[key] for item in batch])
+            tensors = [item[key] for item in batch]
+            if key in variable_length_text_keys:
+                sequence_length_multiple = 8 if key == "prompt_embeds" else 1
+                output[key] = _stack_or_pad_text_tensors(tensors, sequence_length_multiple=sequence_length_multiple)
+            else:
+                output[key] = torch.stack(tensors)
 
     return output
 
@@ -163,6 +200,44 @@ def _build_multiresolution_dataloader_core(
     return dataloader, sampler
 
 
+@dataclass
+class TextToImageDataloaderConfig:
+    """Construction-time configuration for a multiresolution text-to-image dataloader."""
+
+    cache_dir: str
+    train_text_encoder: bool = False
+    base_resolution: tuple[int, int] = (256, 256)
+    drop_last: bool = True
+    shuffle: bool = True
+    dynamic_batch_size: bool = False
+    num_workers: int = 4
+    pin_memory: bool = True
+    prefetch_factor: int = 2
+
+    def build(self, *, dp_rank: int, dp_world_size: int, batch_size: int) -> DiffusionDataloaderBuild:
+        """Build the configured text-to-image dataset, sampler, and dataloader."""
+        dataset = TextToImageDatasetConfig(
+            cache_dir=self.cache_dir,
+            train_text_encoder=self.train_text_encoder,
+        ).build()
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            dataset=dataset,
+            collate_fn=collate_fn_text_to_image,
+            batch_size=batch_size,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            base_resolution=self.base_resolution,
+            drop_last=self.drop_last,
+            shuffle=self.shuffle,
+            dynamic_batch_size=self.dynamic_batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            prefetch_factor=self.prefetch_factor,
+        )
+        logger.info("Built text-to-image dataset with %d samples and %d batches", len(dataset), len(sampler))
+        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler)
+
+
 def build_text_to_image_multiresolution_dataloader(
     *,
     # TextToImageDataset parameters
@@ -203,23 +278,9 @@ def build_text_to_image_multiresolution_dataloader(
     Returns:
         Tuple of (DataLoader, SequentialBucketSampler)
     """
-    logger.info("Building text-to-image multiresolution dataloader:")
-    logger.info(f"  cache_dir: {cache_dir}")
-    logger.info(f"  train_text_encoder: {train_text_encoder}")
-    logger.info(f"  batch_size: {batch_size}")
-    logger.info(f"  dp_rank: {dp_rank}, dp_world_size: {dp_world_size}")
-
-    dataset = TextToImageDataset(
+    result = TextToImageDataloaderConfig(
         cache_dir=cache_dir,
         train_text_encoder=train_text_encoder,
-    )
-
-    dataloader, sampler = _build_multiresolution_dataloader_core(
-        dataset=dataset,
-        collate_fn=collate_fn_text_to_image,
-        batch_size=batch_size,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
         base_resolution=base_resolution,
         drop_last=drop_last,
         shuffle=shuffle,
@@ -227,12 +288,12 @@ def build_text_to_image_multiresolution_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
+    ).build(
+        batch_size=batch_size,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
     )
-
-    logger.info(f"  Dataset size: {len(dataset)}")
-    logger.info(f"  Batches per epoch: {len(sampler)}")
-
-    return dataloader, sampler
+    return result.dataloader, result.sampler
 
 
 def collate_fn_video(batch: List[Dict], model_type: str = "wan") -> Dict:
@@ -266,6 +327,47 @@ def collate_fn_video(batch: List[Dict], model_type: str = "wan") -> Dict:
     collate_optional_video_fields(batch, result)
 
     return result
+
+
+@dataclass
+class TextToVideoDataloaderConfig:
+    """Construction-time configuration for a multiresolution text-to-video dataloader."""
+
+    cache_dir: str
+    model_type: str = "wan"
+    device: str = "cpu"
+    base_resolution: tuple[int, int] = (512, 512)
+    drop_last: bool = True
+    shuffle: bool = True
+    dynamic_batch_size: bool = False
+    num_workers: int = 2
+    pin_memory: bool = True
+    prefetch_factor: int = 2
+
+    def build(self, *, dp_rank: int, dp_world_size: int, batch_size: int) -> DiffusionDataloaderBuild:
+        """Build the configured text-to-video dataset, sampler, and dataloader."""
+        dataset = TextToVideoDatasetConfig(
+            cache_dir=self.cache_dir,
+            model_type=self.model_type,
+            device=self.device,
+        ).build()
+        collate = functools.partial(collate_fn_video, model_type=self.model_type)
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            dataset=dataset,
+            collate_fn=collate,
+            batch_size=batch_size,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            base_resolution=self.base_resolution,
+            drop_last=self.drop_last,
+            shuffle=self.shuffle,
+            dynamic_batch_size=self.dynamic_batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            prefetch_factor=self.prefetch_factor,
+        )
+        logger.info("Built text-to-video dataset with %d samples and %d batches", len(dataset), len(sampler))
+        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler)
 
 
 def build_video_multiresolution_dataloader(
@@ -308,26 +410,10 @@ def build_video_multiresolution_dataloader(
     Returns:
         Tuple of (DataLoader, SequentialBucketSampler)
     """
-    logger.info("Building video multiresolution dataloader:")
-    logger.info(f"  cache_dir: {cache_dir}")
-    logger.info(f"  model_type: {model_type}")
-    logger.info(f"  batch_size: {batch_size}")
-    logger.info(f"  dp_rank: {dp_rank}, dp_world_size: {dp_world_size}")
-
-    dataset = TextToVideoDataset(
+    result = TextToVideoDataloaderConfig(
         cache_dir=cache_dir,
         model_type=model_type,
         device=device,
-    )
-
-    collate = functools.partial(collate_fn_video, model_type=model_type)
-
-    dataloader, sampler = _build_multiresolution_dataloader_core(
-        dataset=dataset,
-        collate_fn=collate,
-        batch_size=batch_size,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
         base_resolution=base_resolution,
         drop_last=drop_last,
         shuffle=shuffle,
@@ -335,9 +421,9 @@ def build_video_multiresolution_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
+    ).build(
+        batch_size=batch_size,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
     )
-
-    logger.info(f"  Dataset size: {len(dataset)}")
-    logger.info(f"  Batches per epoch: {len(sampler)}")
-
-    return dataloader, sampler
+    return result.dataloader, result.sampler

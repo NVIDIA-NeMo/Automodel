@@ -1,0 +1,82 @@
+# Domino draft training for a Qwen3 target (online target hidden-state capture).
+#
+# Domino (sgl-project/SpecForge#571) extends the DFlash parallel draft backbone
+# with a lightweight causal correction head: a GRU encodes a causal state from
+# each block's previous tokens, and a low-rank projection of [backbone hidden |
+# GRU state] adds a correction to the parallel base logits. Training jointly
+# supervises the Domino-refined logits and the backbone-only base logits with a
+# base-anchor curriculum: loss = (1 - lambda_base) * final_loss + lambda_base *
+# base_loss, where lambda_base decays from lambda_base_start to 0.
+#
+# IMPORTANT: regenerate the training responses with the target model before
+# training -- training uses teacher forcing on ground-truth tokens while
+# inference is autoregressive, and the distribution mismatch hurts acceptance
+# length otherwise.
+
+recipe: TrainDominoRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-8B
+  train_data_path: /path/to/perfectblend_qwen3-8b_regen.jsonl   # regenerate responses with the target model first
+  val_data_path: null
+  output_dir: ./outputs/domino_qwen3_8b
+  seq_length: 3072
+  micro_batch_size: 2
+  grad_accumulation_steps: 1
+  num_workers: 4
+  num_epochs: 6
+
+  # --- DFlash backbone (shared with the DFlash recipe) ---
+  draft_num_hidden_layers: 5          # depth of the draft transformer stack
+  block_size: 16                      # tokens drafted in parallel per block
+  num_anchors: 256                    # blocks sampled per sequence per step
+  loss_decay_gamma: 7.0               # block-position loss decay: exp(-(k-offset)/gamma)
+  mask_token_id: 151669               # REQUIRED: token used for non-anchor block positions.
+  #                                   # Pick a reserved / unused token id (do NOT rely on pad:
+  #                                   # pad often aliases eos, which silently degrades quality).
+  # target_layer_ids: [1, 9, 17, 25, 33]   # target layers captured as draft context
+  attention_backend: flex_attention   # "flex_attention" (GPU main path) or "sdpa" (portable fallback)
+
+  # --- Domino head ---
+  emb_dim: 256                        # low-rank bottleneck dim of the logit-correction head
+  gru_hidden_dim: 1024                # hidden size of the causal GRU encoder
+  pure_draft_prefix_len: 1            # leading block positions kept on backbone-only base logits
+  shift_label: true                   # block position k predicts anchor+1+k (Domino default)
+
+  # --- base-anchor curriculum: lambda_base = start * (1 - step / (decay_ratio * total)) ---
+  lambda_base_start: 1.0              # initial weight of the base (backbone-only) loss
+  lambda_base_decay_ratio: 1.0        # fraction of total steps over which lambda_base decays to 0
+
+  trust_remote_code: false
+  # target_attn_implementation: sdpa   # frozen target's attention backend (unset = HF auto-select)
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+  # mask_reasoning_content: true   # exclude <think>...</think> reasoning traces from loss
+
+  # --- checkpoint cadence (independent; the fully-trained model is always saved) ---
+  # ckpt_every_steps: 2000            # also save every N optimizer steps
+  # save_checkpoint_every_epoch: false
+
+optimizer:
+  lr: 6.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.04
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/domino_qwen3_8b/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+  # restore_from: LATEST  # "LATEST", a subdir like "epoch_1_step_1000", or an absolute path
+
+# wandb:
+#   project: domino
+#   entity: my-team
+#   name: qwen3-8b-domino

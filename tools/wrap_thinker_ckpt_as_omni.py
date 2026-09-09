@@ -153,6 +153,15 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
         )
     logger.info("will carry over non-thinker prefixes from base: %s", needed_base_prefixes)
 
+    # Thinker keys present in base but absent from the trained ckpt (e.g.
+    # ``thinker.audio_tower.audio_bos_eos_token.weight``, which the NeMo export
+    # may drop) must be backfilled from base — otherwise the wrapped model has
+    # uninitialised weights and vLLM / transformers refuse to load it.
+    ckpt_key_set = set(ckpt_all_keys)
+    missing_thinker_keys = [k for k in base_prefixes.get("thinker", []) if k not in ckpt_key_set]
+    if missing_thinker_keys:
+        logger.info("backfilling %d thinker key(s) from base: %s", len(missing_thinker_keys), missing_thinker_keys)
+
     # ---- 3. Re-bucket each ckpt shard's content into the output dir ----
     new_index: Dict[str, str] = {}
     next_index = 1
@@ -176,7 +185,18 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
             if prefix in ks_by_prefix:
                 base_shards_per_prefix[prefix].setdefault(shard_name, []).extend(ks_by_prefix[prefix])
 
-    total_shards = len(ckpt_thinker_shards) + sum(len(v) for v in base_shards_per_prefix.values())
+    # Base shards filtered to the missing thinker keys (backfill).
+    base_thinker_missing: Dict[str, list[str]] = {}
+    if missing_thinker_keys:
+        _missing_set = set(missing_thinker_keys)
+        for shard_name, keys_in_shard in base_shards_by_file.items():
+            sel = [k for k in keys_in_shard if k in _missing_set]
+            if sel:
+                base_thinker_missing[shard_name] = sel
+
+    total_shards = (
+        len(ckpt_thinker_shards) + len(base_thinker_missing) + sum(len(v) for v in base_shards_per_prefix.values())
+    )
     logger.info(
         "output plan: %d shards (ckpt thinker=%d; %s)",
         total_shards,
@@ -200,6 +220,18 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
         logger.info(
             "wrote thinker shard %s (%d keys, %.2f GB)", out_name, len(keys), (out_dir / out_name).stat().st_size / 1e9
         )
+
+    # 3b-bis. Backfill thinker keys that exist only in base (write from base).
+    for shard_name, keys in sorted(base_thinker_missing.items()):
+        out_name = _shard_filename(next_index)
+        next_index += 1
+        out_shard_filenames.append(out_name)
+        with safe_open(str(base_dir / shard_name), framework="pt") as f:
+            tensors = {k: f.get_tensor(k) for k in keys}
+        _write_shard(out_dir / out_name, tensors)
+        for k in keys:
+            new_index[k] = out_name
+        logger.info("wrote base-thinker backfill shard %s (%d keys: %s)", out_name, len(keys), keys)
 
     # 3c. Copy every non-thinker prefix's shards from base; filter to only
     # those keys (some base shards mix prefixes).

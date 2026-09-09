@@ -31,11 +31,13 @@ from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
 
 
 class _StubHFTokenizer:
-    def __init__(self, bos_id=101, eos_id=102):
+    def __init__(self, bos_id=101, eos_id=102, add_bos_token=False, add_eos_token=False):
         self.bos_token_id = bos_id
         self.eos_token_id = eos_id
-        self.add_bos_token = True
-        self.add_eos_token = True
+        self.bos_token = "<s>" if bos_id is not None else None
+        self.eos_token = "</s>" if eos_id is not None else None
+        self.add_bos_token = add_bos_token
+        self.add_eos_token = add_eos_token
 
     def __call__(self, *args, **kwargs):
         return BatchEncoding(
@@ -76,14 +78,31 @@ class _StubConfig:
     model_type = "stub"
 
 
+class _Ministral3Config:
+    model_type = "ministral3"
+
+
 class TestNeMoAutoTokenizerFromPretrained:
-    def test_patched_adds_bos_eos(self):
+    def test_default_preserves_tokenizer_special_token_behavior(self):
         stub = _StubHFTokenizer()
         with (
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+
+        assert tok.add_bos_token is False
+        assert tok.add_eos_token is False
+        assert tok(["x"])["input_ids"] == [[5, 6]]
+        assert tok.encode("x") == [5, 6]
+
+    def test_opt_in_adds_bos_eos(self):
+        stub = _StubHFTokenizer()
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_bos_token=True, add_eos_token=True)
             out = tok(["x"])
             assert isinstance(out, BatchEncoding)
             assert out["input_ids"] == [[stub.bos_token_id, 5, 6, stub.eos_token_id]]
@@ -101,6 +120,25 @@ class TestNeMoAutoTokenizerFromPretrained:
 
             enc = tok.encode("x", add_special_tokens=False)
             assert enc == [5, 6]
+
+    def test_ministral3_uses_custom_tokenizer_offline(self, monkeypatch):
+        stub = _StubHFTokenizer()
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained", return_value=_Ministral3Config()),
+            patch(
+                "nemo_automodel._transformers.tokenization.tokenization_mistral_common."
+                "MistralCommonBackend.from_pretrained",
+                return_value=stub,
+            ) as custom_from_pretrained,
+            patch("transformers.AutoTokenizer.from_pretrained") as hf_from_pretrained,
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("mistralai/Devstral-2-123B-Instruct-2512")
+
+        assert tok is stub
+        custom_from_pretrained.assert_called_once_with("mistralai/Devstral-2-123B-Instruct-2512")
+        hf_from_pretrained.assert_not_called()
 
     def test_cls_sep_pattern_fixed_when_tokens_missing(self):
         """Transformers >=5.0 defaults special_tokens_pattern to 'cls_sep'.
@@ -281,7 +319,7 @@ class TestNeMoAutoTokenizerFromPretrained:
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_bos_token=True)
             assert tok._add_bos_token is True
 
     def test_add_eos_token_falls_back_on_value_error(self):
@@ -313,7 +351,7 @@ class TestNeMoAutoTokenizerFromPretrained:
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_eos_token=True)
             assert tok._add_eos_token is True
 
 
@@ -878,7 +916,7 @@ class TestTikTokenLikeTokenizerGuards:
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_bos_token=True, add_eos_token=True)
             assert tok.add_bos_token is True
             assert tok.add_eos_token is True
 
@@ -975,3 +1013,97 @@ class TestTryConvertTikTokenToNative:
             pad_token=None,
         )
         assert result.chat_template == "dummy template"
+
+
+class TestEnforcedTokenizerPicklability:
+    """The runtime tokenizer class is mixed dynamically over the HF base class.
+
+    A plain ``type(...)`` mix is unpicklable (pickle cannot find it by qualified
+    name), which broke DataLoader workers started with the ``forkserver`` method
+    (they pickle their arguments, and the dataset holds the tokenizer). These
+    tests cover the cache + ``__reduce__`` machinery that makes instances
+    round-trip through pickle.
+    """
+
+    @staticmethod
+    def _make_wrapped_tokenizer():
+        import pickle
+
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _enforced_tokenizer_class
+
+        backend = Tokenizer(models.WordLevel(vocab={"a": 0, "b": 1, "c": 2, "[UNK]": 3}, unk_token="[UNK]"))
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok = PreTrainedTokenizerFast(tokenizer_object=backend)
+        # Mirror what from_pretrained stashes before swapping the runtime class.
+        tok._base_class = PreTrainedTokenizerFast
+        tok._original_tokenizer_config = None
+        tok._original_tokenizer_class = None
+        tok._source_dir = None
+        tok.__class__ = _enforced_tokenizer_class(PreTrainedTokenizerFast)
+        return tok, pickle
+
+    def test_enforced_class_is_cached_and_mixed(self):
+        from transformers import PreTrainedTokenizerFast
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+            _enforced_tokenizer_class,
+        )
+
+        cls1 = _enforced_tokenizer_class(PreTrainedTokenizerFast)
+        cls2 = _enforced_tokenizer_class(PreTrainedTokenizerFast)
+        assert cls1 is cls2  # cached per base class
+        assert issubclass(cls1, NeMoAutoTokenizerWithBosEosEnforced)
+        assert issubclass(cls1, PreTrainedTokenizerFast)
+        # The runtime name is preserved so save_pretrained / introspection are unchanged.
+        assert cls1.__name__ == NeMoAutoTokenizerWithBosEosEnforced.__name__
+
+    def test_pickle_round_trip_preserves_behavior(self):
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+        )
+
+        tok, pickle = self._make_wrapped_tokenizer()
+        before = tok("a b c")["input_ids"]
+        tok2 = pickle.loads(pickle.dumps(tok))
+        assert isinstance(tok2, NeMoAutoTokenizerWithBosEosEnforced)
+        assert tok2("a b c")["input_ids"] == before
+        assert type(tok2) is type(tok)
+
+    def test_pickle_round_trip_with_cold_cache(self):
+        """forkserver workers import the module fresh, so the cache starts empty."""
+        import nemo_automodel._transformers.tokenization.nemo_auto_tokenizer as m
+
+        tok, pickle = self._make_wrapped_tokenizer()
+        blob = pickle.dumps(tok)
+        m._ENFORCED_TOKENIZER_CLASSES.clear()
+        tok2 = pickle.loads(blob)
+        assert isinstance(tok2, m.NeMoAutoTokenizerWithBosEosEnforced)
+        assert tok2("a b c")["input_ids"] == tok("a b c")["input_ids"]
+
+    def test_rebuild_helper_returns_mixed_instance(self):
+        from transformers import PreTrainedTokenizerFast
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+            _enforced_tokenizer_class,
+            _rebuild_enforced_tokenizer,
+        )
+
+        obj = _rebuild_enforced_tokenizer(PreTrainedTokenizerFast)
+        assert isinstance(obj, NeMoAutoTokenizerWithBosEosEnforced)
+        assert type(obj) is _enforced_tokenizer_class(PreTrainedTokenizerFast)
+
+    def test_reduce_falls_back_without_base_class(self):
+        """An instance that never went through from_pretrained uses the default reducer."""
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+        )
+
+        bare = NeMoAutoTokenizerWithBosEosEnforced.__new__(NeMoAutoTokenizerWithBosEosEnforced)
+        # No _base_class attribute -> __reduce__ should defer to super().
+        result = bare.__reduce__()
+        assert isinstance(result, tuple)

@@ -70,10 +70,16 @@ class FluxProcessor(BaseModelProcessor):
         """
         from diffusers import FluxPipeline
 
+        from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
+
         logger.info("[FLUX] Loading models from %s via FluxPipeline...", model_name)
 
         # Patch T5 layer norm so it can run in bf16 (apex FusedRMSNorm doesn't support it)
         patch_t5_layer_norm()
+
+        # Resolve to a local snapshot dir so a warm HF cache is not re-validated
+        # (and potentially re-downloaded) over the network on every run.
+        model_name = resolve_diffusion_model_dir(model_name)
 
         # Load pipeline without transformer (not needed for preprocessing)
         pipeline = FluxPipeline.from_pretrained(

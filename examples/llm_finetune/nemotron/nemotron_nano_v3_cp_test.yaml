@@ -44,6 +44,13 @@ distributed:
   pp_size: 1
   ep_size: 4
   sequence_parallel: false
+  moe:
+    # cp=2/ep=4 puts experts on a 2-wide ep_shard FSDP dim; with the default
+    # reshard_after_forward=False the all-gathered experts stay resident across the
+    # whole forward (~11.5 GB/rank), OOMing this 30B model on 8xH100 at step 1 once
+    # Adam state is allocated. Resharding after forward is numerically transparent
+    # (CP-parity is unaffected) and frees that headroom.
+    reshard_after_forward: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

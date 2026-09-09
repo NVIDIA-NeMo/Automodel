@@ -21,7 +21,6 @@ This adapter supports FLUX.1 style models with:
 - 2D image latents (treated as 1-frame video: [B, C, 1, H, W])
 """
 
-import random
 from typing import Any, Dict
 
 import torch
@@ -156,9 +155,10 @@ class FluxAdapter(ModelAdapter):
         if pooled_projections.ndim == 1:
             pooled_projections = pooled_projections.unsqueeze(0)
 
-        if random.random() < context.cfg_dropout_prob:
-            text_embeddings = torch.zeros_like(text_embeddings)
-            pooled_projections = torch.zeros_like(pooled_projections)
+        if context.cfg_dropout_prob > 0.0:
+            drop = torch.rand(batch_size, device=device) < context.cfg_dropout_prob
+            text_embeddings = text_embeddings.masked_fill(drop[:, None, None], 0.0)
+            pooled_projections = pooled_projections.masked_fill(drop[:, None], 0.0)
 
         # Pack latents for Flux transformer
         packed_latents = self._pack_latents(noisy_latents)

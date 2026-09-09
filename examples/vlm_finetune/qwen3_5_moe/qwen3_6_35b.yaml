@@ -38,13 +38,18 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+  text_config:
+    # Set to 0 to disable Qwen3.6 MoE VLM MTP.
+    num_nextn_predict_layers: 1
+  mtp_loss_scaling_factor: 0.1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -67,6 +72,10 @@ distributed:
   ep_size: 8
 
   sequence_parallel: false
+  # Recompute transformer-block activations in backward so the fp32 master weights
+  # (restored for custom MoE under FSDP2 in #1896) fit within 80GB; without this the
+  # 35B-A3B run OOMs intermittently at its ~67 GiB steady-state peak on 8xH100.
+  activation_checkpointing: true
 
 freeze_config:
   freeze_vision_tower: true

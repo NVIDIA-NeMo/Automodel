@@ -26,13 +26,13 @@ from nemo_automodel.components.models.step3p5.layers import (
     Step3p5RotaryEmbedding,
 )
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
 @dataclass
 class MockStep3p5Config:
     """Mock configuration for Step3p5 model."""
+
     vocab_size: int = 128
     hidden_size: int = 64
     intermediate_size: int = 128
@@ -74,7 +74,7 @@ def sdpa_backend():
         attn="sdpa",
         rms_norm="torch",
         rope_fusion=False,
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -277,7 +277,10 @@ class TestStep3p5Attention:
         fake_attn = torch.zeros(batch, config.num_attention_heads, seq, config.head_dim)
         attention.attn_func = MagicMock(return_value=fake_attn.to(torch.bfloat16))
 
-        with patch("nemo_automodel.components.models.step3p5.layers.apply_rotary_emb_qk", side_effect=lambda q, k, *_, **__: (q, k)):
+        with patch(
+            "nemo_automodel.components.models.step3p5.layers.apply_rotary_emb_qk",
+            side_effect=lambda q, k, *_, **__: (q, k),
+        ):
             out = attention(x, freqs_cis=freqs_cis)
 
         assert out.shape == (batch, seq, config.hidden_size)

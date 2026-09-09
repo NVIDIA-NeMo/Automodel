@@ -17,36 +17,106 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
+from collections import deque
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 import torch.nn.functional as F
-import wandb
-from torch.utils.data import IterableDataset
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.config import DDPConfig
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.loggers.metric_logger import (
+    DEFAULT_BUFFER_SIZE,
+    MetricsSample,
+    build_metric_logger,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
+from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.recipes._dist_setup import setup_distributed
-from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import (
-    build_checkpoint_config,
-    build_distributed,
-    build_lr_scheduler,
-    build_step_scheduler,
-    build_wandb,
+from nemo_automodel.components.utils.compile_utils import build_compile_config
+from nemo_automodel.recipes._dist_utils import (
+    create_distributed_setup_from_config,
+    shard_optimizers_for_megatron_fsdp,
 )
+from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.te_patches import apply_te_patches
 
+_, wandb = safe_import("wandb")
+
 logger = logging.getLogger(__name__)
+
+
+def _uses_multi_vector_scoring(model) -> bool:
+    """Return whether the model emits token-level embeddings for MaxSim scoring."""
+    model = _unwrap_model_for_attrs(model)
+    return getattr(model, "pooling", None) in {"colbert", "multi_vector"}
+
+
+def _unwrap_model_for_attrs(model):
+    """Return the underlying model object for configuration-style attribute reads."""
+    return getattr(model, "module", model)
+
+
+def _configure_sentence_transformer_export(model, collate_fn) -> None:
+    """Bind the training collator's exact static prompts to bi-encoder export metadata."""
+    model = _unwrap_model_for_attrs(model)
+    configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
+    if configure_prompts is None:
+        return
+    if hasattr(model, "sentence_transformer_export_config") and model.sentence_transformer_export_config is None:
+        return
+
+    if getattr(collate_fn, "use_dataset_instruction", False):
+        disable_export = getattr(model, "disable_sentence_transformer_export", None)
+        if disable_export is not None:
+            disable_export()
+            logger.warning(
+                "Standard Sentence Transformers export is disabled because per-example dataset instructions "
+                "cannot be represented by static checkpoint prompts."
+            )
+        return
+    else:
+        if not hasattr(collate_fn, "query_prefix") or not hasattr(collate_fn, "passage_prefix"):
+            disable_export = getattr(model, "disable_sentence_transformer_export", None)
+            if disable_export is not None:
+                disable_export()
+                logger.warning(
+                    "Standard Sentence Transformers export is disabled because the configured collator "
+                    "does not expose static query_prefix and passage_prefix metadata."
+                )
+            return
+        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
+        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
+
+    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
+
+
+def _get_autocast_ctx(distributed_config):
+    """Return the optional recipe-level autocast context."""
+    autocast_dtype = getattr(distributed_config, "autocast_dtype", None)
+    if autocast_dtype is None or not torch.cuda.is_available():
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+
+
+def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
+    """Return infrastructure kwargs forwarded to model instantiation."""
+    kwargs = {
+        "distributed_setup": distributed_setup,
+        "peft_config": peft_config,
+    }
+    if cfg.get("compile", None) is not None:
+        kwargs["compile_config"] = build_compile_config(cfg.compile)
+    return kwargs
 
 
 def contrastive_scores_and_labels(
@@ -71,6 +141,59 @@ def contrastive_scores_and_labels(
     qk = torch.sum(repeated_query * key, dim=-1).reshape(query_shape[0], current_train_n_passages)
     labels = torch.zeros(query_shape[0], dtype=torch.long, device=query.device)
     return qk, labels
+
+
+def maxsim_scores_and_labels(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    current_train_n_passages: int,
+    key_attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local multi-vector MaxSim scores and labels without in-batch negatives."""
+    assert key.shape[0] == query.shape[0] * current_train_n_passages, "{} != {} * {}".format(
+        key.shape[0], query.shape[0], current_train_n_passages
+    )
+    assert key_attention_mask.shape == key.shape[:2], "{} != {}".format(key_attention_mask.shape, key.shape[:2])
+
+    key = key.reshape(query.shape[0], current_train_n_passages, key.shape[1], key.shape[2])
+    key_attention_mask = key_attention_mask.reshape(query.shape[0], current_train_n_passages, key.shape[2])
+
+    token_scores = torch.einsum("bqd,bnpd->bnqp", query, key)
+    token_scores.masked_fill_(~key_attention_mask[:, :, None, :].bool(), torch.finfo(token_scores.dtype).min)
+    maxsim = token_scores.max(dim=3).values
+    scores = maxsim.sum(dim=2)
+    labels = torch.zeros(query.shape[0], dtype=torch.long, device=query.device)
+    return scores, labels
+
+
+def distributed_maxsim_scores_and_labels(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    current_train_n_passages: int,
+    key_attention_mask: torch.Tensor,
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local-query multi-vector MaxSim scores against globally gathered passages."""
+    assert key.shape[0] % current_train_n_passages == 0, "{} % {} > 0".format(key.shape[0], current_train_n_passages)
+    assert key_attention_mask.shape == key.shape[:2], "{} != {}".format(key_attention_mask.shape, key.shape[:2])
+
+    global_batch_size = key.shape[0] // current_train_n_passages
+    key = key.reshape(global_batch_size, current_train_n_passages, key.shape[1], key.shape[2])
+    key_attention_mask = key_attention_mask.reshape(global_batch_size, current_train_n_passages, key.shape[2])
+
+    scores_by_passage = []
+    for passage_idx in range(current_train_n_passages):
+        token_scores = torch.einsum("bqd,gpd->bgqp", query, key[:, passage_idx])
+        token_scores.masked_fill_(
+            ~key_attention_mask[None, :, passage_idx, None, :].bool(),
+            torch.finfo(token_scores.dtype).min,
+        )
+        scores_by_passage.append(token_scores.max(dim=3).values.sum(dim=2))
+
+    scores = torch.stack(scores_by_passage, dim=2).reshape(query.shape[0], key.shape[0] * current_train_n_passages)
+    labels = torch.arange(query.shape[0], dtype=torch.long, device=query.device) + rank * query.shape[0]
+    labels = labels * current_train_n_passages
+    return scores, labels
 
 
 def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
@@ -98,120 +221,20 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     return query_batch_dict, doc_batch_dict
 
 
-def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
-    """Build a DataLoader for encoder training."""
-    with ScopedRNG(seed=seed, ranked=True):
-        with FirstRankPerNode():
-            dataset = cfg_dl.dataset.instantiate()
-
-        collate_fn = None
-        if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
-            collate_fn = cfg_dl.collate_fn.instantiate(tokenizer=tokenizer)
-
-        if not isinstance(dataset, IterableDataset):
-            shuffle = cfg_dl.get("shuffle", True)
-            if "shuffle" in cfg_dl:
-                del cfg_dl.shuffle
-
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                dataset,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
-            dl_kwargs = {"sampler": sampler, "batch_size": batch_size}
-        else:
-            logging.info("Using IterableDataset; skipping sampler.")
-            dl_kwargs = {"dataset": dataset, "batch_size": batch_size}
-
-        dl_kwargs["dataset"] = dataset
-        if collate_fn is not None:
-            dl_kwargs["collate_fn"] = collate_fn
-
-        return cfg_dl.instantiate(**dl_kwargs)
-
-
 class TrainBiEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
         self.temperature = self.cfg.get("temperature", 1.0)
 
-    def setup(self):
-        """Build all components needed for training/validation/logging/checkpointing."""
-        torch.cuda.reset_peak_memory_stats()
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
-        setup_logging()
-
-        apply_cache_compatibility_patches()
-        apply_te_patches()
-        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
-
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
-
-        if self.pp_enabled:
-            raise NotImplementedError("Encoder does not support pipeline parallelism")
-
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
-            suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
-            logging.info("🚀 View run at {}".format(run.url))
-
-        self._log_experiment_details()
-        self._log_library_versions()
-
-        self.peft_config = None
-        if self.cfg.get("peft", None) is not None:
-            self.peft_config = self.cfg.peft.instantiate()
-
-        checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            self.cfg.model.pretrained_model_name_or_path,
-            is_peft=self.peft_config is not None,
-        )
-
-        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
-            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
-        else:
-            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
-            self.max_grad_norm = 1.0
-
-        self.checkpointer = Checkpointer(
-            config=checkpoint_config,
-            dp_rank=self._get_dp_rank(include_cp=True),
-            tp_rank=self._get_tp_rank(),
-            pp_rank=self._get_pp_rank(),
-            moe_mesh=self.moe_mesh,
-        )
-
-        with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
-            model = self.cfg.model.instantiate(
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
-                peft_config=self.peft_config,
-            )
-
-        self.model_parts = [model]
-        self.pp = None
-
-        # Apply weight decay only to non-bias/non-norm params
+    def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
+        """Build optimizer parameter groups for trainable model parameters."""
+        model = self.model_parts[0]
         decay_params = []
         no_decay_params = []
-        for name, param in self.model_parts[0].named_parameters():
+        for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
             name_l = name.lower()
@@ -229,62 +252,162 @@ class TrainBiEncoderRecipe(BaseRecipe):
             param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
 
         logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
-        self.optimizer = [self.cfg.optimizer.instantiate(params=param_groups)]
+        return param_groups
+
+    def setup(self):
+        """Build all components needed for training/validation/logging/checkpointing."""
+        torch.cuda.reset_peak_memory_stats()
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
+        setup_logging()
+
+        apply_cache_compatibility_patches()
+        apply_te_patches()
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+
+        (
+            self.distributed_setup,
+            self.mesh_context,
+            self.distributed_config,
+            self.device_mesh,
+            self.moe_mesh,
+            self.pp_enabled,
+            self.pipeline_config,
+            self.moe_parallel_config,
+            self.activation_checkpointing,
+        ) = self._distributed_setup_attributes(
+            create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+        )
+
+        if self.pp_enabled:
+            raise NotImplementedError("Encoder does not support pipeline parallelism")
+
+        if self.dist_env.is_main and self.cfg.wandb is not None:
+            suppress_wandb_log_messages()
+            run = self.cfg.wandb.build(
+                run_config=self.cfg.to_dict(), model_name=self.cfg.model.pretrained_model_name_or_path
+            )
+            logging.info("🚀 View run at {}".format(run.url))
+
+        self._log_experiment_details()
+        self._log_library_versions()
+
+        self.peft_config = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_config = self.cfg.peft.instantiate()
+
+        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
+
+        checkpoint_config = self.cfg.checkpoint
+
+        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
+            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
+        else:
+            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+
+        self.checkpointer = checkpoint_config.build(
+            dp_rank=self._get_dp_rank(include_cp=True),
+            tp_rank=self._get_tp_rank(),
+            pp_rank=self._get_pp_rank(),
+            moe_mesh=self.moe_mesh,
+        )
+
+        with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
+            kwargs = _get_model_instantiate_kwargs(self.cfg, self.distributed_setup, self.peft_config)
+            model = self.cfg.model.instantiate(
+                **kwargs,
+            )
+
+        self.model_parts = [model]
+        self.pp = None
+
+        param_groups = self._build_optimizer_param_groups()
+        optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
+        # Megatron-FSDP ZeRO-1/2/3 requires registering the separately-built optimizer with the
+        # already-wrapped MegatronFSDP model (mirrors the LLM recipe train_ft.py). Without this,
+        # the deferred grad-sync / optimized-weight install hooks are never wired up. Assign
+        # self.optimizer exactly once so BaseRecipe.__setattr__ state-tracking does not reject a
+        # second "optimizer" registration.
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            self.model_parts[0], [optimizer], self.distributed_config, allow=allow_megatron_fsdp_sharding
+        )
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
-            optimizer_cfg=self.cfg.optimizer,
             is_peft=self.peft_config is not None,
             context="retrieval",
             logger=logger,
         )
 
+        # Might be tokenizer or processor (for VLMs)
         self.tokenizer = self.cfg.tokenizer.instantiate()
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.tokenizer.padding_side = "left"
+        tokenizer = self.tokenizer.tokenizer if isinstance(self.tokenizer, ProcessorMixin) else self.tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = self.tokenizer.eos_token
+            tokenizer.padding_side = "left"
 
-        self.dataloader = build_dataloader(
-            self.cfg.dataloader,
-            self.tokenizer,
-            seed=self.cfg.get("seed", 42),
-            batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-            dp_rank=self._get_dp_rank(),
-            dp_world_size=self._get_dp_group_size(),
-        )
-        self.train_n_passages = self.cfg.get("dataloader.dataset.n_passages", 1)
+        dataloader_config = self.cfg.dataloader
+        if dataloader_config is None:
+            raise ValueError("Retrieval training requires a top-level dataset config")
+
+        def materialize_loader(config):
+            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
+            with ScopedRNG(seed=config.seed, ranked=True):
+                return config.build(
+                    tokenizer=self.tokenizer,
+                    dataset_build_context=build_context,
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                )
+
+        self.dataloader = materialize_loader(dataloader_config)
+        _configure_sentence_transformer_export(self.model_parts[0], self.dataloader.collate_fn)
+        self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None
-        if "validation_dataloader" in self.cfg:
-            val_batch_size = self.cfg.get(
-                "validation_dataloader.batch_size", self.cfg.get("step_scheduler.local_batch_size", 1)
-            )
-            self.val_dataloader = build_dataloader(
-                self.cfg.validation_dataloader,
-                self.tokenizer,
-                seed=self.cfg.get("seed", 42),
-                batch_size=val_batch_size,
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-            )
-            self.val_n_passages = self.cfg.get("validation_dataloader.dataset.n_passages", self.train_n_passages)
+        validation_configs = self.cfg.validation_dataloaders
+        if validation_configs:
+            validation_config = next(iter(validation_configs.values()))
+            self.val_dataloader = materialize_loader(validation_config)
+            self.val_n_passages = getattr(validation_config.dataset_config, "n_passages", self.train_n_passages)
 
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None),
+        self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            self.cfg.get("step_scheduler.local_batch_size", 1),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
-        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
+        # buffer_size bounds how many records can be pending, so a hard kill that runs no
+        # cleanup loses at most one checkpoint interval of train metrics; it is NOT what keeps
+        # metrics in step with checkpoints, since it counts records rather than watching
+        # checkpoint boundaries. The explicit flush after each successful checkpoint is what
+        # provides that. flush=True because a buffered write only reaches the file object,
+        # whose own buffer dies with the process. Validation is rare enough to write every
+        # point.
+        train_logger_kwargs = {"flush": True}
+        if self.step_scheduler.ckpt_every_steps > 0:
+            train_logger_kwargs["buffer_size"] = min(DEFAULT_BUFFER_SIZE, self.step_scheduler.ckpt_every_steps)
         self.metric_logger_train = build_metric_logger(
-            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl",
+            **train_logger_kwargs,
         )
         self.metric_logger_valid = build_metric_logger(
-            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl",
+            buffer_size=1,
+            flush=True,
         )
+        self.loss_average_window = deque(maxlen=self.step_scheduler.loss_average_window_steps)
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.load_checkpoint(restore_from)
@@ -300,6 +423,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
+
+                if hasattr(self.dataloader.dataset, "set_epoch"):
+                    self.dataloader.dataset.set_epoch(epoch)
+
                 # The step scheduler yields a list of batches for gradient accumulation
                 for batches in self.step_scheduler:
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
@@ -321,14 +448,38 @@ class TrainBiEncoderRecipe(BaseRecipe):
                             train_loss=train_log_data.metrics["loss"],
                             val_loss=val_loss,
                         )
+                        # Flush once the checkpoint save returns, so the metrics describing the
+                        # steps it covers are durable by the time the loop moves on rather than
+                        # waiting for the buffer to fill. This is a post-save boundary, not an
+                        # atomic one: a crash between the save completing and this flush leaves
+                        # the checkpoint on disk with those records still buffered. Buffer size alone
+                        # does not give this: it counts records, and the count only lines up
+                        # with checkpoint steps while training runs from step 0 with periodic
+                        # checkpoints. Resuming at a step that is not a multiple of
+                        # ckpt_every_steps, or a checkpoint taken at an epoch boundary or the
+                        # final step, leaves the two out of phase.
+                        if self.metric_logger_train is not None:
+                            self.metric_logger_train.flush()
+                        if self.metric_logger_valid is not None:
+                            self.metric_logger_valid.flush()
                     self._maybe_collect_garbage()
+
+                    # Poll per step; the StepScheduler iterators stop on the flag.
+                    if self.step_scheduler.sigterm_received:
+                        logger.info(
+                            "Preemption signal received at step %d; stopping cleanly.", self.step_scheduler.step
+                        )
         finally:
             if pbar is not None:
                 pbar.close()
+            # In the finally, not after it: an exception (OOM, NCCL timeout) would
+            # otherwise propagate past these and discard every buffered record.
+            if self.metric_logger_train is not None:
+                self.metric_logger_train.close()
+            if self.metric_logger_valid is not None:
+                self.metric_logger_valid.close()
 
-        self.metric_logger_train.close()
-        self.metric_logger_valid.close()
-        self.checkpointer.close()
+        self._finalize_and_close_checkpointer()
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         """Forward and backward pass for a single micro-batch."""
@@ -339,7 +490,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         query, passage = _unpack_qp(batch)
 
         model = self.model_parts[0]
-        train_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
+        train_ctx = _get_autocast_ctx(self.distributed_config)
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -351,15 +502,21 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
+            if is_train:
+                if query is not None:
+                    query["run_dummy_vision"] = False
+                if passage is not None:
+                    passage["run_dummy_vision"] = True
             q_reps = model(query)
             p_reps = model(passage)
+            attr_model = _unwrap_model_for_attrs(model)
 
             n_passages = self.train_n_passages
-            if is_train and getattr(model, "do_distributed_inbatch_negative", False):
-                if getattr(model, "pooling", None) == "colbert":
-                    raise NotImplementedError("Distributed in-batch negatives are not implemented for ColBERT pooling.")
+            use_multi_vector_scoring = _uses_multi_vector_scoring(model)
+            if is_train and getattr(attr_model, "do_distributed_inbatch_negative", False):
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
                     dist_gather_tensor,
+                    dist_gather_tensor_with_dim1_padding,
                     mask_gathered_passages_same_doc_as_positive,
                 )
 
@@ -367,12 +524,31 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
-                all_p = dist_gather_tensor(p_reps)
-                expected_p = world_size * local_bs * n_passages
-                assert all_p.shape[0] == expected_p, f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
-                scores = torch.mm(q_reps, all_p.t())
-                labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
-                if model.l2_normalize:
+                preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
+
+                if use_multi_vector_scoring:
+                    all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
+                    all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
+                    expected_p = world_size * local_bs * n_passages
+                    assert all_p.shape[0] == expected_p, (
+                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    )
+                    scores, labels = distributed_maxsim_scores_and_labels(
+                        q_reps,
+                        all_p,
+                        n_passages,
+                        all_p_mask,
+                        rank,
+                    )
+                else:
+                    all_p = dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
+                    expected_p = world_size * local_bs * n_passages
+                    assert all_p.shape[0] == expected_p, (
+                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    )
+                    scores = torch.mm(q_reps, all_p.t())
+                    labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
+                if attr_model.l2_normalize:
                     scores = scores / self.temperature
                 passage_doc_ids = batch.get("passage_doc_ids")
                 if passage_doc_ids is not None:
@@ -385,8 +561,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         local_batch_size=local_bs,
                     )
             else:
-                scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
-                if model.l2_normalize:
+                if use_multi_vector_scoring:
+                    scores, labels = maxsim_scores_and_labels(
+                        q_reps,
+                        p_reps,
+                        n_passages,
+                        passage["attention_mask"],
+                    )
+                else:
+                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+                if attr_model.l2_normalize:
                     scores = scores / self.temperature
             loss = F.cross_entropy(scores, labels)
 
@@ -416,6 +600,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             foreach=True,
             num_label_tokens=None,  # Not applicable for encoder
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            use_torch_clip_grad_norm=isinstance(self.distributed_config, DDPConfig),
         )
 
         self.checkpointer.maybe_wait_for_staging()
@@ -434,12 +619,15 @@ class TrainBiEncoderRecipe(BaseRecipe):
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
+        self.loss_average_window.append(reporting_loss)
+        average_loss = sum(self.loss_average_window) / len(self.loss_average_window)
         elapsed = time.perf_counter() - self.timestamp
         self.timestamp = time.perf_counter()
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
 
         metrics = {
             "loss": reporting_loss,
+            "loss_avg_window": average_loss,
             "grad_norm": grad_norm,
             "lr": lr,
             "mem": mem_allocated,
@@ -451,6 +639,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
             epoch=self.step_scheduler.epoch,
             metrics=metrics,
         )
+
+    def _extract_scoring_reps(self, model_output):
+        """Return the embedding tensor used for validation scoring from a forward output.
+
+        The base bi-encoder forward returns an embedding tensor directly. Subclasses whose
+        forward returns a richer structure (e.g. the distillation student, which returns
+        ``(pooled, projected, intermediate_outputs)``) should override this to select the
+        tensor to score with.
+        """
+        return model_output
 
     def _run_validation_epoch(self, val_dataloader):
         """Run validation for one epoch and compute loss, accuracy@1, and MRR."""
@@ -470,11 +668,20 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     query, passage = _unpack_qp(batch)
 
                     model = self.model_parts[0]
-                    q_reps = model(query)
-                    p_reps = model(passage)
+                    q_reps = self._extract_scoring_reps(model(query))
+                    p_reps = self._extract_scoring_reps(model(passage))
 
-                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
-                    if model.l2_normalize:
+                    if _uses_multi_vector_scoring(model):
+                        scores, labels = maxsim_scores_and_labels(
+                            q_reps,
+                            p_reps,
+                            self.val_n_passages,
+                            passage["attention_mask"],
+                        )
+                    else:
+                        scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
+                    attr_model = _unwrap_model_for_attrs(model)
+                    if attr_model.l2_normalize:
                         scores = scores / self.temperature
                     loss = F.cross_entropy(scores, labels)
 
@@ -534,10 +741,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.metric_logger_train.log(log_data)
 
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
+            "step {} | epoch {} | loss {:.4f} | loss_avg_window {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
+                log_data.metrics["loss_avg_window"],
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],

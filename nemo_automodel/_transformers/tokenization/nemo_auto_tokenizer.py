@@ -20,7 +20,7 @@ import shutil
 
 from jinja2.exceptions import TemplateError
 from transformers import AutoTokenizer
-from transformers.tokenization_utils_base import BatchEncoding
+from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 
 try:
     from huggingface_hub.errors import StrictDataclassClassValidationError
@@ -345,21 +345,35 @@ def _try_convert_tiktoken_to_native(tokenizer):
 
 class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
     """
-    A wrapper around HuggingFace's AutoTokenizer that ensures consistent BOS/EOS token handling.
+    A wrapper around HuggingFace's AutoTokenizer with opt-in BOS/EOS token handling.
 
     There are pre-existing issues with some tokenizers (e.g. GPT2Tokenizer) where the BOS/EOS tokens
-    are not added automatically. This wrapper ensures they are always added when requested.
+    are not added automatically. Set ``add_bos_token`` or ``add_eos_token`` to ``True`` to add them.
     """
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, add_bos_token=True, add_eos_token=True, **kwargs):
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike[str],
+        *args: object,
+        add_bos_token: bool = False,
+        add_eos_token: bool = False,
+        **kwargs: object,
+    ) -> PreTrainedTokenizerBase:
         """
         Load the HF tokenizer class via AutoTokenizer and (optionally) wrap it to add BOS/EOS.
 
         Args:
-            pretrained_model_name_or_path: Model identifier or path
-            add_bos_token: Whether to add BOS token (default: True)
-            add_eos_token: Whether to add EOS token (default: True)
+            pretrained_model_name_or_path: Model identifier or path.
+            *args: Additional positional arguments passed to the tokenizer's ``from_pretrained`` method.
+            add_bos_token: Set to ``True`` to add a BOS token when the tokenizer does not add one itself. By
+                default, the tokenizer's native setting is preserved.
+            add_eos_token: Set to ``True`` to add an EOS token when the tokenizer does not add one itself. By
+                default, the tokenizer's native setting is preserved.
+            **kwargs: Additional keyword arguments passed to the tokenizer's ``from_pretrained`` method.
+
+        Returns:
+            The loaded tokenizer, wrapped with NeMo's tokenizer compatibility behavior.
         """
         try:
             tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
@@ -386,6 +400,24 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
                     raise
             else:
                 raise
+        except AttributeError as e:
+            # DeepSeek-V3.2's remote config is intentionally loaded through
+            # Automodel's local config class, but AutoTokenizer independently
+            # creates a generic config only to discover the tokenizer.  Recent
+            # Transformers validates RoPE during that generic construction and
+            # requires this otherwise irrelevant field.  Supply a minimal config
+            # for tokenizer discovery; model construction still uses the recipe's
+            # DeepseekV32Config.
+            if "max_position_embeddings" not in str(e):
+                raise
+            from transformers import PretrainedConfig
+
+            tokenizer = super().from_pretrained(
+                pretrained_model_name_or_path,
+                *args,
+                config=PretrainedConfig(max_position_embeddings=1),
+                **kwargs,
+            )
 
         # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
         # char_to_token() works natively for {% generation %} mask computation.
@@ -428,7 +460,7 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
 
         tokenizer._source_dir = _resolve_source_dir(pretrained_model_name_or_path, **kwargs)
 
-        tokenizer.__class__ = type(cls.__name__, (cls, base_tokenizer_cls), {})
+        tokenizer.__class__ = _enforced_tokenizer_class(base_tokenizer_cls)
         return tokenizer
 
     def apply_chat_template(self, conversation, *args, **kwargs):
@@ -519,6 +551,52 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             _restore_tokenizer_config(save_directory, original_config)
 
         return result
+
+    def __reduce__(self):
+        # The runtime class is a dynamically mixed ``(wrapper, base)`` type that
+        # pickle cannot locate by qualified name, so the default reducer fails
+        # with "it's not the same object as ...". This breaks DataLoader workers
+        # started with the ``forkserver`` method, which pickle their arguments
+        # (the dataset holds the tokenizer). Reconstruct through the base class
+        # instead -- it is importable by reference -- and re-derive the mixed
+        # class on the far side, then let ``__setstate__`` restore the state.
+        # Falls back to the default for instances without a captured base class.
+        base_class = getattr(self, "_base_class", None)
+        if base_class is None:
+            return super().__reduce__()
+        get_state = getattr(self, "__getstate__", None)
+        state = get_state() if get_state is not None else dict(self.__dict__)
+        return (_rebuild_enforced_tokenizer, (base_class,), state)
+
+
+# The BOS/EOS wrapper is mixed over the concrete HF tokenizer class at runtime
+# (``from_pretrained`` cannot know the base class ahead of time). Cache one mixed
+# class per base so repeated loads reuse it and every instance of a given base
+# shares an identity (stable ``isinstance`` / pickle reconstruction).
+_ENFORCED_TOKENIZER_CLASSES: dict[type, type] = {}
+
+
+def _enforced_tokenizer_class(base_tokenizer_cls: type) -> type:
+    """Return the cached BOS/EOS wrapper class mixed over ``base_tokenizer_cls``."""
+    mixed = _ENFORCED_TOKENIZER_CLASSES.get(base_tokenizer_cls)
+    if mixed is None:
+        mixed = type(
+            NeMoAutoTokenizerWithBosEosEnforced.__name__,
+            (NeMoAutoTokenizerWithBosEosEnforced, base_tokenizer_cls),
+            {},
+        )
+        _ENFORCED_TOKENIZER_CLASSES[base_tokenizer_cls] = mixed
+    return mixed
+
+
+def _rebuild_enforced_tokenizer(base_tokenizer_cls: type):
+    """Recreate a blank enforced-tokenizer instance while unpickling.
+
+    Used by ``NeMoAutoTokenizerWithBosEosEnforced.__reduce__``; pickle restores
+    the tokenizer state onto the returned instance via ``__setstate__``.
+    """
+    mixed = _enforced_tokenizer_class(base_tokenizer_cls)
+    return mixed.__new__(mixed)
 
 
 def _add_token(tokenized, value, position, key):

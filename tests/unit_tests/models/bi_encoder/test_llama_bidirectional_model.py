@@ -17,6 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -31,6 +32,7 @@ from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
+    _register_with_hf_auto_classes,
 )
 from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
@@ -43,7 +45,7 @@ def test_contrastive_scores_and_labels_shapes_and_labels():
     assert torch.all(labels == 0) and labels.shape == (2,)
 
 
-@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "colbert"])
+@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "colbert", "multi_vector"])
 def test_pool_basic_modes(pool_type):
     last_hidden = torch.tensor(
         [
@@ -61,7 +63,7 @@ def test_pool_basic_modes(pool_type):
         assert torch.allclose(out[0], torch.tensor([1.0 + 3.0, 2.0 + 4.0]))
     elif pool_type == "cls":
         assert torch.allclose(out[:, :], last_hidden[:, 0])
-    elif pool_type == "colbert":
+    elif pool_type in {"colbert", "multi_vector"}:
         assert out.shape == last_hidden.shape
 
 
@@ -89,6 +91,44 @@ def test_llama_bidirectional_config_fields():
     assert cfg.pooling == "cls"
     # Some downstream configs may overwrite; just ensure attribute exists and is float-like
     assert isinstance(cfg.temperature, float)
+
+
+def test_llama_bidirectional_sequence_classification_auto_class_registration():
+    config = LlamaBidirectionalConfig(
+        vocab_size=64,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        intermediate_size=32,
+        num_labels=2,
+    )
+
+    model = AutoModelForSequenceClassification.from_config(config)
+
+    assert isinstance(model, LlamaBidirectionalForSequenceClassification)
+
+
+def test_llama_bidirectional_auto_class_registration_ignores_duplicate_errors(monkeypatch):
+    calls = []
+
+    def duplicate_register(name):
+        def register(*args, **kwargs):
+            calls.append(name)
+            raise ValueError("already registered")
+
+        return register
+
+    monkeypatch.setattr(AutoConfig, "register", duplicate_register("config"))
+    monkeypatch.setattr(AutoModel, "register", duplicate_register("model"))
+    monkeypatch.setattr(
+        AutoModelForSequenceClassification,
+        "register",
+        duplicate_register("sequence_classification"),
+    )
+
+    _register_with_hf_auto_classes()
+
+    assert calls == ["config", "model", "sequence_classification"]
 
 
 def test_llama_bidirectional_model_init_and_mask():
@@ -173,7 +213,6 @@ def test_bidirectional_attention_is_symmetric():
     assert not torch.allclose(out_base[0, 0], out_modified[0, 0], atol=1e-6), (
         "Bidirectional model: changing last token should affect first token's hidden state"
     )
-
 
 
 # --- Fakes for classification and encoder tests ---
@@ -270,9 +309,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             )
 
     lm = NoTTIDLm(hidden=8)
-    model = BiEncoderModel(
-        model=lm, pooling="avg", l2_normalize=True
-    )
+    model = BiEncoderModel(model=lm, pooling="avg", l2_normalize=True)
     # encode removes token_type_ids and normalizes
     q = {
         "input_ids": torch.ones(2, 3, dtype=torch.long),
@@ -314,9 +351,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             return OnlyHiddenOutputs(hidden_states)
 
     # Test with model using NoLastLM for query encoder
-    model_no_last = BiEncoderModel(
-        model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True
-    )
+    model_no_last = BiEncoderModel(model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True)
     v2 = model_no_last.encode(
         {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)},
     )
@@ -484,6 +519,8 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
         return FakeConfig()
 
     monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
+    monkeypatch.setattr(encoder_module, "_load_sentence_transformer_wrapper_options", lambda *args, **kwargs: None)
+    monkeypatch.setattr(encoder_module, "_cache_hub_source_legal_assets", lambda *args, **kwargs: None)
 
     # Hub path
     m1 = BiEncoderModel.build(model_name_or_path="llama-tiny")
@@ -571,10 +608,14 @@ def test_init_encoder_common_name_or_path_for_generic():
 
     # Use a class name that is NOT a retrieval arch
     FakeModel.__name__ = "Qwen3Model"
-    FakeModel = type("Qwen3Model", (nn.Module,), {
-        "__init__": FakeModel.__init__,
-        "config": property(lambda self: self._config),
-    })
+    FakeModel = type(
+        "Qwen3Model",
+        (nn.Module,),
+        {
+            "__init__": FakeModel.__init__,
+            "config": property(lambda self: self._config),
+        },
+    )
     fake = object.__new__(FakeModel)
     nn.Module.__init__(fake)
     fake._config = FakeCfg()

@@ -265,7 +265,7 @@ class TestHyMT2ForCausalLM:
         bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         # Output dtype must be the input dtype (bf16), not fp32.
         assert logits.dtype == torch.bfloat16
 
@@ -282,7 +282,7 @@ class TestHyMT2ForCausalLM:
         bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.dtype == torch.bfloat16
 
     def test_lm_head_no_upcast_when_disabled(self, config, backend_config, device):
@@ -291,8 +291,24 @@ class TestHyMT2ForCausalLM:
         bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.dtype == torch.bfloat16
+
+    def test_forward_thd_hidden_states_match_logits_layout(self, config, backend_config, device):
+        model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, config.vocab_size, (batch, seq), device=device)
+        position_ids = torch.arange(seq, device=device).unsqueeze(0)
+        hidden = torch.randn(seq, HIDDEN, device=device, dtype=torch.bfloat16)
+        with patch.object(model.model, "forward", return_value=hidden):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, HIDDEN)
 
     def test_get_set_input_embeddings(self, config, backend_config):
         model = HyMT2ForCausalLM(config, backend=backend_config)

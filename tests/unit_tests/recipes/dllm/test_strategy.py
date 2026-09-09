@@ -12,57 +12,62 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for dLLM strategies (MDLMStrategy, HybridStrategy) and get_dllm_strategy."""
+"""Tests for dLLM strategies (MDLMStrategy, SCDDStrategy, HybridStrategy, DFlashStrategy) and get_dllm_strategy."""
+
+import types
+from pathlib import Path
 
 import pytest
 import torch
 
 from nemo_automodel.components.loss.dllm_loss import (
-    HybridDiffusionLLMLoss,
+    BlockDiffusionCrossEntropyLoss,
+    DFlashDecayLoss,
+    IDLMLoss,
     MDLMCrossEntropyLoss,
+    SCDDLoss,
 )
 from nemo_automodel.recipes.dllm.strategy import (
     DLLM_STRATEGIES,
-    DLLMStrategy,
+    BlockDiffusionStrategy,
+    DFlashStrategy,
     HybridStrategy,
+    IDLMStrategy,
     MDLMStrategy,
+    SCDDStrategy,
+    _build_target_layer_ids,
     get_dllm_strategy,
 )
 
-# ---------------------------------------------------------------------------
-# Strategy registry tests
-# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
-class TestDLLMStrategyRegistry:
-    def test_mdlm_in_strategies(self):
-        assert "mdlm" in DLLM_STRATEGIES
+def test_get_dllm_strategy_rejects_unknown_mode():
+    """Unknown mode must raise a clear ValueError (recipe entry point relies on this)."""
+    with pytest.raises(ValueError, match="Unknown dllm.mode"):
+        get_dllm_strategy("unknown")
 
-    def test_hybrid_in_strategies(self):
-        assert "hybrid" in DLLM_STRATEGIES
 
-    def test_get_mdlm_strategy(self):
-        s = get_dllm_strategy("mdlm")
-        assert isinstance(s, MDLMStrategy)
+def test_get_dllm_strategy_resolves_dflash():
+    """Registry happy-path for the flagship DFlash strategy — a typo in the
+    DLLM_STRATEGIES dict would only surface at smoke time without this test."""
+    assert isinstance(get_dllm_strategy("dflash"), DFlashStrategy)
 
-    def test_get_hybrid_strategy(self):
-        s = get_dllm_strategy("hybrid")
-        assert isinstance(s, HybridStrategy)
 
-    def test_unknown_mode_raises(self):
-        with pytest.raises(ValueError, match="Unknown dllm.mode"):
-            get_dllm_strategy("unknown")
+def test_every_registered_strategy_has_valid_normalization_mode():
+    """Strategy contract: ``normalization_mode`` selects the loss denominator in
+    ``_run_train_optim_step``; a typo (e.g. ``"supervize"``) raises
+    ``Invalid normalization_mode`` at runtime. Iterating the registry catches
+    this at test time for every strategy."""
+    for name, cls in DLLM_STRATEGIES.items():
+        mode = cls().normalization_mode
+        assert mode in ("supervised", "noise"), f"strategy {name!r}: invalid normalization_mode {mode!r}"
 
-    def test_all_strategies_are_subclasses(self):
-        for name, cls in DLLM_STRATEGIES.items():
-            assert issubclass(cls, DLLMStrategy)
 
-    def test_all_strategies_have_valid_normalization_mode(self):
-        for name, cls in DLLM_STRATEGIES.items():
-            s = cls()
-            assert s.normalization_mode in ("supervised", "noise"), (
-                f"Strategy {name} has invalid normalization_mode: {s.normalization_mode}"
-            )
+def test_build_target_layer_ids_even_spacing():
+    assert _build_target_layer_ids(num_target_layers=12, num_draft_layers=1) == [6]
+    assert _build_target_layer_ids(num_target_layers=12, num_draft_layers=3) == [1, 5, 9]
 
 
 # ---------------------------------------------------------------------------
@@ -74,30 +79,6 @@ class TestMDLMStrategy:
     @pytest.fixture
     def strategy(self):
         return MDLMStrategy()
-
-    def test_normalization_mode_default(self, strategy):
-        assert strategy.normalization_mode == "supervised"
-
-    def test_create_loss_fn_type(self, strategy):
-        loss_fn = strategy.create_loss_fn({})
-        assert isinstance(loss_fn, MDLMCrossEntropyLoss)
-
-    def test_apply_corruption_shapes(self, strategy):
-        torch.manual_seed(42)
-        B, L = 2, 16
-        input_ids = torch.randint(0, 100, (B, L))
-        loss_mask = torch.ones(B, L, dtype=torch.long)
-        noisy, noise_mask, p_mask = strategy.apply_corruption(
-            input_ids,
-            loss_mask,
-            mask_token_id=999,
-            eps=0.001,
-            block_size=None,
-            half_life_ratio=None,
-        )
-        assert noisy.shape == (B, L)
-        assert noise_mask.shape == (B, L)
-        assert p_mask.shape == (B, L)
 
     def test_apply_corruption_uses_uniform(self, strategy):
         """MDLM always uses uniform corruption (p_mask constant per sequence)."""
@@ -113,12 +94,11 @@ class TestMDLMStrategy:
             block_size=None,
             half_life_ratio=None,
         )
-        # Uniform corruption: p_mask is constant per sequence
         for b in range(B):
             assert (p_mask[b] == p_mask[b, 0]).all()
 
     def test_prepare_batch_sets_noisy_input_ids(self, strategy):
-        """MDLM sets input_ids to noisy tokens and removes attention_mask."""
+        """MDLM sets input_ids to noisy tokens and removes attention_mask (bidirectional)."""
         batch = {"input_ids": torch.zeros(2, 4, dtype=torch.long), "attention_mask": torch.ones(2, 4)}
         noisy = torch.ones(2, 4, dtype=torch.long) * 999
         noise_mask = torch.ones(2, 4, dtype=torch.bool)
@@ -126,8 +106,77 @@ class TestMDLMStrategy:
 
         result = strategy.prepare_batch(batch, noisy, noise_mask, clean)
         assert (result["input_ids"] == noisy).all()
-        # attention_mask should be removed for MDLM (bidirectional)
         assert "attention_mask" not in result
+
+    def test_pre_step_stashes_corruption_sidecars(self, strategy):
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "loss_mask": torch.tensor([[1, 0, 1], [0, 1, 1]]),
+        }
+        seen_microbatch_indices = []
+
+        def apply_corruption(input_ids, loss_mask, microbatch_idx=0):
+            seen_microbatch_indices.append(microbatch_idx)
+            return input_ids + 100, loss_mask.bool(), torch.full(input_ids.shape, 0.5)
+
+        recipe = types.SimpleNamespace(_apply_corruption=apply_corruption)
+
+        num_noise, num_supervised = strategy.pre_step(recipe, [batch])
+
+        assert num_noise == 4
+        assert num_supervised == 4
+        assert torch.equal(batch["_noisy_input_ids"], torch.tensor([[101, 102, 103], [104, 105, 106]]))
+        assert torch.equal(batch["_noise_mask"], batch["loss_mask"].bool())
+        assert torch.equal(batch["_clean_input_ids"], torch.tensor([[1, 2, 3], [4, 5, 6]]))
+        # pre_step threads the grad-accum microbatch index into the corruption
+        # seed so every microbatch draws distinct, resume-reproducible noise.
+        assert seen_microbatch_indices == [0]
+
+    def test_pre_step_passes_distinct_microbatch_indices(self, strategy):
+        batches = [
+            {"input_ids": torch.tensor([[1, 2]]), "loss_mask": torch.tensor([[1, 1]])},
+            {"input_ids": torch.tensor([[3, 4]]), "loss_mask": torch.tensor([[1, 1]])},
+        ]
+        seen_microbatch_indices = []
+
+        def apply_corruption(input_ids, loss_mask, microbatch_idx=0):
+            seen_microbatch_indices.append(microbatch_idx)
+            return input_ids, loss_mask.bool(), torch.ones_like(input_ids, dtype=torch.float32)
+
+        recipe = types.SimpleNamespace(_apply_corruption=apply_corruption)
+        strategy.pre_step(recipe, batches)
+        assert seen_microbatch_indices == [0, 1]
+
+    def test_forward_backward_delegates_to_recipe_step(self, strategy):
+        calls = []
+
+        def forward_backward_step(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        recipe = types.SimpleNamespace(_forward_backward_step=forward_backward_step)
+        batch = {"input_ids": torch.ones(1, 2, dtype=torch.long)}
+        loss_buffer = []
+
+        strategy.forward_backward(
+            recipe,
+            1,
+            batch,
+            loss_buffer=loss_buffer,
+            num_diffusion_tokens=7,
+            num_ar_tokens=3,
+            num_batches=2,
+            is_train=False,
+        )
+
+        args, kwargs = calls[0]
+        assert args == (1, batch)
+        assert kwargs == {
+            "loss_buffer": loss_buffer,
+            "num_diffusion_tokens": 7,
+            "num_ar_tokens": 3,
+            "num_batches": 2,
+            "is_train": False,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -140,13 +189,8 @@ class TestLLaDAIntegration:
 
     LLADA_MASK_TOKEN_ID = 126336
 
-    def test_mdlm_strategy_for_llada(self):
-        """LLaDA uses MDLM mode."""
-        strategy = get_dllm_strategy("mdlm")
-        assert isinstance(strategy, MDLMStrategy)
-
     def test_corruption_with_llada_mask_token(self):
-        """Verify corruption works with LLaDA's mask token ID."""
+        """Corrupted positions get LLaDA's mask token; uncorrupted positions are unchanged."""
         torch.manual_seed(42)
         strategy = MDLMStrategy()
         B, L = 2, 16
@@ -161,73 +205,26 @@ class TestLLaDAIntegration:
             block_size=None,
             half_life_ratio=None,
         )
-        # Corrupted positions should have LLaDA's mask token
         assert (noisy[noise_mask] == self.LLADA_MASK_TOKEN_ID).all()
-        # Uncorrupted positions unchanged
         assert (noisy[~noise_mask] == input_ids[~noise_mask]).all()
 
-    def test_mdlm_loss_with_llada_outputs(self):
-        """Test MDLM loss with shapes matching LLaDA output."""
-        torch.manual_seed(42)
-        strategy = MDLMStrategy()
-        loss_fn = strategy.create_loss_fn({})
-
-        B, L, V_test = 2, 16, 100
-        logits = torch.randn(B, L, V_test)
-        target_ids = torch.randint(0, V_test, (B, L))
-        loss_mask = torch.ones(B, L, dtype=torch.long)
-        noise_mask = torch.rand(B, L) > 0.5
-        p_mask = torch.full((B, L), 0.5)
-
-        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
-        assert result.total_loss.item() > 0
-        # MDLM: total_loss == dllm_loss (no AR component)
-        assert torch.allclose(result.total_loss, result.dllm_loss, atol=1e-6)
-
-    def test_prepare_batch_for_llada_forward(self):
-        """Verify batch prepared by MDLM strategy is compatible with LLaDA.
-
-        LLaDA forward() accepts: input_ids, inputs_embeds, attention_mask,
-        attention_bias, past_key_values, labels, use_cache, output_attentions,
-        output_hidden_states, return_dict, cache_position.
-        It does NOT accept **kwargs.
-        """
+    def test_prepare_batch_passes_extra_keys_for_recipe_filtering(self):
+        """Strategy keeps extra collator keys (input_lengths); the recipe filters
+        them against the LLaDA forward signature (which does not accept **kwargs)."""
         strategy = MDLMStrategy()
         batch = {
             "input_ids": torch.zeros(2, 4, dtype=torch.long),
             "attention_mask": torch.ones(2, 4),
-            "input_lengths": torch.tensor([3, 4]),  # Extra key from collator
+            "input_lengths": torch.tensor([3, 4]),  # extra key from collator
         }
         noisy = torch.ones(2, 4, dtype=torch.long) * 126336
         noise_mask = torch.ones(2, 4, dtype=torch.bool)
         clean = torch.zeros(2, 4, dtype=torch.long)
 
         result = strategy.prepare_batch(batch, noisy, noise_mask, clean)
-
-        # input_ids should be noisy
         assert (result["input_ids"] == noisy).all()
-        # attention_mask should be removed by strategy
         assert "attention_mask" not in result
-        # input_lengths is still present (filtering is done by the recipe)
-        assert "input_lengths" in result
-
-        # Simulate recipe-level filtering for LLaDA
-        llada_params = {
-            "input_ids",
-            "inputs_embeds",
-            "attention_mask",
-            "attention_bias",
-            "past_key_values",
-            "labels",
-            "use_cache",
-            "output_attentions",
-            "output_hidden_states",
-            "return_dict",
-            "cache_position",
-        }
-        filtered = {k: v for k, v in result.items() if k in llada_params}
-        assert "input_lengths" not in filtered
-        assert "input_ids" in filtered
+        assert "input_lengths" in result  # passed through; recipe filters it
 
 
 # ---------------------------------------------------------------------------
@@ -240,14 +237,9 @@ class TestHybridStrategy:
     def strategy(self):
         return HybridStrategy()
 
-    def test_create_loss_fn_type(self, strategy):
-        loss_fn = strategy.create_loss_fn({"ar_loss_alpha": 0.3})
-        assert isinstance(loss_fn, HybridDiffusionLLMLoss)
-        assert loss_fn.alpha == 0.3
-
-    def test_create_loss_fn_default_alpha(self, strategy):
-        loss_fn = strategy.create_loss_fn({})
-        assert loss_fn.alpha == 1.0
+    def test_create_loss_fn_reads_alpha_from_config(self, strategy):
+        assert strategy.create_loss_fn({"ar_loss_alpha": 0.3}).alpha == 0.3
+        assert strategy.create_loss_fn({}).alpha == 1.0  # default
 
     def test_apply_corruption_uniform_when_no_block_size(self, strategy):
         """block_size=None should select uniform corruption (constant p_mask per row)."""
@@ -255,7 +247,7 @@ class TestHybridStrategy:
         B, L = 2, 16
         input_ids = torch.randint(0, 100, (B, L))
         loss_mask = torch.ones(B, L, dtype=torch.long)
-        noisy, noise_mask, p_mask = strategy.apply_corruption(
+        _, _, p_mask = strategy.apply_corruption(
             input_ids,
             loss_mask,
             mask_token_id=999,
@@ -263,18 +255,14 @@ class TestHybridStrategy:
             block_size=None,
             half_life_ratio=None,
         )
-        assert noisy.shape == (B, L)
-        assert noise_mask.shape == (B, L)
-        assert p_mask.shape == (B, L)
         for b in range(B):
             assert torch.allclose(p_mask[b], p_mask[b, 0].expand_as(p_mask[b]))
 
     def test_apply_corruption_blockwise_when_block_size_set(self, strategy):
-        """block_size=4 should invoke the blockwise corruption path."""
         torch.manual_seed(42)
-        B, L = 2, 16
-        input_ids = torch.randint(0, 100, (B, L))
-        loss_mask = torch.ones(B, L, dtype=torch.long)
+        input_ids = torch.randint(0, 100, (2, 16))
+        loss_mask = torch.ones(2, 16, dtype=torch.long)
+
         noisy, noise_mask, p_mask = strategy.apply_corruption(
             input_ids,
             loss_mask,
@@ -283,9 +271,10 @@ class TestHybridStrategy:
             block_size=4,
             half_life_ratio=None,
         )
-        assert noisy.shape == (B, L)
-        assert noise_mask.shape == (B, L)
-        assert p_mask.shape == (B, L)
+
+        assert noisy.shape == input_ids.shape
+        assert noise_mask.shape == input_ids.shape
+        assert p_mask.shape == input_ids.shape
 
     def test_prepare_batch_passes_clean_input_ids(self, strategy):
         """Hybrid models receive clean tokens plus a masked_indices sidecar."""
@@ -309,30 +298,1009 @@ class TestHybridStrategy:
 
 
 # ---------------------------------------------------------------------------
-# normalization_mode override tests
+# IDLMStrategy tests
 # ---------------------------------------------------------------------------
 
 
-class TestNormalizationModeOverride:
-    """Verify that a strategy subclass can override normalization_mode."""
+class TestIDLMStrategy:
+    @pytest.fixture
+    def strategy(self):
+        return IDLMStrategy()
 
-    def test_custom_noise_mode(self):
-        class NoiseModeStrategy(DLLMStrategy):
-            @property
-            def normalization_mode(self):
-                return "noise"
+    def test_resolves_from_registry(self):
+        assert isinstance(get_dllm_strategy("idlm"), IDLMStrategy)
 
-            def create_loss_fn(self, dllm_cfg):
-                return MDLMCrossEntropyLoss()
+    def test_create_loss_fn_reads_clean_weight(self, strategy):
+        assert strategy.create_loss_fn({"clean_loss_weight": 0.3}).clean_loss_weight == 0.3
+        assert strategy.create_loss_fn({}).clean_loss_weight == 0.2  # paper default
+        assert isinstance(strategy.create_loss_fn({}), IDLMLoss)
+        assert strategy.create_loss_fn({"auto_balance_clean_loss": True}).auto_balance is True
 
-            def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
-                from nemo_automodel.components.datasets.dllm.corruption import corrupt_uniform
+    def test_create_loss_fn_captures_block_length(self, strategy):
+        strategy.create_loss_fn({"block_length": 3})
+        assert strategy.block_size == 3
+        strategy.create_loss_fn({})
+        assert strategy.block_size == 1  # b1 default
 
-                return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps)
+    def test_setup_extra_validates_mask_token_id(self, strategy):
+        recipe = types.SimpleNamespace(
+            distributed_config=types.SimpleNamespace(cp_size=1),
+            model_parts=[
+                types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=1000))
+            ],
+            mask_token_id=None,
+        )
+        with pytest.raises(ValueError, match="mask_token_id"):
+            strategy.setup_extra(recipe)
+        recipe.mask_token_id = 1000  # == vocab_size, out of range
+        with pytest.raises(ValueError, match="outside the model vocab"):
+            strategy.setup_extra(recipe)
+        recipe.mask_token_id = 999
+        strategy.setup_extra(recipe)
 
-            def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
-                batch["input_ids"] = noisy_input_ids
-                return batch
+    def test_apply_corruption_masks_all_supervised(self, strategy):
+        input_ids = torch.randint(0, 100, (2, 16))
+        loss_mask = torch.zeros(2, 16, dtype=torch.long)
+        loss_mask[:, 8:] = 1  # supervised region = response
+        noisy, noise_mask, _ = strategy.apply_corruption(
+            input_ids,
+            loss_mask,
+            mask_token_id=999,
+            eps=0.0,
+            block_size=None,
+            half_life_ratio=None,
+            generator=torch.Generator(),  # accepted (recipe passes it) though corruption is deterministic
+        )
+        # All-masked: every supervised position masked, prompt untouched.
+        assert torch.equal(noise_mask, loss_mask.bool())
+        assert (noisy[:, 8:] == 999).all()
+        assert (noisy[:, :8] == input_ids[:, :8]).all()
 
-        s = NoiseModeStrategy()
-        assert s.normalization_mode == "noise"
+    def test_setup_extra_rejects_context_parallel(self, strategy):
+        recipe = types.SimpleNamespace(
+            distributed_config=types.SimpleNamespace(cp_size=2),
+            model_parts=[
+                types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=1000))
+            ],
+            mask_token_id=1,
+        )
+        with pytest.raises(ValueError, match="context parallelism"):
+            strategy.setup_extra(recipe)
+
+    def test_setup_extra_rejects_flash_attention_2(self, strategy):
+        recipe = types.SimpleNamespace(
+            distributed_config=types.SimpleNamespace(cp_size=1),
+            model_parts=[
+                types.SimpleNamespace(
+                    config=types.SimpleNamespace(_attn_implementation="flash_attention_2", vocab_size=1000)
+                )
+            ],
+            mask_token_id=1,
+        )
+        with pytest.raises(ValueError, match="FlashAttention-2 ignores 4D masks"):
+            strategy.setup_extra(recipe)
+
+    def test_prepare_batch_assigns_noisy_input_ids(self, strategy):
+        # Unused on the I-DLM path but kept correct: it stashes the noisy ids.
+        batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
+        noisy = torch.ones(1, 4, dtype=torch.long)
+        out = strategy.prepare_batch(batch, noisy, None, None)
+        assert out is batch
+        assert torch.equal(out["input_ids"], noisy)
+
+    def test_forward_backward_concats_and_backprops(self, strategy):
+        """End-to-end I-DLM microbatch on CPU: single ``[x_t | x_0]`` concat
+        forward, two-CE loss, and a real backward (is_train=True, dense sdpa
+        mask). Omitting ``attention_mask`` also exercises the all-ones fallback.
+        """
+        torch.manual_seed(0)
+        vocab, seq_len, mask_id = 32, 6, 31
+        loss_fn = strategy.create_loss_fn({"block_length": 2, "clean_loss_weight": 0.2})
+
+        class _TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(vocab, 8)
+                self.head = torch.nn.Linear(8, vocab)
+                self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+
+            def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+                return types.SimpleNamespace(logits=self.head(self.embed(input_ids)))
+
+        model = _TinyModel()
+        recipe = types.SimpleNamespace(
+            dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+            model_parts=[model],
+            distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+            te_fp8=None,
+            device_mesh=None,
+            dllm_loss_fn=loss_fn,
+            _dllm_loss_buffer=[],
+            _get_dp_group_size=lambda include_cp=True: 1.0,
+        )
+        clean = torch.randint(0, vocab, (1, seq_len))
+        noise_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+        noise_mask[:, seq_len // 2 :] = True  # supervise + mask the response half
+        noisy = clean.clone()
+        noisy[noise_mask] = mask_id
+        batch = {
+            "_clean_input_ids": clean,
+            "_noisy_input_ids": noisy,
+            "_noise_mask": noise_mask,
+            "loss_mask": torch.ones(1, seq_len, dtype=torch.long),
+        }
+        loss_buffer = []
+
+        strategy.forward_backward(
+            recipe,
+            0,
+            batch,
+            loss_buffer=loss_buffer,
+            num_diffusion_tokens=int(noise_mask.sum()),
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert len(loss_buffer) == 1
+        assert torch.isfinite(loss_buffer[0])
+        assert len(recipe._dllm_loss_buffer) == 1
+        # is_train=True ran a real backward: draft params carry finite grads.
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
+# ---------------------------------------------------------------------------
+# DFlashStrategy — anchor-block sampling (CPU, no model loading)
+# ---------------------------------------------------------------------------
+
+MASK_ID = 999
+BLOCK_SIZE = 16
+
+
+def test_dflash_strategy_defaults():
+    """Lock load-bearing DFlashStrategy constructor defaults.
+
+    These defaults encode deliberate design decisions (paper §4.2 + the
+    safety guard rails surfaced by the original PR review):
+
+    - ``overlap_anchors=True``: paper-default per-sample independent anchor
+      sampling (gap #1 fix). Flipping to False silently reverts to the legacy
+      batch-shared stars-and-bars sampler.
+    - ``block_size=0``: sentinel meaning "read block_size from the draft
+      model's config". Any non-zero default would override the draft config.
+    - ``num_blocks_per_sample=1``: safe default; production yaml must opt
+      into the paper's 512 explicitly. A larger default would silently OOM
+      smaller GPUs.
+    - ``attention_backend="sdpa"``: dense fallback that works everywhere;
+      production yaml must opt into ``flex_attention`` for N=512.
+    """
+    s = DFlashStrategy()
+    assert s.overlap_anchors is True
+    assert s.block_size == 0
+    assert s.num_blocks_per_sample == 1
+    assert s.attention_backend == "sdpa"
+
+
+def test_dflash_strategy_placeholder_methods():
+    strategy = DFlashStrategy()
+    assert isinstance(strategy.create_loss_fn({}), MDLMCrossEntropyLoss)
+
+    batch = {"input_ids": torch.tensor([[1, 2]])}
+    assert strategy.prepare_batch(batch, None, None, None) is batch
+
+    torch.manual_seed(12)
+    input_ids = torch.randint(0, 100, (2, 8))
+    loss_mask = torch.ones(2, 8, dtype=torch.long)
+    noisy, noise_mask, p_mask = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        mask_token_id=999,
+        eps=0.001,
+        block_size=None,
+        half_life_ratio=None,
+    )
+    assert noisy.shape == input_ids.shape
+    assert noise_mask.shape == input_ids.shape
+    assert p_mask.shape == input_ids.shape
+
+
+def _make_recipe(mask_token_id=MASK_ID):
+    """Minimal recipe stub with the fields DFlashStrategy methods need."""
+    return types.SimpleNamespace(mask_token_id=mask_token_id)
+
+
+def _make_strategy(block_size=BLOCK_SIZE, overlap_anchors=False):
+    """DFlashStrategy stub with block_size set; defaults to the
+    non-overlapping sampler for backward compatibility with existing tests.
+    """
+    s = DFlashStrategy()
+    s.block_size = block_size
+    s.overlap_anchors = overlap_anchors
+    return s
+
+
+class _FakeTargetModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = types.SimpleNamespace(embed_tokens=torch.nn.Embedding(16, 4))
+        self.lm_head = torch.nn.Linear(4, 16)
+        self.config = types.SimpleNamespace(num_hidden_layers=12)
+        self.eval_called = False
+        self.to_device = None
+
+    def eval(self):
+        self.eval_called = True
+        return super().eval()
+
+    def get_input_embeddings(self):
+        return None
+
+    def get_output_embeddings(self):
+        return None
+
+    def to(self, device):
+        self.to_device = device
+        return super().to(device)
+
+
+class _FakeTokenizer:
+    mask_token_id = None
+
+    def add_special_tokens(self, special_tokens):
+        assert special_tokens == {"mask_token": "<|MASK|>"}
+        self.mask_token_id = 321
+
+
+class _RecordingDraft(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.last_kwargs = None
+
+    def forward(self, **kwargs):
+        self.last_kwargs = kwargs
+        return kwargs["noise_embedding"]
+
+
+def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
+    fake_target = _FakeTargetModel()
+    fake_tokenizer = _FakeTokenizer()
+
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: fake_target)
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: fake_tokenizer)
+
+    draft_cfg = types.SimpleNamespace(block_size=8, num_target_layers=12, num_hidden_layers=3)
+    draft = types.SimpleNamespace(config=draft_cfg)
+    recipe = types.SimpleNamespace(
+        cfg={
+            "dflash": {
+                "target_model_id": "fake-target",
+                "target_torch_dtype": "float32",
+                "block_size": 0,
+                "num_blocks_per_sample": 7,
+                "attention_backend": "flex_attention",
+                "overlap_anchors": False,
+                "use_fused_linear_ce": False,
+                "ce_chunk_size": 17,
+            },
+            "dataset": {"seq_length": 128},
+        },
+        mask_token_id=None,
+        dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+        model_parts=[draft],
+    )
+
+    strategy = DFlashStrategy()
+    strategy.setup_extra(recipe)
+
+    assert recipe.mask_token_id == 321
+    assert strategy.target_model is fake_target
+    assert fake_target.eval_called is True
+    assert fake_target.to_device == torch.device("cpu")
+    assert all(not parameter.requires_grad for parameter in fake_target.parameters())
+    assert strategy.target_embed is fake_target.model.embed_tokens
+    assert strategy.target_head is fake_target.lm_head
+    assert strategy.block_size == 8
+    assert strategy.layer_ids == [1, 5, 9]
+    assert strategy.num_blocks_per_sample == 7
+    assert strategy.attention_backend == "flex_attention"
+    assert draft_cfg._attn_implementation == "flex_attention"
+    assert strategy.overlap_anchors is False
+    assert strategy.fixed_ctx_len == 128
+    assert strategy.use_fused_linear_ce is False
+    assert isinstance(strategy.dflash_loss_fn, DFlashDecayLoss)
+    assert strategy.dflash_loss_fn.loss_gamma == 4.0
+    assert strategy.dflash_loss_fn.chunk_size == 17
+
+
+def test_dflash_setup_extra_requires_target_model_id():
+    recipe = types.SimpleNamespace(cfg={"dflash": {}}, mask_token_id=5)
+    with pytest.raises(ValueError, match="dflash.target_model_id"):
+        DFlashStrategy().setup_extra(recipe)
+
+
+def test_dflash_run_target_forward_concatenates_selected_hidden_states():
+    class Target(torch.nn.Module):
+        def forward(self, **kwargs):
+            hidden_states = [torch.full((2, 5, 3), float(i)) for i in range(5)]
+            return types.SimpleNamespace(hidden_states=hidden_states)
+
+    strategy = DFlashStrategy()
+    strategy.target_model = Target()
+    strategy.layer_ids = [0, 2]
+
+    hidden = strategy._run_target_forward(
+        input_ids=torch.ones(2, 5, dtype=torch.long),
+        attention_mask=torch.ones(2, 5, dtype=torch.long),
+        start=3,
+    )
+
+    assert hidden.shape == (2, 3, 6)
+    assert torch.equal(hidden[..., :3], torch.ones(2, 3, 3))
+    assert torch.equal(hidden[..., 3:], torch.full((2, 3, 3), 3.0))
+
+
+def test_dflash_sample_anchor_block_uses_loss_mask():
+    torch.manual_seed(4)
+    strategy = _make_strategy(block_size=4)
+    recipe = _make_recipe()
+    input_ids = torch.arange(16, dtype=torch.long).view(2, 8)
+    attention_mask = torch.ones(2, 8, dtype=torch.long)
+    loss_mask = torch.zeros(2, 8, dtype=torch.long)
+
+    start, block_output_ids, block_targets, block_mask = strategy._sample_anchor_block(
+        recipe,
+        input_ids,
+        attention_mask,
+        loss_mask=loss_mask,
+    )
+
+    assert 1 <= start <= 4
+    assert torch.equal(block_output_ids[:, 0], input_ids[:, start])
+    assert block_targets.shape == (2, 3)
+    assert block_mask.sum().item() == 0.0
+
+
+def test_dflash_pre_step_stashes_target_and_anchor_tensors():
+    strategy = _make_strategy(block_size=4, overlap_anchors=False)
+    strategy.num_blocks_per_sample = 2
+
+    def run_target_forward(input_ids, attention_mask, start):
+        return torch.ones(input_ids.size(0), start, 3, device=input_ids.device)
+
+    strategy._run_target_forward = run_target_forward
+    recipe = types.SimpleNamespace(mask_token_id=MASK_ID, dist_env=types.SimpleNamespace(device=torch.device("cpu")))
+    batch = {
+        "input_ids": torch.arange(32, dtype=torch.long).view(2, 16),
+        "attention_mask": torch.ones(2, 16, dtype=torch.long),
+        "loss_mask": torch.ones(2, 16, dtype=torch.long),
+    }
+
+    num_noise, num_supervised = strategy.pre_step(recipe, [batch])
+
+    assert num_noise == 12
+    assert num_supervised == 12
+    assert batch["_dflash_anchor_positions"].shape == (2, 2)
+    assert batch["_dflash_block_keep"].all()
+    assert batch["_dflash_target_hidden"].shape == (2, 16, 3)
+    assert batch["_dflash_block_output_ids"].shape == (2, 8)
+    assert batch["_dflash_block_targets"].shape == (2, 6)
+    assert batch["_dflash_block_mask"].sum().item() == 12.0
+
+
+@pytest.mark.parametrize("use_fused_linear_ce", [False, True])
+def test_dflash_forward_backward_uses_precomputed_multiblock_tensors(use_fused_linear_ce):
+    draft = _RecordingDraft()
+    strategy = _make_strategy(block_size=3, overlap_anchors=False)
+    strategy.num_blocks_per_sample = 2
+    strategy.fixed_ctx_len = 6
+    strategy.attention_backend = "sdpa"
+    strategy.use_fused_linear_ce = use_fused_linear_ce
+    strategy.target_embed = torch.nn.Embedding(16, 5)
+    strategy.target_head = torch.nn.Linear(5, 11)
+    strategy.dflash_loss_fn = DFlashDecayLoss(loss_gamma=2.0, use_fused_linear_ce=use_fused_linear_ce, chunk_size=2)
+    recipe = types.SimpleNamespace(
+        dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+        model_parts=[draft],
+        distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+        te_fp8=None,
+        device_mesh=None,
+        _dllm_loss_buffer=[],
+        _dflash_correct_per_pos_buffer=[],
+        _dflash_count_per_pos_buffer=[],
+    )
+    batch = {
+        "_dflash_anchor_positions": torch.tensor([[1, 3]], dtype=torch.long),
+        "_dflash_block_keep": torch.tensor([[True, True]]),
+        "_dflash_target_hidden": torch.ones(1, 4, 2),
+        "_dflash_block_output_ids": torch.tensor([[2, 15, 15, 4, 15, 15]], dtype=torch.long),
+        "_dflash_block_targets": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        "_dflash_block_mask": torch.ones(1, 4),
+    }
+    loss_buffer = []
+
+    strategy.forward_backward(
+        recipe,
+        0,
+        batch,
+        loss_buffer=loss_buffer,
+        num_diffusion_tokens=4,
+        num_batches=1,
+        is_train=False,
+    )
+
+    assert len(loss_buffer) == 1
+    assert len(recipe._dllm_loss_buffer) == 1
+    assert len(recipe._dflash_correct_per_pos_buffer) == 1
+    assert len(recipe._dflash_count_per_pos_buffer) == 1
+    assert recipe._dflash_correct_per_pos_buffer[0].shape == (2,)
+    assert recipe._dflash_count_per_pos_buffer[0].shape == (2,)
+    assert draft.last_kwargs["target_hidden"].shape == (1, 6, 2)
+    assert draft.last_kwargs["noise_embedding"].shape == (1, 6, 5)
+    assert draft.last_kwargs["position_ids"].tolist() == [[0, 1, 2, 3, 4, 5, 1, 2, 3, 3, 4, 5]]
+    assert draft.last_kwargs["attention_mask"].shape == (1, 1, 6, 12)
+
+
+def test_dflash_forward_backward_fallback_skips_mask_for_single_sdpa_block():
+    draft = _RecordingDraft()
+    strategy = _make_strategy(block_size=3, overlap_anchors=False)
+    strategy.num_blocks_per_sample = 1
+    strategy.attention_backend = "sdpa"
+    strategy.use_fused_linear_ce = False
+    strategy.target_embed = torch.nn.Embedding(32, 5)
+    strategy.target_head = torch.nn.Linear(5, 32)
+    strategy.dflash_loss_fn = DFlashDecayLoss(loss_gamma=2.0)
+    strategy._run_target_forward = lambda input_ids, attention_mask, start: torch.ones(input_ids.size(0), start, 2)
+    recipe = types.SimpleNamespace(
+        mask_token_id=31,
+        dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+        model_parts=[draft],
+        distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+        te_fp8=None,
+        device_mesh=None,
+        _dllm_loss_buffer=[],
+        _dflash_correct_per_pos_buffer=[],
+        _dflash_count_per_pos_buffer=[],
+    )
+    batch = {
+        "input_ids": torch.arange(16, dtype=torch.long).view(1, 16),
+        "attention_mask": torch.ones(1, 16, dtype=torch.long),
+        "loss_mask": torch.ones(1, 16, dtype=torch.long),
+    }
+
+    strategy.forward_backward(
+        recipe,
+        0,
+        batch,
+        loss_buffer=[],
+        num_diffusion_tokens=2,
+        num_batches=1,
+        is_train=False,
+    )
+
+    assert "attention_mask" not in draft.last_kwargs
+
+
+class TestDFlashSampleAnchorBlocks:
+    """Tests for the non-overlapping (legacy) _sample_anchor_blocks path.
+
+    Returns the per-sample 5-tuple
+    ``(anchor_positions [B,N], block_keep_mask [B,N], block_output_ids,
+    block_targets, block_mask)``.
+    """
+
+    def _make_inputs(self, seq_len, batch_size=2):
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 100, (batch_size, seq_len))
+        attn = torch.ones(batch_size, seq_len, dtype=torch.long)
+        return input_ids, attn
+
+    def test_shapes(self):
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        for n in (1, 4):
+            input_ids, attn = self._make_inputs(128)
+            ap, keep, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=n)
+            assert ap.shape == (2, n)
+            assert keep.shape == (2, n)
+            assert boi.shape == (2, n * 8)
+            assert bt.shape == (2, n * 7)
+            assert bm.shape == (2, n * 7)
+
+    def test_blocks_are_non_overlapping(self):
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        for _ in range(10):
+            ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            starts = ap[0].tolist()  # batch-shared in non-overlap mode
+            assert starts == sorted(starts)
+            for i in range(len(starts) - 1):
+                assert starts[i + 1] >= starts[i] + s.block_size, f"blocks overlap: {starts}"
+
+    def test_blocks_fit_in_sequence(self):
+        seq_len = 64
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(seq_len)
+        for _ in range(10):
+            ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            assert (ap >= 1).all() and (ap + s.block_size <= seq_len).all()
+
+    def test_anchor_token_is_clean(self):
+        """First token of each kept block must be the real token at its anchor."""
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        ap, keep, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
+        B, n = ap.shape
+        for b in range(B):
+            for i in range(n):
+                if keep[b, i]:
+                    assert boi[b, i * s.block_size] == input_ids[b, ap[b, i]]
+
+    def test_non_anchor_tokens_are_mask(self):
+        """All positions after the anchor in each block should be MASK_ID."""
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        ap, _, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
+        n = ap.shape[1]
+        for b in range(n):
+            noise_slice = boi[:, b * s.block_size + 1 : (b + 1) * s.block_size]
+            assert (noise_slice == MASK_ID).all()
+
+    def test_loss_mask_zeros_block_mask(self):
+        """block_mask must be zero wherever loss_mask is zero."""
+        torch.manual_seed(7)
+        B, L, bs = 2, 64, 8
+        s = _make_strategy(block_size=bs)
+        recipe = _make_recipe()
+        input_ids = torch.randint(0, 100, (B, L))
+        attn = torch.ones(B, L, dtype=torch.long)
+        # Zero the entire loss_mask — every predicted position should be masked out.
+        loss_mask = torch.zeros(B, L, dtype=torch.long)
+        _, _, _, _, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3, loss_mask=loss_mask)
+        assert bm.sum().item() == 0
+
+
+class TestDFlashSampleAnchorBlocksOverlapping:
+    """Tests for the paper-default per-sample overlap_anchors=True sampler.
+
+    Each sample draws ``num_blocks`` anchors independently (Appendix A.1), so
+    anchor_positions is ``[B, N]`` with potentially different rows.
+    """
+
+    def _make_inputs(self, seq_len, batch_size=2):
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 100, (batch_size, seq_len))
+        attn = torch.ones(batch_size, seq_len, dtype=torch.long)
+        return input_ids, attn
+
+    def test_anchors_in_valid_range(self):
+        """Every anchor must satisfy 1 <= a <= valid_len - block_size."""
+        seq_len, bs = 64, 8
+        s = _make_strategy(block_size=bs, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(seq_len)
+        for _ in range(10):
+            ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
+            assert (ap >= 1).all() and (ap <= seq_len - bs).all()
+
+    def test_can_exceed_non_overlapping_cap(self):
+        """N > seq_len // block_size succeeds (impossible in non-overlap mode)."""
+        seq_len, bs = 32, 8  # non-overlap cap = 4
+        s = _make_strategy(block_size=bs, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(seq_len)
+        ap, keep, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=20)
+        assert ap.shape == (2, 20)
+        assert boi.shape == (2, 20 * bs)
+
+    def test_per_sample_diversity(self):
+        """Different samples should (with high probability) get different anchors."""
+        torch.manual_seed(0)
+        s = _make_strategy(block_size=8, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(256, batch_size=2)
+        ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
+        # Two independently-sampled rows of 16 anchors should not be identical.
+        assert not torch.equal(ap[0], ap[1])
+
+    def test_anchor_token_is_clean_per_sample(self):
+        """Each kept block's first token is the real token at that sample's anchor."""
+        s = _make_strategy(block_size=8, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        ap, keep, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=10)
+        B, n = ap.shape
+        for b in range(B):
+            for i in range(n):
+                if keep[b, i]:
+                    assert boi[b, i * s.block_size] == input_ids[b, ap[b, i]]
+
+    def test_min_token_filter_drops_short_samples(self):
+        """Samples with < 2*block_size supervised tokens get block_keep_mask=False."""
+        bs = 8
+        s = _make_strategy(block_size=bs, overlap_anchors=True)
+        recipe = _make_recipe()
+        torch.manual_seed(1)
+        B, L = 2, 128
+        input_ids = torch.randint(0, 100, (B, L))
+        attn = torch.ones(B, L, dtype=torch.long)
+        # Sample 0 long enough, sample 1 too short (< 2*bs valid tokens).
+        attn[1, 2 * bs - 1 :] = 0
+        ap, keep, _, _, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+        assert keep[0].all()  # long sample kept
+        assert (~keep[1]).all()  # short sample fully dropped
+        assert bm[1].sum().item() == 0  # short sample contributes no loss
+
+
+class TestBlockDiffusionStrategy:
+    @pytest.fixture
+    def strategy(self):
+        return BlockDiffusionStrategy()
+
+    def test_registered(self):
+        assert "block_diffusion" in DLLM_STRATEGIES
+        assert isinstance(get_dllm_strategy("block_diffusion"), BlockDiffusionStrategy)
+
+    def test_normalization_mode_is_supervised(self, strategy):
+        # All supervised canvas tokens are scored (matches Google's canvas_mask
+        # loss support), so the denominator is the supervised count, not corrupted.
+        assert strategy.normalization_mode == "supervised"
+
+    def test_create_loss_fn_is_block_diffusion(self, strategy):
+        loss_fn = strategy.create_loss_fn({"vocab_size": 100})
+        assert isinstance(loss_fn, BlockDiffusionCrossEntropyLoss)
+
+    def test_apply_corruption_requires_vocab_size(self, strategy):
+        """apply_corruption raises if vocab_size was never captured via create_loss_fn."""
+        ids = torch.randint(0, 100, (2, 16))
+        lm = torch.ones(2, 16, dtype=torch.long)
+        with pytest.raises(ValueError, match="vocab_size"):
+            strategy.apply_corruption(ids, lm, mask_token_id=999, eps=1e-3, block_size=8, half_life_ratio=None)
+
+    def test_apply_corruption_random_tokens(self, strategy):
+        """After create_loss_fn captures vocab_size, corruption uses random tokens, p_mask=ones."""
+        strategy.create_loss_fn({"vocab_size": 50})
+        torch.manual_seed(0)
+        ids = torch.randint(0, 50, (2, 16))
+        lm = torch.ones(2, 16, dtype=torch.long)
+        noisy, noise_mask, p_mask = strategy.apply_corruption(
+            ids, lm, mask_token_id=999, eps=1e-3, block_size=8, half_life_ratio=None
+        )
+        assert noisy.shape == (2, 16)
+        assert (noisy >= 0).all() and (noisy < 50).all()
+        assert (noisy != 999).all(), "block diffusion must not use a mask token id"
+        assert torch.equal(p_mask, torch.ones(2, 16))
+
+    def test_split_prompt_response_contiguous_suffix(self):
+        ids = torch.zeros(3, 8, dtype=torch.long)
+        loss_mask = torch.tensor(
+            [
+                [0, 0, 0, 1, 1, 1, 1, 1],
+                [0, 0, 0, 0, 0, 0, 1, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1],
+            ]
+        )
+        prefix_lengths, response_mask = BlockDiffusionStrategy.split_prompt_response(ids, loss_mask)
+        assert prefix_lengths.tolist() == [3, 6, 0]
+        assert response_mask[0].tolist() == [0, 0, 0, 1, 1, 1, 1, 1]
+        assert response_mask[2].all()
+
+    def test_split_prompt_response_no_supervised(self):
+        """A row with no supervised token is treated as all prompt (empty response)."""
+        ids = torch.zeros(1, 8, dtype=torch.long)
+        loss_mask = torch.zeros(1, 8, dtype=torch.long)
+        prefix_lengths, response_mask = BlockDiffusionStrategy.split_prompt_response(ids, loss_mask)
+        assert prefix_lengths.item() == 8
+        assert not response_mask.any()
+
+    def test_prepare_batch_sets_canvas_and_clean_inputs(self, strategy):
+        clean = torch.randint(0, 100, (2, 16))
+        noisy = torch.randint(0, 100, (2, 16))
+        noise_mask = torch.zeros(2, 16, dtype=torch.bool)
+        batch = {"input_ids": clean.clone(), "attention_mask": torch.ones(2, 16), "use_cache": True}
+        result = strategy.prepare_batch(batch, noisy, noise_mask, clean)
+        # Encoder sees the clean full sequence; decoder canvas is the noised sequence.
+        assert torch.equal(result["input_ids"], clean)
+        assert torch.equal(result["canvas_ids"], noisy)
+        # Bidirectional model -> attention_mask / use_cache dropped.
+        assert "attention_mask" not in result
+        assert "use_cache" not in result
+
+
+# ---------------------------------------------------------------------------
+# SCDDStrategy
+# ---------------------------------------------------------------------------
+
+
+SCDD_VOCAB = 64
+SCDD_MASK_ID = 63
+
+
+def _scdd_strategy(**cfg):
+    strategy = SCDDStrategy()
+    strategy.create_loss_fn({"vocab_size": SCDD_VOCAB, "mask_token_id": SCDD_MASK_ID, **cfg})
+    return strategy
+
+
+def test_get_dllm_strategy_resolves_scdd():
+    assert isinstance(get_dllm_strategy("scdd"), SCDDStrategy)
+    assert DLLM_STRATEGIES["scdd"] is SCDDStrategy
+
+
+def test_scdd_create_loss_fn_builds_scdd_loss_from_config():
+    strategy = SCDDStrategy()
+    loss_fn = strategy.create_loss_fn(
+        {
+            "vocab_size": SCDD_VOCAB,
+            "mask_token_id": SCDD_MASK_ID,
+            "num_timesteps": 256,
+            "uniform_ratio": 0.25,
+            "schedule_shape": 2.0,
+            "schedule_peak": 0.4,
+        }
+    )
+    assert isinstance(loss_fn, SCDDLoss)
+    assert (loss_fn.num_timesteps, loss_fn.max_ratio) == (256, 0.25)
+    assert (loss_fn.gamma_shape, loss_fn.t_peak) == (2.0, 0.4)
+
+
+def test_scdd_apply_corruption_keeps_t_on_the_discrete_grid():
+    """t must land on {1/T, ..., (T-1)/T}.
+
+    SCDDLoss reads t back out of p_mask and forms s = t - 1/T, so an off-grid t
+    (the old 1 - 1e-4 clamp) puts s off-grid too. The top point t = 1 stays
+    excluded because the schedule is fully absorbed there.
+    """
+    num_timesteps = 8
+    strategy = _scdd_strategy(num_timesteps=num_timesteps)
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (256, 4))
+    loss_mask = torch.ones(256, 4, dtype=torch.long)
+
+    _, _, p_mask = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        SCDD_MASK_ID,
+        eps=1e-3,
+        block_size=None,
+        half_life_ratio=None,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    t = p_mask[:, 0]
+    steps = t * num_timesteps
+    assert torch.allclose(steps, steps.round())
+    assert int(steps.min()) >= 1
+    assert int(steps.max()) == num_timesteps - 1
+
+
+def test_scdd_create_loss_fn_requires_vocab_size():
+    with pytest.raises(ValueError, match="dllm.vocab_size"):
+        SCDDStrategy().create_loss_fn({"mask_token_id": SCDD_MASK_ID})
+
+
+def test_scdd_apply_corruption_before_create_loss_fn_raises():
+    with pytest.raises(ValueError, match="create_loss_fn"):
+        SCDDStrategy().apply_corruption(
+            torch.zeros(1, 4, dtype=torch.long),
+            torch.ones(1, 4, dtype=torch.long),
+            SCDD_MASK_ID,
+            eps=1e-3,
+            block_size=None,
+            half_life_ratio=None,
+        )
+
+
+def _scdd_recipe(mask_token_id=SCDD_MASK_ID, vocab_size=SCDD_VOCAB, cp_size=1, loss_fn=None):
+    """Minimal recipe stand-in exposing what SCDDStrategy.setup_extra reads."""
+    model = types.SimpleNamespace(config=types.SimpleNamespace(vocab_size=vocab_size))
+    return types.SimpleNamespace(
+        mask_token_id=mask_token_id,
+        dllm_loss_fn=loss_fn if loss_fn is not None else SCDDLoss(mask_token_id=0),
+        model_parts=[model],
+        distributed_config=types.SimpleNamespace(cp_size=cp_size),
+    )
+
+
+def test_scdd_setup_extra_installs_the_resolved_mask_token_id():
+    """mask_token_id may only be known after the tokenizer is built, so the
+    loss module must pick up the recipe's resolved value."""
+    loss_fn = SCDDLoss(mask_token_id=0)
+    _scdd_strategy().setup_extra(_scdd_recipe(loss_fn=loss_fn))
+    assert loss_fn.mask_token_id == SCDD_MASK_ID
+
+
+def test_scdd_setup_extra_requires_a_mask_token_id():
+    with pytest.raises(ValueError, match="mask_token_id"):
+        _scdd_strategy().setup_extra(_scdd_recipe(mask_token_id=None))
+
+
+def test_scdd_setup_extra_rejects_a_mask_id_outside_the_model_vocab():
+    with pytest.raises(ValueError, match="outside the model vocab"):
+        _scdd_strategy().setup_extra(_scdd_recipe(mask_token_id=SCDD_VOCAB + 10))
+
+
+def test_scdd_setup_extra_rejects_a_vocab_size_mismatch():
+    """The corruption domain and the ELBO's non-[MASK] domain must both be the
+    model's output domain; a stale dllm.vocab_size silently changes the loss."""
+    with pytest.raises(ValueError, match="does not match the model vocab"):
+        _scdd_strategy().setup_extra(_scdd_recipe(vocab_size=SCDD_VOCAB + 128))
+
+
+def test_scdd_setup_extra_rejects_context_parallelism():
+    """The loss scores unsharded clean targets against the model logits, so a
+    sequence-sharded forward would silently mis-align them."""
+    with pytest.raises(ValueError, match="context parallelism"):
+        _scdd_strategy().setup_extra(_scdd_recipe(cp_size=2))
+
+
+def test_scdd_apply_corruption_contract():
+    strategy = _scdd_strategy(num_timesteps=100, uniform_ratio=0.2)
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (3, 64))
+    loss_mask = torch.zeros(3, 64, dtype=torch.long)
+    loss_mask[:, 16:] = 1
+
+    noisy, noise_mask, p_mask = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        SCDD_MASK_ID,
+        eps=1e-3,
+        block_size=None,
+        half_life_ratio=None,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    assert noisy.shape == input_ids.shape and noise_mask.shape == input_ids.shape
+    assert p_mask.shape == input_ids.shape and p_mask.dtype == torch.float32
+    # Only supervised positions may be corrupted.
+    assert torch.equal(noisy[loss_mask == 0], input_ids[loss_mask == 0])
+    assert not noise_mask[loss_mask == 0].any()
+    # p_mask carries one diffusion time per sequence, snapped to the 1/T grid.
+    t = p_mask[:, 0]
+    assert torch.equal(p_mask, t[:, None].expand_as(p_mask))
+    assert ((t > 0) & (t <= 1.0)).all()
+    torch.testing.assert_close(t * 100, (t * 100).round(), rtol=0, atol=1e-3)
+
+
+def test_scdd_apply_corruption_produces_both_channels():
+    """The point of SCDD is that some corrupted positions are wrong-but-visible
+    tokens, not just [MASK]."""
+    strategy = _scdd_strategy(num_timesteps=1000, uniform_ratio=0.4)
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (16, 256))
+    loss_mask = torch.ones_like(input_ids)
+    noisy, noise_mask, _ = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        SCDD_MASK_ID,
+        eps=1e-3,
+        block_size=None,
+        half_life_ratio=None,
+        generator=torch.Generator().manual_seed(1),
+    )
+    absorbed = noisy == SCDD_MASK_ID
+    transitioned = noise_mask & ~absorbed
+    assert absorbed.any() and transitioned.any()
+    assert (noisy[transitioned] != input_ids[transitioned]).all()
+
+
+def test_scdd_apply_corruption_is_seed_reproducible():
+    strategy = _scdd_strategy()
+    args = (torch.randint(0, SCDD_VOCAB - 1, (2, 32)), torch.ones(2, 32, dtype=torch.long), SCDD_MASK_ID)
+    kwargs = dict(eps=1e-3, block_size=None, half_life_ratio=None)
+    a = strategy.apply_corruption(*args, generator=torch.Generator().manual_seed(5), **kwargs)
+    b = strategy.apply_corruption(*args, generator=torch.Generator().manual_seed(5), **kwargs)
+    for x, y in zip(a, b):
+        assert torch.equal(x, y)
+
+
+def test_scdd_prepare_batch_feeds_the_corrupted_tokens():
+    strategy = _scdd_strategy()
+    clean = torch.randint(0, SCDD_VOCAB - 1, (2, 8))
+    noisy = clean.clone()
+    noisy[:, 0] = SCDD_MASK_ID
+    batch = {"input_ids": clean, "attention_mask": torch.ones(2, 8, dtype=torch.long)}
+    out = strategy.prepare_batch(batch, noisy, noisy != clean, clean)
+    assert torch.equal(out["input_ids"], noisy)
+    assert "attention_mask" not in out
+
+
+def test_scdd_normalizes_over_all_supervised_tokens():
+    """The SCDD ELBO has a term at every supervised position, corrupted or not,
+    so the denominator must not be the corrupted-only count."""
+    assert SCDDStrategy().normalization_mode == "supervised"
+
+
+def test_scdd_corruption_does_not_touch_the_global_rng():
+    """TP/CP peers share a data shard but not their global RNG state, so the
+    corruption must come exclusively from the step-seeded generator — otherwise
+    peers feed the sharded forward different inputs."""
+    strategy = _scdd_strategy()
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (2, 32))
+    loss_mask = torch.ones(2, 32, dtype=torch.long)
+    kwargs = dict(eps=1e-3, block_size=None, half_life_ratio=None)
+
+    torch.manual_seed(0)
+    expected = torch.rand(4)
+
+    torch.manual_seed(0)
+    peer_a = strategy.apply_corruption(
+        input_ids, loss_mask, SCDD_MASK_ID, generator=torch.Generator().manual_seed(1234), **kwargs
+    )
+    assert torch.equal(torch.rand(4), expected), "global RNG was consumed"
+
+    torch.manual_seed(999)  # a peer with a diverged global RNG state
+    peer_b = strategy.apply_corruption(
+        input_ids, loss_mask, SCDD_MASK_ID, generator=torch.Generator().manual_seed(1234), **kwargs
+    )
+    for a, b in zip(peer_a, peer_b):
+        assert torch.equal(a, b)
+
+
+def test_scdd_corruption_and_loss_agree_on_the_p_mask_contract():
+    """End-to-end guard on the strategy<->loss handshake: the strategy writes
+    the diffusion time into ``p_mask`` and the loss reads the schedule back out
+    of it. A drift in either direction silently trains the wrong objective."""
+    strategy = _scdd_strategy(num_timesteps=1000, uniform_ratio=0.2)
+    loss_fn = strategy.create_loss_fn(
+        {"vocab_size": SCDD_VOCAB, "mask_token_id": SCDD_MASK_ID, "num_timesteps": 1000, "uniform_ratio": 0.2}
+    )
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (4, 32))
+    loss_mask = torch.ones(4, 32, dtype=torch.long)
+
+    noisy, noise_mask, p_mask = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        SCDD_MASK_ID,
+        eps=1e-3,
+        block_size=None,
+        half_life_ratio=None,
+        generator=torch.Generator().manual_seed(7),
+    )
+
+    logits = torch.randn(4, 32, SCDD_VOCAB, requires_grad=True)
+    out = loss_fn(
+        logits=logits,
+        target_ids=input_ids,
+        noise_mask=noise_mask,
+        p_mask=p_mask,
+        loss_mask=loss_mask,
+        noisy_input_ids=noisy,
+        num_diffusion_tokens=int(loss_mask.sum()),
+    )
+    assert torch.isfinite(out.total_loss)
+    out.total_loss.backward()
+    assert torch.isfinite(logits.grad).all() and logits.grad.abs().sum() > 0
+
+
+def test_scdd_create_loss_fn_threads_chunk_size():
+    """The loss's memory knob must be reachable from the recipe YAML, including
+    the explicit ``null`` that turns chunking off."""
+    strategy = SCDDStrategy()
+    base = {"vocab_size": SCDD_VOCAB, "mask_token_id": SCDD_MASK_ID}
+    assert strategy.create_loss_fn(base).chunk_size == 1024
+    assert strategy.create_loss_fn({**base, "chunk_size": 256}).chunk_size == 256
+    assert strategy.create_loss_fn({**base, "chunk_size": None}).chunk_size is None
+
+
+def test_shipped_scdd_recipe_builds_its_strategy_and_loss():
+    """The go-to recipe must stay loadable: a typo in dllm.mode or a schedule key
+    would otherwise only surface on an 8-GPU run."""
+    import yaml
+
+    config_path = REPO_ROOT / "examples" / "dllm_sft" / "llada_scdd.yaml"
+    cfg = yaml.safe_load(config_path.read_text())
+    dllm_cfg = cfg["dllm"]
+
+    strategy = get_dllm_strategy(dllm_cfg["mode"])
+    assert isinstance(strategy, SCDDStrategy)
+    loss_fn = strategy.create_loss_fn(dllm_cfg)
+    assert isinstance(loss_fn, SCDDLoss)
+    # Schedule values match the authors' released checkpoint config.
+    assert (loss_fn.num_timesteps, loss_fn.max_ratio) == (1000, 0.1)
+    assert (loss_fn.gamma_shape, loss_fn.t_peak) == (1.0, 0.5)
+    assert loss_fn.max_ratio > 0, "uniform_ratio 0 would silently degenerate SCDD to MDLM"
+    # The mask id must be inside the vocabulary the uniform channel samples over.
+    assert 0 <= dllm_cfg["mask_token_id"] < dllm_cfg["vocab_size"]
+    assert cfg["distributed"]["cp_size"] == 1, "SCDD rejects context parallelism"

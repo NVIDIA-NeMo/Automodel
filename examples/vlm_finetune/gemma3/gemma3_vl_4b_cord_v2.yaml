@@ -88,7 +88,6 @@ optimizer:
   betas: [0.9, 0.95]
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
   
@@ -100,4 +99,5 @@ freeze_config:
 #   wandb_save_dir:
 
 ci:
+  time: "00:15:00"
   recipe_owner: akoumpa

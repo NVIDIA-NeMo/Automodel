@@ -82,7 +82,6 @@ distributed:
   sequence_parallel: false
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -127,3 +126,7 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_name>
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:15:00"

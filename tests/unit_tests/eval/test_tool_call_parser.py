@@ -20,16 +20,11 @@ from nemo_automodel.components.eval.tool_call_parser import (
     parse_tool_calls,
 )
 
-
 # ---------- parse_tool_calls: wrapper formats ----------
 
 
 def test_parse_qwen_single_call():
-    text = (
-        '<tool_call>\n'
-        '{"name": "get_weather", "arguments": {"city": "Tokyo"}}\n'
-        '</tool_call>'
-    )
+    text = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Tokyo"}}\n</tool_call>'
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].name == "get_weather"
@@ -38,11 +33,7 @@ def test_parse_qwen_single_call():
 
 
 def test_parse_qwen_string_encoded_arguments():
-    text = (
-        '<tool_call>'
-        '{"name": "calc", "arguments": "{\\"a\\": 1, \\"b\\": 2}"}'
-        '</tool_call>'
-    )
+    text = '<tool_call>{"name": "calc", "arguments": "{\\"a\\": 1, \\"b\\": 2}"}</tool_call>'
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].arguments == {"a": 1, "b": 2}
@@ -59,7 +50,7 @@ def test_parse_qwen_multiple_calls():
 
 
 def test_parse_qwen_malformed_json_records_invalid():
-    text = '<tool_call>{not json}</tool_call>'
+    text = "<tool_call>{not json}</tool_call>"
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].name is None
@@ -67,9 +58,7 @@ def test_parse_qwen_malformed_json_records_invalid():
 
 
 def test_parse_llama_python_tag():
-    text = (
-        '<|python_tag|>{"name": "search", "parameters": {"q": "cats"}}<|eom_id|>'
-    )
+    text = '<|python_tag|>{"name": "search", "parameters": {"q": "cats"}}<|eom_id|>'
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].name == "search"
@@ -85,22 +74,14 @@ def test_parse_llama_python_tag_no_closing():
 
 
 def test_parse_mistral_tool_calls_array():
-    text = (
-        '[TOOL_CALLS]['
-        '{"name": "a", "arguments": {"k": 1}},'
-        '{"name": "b", "arguments": {}}'
-        ']'
-    )
+    text = '[TOOL_CALLS][{"name": "a", "arguments": {"k": 1}},{"name": "b", "arguments": {}}]'
     calls = parse_tool_calls(text)
     assert [c.name for c in calls] == ["a", "b"]
     assert calls[0].arguments == {"k": 1}
 
 
 def test_parse_harmony_gpt_oss():
-    text = (
-        '<|channel|>commentary to=functions.lookup '
-        '<|message|>{"city": "Paris"}'
-    )
+    text = '<|channel|>commentary to=functions.lookup <|message|>{"city": "Paris"}'
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].name == "lookup"
@@ -131,10 +112,7 @@ def test_parse_empty_string():
 
 
 def test_parse_qwen_wins_over_generic_fallback():
-    text = (
-        '<tool_call>{"name": "wrapped", "arguments": {}}</tool_call>\n'
-        '{"name": "stray", "arguments": {}}'
-    )
+    text = '<tool_call>{"name": "wrapped", "arguments": {}}</tool_call>\n{"name": "stray", "arguments": {}}'
     calls = parse_tool_calls(text)
     assert [c.name for c in calls] == ["wrapped"]
 
@@ -226,11 +204,7 @@ def test_metrics_no_gt():
 
 
 def test_parse_qwen_nested_object_args():
-    text = (
-        '<tool_call>'
-        '{"name": "search", "arguments": {"query": {"text": "x", "lang": "en"}}}'
-        '</tool_call>'
-    )
+    text = '<tool_call>{"name": "search", "arguments": {"query": {"text": "x", "lang": "en"}}}</tool_call>'
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].name == "search"
@@ -239,10 +213,7 @@ def test_parse_qwen_nested_object_args():
 
 
 def test_parse_harmony_nested_object_args():
-    text = (
-        '<|channel|>commentary to=functions.search '
-        '<|message|>{"query": {"text": "x", "lang": "en"}, "k": 5}'
-    )
+    text = '<|channel|>commentary to=functions.search <|message|>{"query": {"text": "x", "lang": "en"}, "k": 5}'
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].name == "search"
@@ -250,32 +221,21 @@ def test_parse_harmony_nested_object_args():
 
 
 def test_parse_llama_nested_object_args():
-    text = (
-        '<|python_tag|>'
-        '{"name": "search", "parameters": {"filter": {"a": 1, "b": [2, 3]}}}'
-        '<|eom_id|>'
-    )
+    text = '<|python_tag|>{"name": "search", "parameters": {"filter": {"a": 1, "b": [2, 3]}}}<|eom_id|>'
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].arguments == {"filter": {"a": 1, "b": [2, 3]}}
 
 
 def test_parse_mistral_array_valued_arguments():
-    text = (
-        '[TOOL_CALLS]['
-        '{"name": "f", "arguments": {"items": [1, 2, 3], "meta": {"k": "v"}}}'
-        ']'
-    )
+    text = '[TOOL_CALLS][{"name": "f", "arguments": {"items": [1, 2, 3], "meta": {"k": "v"}}}]'
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].arguments == {"items": [1, 2, 3], "meta": {"k": "v"}}
 
 
 def test_parse_harmony_brace_in_string_does_not_truncate():
-    text = (
-        '<|channel|>commentary to=functions.echo '
-        '<|message|>{"text": "value with } closing brace inside"}'
-    )
+    text = '<|channel|>commentary to=functions.echo <|message|>{"text": "value with } closing brace inside"}'
     calls = parse_tool_calls(text)
     assert len(calls) == 1
     assert calls[0].arguments == {"text": "value with } closing brace inside"}

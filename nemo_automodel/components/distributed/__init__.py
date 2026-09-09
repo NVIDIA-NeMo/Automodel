@@ -12,7 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import (
+    DDPConfig,
+    DistributedSetup,
+    FSDP2Config,
+    MegatronFSDPConfig,
+    MoEParallelizerConfig,
+    MultimodalDistributedConfig,
+)
+from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
+from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
-__all__ = ["FSDP2Config", "MegatronFSDPConfig", "DDPConfig", "PipelineConfig"]
+__all__ = [
+    "DDPConfig",
+    "DistributedSetup",
+    "DistInfo",
+    "FSDP2Config",
+    "MegatronFSDPConfig",
+    "MeshContext",
+    "MoEParallelizerConfig",
+    "MultimodalDistributedConfig",
+    "ParallelismSizes",
+    "PipelineConfig",
+    "initialize_distributed",
+]

@@ -20,7 +20,13 @@ in NeMo's distributed checkpointing pipeline and gives us a stable native class
 name for the model registry.
 """
 
+from dataclasses import dataclass
+
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
 
@@ -53,6 +59,28 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
               under a stable native class name.
         """
 
+        # Only tied Gemma4 assistant checkpoints ship; untying is unsupported.
+        tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
+        _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+        def __init__(self, config: Gemma4AssistantConfig, *args, **kwargs):
+            reject_unsupported_tie_word_embeddings(type(self), config)
+            super().__init__(config, *args, **kwargs)
+            self.tie_weights()
+
+        def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+            """Tie ``lm_head`` to the drafter token embedding."""
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+        @dataclass(frozen=True)
+        class ModelCapabilities:
+            """Declared parallelism capabilities for this model class."""
+
+            supports_tp: bool = False
+            supports_cp: bool = False
+            supports_pp: bool = False
+            supports_ep: bool = False
+
         @classmethod
         def from_config(cls, config: Gemma4AssistantConfig, **kwargs):
             return cls(config, **kwargs)
@@ -62,6 +90,15 @@ else:
 
     class Gemma4DrafterForCausalLM:
         """Placeholder raised when ``transformers.models.gemma4_assistant`` is unavailable."""
+
+        @dataclass(frozen=True)
+        class ModelCapabilities:
+            """Declared parallelism capabilities for this model class."""
+
+            supports_tp: bool = False
+            supports_cp: bool = False
+            supports_pp: bool = False
+            supports_ep: bool = False
 
         def __init__(self, *args, **kwargs):
             raise UnavailableError(

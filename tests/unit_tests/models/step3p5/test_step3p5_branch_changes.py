@@ -123,7 +123,7 @@ def test_rotary_embedding_apply_recomputes_inv_freq_on_target_device():
 def test_attention_accepts_position_ids_instead_of_freqs_and_errors_without_either():
     config = TinyStepConfig(num_hidden_layers=1)
     attention = Step3p5Attention(config, layer_idx=0, backend=tiny_backend())
-    x = torch.randn(1, 3, config.hidden_size, dtype=torch.bfloat16)
+    x = torch.randn(1, 3, config.hidden_size, dtype=torch.float32)
     position_ids = torch.arange(3).unsqueeze(0)
     out = attention(x, position_ids=position_ids)
     assert out.shape == x.shape

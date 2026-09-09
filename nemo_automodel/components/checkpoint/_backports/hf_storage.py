@@ -18,10 +18,12 @@
 
 import dataclasses
 import json
+import logging
+import mmap
 import os
 import queue
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
@@ -65,6 +67,15 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 __all__ = ["_HuggingFaceStorageWriter", "_HuggingFaceStorageReader"]
 
 _DIFFUSERS_INDEX_FN = "diffusion_pytorch_model.safetensors.index.json"
+logger = logging.getLogger(__name__)
+
+
+def _is_integrated_cuda_device(device: torch.device) -> bool:
+    """Whether CUDA reports *device* as sharing physical memory with the host."""
+    if device.type != "cuda":
+        return False
+    properties = torch.cuda.get_device_properties(device)
+    return bool(getattr(properties, "is_integrated", False))
 
 
 def _maybe_rename_index_for_diffusers(consolidated_dir: str) -> None:
@@ -90,14 +101,15 @@ class _HuggingFaceStorageWriter(FsspecWriter):
     def __init__(
         self,
         path: str,
-        fqn_to_index_mapping: Optional[dict[str, int]] = None,
+        fqn_to_index_mapping: dict[str, int] | None = None,
         thread_count: int = 1,
-        token: Optional[str] = None,
+        token: str | None = None,
         save_sharded: bool = False,
-        consolidated_output_path: Optional[str] = None,
-        num_threads_consolidation: Optional[int] = None,
-        staging_dir: Optional[str] = None,
+        consolidated_output_path: str | None = None,
+        num_threads_consolidation: int | None = None,
+        staging_dir: str | None = None,
         diffusers_compatible: bool = False,
+        fqn_to_dtype_mapping: dict[str, str] | None = None,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -120,6 +132,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                         temp files will be created here instead of system temp.
             diffusers_compatible: If True, rename the index file to diffusion_pytorch_model.safetensors.index.json
                         so checkpoints are loadable via diffusers from_pretrained().
+            fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF safetensors dtype string.
         """
         if token is not None:
             super().__init__(
@@ -132,11 +145,12 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                 path=path,
                 serialization_format=SerializationFormat.SAFETENSORS,
             )
-        self._fqn_to_index_mapping: Optional[dict[str, int]] = fqn_to_index_mapping
+        self._fqn_to_index_mapping: dict[str, int] | None = fqn_to_index_mapping
         self._save_sharded = save_sharded
         self._consolidated_output_path = consolidated_output_path
         self._staging_dir = staging_dir
         self._diffusers_compatible = diffusers_compatible
+        self._fqn_to_dtype_mapping = fqn_to_dtype_mapping
 
         if num_threads_consolidation:
             self._num_threads_consolidation = num_threads_consolidation
@@ -173,8 +187,8 @@ class _HuggingFaceStorageWriter(FsspecWriter):
 
         # storage_plan is a map from key to file index
         storage_data: dict[str, Any] = plan.storage_data
-        storage_plan: Optional[dict[str, int]] = None
-        shard_index: Optional[int] = None
+        storage_plan: dict[str, int] | None = None
+        shard_index: int | None = None
         if "fqn_to_index_mapping" in storage_data:
             storage_plan = storage_data["fqn_to_index_mapping"]
         if "shard_index" in storage_data:
@@ -194,14 +208,14 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         if self._save_sharded and not self._consolidated_output_path:
             return
         if self._save_sharded:
-            # Use staging for single-rank consolidation path
             consolidate_safetensors_files(
                 input_dir=self.path,
                 output_dir=self._consolidated_output_path,
                 num_threads=self._num_threads_consolidation,
                 fqn_to_index_mapping=self._fqn_to_index_mapping,
-                use_staging=True,
+                use_staging=self._staging_dir is not None,
                 staging_dir=self._staging_dir,
+                fqn_to_dtype_mapping=self._fqn_to_dtype_mapping,
             )
             if self._diffusers_compatible:
                 _maybe_rename_index_for_diffusers(self._consolidated_output_path)
@@ -221,7 +235,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             json.dump(metadata_to_write, metadata_file, indent=2)
 
     def _split_by_storage_plan(
-        self, storage_plan: Optional[dict[str, int]], items: list[WriteItem]
+        self, storage_plan: dict[str, int] | None, items: list[WriteItem]
     ) -> dict[int, list[WriteItem]]:
         # storage_plan is a map from key to index
         if storage_plan is None:
@@ -251,7 +265,7 @@ class _HuggingFaceStorageReader(FsspecReader):
     Fsspec registration of the storage solution is required.
     """
 
-    def __init__(self, path: str, token: Optional[str] = None, key_mapping: Optional[dict[str, str]] = None) -> None:
+    def __init__(self, path: str, token: str | None = None, key_mapping: dict[str, str] | None = None) -> None:
         """
         Initialize the huggingface reader pointing to path.
 
@@ -280,27 +294,98 @@ class _HuggingFaceStorageReader(FsspecReader):
             per_file.setdefault(file_name, []).append(read_item)
 
         for file_name, reqs in per_file.items():
-            with self.fs.create_stream(file_name, "rb") as stream:
-                for req in reqs:
-                    item_md = self.storage_data[req.storage_index]
+            # Prefer mmap for local files: each request copies out only its narrowed slice,
+            # so only those pages fault in -- and they are file-backed (reclaimable) rather
+            # than anonymous host RAM. The previous path read every full tensor into a host
+            # bytearray (plus a second copy), which host-OOM-kills very large checkpoints
+            # (e.g. a 355B fp8 model with 8 ranks/node). Falls back to the streaming read for
+            # remote/non-local files.
+            mm = None
+            mfile = None
+            try:
+                if os.path.isfile(file_name):
+                    mfile = open(file_name, "rb")  # noqa: SIM115
+                    # Copy-on-write mmap keeps pages file-backed unless mutated, while
+                    # giving torch.frombuffer a writable view so it does not warn.
+                    mm = mmap.mmap(mfile.fileno(), 0, access=mmap.ACCESS_COPY)
+            except (OSError, ValueError):
+                if mm is not None:
+                    mm.close()
+                    mm = None
+                if mfile is not None:
+                    mfile.close()
+                    mfile = None
 
-                    stream.seek(item_md.offset)
-                    tensor_bytes = bytearray(stream.read(item_md.length))
+            try:
+                if mm is not None:
+                    view = memoryview(mm)
+                    for req in reqs:
+                        item_md = self.storage_data[req.storage_index]
+                        # torch.frombuffer is zero-copy but requires the byte offset to be
+                        # aligned to the dtype; safetensors headers can misalign (e.g. bf16),
+                        # so copy just that one tensor's bytes when unaligned.
+                        if item_md.offset % item_md.dtype.itemsize == 0:
+                            numel = item_md.length // item_md.dtype.itemsize
+                            tensor = torch.frombuffer(
+                                view, dtype=item_md.dtype, count=numel, offset=item_md.offset
+                            ).reshape(item_md.shape)
+                            # This view still faults pages from the file mmap.
+                            file_backed = True
+                        else:
+                            tensor = torch.frombuffer(
+                                bytearray(view[item_md.offset : item_md.offset + item_md.length]),
+                                dtype=item_md.dtype,
+                            ).reshape(item_md.shape)
+                            # The alignment fallback already owns resident bytes.
+                            file_backed = False
+                        tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
+                        target_tensor = planner.resolve_tensor(req).detach()
 
-                    tensor = torch.frombuffer(
-                        tensor_bytes,
-                        dtype=item_md.dtype,
-                    )
-                    tensor = tensor.reshape(item_md.shape)
-                    tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
-                    target_tensor = planner.resolve_tensor(req).detach()
+                        assert target_tensor.size() == tensor.size(), (
+                            f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                        )
 
-                    assert target_tensor.size() == tensor.size(), (
-                        f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
-                    )
+                        # On integrated GPUs, copying a file-backed mmap directly to CUDA can
+                        # migrate it page-by-page and take minutes per tensor. Stage only this
+                        # requested slice in anonymous host memory; unlike the full-state loader,
+                        # peak host memory is bounded by one tensor. Discrete GPUs keep the
+                        # zero-copy mmap source used to avoid host OOM on very large checkpoints.
+                        if file_backed and _is_integrated_cuda_device(target_tensor.device):
+                            tensor = tensor.clone()
 
-                    target_tensor.copy_(tensor)
-                    planner.commit_tensor(req, target_tensor)
+                        # copy_ from a pageable host buffer is synchronous, so the mmap can be
+                        # released right after this loop without racing an in-flight H2D copy.
+                        target_tensor.copy_(tensor)
+                        planner.commit_tensor(req, target_tensor)
+                        del tensor
+                    view.release()
+                else:
+                    with self.fs.create_stream(file_name, "rb") as stream:
+                        for req in reqs:
+                            item_md = self.storage_data[req.storage_index]
+
+                            stream.seek(item_md.offset)
+                            tensor_bytes = bytearray(stream.read(item_md.length))
+
+                            tensor = torch.frombuffer(
+                                tensor_bytes,
+                                dtype=item_md.dtype,
+                            )
+                            tensor = tensor.reshape(item_md.shape)
+                            tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
+                            target_tensor = planner.resolve_tensor(req).detach()
+
+                            assert target_tensor.size() == tensor.size(), (
+                                f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                            )
+
+                            target_tensor.copy_(tensor)
+                            planner.commit_tensor(req, target_tensor)
+            finally:
+                if mm is not None:
+                    mm.close()
+                if mfile is not None:
+                    mfile.close()
 
         fut: Future = Future()
         fut.set_result(None)
@@ -381,12 +466,13 @@ class _HuggingFaceStorageReader(FsspecReader):
         return metadata
 
 
-def _extract_file_index(filename: str) -> int:
+def _extract_file_index_with_status(filename: str) -> tuple[int, bool]:
     """Return the 1-based shard index encoded in a safetensors filename.
 
     Supported patterns::
 
         model-00001-of-00008.safetensors
+        model.safetensors-00001-of-00008.safetensors
         shard-00000-model-00002-of-00008.safetensors
         model.safetensors  (single-file checkpoints)
 
@@ -394,34 +480,29 @@ def _extract_file_index(filename: str) -> int:
         filename: The (relative) safetensors filename.
 
     Returns:
-        The numeric shard index, defaulting to ``1`` when no explicit index is
-        present or when the filename cannot be parsed.
+        The numeric shard index and whether the filename was recognized.
+        Unparseable filenames return ``(1, False)``.
     """
     # Strip any leading directory components so we only deal with the basename.
     basename = filename.split("/")[-1]
 
     # Single-file checkpoints which usually carry the name ``model.safetensors``.
     if basename == "model.safetensors":
-        return 1
+        return 1, True
 
-    parts = basename.split("-")
-
-    # Common HF pattern: *model-{idx}-of-{n}.safetensors*
-    if "model" in parts:
-        idx_pos = parts.index("model") + 1
-        if idx_pos < len(parts):
-            token = parts[idx_pos].split(".")[0]  # Remove extension if present.
-            try:
-                return int(token.lstrip("0") or "0")
-            except ValueError:
-                pass
+    match = re.search(r"-(\d+)-of-(\d+)\.safetensors$", basename)
+    if match:
+        idx = int(match.group(1).lstrip("0") or "0")
+        total = int(match.group(2).lstrip("0") or "0")
+        if 1 <= idx <= total:
+            return idx, True
 
     # default to the first shard.
-    return 1
+    return 1, False
 
 
 def get_fqn_to_file_index_mapping(
-    reference_model_path: str, key_mapping: Optional[dict[str, str]] = None
+    reference_model_path: str, key_mapping: dict[str, str] | None = None
 ) -> dict[str, int]:
     """
     Get the FQN to file index mapping from the metadata.
@@ -433,23 +514,98 @@ def get_fqn_to_file_index_mapping(
         A mapping from tensor FQN to the index of the file that the tensor should be written to.
         Indices are from 1 to N, where N is the number of files.
     """
-    hf_reader = _HuggingFaceStorageReader(reference_model_path)
     fqn_to_file_index_mapping: dict[str, int] = {}
-    metadata = hf_reader.read_metadata()
+    fqn_to_filename_mapping: dict[str, str] = {}
+    filename_to_index: dict[str, tuple[int, bool]] = {}
 
-    for md_index, storage_info in metadata.storage_data.items():
-        fqn = getattr(md_index, "fqn", md_index)
-        fqn = _get_key_renaming_mapping(fqn, key_mapping)
-        filename = storage_info.relative_path
-        fqn_to_file_index_mapping[str(fqn)] = _extract_file_index(filename)
+    index_file = os.path.join(reference_model_path, _metadata_fn)
+    if os.path.isfile(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        for fqn, filename in weight_map.items():
+            fqn = _get_key_renaming_mapping(fqn, key_mapping)
+            idx, parsed = _extract_file_index_with_status(filename)
+            fqn_to_file_index_mapping[str(fqn)] = idx
+            fqn_to_filename_mapping[str(fqn)] = filename
+            filename_to_index[filename] = (idx, parsed)
+    else:
+        hf_reader = _HuggingFaceStorageReader(reference_model_path)
+        metadata = hf_reader.read_metadata()
+
+        for md_index, storage_info in metadata.storage_data.items():
+            fqn = getattr(md_index, "fqn", md_index)
+            fqn = _get_key_renaming_mapping(fqn, key_mapping)
+            filename = storage_info.relative_path
+            idx, parsed = _extract_file_index_with_status(filename)
+            fqn_to_file_index_mapping[str(fqn)] = idx
+            fqn_to_filename_mapping[str(fqn)] = filename
+            filename_to_index[filename] = (idx, parsed)
+
+    distinct_filenames = set(filename_to_index)
+    parsed_indices = {idx for idx, parsed in filename_to_index.values() if parsed}
+    expected_indices = set(range(1, len(distinct_filenames) + 1))
+
+    # Expected parsed indices are 1..N for N observed source files.
+    # If not, fall back to sorted filename order.
+    if len(distinct_filenames) > 1 and parsed_indices != expected_indices:
+        filename_to_dense_index = {filename: idx for idx, filename in enumerate(sorted(distinct_filenames), start=1)}
+        for fqn, filename in fqn_to_filename_mapping.items():
+            fqn_to_file_index_mapping[fqn] = filename_to_dense_index[filename]
+
+        logger.warning(
+            "Safetensors shard index parsing failed or produced unexpected indices under %s. "
+            "Expected indices to be 1..%d; falling back to sorted filename order for output indices. "
+            "Example assignments: %s",
+            reference_model_path,
+            len(distinct_filenames),
+            dict(list(filename_to_dense_index.items())[:5]),
+        )
 
     return fqn_to_file_index_mapping
+
+
+def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: dict[str, str] | None = None) -> dict[str, str]:
+    """
+    Get the FQN to original safetensors dtype mapping from HF shard headers.
+
+    Args:
+        reference_model_path: Path to reference model to copy dtype metadata from.
+        key_mapping: Optional regex key mapping applied in the same way as load-time HF key conversion.
+
+    Returns:
+        A mapping from tensor FQN to the original safetensors dtype string.
+    """
+    fqn_to_dtype_mapping: dict[str, str] = {}
+    filenames: set[str] = set()
+
+    index_file = os.path.join(reference_model_path, _metadata_fn)
+    if os.path.isfile(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        filenames.update(index.get("weight_map", {}).values())
+    else:
+        filenames.update(filename for filename in os.listdir(reference_model_path) if filename.endswith(SUFFIX))
+
+    for filename in sorted(filenames):
+        shard_path = os.path.join(reference_model_path, filename)
+        if not os.path.isfile(shard_path):
+            continue
+        with open(shard_path, "rb") as f:
+            safetensors_metadata, _ = _get_safetensors_file_metadata(f)
+        for key, val in safetensors_metadata.items():
+            if key == DEFAULT_EXTRA_METADATA_KEY:
+                continue
+            fqn = _get_key_renaming_mapping(key, key_mapping)
+            fqn_to_dtype_mapping[str(fqn)] = val[DTYPE_KEY]
+
+    return fqn_to_dtype_mapping
 
 
 # the following function is taken from https://github.com/huggingface/transformers/blob/b85ed49e0a5f1bd9fd887f497d055b22b9319a12/src/transformers/modeling_utils.py#L4989-L5047
 def _get_key_renaming_mapping(
     key: str,
-    key_mapping: Optional[dict[str, str]] = None,
+    key_mapping: dict[str, str] | None = None,
 ) -> str:
     if key_mapping is None:
         return key

@@ -43,7 +43,7 @@ checkpoint:
   enabled: true
   model_save_format: safetensors
   checkpoint_dir: ./checkpoints
-  save_consolidated: true
+  save_consolidated: final
   dequantize_base_checkpoint: true
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
@@ -80,5 +80,4 @@ loss_fn:
 ci:
   time: "00:30:00"
   checkpoint_robustness:
-    hf_kl_threshold: 1e-2
     tokenizer_name: meta-llama/Llama-3.1-8B-Instruct

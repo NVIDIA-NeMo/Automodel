@@ -47,10 +47,11 @@ checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
+  activation_checkpointing: true
   tp_size: 1
   cp_size: 1
   pp_size: 1
@@ -58,7 +59,6 @@ distributed:
   sequence_parallel: false
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -97,7 +97,12 @@ validation_dataloader:
 #   name: <your_run_name>
 
 optimizer:
-  _target_: torch.optim.AdamW
-  lr: 1e-4
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 6.0e-6
   weight_decay: 0.01
   betas: [0.9, 0.95]
+  eps: 1e-8
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32

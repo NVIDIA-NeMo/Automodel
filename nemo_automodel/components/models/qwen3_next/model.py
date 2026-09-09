@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
-from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
 
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -26,9 +28,17 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
-from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
+from nemo_automodel.components.models.qwen3_next.layers import (
+    Qwen3NextAttention,
+    Qwen3NextFp32GatedDeltaNet,
+    Qwen3NextRMSNorm,
+)
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -42,7 +52,9 @@ class Block(nn.Module):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen3NextGatedDeltaNet(config, layer_idx)
+            # fp32-aware GatedDeltaNet: keeps the intrinsically-fp32 A_log/dt_bias decay
+            # gate in fp32 under FSDP mixed precision (see Qwen3NextFp32GatedDeltaNet).
+            self.linear_attn = Qwen3NextFp32GatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(config, layer_idx, backend)
 
@@ -54,7 +66,14 @@ class Block(nn.Module):
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
         else:
-            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
+            # Thread dtype from config.torch_dtype so the dense MLP dtype stays
+            # aligned with the rest of the model (fp32 under fp32 master weights).
+            self.mlp = MLP(
+                config.hidden_size,
+                config.intermediate_size,
+                backend.linear,
+                dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+            )
 
         self.input_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -92,10 +111,14 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
+        # ``self.mlp`` may be wrapped by activation checkpointing (submodule-level
+        # AC), so inspect the underlying module to pick the dense (no padding_mask)
+        # vs MoE (padding_mask) call signature, but invoke the wrapped module.
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if isinstance(mlp, MLP):
             return self.mlp(x)
         else:
-            assert isinstance(self.mlp, MoE)
+            assert isinstance(mlp, MoE)
             return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
@@ -110,7 +133,10 @@ class Block(nn.Module):
             linear_list = [self.linear_attn.in_proj_qkvz, self.linear_attn.in_proj_ba, self.linear_attn.out_proj]
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            self.linear_attn.norm.reset_parameters()
+            # transformers 5.15 dropped the FusedRMSNormGated branch, so this is always
+            # Qwen3NextRMSNormGated, which has no reset_parameters(). Its weight is an
+            # RMSNorm gain, initialized to ones.
+            nn.init.ones_(self.linear_attn.norm.weight)
         self.mlp.init_weights(buffer_device)
 
 
@@ -128,6 +154,11 @@ class Qwen3NextModel(nn.Module):
         self.config = config
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
+
+        # Resolve model dtype from config.torch_dtype once; thread it
+        # explicitly into every sub-module so fp32 master weights work even
+        # when construction is not wrapped in local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 
         # Map HF Qwen3Next MoE config -> our MoE wrapper
         moe_defaults = dict(
@@ -151,18 +182,19 @@ class Qwen3NextModel(nn.Module):
             softmax_before_topk=True,
             shared_expert_gate=True,
             shared_expert_inter_dim=config.shared_expert_intermediate_size,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
@@ -237,6 +269,19 @@ class Qwen3NextModel(nn.Module):
 
 
 class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
+    _keep_in_fp32_modules_strict = ["_fp32_params"]
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -266,13 +311,21 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3NextModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
+        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
+        if "_fp32_params" not in keep_fp32:
+            keep_fp32.append("_fp32_params")
+        self._keep_in_fp32_modules = keep_fp32
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3NextStateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+                self.config, self.model.moe_config, self.backend, dtype=model_dtype
             )
 
     def get_input_embeddings(self):
@@ -294,9 +347,18 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = attn_kwargs.get("qkv_format") == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -309,10 +371,10 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(hidden) if self.lm_head else hidden
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            logits = logits.unsqueeze(0)
-        return logits
+
+        return compute_lm_head_logits(
+            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
+        )
 
     @torch.no_grad()
     def initialize_weights(
@@ -332,7 +394,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        cast_model_to_dtype(self, dtype)
+        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

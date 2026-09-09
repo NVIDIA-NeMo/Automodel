@@ -13,14 +13,11 @@
 # limitations under the License.
 import logging
 import random
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 from unittest.mock import MagicMock
 
-import numpy as np
 import torch
 from PIL import Image as PILImage
-
-from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -221,7 +218,7 @@ def build_labels(
 # ---------------------------------------------------------------------------
 
 
-def _get_assistant_marker(tokenizer) -> Optional[List[int]]:
+def _get_assistant_marker(tokenizer) -> List[int] | None:
     """Return the token-id sequence that introduces an assistant turn.
 
     For Qwen-family models the marker is ``[<|im_start|>, assistant, \\n]``.
@@ -239,7 +236,7 @@ def _get_assistant_marker(tokenizer) -> Optional[List[int]]:
         return None
 
 
-def _get_stop_token_id(tokenizer) -> Optional[int]:
+def _get_stop_token_id(tokenizer) -> int | None:
     """Return the token id of the turn-ending marker (``<|im_end|>``)."""
     try:
         tid = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -424,6 +421,18 @@ def build_labels_from_template(
     """
     processor_type = type(processor).__name__
     tokenizer = getattr(processor, "tokenizer", processor)
+
+    # Inkling closes an assistant message before emitting a separate sampling
+    # terminator. Label through the first sampling terminator, which also keeps
+    # subsequent padding (using the same token id) masked.
+    if processor_type == "InklingProcessor":
+        marker_tokens = ("<|message_model|>", "<|content_text|>")
+        assistant_marker = [tokenizer.convert_tokens_to_ids(token) for token in marker_tokens]
+        stop_id = tokenizer.convert_tokens_to_ids("<|content_model_end_sampling|>")
+        if all(token_id is not None and token_id != tokenizer.unk_token_id for token_id in assistant_marker) and (
+            stop_id is not None and stop_id != tokenizer.unk_token_id
+        ):
+            return _build_labels_from_markers(input_ids_batch, assistant_marker, stop_id)
 
     # ------------------------------------------------------------------
     # Fast path: Qwen-family processors with <|im_start|>/<|im_end|>.
@@ -619,7 +628,7 @@ def qwen3_omni_collate_fn(
     """Collate function for Qwen3 Omni processors."""
     if not HAVE_QWEN_OMNI_UTILS:
         raise ImportError(
-            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils"
+            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install nemo-automodel[vlm-media]"
         )
 
     # Import at call-time to support environments/tests that inject the module
@@ -628,7 +637,7 @@ def qwen3_omni_collate_fn(
         from qwen_omni_utils import process_mm_info as _process_mm_info
     except ImportError as exc:
         raise ImportError(
-            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils"
+            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install nemo-automodel[vlm-media]"
         ) from exc
 
     conversations = [example["conversation"] for example in examples]
@@ -701,194 +710,10 @@ def qwen3_omni_collate_fn(
     return batch
 
 
-def _extract_audios_from_conversation(conversation: Sequence[Dict[str, Any]]) -> List[Any]:
-    """Walk a Qwen3-Omni-style conversation and collect audio payloads in order.
-
-    The returned list contains the raw audio objects (typically 1-D ``np.ndarray``
-    waveforms) attached to ``{"type": "audio", "audio": ...}`` items in any
-    message's content list. Used by :func:`qwen3_omni_asr_collate_fn` to feed the
-    processor's ``audio=`` kwarg without going through ``qwen_omni_utils``.
-    """
-    audios: List[Any] = []
-    for message in conversation:
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "audio":
-                audios.append(item.get("audio"))
-    return audios
-
-
-def _validate_and_coerce_audio_payload(payload: Any, sample_index: int) -> np.ndarray:
-    """Coerce an audio payload to a 1-D ``float32`` ``np.ndarray`` or raise.
-
-    The single rule:
-      - Convert any numeric ``np.ndarray`` / ``torch.Tensor`` to ``np.float32``.
-      - The result must be exactly 1-D after conversion (mono waveform).
-      - Anything else raises ``ValueError`` naming the sample index, observed
-        shape, and observed dtype so the caller can pinpoint the bad sample.
-
-    Args:
-        payload: Audio object pulled from a conversation content item.
-        sample_index: Index of the offending sample within the batch (for error
-            messages).
-
-    Returns:
-        A 1-D ``np.float32`` ``np.ndarray``.
-
-    Raises:
-        ValueError: When the payload is not a numeric array or is not 1-D.
-    """
-    if hasattr(payload, "detach") and hasattr(payload, "cpu") and hasattr(payload, "numpy"):
-        # torch.Tensor or similar; move to CPU before NumPy view.
-        payload = payload.detach().cpu().numpy()
-
-    if not isinstance(payload, np.ndarray):
-        raise ValueError(
-            f"sample[{sample_index}] audio payload must be an np.ndarray or torch.Tensor; "
-            f"got type={type(payload).__name__}"
-        )
-
-    if not np.issubdtype(payload.dtype, np.number):
-        raise ValueError(
-            f"sample[{sample_index}] audio payload must have a numeric dtype; "
-            f"got shape={payload.shape} dtype={payload.dtype}"
-        )
-
-    if payload.dtype != np.float32:
-        payload = payload.astype(np.float32, copy=False)
-
-    if payload.ndim != 1:
-        raise ValueError(
-            f"sample[{sample_index}] audio payload must be 1-D (mono waveform); "
-            f"got shape={payload.shape} dtype={payload.dtype}"
-        )
-
-    return payload
-
-
-def _conversation_ends_with_assistant_text(conversation: Sequence[Dict[str, Any]]) -> bool:
-    """Return True iff the last turn is an ``assistant`` turn with non-empty text content."""
-    if not conversation:
-        return False
-    last = conversation[-1]
-    if last.get("role") != "assistant":
-        return False
-    content = last.get("content")
-    if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if isinstance(text, str) and text.strip():
-                    return True
-    return False
-
-
-def qwen3_omni_asr_collate_fn(
-    examples: Sequence[Dict[str, Any]],
-    processor,
-) -> Dict[str, torch.Tensor]:
-    """Collate Qwen3-Omni ASR conversations into model inputs without ``qwen_omni_utils``.
-
-    Unlike :func:`qwen3_omni_collate_fn`, this collate is intended for environments
-    that lack ``qwen_omni_utils`` and ``torchcodec``. It assumes audio waveforms
-    are already attached to the conversation as 1-D ``np.ndarray`` items of the
-    form ``{"type": "audio", "audio": waveform}`` (see
-    :func:`nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset`)
-    and passes them directly to the processor's ``audio=`` kwarg, which routes to
-    the bundled ``WhisperFeatureExtractor``.
-
-    Label masking is delegated to :func:`build_labels_from_template`, which uses
-    the marker-based fast path that already supports ``Qwen3OmniMoeProcessor``
-    via ``_IMSTART_TEMPLATE_PROCESSORS``. The collate produces pre-shifted labels
-    (``labels[:, 1:]``) and slices same-shape tensors to ``[:, :-1]`` so the
-    downstream loss (``MaskedCrossEntropy``/``FusedLinearCrossEntropy``) consumes
-    them without a second internal shift.
-
-    Args:
-        examples: Iterable of dicts each containing a ``conversation`` key, where
-            the last turn MUST be an ``assistant`` turn with non-empty text.
-        processor: A ``Qwen3OmniMoeProcessor`` instance (or compatible mock).
-
-    Returns:
-        Dict with ``input_ids``, ``attention_mask``, ``input_features``,
-        ``feature_attention_mask``, and ``labels`` plus any other tensors the
-        processor returns, all aligned along the batch dimension.
-
-    Raises:
-        ValueError: If any conversation lacks a non-empty assistant turn at the
-            end (the marker-based labeler would otherwise produce all-``-100``
-            labels and a NaN loss).
-    """
-    conversations = [example["conversation"] for example in examples]
-
-    for idx, conv in enumerate(conversations):
-        if not _conversation_ends_with_assistant_text(conv):
-            raise ValueError(
-                f"example[{idx}].conversation must end with an assistant turn containing non-empty text; got: {conv!r}"
-            )
-
-    texts = [processor.apply_chat_template(conv, add_generation_prompt=False, tokenize=False) for conv in conversations]
-
-    all_audios: List[Any] = []
-    for idx, conv in enumerate(conversations):
-        sample_audios = _extract_audios_from_conversation(conv)
-        for payload in sample_audios:
-            all_audios.append(_validate_and_coerce_audio_payload(payload, sample_index=idx))
-
-    processor_kwargs = {
-        "text": texts,
-        "return_tensors": "pt",
-        "padding": True,
-        # Match qwen3_omni_collate_fn and the recipe's token-accounting helpers
-        # (count_tail_padding only strips right-tail padding); transformers 5.5.0
-        # defaults this processor's text padding to "left".
-        "padding_side": "right",
-    }
-    if all_audios:
-        processor_kwargs["audio"] = all_audios
-
-    batch = processor(**processor_kwargs)
-
-    labels = build_labels_from_template(
-        batch["input_ids"],
-        conversations,
-        processor,
-    )
-
-    batch["labels"] = labels[:, 1:]
-
-    input_shape = batch["input_ids"].shape
-    for key, value in list(batch.items()):
-        if isinstance(value, torch.Tensor) and value.shape == input_shape:
-            batch[key] = value[:, :-1]
-
-    return batch
-
-
-def qwen2_5_omni_asr_collate_fn(
-    examples: Sequence[Dict[str, Any]],
-    processor,
-) -> Dict[str, torch.Tensor]:
-    """Collate Qwen2.5-Omni ASR conversations.
-
-    Thin alias over :func:`qwen3_omni_asr_collate_fn`: the body is processor-
-    agnostic (it only depends on the processor exposing ``apply_chat_template``
-    and the ``audio=`` kwarg, both of which ``Qwen2_5OmniProcessor`` provides),
-    so the entire Qwen3-Omni-ASR path works unchanged here. We expose a
-    separate symbol so YAML configs can pick the right collate via
-    ``_target_`` without users having to know about the Qwen3-Omni name.
-    """
-    return qwen3_omni_asr_collate_fn(examples, processor)
-
-
 def kimi_vl_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for KimiVL processors."""
     conversations = [example["conversation"] for example in examples]
@@ -1023,7 +848,7 @@ def _expand_image_tokens(
 def kimi_k25_vl_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
     drop_overlong: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for Kimi K2.5 VL processors with pre-expanded image tokens.
@@ -1428,22 +1253,30 @@ def _drop_overlong_samples(conversations, processor, max_length):
 def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
     drop_overlong: bool = False,
     _post_tokenize_hook=None,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """Default collate function for multimodal VLM datasets.
 
     Args:
+        examples: Conversation samples to collate.
+        processor: Multimodal processor used to apply the chat template.
+        max_length: Optional maximum token sequence length.
+        drop_overlong: Whether to remove samples estimated to exceed ``max_length``.
         _post_tokenize_hook: Optional callable ``(batch, processor) -> batch``
             invoked right after ``apply_chat_template`` and before
             ``build_labels``.  Used by model-specific collate wrappers
             (e.g. Gemma4 thinking-channel injection) to transform the
             tokenized batch and the prefix tokens without duplicating the rest of the pipeline.
-    """
-    if not HAVE_QWEN_VL_UTILS:
-        raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
+    Returns:
+        Batch mapping containing ``input_ids``, ``attention_mask``, and ``labels``
+        tensors of shape [batch, sequence]. Processor-specific media values are
+        either tensors with processor-defined shape and arbitrary rank or lists
+        whose tensor elements preserve their processor-defined shapes; image lists
+        commonly contain tensors of shape [channels, height, width].
+    """
     conversations = _ensure_rgb([example["conversation"] for example in examples])
 
     # Optionally drop overlong samples before processing
@@ -1451,19 +1284,24 @@ def default_collate_fn(
         conversations, kept = _drop_overlong_samples(conversations, processor, max_length)
         examples = [examples[i] for i in kept]
 
-    processor_kwargs = {
-        "tokenize": True,
-        "padding": True,
-        "truncation": True,
-        "return_tensors": "pt",
-        "return_dict": True,
-    }
+    # transformers>=5 expects processing kwargs (padding/truncation/max_length) to be
+    # nested under `processor_kwargs`; only apply_chat_template's own controls
+    # (tokenize/return_dict/return_tensors) stay top-level. Passing them flat still
+    # works but logs, once per sample: "Kwargs passed to `processor.__call__` have to
+    # be in `processor_kwargs` dict, not in `**kwargs`".
+    processing_kwargs = {"padding": True, "truncation": True}
     if max_length is not None:
-        processor_kwargs["max_length"] = max_length
-        processor_kwargs["padding"] = "max_length"
+        processing_kwargs["max_length"] = max_length
+        processing_kwargs["padding"] = "max_length"
         if drop_overlong:
-            processor_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
-    batch = processor.apply_chat_template(conversations, **processor_kwargs)
+            processing_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
+    batch = processor.apply_chat_template(
+        conversations,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        processor_kwargs=processing_kwargs,
+    )
 
     if _post_tokenize_hook is not None:
         batch = _post_tokenize_hook(batch, processor)
@@ -1476,9 +1314,21 @@ def default_collate_fn(
 
     # Convert pixel values to bfloat16 (images and/or videos)
     if "pixel_values" in batch:
-        batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
+        pixel_values = batch["pixel_values"]
+        if isinstance(pixel_values, torch.Tensor):
+            batch["pixel_values"] = pixel_values.to(torch.bfloat16)
+        elif isinstance(pixel_values, list):
+            batch["pixel_values"] = [
+                value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values
+            ]
     if "pixel_values_videos" in batch:
-        batch["pixel_values_videos"] = batch["pixel_values_videos"].to(torch.bfloat16)
+        pixel_values_videos = batch["pixel_values_videos"]
+        if isinstance(pixel_values_videos, torch.Tensor):
+            batch["pixel_values_videos"] = pixel_values_videos.to(torch.bfloat16)
+        elif isinstance(pixel_values_videos, list):
+            batch["pixel_values_videos"] = [
+                value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values_videos
+            ]
 
     labels = build_labels_from_template(
         batch["input_ids"],
@@ -1505,13 +1355,36 @@ def default_collate_fn(
     if any(c > 0 for c in video_counts):
         batch["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
+    pixel_values = batch.get("pixel_values")
+    image_token_id = getattr(processor, "image_token_id", None)
+    if image_token_id is not None and isinstance(pixel_values, torch.Tensor) and pixel_values.dim() == 5:
+        batch["num_patches"] = (batch["input_ids"] == image_token_id).sum(dim=-1)
     return batch
+
+
+def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
+    """Merge fixed-shape patch tensors or preserve variable-resolution media lists."""
+    if not values:
+        raise ValueError("Media merge requires at least one value.")
+    if all(isinstance(value, torch.Tensor) for value in values):
+        return torch.cat(values, dim=0).to(torch.bfloat16)
+    # At least one pack carries variable-resolution media as a list: flatten
+    # every pack to one tensor per image (a stacked [N, ...] tensor splits along dim 0).
+    flat = []
+    for value in values:
+        if isinstance(value, torch.Tensor):
+            flat.extend(value.to(torch.bfloat16))
+        elif isinstance(value, (list, tuple)):
+            flat.extend(item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item for item in value)
+        else:
+            raise TypeError(f"VLM media values must be tensors or lists, got {type(value).__name__}.")
+    return flat
 
 
 def pad_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for pre-tokenized samples (from :class:`PreTokenizedDatasetWrapper`).
 
@@ -1595,7 +1468,7 @@ def pad_collate_fn(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [ex[key] for ex in examples if key in ex and ex[key] is not None]
         if tensors:
-            batch[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            batch[key] = _merge_media_values(tensors)
 
     # Per-sample image counts from image_grid_thw shapes (before concat)
     image_grid_per_sample = [
@@ -1636,6 +1509,7 @@ def neat_packed_vlm_collater(
     padding_idx: int = 0,
     max_length: int | None = None,
     attn_implementation: str = "sdpa",
+    materialize_4d_mask: bool = True,
 ) -> dict:
     """Collater for neat-packed VLM sequences.
 
@@ -1661,6 +1535,11 @@ def neat_packed_vlm_collater(
             and ensures uniform tensor shapes across steps.
         attn_implementation: Attention backend (``"flash_attention_2"``,
             ``"sdpa"``, or ``"eager"``).
+        materialize_4d_mask: Whether SDPA/eager packing should expand the
+            indexed ``[B, S]`` document map into a dense
+            ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
+            rebuild their local mask from ``_packed_seq_ids`` and set this to
+            False to avoid the quadratic allocation.
 
     Returns:
         Dict with batched tensors ready for model forward.
@@ -1672,10 +1551,13 @@ def neat_packed_vlm_collater(
     use_flash = attn_implementation == "flash_attention_2"
 
     # Determine pad target: fixed max_length or batch-dynamic
-    batch_max = max(
-        x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
+    max_len = (
+        max_length
+        if max_length is not None
+        else max(
+            x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
+        )
     )
-    max_len = max_length if max_length is not None else batch_max
 
     def _pad_1d(tensor, pad_value, target_len):
         """Pad a 1D tensor to target_len."""
@@ -1696,9 +1578,10 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
-    if use_flash:
-        # Keep indexed [B, S] mask for flash_attn_varlen_func.
-        # The patched _get_unpad_data will extract per-document cu_seqlens.
+    if use_flash or not materialize_4d_mask:
+        # Keep the compact indexed [B, S] document map. FlashAttention derives
+        # cu_seqlens from it; block-diagonal CP rebuilds its local mask from the
+        # identical _packed_seq_ids emitted below.
         attention_mask_out = attention_mask
     else:
         from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
@@ -1733,14 +1616,15 @@ def neat_packed_vlm_collater(
     # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
     # ``attention_mask_out`` is already converted to 4D, so keep a copy.
-    if attention_mask.max() > 1:
+    has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
+    if has_multiple_docs or not materialize_4d_mask:
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            result[key] = _merge_media_values(tensors)
 
     for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
@@ -1758,10 +1642,141 @@ def neat_packed_vlm_collater(
     return result
 
 
+def packed_sequence_thd_vlm_collater(
+    batch: list[dict],
+    padding_idx: int = 0,
+    max_length: int | None = None,
+    seq_lens_padding_value: int = -1000,
+) -> dict:
+    """Collater for neat-packed VLM sequences in THD (Transformer Engine) format.
+
+    VLM counterpart of ``packed_sequence_thd_collater`` (text-only,
+    ``datasets/utils.py``). Packs arrive with variable lengths (no pre-padding)
+    from ``neat_pack_dataset_vlm``. This collater pads text tensors to a common
+    length and stacks them to ``[batch, seq]``. CP-aware packed samples provide
+    explicit ``seq_lens`` and ``seq_lens_padded`` metadata; older samples derive
+    real lengths from the indexed ``attention_mask`` (values 1, 2, ... per
+    sub-sequence, 0 = padding). The collater folds only batch-level trailing pad
+    into the last document, keeps the mRoPE ``[3, seq]`` layout as
+    ``[3, batch, seq]``, concatenates media tensors, and emits ``qkv_format='thd'``.
+
+    Args:
+        batch: List of packed sample dicts. Each holds ``input_ids``/``labels``/
+            ``attention_mask`` of shape ``[seq]`` (mask indexed by sub-sequence),
+            ``position_ids`` of shape ``[seq]`` (1D) or ``[3, seq]`` (mRoPE), and
+            optional media tensors (``pixel_values`` ``[num_patches, dim]``,
+            ``image_grid_thw`` ``[num_images, 3]``, video/second-per-grid analogues).
+        padding_idx: Token ID used to pad ``input_ids`` (default 0).
+        max_length: If set, pad every sample to this fixed length; else pad to the
+            longest pack in the batch.
+        seq_lens_padding_value: Sentinel to right-pad ragged ``seq_lens`` rows
+            (default -1000); filtered downstream in ``process_input_for_thd``.
+
+    Returns:
+        Dict with ``input_ids``/``labels`` ``[batch, seq]``, ``position_ids``
+        ``[batch, seq]`` or ``[3, batch, seq]``, ``seq_lens``/``seq_lens_padded``
+        ``[batch, max_packs]``, ``qkv_format='thd'``, and concatenated media tensors.
+    """
+    if not batch:
+        return {}
+
+    from nemo_automodel.components.datasets.utils import pad_within_micro
+
+    LABEL_PAD = -100
+
+    batch_max = max(
+        x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
+    )
+    max_len = max_length if max_length is not None else batch_max
+    if batch_max > max_len:
+        raise ValueError(
+            f"Packed VLM THD batch requires {batch_max} tokens, exceeding configured max_length={max_len}."
+        )
+
+    def _pad_seq(tensor, pad_value, target_len, seq_dim=-1):
+        """Pad ``tensor`` along ``seq_dim`` to ``target_len`` with ``pad_value``."""
+        t = torch.as_tensor(tensor)
+        pad_len = target_len - t.shape[seq_dim]
+        if pad_len <= 0:
+            return t
+        shape = list(t.shape)
+        shape[seq_dim] = pad_len
+        return torch.cat([t, torch.full(shape, pad_value, dtype=t.dtype)], dim=seq_dim)
+
+    input_ids = torch.stack([_pad_seq(x["input_ids"], padding_idx, max_len) for x in batch])
+    labels = torch.stack([_pad_seq(x["labels"], LABEL_PAD, max_len) for x in batch])
+
+    seq_lens_list: list[list[int]] = []
+    seq_lens_padded_list: list[list[int]] = []
+    for x in batch:
+        has_seq_lens = "seq_lens" in x
+        has_seq_lens_padded = "seq_lens_padded" in x
+        if has_seq_lens != has_seq_lens_padded:
+            raise ValueError("Packed VLM samples must provide both seq_lens and seq_lens_padded, or neither.")
+
+        item_len = int(torch.as_tensor(x["input_ids"]).shape[-1])
+        if has_seq_lens:
+            doc_lens = torch.as_tensor(x["seq_lens"], dtype=torch.long).reshape(-1).tolist()
+            padded = torch.as_tensor(x["seq_lens_padded"], dtype=torch.long).reshape(-1).tolist()
+            invalid_lengths = not padded or any(
+                real < 0 or slots < 0 or real > slots for real, slots in zip(doc_lens, padded)
+            )
+            if len(doc_lens) != len(padded) or invalid_lengths:
+                raise ValueError(
+                    f"Invalid packed VLM THD sequence metadata: seq_lens={doc_lens}, seq_lens_padded={padded}."
+                )
+            if sum(padded) != item_len:
+                raise ValueError(
+                    "Packed VLM THD seq_lens_padded must cover the materialized token stream, "
+                    f"got sum={sum(padded)} and tokens={item_len}."
+                )
+        else:
+            am = torch.as_tensor(x["attention_mask"]).to(torch.long)
+            doc_lens = torch.bincount(am)[1:].tolist()
+            if not doc_lens:
+                doc_lens = [item_len]
+            padded = list(doc_lens)
+
+        padded[-1] += max_len - item_len
+        seq_lens_list.append(doc_lens)
+        seq_lens_padded_list.append(padded)
+
+    seq_lens = torch.LongTensor(pad_within_micro(seq_lens_list, seq_lens_padding_value))
+    seq_lens_padded = torch.LongTensor(pad_within_micro(seq_lens_padded_list, seq_lens_padding_value))
+
+    pos_sample = torch.as_tensor(batch[0]["position_ids"])
+    if pos_sample.ndim == 2:
+        # mRoPE [n_rope, seq]: pad along the seq axis, then stack on a new batch axis.
+        position_ids = torch.stack([_pad_seq(x["position_ids"], 0, max_len, seq_dim=1) for x in batch], dim=1)
+    else:
+        position_ids = torch.stack([_pad_seq(x["position_ids"], 0, max_len) for x in batch])
+
+    result: Dict[str, Any] = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "seq_lens": seq_lens,
+        "seq_lens_padded": seq_lens_padded,
+        "qkv_format": "thd",
+    }
+
+    for key in ("pixel_values", "pixel_values_videos"):
+        tensors = [x[key] for x in batch if key in x and x[key] is not None]
+        if tensors:
+            result[key] = _merge_media_values(tensors)
+
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+        tensors = [x[key] for x in batch if key in x and x[key] is not None]
+        if tensors:
+            result[key] = torch.cat(tensors, dim=0)
+
+    return result
+
+
 def nemotron_omni_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
     max_video_frames: int = 8,
 ) -> Dict[str, torch.Tensor]:
     """Collate for NemotronOmni (image / video / audio).
@@ -1801,12 +1816,12 @@ def nemotron_omni_collate_fn(
         sample_audio[idx] = waveform
 
     all_images: List[List[Any]] = []
-    all_videos: List[Optional[Tuple[List[Any], Optional[VideoMetadata]]]] = []
+    all_videos: List[Tuple[List[Any], VideoMetadata | None] | None] = []
     texts: List[str] = []
 
     for conversation in conversations:
         conv_images: List[Any] = []
-        conv_video: Optional[Tuple[List[Any], Optional[VideoMetadata]]] = None
+        conv_video: Tuple[List[Any], VideoMetadata | None] | None = None
         text_conversation = []
         for message in conversation:
             content = message.get("content")
@@ -1826,7 +1841,12 @@ def nemotron_omni_collate_fn(
                         if vid is None:
                             continue
                         if isinstance(vid, str):
-                            import decord
+                            try:
+                                import decord
+                            except ImportError as exc:
+                                raise RuntimeError(
+                                    "decord is required to read video files; install it with: pip install nemo-automodel[vlm-media]"
+                                ) from exc
 
                             decord.bridge.set_bridge("native")
                             total = len(decord.VideoReader(vid))
@@ -2098,10 +2118,58 @@ def gemma4_inject_thinking_prefix(
     return _inject_thinking_prefix_tokens(batch, tokenizer)
 
 
+# Batch entries whose axis 1 is the text-token axis. Everything else in a VLM
+# batch is indexed by patch/frame and must not be sliced to a token count.
+_TOKEN_AXIS_KEYS: tuple[str, ...] = (
+    "input_ids",
+    "attention_mask",
+    "labels",
+    "token_type_ids",
+    "mm_token_type_ids",
+)
+
+
+def _truncate_token_axis(batch: Dict[str, torch.Tensor], max_length: int) -> None:
+    """Truncate the text-token axis of a batch in place.
+
+    Only the tensors listed in ``_TOKEN_AXIS_KEYS`` are indexed on axis 1 by text
+    token. Media tensors such as ``pixel_values`` of shape
+    ``[batch, patches, patch_dim]`` and ``image_position_ids`` of shape
+    ``[batch, patches, 2]`` are indexed by *patch*, so slicing them to a token
+    count silently decouples the image features from the placeholder tokens that
+    address them. Truncating by an allowlist keeps new media keys safe by default;
+    the previous denylist only spared ``pixel_values`` and clipped
+    ``image_position_ids`` alongside the text.
+
+    Args:
+        batch: Collated batch. Token-aligned entries have shape
+            ``[batch, sequence]``; media entries keep their own axis 1 and are
+            left untouched.
+        max_length: Maximum number of text tokens to keep.
+
+    Raises:
+        ValueError: If truncating would drop multimodal placeholder tokens, which
+            would leave more image features than positions to scatter them into.
+    """
+    media_marker = batch.get("mm_token_type_ids")
+    if isinstance(media_marker, torch.Tensor) and media_marker.dim() >= 2 and media_marker.size(1) > max_length:
+        if bool((media_marker[:, max_length:] != 0).any()):
+            raise ValueError(
+                f"max_length={max_length} cuts into multimodal tokens, which would leave image features "
+                "with no placeholder tokens to scatter into. Raise max_length above the prompt's image "
+                "token span, or drop the corresponding images before collation."
+            )
+
+    for key in _TOKEN_AXIS_KEYS:
+        value = batch.get(key)
+        if isinstance(value, torch.Tensor) and value.dim() >= 2 and value.size(1) > max_length:
+            batch[key] = value[:, :max_length]
+
+
 def gemma4_prefix_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for Gemma4 models with thinking-channel prefix.
 
@@ -2115,10 +2183,7 @@ def gemma4_prefix_collate_fn(
     def _inject(batch, proc):
         batch = gemma4_inject_thinking_prefix(batch, proc)
         if max_length is not None and batch["input_ids"].size(1) > max_length:
-            for key in list(batch.keys()):
-                v = batch[key]
-                if isinstance(v, torch.Tensor) and v.dim() >= 2 and v.size(1) > max_length and key != "pixel_values":
-                    batch[key] = v[:, :max_length]
+            _truncate_token_axis(batch, max_length)
         return batch
 
     return default_collate_fn(examples, processor, max_length, _post_tokenize_hook=_inject)
@@ -2178,7 +2243,6 @@ def llava_onevision_collate_fn(
 # Mapping of processor types to their collate functions
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
-    "Qwen2_5OmniProcessor": qwen2_5_omni_asr_collate_fn,
     "Qwen3OmniMoeProcessor": qwen3_omni_collate_fn,
     "KimiVLProcessor": kimi_vl_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,

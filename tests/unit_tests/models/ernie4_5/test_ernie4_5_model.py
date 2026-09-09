@@ -27,6 +27,7 @@ from transformers.models.ernie4_5.configuration_ernie4_5 import Ernie4_5Config
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.ernie4_5.model import (
     Ernie4_5_MoeForCausalLM,
     Ernie4_5_MoeModel,
@@ -215,6 +216,18 @@ class TestErnie4_5Model:
 # MoE model
 # ---------------------------------------------------------------------------
 class TestErnie4_5_MoeModel:
+    def test_gate_precision_defaults_to_fp32(self, moe_hf_config, backend_config):
+        assert backend_config.gate_precision is None
+        model = Ernie4_5_MoeModel(moe_hf_config, backend_config)
+        assert backend_config.gate_precision is None
+        assert model.backend.gate_precision == torch.float32
+        assert model.layers["1"].mlp.gate.gate_precision == torch.float32
+
+    def test_gate_precision_respects_explicit_override(self, moe_hf_config, backend_config):
+        backend_config.gate_precision = torch.bfloat16
+        model = Ernie4_5_MoeModel(moe_hf_config, backend_config)
+        assert model.layers["1"].mlp.gate.gate_precision == torch.bfloat16
+
     def test_moe_config_defaults_from_hf_config(self, moe_hf_config, backend_config):
         model = Ernie4_5_MoeModel(moe_hf_config, backend_config)
         assert hasattr(model, "moe_config")
@@ -327,10 +340,11 @@ class TestErnie4_5ForCausalLM:
         model = Ernie4_5ForCausalLM(dense_config, backend=backend_config)
         assert model.lm_head.weight is model.model.embed_tokens.weight
 
-    def test_lm_head_untied(self, dense_config, backend_config):
+    def test_lm_head_untied_is_rejected(self, dense_config, backend_config):
+        # ERNIE-4.5 is TIED_ONLY: both shipped checkpoints are tied, so untying is rejected.
         dense_config.tie_word_embeddings = False
-        model = Ernie4_5ForCausalLM(dense_config, backend=backend_config)
-        assert model.lm_head.weight is not model.model.embed_tokens.weight
+        with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=False"):
+            Ernie4_5ForCausalLM(dense_config, backend=backend_config)
 
     def test_tie_weights_rebinds(self, dense_config, backend_config):
         dense_config.tie_word_embeddings = True
@@ -388,10 +402,11 @@ class TestErnie4_5_MoeForCausalLM:
         model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
         assert model.lm_head.weight is model.model.embed_tokens.weight
 
-    def test_lm_head_untied(self, moe_hf_config, backend_config):
+    def test_lm_head_untied_is_rejected(self, moe_hf_config, backend_config):
+        # ERNIE-4.5 is TIED_ONLY: both shipped checkpoints are tied, so untying is rejected.
         moe_hf_config.tie_word_embeddings = False
-        model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
-        assert model.lm_head.weight is not model.model.embed_tokens.weight
+        with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=False"):
+            Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
 
     def test_state_dict_adapter_off_by_default(self, moe_hf_config, backend_config):
         model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
@@ -423,6 +438,43 @@ class TestErnie4_5_MoeForCausalLM:
         model.tie_weights()
         assert model.lm_head.weight is model.model.embed_tokens.weight
 
+    def test_router_fp32_contract_preserves_checkpoint_precision(self, moe_hf_config, backend_config):
+        model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
+        moe = model.model.layers["1"].mlp
+
+        assert "mlp.gate.weight" in model._keep_in_fp32_modules_strict
+        assert "mlp.gate.e_score_correction_bias" in model._keep_in_fp32_modules_strict
+        assert "rotary_emb" in model._keep_in_fp32_modules
+        assert moe.gate.weight.dtype == torch.float32
+        assert moe.gate.e_score_correction_bias.dtype == torch.float32
+        assert moe.experts.gate_and_up_projs.dtype == torch.bfloat16
+        assert model.model.rotary_emb.inv_freq.dtype == torch.float32
+
+        reference_weight = torch.linspace(
+            -0.1234567,
+            0.7654321,
+            moe.gate.weight.numel(),
+            dtype=torch.float32,
+        ).reshape_as(moe.gate.weight)
+        assert not torch.equal(reference_weight, reference_weight.to(torch.bfloat16).float())
+
+        model.load_state_dict({"model.layers.1.mlp.gate.weight": reference_weight}, strict=False)
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert moe.gate.weight.dtype == torch.float32
+        assert torch.equal(moe.gate.weight, reference_weight)
+
+    def test_router_fp32_contract_applies_to_meta_construction(self, moe_hf_config, backend_config):
+        with torch.device("meta"):
+            model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
+
+        moe = model.model.layers["1"].mlp
+        assert moe.gate.weight.device.type == "meta"
+        assert moe.gate.weight.dtype == torch.float32
+        assert moe.gate.e_score_correction_bias.dtype == torch.float32
+        assert moe.experts.gate_and_up_projs.dtype == torch.bfloat16
+        assert model.model.rotary_emb.inv_freq.dtype == torch.float32
+
 
 # ---------------------------------------------------------------------------
 # Forward-pass shape tests (CPU)
@@ -450,7 +502,7 @@ class TestForwardShapes:
         batch, seq = 2, 4
         input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.shape == (batch, seq, dense_config.vocab_size)
 
     def test_dense_forward_accepts_explicit_position_ids(self, dense_config, backend_config):
@@ -459,7 +511,7 @@ class TestForwardShapes:
         input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
         position_ids = torch.arange(seq).unsqueeze(0)
         with torch.no_grad():
-            logits = model(input_ids, position_ids=position_ids)
+            logits = model(input_ids, position_ids=position_ids).logits
         assert logits.shape == (batch, seq, dense_config.vocab_size)
 
     def test_dense_forward_logits_to_keep_int(self, dense_config, backend_config):
@@ -467,24 +519,52 @@ class TestForwardShapes:
         batch, seq = 1, 8
         input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids, logits_to_keep=2)
+            logits = model(input_ids, logits_to_keep=2).logits
         assert logits.shape == (batch, 2, dense_config.vocab_size)
+
+    def test_dense_forward_thd_hidden_states_match_logits_layout(self, dense_config, backend_config):
+        model = self._dense_model(dense_config, backend_config)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
+        position_ids = torch.arange(seq).unsqueeze(0)
+        hidden = torch.randn(seq, dense_config.hidden_size)
+        with torch.no_grad(), patch.object(model.model, "forward", return_value=hidden):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, dense_config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, dense_config.hidden_size)
 
     def test_moe_forward_bshd_shape(self, moe_hf_config, backend_config):
         model = self._moe_model(moe_hf_config, backend_config)
         batch, seq = 1, 4
         input_ids = torch.randint(0, moe_hf_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.shape == (batch, seq, moe_hf_config.vocab_size)
 
-    # NOTE: thd-format forward tests are deliberately omitted from this CPU
-    # test class. The thd path is implemented for the TransformerEngine
-    # attention backend (which uses cu_seqlens); sdpa cannot consume
-    # variable-length packed sequences without bshd reshaping, so a thd
-    # forward through sdpa raises a tensor-shape mismatch. The dense vs.
-    # MoE 1-D position_ids handling that the bug fix targets is covered
-    # by direct Ernie4_5Model.forward unit tests on the Model class.
+    def test_moe_forward_thd_hidden_states_match_logits_layout(self, moe_hf_config, backend_config):
+        model = self._moe_model(moe_hf_config, backend_config)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, moe_hf_config.vocab_size, (batch, seq))
+        position_ids = torch.arange(seq).unsqueeze(0)
+        hidden = torch.randn(seq, moe_hf_config.hidden_size)
+        with torch.no_grad(), patch.object(model.model, "forward", return_value=hidden):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, moe_hf_config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, moe_hf_config.hidden_size)
+
+    # NOTE: these thd-format causal-LM wrapper tests mock the inner model. The
+    # real thd attention path is implemented for TransformerEngine; sdpa cannot
+    # consume variable-length packed sequences without bshd reshaping.
 
 
 # ---------------------------------------------------------------------------

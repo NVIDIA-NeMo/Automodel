@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import io
 import json
 import logging
@@ -20,13 +22,19 @@ import os
 import random
 import re
 import time
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar
 
-import numpy as np
-import soundfile as sf
+import torch
 import torch.utils.data
-from datasets import Audio, load_dataset
+from datasets import Dataset, load_dataset
+from datasets import Image as HfImage
 from PIL import Image
+
+if TYPE_CHECKING:
+    from transformers import ProcessorMixin
 
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
@@ -36,6 +44,35 @@ from nemo_automodel.components.datasets.vlm.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _replacement_rng(idx: int) -> random.Random:
+    """Per-sample RNG for picking a substitute when sample ``idx`` is unusable.
+
+    Seeded from the ORIGINAL sample index only, so every rank (and every
+    dp/cp world size) that materializes sample ``idx`` substitutes the same
+    replacement. Drawing from the process-global ``random`` instead made the
+    substitute rank-dependent: ranks whose global RNG stream had advanced
+    differently (e.g. the per-node dataset-building rank) picked a different
+    document, so context-parallel ranks in one CP group ended up with
+    different packs / ``cu_seqlens`` for the same microbatch -- corrupting the
+    ring-attention gradient accumulation (inf/nan or silently wrong dk/dv).
+    """
+    return random.Random(0x9E3779B9 + 2654435761 * int(idx))
+
+
+@dataclass
+class RdrDatasetConfig:
+    """Construction-time configuration for the RDR dataset."""
+
+    path_or_dataset: str = "quintend/rdr-items"
+    """HuggingFace dataset id or local path for the RDR dataset."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the RDR dataset from this config."""
+        return make_rdr_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwargs):
@@ -72,12 +109,35 @@ def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwar
     # return dataset.map(format, batched=False)
 
 
+@dataclass
+class CordV2DatasetConfig:
+    """Construction-time configuration for the CORD-V2 dataset."""
+
+    path_or_dataset: str = "naver-clova-ix/cord-v2"
+    """HuggingFace dataset id or local path for the CORD-V2 dataset."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+    limit_dataset_samples: int | None = None
+    """Optional maximum number of samples to load."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the CORD-V2 dataset from this config."""
+        return make_cord_v2_dataset(
+            path_or_dataset=self.path_or_dataset,
+            split=self.split,
+            limit_dataset_samples=self.limit_dataset_samples,
+        )
+
+
 def make_cord_v2_dataset(
     path_or_dataset="naver-clova-ix/cord-v2",
     split="train",
+    limit_dataset_samples: int | None = None,
     **kwargs,
 ):
     """Load and preprocess the CORD-V2 dataset for image-to-text fine-tuning."""
+    if limit_dataset_samples is not None:
+        split = f"{split}[:{limit_dataset_samples}]"
     dataset = load_dataset(path_or_dataset, split=split)
 
     def format(example):
@@ -113,25 +173,75 @@ def make_cord_v2_dataset(
     # return dataset.map(format, batched=False, num_proc=8,remove_columns=["ground_truth"])
 
 
-def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
-    """Load and preprocess the MedPix dataset for image-to-text fine-tuning."""
-    dataset = load_dataset(path_or_dataset, split=split)
+@dataclass
+class MedPixDatasetConfig:
+    """Construction-time configuration for the MedPix dataset."""
 
-    def format(example):
+    path_or_dataset: str = "medpix-dataset/medpix-dataset"
+    """HuggingFace dataset id or local path for MedPix."""
+    split: str = "train"
+    """Dataset split to load."""
+
+    def build(self) -> object:
+        """Build the lazily decoded MedPix dataset."""
+        return make_medpix_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
+
+
+def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
+    """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
+
+    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
+    dataset stays Arrow-backed (no Python-side copy of every image). Images are
+    loaded undecoded (``Image(decode=False)``) and wrapped as lazy ``PIL``
+    handles (``Image.open`` reads only the header); the actual pixel decode then
+    happens on demand in the DataLoader workers, rather than eagerly decoding the
+    whole split up front.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    if "image_id" in getattr(dataset, "features", {}):
+        dataset = dataset.cast_column("image_id", HfImage(decode=False))
+
+    def lazy_image(value):
+        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
+
+    def transform(batch):
         return {
             "conversation": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": example["image_id"]},
-                        {"type": "text", "text": example["question"]},
-                    ],
-                },
-                {"role": "assistant", "content": [{"type": "text", "text": example["answer"]}]},
-            ],
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": lazy_image(image)},
+                            {"type": "text", "text": question},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+                ]
+                for image, question, answer in zip(batch["image_id"], batch["question"], batch["answer"])
+            ]
         }
 
-    return [format(example) for example in dataset]
+    return dataset.with_transform(transform)
+
+
+@dataclass
+class LlavaOnevisionDatasetConfig:
+    """Construction-time configuration for the LLaVA-OneVision dataset."""
+
+    path_or_dataset: str = "liuhaotian/LLaVA-Instruct-150K"
+    """HuggingFace dataset id or local path."""
+    split: str = "train"
+    """Dataset split to load."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the LLaVA-OneVision conversation dataset."""
+        return make_llava_onevision_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_llava_onevision_dataset(
@@ -187,6 +297,32 @@ def make_llava_onevision_dataset(
         }
 
     return [format(example) for example in dataset]
+
+
+@dataclass
+class Tulu3MagicoderTextMixDatasetConfig:
+    """Construction-time configuration for the Tulu-3/Magicoder text mixture."""
+
+    tulu_split: str = "train"
+    """Split expression for the Tulu-3 source."""
+    magicoder_split: str = "train"
+    """Split expression for the Magicoder source."""
+    seed: int = 42
+    """Sampling seed for interleaving the two sources."""
+    max_turns: int = 16
+    """Maximum number of turns retained from a Tulu-3 conversation."""
+    limit_total: int | None = None
+    """Optional cap on the merged row count."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the text-only Tulu-3/Magicoder mixture."""
+        return make_tulu3_magicoder_text_mix_dataset(
+            tulu_split=self.tulu_split,
+            magicoder_split=self.magicoder_split,
+            seed=self.seed,
+            max_turns=self.max_turns,
+            limit_total=self.limit_total,
+        )
 
 
 def make_tulu3_magicoder_text_mix_dataset(
@@ -306,242 +442,52 @@ def make_tulu3_magicoder_text_mix_dataset(
     return out
 
 
-def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="train", **kwargs):
-    """Load and preprocess the CommonVoice 17 dataset for audio-to-text fine-tuning."""
+def make_tulu3_dataset(
+    path_or_dataset: str = "allenai/tulu-3-sft-mixture",
+    split: str = "train",
+    **kwargs,
+):
+    """Load ``allenai/tulu-3-sft-mixture`` directly from the HF Hub as text-only conversations.
+
+    This avoids the meta-JSON + JSONL data-prep step required by
+    :func:`make_meta_dataset`: point the recipe's ``dataset._target_`` at this
+    function and the Tulu-3 split is pulled straight from the Hub. Each row's
+    ``messages`` field is converted with the same helper the meta-JSON path uses
+    (:func:`_convert_sharegpt_to_conversation`), so the resulting data composition is
+    **identical** to dumping the split to JSONL and loading it via
+    :func:`make_meta_dataset`: no turn cap, ``system`` turns preserved, every row kept
+    in the original split order. Conversations are text-only (no ``image`` entries),
+    so batches carry no ``pixel_values`` / vision tensors.
+
+    The returned dataset stays Arrow-backed (``map``) so the full ~939k-row split is
+    not copied into a Python list.
+
+    Args:
+        path_or_dataset: HF Hub id (or local path) of the Tulu-3 SFT mixture.
+        split: HF split expression (e.g. ``"train"`` or ``"train[:50000]"``).
+        **kwargs: Ignored. Accepted so recipe-level dataset keys (e.g. ``truncate``)
+            that are forwarded to the dataset target do not raise.
+
+    Returns:
+        datasets.Dataset: Rows with a single ``conversation`` column, each a list of
+        ``{"role": "user"|"assistant", "content": [{"type": "text", "text": ...}]}`` turns.
+    """
     dataset = load_dataset(path_or_dataset, split=split)
-    all_columns = dataset.column_names
-    columns_to_remove = [col for col in all_columns if col not in ["audio", "transcription"]]
-    dataset = dataset.remove_columns(columns_to_remove)
-
-    def format(example):
-        return {
-            "conversation": [
-                {"role": "user", "content": "<|endoftext11|>Transcribe the Turkish audio clip."},
-                {"role": "assistant", "content": example["transcription"]},
-            ],
-            "audio": (example["audio"]["array"], example["audio"]["sampling_rate"]),
-        }
-
-    ret = [format(example) for example in dataset]
-    return ret
+    return dataset.map(_convert_sharegpt_to_conversation, remove_columns=dataset.column_names)
 
 
-def _decode_audio_cell_to_mono_float32(audio_cell, target_sampling_rate):
-    """Decode a HuggingFace ``Audio(decode=False)`` cell to a 1-D float32 waveform.
+@dataclass
+class UnimmChatDatasetConfig:
+    """Construction-time configuration for the UniMM-Chat dataset."""
 
-    Avoids ``torchcodec`` by using ``soundfile`` for both byte and path branches,
-    matching the pattern in ``result/decode_vllm.py``.
+    path_or_dataset: str = "Yirany/UniMM-Chat"
+    """HuggingFace dataset id or local path for the UniMM-Chat dataset."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    Args:
-        audio_cell: Dict with ``bytes`` and/or ``path`` keys, as returned by
-            HuggingFace ``datasets`` when the column has ``Audio(decode=False)``.
-        target_sampling_rate: Desired output sampling rate (Hz). If the source
-            differs, the waveform is resampled via ``scipy.signal.resample_poly``.
-
-    Returns:
-        Tuple of ``(waveform_float32_mono, target_sampling_rate)``.
-
-    Raises:
-        ValueError: If both ``bytes`` and ``path`` are missing.
-    """
-    if not isinstance(audio_cell, dict):
-        raise ValueError(f"audio cell must be a dict, got {type(audio_cell).__name__}: {audio_cell!r}")
-
-    raw_bytes = audio_cell.get("bytes")
-    raw_path = audio_cell.get("path")
-
-    if raw_bytes is not None:
-        waveform, source_sampling_rate = sf.read(io.BytesIO(raw_bytes))
-    elif isinstance(raw_path, str) and raw_path:
-        waveform, source_sampling_rate = sf.read(raw_path)
-    else:
-        raise ValueError(f"audio cell has neither 'bytes' nor 'path': {audio_cell!r}")
-
-    if waveform.ndim > 1:
-        waveform = waveform.mean(axis=1)
-    waveform = waveform.astype(np.float32, copy=False)
-
-    if source_sampling_rate != target_sampling_rate:
-        # Local import to avoid a hard scipy dependency at module load.
-        from scipy.signal import resample_poly
-
-        waveform = resample_poly(waveform, target_sampling_rate, source_sampling_rate).astype(np.float32, copy=False)
-
-    return waveform, target_sampling_rate
-
-
-def _build_asr_conversation(
-    waveform,
-    transcript,
-    *,
-    system_prompt,
-    user_prompt,
-    has_system,
-    has_user_text,
-):
-    """Assemble the Qwen3-Omni ASR chat-template conversation for one sample."""
-    conversation = []
-    if has_system:
-        conversation.append({"role": "system", "content": system_prompt})
-
-    user_content = []
-    if has_user_text:
-        user_content.append({"type": "text", "text": user_prompt})
-    user_content.append({"type": "audio", "audio": waveform})
-    conversation.append({"role": "user", "content": user_content})
-
-    conversation.append({"role": "assistant", "content": [{"type": "text", "text": transcript}]})
-    return conversation
-
-
-def make_hf_audio_asr_dataset(
-    path_or_dataset,
-    split="train",
-    name=None,
-    sampling_rate=16000,
-    system_prompt=None,
-    user_prompt=None,
-    audio_column="audio",
-    text_column="text",
-    drop_empty_text=True,
-    min_audio_duration_seconds=None,
-    **load_kwargs,
-):
-    """Lazy HuggingFace audio→text dataset builder for Qwen3-Omni ASR fine-tuning.
-
-    Loads any HuggingFace ASR dataset that exposes an audio column (``Audio``
-    feature with ``bytes`` and/or ``path`` populated after
-    ``cast_column(decode=False)``) and a transcript column, and yields the
-    Qwen3-Omni chat-template conversation expected by
-    :func:`qwen3_omni_asr_collate_fn`. **No audio is decoded at construction
-    time** — both the soundfile decode (mono mix + ``float32`` cast + optional
-    ``scipy.signal.resample_poly``) and the conversation assembly run inside a
-    HuggingFace ``with_transform`` callback, so the only fixed startup cost is
-    the Arrow-level metadata read of the parquet shards (and the on-demand
-    download of those shards if they are not already in the HF cache).
-    Empty-transcript filtering happens via ``dataset.filter`` against the text
-    column only — also Arrow-level — so audio bytes are never materialized at
-    startup.
-
-    Defaults are tuned for the common case (``audio`` / ``text`` columns,
-    16 kHz, no system turn). Datasets that diverge can override per-field via
-    YAML; see :file:`docs/guides/audio/qwen3-omni-asr.md` for an override table.
-
-    The conversation shape follows the prompt-presence matrix:
-
-    - both ``system_prompt`` and ``user_prompt`` set →
-      ``system → user(text+audio) → assistant``
-    - only ``system_prompt`` set → ``system → user(audio) → assistant``
-    - only ``user_prompt`` set → ``user(text+audio) → assistant``  (no system turn)
-    - neither set (the default) → ``user(audio) → assistant``
-
-    Whitespace-only prompts are treated as absent.
-
-    Args:
-        path_or_dataset: HuggingFace dataset id or local path.
-        split: Dataset split to load (e.g. ``"train"``, ``"train[:5000]"``).
-        name: Optional dataset configuration / subset. Forwarded to
-            ``datasets.load_dataset(path, name=name, ...)``. Required by some
-            datasets (e.g. ``edinburghcstr/ami`` needs ``"ihm"`` or ``"sdm"``;
-            CommonVoice needs the language code).
-        sampling_rate: Target sampling rate in Hz. Audio is resampled inside
-            the lazy transform if the source rate differs.
-        system_prompt: Instruction placed in a ``system`` turn. Default
-            ``None`` skips the system turn entirely; pass a string to emit one.
-        user_prompt: Instruction prepended to the audio inside the user turn.
-            Pass ``None`` to emit a user turn with only the audio item.
-        audio_column: Name of the audio column in the source dataset (default
-            ``"audio"`` — works for AMI / LibriSpeech / GigaSpeech /
-            WenetSpeech / CommonVoice).
-        text_column: Name of the transcript column (default ``"text"`` —
-            works for AMI / LibriSpeech / GigaSpeech / WenetSpeech; override
-            to ``"sentence"`` for CommonVoice).
-        drop_empty_text: If True, samples whose transcript is empty or
-            whitespace are dropped via ``dataset.filter`` (Arrow-level, no
-            audio decode). If False, an empty transcript triggers a
-            ``ValueError`` inside the transform at access time.
-        min_audio_duration_seconds: Optional minimum audio duration. Samples
-            shorter than this threshold are dropped via ``dataset.filter``
-            using ``soundfile.info`` (header-only read, no full decode). The
-            HF Qwen3-Omni Whisper feature extractor has a known off-by-one
-            between ``input_features`` and ``feature_attention_mask`` for
-            sub-second clips (~0.27 s manifests as a 27-vs-26 frame
-            mismatch); set this to ``1.0`` for AMI / CommonVoice-style
-            corpora that contain very short utterances.
-        **load_kwargs: Forwarded to ``datasets.load_dataset`` (e.g.
-            ``trust_remote_code=True``).
-
-    Returns:
-        A HuggingFace ``Dataset`` whose elements are
-        ``{"conversation": <chat-template list>}`` and whose audio is decoded
-        on demand via dataloader workers.
-
-    Raises:
-        ValueError: When ``audio_column`` or ``text_column`` is missing, when
-            an audio cell has neither ``bytes`` nor ``path``, or when
-            ``drop_empty_text=False`` and a transcript is empty.
-    """
-    dataset = load_dataset(path_or_dataset, name=name, split=split, **load_kwargs)
-
-    if audio_column not in dataset.column_names:
-        raise ValueError(f"audio_column={audio_column!r} not found in dataset columns: {dataset.column_names}")
-    if text_column not in dataset.column_names:
-        raise ValueError(f"text_column={text_column!r} not found in dataset columns: {dataset.column_names}")
-
-    dataset = dataset.cast_column(audio_column, Audio(decode=False))
-
-    if drop_empty_text:
-        # Arrow-level filter on the text column only; no audio decode runs.
-        dataset = dataset.filter(
-            lambda batch: [bool(t) and bool(t.strip()) for t in batch[text_column]],
-            batched=True,
-        )
-
-    if min_audio_duration_seconds is not None:
-        # Header-only duration probe via soundfile.info — no PCM decode.
-        # Bytes branch: wrap in BytesIO; path branch: pass path directly.
-        def _duration_at_least(batch):
-            keep = []
-            for cell in batch[audio_column]:
-                try:
-                    if cell.get("bytes"):
-                        info = sf.info(io.BytesIO(cell["bytes"]))
-                    else:
-                        info = sf.info(cell["path"])
-                    keep.append((info.frames / info.samplerate) >= min_audio_duration_seconds)
-                except Exception:
-                    keep.append(False)
-            return keep
-
-        dataset = dataset.filter(_duration_at_least, batched=True)
-
-    has_system = isinstance(system_prompt, str) and bool(system_prompt.strip())
-    has_user_text = isinstance(user_prompt, str) and bool(user_prompt.strip())
-
-    def _format(batch):
-        # ``with_transform`` always passes a column-batched dict
-        # ({col: [v1, v2, ...]}) regardless of whether the caller did
-        # ``ds[i]`` or ``ds[i:j]``; HF unwraps the single-row case afterwards.
-        audio_cells = batch[audio_column]
-        transcripts = batch[text_column]
-        conversations = []
-        for audio_cell, transcript in zip(audio_cells, transcripts):
-            if not isinstance(transcript, str) or not transcript.strip():
-                raise ValueError(f"empty transcript in {text_column!r}; refusing to emit zero-label sample")
-            waveform, _ = _decode_audio_cell_to_mono_float32(audio_cell, sampling_rate)
-            conversations.append(
-                _build_asr_conversation(
-                    waveform,
-                    transcript,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    has_system=has_system,
-                    has_user_text=has_user_text,
-                )
-            )
-        return {"conversation": conversations}
-
-    return dataset.with_transform(_format)
+    def build(self) -> list[dict[str, object]]:
+        """Build the UniMM-Chat dataset from this config."""
+        return make_unimm_chat_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", **kwargs):
@@ -591,7 +537,98 @@ def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", 
     return [format(example) for example in dataset]
 
 
-def _convert_sharegpt_to_conversation(
+SHOPIFY_PRODUCT_CATALOGUE_PROMPT = "What product category does this item belong to?"
+
+
+@dataclass
+class ShopifyProductCatalogueDatasetConfig:
+    """Construction-time configuration for the Shopify product-catalogue dataset."""
+
+    path_or_dataset: str = "Shopify/product-catalogue"
+    """HuggingFace dataset id or local path for the Shopify product catalogue."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+    limit_dataset_samples: int | None = None
+    """Optional maximum number of samples to load."""
+
+    def build(self) -> Dataset:
+        """Build the Shopify product-catalogue dataset from this config."""
+        return make_shopify_product_catalogue_dataset(
+            path_or_dataset=self.path_or_dataset,
+            split=self.split,
+            limit_dataset_samples=self.limit_dataset_samples,
+        )
+
+
+def make_shopify_product_catalogue_dataset(
+    path_or_dataset="Shopify/product-catalogue",
+    split="train",
+    limit_dataset_samples: int | None = None,
+    **kwargs,
+) -> Dataset:
+    """Load the Shopify product-catalogue dataset for image-to-text fine-tuning.
+
+    The task is product image -> taxonomy category, supervised on the dataset's
+    ``ground_truth_category`` field.
+
+    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
+    dataset stays Arrow-backed, as in :func:`make_medpix_dataset`. The train
+    split holds 38,631 product photos; materialising formatted rows measured
+    ~8.1 GB per 1,500 rows (~209 GB for the full split) because each retained
+    row pins its decoded image. Images are loaded undecoded
+    (``Image(decode=False)``) and wrapped as lazy ``PIL`` handles, so the pixel
+    decode happens in the DataLoader workers.
+
+    Note:
+        Product photos are full resolution (up to 2084x2084). Bound the visual
+        token count through the processor (e.g. Qwen2.5-VL's ``max_pixels``) or
+        via ``max_length`` on the collate function.
+
+    Args:
+        path_or_dataset: HuggingFace dataset id or local path.
+        split: Dataset split to load.
+        limit_dataset_samples: Optional maximum number of samples to load.
+        **kwargs: Unused; accepted for parity with the other dataset builders.
+
+    Returns:
+        Dataset: Arrow-backed dataset yielding ``{"conversation": [...]}`` rows.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    if limit_dataset_samples is not None:
+        dataset = dataset.select(range(min(limit_dataset_samples, len(dataset))))
+    if "product_image" in getattr(dataset, "features", {}):
+        dataset = dataset.cast_column("product_image", HfImage(decode=False))
+
+    def lazy_image(value):
+        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
+
+    def transform(batch):
+        return {
+            "conversation": [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": lazy_image(image)},
+                            {"type": "text", "text": SHOPIFY_PRODUCT_CATALOGUE_PROMPT},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": category}]},
+                ]
+                for image, category in zip(batch["product_image"], batch["ground_truth_category"])
+            ]
+        }
+
+    return dataset.with_transform(transform)
+
+
+def convert_sharegpt_to_conversation(
     example,
     columns=None,
     tags=None,
@@ -602,7 +639,8 @@ def _convert_sharegpt_to_conversation(
     Args:
         example (dict): A single data example in sharegpt format.
         columns (dict): Column name mapping with keys 'messages', 'images', 'videos'.
-        tags (dict): Tag mapping with keys 'role_tag', 'content_tag', 'user_tag', 'assistant_tag'.
+        tags (dict): Tag mapping with keys 'role_tag', 'content_tag', 'user_tag', 'assistant_tag',
+            'system_tag'.
         media_dir (str | None): Directory prefix for resolving relative media paths.
 
     Returns:
@@ -619,6 +657,7 @@ def _convert_sharegpt_to_conversation(
     content_tag = tags.get("content_tag", "content")
     user_tag = tags.get("user_tag", "user")
     assistant_tag = tags.get("assistant_tag", "assistant")
+    system_tag = tags.get("system_tag", "system")
 
     messages = example.get(messages_col, [])
     images = list(example.get(images_col, []) or [])
@@ -636,13 +675,17 @@ def _convert_sharegpt_to_conversation(
             role = "user"
         elif role_value == assistant_tag:
             role = "assistant"
+        elif role_value == system_tag:
+            role = "system"
         else:
             continue
 
-        if role == "assistant":
+        # Media placeholders are only meaningful in user turns; system and
+        # assistant turns are emitted as plain text.
+        if role in ("assistant", "system"):
             conversation.append(
                 {
-                    "role": "assistant",
+                    "role": role,
                     "content": [{"type": "text", "text": content_text}],
                 }
             )
@@ -704,6 +747,14 @@ def _convert_sharegpt_to_conversation(
         result["_text_tokens"] = example["_text_tokens"]
 
     return result
+
+
+# The parser was private, but it is also the contract the ViSpec regeneration
+# script checks its output against (it verifies the prompt it writes rebuilds the
+# prompt it generated under). A caller outside this module needs a name that is
+# not declared unstable, so the public spelling above is canonical and this alias
+# keeps the existing in-module callers and their tests unchanged.
+_convert_sharegpt_to_conversation = convert_sharegpt_to_conversation
 
 
 def _load_json_or_jsonl(file_path):
@@ -1000,6 +1051,41 @@ class _ExamplesWithStats(list):
     __slots__ = ("stats",)
 
 
+@dataclass
+class MetaDatasetConfig:
+    """Construction-time configuration for the meta (multi-source) VLM dataset."""
+
+    builds_with_data_parallel_rank: ClassVar[bool] = True
+
+    path_or_dataset: str = ""
+    """Path to the meta JSON file that defines the datasets to load."""
+    dataset_names: list[str] | None = None
+    """Names of datasets to load from the meta file. ``None`` loads all."""
+    split: str = "train"
+    """Dataset split to load (passed through for API consistency)."""
+    shard_data: bool = False
+    """If ``True``, each rank loads only its ``1/world_size`` slice."""
+
+    def build(self, *, rank: int | None = None, world_size: int | None = None) -> list[dict[str, object]]:
+        """Build the meta VLM dataset from this config.
+
+        Args:
+            rank: Runtime data-parallel rank. Inferred from ``torch.distributed`` when ``None``.
+            world_size: Runtime data-parallel world size. Inferred from ``torch.distributed`` when ``None``.
+
+        Returns:
+            Materialized multimodal examples from the selected source datasets.
+        """
+        return make_meta_dataset(
+            path_or_dataset=self.path_or_dataset,
+            dataset_names=self.dataset_names,
+            split=self.split,
+            shard_data=self.shard_data,
+            rank=rank,
+            world_size=world_size,
+        )
+
+
 def make_meta_dataset(
     path_or_dataset,
     dataset_names=None,
@@ -1015,7 +1101,7 @@ def make_meta_dataset(
         - file_name (str): Path to the data file (JSON/JSONL). Relative paths are resolved
           against the meta file's directory.
         - columns (dict): Column name mapping (messages, images, videos).
-        - tags (dict): Tag mapping (role_tag, content_tag, user_tag, assistant_tag).
+        - tags (dict): Tag mapping (role_tag, content_tag, user_tag, assistant_tag, system_tag).
         - media_dir (str): Directory prefix for media files.
         - sample_ratio (float): Sampling ratio (0.0 to 1.0, default 1.0).
 
@@ -1237,6 +1323,118 @@ def make_meta_dataset(
     return result
 
 
+def _resolve_processor_token_id(processor, attr_names, token_names):
+    """Resolve a model-specific media token id from processor/config/tokenizer."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
+    config = getattr(processor, "config", None)
+    for source in (processor, config, tokenizer, getattr(tokenizer, "config", None)):
+        if source is None:
+            continue
+        for attr in attr_names:
+            value = getattr(source, attr, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                try:
+                    token_id = tokenizer.convert_tokens_to_ids(value)
+                except Exception:
+                    continue
+                if isinstance(token_id, int) and token_id != unk_id:
+                    return token_id
+    for token in token_names:
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            continue
+        if isinstance(token_id, int) and token_id != unk_id:
+            return token_id
+    return None
+
+
+def _grid_media_token_count(grid, merge_size: int) -> int:
+    if grid is None:
+        return 0
+    grid_t = torch.as_tensor(grid)
+    if grid_t.numel() == 0:
+        return 0
+    if grid_t.ndim == 1:
+        grid_t = grid_t.view(1, -1)
+    merge_len = int(merge_size) ** 2
+    return int((grid_t.to(torch.long).prod(dim=-1) // merge_len).sum().item())
+
+
+def _media_token_mismatch(input_ids, result, processor) -> str | None:
+    """Return a mismatch description if media grids survived without tokens."""
+    image_token_id = _resolve_processor_token_id(
+        processor,
+        ("image_token_id", "image_token_index", "image_token"),
+        ("<|image_pad|>", "<image>", "<|image|>"),
+    )
+    video_token_id = _resolve_processor_token_id(
+        processor,
+        ("video_token_id", "video_token_index", "video_token"),
+        ("<|video_pad|>", "<video>", "<|video|>"),
+    )
+
+    image_grid = result.get("image_grid_thw")
+    if image_grid is not None and image_token_id is not None:
+        image_merge_size = getattr(getattr(processor, "image_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(image_grid, image_merge_size)
+        actual = int((input_ids == image_token_id).sum().item())
+        if actual != expected:
+            return f"image tokens={actual}, expected={expected}"
+
+    video_grid = result.get("video_grid_thw")
+    if video_grid is not None and video_token_id is not None:
+        video_merge_size = getattr(getattr(processor, "video_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(video_grid, video_merge_size)
+        actual = int((input_ids == video_token_id).sum().item())
+        if actual != expected:
+            return f"video tokens={actual}, expected={expected}"
+
+    return None
+
+
+@dataclass
+class PreTokenizedDatasetWrapperConfig:
+    """Construction-time configuration for :class:`PreTokenizedDatasetWrapper`."""
+
+    max_length: int | None = None
+    """Maximum token sequence length. Overlong samples are replaced or truncated."""
+    max_retries: int = 10
+    """Number of retry attempts when a sample fails to tokenize."""
+    truncate: bool = False
+    """If ``True``, truncate overlong samples instead of replacing them."""
+    inject_fake_images: bool = True
+    """If ``True``, inject a fake image into text-only samples for sharded training."""
+    post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None
+    """Optional declarative callback applied to each tokenizer result."""
+
+    def build(
+        self,
+        *,
+        dataset: torch.utils.data.Dataset | Sequence[dict[str, object]],
+        processor: "ProcessorMixin",
+    ) -> "PreTokenizedDatasetWrapper":
+        """Build a :class:`PreTokenizedDatasetWrapper` from this config.
+
+        Args:
+            dataset: The raw dataset (conversations) to wrap.
+            processor: HuggingFace processor for tokenization.
+        """
+        return PreTokenizedDatasetWrapper(
+            dataset=dataset,
+            processor=processor,
+            max_length=self.max_length,
+            max_retries=self.max_retries,
+            truncate=self.truncate,
+            post_tokenize_hook=self.post_tokenize_hook,
+            inject_fake_images=self.inject_fake_images,
+        )
+
+
 class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
     """Dataset wrapper that tokenizes samples in ``__getitem__``.
 
@@ -1268,6 +1466,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         max_retries=10,
         truncate=False,
         post_tokenize_hook=None,
+        inject_fake_images=True,
     ):
         self.dataset = dataset
         self.processor = processor
@@ -1275,6 +1474,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         self.truncate = truncate
         self.max_retries = max_retries
         self.post_tokenize_hook = post_tokenize_hook
+        self.inject_fake_images = inject_fake_images
         # Compatibility attributes expected by build_dataloader
         self.preload_media = False
 
@@ -1282,6 +1482,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        rng = _replacement_rng(idx)
         from nemo_automodel.components.datasets.vlm.collate_fns import (
             _extract_media_from_conversations,
             build_labels_from_template,
@@ -1305,7 +1506,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 conversation = example["conversation"]
 
                 # Inject fake image into pure-text samples for FSDP/Zero3.
-                injected_fake = not _conversation_has_media(conversation)
+                injected_fake = self.inject_fake_images and not _conversation_has_media(conversation)
                 if injected_fake:
                     conversation = inject_fake_image_into_conversation(conversation)
 
@@ -1360,7 +1561,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                             seq_len,
                             self.max_length,
                         )
-                        idx = random.randint(0, len(self.dataset) - 1)
+                        idx = rng.randint(0, len(self.dataset) - 1)
                         continue
 
                 # Build labels BEFORE truncation so the full assistant text
@@ -1387,6 +1588,16 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         for k, v in result.items()
                     }
                     seq_len = ml
+
+                mismatch = _media_token_mismatch(input_ids, result, self.processor)
+                if mismatch is not None:
+                    logger.warning(
+                        "Sample %d: media token mismatch after tokenization/truncation (%s), replacing.",
+                        idx,
+                        mismatch,
+                    )
+                    idx = rng.randint(0, len(self.dataset) - 1)
+                    continue
 
                 output = {
                     "input_ids": input_ids,
@@ -1421,7 +1632,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     self.max_retries,
                     e,
                 )
-                idx = random.randint(0, len(self.dataset) - 1)
+                idx = rng.randint(0, len(self.dataset) - 1)
 
         raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
 
@@ -1450,6 +1661,7 @@ class RobustDatasetWrapper(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        rng = _replacement_rng(idx)
         from nemo_automodel.components.datasets.vlm.fake_image import (
             _conversation_has_media,
             inject_fake_image_into_conversation,
@@ -1468,7 +1680,7 @@ class RobustDatasetWrapper(torch.utils.data.Dataset):
                 return example
             except Exception as e:
                 logger.warning(f"Error loading sample {idx}: {e}. Retrying with a different sample.")
-                idx = random.randint(0, len(self.dataset) - 1)
+                idx = rng.randint(0, len(self.dataset) - 1)
         raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
 
     def robust_collate(self, collate_fn):

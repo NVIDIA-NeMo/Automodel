@@ -13,19 +13,22 @@
 # limitations under the License.
 
 import importlib
+import inspect
 import logging
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Any, Dict, Generator, List, Sequence, Tuple, Union
 
 import torch
 import transformers
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
+    CheckpointWrapper,
     checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
@@ -46,11 +49,45 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
-from transformers.models.gemma4.modeling_gemma4 import (
-    Gemma4ForConditionalGeneration,
-)
 
+try:
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4ForConditionalGeneration,
+    )
+except (ImportError, ModuleNotFoundError):
+
+    class Gemma4ForConditionalGeneration:  # type: ignore[no-redef]
+        """Placeholder when the installed transformers build has no Gemma4."""
+
+        pass
+
+
+from nemo_automodel.components.distributed.activation_checkpointing import (
+    SELECTIVE_AC_WRAPPER_FLAG,
+    apply_full_layer_checkpointing_to_layers,
+    apply_selective_checkpointing_to_layers,
+    apply_submodule_checkpointing,
+    detect_kv_sharing_and_maybe_disable_cache,
+    is_selective_activation_checkpointing,
+)
+from nemo_automodel.components.distributed.config import (
+    ActivationCheckpointingScope,
+    normalize_activation_checkpointing_scope,
+)
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.shared.multimodal_fsdp import (
+    FrozenMultimodalSharding,
+    ignored_params_for_root,
+    is_multimodal_module_name,
+    iter_multimodal_modules,
+    module_is_fully_frozen,
+    module_parameters,
+    normalize_frozen_multimodal_sharding,
+)
+from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
+)
 
 
 def _is_transformers_v5_or_higher() -> bool:
@@ -93,23 +130,119 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_llama_nemotron_super_tp_plan,
 )
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 
-# TODO(boxiangw): Change to MegatronFSDP once it got published
+_MEGATRON_FSDP_050_REQUIRED_MSG = (
+    "megatron_fsdp.MixedPrecisionPolicy could not be imported: NeMo Automodel requires megatron-fsdp==0.5.0"
+)
+
 HAVE_MEGATRON_FSDP = False
 logging.getLogger("megatron_fsdp").setLevel(logging.WARNING)
 try:
     from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
 
+    # megatron-fsdp==0.5.0, the only supported release, always exports
+    # MixedPrecisionPolicy. safe_import_from keeps module import safe on any
+    # other install; constructing the returned placeholder then raises
+    # _MEGATRON_FSDP_050_REQUIRED_MSG instead of silently degrading.
+    _, MegatronFSDPMixedPrecisionPolicy = safe_import_from(
+        "megatron_fsdp", "MixedPrecisionPolicy", msg=_MEGATRON_FSDP_050_REQUIRED_MSG
+    )
+
     HAVE_MEGATRON_FSDP = True
-except ImportError:
-    pass
+except (ImportError, FileNotFoundError, OSError):
+    # megatron_fsdp itself is unavailable; every use is already guarded by
+    # HAVE_MEGATRON_FSDP, and this placeholder fails loudly like the one above.
+    MegatronFSDPMixedPrecisionPolicy = UnavailableMeta(
+        "MixedPrecisionPolicy", (), {"_msg": _MEGATRON_FSDP_050_REQUIRED_MSG}
+    )
 
 # Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
 import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# One-time flag: megatron-fsdp 0.5.0 removed the legacy buffer-level NaN check,
+# so a truthy check_for_nan_in_grad is dropped by _megatron_fsdp_compat_kwargs
+# and only warned about once per process.
+_megatron_fsdp_nan_check_noop_warned = False
+
+
+def apply_selective_activation_checkpointing(
+    model: nn.Module,
+    *,
+    enable_compile: bool = False,
+    activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+) -> None:
+    """Apply selective activation checkpointing to ``model`` end to end.
+
+    Standalone entry point (detects KV-sharing, disables ``use_cache``, and
+    wraps transformer blocks) for paths where the FSDP2 parallelize flow is
+    skipped -- notably single-GPU training.
+
+    Args:
+        model: The model to checkpoint.
+        enable_compile: Whether per-layer ``torch.compile`` will be applied.
+        activation_checkpointing_scope: Which extracted layer groups to wrap.
+    """
+    layer_groups = _extract_model_layer_groups(model)
+    layers, _ = _filter_layer_groups_for_activation_checkpointing(layer_groups, activation_checkpointing_scope)
+    if not layers:
+        logger.warning("No transformer layers found; skipping selective activation checkpointing.")
+        return
+    has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
+    apply_selective_checkpointing_to_layers(model, layers, has_kv_sharing, enable_compile=enable_compile)
+
+
+_BAGEL_FULL_LAYER_CHECKPOINT_MODULE_LISTS = (
+    "model.language_model.model.layers",
+    "model.vit_model.vision_model.encoder.layers",
+)
+
+
+def _get_module_by_fqn(module: nn.Module, fqn: str) -> nn.Module | None:
+    obj = module
+    for part in fqn.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def _is_checkpoint_wrapped(module: nn.Module) -> bool:
+    return hasattr(module, "_checkpoint_wrapped_module")
+
+
+def _apply_bagel_full_layer_activation_checkpointing(model: nn.Module) -> bool:
+    """Apply native BAGEL-style activation checkpointing to whole logical layers."""
+    if type(model).__name__ != "BagelForUnifiedMultimodal":
+        return False
+
+    wrapped_count = 0
+    for fqn in _BAGEL_FULL_LAYER_CHECKPOINT_MODULE_LISTS:
+        container = _get_module_by_fqn(model, fqn)
+        if container is None:
+            logger.warning("BAGEL activation checkpointing skipped missing module list %s", fqn)
+            continue
+        if not isinstance(container, (nn.ModuleList, nn.ModuleDict)):
+            logger.warning(
+                "BAGEL activation checkpointing expected %s to be a module list, got %s",
+                fqn,
+                type(container),
+            )
+            continue
+
+        items = container.items() if isinstance(container, nn.ModuleDict) else enumerate(container)
+        for key, layer in list(items):
+            if _is_checkpoint_wrapped(layer):
+                continue
+            container[key] = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            wrapped_count += 1
+
+    logger.info("Applied BAGEL full-layer activation checkpointing to %d layers", wrapped_count)
+    return wrapped_count > 0
 
 
 class ParallelizationStrategy(ABC):
@@ -120,18 +253,98 @@ class ParallelizationStrategy(ABC):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reshard_after_forward: bool | None = None,
+        activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+        frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
         pass
+
+
+def _fully_shard_untied_input_output_embeddings(
+    model: nn.Module,
+    *,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy,
+    offload_policy: OffloadPolicy | None,
+    input_reshard_after_forward: bool,
+    fully_shard_fn: Callable[..., nn.Module],
+) -> None:
+    """Give large trainable untied embedding tables independent FSDP buffers.
+
+    The generic dense path otherwise leaves both tables in the root FSDP unit.
+    With fp32 gradient reduction, that unit allocates one contiguous
+    reduce-scatter input containing both gradients. Keeping the two trainable
+    leaf modules in separate FSDP units bounds that allocation by the larger
+    table instead of their sum. Tied weights stay in one unit to preserve
+    aliasing, and frozen tables stay in the root because they have no gradient
+    communication buffer to split.
+
+    Args:
+        model: Model whose input and output embedding modules may be sharded.
+        mesh: Device mesh that owns the FSDP shards.
+        mp_policy: Mixed-precision policy used by the surrounding FSDP units.
+        offload_policy: Optional offload policy used by the surrounding FSDP
+            units.
+        input_reshard_after_forward: Whether the input embedding unit reshards
+            its parameters after forward.
+        fully_shard_fn: FSDP sharding callable, injectable for unit tests.
+    """
+    weights_are_tied = ensure_tied_lm_head(model)
+
+    def _resolve(getter_name: str) -> nn.Module | None:
+        getter = getattr(model, getter_name, None)
+        if not callable(getter):
+            return None
+        try:
+            module = getter()
+        except (AttributeError, NotImplementedError):
+            return None
+        return module if isinstance(module, nn.Module) else None
+
+    input_embeddings = _resolve("get_input_embeddings")
+    output_embeddings = _resolve("get_output_embeddings")
+    input_weight = getattr(input_embeddings, "weight", None)
+    output_weight = getattr(output_embeddings, "weight", None)
+    weights_are_physically_tied = input_embeddings is not None and (
+        input_embeddings is output_embeddings or (input_weight is not None and input_weight is output_weight)
+    )
+    if weights_are_tied or weights_are_physically_tied:
+        logger.info("Keeping tied input/output embeddings in the root FSDP unit")
+        return
+
+    seen: set[int] = set()
+    for role, module, module_reshard_after_forward in (
+        ("input embedding", input_embeddings, input_reshard_after_forward),
+        # The output projection is the last compute unit. Keep it gathered until
+        # backward, matching the old root-owned behavior and allowing
+        # FusedLinearCrossEntropy to consume its mixed-precision compute weight
+        # outside the module's forward.
+        ("output embedding", output_embeddings, False),
+    ):
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        if not any(param.requires_grad for param in module.parameters()):
+            continue
+        fully_shard_fn(
+            module,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=module_reshard_after_forward,
+            offload_policy=offload_policy,
+        )
+        logger.info("Sharded %s as an independent FSDP unit", role)
 
 
 class DefaultParallelizationStrategy(ParallelizationStrategy):
@@ -141,11 +354,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -154,9 +367,14 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         enable_fsdp2_prefetch: bool = True,
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
+        reshard_after_forward: bool | None = None,
+        activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+        frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         fully_shard_fn=None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
+        frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
         tp_mesh = device_mesh[tp_mesh_name]
         if fully_shard_fn is None:
             fully_shard_fn = fully_shard
@@ -164,9 +382,15 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+        pp_enabled = "pp" in dp_mesh.mesh_dim_names and dp_mesh["pp"].size() > 1
+        if pp_enabled and reshard_after_forward is True:
+            logger.warning(
+                "reshard_after_forward=True overrides the pipeline-parallel default of keeping layer weights "
+                "gathered across microbatches. This may increase per-microbatch all-gathers and reduce throughput."
+            )
 
-        # Extract layers from the model for parallelization
-        layers = _extract_model_layers(model)
+        # Extract layers from the model for parallelization.
+        layer_groups = _extract_model_layer_groups(model)
 
         # TP sharding with enhanced plan generation
         if tp_mesh.size() > 1:
@@ -199,6 +423,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         category=UserWarning,
                     )
                     parallelize_module(model, tp_mesh, model_parallel_plan)
+                # TP styles replace module weights with DTensors independently.
+                # Restore an architectural embedding/head alias before FSDP
+                # records ownership; re-tying after FSDP can leave two roots
+                # that disagree about the shared parameter.
+                ensure_tied_lm_head(model)
                 if _attention_is_head_sharded(model_parallel_plan):
                     _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
@@ -218,72 +447,61 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     except Exception as e:
                         logger.warning(f"Could not enable symmetric memory for TP group: {e}")
 
-        # Apply activation checkpointing to linear layers if requested
+        # Apply activation checkpointing to transformer blocks if requested
         if activation_checkpointing:
-            # Models with KV-shared layers (e.g. Gemma4 2B/4B) pass K/V from
-            # earlier layers to later layers through the DynamicCache.  Disabling
-            # the cache breaks this architectural dependency, so we must keep
-            # use_cache=True for those models.
-            _text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(model, "config", None)
-            _has_kv_sharing = getattr(_text_cfg, "num_kv_shared_layers", 0) > 0
+            _has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
+            ac_layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
+                layer_groups,
+                activation_checkpointing_scope,
+            )
 
-            if not _has_kv_sharing:
-                if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
-                    try:
-                        model.config.use_cache = False
-                    except Exception:
-                        pass
-
-            if enable_compile:
+            if is_selective_activation_checkpointing(activation_checkpointing):
+                apply_selective_checkpointing_to_layers(
+                    model,
+                    ac_layers,
+                    _has_kv_sharing,
+                    enable_compile=enable_compile,
+                )
+            elif ac_scopes == ("all",) and _apply_bagel_full_layer_activation_checkpointing(model):
+                logger.info("Using BAGEL full-layer activation checkpointing; skipping submodule checkpoint wrappers.")
+            elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
                 # sharding so the module structure is stable when fully_shard() indexes params.
-                for layer in layers:
-                    for attr in ("self_attn", "mlp"):
+                for layer in ac_layers:
+                    for attr in ("self_attn", "attention", "attn", "linear_attn", "mlp", "feed_forward", "ffn"):
                         m = getattr(layer, attr, None)
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
             else:
-                # Preserve original behavior when compile is disabled.
-                # For HF models on transformers >= 5.3.0, GradientCheckpointingLayer applies
-                # AC at full-layer granularity via __call__ -- fewer CheckpointWrapper objects
-                # and no memory-fragmentation overhead from sub-module wrapping.
-                _use_hf_native_grad_ckpt = False
-                try:
-                    from transformers.modeling_layers import GradientCheckpointingLayer as _HFGradLayer
-
-                    _use_hf_native_grad_ckpt = (
-                        bool(layers)
-                        and layers[0].__class__.__module__.startswith("transformers.")
-                        and isinstance(layers[0], _HFGradLayer)
-                        and getattr(model, "supports_gradient_checkpointing", False)
-                        and hasattr(model, "gradient_checkpointing_enable")
-                    )
-                except ImportError:
-                    pass
-
-                if _use_hf_native_grad_ckpt:
-                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+                if _should_use_hf_native_gradient_checkpointing(
+                    model,
+                    layer_groups,
+                    ac_scopes,
+                    enable_compile=enable_compile,
+                ) and (not _has_kv_sharing or _kv_sharing_survives_checkpoint_replay(model)):
+                    # Work around a PyTorch FSDP2 bug that skips mixed-precision input casts during
+                    # checkpoint recomputation. Remove when the minimum PyTorch version is 2.13.
+                    apply_full_layer_checkpointing_to_layers(model, ac_layers)
                 else:
-                    for i, layer in enumerate(layers):
-                        if hasattr(layer, "mlp"):
-                            layers[i].mlp = checkpoint_wrapper(layers[i].mlp)
-                        # Skip self_attn checkpointing for KV-shared models:
-                        # recomputation would double-write to the DynamicCache,
-                        # corrupting K/V entries that shared layers depend on.
-                        if hasattr(layer, "self_attn") and not _has_kv_sharing:
-                            layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+                    apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
 
-                        if hasattr(layer, "input_layernorm"):
-                            layers[i].input_layernorm = checkpoint_wrapper(
-                                layers[i].input_layernorm  # type: ignore
-                            )
+        if reapply_trainability is not None:
+            reapply_trainability(model)
 
-                        if hasattr(layer, "post_attention_layernorm"):
-                            layers[i].post_attention_layernorm = checkpoint_wrapper(
-                                layers[i].post_attention_layernorm  # type: ignore
-                            )
+        # Evaluate frozen-module ownership only after TP/AC transformations and
+        # trainability rebinding so FSDP sees the final module hierarchy.
+        frozen_multimodal_modules = [
+            name for name, module in iter_multimodal_modules(model) if module_is_fully_frozen(module)
+        ]
+        if frozen_multimodal_sharding == "per_layer" and frozen_multimodal_modules:
+            logger.warning(
+                "distributed.multimodal.frozen_sharding='per_layer' selected for %s. Every rank in the FSDP "
+                "group must execute or skip these modules the same number of times and in the same order on every "
+                "microbatch; rank-asymmetric modality execution can hang or desynchronize FSDP collectives.",
+                ", ".join(frozen_multimodal_modules),
+            )
 
         # Set up mixed precision policy
         if not mp_policy:
@@ -292,6 +510,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             )
+
+        # Install this only when NeMo actually enters FSDP2 sharding.
+        _patch_fsdp_accumulated_grad_guard()
+
+        ignored_multimodal_params: set[nn.Parameter] = set()
 
         # Find transformer layers and apply parallelisms
         apply_fsdp2_sharding_recursively(
@@ -302,21 +525,65 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth,
+            reshard_after_forward,
+            fully_shard_fn=fully_shard_fn,
+            frozen_multimodal_sharding=frozen_multimodal_sharding,
+            ignored_multimodal_params=ignored_multimodal_params,
+        )
+
+        input_embedding_reshard_after_forward = (
+            reshard_after_forward if reshard_after_forward is not None else not pp_enabled
+        )
+        _fully_shard_untied_input_output_embeddings(
+            model,
+            mesh=dp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            input_reshard_after_forward=input_embedding_reshard_after_forward,
             fully_shard_fn=fully_shard_fn,
         )
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
         # will be used in backward immediately
-        model = fully_shard_fn(
-            model,
-            mesh=dp_mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=False,
-            offload_policy=offload_policy,
-        )
+        root_ignored_params = ignored_params_for_root(model, ignored_multimodal_params)
+        root_kwargs = {
+            "mesh": dp_mesh,
+            "mp_policy": mp_policy,
+            "reshard_after_forward": False,
+            "offload_policy": offload_policy,
+        }
+        if root_ignored_params is not None:
+            root_kwargs["ignored_params"] = root_ignored_params
+        model = fully_shard_fn(model, **root_kwargs)
+
+        cp_enabled = "cp" in device_mesh.mesh_dim_names and device_mesh["cp"].size() > 1
+        if cp_enabled:
+            configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
+            logger.info(
+                "Enabled unused-parameter reduce-scatter on %d FSDP units for context parallelism",
+                configured_units,
+            )
 
         return model
+
+
+def _nemotronh_decoder_blocks(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
+    """Return ``(container, blocks)`` for a NemotronH model's decoder blocks.
+
+    Two distinct classes share the name ``NemotronHForCausalLM``:
+
+    * the HF model keeps its blocks in ``model.backbone.layers`` (an ``nn.ModuleList``), while
+    * the native Nemotron-V3 model (``NemotronV3Model``) keeps them in ``model.model.layers``
+      (an ``nn.ModuleDict`` keyed ``"0".."N-1"``).
+
+    ``container`` is the underlying ``ModuleList``/``ModuleDict`` (so callers can write rewrapped
+    blocks back into the model), and ``blocks`` is the ordered list of block modules.
+    """
+    inner = model.backbone if hasattr(model, "backbone") else model.model
+    container = inner.layers
+    blocks = list(container.values()) if isinstance(container, nn.ModuleDict) else list(container)
+    return container, blocks
 
 
 class NemotronHParallelizationStrategy(ParallelizationStrategy):
@@ -326,21 +593,23 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reshard_after_forward: bool | None = None,
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
         logger.info("Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
 
-        layers: torch.nn.ModuleList = model.backbone.layers
+        block_container, layers = _nemotronh_decoder_blocks(model)
         tp_mesh = device_mesh[tp_mesh_name]
         if tp_mesh.size() > 1:
             model_tp_plan: dict[str, ParallelStyle] = {
@@ -354,7 +623,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
             parallelize_module(model, tp_mesh, model_tp_plan)
 
-            for layer in model.backbone.layers:
+            for layer in layers:
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
@@ -362,10 +631,25 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
         if cp_mesh is not None and cp_mesh.size() > 1:
             cp_group = cp_mesh.get_group()
+            cp_global_ranks = torch.distributed.get_process_group_ranks(cp_group)
+            cp_layers = list(layers)
+            mtp_module = getattr(model, "mtp", None)
+            mtp_layers = getattr(mtp_module, "layers", None)
+            mtp_cp_enabled = model.supports.mtp_enabled
+            parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
+            parallelizer_utils.reject_unsupported_mtp_cp(model)
+            if mtp_cp_enabled and mtp_layers is None:
+                raise RuntimeError(
+                    "MTP is enabled but model.mtp.layers is unavailable; cannot configure context parallelism for MTP"
+                )
+            if mtp_cp_enabled and mtp_layers is not None:
+                # MTP blocks live outside the backbone container but execute
+                # the same attention/Mamba CP collectives.
+                cp_layers.extend(mtp_layers)
 
-            for layer in layers:
+            for layer in cp_layers:
                 if hasattr(layer, "block_type") and layer.block_type == "mamba":
-                    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+                    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
                     mixer = layer.mixer
                     mixer.cp = MambaContextParallel(
@@ -383,24 +667,38 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                     if isinstance(attn_module, DotProductAttention):
                         attn_module.set_context_parallel_group(
                             cp_group,
-                            torch.distributed.get_process_group_ranks(cp_group),
+                            cp_global_ranks,
                             torch.cuda.Stream(),
                             cp_comm_type="p2p",
                         )
 
         if activation_checkpointing:
-            for i in range(len(layers)):
-                if layers[i].block_type == "mlp":
-                    layers[i] = checkpoint_wrapper(layers[i])
+            # Write rewrapped blocks back into the real container (ModuleList -> int key,
+            # ModuleDict -> str key) so the model, not just the local handle, is updated.
+            block_items = (
+                block_container.items() if isinstance(block_container, nn.ModuleDict) else enumerate(block_container)
+            )
+            for key, layer in list(block_items):
+                if getattr(layer, "block_type", None) in ("mlp", "mamba"):
+                    block_container[key] = checkpoint_wrapper(layer)
+            # Refresh the local handle so the FSDP wrap below sees the wrapped blocks.
+            _, layers = _nemotronh_decoder_blocks(model)
 
-                if layers[i].block_type == "mamba":
-                    layers[i] = checkpoint_wrapper(layers[i])
+        if reapply_trainability is not None:
+            reapply_trainability(model)
 
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
+        fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
+
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
-                layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+                layer,
+                mesh=dp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                fp32_compute_module_names=fp32_compute_module_names,
+                reshard_after_forward=reshard_after_forward,
             )
 
         # do not reshard after forward for root model
@@ -423,12 +721,13 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
     """
 
     def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-        # Patch HF GatedDeltaNet for FSDP mixed-dtype support (and CP if enabled)
-        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
-
         cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
         cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
-        patch_hf_model(model, cp_enabled=cp_enabled)
+
+        # The Qwen3.5 model builds CPAwareGatedDeltaNet with a fp32 ``SSMGate``
+        # (``_fp32_params``) at construction — no runtime patch needed. Keep those
+        # params in their own dtype-uniform fp32 FSDP group (true master weights).
+        fp32_compute_module_names = ("_fp32_params",)
 
         # Delegate TP, AC, mixed precision to the default strategy, but
         # override the FSDP sharding to use fully_shard_by_dtype.
@@ -437,22 +736,83 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         original_fn = globals().get("apply_fsdp2_sharding_recursively")
         assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
 
-        def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None, *args, **kwargs):
+        def _fsdp_by_dtype(
+            module,
+            mesh,
+            mp_policy,
+            offload_policy=None,
+            enable_fsdp2_prefetch=True,
+            fsdp2_backward_prefetch_depth=2,
+            fsdp2_forward_prefetch_depth=1,
+            reshard_after_forward=None,
+            fully_shard_fn=None,
+            frozen_multimodal_sharding="root",
+            ignored_multimodal_params=None,
+        ):
+            del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth, fully_shard_fn
+            frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
+            pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
+
             if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-                items = module.items() if isinstance(module, nn.ModuleDict) else enumerate(module)
-                for layer_id, child in items:
-                    if isinstance(child, (nn.ModuleList, nn.ModuleDict)):
-                        _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
+                all_items = list(module.items()) if isinstance(module, nn.ModuleDict) else list(enumerate(module))
+                flat_layer_items = [
+                    (layer_id, child)
+                    for layer_id, child in all_items
+                    if not isinstance(child, (nn.ModuleList, nn.ModuleDict))
+                ]
+                nested_items = [
+                    (layer_id, child)
+                    for layer_id, child in all_items
+                    if isinstance(child, (nn.ModuleList, nn.ModuleDict))
+                ]
+
+                for _, child in nested_items:
+                    _fsdp_by_dtype(
+                        child,
+                        mesh,
+                        mp_policy,
+                        offload_policy,
+                        reshard_after_forward=reshard_after_forward,
+                        frozen_multimodal_sharding=frozen_multimodal_sharding,
+                        ignored_multimodal_params=ignored_multimodal_params,
+                    )
+
+                for enum_id, (_, child) in enumerate(flat_layer_items):
+                    if reshard_after_forward is not None:
+                        layer_reshard_after_forward = reshard_after_forward
+                    elif pp_enabled:
+                        layer_reshard_after_forward = False
                     else:
-                        parallelizer_utils.fully_shard_by_dtype(
-                            child,
-                            mesh,
-                            mp_policy,
-                            offload_policy,
-                        )
+                        layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
+                    parallelizer_utils.fully_shard_by_dtype(
+                        child,
+                        mesh,
+                        mp_policy,
+                        offload_policy,
+                        fp32_compute_module_names=fp32_compute_module_names,
+                        reshard_after_forward=layer_reshard_after_forward,
+                    )
             else:
-                for _, sub in module.named_children():
-                    _fsdp_by_dtype(sub, mesh, mp_policy, offload_policy)
+                for name, sub in module.named_children():
+                    if is_multimodal_module_name(name) and module_is_fully_frozen(sub):
+                        if frozen_multimodal_sharding in ("root", "replicate"):
+                            logger.info(
+                                "Keeping frozen multimodal module %s at FSDP policy %s",
+                                name,
+                                frozen_multimodal_sharding,
+                            )
+                            if frozen_multimodal_sharding == "replicate" and ignored_multimodal_params is not None:
+                                ignored_multimodal_params.update(module_parameters(sub))
+                            continue
+                    _fsdp_by_dtype(
+                        sub,
+                        mesh,
+                        mp_policy,
+                        offload_policy,
+                        reshard_after_forward=reshard_after_forward,
+                        frozen_multimodal_sharding=frozen_multimodal_sharding,
+                        ignored_multimodal_params=ignored_multimodal_params,
+                    )
 
         globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
         try:
@@ -473,6 +833,11 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
             for _, mod in model.named_modules():
                 if isinstance(mod, CPAwareGatedDeltaNet):
                     mod._cp_mesh = cp_mesh
+            # Hand the CP submesh to the model so a forward that embeds and
+            # sequence-shards its own primary stream (Megatron-style per-microbatch
+            # CP; see shard_sequence_for_cp_round_robin / shard_batch_aux_only) can build this
+            # rank's round-robin shard.
+            model.cp_mesh = cp_mesh
 
         return result
 
@@ -503,14 +868,15 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         # Not using custom tp_shard_plan; apply Wan-specific plan
@@ -568,6 +934,18 @@ class WanParallelizationStrategy(ParallelizationStrategy):
             except Exception as e:
                 logger.warning(f"Wan strategy: failed to TP blocks/proj_out: {e}")
 
+        # Activation checkpointing wraps every WanTransformerBlock so its
+        # forward activations are recomputed on backward instead of being
+        # held in memory. Critical for Wan2.2-A14B (14B params, ~30k-token
+        # video sequence) — without this, fp32 layer-norm casts in the block
+        # forward will OOM even on 8x80GB H100.
+        if activation_checkpointing and hasattr(model, "blocks"):
+            for idx in range(len(model.blocks)):
+                model.blocks[idx] = checkpoint_wrapper(
+                    model.blocks[idx],
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                )
+
         # Mixed precision default like Default strategy
         if not mp_policy:
             mp_policy = MixedPrecisionPolicy(
@@ -575,6 +953,9 @@ class WanParallelizationStrategy(ParallelizationStrategy):
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             )
+
+        if reapply_trainability is not None:
+            reapply_trainability(model)
 
         # Apply FSDP sharding recursively and to root
         apply_fsdp2_sharding_recursively(
@@ -603,14 +984,15 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: bool = True,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
@@ -629,6 +1011,9 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
                     model.transformer_blocks[idx],
                     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
                 )
+
+        if reapply_trainability is not None:
+            reapply_trainability(model)
 
         # Apply FSDP sharding recursively and to root
         apply_fsdp2_sharding_recursively(
@@ -650,6 +1035,110 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         )
 
 
+class LTX2ParallelizationStrategy(HunyuanParallelizationStrategy):
+    """Parallelization strategy for the LTX-2 video+audio transformer.
+
+    ``LTX2VideoTransformer3DModel`` exposes its layers as ``transformer_blocks``
+    but names the attention/FFN submodules ``attn1``/``attn2``/``ff``, which the
+    Default strategy's submodule-level activation checkpointing does not
+    recognize — leaving attention and MLP activations un-checkpointed and OOM-ing
+    on the long combined video+audio token sequence. Wrapping each whole block
+    (as the HunyuanVideo strategy does) restores the expected memory profile.
+    """
+
+
+def _unwrap_qwen_checkpointed_block(block: nn.Module) -> nn.Module:
+    """Return the Qwen transformer block held by a checkpoint wrapper."""
+    if isinstance(block, CheckpointWrapper):
+        return block._checkpoint_wrapped_module
+    return block
+
+
+def _validate_qwen_transformer_blocks(model: nn.Module) -> nn.ModuleList:
+    """Validate the upstream Qwen dual-stream block structure.
+
+    Args:
+        model: Upstream Qwen image transformer whose ``transformer_blocks``
+            container must hold dual-stream image/text blocks.
+
+    Returns:
+        The model's ``transformer_blocks`` ModuleList. Returned modules alias
+        the model-owned blocks.
+    """
+    blocks = getattr(model, "transformer_blocks", None)
+    if not isinstance(blocks, nn.ModuleList) or not blocks:
+        raise TypeError("Qwen image FSDP2 requires a non-empty transformer_blocks nn.ModuleList")
+
+    required_branches = ("attn", "img_mlp", "txt_mlp")
+    for index, wrapped_block in enumerate(blocks):
+        block = _unwrap_qwen_checkpointed_block(wrapped_block)
+        missing = [name for name in required_branches if not isinstance(getattr(block, name, None), nn.Module)]
+        if missing:
+            raise TypeError(
+                f"Qwen transformer_blocks[{index}] is missing required dual-stream modules: {', '.join(missing)}"
+            )
+    return blocks
+
+
+def _apply_qwen_block_activation_checkpointing(model: nn.Module) -> None:
+    """Checkpoint complete Qwen blocks, including both image and text MLPs.
+
+    Args:
+        model: Upstream Qwen image transformer. Each block consumes image
+            hidden states with shape [batch, image_tokens, hidden], text hidden
+            states with shape [batch, text_tokens, hidden], a text mask with
+            shape [batch, text_tokens], timestep embeddings with shape [batch,
+            hidden], and rotary tensors whose leading layout is owned by
+            Diffusers. Its block outputs preserve the image/text layouts.
+    """
+    blocks = _validate_qwen_transformer_blocks(model)
+    wrapped_count = 0
+    for index, block in enumerate(blocks):
+        if isinstance(block, CheckpointWrapper):
+            continue
+        blocks[index] = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+        wrapped_count += 1
+    logger.info("Applied whole-block activation checkpointing to %d Qwen image transformer blocks", wrapped_count)
+
+
+class QwenImageEditParallelizationStrategy(DefaultParallelizationStrategy):
+    """Shard upstream Qwen image transformer blocks as complete FSDP2 units.
+
+    Applies whole-block activation checkpointing that covers the attention,
+    image-MLP, and text-MLP branches of each dual-stream block, then delegates
+    TP planning and FSDP2 sharding to the default strategy.
+    """
+
+    def parallelize(self, model: nn.Module, *args, **kwargs) -> nn.Module:
+        """Apply Qwen block checkpointing followed by the standard FSDP2 flow.
+
+        Args:
+            model: Upstream Qwen image transformer. Tensor layouts are unchanged
+                by sharding; each dual-stream block consumes image tensors of
+                shape [batch, image_tokens, hidden] and text tensors of shape
+                [batch, text_tokens, hidden].
+            *args: Positional arguments forwarded to the default strategy.
+            **kwargs: Keyword arguments accepted by
+                :meth:`DefaultParallelizationStrategy.parallelize`.
+
+        Returns:
+            The same upstream model with its parameters represented by FSDP2
+            DTensors on distributed runs. Global tensor shapes and upstream
+            Diffusers state-dict keys are preserved.
+        """
+        _validate_qwen_transformer_blocks(model)
+        activation_checkpointing = kwargs.get("activation_checkpointing", False)
+        selective_checkpointing = (
+            isinstance(activation_checkpointing, str)
+            and activation_checkpointing.lower().replace("-", "_") == "selective"
+        )
+        if activation_checkpointing and not selective_checkpointing:
+            _apply_qwen_block_activation_checkpointing(model)
+            kwargs["activation_checkpointing"] = False
+
+        return super().parallelize(model, *args, **kwargs)
+
+
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
@@ -658,6 +1147,8 @@ PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
+    "LTX2VideoTransformer3DModel": LTX2ParallelizationStrategy(),
+    "QwenImageTransformer2DModel": QwenImageEditParallelizationStrategy(),
 }
 
 # Default strategy instance
@@ -670,7 +1161,7 @@ def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
     return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
 
 
-def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
+def register_parallel_strategy(arg=None, *, name: str | None = None):
     """Decorator to register out-of-tree parallelism strategies.
 
     Supports:
@@ -732,6 +1223,12 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     and mlp before FSDP2 sharding (done in DefaultParallelizationStrategy).  This
     function only handles the compile step.
 
+    Whole-block selective-AC wrappers (tagged with ``SELECTIVE_AC_WRAPPER_FLAG``)
+    are compiled OUTER -- the wrapper itself is compiled so the selective policy
+    is traced and the partitioner honors its recompute tags. Other layer-level
+    CheckpointWrappers (e.g. the PP path) are unwrapped and the decoder layer is
+    compiled directly.
+
     nn.Module.compile() is used instead of torch.compile() to compile in-place without
     introducing an _orig_mod wrapper, which would add a key prefix and break checkpoint
     loading.
@@ -746,14 +1243,24 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     compiled_count = 0
     compiled_modules: set[int] = set()
 
+    def _compile_target(layer: nn.Module) -> nn.Module:
+        # Whole-block selective-AC wrappers must be compiled OUTER so the SAC
+        # policy is traced and the partitioner honors its recompute tags.
+        # Other CheckpointWrappers (e.g. PP full-layer wrap with sub-module AC
+        # inside) are unwrapped so the decoder layer is compiled directly.
+        if isinstance(layer, CheckpointWrapper):
+            if getattr(layer, SELECTIVE_AC_WRAPPER_FLAG, False):
+                return layer
+            return layer._checkpoint_wrapped_module
+        return layer
+
     def _compile_module_list(module_list: nn.ModuleList | nn.ModuleDict) -> None:
         nonlocal compiled_count
         # PP converts model.model.layers from nn.ModuleList to nn.ModuleDict (str keys).
         # enumerate(nn.ModuleDict) yields string keys, not modules -- use .items() instead.
         items = module_list.items() if isinstance(module_list, nn.ModuleDict) else enumerate(module_list)
         for _, layer in items:
-            # Unwrap any layer-level checkpoint wrapper (PP path) to reach the actual decoder layer.
-            actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
+            actual_layer = _compile_target(layer)
             module_id = id(actual_layer)
             if module_id in compiled_modules:
                 continue
@@ -777,7 +1284,7 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     else:
         logger.warning("_apply_per_layer_compile: using heuristic layer extraction")
         for layer in _extract_model_layers(model):
-            actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
+            actual_layer = _compile_target(layer)
             module_id = id(actual_layer)
             if module_id in compiled_modules:
                 continue
@@ -791,12 +1298,15 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
-    mp_policy: Optional[MixedPrecisionPolicy],
-    offload_policy: Optional[OffloadPolicy] = None,
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None = None,
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
+    reshard_after_forward: bool | None = None,
     fully_shard_fn=None,
+    frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+    ignored_multimodal_params: set[nn.Parameter] | None = None,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -819,10 +1329,17 @@ def apply_fsdp2_sharding_recursively(
         enable_fsdp2_prefetch (bool): Enable explicit forward/backward prefetch chains.
         fsdp2_backward_prefetch_depth (int): Backward prefetch depth.
         fsdp2_forward_prefetch_depth (int): Forward prefetch depth.
+        reshard_after_forward (Optional[bool]): Optional override for each layer's
+            ``fully_shard`` reshard behavior.
+        frozen_multimodal_sharding: Whether fully frozen multimodal modules are
+            owned by the root FSDP unit, sharded per layer, or replicated.
+        ignored_multimodal_params: Accumulator for replicated frozen multimodal
+            parameters that must be ignored by ancestor FSDP roots.
     Note:
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
     """
+    frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
     if fully_shard_fn is None:
         fully_shard_fn = fully_shard
 
@@ -852,28 +1369,37 @@ def apply_fsdp2_sharding_recursively(
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
+                reshard_after_forward,
                 fully_shard_fn=fully_shard_fn,
+                frozen_multimodal_sharding=frozen_multimodal_sharding,
+                ignored_multimodal_params=ignored_multimodal_params,
             )
 
         for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
             # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
             # Without PP: reshard all but last layer to enable forward+backward weight prefetching.
-            if pp_enabled:
-                reshard_after_forward = False
+            if reshard_after_forward is not None:
+                layer_reshard_after_forward = reshard_after_forward
+            elif pp_enabled:
+                layer_reshard_after_forward = False
             else:
-                reshard_after_forward = enum_id < len(flat_layer_items) - 1
+                layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
             fully_shard_fn(
                 child_module,
                 mesh=mesh,
                 mp_policy=mp_policy,
-                reshard_after_forward=reshard_after_forward,
+                reshard_after_forward=layer_reshard_after_forward,
                 offload_policy=offload_policy,
             )
             module[layer_key] = child_module
 
         # Set up explicit forward/backward prefetch chains when layers are being resharded.
-        # With PP, reshard_after_forward=False so weights are always gathered -- no prefetch needed.
-        if not pp_enabled and enable_fsdp2_prefetch:
+        # With PP or an explicit no-reshard override, weights are always gathered -- no prefetch needed.
+        if reshard_after_forward is False:
+            should_prefetch = False
+        else:
+            should_prefetch = not pp_enabled and enable_fsdp2_prefetch
+        if should_prefetch:
             fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
             if fsdp2_forward_prefetch_depth > 0:
                 for i in range(len(fsdp_units) - 1):
@@ -891,6 +1417,16 @@ def apply_fsdp2_sharding_recursively(
                     fsdp_units[i].set_modules_to_backward_prefetch(targets)
     else:
         for name, sub_module in module.named_children():
+            if is_multimodal_module_name(name) and module_is_fully_frozen(sub_module):
+                if frozen_multimodal_sharding in ("root", "replicate"):
+                    logger.info(
+                        "Keeping frozen multimodal module %s at FSDP policy %s",
+                        name,
+                        frozen_multimodal_sharding,
+                    )
+                    if frozen_multimodal_sharding == "replicate" and ignored_multimodal_params is not None:
+                        ignored_multimodal_params.update(module_parameters(sub_module))
+                    continue
             apply_fsdp2_sharding_recursively(
                 sub_module,
                 mesh,
@@ -899,7 +1435,10 @@ def apply_fsdp2_sharding_recursively(
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
+                reshard_after_forward,
                 fully_shard_fn=fully_shard_fn,
+                frozen_multimodal_sharding=frozen_multimodal_sharding,
+                ignored_multimodal_params=ignored_multimodal_params,
             )
 
 
@@ -933,13 +1472,17 @@ def get_hf_tp_shard_plan(model):
         model_prefix = "model.language_model"
 
     elif model_cls == Gemma3ForConditionalGeneration:
-        # In transformers v5, Gemma3 uses 'model' instead of 'language_model'
-        if _is_transformers_v5_or_higher():
-            inner_model = model.model
-            model_prefix = "model"
-        else:
+        # Gemma3 releases before the mid-4.x VLM standardization hang the text
+        # tower off a top-level `language_model`; later releases nest everything
+        # under the shared `model` backbone. Resolve structurally via registered
+        # child modules (not `hasattr`) because standardized 4.x releases keep a
+        # deprecated `language_model` alias property on the wrapper class.
+        if any(name == "language_model" for name, _ in model.named_children()):
             inner_model = model.language_model
             model_prefix = "language_model"
+        else:
+            inner_model = model.model
+            model_prefix = "model"
 
     elif model_cls == Llama4ForConditionalGeneration:
         inner_model = model.language_model.model
@@ -1075,6 +1618,10 @@ def translate_to_torch_parallel_style(style: str):
     elif style == "rowwise":
         return RowwiseParallel()
     elif style == "colwise_rep":
+        return ColwiseParallel(output_layouts=Replicate())
+    elif style == "colwise_gather_output":
+        # HF maps this to ColwiseParallel(gather_output=True); gathering the output
+        # is the same as replicating it, so this matches "colwise_rep" above.
         return ColwiseParallel(output_layouts=Replicate())
     elif style == "rowwise_rep":
         return RowwiseParallel(input_layouts=Replicate())
@@ -1262,7 +1809,7 @@ def validate_tp_mesh(model, tp_mesh):
     )
 
 
-def _find_largest_module_list(model: nn.Module) -> Optional[Union[nn.ModuleList, nn.ModuleDict]]:
+def _find_largest_module_list(model: nn.Module) -> Union[nn.ModuleList, nn.ModuleDict] | None:
     """
     Heuristic function to find the largest layer container in a model.
 
@@ -1278,7 +1825,7 @@ def _find_largest_module_list(model: nn.Module) -> Optional[Union[nn.ModuleList,
     Returns:
         Optional[Union[nn.ModuleList, nn.ModuleDict]]: The largest layer container found, or None.
     """
-    largest_module_list: Optional[Union[nn.ModuleList, nn.ModuleDict]] = None
+    largest_module_list: Union[nn.ModuleList, nn.ModuleDict] | None = None
     largest_size = 0
 
     def _is_pp_layer_module_dict(module: nn.ModuleDict) -> bool:
@@ -1315,106 +1862,230 @@ def _find_largest_module_list(model: nn.Module) -> Optional[Union[nn.ModuleList,
     return largest_module_list
 
 
-def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
-    """
-    Extract layers from different model architectures for parallelization.
+def _reduce_attrs(model: nn.Module, fqns: Sequence[str]) -> List[nn.Module]:
+    ans = []
+    for fqn in fqns:
+        parts = fqn.split(".")
+        obj = model
+        for part in parts:
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if obj is not None:
+            ans.append(obj)
+    return ans
 
-    This function handles various model types including vision-language models,
-    causal language models, and multimodal models. It collects both language
-    model layers and vision model layers where applicable.
 
-    Args:
-        model (nn.Module): The model to extract layers from.
+def _extend_layers(layers: List[nn.Module], modules: Sequence[nn.Module]) -> None:
+    for m in modules:
+        if isinstance(m, nn.ModuleList):
+            layers.extend(m)
+        elif isinstance(m, nn.ModuleDict):
+            layers.extend(m.values())
+        else:
+            layers.append(m)
 
-    Returns:
-        List[nn.Module]: A list of all layers that should be parallelized.
-    """
 
-    def _reduce_attrs(model, fqns: List[str]) -> List[nn.Module]:
-        if isinstance(fqns, str):
-            fqns = [fqns]
-        ans = []
-        for fqn in fqns:
-            parts = fqn.split(".")
-            obj = model
-            for part in parts:
-                obj = getattr(obj, part, None)
-                if obj is None:
-                    break
-            if obj is not None:
-                ans.append(obj)
-        return ans
-
-    # Gemma3 layer paths depend on transformers version
-    _gemma3_layers = (
-        ["model.layers", "model.vision_tower.vision_model.encoder.layers"]
-        if _is_transformers_v5_or_higher()
-        else ["language_model.layers", "vision_tower.vision_model.encoder.layers"]
-    )
-    VLM_MODEL_CLS_TO_LAYERS = {
+def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
+    # Each group lists every known location of its layer container across
+    # transformers releases; ``_extract_model_layer_groups`` takes the first
+    # candidate that resolves, so the specs need no version gating. The VLM
+    # module-tree standardization landed mid-4.x (not at the v5 boundary), so
+    # gating paths on ``transformers.__version__`` picks wrong paths for parts
+    # of the 4.x line. The shapes below were verified by meta-instantiating
+    # each class on transformers 4.51.3, 4.57.1, 5.8.1 and 5.12.1.
+    #
+    # Gemma3 tree history:
+    #   pre-standardization (verified 4.51.3):
+    #     `language_model.model.layers` + `vision_tower.vision_model.encoder.layers`
+    #   standardized 4.x (verified 4.57.1):
+    #     `model.language_model.layers` + `model.vision_tower.vision_model.encoder.layers`
+    #   v5 (verified 5.8.1 / 5.12.1): `model.language_model.layers` +
+    #     `model.vision_tower.encoder.layers` (SigLIP tower flattened, no inner
+    #     `vision_model`).
+    # Canonical paths come first: standardized 4.x releases keep deprecated
+    # top-level alias properties (`language_model`, `vision_tower`) that also
+    # resolve, and first-match-wins must not pick the alias.
+    _gemma3_layers = {
+        "language": ["model.language_model.layers", "language_model.model.layers"],
+        "vision": [
+            "model.vision_tower.vision_model.encoder.layers",
+            "model.vision_tower.encoder.layers",
+            "vision_tower.vision_model.encoder.layers",
+        ],
+    }
+    # Qwen2-VL / Qwen2.5-VL tree history:
+    #   pre-standardization (verified 4.51.3): `model.layers` + `visual.blocks`
+    #   standardized 4.x and v5 (verified 4.57.1 / 5.8.1 / 5.12.1):
+    #     `model.language_model.layers` + `model.visual.blocks` (4.x also keeps
+    #     deprecated top-level `language_model` / `visual` alias properties).
+    _qwen2_vl_layers = {
+        "language": ["model.language_model.layers", "model.layers"],
+        "vision": ["model.visual.blocks", "visual.blocks"],
+    }
+    # Llava family: same tree history as Gemma3 (CLIP instead of SigLIP tower),
+    # verified on the same versions for Llava/LlavaNext/LlavaNextVideo/
+    # LlavaOnevision.
+    _llava_layers = {
+        "language": ["model.language_model.layers", "language_model.model.layers"],
+        "vision": [
+            "model.vision_tower.vision_model.encoder.layers",
+            "model.vision_tower.encoder.layers",
+            "vision_tower.vision_model.encoder.layers",
+        ],
+    }
+    return {
         Gemma3ForConditionalGeneration: _gemma3_layers,
-        Qwen2_5_VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
-        Qwen2VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
-        # Note: `model.` is not a mistake here, it's the full fqn
-        SmolVLMForConditionalGeneration: ["model.text_model.layers", "model.vision_model.encoder.layers"],
-        LlavaForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
-        LlavaNextForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
-        LlavaNextVideoForConditionalGeneration: [
-            "model.language_model.layers",
-            "vision_tower.vision_model.encoder.layers",
-        ],
-        LlavaOnevisionForConditionalGeneration: [
-            "model.language_model.layers",
-            "vision_tower.vision_model.encoder.layers",
-        ],
-        Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
+        Qwen2_5_VLForConditionalGeneration: _qwen2_vl_layers,
+        Qwen2VLForConditionalGeneration: _qwen2_vl_layers,
+        # Note: `model.` is not a mistake here, it's the full fqn.
+        SmolVLMForConditionalGeneration: {
+            "language": ["model.text_model.layers"],
+            "vision": ["model.vision_model.encoder.layers"],
+        },
+        LlavaForConditionalGeneration: _llava_layers,
+        LlavaNextForConditionalGeneration: _llava_layers,
+        LlavaNextVideoForConditionalGeneration: _llava_layers,
+        LlavaOnevisionForConditionalGeneration: _llava_layers,
+        Mistral3ForConditionalGeneration: {
+            "language": ["model.language_model.layers"],
+            "vision": [
+                "model.vision_tower.encoder.layers",
+                "model.vision_tower.vision_model.encoder.layers",
+                "model.vision_tower.transformer.layers",
+            ],
+        },
         # FP8 VLM subclass (own FP8 dequant on top of HF's Mistral3). String-keyed
         # because NeMo Auto wraps the class via HFCheckpointingMixin into a new
         # type with the same __name__ but distinct identity, so direct class
         # comparison misses; the elif `model_cls.__name__ in MAP` check catches it.
-        "Mistral3FP8VLMForConditionalGeneration": [
-            "model.language_model.layers",
-            "model.vision_tower.transformer.layers",
-        ],
-        Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
+        "Mistral3FP8VLMForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": [
+                "model.vision_tower.encoder.layers",
+                "model.vision_tower.vision_model.encoder.layers",
+                "model.vision_tower.transformer.layers",
+            ],
+        },
+        # Retrieval text encoder in components.models.ministral_bidirectional.model.
+        "Ministral3BidirectionalModel": {"language": ["layers"]},
+        # Retrieval VLM in components.models.llama_nemotron_vl.model. String-keyed
+        # to keep distributed core from importing optional model-specific deps.
+        "LlamaNemotronVLModel": {
+            "language": ["language_model.layers"],
+            "vision": [
+                "vision_model.vision_model.encoder.layers",
+                "vision_model.encoder.layers",
+            ],
+        },
+        Llama4ForConditionalGeneration: {
+            "language": ["language_model.model.layers"],
+            "vision": ["vision_model.model.layers"],
+        },
         # String-keyed to avoid eagerly importing transformers.models.qwen3_5 at
         # module load (which would defeat test monkeypatches that stub the
         # module before first import).
-        "Qwen3_5ForConditionalGeneration": ["model.language_model.layers", "model.visual.blocks"],
-        Gemma4ForConditionalGeneration: ["model.language_model.layers"],
-        # String fallback in case of class identity mismatch across imports
-        "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
+        "Qwen3_5ForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.visual.blocks"],
+        },
+        "Qwen3_5MoeForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.visual.blocks"],
+        },
+        "Qwen3VLMoeForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.visual.blocks"],
+        },
+        Gemma4ForConditionalGeneration: {"language": ["model.language_model.layers"]},
+        # String fallback in case of class identity mismatch across imports.
+        "Gemma4ForConditionalGeneration": {"language": ["model.language_model.layers"]},
+        "KimiVLForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.vision_tower.encoder.blocks"],
+        },
+        "KimiK25VLForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.vision_tower.encoder.blocks"],
+        },
+        "MiniMaxM3SparseForConditionalGeneration": {
+            "language": ["model.layers"],
+            "vision": ["vision_tower.vision_model.encoder.layers"],
+        },
+        "Step3p7ForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.vision_model.transformer.resblocks"],
+        },
+        "DeepseekV4ForCausalLM": {
+            "language": ["model.layers"],
+            "vision": ["model.vision.blocks"],
+        },
+        # BAGEL (text-to-image + understanding). String-keyed to avoid an
+        # import cycle: parallelizer is core distributed code, the BAGEL
+        # model lives under components/models/bagel/. Lists both the Qwen2
+        # decoder ModuleList and the SigLIP encoder ModuleList so each
+        # member becomes its own FSDP unit (matching upstream BAGEL's
+        # transformer_auto_wrap_policy class set; without the SigLIP
+        # entry, Stage 2 OOMs on 8x80GB because the SigLIP layers sit in
+        # the root FSDP unit's all-gather peak).
+        "BagelForUnifiedMultimodal": {
+            "language": ["model.language_model.model.layers"],
+            "vision": ["model.vit_model.vision_model.encoder.layers"],
+        },
+        "NemotronHForCausalLM": {"language": ["backbone.layers", "model.layers"]},
+        GPT2LMHeadModel: {"language": ["transformer.h"]},
     }
-    LLM_MODEL_CLS_TO_LAYERS = {
-        "NemotronHForCausalLM": ["backbone.layers"],
-        GPT2LMHeadModel: ["transformer.h"],
-    }
 
-    MODEL_CLS_TO_LAYERS = VLM_MODEL_CLS_TO_LAYERS | LLM_MODEL_CLS_TO_LAYERS
 
-    def _extend_layers(layers, modules):
-        for m in modules:
-            if isinstance(m, nn.ModuleList):
-                layers.extend(m)
-            elif isinstance(m, nn.ModuleDict):
-                layers.extend(m.values())
-            else:
-                layers.append(m)
-
+def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
+    """Extract transformer layers grouped by model role."""
     model_cls = type(model)
-    layers: List[nn.Module] = []
-    if model_cls in MODEL_CLS_TO_LAYERS:
-        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
-    elif model_cls.__name__ in MODEL_CLS_TO_LAYERS:
-        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
+    if model_cls.__name__ in {"BiEncoderModel", "CrossEncoderModel", "FSDPBiEncoderModel"}:
+        inner_model = getattr(model, "model", None)
+        if isinstance(inner_model, nn.Module):
+            return _extract_model_layer_groups(inner_model)
+
+    model_cls_to_layer_groups = _get_model_layer_group_specs()
+    layer_group_specs = None
+    if model_cls in model_cls_to_layer_groups:
+        layer_group_specs = model_cls_to_layer_groups[model_cls]
+    elif model_cls.__name__ in model_cls_to_layer_groups:
+        layer_group_specs = model_cls_to_layer_groups[model_cls.__name__]
+
+    layer_groups: Dict[str, List[nn.Module]] = {}
+    if layer_group_specs is not None:
+        for group_name, fqns in layer_group_specs.items():
+            layers: List[nn.Module] = []
+            # Candidate FQNs are alternative locations of the same container
+            # across transformers versions; take the first that resolves so
+            # deprecated alias properties (e.g. top-level `visual` on
+            # standardized 4.x Qwen2-VL aliasing `model.visual`) cannot
+            # double-count layers.
+            for fqn in fqns:
+                _extend_layers(layers, _reduce_attrs(model, [fqn]))
+                if layers:
+                    break
+            if layers:
+                layer_groups[group_name] = layers
+        if not layer_groups:
+            logger.warning(
+                "Layer-group spec for %s resolved no modules: none of the expected FQNs %s exist in the "
+                "model tree (likely transformers version drift). Activation checkpointing and layer-based "
+                "sharding will skip this model until the spec is updated.",
+                model_cls.__name__,
+                {group_name: list(fqns) for group_name, fqns in layer_group_specs.items()},
+            )
     elif hasattr(model, "model") and hasattr(model.model, "layers"):
-        # Default case for all other models (assumed to be a causal LM)
-        if isinstance(model.model.layers, nn.ModuleDict):
-            layers.extend(model.model.layers.values())
-        else:
-            layers.extend(model.model.layers)
+        # Default case for all other models (assumed to be a causal LM).
+        layer_groups["language"] = (
+            list(model.model.layers.values())
+            if isinstance(model.model.layers, nn.ModuleDict)
+            else list(model.model.layers)
+        )
     elif hasattr(model, "layers"):
-        layers.extend(model.layers)
+        layer_groups["language"] = (
+            list(model.layers.values()) if isinstance(model.layers, nn.ModuleDict) else list(model.layers)
+        )
     else:
         # Use heuristic to find the largest layer container in the model.
         logger.warning(f"Unknown model type: {model_cls}. Using heuristic to find transformer layers.")
@@ -1426,20 +2097,186 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
                 f"Unknown model type: {model_cls} and no ModuleList or ModuleDict found in model structure"
             )
 
-        if isinstance(largest_module_list, nn.ModuleDict):
-            layers.extend(largest_module_list.values())
-        else:
-            layers.extend(largest_module_list)
+        layer_groups["unknown"] = (
+            list(largest_module_list.values())
+            if isinstance(largest_module_list, nn.ModuleDict)
+            else list(largest_module_list)
+        )
         logger.info(f"Successfully extracted {len(largest_module_list)} layers using heuristic")
 
-    assert all(isinstance(m, nn.Module) for m in layers), "layers shoudl be nn.Module instances"
-    return layers
+    layers = [layer for group_layers in layer_groups.values() for layer in group_layers]
+    assert all(isinstance(m, nn.Module) for m in layers), "layers should be nn.Module instances"
+    return layer_groups
+
+
+def get_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
+    """Return transformer layers grouped by model role (e.g. ``language``, ``vision``).
+
+    Public accessor over the per-model layer-group mapping used for FSDP wrapping
+    and activation checkpointing, so other components (e.g. the MoE parallelizer)
+    can consume the grouping without importing private helpers.
+
+    Args:
+        model: Root model to extract grouped layers from.
+
+    Returns:
+        Mapping from group name to the list of transformer blocks in that group.
+    """
+    return _extract_model_layer_groups(model)
+
+
+def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
+    """
+    Extract layers from different model architectures for parallelization.
+
+    This compatibility wrapper flattens grouped language/vision/audio layers.
+    New activation-checkpointing code should use ``_extract_model_layer_groups``
+    so scope decisions can be explicit.
+    """
+    layer_groups = _extract_model_layer_groups(model)
+    return [layer for group_layers in layer_groups.values() for layer in group_layers]
+
+
+def _dedupe_layers(layers: Sequence[nn.Module]) -> List[nn.Module]:
+    deduped: List[nn.Module] = []
+    seen: set[int] = set()
+    for layer in layers:
+        layer_id = id(layer)
+        if layer_id in seen:
+            continue
+        seen.add(layer_id)
+        deduped.append(layer)
+    return deduped
+
+
+def _has_trainable_parameters(module: nn.Module) -> bool:
+    return any(param.requires_grad for param in module.parameters(recurse=True))
+
+
+def _filter_layer_groups_for_activation_checkpointing(
+    layer_groups: Dict[str, List[nn.Module]],
+    activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+) -> Tuple[List[nn.Module], Tuple[str, ...]]:
+    """Select trainable activation-checkpointed layers from grouped model layers."""
+    scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
+    all_layers = [layer for group_layers in layer_groups.values() for layer in group_layers]
+
+    selected = []
+    if scopes == ("all",):
+        selected = all_layers
+    else:
+        for scope in scopes:
+            if scope == "multimodal":
+                selected.extend(layer_groups.get("vision", []))
+                selected.extend(layer_groups.get("audio", []))
+            else:
+                selected.extend(layer_groups.get(scope, []))
+
+    selected = _dedupe_layers(selected)
+    skipped_frozen = [layer for layer in selected if not _has_trainable_parameters(layer)]
+    if skipped_frozen:
+        selected = [layer for layer in selected if _has_trainable_parameters(layer)]
+    group_counts = {name: len(layers) for name, layers in layer_groups.items()}
+    selected_counts = {
+        name: sum(1 for layer in layers if any(layer is selected_layer for selected_layer in selected))
+        for name, layers in layer_groups.items()
+    }
+    logger.info(
+        "Activation checkpointing scope %s selected %d/%d trainable layers; groups=%s selected_groups=%s "
+        "skipped_frozen=%d",
+        scopes,
+        len(selected),
+        len(all_layers),
+        group_counts,
+        selected_counts,
+        len(skipped_frozen),
+    )
+    if all_layers and not selected:
+        logger.warning("Activation checkpointing scope %s selected no layers.", scopes)
+    return selected, scopes
+
+
+def _should_use_hf_native_gradient_checkpointing(
+    model: nn.Module,
+    layer_groups: Dict[str, List[nn.Module]],
+    scopes: Tuple[str, ...],
+    *,
+    enable_compile: bool = False,
+) -> bool:
+    """Return whether HF-native gradient checkpointing can preserve AutoModel's AC scope."""
+    if enable_compile or scopes != ("all",):
+        return False
+    if set(layer_groups) != {"language"}:
+        return False
+    language_layers = layer_groups.get("language", [])
+    if not language_layers:
+        return False
+    if any(not _has_trainable_parameters(layer) for layer in language_layers):
+        return False
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer as _HFGradLayer
+    except ImportError:
+        return False
+    return (
+        language_layers[0].__class__.__module__.startswith("transformers.")
+        and isinstance(language_layers[0], _HFGradLayer)
+        and getattr(model, "supports_gradient_checkpointing", False)
+        and hasattr(model, "gradient_checkpointing_enable")
+    )
+
+
+def _kv_sharing_survives_checkpoint_replay(model: nn.Module) -> bool:
+    """Return whether whole-block activation checkpointing is safe for a KV-shared model.
+
+    ``checkpoint_wrapper`` replays a whole decoder block during backward with the
+    arguments the forward saw. Unlike HF's ``GradientCheckpointingLayer.__call__``
+    it cannot drop ``past_key_values`` from that replay, so every layer that
+    writes to a cache writes to it a second time. A KV-shared model then needs
+    both halves to hold:
+
+    * the layers that populate the cache -- the *non*-shared ones, which are what
+      call ``Cache.update()`` -- must not accumulate on the replay, or the
+      recomputed K/V stops matching the forward;
+    * the shared layers must still read the K/V their source layer produced.
+
+    Neither holds for a model backed by an accumulating ``Cache``: the second
+    ``Cache.update()`` grows the entry and backward dies with a
+    ``CheckpointError`` about changed tensor metadata (observed on native HF
+    ``Gemma3nForCausalLM`` with ``use_cache=True``). KV-shared models therefore
+    stay on ``apply_submodule_checkpointing``, which leaves attention unwrapped,
+    by default.
+
+    A model that satisfies both halves opts in by setting the class attribute
+    ``kv_sharing_survives_checkpoint_replay = True``. Gemma4 E2B/E4B qualify: a
+    pass-through holder stands in for the cache, and the shared layers read a
+    separate store that the replay does not disturb (see
+    ``gemma4_moe/model.py``).
+
+    Args:
+        model: The model about to be checkpointed.
+
+    Returns:
+        Whether the model declares its KV sharing safe under whole-block replay.
+    """
+    return bool(getattr(model, "kv_sharing_survives_checkpoint_replay", False))
+
+
+def _uses_custom_moe_modules(model: nn.Module) -> bool:
+    """Return whether ``model`` contains Automodel's grouped custom-MoE layer."""
+    iter_modules = getattr(model, "modules", None)
+    if not callable(iter_modules):
+        return False
+    try:
+        from nemo_automodel.components.moe.layers import MoE
+    except ImportError:
+        return False
+    return any(isinstance(module, MoE) for module in iter_modules())
 
 
 def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
-    tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
     tp_size: int = 1,
 ) -> Dict[str, ParallelStyle]:
     """
@@ -1619,14 +2456,31 @@ def _get_parallel_plan(
             logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
 
     # Nemotron-Flash's forward computes `logits / self.lm_head.weight.norm(p=2, dim=1)`.
-    # Under TP, sharding lm_head turns the weight into a DTensor while `logits` is a
-    # plain tensor (output_layouts=Replicate), and the mixed-operand division raises
-    # "aten.div.Tensor got mixed torch.Tensor and DTensor". Drop lm_head from the plan
-    # so its weight stays replicated and the division stays in plain-tensor space.
+    # The logits and weight norm must therefore either both be plain tensors or both
+    # use the same vocab-sharded DTensor layout.  A replicated-output ColwiseParallel
+    # plan mixes a plain logits tensor with a sharded weight norm, so retain the
+    # historical fallback of dropping that plan.  A vocab-sharded output keeps both
+    # operands aligned and is required under FSDP+TP: leaving lm_head unplanned makes
+    # FSDP expose its weight as a DTensor while the input activation remains local.
     if _is_nemotron_flash_config(getattr(model, "config", None)):
         for k in ("lm_head", "language_model.lm_head"):
-            if model_parallel_plan.pop(k, None) is not None:
-                logger.info("Nemotron-Flash: excluding %s from TP plan to keep lm_head.weight replicated.", k)
+            style = model_parallel_plan.get(k)
+            output_layouts = getattr(style, "output_layouts", ())
+            if not isinstance(output_layouts, (tuple, list)):
+                output_layouts = (output_layouts,)
+            if any(isinstance(layout, Shard) for layout in output_layouts):
+                logger.info("Nemotron-Flash: retaining vocab-sharded %s TP plan.", k)
+            elif model_parallel_plan.pop(k, None) is not None:
+                logger.info("Nemotron-Flash: excluding replicated-output %s from TP plan.", k)
+
+    # EP=1 uses this generic FSDP2 path rather than the dedicated MoE
+    # parallelizer. Apply the same routed-expert ownership validation here so
+    # an explicit/wildcard TP plan cannot silently shard expert or router
+    # modules merely because expert parallelism is disabled.
+    if tp_size > 1 and _uses_custom_moe_modules(model):
+        from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+
+        model_parallel_plan = _validate_moe_tp_plan(model_parallel_plan, model=model)
 
     return model_parallel_plan
 
@@ -1636,11 +2490,11 @@ def _get_parallel_plan(
 def fsdp2_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
-    mp_policy: Optional[MixedPrecisionPolicy] = None,
-    offload_policy: Optional[OffloadPolicy] = None,
+    mp_policy: MixedPrecisionPolicy | None = None,
+    offload_policy: OffloadPolicy | None = None,
     sequence_parallel: bool = False,
     activation_checkpointing: bool = False,
-    tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
     dp_replicate_mesh_name: str = "dp_replicate",
     dp_shard_cp_mesh_name: str = "dp_shard_cp",
     tp_mesh_name: str = "tp",
@@ -1649,7 +2503,11 @@ def fsdp2_strategy_parallelize(
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
-):
+    reshard_after_forward: bool | None = None,
+    activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+    frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+    reapply_trainability: Callable[[nn.Module], None] | None = None,
+) -> nn.Module:
     """
     Apply parallelisms and activation checkpointing to the model.
 
@@ -1680,6 +2538,13 @@ def fsdp2_strategy_parallelize(
             Used when data parallel shard is enabled. Defaults to "dp_shard_cp".
         tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tp".
+        frozen_multimodal_sharding: Whether fully frozen multimodal modules are
+            owned by the root FSDP unit (``"root"``), sharded normally
+            (``"per_layer"``), or excluded from FSDP and copied on every rank
+            (``"replicate"``).
+        reapply_trainability: Optional callback that re-resolves parameter
+            trainability after strategy-specific model surgery and immediately
+            before FSDP construction.
 
     Returns:
         The parallelized model.
@@ -1707,15 +2572,124 @@ def fsdp2_strategy_parallelize(
         enable_fsdp2_prefetch=enable_fsdp2_prefetch,
         fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
         fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
+        reshard_after_forward=reshard_after_forward,
+        activation_checkpointing_scope=activation_checkpointing_scope,
+        frozen_multimodal_sharding=frozen_multimodal_sharding,
+        reapply_trainability=reapply_trainability,
     )
+
+
+def _megatron_fsdp_compat_kwargs(
+    shard_fn,
+    *,
+    grad_reduce_in_fp32: bool,
+    preserve_fp32_weights: bool,
+    check_for_nan_in_grad: bool,
+    report_nan_in_param_grad: bool,
+) -> Dict[str, Any]:
+    """Translate the config precision controls to the Megatron-FSDP 0.5.0 API.
+
+    megatron-fsdp==0.5.0, the only supported release, expresses precision
+    through a ``MixedPrecisionPolicy`` plus a more expensive per-parameter NaN
+    reporter. The reporter stays a separate opt-in rather than being silently
+    enabled from the legacy buffer-check setting; because 0.5.0 has no
+    buffer-level NaN check at all, a truthy ``check_for_nan_in_grad`` is
+    dropped with a one-time warning that points at ``report_nan_in_param_grad``
+    as the opt-in replacement. Any other ``fully_shard`` signature — older or
+    newer releases alike — fails loudly instead of guessing a translation.
+    """
+    try:
+        parameters = inspect.signature(shard_fn).parameters
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("cannot determine the installed Megatron-FSDP fully_shard API") from exc
+
+    required_names = {"mixed_precision_policy", "report_nan_in_param_grad"}
+    if not required_names.issubset(parameters):
+        raise RuntimeError(
+            "unsupported Megatron-FSDP fully_shard API: NeMo Automodel requires megatron-fsdp==0.5.0, "
+            f"whose signature has the arguments {sorted(required_names)!r}; got {sorted(parameters)!r}"
+        )
+
+    global _megatron_fsdp_nan_check_noop_warned
+    if check_for_nan_in_grad and not _megatron_fsdp_nan_check_noop_warned:
+        _megatron_fsdp_nan_check_noop_warned = True
+        logger.warning(
+            "check_for_nan_in_grad=True is a no-op with megatron-fsdp==0.5.0, which removed the "
+            "legacy buffer-level NaN check: gradient NaN checking is now DISABLED. Set "
+            "report_nan_in_param_grad=True to restore per-parameter gradient NaN checking."
+        )
+    return {
+        "mixed_precision_policy": MegatronFSDPMixedPrecisionPolicy(
+            main_params_dtype=torch.float32 if preserve_fp32_weights else None,
+            main_grads_dtype=torch.float32 if grad_reduce_in_fp32 else None,
+            # In megatron-fsdp 0.5.0, None makes communication use the main
+            # gradient dtype, matching the legacy grad_reduce_in_fp32 flag.
+            grad_comm_dtype=None,
+        ),
+        "report_nan_in_param_grad": report_nan_in_param_grad,
+    }
+
+
+def _derive_megatron_fsdp_unit_modules(model: nn.Module) -> list[type[nn.Module]]:
+    """Derive the MegatronFSDP wrap classes from a model's ``_no_split_modules``.
+
+    Used when a config does not specify ``megatron_fsdp_unit_modules``. HF
+    ``PreTrainedModel`` and the NeMo custom models both define ``_no_split_modules``
+    as a list of block class *names* (for example ``["LlamaDecoderLayer"]``).
+    Walking ``model.modules()`` and matching ``type(module).__name__`` against those
+    names resolves the actual instantiated classes, so the result is correct for
+    both the HF backend and the NeMo-custom backend (which use distinct classes that
+    share the same name). For VLM/MoE models whose top-level ``_no_split_modules``
+    lists several block classes (for example vision and language towers), every
+    matching class found anywhere in the module tree is collected.
+
+    Args:
+        model: The (already TP-parallelized) model to be wrapped by MegatronFSDP.
+
+    Returns:
+        The de-duplicated list of submodule classes to wrap as MegatronFSDP units,
+        in module-traversal order.
+
+    Raises:
+        ValueError: If the model does not expose a non-empty ``_no_split_modules``,
+            or if none of those names match an instantiated submodule. Raised with
+            an actionable message instead of letting MegatronFSDP later fail with
+            ``ZeroDivisionError`` (``total_fsdp_module=0``) when zero modules are wrapped.
+    """
+    no_split_modules = getattr(model, "_no_split_modules", None)
+    if not no_split_modules:
+        raise ValueError(
+            "distributed.megatron_fsdp_unit_modules was not provided and the model does not define a "
+            "non-empty '_no_split_modules' to derive them from. Set distributed.megatron_fsdp_unit_modules "
+            "explicitly to the transformer block class path(s) to wrap as MegatronFSDP units."
+        )
+    no_split_names = set(no_split_modules)
+    derived: list[type[nn.Module]] = []
+    seen: set[type[nn.Module]] = set()
+    for submodule in model.modules():
+        cls = type(submodule)
+        if cls.__name__ in no_split_names and cls not in seen:
+            seen.add(cls)
+            derived.append(cls)
+    if not derived:
+        raise ValueError(
+            "distributed.megatron_fsdp_unit_modules was not provided and none of the model's "
+            f"_no_split_modules {sorted(no_split_names)} matched an instantiated submodule; cannot derive "
+            "MegatronFSDP unit modules. Set distributed.megatron_fsdp_unit_modules explicitly."
+        )
+    logger.info(
+        "Auto-derived MegatronFSDP unit modules from _no_split_modules: %s",
+        [cls.__name__ for cls in derived],
+    )
+    return derived
 
 
 def megatron_fsdp_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
     optimizer=None,
-    megatron_fsdp_unit_modules: Optional[List[str]] = None,
-    tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
+    megatron_fsdp_unit_modules: List[str] | None = None,
+    tp_shard_plan: Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]] | None = None,
     zero_dp_strategy: int = 3,
     init_fsdp_with_meta_device: bool = False,
     grad_reduce_in_fp32: bool = False,
@@ -1723,6 +2697,7 @@ def megatron_fsdp_strategy_parallelize(
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     check_for_nan_in_grad: bool = True,
+    report_nan_in_param_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -1731,6 +2706,7 @@ def megatron_fsdp_strategy_parallelize(
     fsdp_double_buffer: bool = False,
     dp_shard_dim: str = "dp",
     tp_dim: str = "tp",
+    reapply_trainability: Callable[[nn.Module], None] | None = None,
 ):
     """
     Apply tensor/data parallelism (MegatronFSDP) and optional activation-checkpointing to the model.
@@ -1739,9 +2715,10 @@ def megatron_fsdp_strategy_parallelize(
         model: The model to be parallelized.
         device_mesh (DeviceMesh): The device mesh describing the physical devices
             used for distributed training.
-        megatron_fsdp_unit_modules (Optional[List[str]]): Names of sub-modules that should
-            become individual MegatronFSDP units. If None, the full model is wrapped as
-            a single unit.
+        megatron_fsdp_unit_modules (Optional[List[str]]): Class paths of the sub-modules that
+            should become individual MegatronFSDP units. When None or empty, the wrap classes
+            are auto-derived from the model's ``_no_split_modules`` (see
+            :func:`_derive_megatron_fsdp_unit_modules`).
         tp_shard_plan (Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]]):
             A tensor-parallel sharding plan.
             Keys are module names; values specify the parallel style to apply
@@ -1758,8 +2735,17 @@ def megatron_fsdp_strategy_parallelize(
             backward computation.
         overlap_param_gather (bool): If True, overlap parameter gathering with
             forward computation.
-        check_for_nan_in_grad (bool): Whether to check gradients for NaNs/Infs
-            before applying the optimizer step.
+        check_for_nan_in_grad (bool): Legacy buffer-level gradient NaN check.
+            BREAKING CHANGE on megatron-fsdp 0.5.0: this flag is a no-op,
+            preserved only for config compatibility. 0.5.0 removed the
+            buffer-level NaN check entirely, so gradient NaN checking is now OFF
+            regardless of this value; a truthy value is dropped with a one-time
+            warning per process. Enable ``report_nan_in_param_grad`` to restore
+            gradient NaN checking.
+        report_nan_in_param_grad (bool): Whether Megatron-FSDP should perform
+            its precise per-parameter gradient NaN check. This is the 0.5.0
+            replacement for ``check_for_nan_in_grad`` and is disabled by default
+            because it can significantly reduce training throughput.
         average_in_collective (bool): Perform gradient averaging inside the
             collective operation instead of dividing afterward.
         disable_bucketing (bool): Disable gradient bucketing; gradients are
@@ -1776,6 +2762,9 @@ def megatron_fsdp_strategy_parallelize(
             Defaults to "dp".
         tp_dim (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tp".
+        reapply_trainability: Optional callback that re-resolves parameter
+            trainability after tensor-parallel surgery and immediately before
+            Megatron-FSDP construction.
 
     NOTE: The passed-in model should preferably reside on the meta device.
     Otherwise, ensure the model fits into available GPU or CPU memory.
@@ -1801,8 +2790,8 @@ def megatron_fsdp_strategy_parallelize(
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
 
-    # Import MegatronFSDP unit modules specified by the user.
-    megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
+    if reapply_trainability is not None:
+        reapply_trainability(model)
 
     # MegatronFSDP requires a sharded DP dimension to create its param/grad buffers.
     # In practice, configurations like world_size=2,tp=2 -> dp=1 frequently hit
@@ -1824,6 +2813,17 @@ def megatron_fsdp_strategy_parallelize(
                 model = model.to("cuda")
         return model, optimizer
 
+    # Resolve the MegatronFSDP unit (wrap) modules (only needed on the wrapping path).
+    # When the config specifies them, import the class paths as-is. Otherwise derive
+    # them from the model's `_no_split_modules` so the real instantiated block classes
+    # are wrapped regardless of backend (HF or NeMo-custom); a mismatched hard-coded
+    # class path would otherwise wrap zero modules and MegatronFSDP would raise a
+    # ZeroDivisionError (total_fsdp_module=0).
+    if megatron_fsdp_unit_modules:
+        megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
+    else:
+        megatron_fsdp_unit_modules = _derive_megatron_fsdp_unit_modules(model)
+
     # Wrap model with MegatronFSDP.
     # When an optimizer is provided, use the combined fully_shard which handles
     # both model wrapping and optimizer sharding in one step.
@@ -1838,11 +2838,8 @@ def megatron_fsdp_strategy_parallelize(
         tp_dim=tp_dim,
         zero_dp_strategy=zero_dp_strategy,
         init_model_with_meta_device=init_fsdp_with_meta_device,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
-        check_for_nan_in_grad=check_for_nan_in_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
@@ -1851,8 +2848,26 @@ def megatron_fsdp_strategy_parallelize(
         fsdp_double_buffer=fsdp_double_buffer,
     )
     if optimizer is not None:
+        fsdp_kwargs.update(
+            _megatron_fsdp_compat_kwargs(
+                megatron_fsdp_fully_shard,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+                preserve_fp32_weights=preserve_fp32_weights,
+                check_for_nan_in_grad=check_for_nan_in_grad,
+                report_nan_in_param_grad=report_nan_in_param_grad,
+            )
+        )
         model, optimizer = megatron_fsdp_fully_shard(module=model, optimizer=optimizer, **fsdp_kwargs)
     else:
+        fsdp_kwargs.update(
+            _megatron_fsdp_compat_kwargs(
+                megatron_fsdp_fully_shard_model,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+                preserve_fp32_weights=preserve_fp32_weights,
+                check_for_nan_in_grad=check_for_nan_in_grad,
+                report_nan_in_param_grad=report_nan_in_param_grad,
+            )
+        )
         model = megatron_fsdp_fully_shard_model(module=model, **fsdp_kwargs)
         model._replace_param_with_distributed_if_needed()
 

@@ -15,25 +15,32 @@
 """Example launcher for dLLM (diffusion LLM) SFT fine-tuning.
 
 Usage (single GPU):
-    python examples/dllm_sft/finetune.py -c examples/dllm_sft/mdlm_sft.yaml
+    python examples/dllm_sft/finetune.py -c examples/dllm_sft/llada_sft.yaml
 
 Usage (multi-GPU):
     python -m torch.distributed.run --nproc-per-node=8 \
-        examples/dllm_sft/finetune.py -c examples/dllm_sft/mdlm_sft.yaml
+        examples/dllm_sft/finetune.py -c examples/dllm_sft/llada_sft.yaml
 
-When run without ``-c`` it defaults to the MDLM YAML.
+When run without ``-c`` it defaults to the LLaDA (MDLM) YAML.
 """
 
 from __future__ import annotations
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
+from nemo_automodel.recipes.dllm.train_ft import DiffusionGemmaSFTRecipe, DiffusionLMSFTRecipe
 
 
-def main(default_config_path="examples/dllm_sft/mdlm_sft.yaml") -> None:
-    """Entry-point for dLLM SFT training."""
+def main(default_config_path="examples/dllm_sft/llada_sft.yaml") -> None:
+    """Entry-point for dLLM SFT training.
+
+    Selects the recipe class from the config's ``recipe`` field
+    (``DiffusionGemmaSFTRecipe`` for ``diffusion_gemma`` block diffusion,
+    otherwise the default :class:`DiffusionLMSFTRecipe`).
+    """
     cfg = parse_args_and_load_config(default_config_path)
-    recipe = DiffusionLMSFTRecipe(cfg)
+    recipe_name = cfg.get("recipe", "DiffusionLMSFTRecipe")
+    recipe_cls = DiffusionGemmaSFTRecipe if recipe_name == "DiffusionGemmaSFTRecipe" else DiffusionLMSFTRecipe
+    recipe = recipe_cls(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 

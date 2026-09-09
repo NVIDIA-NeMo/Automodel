@@ -13,7 +13,9 @@
 # limitations under the License.
 from __future__ import annotations
 
+import io
 import json
+from types import SimpleNamespace
 from typing import Dict, List
 
 import pytest
@@ -138,20 +140,47 @@ def test_make_cord_v2_dataset(monkeypatch, stub_json2token, ground_key, wrapper)
         assert call["sort_json_key"] is True
 
 
-def test_make_medpix_dataset(monkeypatch):
-    """End-to-end sanity check for `make_medpix_dataset`."""
+def test_cord_v2_dataset_config_limits_samples(monkeypatch):
+    requested_splits = []
     fake_ds = [
         {
-            "image_id": "medpix_001.jpg",
-            "question": "What is shown in this medical image?",
-            "answer": "This is a chest X-ray showing normal lung fields.",
-        },
-        {
-            "image_id": "medpix_002.jpg",
-            "question": "Describe the findings in this image.",
-            "answer": "The image shows a fracture in the left femur.",
-        },
+            "image": "img_1337",
+            "ground_truth": json.dumps({"gt_parse": {"answer": 42}}),
+        }
     ]
+
+    def load_dataset(_path_or_dataset, *, split):
+        requested_splits.append(split)
+        return fake_ds
+
+    monkeypatch.setattr(ds, "load_dataset", load_dataset)
+
+    result = ds.CordV2DatasetConfig(limit_dataset_samples=100).build()
+
+    assert requested_splits == ["train[:100]"]
+    assert len(result) == 1
+
+
+def test_make_medpix_dataset(monkeypatch):
+    """End-to-end sanity check for `make_medpix_dataset`.
+
+    ``make_medpix_dataset`` defers formatting via ``with_transform`` and decodes
+    images lazily, so ``load_dataset`` is mocked with a real HF ``Dataset`` whose
+    ``image_id`` is an ``Image`` column (matching the production dataset).
+    """
+    from datasets import Dataset, Features, Value
+    from datasets import Image as HFImage
+
+    images = [Image.new("RGB", (8, 8), (255, 0, 0)), Image.new("RGB", (8, 8), (0, 255, 0))]
+    questions = ["What is shown in this medical image?", "Describe the findings in this image."]
+    answers = [
+        "This is a chest X-ray showing normal lung fields.",
+        "The image shows a fracture in the left femur.",
+    ]
+    fake_ds = Dataset.from_dict(
+        {"image_id": images, "question": questions, "answer": answers},
+        features=Features({"image_id": HFImage(), "question": Value("string"), "answer": Value("string")}),
+    )
 
     # Patch `load_dataset` so no network call is issued.
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: fake_ds)
@@ -159,23 +188,25 @@ def test_make_medpix_dataset(monkeypatch):
     result = ds.make_medpix_dataset()
 
     assert len(result) == len(fake_ds)
-    for sample, src in zip(result, fake_ds, strict=True):
+    for i in range(len(result)):
+        sample = result[i]
         assert list(sample) == ["conversation"]
 
         conversation = sample["conversation"]
         assert len(conversation) == 2
 
-        # user turn
+        # user turn -- image decode is deferred, so it surfaces as a lazy PIL handle
         user_turn = conversation[0]
         assert user_turn["role"] == "user"
-        assert user_turn["content"][0] == {"type": "image", "image": src["image_id"]}
-        assert user_turn["content"][1] == {"type": "text", "text": src["question"]}
+        image_item = user_turn["content"][0]
+        assert image_item["type"] == "image"
+        assert isinstance(image_item["image"], Image.Image)
+        assert user_turn["content"][1] == {"type": "text", "text": questions[i]}
 
         # assistant turn
         assistant_turn = conversation[1]
         assert assistant_turn["role"] == "assistant"
-        assistant_payload = assistant_turn["content"][0]
-        assert assistant_payload == {"type": "text", "text": src["answer"]}
+        assert assistant_turn["content"][0] == {"type": "text", "text": answers[i]}
 
 
 class _FakeHFDataset:
@@ -364,64 +395,104 @@ class TestMakeTulu3MagicoderTextMixDataset:
         assert len(result) == 3
 
 
-def test_make_cv17_dataset(monkeypatch):
-    """End-to-end sanity check for `make_cv17_dataset`."""
+class TestMakeTulu3Dataset:
+    """End-to-end checks for ``make_tulu3_dataset``.
 
-    # Mock dataset with audio data and extra columns to test column removal
-    class MockDataset:
-        def __init__(self, data):
-            self.data = data
-            self.column_names = ["audio", "transcription", "extra_col1", "extra_col2", "unwanted_col"]
+    The function loads ``allenai/tulu-3-sft-mixture`` directly from the Hub and
+    delegates row conversion to ``_convert_sharegpt_to_conversation`` — the same
+    helper the meta-JSON path uses — so the data composition matches loading a
+    dumped Tulu-3 JSONL through ``make_meta_dataset``: no turn cap, ``system``
+    turns preserved, and every row kept in split order. ``load_dataset`` is mocked
+    with a real HF ``Dataset`` whose rows carry a ``messages`` field (matching the
+    production schema).
+    """
 
-        def remove_columns(self, columns_to_remove):
-            # Simulate column removal
-            expected_removed = ["extra_col1", "extra_col2", "unwanted_col"]
-            assert set(columns_to_remove) == set(expected_removed)
-            return self.data
+    def _fake_tulu(self, rows):
+        from datasets import Dataset
 
-        def __iter__(self):
-            return iter(self.data)
+        return Dataset.from_list(rows)
 
-    fake_audio_data = [
-        {
-            "audio": {"array": [0.1, 0.2, 0.3, -0.1, -0.2], "sampling_rate": 16000},
-            "transcription": "Merhaba, nasılsınız?",
-        },
-        {
-            "audio": {"array": [0.5, -0.3, 0.8, 0.2, -0.1], "sampling_rate": 16000},
-            "transcription": "Bu bir test cümlesidir.",
-        },
-    ]
+    def test_happy_path_text_only(self, monkeypatch):
+        rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            },
+        ]
+        monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: self._fake_tulu(rows))
 
-    mock_dataset = MockDataset(fake_audio_data)
+        result = ds.make_tulu3_dataset()
 
-    # Patch `load_dataset` so no network call is issued
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: mock_dataset)
+        assert len(result) == 1
+        sample = result[0]
+        assert list(sample) == ["conversation"]
+        conv = sample["conversation"]
+        assert conv[0] == {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        assert conv[1] == {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}
+        # No image entries anywhere (text-only training).
+        for turn in conv:
+            for block in turn["content"]:
+                assert block["type"] == "text"
 
-    result = ds.make_cv17_dataset()
+    def test_system_turns_preserved_like_meta_path(self, monkeypatch):
+        """``_convert_sharegpt_to_conversation`` maps system/user/assistant, so a
+        ``system`` turn reaches the chat template instead of being dropped."""
+        rows = [
+            {
+                "messages": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            }
+        ]
+        monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: self._fake_tulu(rows))
+        result = ds.make_tulu3_dataset()
+        assert len(result) == 1
+        conv = result[0]["conversation"]
+        assert [t["role"] for t in conv] == ["system", "user", "assistant"]
+        assert conv[0]["content"] == [{"type": "text", "text": "You are helpful."}]
 
-    assert len(result) == len(fake_audio_data)
-    for sample, src in zip(result, fake_audio_data, strict=True):
-        assert set(sample.keys()) == {"conversation", "audio"}
+    def test_no_turn_cap_long_conversation_kept(self, monkeypatch):
+        """Unlike the tulu-magicoder mix builder, there is no ``max_turns`` cap:
+        long multi-turn conversations are retained in full."""
+        long_msgs = [
+            {"role": "user", "content": f"u{i}"} if i % 2 == 0 else {"role": "assistant", "content": f"a{i}"}
+            for i in range(40)
+        ]
+        rows = [{"messages": long_msgs}]
+        monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: self._fake_tulu(rows))
+        result = ds.make_tulu3_dataset()
+        assert len(result) == 1
+        assert len(result[0]["conversation"]) == 40
 
-        # Test conversation structure
-        conversation = sample["conversation"]
-        assert len(conversation) == 2
+    def test_every_row_kept_in_order(self, monkeypatch):
+        """No rows are filtered out; order matches the source split."""
+        rows = [
+            {"messages": [{"role": "user", "content": f"u{i}"}, {"role": "assistant", "content": f"a{i}"}]}
+            for i in range(5)
+        ]
+        monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: self._fake_tulu(rows))
+        result = ds.make_tulu3_dataset()
+        assert len(result) == 5
+        texts = [r["conversation"][0]["content"][0]["text"] for r in result]
+        assert texts == ["u0", "u1", "u2", "u3", "u4"]
 
-        # Test user turn
-        user_turn = conversation[0]
-        assert user_turn["role"] == "user"
-        assert user_turn["content"] == "<|endoftext11|>Transcribe the Turkish audio clip."
+    def test_extra_kwargs_ignored(self, monkeypatch):
+        """Recipe-forwarded keys like ``truncate`` are absorbed, not passed to load_dataset."""
+        rows = [{"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}]
 
-        # Test assistant turn
-        assistant_turn = conversation[1]
-        assert assistant_turn["role"] == "assistant"
-        assert assistant_turn["content"] == src["transcription"]
+        def _fake_load_dataset(path_or_dataset, split="train"):
+            # Signature intentionally does NOT accept **kwargs: if make_tulu3_dataset
+            # forwarded truncate/split here, this would raise TypeError.
+            assert path_or_dataset == "allenai/tulu-3-sft-mixture"
+            return self._fake_tulu(rows)
 
-        # Test audio data processing
-        audio_array, sampling_rate = sample["audio"]
-        assert audio_array == src["audio"]["array"]
-        assert sampling_rate == src["audio"]["sampling_rate"]
+        monkeypatch.setattr(ds, "load_dataset", _fake_load_dataset)
+        result = ds.make_tulu3_dataset(truncate=False, split="train")
+        assert len(result) == 1
 
 
 def test_make_unimm_chat_dataset(monkeypatch):
@@ -627,13 +698,79 @@ class TestConvertSharegptToConversation:
         """Messages with unrecognized roles are silently skipped."""
         example = {
             "messages": [
+                {"role": "tool", "content": "{}"},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+            ],
+        }
+        result = ds._convert_sharegpt_to_conversation(example)
+        assert [t["role"] for t in result["conversation"]] == ["user", "assistant"]
+
+    def test_system_turn_preserved(self):
+        """A ``system`` turn is kept so the chat template can render it."""
+        example = {
+            "messages": [
                 {"role": "system", "content": "You are helpful."},
                 {"role": "user", "content": "Hello"},
                 {"role": "assistant", "content": "Hi"},
             ],
         }
         result = ds._convert_sharegpt_to_conversation(example)
-        assert len(result["conversation"]) == 2
+        conv = result["conversation"]
+        assert [t["role"] for t in conv] == ["system", "user", "assistant"]
+        assert conv[0] == {"role": "system", "content": [{"type": "text", "text": "You are helpful."}]}
+
+    def test_system_turn_media_placeholder_not_expanded(self):
+        """Media placeholders are only parsed in user turns, so an ``<image>``
+        inside a system turn stays literal text and consumes no image."""
+        example = {
+            "messages": [
+                {"role": "system", "content": "Describe the <image> carefully."},
+                {"role": "user", "content": "<image>"},
+                {"role": "assistant", "content": "A cat."},
+            ],
+            "images": ["cat.png"],
+        }
+        result = ds._convert_sharegpt_to_conversation(example)
+        conv = result["conversation"]
+        assert conv[0]["content"] == [{"type": "text", "text": "Describe the <image> carefully."}]
+        assert conv[1]["content"] == [{"type": "image", "image": "cat.png"}]
+
+    def test_custom_system_tag(self):
+        """The system role is remappable like the user and assistant roles."""
+        example = {
+            "conversations": [
+                {"from": "sys", "value": "Be terse."},
+                {"from": "human", "value": "Hi"},
+                {"from": "gpt", "value": "Hello"},
+            ],
+        }
+        result = ds._convert_sharegpt_to_conversation(
+            example,
+            columns={"messages": "conversations"},
+            tags={
+                "role_tag": "from",
+                "content_tag": "value",
+                "user_tag": "human",
+                "assistant_tag": "gpt",
+                "system_tag": "sys",
+            },
+        )
+        conv = result["conversation"]
+        assert [t["role"] for t in conv] == ["system", "user", "assistant"]
+        assert conv[0]["content"] == [{"type": "text", "text": "Be terse."}]
+
+    def test_custom_system_tag_leaves_default_system_unmapped(self):
+        """With a remapped ``system_tag``, a literal "system" role is unknown."""
+        example = {
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+            ],
+        }
+        result = ds._convert_sharegpt_to_conversation(example, tags={"system_tag": "sys"})
+        assert [t["role"] for t in result["conversation"]] == ["user", "assistant"]
 
     def test_mm_inputs_meta_passthrough(self):
         """mm_inputs_meta is passed through to the output."""
@@ -706,6 +843,44 @@ class TestMakeMetaDataset:
         # Second example: text only
         conv1 = result[1]["conversation"]
         assert conv1[0]["content"] == [{"type": "text", "text": "Hello"}]
+
+    def test_system_turns_survive_the_meta_path(self, tmp_path):
+        """A JSONL row carrying a system turn keeps it end to end.
+
+        Rows with and without a system turn are mixed on purpose: the dataset
+        stays the same length and only the annotated row grows a system turn.
+        """
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "system", "content": "Answer in French."},
+                        {"role": "user", "content": "Hello"},
+                        {"role": "assistant", "content": "Bonjour"},
+                    ],
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "Hello"},
+                        {"role": "assistant", "content": "Hi there"},
+                    ],
+                }
+            )
+            + "\n",
+        )
+        meta_file = tmp_path / "dataset_info.json"
+        meta_file.write_text(json.dumps({"my_dataset": {"file_name": "train.jsonl"}}))
+
+        result = ds.make_meta_dataset(str(meta_file))
+
+        assert len(result) == 2
+        assert [t["role"] for t in result[0]["conversation"]] == ["system", "user", "assistant"]
+        assert result[0]["conversation"][0]["content"] == [{"type": "text", "text": "Answer in French."}]
+        assert [t["role"] for t in result[1]["conversation"]] == ["user", "assistant"]
 
     def test_json_array_file(self, tmp_path):
         """Load from a plain JSON array file."""
@@ -1265,6 +1440,111 @@ class TestPreloadMedia:
         with pytest.raises(FileNotFoundError):
             vlm_utils._preload_media(example)
 
+    # ---- pre-extracted frame sequence (video value is a list of image paths) ----
+
+    def _make_frame_paths(self, tmp_path, n):
+        """Create *n* tiny frame images on disk and return their paths."""
+        paths = []
+        for i in range(n):
+            frame = Image.new("RGB", (4, 4), color=(i, 0, 0))
+            path = tmp_path / f"frame_{i}.png"
+            frame.save(str(path))
+            paths.append(str(path))
+        return paths
+
+    def _make_frame_sequence_example(self, paths, **extra_item_fields):
+        """Build a conversation example whose video content is a frame path list."""
+        return {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": paths, **extra_item_fields},
+                        {"type": "text", "text": "Describe."},
+                    ],
+                },
+            ],
+        }
+
+    def test_frame_sequence_loaded_and_padded(self, tmp_path):
+        """Odd frame count is padded to temporal_patch_size=2 by repeating the last frame."""
+        paths = self._make_frame_paths(tmp_path, 5)
+        example = self._make_frame_sequence_example(paths)
+
+        result = vlm_utils._preload_media(example)
+        loaded = result["conversation"][0]["content"][0]["video"]
+        assert isinstance(loaded, list)
+        # 5 frames -> padded to 6 (default temporal_patch_size=2)
+        assert len(loaded) == 6
+        assert all(isinstance(f, Image.Image) for f in loaded)
+        assert all(f.mode == "RGB" for f in loaded)
+        # Padding repeats the last frame
+        assert loaded[5] is loaded[4]
+
+    def test_frame_sequence_no_padding_when_aligned(self, tmp_path):
+        """Even frame count needs no padding."""
+        paths = self._make_frame_paths(tmp_path, 4)
+        example = self._make_frame_sequence_example(paths)
+
+        result = vlm_utils._preload_media(example)
+        loaded = result["conversation"][0]["content"][0]["video"]
+        assert len(loaded) == 4
+
+    def test_frame_sequence_respects_processor_temporal_patch_size(self, tmp_path):
+        """temporal_patch_size from the processor drives the padding amount."""
+        paths = self._make_frame_paths(tmp_path, 5)
+        example = self._make_frame_sequence_example(paths)
+        processor = SimpleNamespace(video_processor=SimpleNamespace(temporal_patch_size=4))
+
+        result = vlm_utils._preload_media(example, processor=processor)
+        loaded = result["conversation"][0]["content"][0]["video"]
+        # 5 frames -> padded to 8 (temporal_patch_size=4)
+        assert len(loaded) == 8
+        assert loaded[5] is loaded[4] and loaded[6] is loaded[4] and loaded[7] is loaded[4]
+
+    def test_frame_sequence_metadata_from_item_fps(self, tmp_path):
+        """preserve_video_metadata=True stores _video_fps from the item and padded _frame_indices."""
+        paths = self._make_frame_paths(tmp_path, 5)
+        example = self._make_frame_sequence_example(paths, fps=2.0)
+
+        result = vlm_utils._preload_media(example, preserve_video_metadata=True)
+        item = result["conversation"][0]["content"][0]
+        assert item["_video_fps"] == 2.0
+        # Indices padded by repeating the last index, mirroring the frames
+        assert item["_frame_indices"] == [0, 1, 2, 3, 4, 4]
+        assert len(item["video"]) == len(item["_frame_indices"])
+
+    def test_frame_sequence_metadata_fps_from_processor(self, tmp_path):
+        """fps falls back to the processor's video_processor when absent on the item."""
+        paths = self._make_frame_paths(tmp_path, 4)
+        example = self._make_frame_sequence_example(paths)
+        processor = SimpleNamespace(video_processor=SimpleNamespace(fps=1.0))
+
+        result = vlm_utils._preload_media(example, processor=processor, preserve_video_metadata=True)
+        item = result["conversation"][0]["content"][0]
+        assert item["_video_fps"] == 1.0
+        assert item["_frame_indices"] == [0, 1, 2, 3]
+
+    def test_frame_sequence_fps_missing_raises(self, tmp_path):
+        """ValueError when metadata is requested but fps cannot be resolved."""
+        paths = self._make_frame_paths(tmp_path, 4)
+        example = self._make_frame_sequence_example(paths)
+
+        with pytest.raises(ValueError, match="fps is required"):
+            vlm_utils._preload_media(example, preserve_video_metadata=True)
+
+    def test_frame_sequence_no_metadata_without_flag(self, tmp_path):
+        """Without preserve_video_metadata, no fps is needed and no metadata keys are set."""
+        paths = self._make_frame_paths(tmp_path, 3)
+        example = self._make_frame_sequence_example(paths)
+
+        result = vlm_utils._preload_media(example)
+        item = result["conversation"][0]["content"][0]
+        assert "_video_fps" not in item
+        assert "_frame_indices" not in item
+        # Frames still loaded and padded
+        assert len(item["video"]) == 4
+
 
 # ---------------------------------------------------------------------------
 # Tests for _read_video_frames
@@ -1637,380 +1917,260 @@ class TestRobustDatasetWrapperFakeImageInjection:
         assert original_conv[0]["content"][0]["type"] == "text"
 
 
-# ---------------------------------------------------------------------------
-# HF audio ASR dataset builder (Qwen3-Omni)
-# ---------------------------------------------------------------------------
-import io as _io
-import sys as _sys
+class _FakeProcessor:
+    """Minimal processor stand-in for PreTokenizedDatasetWrapper tests."""
 
-import numpy as _np
-import soundfile as _sf
+    def apply_chat_template(self, conversations, tokenize=False):
+        return ["rendered text"]
 
+    def __call__(self, **kwargs):
+        import torch
 
-def _make_wav_bytes(sampling_rate=16000, duration_seconds=0.5, frequency_hz=440.0):
-    """Generate a short mono WAV blob for synthetic tests."""
-    t = _np.linspace(0, duration_seconds, int(sampling_rate * duration_seconds), endpoint=False)
-    waveform = 0.1 * _np.sin(2 * _np.pi * frequency_hz * t).astype(_np.float32)
-    buf = _io.BytesIO()
-    _sf.write(buf, waveform, sampling_rate, format="WAV", subtype="PCM_16")
-    return buf.getvalue()
+        return {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1]]),
+        }
 
 
-def _SyntheticHFRows(rows):
-    """Build a real HF ``Dataset`` from a list of ``{audio: {bytes,path}, text}`` rows.
+class TestPreTokenizedDatasetWrapperInjectFakeImages:
+    """The ``inject_fake_images`` flag gates fake-image injection for pure-text samples."""
 
-    The audio column is stored as a plain ``struct<bytes, path>`` (no ``Audio``
-    feature), because HF's ``Audio.encode_example`` requires ``torchcodec`` even
-    for ``decode=False`` and that is absent from this env. The builder's
-    downstream ``cast_column(audio, Audio(decode=False))`` is monkey-patched
-    away below; the storage layout already matches what the builder's lazy
-    ``with_transform`` callback consumes, so the cast is functionally a no-op.
+    def _patch_pipeline(self, monkeypatch):
+        """Stub out the heavy media/tokenization helpers used by ``__getitem__``."""
+        import torch
+
+        import nemo_automodel.components.datasets.vlm.collate_fns as collate_fns
+        import nemo_automodel.components.datasets.vlm.fake_image as fake_image
+
+        monkeypatch.setattr(ds, "_preload_media", lambda example, processor, **kw: example)
+        monkeypatch.setattr(ds, "_build_video_metadata", lambda conversation: None)
+        monkeypatch.setattr(fake_image, "_conversation_has_media", lambda conversation: False)
+        monkeypatch.setattr(
+            collate_fns,
+            "_extract_media_from_conversations",
+            lambda conversations: ([], []),
+        )
+        monkeypatch.setattr(
+            collate_fns,
+            "build_labels_from_template",
+            lambda input_ids, conversations, processor: torch.tensor([[1, 2, 3, 4]]),
+        )
+
+        inject_calls = []
+        mask_calls = []
+
+        def _fake_inject(conversation):
+            inject_calls.append(conversation)
+            return conversation
+
+        monkeypatch.setattr(fake_image, "inject_fake_image_into_conversation", _fake_inject)
+        monkeypatch.setattr(
+            fake_image,
+            "mask_fake_vision_tokens_single",
+            lambda output, processor: mask_calls.append(output),
+        )
+        return inject_calls, mask_calls
+
+    def _make_dataset(self):
+        return [
+            {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                ]
+            }
+        ]
+
+    def test_default_injects_fake_image_for_text_only(self, monkeypatch):
+        inject_calls, mask_calls = self._patch_pipeline(monkeypatch)
+        wrapper = ds.PreTokenizedDatasetWrapper(self._make_dataset(), _FakeProcessor())
+        assert wrapper.inject_fake_images is True
+
+        wrapper[0]
+
+        assert len(inject_calls) == 1, "fake image should be injected for pure-text samples by default"
+        assert len(mask_calls) == 1, "injected fake vision tokens should be masked"
+
+    def test_disabled_skips_injection(self, monkeypatch):
+        inject_calls, mask_calls = self._patch_pipeline(monkeypatch)
+        wrapper = ds.PreTokenizedDatasetWrapper(self._make_dataset(), _FakeProcessor(), inject_fake_images=False)
+        assert wrapper.inject_fake_images is False
+
+        wrapper[0]
+
+        assert inject_calls == [], "injection must be skipped when inject_fake_images=False"
+        assert mask_calls == [], "no masking when nothing was injected"
+
+    def test_config_forwards_inject_fake_images(self):
+        wrapper = ds.PreTokenizedDatasetWrapperConfig(inject_fake_images=False).build(
+            dataset=self._make_dataset(),
+            processor=_FakeProcessor(),
+        )
+
+        assert wrapper.inject_fake_images is False
+
+
+def _shopify_hf_dataset(n=3):
+    """A real in-memory HF dataset so ``with_transform`` is actually exercised."""
+    import datasets as hfds
+
+    images = []
+    for i in range(n):
+        buf = io.BytesIO()
+        Image.new("RGB", (8 + i, 8), (i, i, i)).save(buf, format="PNG")
+        images.append({"bytes": buf.getvalue(), "path": None})
+
+    return hfds.Dataset.from_dict(
+        {
+            "product_image": images,
+            "ground_truth_category": [f"Root > Mid > Leaf {i}" for i in range(n)],
+        }
+    ).cast_column("product_image", hfds.Image())
+
+
+def test_make_shopify_product_catalogue_dataset(monkeypatch):
+    """Rows are emitted in the Automodel conversation schema."""
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(3))
+
+    result = ds.make_shopify_product_catalogue_dataset()
+
+    assert len(result) == 3
+    conversation = result[1]["conversation"]
+    user_turn, assistant_turn = conversation
+
+    assert user_turn["role"] == "user"
+    assert user_turn["content"][1] == {
+        "type": "text",
+        "text": ds.SHOPIFY_PRODUCT_CATALOGUE_PROMPT,
+    }
+    assert assistant_turn["role"] == "assistant"
+    assert assistant_turn["content"] == [{"type": "text", "text": "Root > Mid > Leaf 1"}]
+
+
+def test_make_shopify_product_catalogue_dataset_images_stay_undecoded(monkeypatch):
+    """Images arrive as lazy PIL handles, not eagerly decoded rasters.
+
+    The train split is 38,631 product photos, so eager decoding would pin every
+    image in memory.
     """
-    from datasets import Dataset as _Dataset
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(2))
 
-    columns = sorted({k for row in rows for k in row.keys()}) if rows else ["audio", "text"]
-    data = {col: [r.get(col) for r in rows] for col in columns}
-    dataset = _Dataset.from_dict(data)
-    # Replace cast_column on the produced instance so the builder's call
-    # ``cast_column(audio, Audio(decode=False))`` does not pull torchcodec.
-    dataset.cast_column = lambda column_name, _feature: dataset  # type: ignore[assignment]
-    return dataset
+    result = ds.make_shopify_product_catalogue_dataset()
+    image = result[0]["conversation"][0]["content"][0]["image"]
 
-
-def test_make_hf_audio_asr_dataset_bytes_branch(monkeypatch):
-    """The bytes branch decodes via soundfile and emits the Qwen3-Omni schema."""
-    wav = _make_wav_bytes()
-    fake_rows = _SyntheticHFRows(
-        [
-            {"audio": {"bytes": wav, "path": None}, "text": "你好"},
-            {"audio": {"bytes": wav, "path": None}, "text": "侬好"},
-        ]
-    )
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    rows = ds.make_hf_audio_asr_dataset(
-        path_or_dataset="ignored",
-        split="train",
-        sampling_rate=16000,
-    )
-
-    assert len(rows) == 2
-    for row, src in zip(rows, fake_rows):
-        assert list(row.keys()) == ["conversation"]
-        conv = row["conversation"]
-        # Default system_prompt is None → no system turn.
-        assert [t["role"] for t in conv] == ["user", "assistant"]
-
-        # user turn carries the decoded audio
-        user_content = conv[0]["content"]
-        assert isinstance(user_content, list) and len(user_content) == 1
-        audio_item = user_content[0]
-        assert audio_item["type"] == "audio"
-        waveform = audio_item["audio"]
-        assert isinstance(waveform, _np.ndarray)
-        assert waveform.dtype == _np.float32
-        assert waveform.ndim == 1
-
-        # assistant turn carries the transcript
-        assistant_content = conv[1]["content"]
-        assert assistant_content == [{"type": "text", "text": src["text"]}]
+    assert isinstance(image, Image.Image)
+    # PIL populates .size from the header but defers the pixel decode; a pending
+    # decode shows up as a non-empty tile list, which load() then clears.
+    assert image.size == (8, 8)
+    assert image.tile
+    image.load()
+    assert not image.tile
 
 
-def test_make_hf_audio_asr_dataset_path_branch(monkeypatch, tmp_path):
-    """The path branch decodes via soundfile when no in-memory bytes are present."""
-    wav_path = tmp_path / "sample.wav"
-    _sf.write(str(wav_path), _np.zeros(800, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
-    fake_rows = _SyntheticHFRows(
-        [
-            {"audio": {"bytes": None, "path": str(wav_path)}, "text": "侬好"},
-        ]
-    )
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+def test_make_shopify_product_catalogue_dataset_limit(monkeypatch):
+    """``limit_dataset_samples`` truncates, and never over-selects a short split."""
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(5))
+    assert len(ds.make_shopify_product_catalogue_dataset(limit_dataset_samples=2)) == 2
 
-    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
-    assert len(rows) == 1
-    # Default system_prompt is None → user turn at index 0.
-    waveform = rows[0]["conversation"][0]["content"][0]["audio"]
-    assert waveform.dtype == _np.float32
-    assert waveform.ndim == 1
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(3))
+    assert len(ds.make_shopify_product_catalogue_dataset(limit_dataset_samples=99)) == 3
 
 
-def test_make_hf_audio_asr_dataset_raises_when_audio_cell_empty(monkeypatch):
-    """Both ``bytes`` and ``path`` missing must raise a clear ValueError.
+def test_shopify_product_catalogue_dataset_config_build(monkeypatch):
+    """The config dataclass forwards its fields to the builder."""
+    captured = {}
 
-    With the lazy ``with_transform`` builder this fires at access time, not at
-    construction time — so the assertion is anchored on ``rows[0]``.
+    def _fake_load_dataset(path_or_dataset, split=None, **kwargs):
+        captured["path_or_dataset"] = path_or_dataset
+        captured["split"] = split
+        return _shopify_hf_dataset(4)
+
+    monkeypatch.setattr(ds, "load_dataset", _fake_load_dataset)
+
+    cfg = ds.ShopifyProductCatalogueDatasetConfig(split="test", limit_dataset_samples=2)
+    dataset = cfg.build()
+
+    assert captured == {"path_or_dataset": "Shopify/product-catalogue", "split": "test"}
+    assert len(dataset) == 2
+
+
+class _LengthByTextProcessor:
+    """Processor whose token count depends on the rendered text: ``LONG`` -> 10 tokens
+    (over the test max_length), anything else -> 4 tokens whose ids encode the sample."""
+
+    def apply_chat_template(self, conversations, tokenize=False):
+        return [conversations[0][0]["content"][0]["text"]]
+
+    def __call__(self, **kwargs):
+        import torch
+
+        text = kwargs["text"][0]
+        if text == "LONG":
+            ids = list(range(100, 110))
+        else:
+            ids = [int(text)] * 4
+        return {
+            "input_ids": torch.tensor([ids]),
+            "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+        }
+
+
+class TestPreTokenizedDatasetWrapperReplacementDeterminism:
+    """Over-long (or otherwise unusable) samples are replaced by a substitute chosen
+    from a per-sample RNG, never from the process-global ``random`` state.
+
+    Regression test: with the global RNG, ranks whose ``random`` stream had
+    advanced differently (e.g. the per-node dataset-building rank) substituted a
+    different document, so context-parallel ranks of one CP group saw different
+    packs / ``cu_seqlens`` for the same microbatch and TE's ring-attention gradient
+    accumulation produced inf/nan (or silently wrong) dk/dv.
     """
-    fake_rows = _SyntheticHFRows([{"audio": {"bytes": None, "path": None}, "text": "x"}])
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
-    with pytest.raises(ValueError, match="neither 'bytes' nor 'path'"):
-        _ = rows[0]
+    def _stub_pipeline(self, monkeypatch):
+        import torch
 
+        import nemo_automodel.components.datasets.vlm.collate_fns as collate_fns
+        import nemo_automodel.components.datasets.vlm.fake_image as fake_image
 
-def test_make_hf_audio_asr_dataset_drops_empty_text(monkeypatch):
-    """Default behaviour skips samples whose transcript is empty/whitespace."""
-    wav = _make_wav_bytes()
-    fake_rows = _SyntheticHFRows(
-        [
-            {"audio": {"bytes": wav, "path": None}, "text": "  "},
-            {"audio": {"bytes": wav, "path": None}, "text": "侬好"},
-        ]
-    )
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+        monkeypatch.setattr(ds, "_preload_media", lambda example, processor, **kw: example)
+        monkeypatch.setattr(ds, "_build_video_metadata", lambda conversation: None)
+        monkeypatch.setattr(fake_image, "_conversation_has_media", lambda conversation: False)
+        monkeypatch.setattr(collate_fns, "_extract_media_from_conversations", lambda conversations: ([], []))
+        monkeypatch.setattr(
+            collate_fns,
+            "build_labels_from_template",
+            lambda input_ids, conversations, processor: torch.zeros_like(input_ids),
+        )
 
-    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
-    assert len(rows) == 1
-    # Default system_prompt is None → assistant turn at index 1.
-    assert rows[0]["conversation"][1]["content"][0]["text"] == "侬好"
+    def _make_dataset(self, n=64):
+        def conv(text):
+            return {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": text}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                ]
+            }
 
+        return [conv("LONG")] + [conv(str(i)) for i in range(1, n)]
 
-def test_make_hf_audio_asr_dataset_module_does_not_import_torchcodec():
-    """The dataset module must not transitively pull in torchcodec."""
-    assert "torchcodec" not in _sys.modules
-    # The module under test (already imported at the top of this file as ``ds``)
-    # must not import torchcodec at module load time either.
-    # ``ds.__dict__`` should not contain a top-level ``torchcodec`` binding.
-    assert "torchcodec" not in ds.__dict__
+    def test_substitute_is_independent_of_global_random_state(self, monkeypatch):
+        import random
 
+        self._stub_pipeline(monkeypatch)
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            self._make_dataset(), _LengthByTextProcessor(), max_length=4, truncate=False, inject_fake_images=False
+        )
 
-def test_make_hf_audio_asr_dataset_resamples_when_sr_differs(monkeypatch):
-    """When source SR != target SR, the waveform is resampled and stays float32 mono."""
-    wav = _make_wav_bytes(sampling_rate=8000, duration_seconds=0.25)
-    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+        random.seed(1)
+        first = wrapper[0]["input_ids"].tolist()
+        random.seed(2)
+        second = wrapper[0]["input_ids"].tolist()
+        random.seed(3)
+        third = wrapper[0]["input_ids"].tolist()
 
-    rows = ds.make_hf_audio_asr_dataset(
-        path_or_dataset="ignored",
-        sampling_rate=16000,
-    )
-    # Default system_prompt is None → user turn at index 0.
-    waveform = rows[0]["conversation"][0]["content"][0]["audio"]
-    assert waveform.dtype == _np.float32
-    assert waveform.ndim == 1
-    # 0.25s at 16 kHz target ≈ 4000 samples (allow ±a few for resample_poly polyphase rounding).
-    assert abs(waveform.shape[0] - 4000) <= 8
+        assert first != list(range(100, 110)), "the over-long sample must have been replaced"
+        assert first == second == third, "the substitute must not depend on the process-global RNG state"
 
-
-def test_make_hf_audio_asr_dataset_user_prompt_appears_before_audio(monkeypatch):
-    """When ``user_prompt`` is set, it becomes the first text item in the user turn."""
-    wav = _make_wav_bytes()
-    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    rows = ds.make_hf_audio_asr_dataset(
-        path_or_dataset="ignored",
-        system_prompt="Transcribe.",
-        user_prompt="please transcribe",
-    )
-    assert len(rows) == 1
-    conv = rows[0]["conversation"]
-    # Explicit system_prompt is set → full three-turn shape.
-    assert [t["role"] for t in conv] == ["system", "user", "assistant"]
-    user_content = conv[1]["content"]
-    # First user item is the text prompt, second is the audio ndarray.
-    assert user_content[0] == {"type": "text", "text": "please transcribe"}
-    assert user_content[1]["type"] == "audio"
-    assert isinstance(user_content[1]["audio"], _np.ndarray)
-
-
-def test_make_hf_audio_asr_dataset_system_none_drops_system_turn(monkeypatch):
-    """``system_prompt=None`` (or empty) must drop the system turn entirely."""
-    wav = _make_wav_bytes()
-    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    rows = ds.make_hf_audio_asr_dataset(
-        path_or_dataset="ignored",
-        system_prompt=None,
-        user_prompt="please transcribe",
-    )
-    assert len(rows) == 1
-    conv = rows[0]["conversation"]
-    # No system turn.
-    assert [t["role"] for t in conv] == ["user", "assistant"]
-    user_content = conv[0]["content"]
-    assert user_content[0]["type"] == "text"
-    assert user_content[1]["type"] == "audio"
-
-
-def test_make_hf_audio_asr_dataset_both_prompts_none(monkeypatch):
-    """When both prompts are None the user turn carries only the audio item."""
-    wav = _make_wav_bytes()
-    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    rows = ds.make_hf_audio_asr_dataset(
-        path_or_dataset="ignored",
-        system_prompt=None,
-        user_prompt=None,
-    )
-    conv = rows[0]["conversation"]
-    assert [t["role"] for t in conv] == ["user", "assistant"]
-    assert len(conv[0]["content"]) == 1
-    assert conv[0]["content"][0]["type"] == "audio"
-
-
-def test_make_hf_audio_asr_dataset_blank_prompts_drop(monkeypatch):
-    """Whitespace-only prompts are treated as absent."""
-    wav = _make_wav_bytes()
-    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    rows = ds.make_hf_audio_asr_dataset(
-        path_or_dataset="ignored",
-        system_prompt="   ",
-        user_prompt="\t\n",
-    )
-    conv = rows[0]["conversation"]
-    assert [t["role"] for t in conv] == ["user", "assistant"]
-    assert len(conv[0]["content"]) == 1
-    assert conv[0]["content"][0]["type"] == "audio"
-
-
-def test_make_hf_audio_asr_dataset_is_lazy_no_decode_at_construction(monkeypatch):
-    """Builder must NOT call the audio decoder at construction time.
-
-    The decode helper is recorded on each call; constructing the dataset must
-    not trigger any decode. Only ``rows[0]`` (the lazy transform access) should.
-    """
-    wav = _make_wav_bytes()
-    fake_rows = _SyntheticHFRows(
-        [
-            {"audio": {"bytes": wav, "path": None}, "text": "你好"},
-            {"audio": {"bytes": wav, "path": None}, "text": "侬好"},
-        ]
-    )
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    decode_calls = []
-    original_decode = ds._decode_audio_cell_to_mono_float32
-
-    def _spy(audio_cell, target_sampling_rate):
-        decode_calls.append(target_sampling_rate)
-        return original_decode(audio_cell, target_sampling_rate)
-
-    monkeypatch.setattr(ds, "_decode_audio_cell_to_mono_float32", _spy)
-
-    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
-    # Construction must not have decoded any audio.
-    assert decode_calls == [], f"decode ran at construction time: {len(decode_calls)} calls"
-    # Length is O(1) (Arrow row count); does not iterate.
-    assert len(rows) == 2
-    assert decode_calls == []
-    # First __getitem__ triggers exactly one decode.
-    _ = rows[0]
-    assert len(decode_calls) == 1
-    # Second __getitem__ triggers one more (no caching at this layer).
-    _ = rows[1]
-    assert len(decode_calls) == 2
-
-
-def test_make_hf_audio_asr_dataset_default_system_prompt_is_none(monkeypatch):
-    """Without overriding ``system_prompt``, the builder emits no system turn.
-
-    Pins down the post-rename default: the builder is dataset-agnostic, so its
-    default prompt shape is the most neutral one (``user → assistant``).
-    """
-    wav = _make_wav_bytes()
-    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
-    conv = rows[0]["conversation"]
-    assert [t["role"] for t in conv] == ["user", "assistant"]
-    # User turn carries only the audio (no text item).
-    assert conv[0]["content"][0]["type"] == "audio"
-
-
-def test_make_hf_audio_asr_dataset_passes_name_to_load_dataset(monkeypatch):
-    """``name`` is forwarded to ``datasets.load_dataset`` as the subset/config.
-
-    AMI requires ``name='ihm'`` or ``name='sdm'``; CommonVoice requires the
-    language code. The builder must expose this as a first-class parameter so
-    YAML files don't have to round-trip through ``**load_kwargs``.
-    """
-    wav = _make_wav_bytes()
-    captured_kwargs = {}
-
-    def _spy_load_dataset(path, *args, **kwargs):
-        captured_kwargs["path"] = path
-        captured_kwargs.update(kwargs)
-        # Return a real fake dataset so the rest of the builder can run.
-        return _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "x"}])
-
-    monkeypatch.setattr(ds, "load_dataset", _spy_load_dataset)
-
-    ds.make_hf_audio_asr_dataset(
-        path_or_dataset="edinburghcstr/ami",
-        name="ihm",
-        split="train[:1]",
-    )
-    assert captured_kwargs["path"] == "edinburghcstr/ami"
-    assert captured_kwargs["name"] == "ihm"
-    assert captured_kwargs["split"] == "train[:1]"
-
-
-def test_make_hf_audio_asr_dataset_min_duration_filters_short_bytes(monkeypatch):
-    """``min_audio_duration_seconds`` drops sub-threshold samples in the bytes branch.
-
-    The HF Qwen3-Omni Whisper feature extractor crashes on sub-second clips
-    due to an off-by-one between ``input_features`` and
-    ``feature_attention_mask``; the builder exposes this filter to keep
-    AMI / CommonVoice-style corpora trainable.
-    """
-    short_wav = _make_wav_bytes(duration_seconds=0.25)
-    long_wav = _make_wav_bytes(duration_seconds=1.5)
-    fake_rows = _SyntheticHFRows(
-        [
-            {"audio": {"bytes": short_wav, "path": None}, "text": "short"},
-            {"audio": {"bytes": long_wav, "path": None}, "text": "long"},
-            {"audio": {"bytes": short_wav, "path": None}, "text": "short2"},
-        ]
-    )
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    rows = ds.make_hf_audio_asr_dataset(
-        path_or_dataset="ignored",
-        min_audio_duration_seconds=1.0,
-    )
-    assert len(rows) == 1
-    assert rows[0]["conversation"][1]["content"][0]["text"] == "long"
-
-
-def test_make_hf_audio_asr_dataset_min_duration_filters_short_paths(monkeypatch, tmp_path):
-    """``min_audio_duration_seconds`` also covers the path branch via sf.info."""
-    short_path = tmp_path / "short.wav"
-    long_path = tmp_path / "long.wav"
-    _sf.write(str(short_path), _np.zeros(800, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
-    _sf.write(str(long_path), _np.zeros(24000, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
-    fake_rows = _SyntheticHFRows(
-        [
-            {"audio": {"bytes": None, "path": str(short_path)}, "text": "short"},
-            {"audio": {"bytes": None, "path": str(long_path)}, "text": "long"},
-        ]
-    )
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    rows = ds.make_hf_audio_asr_dataset(
-        path_or_dataset="ignored",
-        min_audio_duration_seconds=1.0,
-    )
-    assert len(rows) == 1
-    assert rows[0]["conversation"][1]["content"][0]["text"] == "long"
-
-
-def test_make_hf_audio_asr_dataset_min_duration_none_keeps_all(monkeypatch):
-    """``min_audio_duration_seconds=None`` (default) skips the filter entirely."""
-    short_wav = _make_wav_bytes(duration_seconds=0.25)
-    fake_rows = _SyntheticHFRows(
-        [
-            {"audio": {"bytes": short_wav, "path": None}, "text": "a"},
-            {"audio": {"bytes": short_wav, "path": None}, "text": "b"},
-        ]
-    )
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
-
-    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
-    assert len(rows) == 2
+    def test_different_samples_get_different_substitute_streams(self):
+        draws = {ds._replacement_rng(idx).randint(0, 10**9) for idx in range(32)}
+        assert len(draws) > 1

@@ -33,7 +33,9 @@ GPU_INSTALL_STRING = (
 or use `pip install --extra-index-url https://pypi.nvidia.com ".[cuda12x]"` if installing from source"""
 )
 MISSING_TRITON_MSG = "triton is not installed. Please install it with `pip install triton`."
-MISSING_QWEN_VL_UTILS_MSG = "qwen_vl_utils is not installed. Please install it with `pip install qwen-vl-utils`."
+MISSING_QWEN_VL_UTILS_MSG = (
+    "qwen_vl_utils is not installed. Please install it with `pip install nemo-automodel[vlm-media]`."
+)
 MISSING_CUT_CROSS_ENTROPY_MSG = (
     "cut_cross_entropy is not installed. Please install it with `pip install cut-cross-entropy`."
 )
@@ -388,6 +390,10 @@ def safe_import_te():
        transformer_engine.common.load_framework_extension("torch")):
        FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
 
+    3) OSError when TE's core .so is dlopen'd against an incompatible CUDA lib,
+       e.g. a prebuilt wheel needing a newer cuBLAS than is installed:
+       OSError: .../libtransformer_engine.so: undefined symbol: cublasLtGroupedMatrixLayoutInit_internal, version libcublasLt.so.13
+
     Returns:
         Tuple[bool, Union[module, UnavailableMeta]]: (True, te_module) if import
         and TE torch lib load succeeded; (False, placeholder) otherwise.
@@ -398,6 +404,9 @@ def safe_import_te():
     # 2) FileNotFoundError when TE's load_framework_extension("torch") runs (e.g. in transformer_engine.pytorch):
     #    raise FileNotFoundError(
     #    FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
+    # 3) OSError when TE's core .so is dlopen'd against an incompatible CUDA lib:
+    #    OSError: .../libtransformer_engine.so: undefined symbol: cublasLtGroupedMatrixLayoutInit_internal, version libcublasLt.so.13
+    # FileNotFoundError is a subclass of OSError, so it must be caught first.
     msg = "transformer_engine could not be imported (e.g. CUDA symbol mismatch or TE torch lib not found)."
     try:
         import transformer_engine as te
@@ -406,6 +415,9 @@ def safe_import_te():
         return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
     except FileNotFoundError:
         logger.debug("safe_import_te: import transformer_engine failed (TE torch lib not found)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+    except OSError:
+        logger.debug("safe_import_te: import transformer_engine failed (CUDA lib symbol mismatch)", exc_info=True)
         return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
 
     try:
@@ -416,6 +428,9 @@ def safe_import_te():
         return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
     except FileNotFoundError:
         logger.debug("safe_import_te: transformer_engine.pytorch failed (TE torch lib not found)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+    except OSError:
+        logger.debug("safe_import_te: transformer_engine.pytorch failed (CUDA lib symbol mismatch)", exc_info=True)
         return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
 
     return True, te

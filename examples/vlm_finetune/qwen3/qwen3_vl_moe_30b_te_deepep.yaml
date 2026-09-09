@@ -47,8 +47,8 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: te
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -56,7 +56,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -100,7 +100,6 @@ optimizer:
   weight_decay: 0.0
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -116,4 +115,10 @@ freeze_config:
 
 ci:
   recipe_owner: HuiyingLi
+  nodes: 1
   time: "00:30:00"
+  checkpoint_robustness:
+    hf_device_map_auto: true
+    # Independently calibrated normal-run envelope; it does not relax resume correctness.
+    training_reproducibility_loss_threshold: 2e-2
+    tokenizer_name: Qwen/Qwen3-VL-30B-A3B-Instruct

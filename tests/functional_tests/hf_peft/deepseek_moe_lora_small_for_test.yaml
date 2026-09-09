@@ -50,8 +50,7 @@ model:
     qk_rope_head_dim: 64
     v_head_dim: 64
     qk_nope_head_dim: 64
-  moe_config:
-    _target_: nemo_automodel.components.moe.layers.MoEConfig
+  moe_overrides:
     n_routed_experts: 8
     n_shared_experts: 1
     n_activated_experts: 2

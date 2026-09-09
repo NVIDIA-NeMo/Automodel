@@ -17,31 +17,29 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
+from contextlib import nullcontext
 
 import torch
 import wandb
 
-from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
-from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
+    _build_tokenizer,
     _get_model_name,
-    build_checkpoint_config,
-    build_dataloader,
-    build_distributed,
-    build_lr_scheduler,
     build_model,
-    build_optimizer,
-    build_step_scheduler,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,28 +49,35 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     """Recipe for fine-tuning a model for sequence classification."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
         torch.cuda.reset_peak_memory_stats()
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
         setup_logging()
         apply_cache_compatibility_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        (
+            self.distributed_setup,
+            self.mesh_context,
+            self.distributed_config,
+            self.device_mesh,
+            self.moe_mesh,
+            self.pp_enabled,
+            self.pipeline_config,
+            self.moe_parallel_config,
+            self.activation_checkpointing,
+        ) = self._distributed_setup_attributes(
+            create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+        )
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            # Reuse helper from NTP recipe
-            from nemo_automodel.recipes.llm.train_ft import build_wandb
-
-            run = build_wandb(self.cfg)
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
         self._log_experiment_details()
@@ -84,14 +89,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         # loss function: standard CE on logits
         self.loss_fn = torch.nn.CrossEntropyLoss()
 
-        checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            _get_model_name(self.cfg.model),
-            True if self.cfg.get("peft", None) else False,
-        )
-
-        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+        checkpoint_config = self.cfg.checkpoint
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
             self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
@@ -99,8 +97,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
             self.max_grad_norm = 1.0
 
-        self.checkpointer = Checkpointer(
-            config=checkpoint_config,
+        self.checkpointer = checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
@@ -108,6 +105,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
+        freeze_config = self.cfg.get("freeze_config", None)
+        if freeze_config is None and self.peft_config is not None:
+            # Preserve the pre-freeze_config behavior for existing PEFT sequence
+            # classification recipes; new configs declare this selector directly.
+            freeze_config = FreezeConfig(unfreeze_modules=[ModuleSelector(glob="*classifier")])
+        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
         model = build_model(
             cfg_model=self.cfg.model,
             cfg_peft=self.peft_config,
@@ -115,64 +118,52 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             has_packed_sequence=use_hf_fa2,
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            distributed_config=self.distributed_config,
-            unfreeze_modules=["classifier"] if self.peft_config is not None else None,
+            distributed_setup=self.distributed_setup,
+            cfg_freeze=freeze_config,
         )
-        self.optimizer = build_optimizer(
-            model,
-            self.cfg.optimizer,
-            self.distributed_config,
-            self.device_mesh,
-            is_peft=self.peft_config is not None,
+        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
         self.model_parts = [model]
-        self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
+        self.mfu_calculator = self.cfg.mfu.build(model=self.model_parts[0])
 
-        self.dataloader, self.tokenizer = build_dataloader(
-            self.cfg.dataset,
-            self.cfg.dataloader,
-            self.cfg.model,
-            cfg_ps=None,
-            seed=self.cfg.get("seed", 42),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-            global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
-            max_steps=self.cfg.get("step_scheduler.max_steps", None),
-            val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
-            dp_rank=self._get_dp_rank(),
-            dp_world_size=self._get_dp_group_size(),
-            pp_enabled=False,
-        )
+        _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
+
+        def materialize_loader(config):
+            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
+            with ScopedRNG(seed=config.seed, ranked=True):
+                return config.build(
+                    tokenizer=self.tokenizer,
+                    dataset_build_context=build_context,
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                    pp_enabled=False,
+                    cp_size=self.cfg.get("distributed.cp_size", 1),
+                )
+
+        self.dataloader = materialize_loader(self.cfg.dataloader)
 
         self.val_dataloader = None
-        if "validation_dataset" in self.cfg:
-            self.val_dataloader, _ = build_dataloader(
-                self.cfg.validation_dataset,
-                self.cfg.validation_dataloader,
-                self.cfg.model,
-                cfg_ps=None,
-                seed=self.cfg.get("seed", 42),
-                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
-                max_steps=self.cfg.get("step_scheduler.max_steps", None),
-                val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-                pp_enabled=False,
-            )
+        val_configs = self.cfg.validation_dataloaders
+        if val_configs:
+            self.val_dataloader = materialize_loader(next(iter(val_configs.values())))
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None),
+        self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            self.cfg.get("step_scheduler.local_batch_size", 1),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
-        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
 
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
@@ -223,7 +214,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
-        self.checkpointer.close()
+        self._finalize_and_close_checkpointer()
 
     def _run_train_optim_step(self, batches):
         model = self.model_parts[0]
@@ -244,9 +235,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits, labels.view(-1))
+            with self._autocast_context():
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                loss = self.loss_fn(logits, labels.view(-1))
             losses.append(loss.detach().clone())
 
             # Collect predictions for accuracy calculation
@@ -312,7 +304,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 step_flops = self._dp_allreduce(
                     torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
                 ).item()
-                mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
+                mfu = calculate_mfu(
+                    step_flops / 1e12,
+                    self.dist_env.world_size,
+                    time_delta,
+                    reference_mfu=mfu_calculator.reference_mfu,
+                )
 
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
@@ -348,9 +345,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits, labels.view(-1))
+            with self._autocast_context():
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                loss = self.loss_fn(logits, labels.view(-1))
             total_loss += loss.detach()
 
             # Collect predictions for accuracy

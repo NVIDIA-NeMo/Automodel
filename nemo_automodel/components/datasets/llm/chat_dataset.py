@@ -17,10 +17,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Sequence, Union
 
 from datasets import VerificationMode, load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 from torch.utils.data import Dataset
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
@@ -52,7 +56,7 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
 _SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(\d*):(\d*)\]$")
 
 
-def _parse_split_slice(split: Optional[str]):
+def _parse_split_slice(split: str | None):
     """Parse a split string like ``"train[1024:]"`` into ``(base_split, slice | None)``."""
     if split is None:
         return split, None
@@ -67,9 +71,9 @@ def _parse_split_slice(split: Optional[str]):
 
 def _load_openai_messages(
     path_or_dataset_id: Union[str, Sequence[str]],
-    split: Optional[str] = None,
-    name: Optional[str] = None,
-    shuffle_seed: Optional[int] = None,
+    split: str | None = None,
+    name: str | None = None,
+    shuffle_seed: int | None = None,
     skip_invalid_samples: bool = False,
 ):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
@@ -273,13 +277,114 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return norm
 
 
+# ShareGPT ``from`` role -> OpenAI ``role``. Covers the plain-chat roles that
+# datasets such as PerfectBlend ship under a ``conversations`` column. Tool-call
+# agent traces (``function_call`` / ``observation`` / ``tool_call``) are out of
+# scope here -- use the agent SFT dataset (``make_agent_chat_dataset``) for those.
+_SHAREGPT_ROLE_MAP = {
+    "system": "system",
+    "human": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "chatgpt": "assistant",
+    "model": "assistant",
+    "bot": "assistant",
+}
+
+
+def _conversations_to_messages(conversations: Any) -> List[Dict[str, Any]]:
+    """Convert a ShareGPT ``conversations`` list to OpenAI ``messages``.
+
+    ShareGPT-style rows store turns as ``{"from": <role>, "value": <text>}`` under
+    a ``conversations`` column instead of OpenAI ``{"role", "content"}`` under
+    ``messages``. Map the common plain-chat roles so such datasets load without a
+    manual rename. Raises on an unsupported role rather than guessing.
+    """
+    if not isinstance(conversations, list):
+        raise ValueError(f"`conversations` must be a list of turns, got {type(conversations).__name__}")
+    messages: List[Dict[str, Any]] = []
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            raise ValueError(f"Each `conversations` turn must be a dict, got {type(turn).__name__}")
+        src_role = turn.get("from", turn.get("role"))
+        role = _SHAREGPT_ROLE_MAP.get(src_role)
+        if role is None:
+            raise ValueError(
+                f"Unsupported ShareGPT role {src_role!r} in `conversations`. Supported plain-chat "
+                f"roles: {sorted(_SHAREGPT_ROLE_MAP)}. For tool-calling traces use the agent SFT "
+                "dataset (make_agent_chat_dataset)."
+            )
+        messages.append({"role": role, "content": turn.get("value", turn.get("content", ""))})
+    return messages
+
+
+@dataclass
+class ChatDatasetConfig:
+    """Construction-time configuration for :class:`ChatDataset` (tokenizer is a build arg)."""
+
+    accepts_tokenizer: ClassVar[bool] = True
+
+    path_or_dataset_id: str | Sequence[str]
+    """HF dataset id, local JSON/JSONL path(s), Parquet file, or Parquet directory."""
+    split: str | None = None
+    """Dataset split or slice (e.g. ``train``, ``train[1024:]``)."""
+    name: str | None = None
+    """Optional Hub subset / config name."""
+    seq_length: int | None = None
+    """Maximum sequence length for padding and truncation in formatting."""
+    padding: str | bool = "do_not_pad"
+    """Padding mode for ``format_chat_template``."""
+    truncation: str | bool = "do_not_truncate"
+    """Truncation mode for ``format_chat_template``."""
+    start_of_turn_token: str | None = None
+    """Optional token marking assistant turns for answer-only loss."""
+    chat_template: str | None = None
+    """Optional Jinja template string overriding ``tokenizer.chat_template``."""
+    shuffle_seed: int | None = None
+    """If set, shuffles Hub/Parquet data before applying a split slice."""
+    mask_reasoning_content: bool = False
+    """If ``True``, exclude rendered reasoning traces from the loss mask."""
+    mask_history: bool = False
+    """If ``True``, supervise only the final assistant turn."""
+    unshifted: bool = False
+    """Passed through to ``format_chat_template``."""
+    skip_invalid_samples: bool = False
+    """If ``True``, skip malformed JSONL lines when reading local files."""
+    mask_generation_prompt: bool = False
+    """If ``True``, exclude the template-supplied prefix of each assistant turn (role header and any
+    empty reasoning block such as ``<think></think>``) from the loss mask."""
+
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "ChatDataset":
+        """Build a :class:`ChatDataset` from this :class:`ChatDatasetConfig` and a runtime tokenizer."""
+        return ChatDataset(
+            path_or_dataset_id=self.path_or_dataset_id,
+            tokenizer=tokenizer,
+            split=self.split,
+            name=self.name,
+            seq_length=self.seq_length,
+            padding=self.padding,
+            truncation=self.truncation,
+            start_of_turn_token=self.start_of_turn_token,
+            chat_template=self.chat_template,
+            shuffle_seed=self.shuffle_seed,
+            mask_reasoning_content=self.mask_reasoning_content,
+            mask_generation_prompt=self.mask_generation_prompt,
+            mask_history=self.mask_history,
+            unshifted=self.unshifted,
+            skip_invalid_samples=self.skip_invalid_samples,
+        )
+
+
 class ChatDataset(Dataset):
     """Dataset for OpenAI-format tool-calling chat transcripts.
 
-    This class expects each row to contain a `messages` list in OpenAI chat format,
-    potentially including tool calls and tool responses. The datasetformats the
-    conversation via the tokenizer's chat template to produce `input_ids`, `labels`,
-    and `attention_mask` suitable for SFT.
+    Each row should contain a `messages` list in OpenAI chat format (`role` /
+    `content`), potentially including tool calls and tool responses. Rows that
+    instead carry a ShareGPT `conversations` list (`from` / `value`, as used by
+    PerfectBlend and similar) are auto-converted, so no manual column rename is
+    needed. The conversation is formatted via the tokenizer's chat template to
+    produce `input_ids`, `labels`, and `attention_mask` suitable for SFT.
     """
 
     def __init__(
@@ -287,17 +392,19 @@ class ChatDataset(Dataset):
         path_or_dataset_id: Union[str, Sequence[str]],
         tokenizer,
         *,
-        split: Optional[str] = None,
-        name: Optional[str] = None,
-        seq_length: Optional[int] = None,
+        split: str | None = None,
+        name: str | None = None,
+        seq_length: int | None = None,
         padding: Union[str, bool] = "do_not_pad",
         truncation: Union[str, bool] = "do_not_truncate",
-        start_of_turn_token: Optional[str] = None,
-        chat_template: Optional[str] = None,
-        shuffle_seed: Optional[int] = None,
+        start_of_turn_token: str | None = None,
+        chat_template: str | None = None,
+        shuffle_seed: int | None = None,
         mask_reasoning_content: bool = False,
+        mask_history: bool = False,
         unshifted: bool = False,
         skip_invalid_samples: bool = False,
+        mask_generation_prompt: bool = False,
     ) -> None:
         """Load OpenAI-format chat rows and tokenize via the chat template.
 
@@ -313,10 +420,24 @@ class ChatDataset(Dataset):
             chat_template: Optional Jinja template string overriding ``tokenizer.chat_template``.
             shuffle_seed: If set, shuffles Hub/Parquet data before applying a split slice.
             mask_reasoning_content: If ``True``, exclude rendered reasoning traces from the loss mask.
+            mask_history: If ``True``, supervise only the FINAL assistant turn and treat all
+                earlier turns as (clean) prompt context. Multi-turn conversations otherwise
+                supervise every assistant turn, yielding a gappy loss_mask; downstream
+                consumers that require a single contiguous supervised suffix (e.g. the
+                block-diffusion response window, matching Google's prompt+single-response
+                data model) need this. No-op for single-turn data.
             unshifted: Passed through to ``format_chat_template``.
             skip_invalid_samples: If ``True``, skip malformed JSONL lines when reading local files (warning logs
                 include skip counts). If ``False``, a bad line raises. Does not skip invalid structured rows after
                 load; those still raise when a sample is accessed.
+            mask_generation_prompt: If ``True``, exclude from the loss the tokens of each assistant turn that
+                the chat template's generation prompt supplies at inference: the role header and any
+                template-inserted empty reasoning block (for example the ``<think></think>`` Nemotron
+                templates emit for non-thinking turns). The model never generates those tokens, so
+                supervising them only reinforces template boilerplate. Detected per template by rendering
+                the generation prompt, so no tag strings are hardcoded. Only a generation prompt the
+                template appends to the unchanged conversation prefix, and that the rendered turn
+                reproduces in full, is removed; anything else leaves the turn supervised.
         """
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -334,6 +455,8 @@ class ChatDataset(Dataset):
         self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
         self.mask_reasoning_content = mask_reasoning_content
+        self.mask_generation_prompt = mask_generation_prompt
+        self.mask_history = mask_history
         self.unshifted = unshifted
         self.skip_invalid_samples = skip_invalid_samples
 
@@ -352,11 +475,40 @@ class ChatDataset(Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
+    @staticmethod
+    def _keep_last_supervised_run(seq: List[int], unsupervised_value: int) -> None:
+        """In place, keep only the final contiguous supervised run; mask the rest.
+
+        Supervised positions are those ``!= unsupervised_value`` (0 for ``loss_mask``,
+        -100 for ``labels``). Used for ``mask_history``: a multi-turn conversation has
+        one supervised run per assistant turn separated by unsupervised user turns;
+        this collapses it to the last turn so the supervised tokens form a single
+        suffix.
+        """
+        last = -1
+        for i in range(len(seq) - 1, -1, -1):
+            if seq[i] != unsupervised_value:
+                last = i
+                break
+        if last < 0:
+            return
+        start = last
+        while start - 1 >= 0 and seq[start - 1] != unsupervised_value:
+            start -= 1
+        for i in range(start):
+            seq[i] = unsupervised_value
+
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         row = self.dataset[idx]
         messages = row.get("messages")
+        if messages is None and row.get("conversations") is not None:
+            # ShareGPT layout (PerfectBlend etc.): convert {from, value} turns to
+            # OpenAI {role, content} so no manual column rename is needed.
+            messages = _conversations_to_messages(row["conversations"])
         if not isinstance(messages, list):
-            raise ValueError("Each sample must contain a `messages` list in OpenAI format")
+            raise ValueError(
+                "Each sample must contain a `messages` list (OpenAI format) or a `conversations` list (ShareGPT format)"
+            )
 
         normalized = _normalize_messages(messages)
         tools = row.get("tools")
@@ -386,5 +538,15 @@ class ChatDataset(Dataset):
             tools=tools,
             mask_reasoning_content=self.mask_reasoning_content,
             unshifted=self.unshifted,
+            mask_generation_prompt=self.mask_generation_prompt,
         )
+        if self.mask_history:
+            # Collapse multi-turn supervision to the final assistant turn so the
+            # supervised tokens are a single contiguous suffix (prior turns become
+            # clean prompt context) — required by the block-diffusion response window
+            # and matching Google's prompt+single-response data model.
+            if "loss_mask" in sample:
+                self._keep_last_supervised_run(sample["loss_mask"], 0)
+            if "labels" in sample:
+                self._keep_last_supervised_run(sample["labels"], -100)
         return sample

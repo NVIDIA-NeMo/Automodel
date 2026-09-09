@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     torch.manual_seed(0)
     input_ids = torch.randint(0, cfg.vocab_size, (1, args.seq_len), device=args.out_device)
     with torch.no_grad():
-        logits = model(input_ids)
+        logits = model(input_ids).logits
     logits = logits.float()
 
     finite = torch.isfinite(logits).all().item()

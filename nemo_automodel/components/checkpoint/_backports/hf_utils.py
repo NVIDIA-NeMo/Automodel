@@ -18,7 +18,7 @@ import io
 import json
 import struct
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -36,6 +36,8 @@ SHAPE_KEY = "shape"
 DATA_KEY = "data"
 DTYPE_KEY = "dtype"
 DATA_OFFSETS_KEY = "data_offsets"
+FQN_TO_DTYPE_MAPPING_FILENAME = "fqn_to_dtype_mapping.json"
+FQN_TO_FILE_INDEX_MAPPING_FILENAME = "fqn_to_file_index_mapping.json"
 
 DTYPE_MAP = {
     "F16": torch.float16,
@@ -50,6 +52,9 @@ DTYPE_MAP = {
     "F8_E4M3": torch.float8_e4m3fn,
     "F8_E5M2": torch.float8_e5m2,
     "F8_E8M0": torch.float8_e8m0fnu,
+    # Standard safetensors dtype; without it, bool buffers (e.g. EAGLE-3's
+    # draft-vocab masks) crash the safetensors checkpoint save.
+    "BOOL": torch.bool,
 }
 
 HF_DCP_VERSION: float = 1.0
@@ -71,7 +76,7 @@ class _HFStorageInfo:
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
-def _gen_file_name(index: int, largest_index: int, shard_index: Optional[int] = None) -> str:
+def _gen_file_name(index: int, largest_index: int, shard_index: int | None = None) -> str:
     if shard_index is not None:
         return (
             SHARDED_FILE_NAME.format(
@@ -106,7 +111,7 @@ def _get_dtype(dtype_str: str) -> torch.dtype:
     return dtype
 
 
-def _get_dcp_custom_metadata(metadata: Any) -> Optional[Any]:
+def _get_dcp_custom_metadata(metadata: Any) -> Any | None:
     if DEFAULT_EXTRA_METADATA_KEY in metadata:
         custom_metadata = metadata[DEFAULT_EXTRA_METADATA_KEY]
         if CUSTOM_METADATA_KEY in custom_metadata:

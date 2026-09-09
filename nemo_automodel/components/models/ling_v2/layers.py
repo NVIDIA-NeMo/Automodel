@@ -36,6 +36,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class BailingMoeV2Attention(nn.Module):
@@ -61,26 +62,35 @@ class BailingMoeV2Attention(nn.Module):
         attention_bias = bool(getattr(config, "use_qkv_bias", False))
         out_bias = bool(getattr(config, "use_bias", False))
 
+        # Thread dtype explicitly from config.torch_dtype so fp32 master
+        # weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         # Separate q / k / v projections.  HF Bailing fuses them into a single
         # ``query_key_value`` linear; the state_dict adapter splits that fused
         # tensor at load time so this module can stay aligned with the rest of
         # the framework (and with TP plans that expect separate q/k/v).
         self.q_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
+            backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias, dtype=dtype
         )
         self.k_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias, dtype=dtype
         )
         self.v_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias, dtype=dtype
         )
         self.o_proj = initialize_linear_module(
-            backend.linear, self.num_heads * self.head_dim, config.hidden_size, out_bias
+            backend.linear, self.num_heads * self.head_dim, config.hidden_size, out_bias, dtype=dtype
         )
 
         if self.use_qk_norm:
-            self.q_norm = initialize_rms_norm_module(backend.rms_norm, self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = initialize_rms_norm_module(backend.rms_norm, self.head_dim, eps=config.rms_norm_eps)
+            self.q_norm = initialize_rms_norm_module(
+                backend.rms_norm, self.head_dim, eps=config.rms_norm_eps, dtype=dtype
+            )
+            self.k_norm = initialize_rms_norm_module(
+                backend.rms_norm, self.head_dim, eps=config.rms_norm_eps, dtype=dtype
+            )
         else:
             self.q_norm = None
             self.k_norm = None

@@ -16,14 +16,14 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_chat_template(chat_template: Optional[str]) -> Optional[str]:
+def _resolve_chat_template(chat_template: str | None) -> str | None:
     """Resolve a chat template string that may be a file path.
 
     If *chat_template* points to an existing file, its contents are returned.
@@ -60,37 +60,21 @@ if TYPE_CHECKING:
 GENERATION_REGEX = re.compile(r"\{%-?\s+generation\s+-?%\}")
 
 
-def _tokenized_chat_length(
-    tokenizer: "PreTrainedTokenizer",
-    messages: List[Dict[str, str]],
-    *,
-    tools: Optional[List[Dict]] = None,
-    truncation: Union[str, bool] = "do_not_truncate",
-    seq_length: Optional[int] = None,
-) -> int:
-    """Return the tokenized chat length for a message prefix without padding."""
-    tokenized_chat = tokenizer.apply_chat_template(
-        messages,
-        tools=tools,
-        tokenize=True,
-        return_dict=True,
-        return_assistant_tokens_mask=False,
-        padding=False,
-        truncation=truncation,
-        max_length=seq_length,
-    )
-    return len(tokenized_chat.get("input_ids", []))
-
-
 def _tokenize_chat(
     tokenizer: "PreTrainedTokenizer",
     messages: List[Dict[str, Any]],
     *,
-    tools: Optional[List[Dict]] = None,
+    tools: List[Dict] | None = None,
     truncation: Union[str, bool] = "do_not_truncate",
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
+    **template_kwargs: Any,
 ) -> List[int]:
-    """Tokenize chat messages without padding and return input ids."""
+    """Tokenize chat messages without padding and return input ids.
+
+    ``template_kwargs`` (for example ``add_generation_prompt`` or
+    ``enable_thinking``) are forwarded to ``apply_chat_template`` as given, so the
+    default path calls the tokenizer exactly as before.
+    """
     tokenized_chat = tokenizer.apply_chat_template(
         messages,
         tools=tools,
@@ -100,14 +84,27 @@ def _tokenize_chat(
         padding=False,
         truncation=truncation,
         max_length=seq_length,
+        **template_kwargs,
     )
     return tokenized_chat.get("input_ids", [])
+
+
+def _tokenized_chat_length(
+    tokenizer: "PreTrainedTokenizer",
+    messages: List[Dict[str, str]],
+    *,
+    tools: List[Dict] | None = None,
+    truncation: Union[str, bool] = "do_not_truncate",
+    seq_length: int | None = None,
+) -> int:
+    """Return the tokenized chat length for a message prefix without padding."""
+    return len(_tokenize_chat(tokenizer, messages, tools=tools, truncation=truncation, seq_length=seq_length))
 
 
 def _maybe_shift_mask_for_left_padding(
     mask: List[int],
     tokenizer: "PreTrainedTokenizer",
-    attention_mask: Optional[List[int]],
+    attention_mask: List[int] | None,
 ) -> List[int]:
     """Shift a token-level mask right when the tokenizer uses left padding.
 
@@ -129,38 +126,110 @@ def _maybe_shift_mask_for_left_padding(
     return [0] * pad_len + mask[: len(mask) - pad_len]
 
 
+def _is_consistent_render_prefix(
+    prefix_ids: "list[int]", reference_ids: "list[int]", *, trailing_token_id: "int | None" = None
+) -> bool:
+    """Check that a prefix render matches the start of the full-conversation render.
+
+    Locating spans by prefix lengths is only correct when
+    ``render(messages[:k])`` reproduces the first tokens of ``render(messages)``.
+    The comparison is exact unless a multi-token prefix ends with a known
+    standalone terminator that is replaced when the next message is appended.
+    """
+    if len(prefix_ids) > len(reference_ids):
+        return False
+    if prefix_ids == reference_ids[: len(prefix_ids)]:
+        return True
+    return (
+        len(prefix_ids) > 1
+        and trailing_token_id is not None
+        and prefix_ids[-1] == trailing_token_id
+        and prefix_ids[:-1] == reference_ids[: len(prefix_ids) - 1]
+    )
+
+
 def _build_multiturn_assistant_mask(
     tokenizer: "PreTrainedTokenizer",
     formatted_text: List[Dict[str, Any]],
     input_ids: List[int],
     *,
-    tools: Optional[List[Dict]] = None,
+    tools: List[Dict] | None = None,
     truncation: Union[str, bool] = "do_not_truncate",
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
+    unpadded_full_ids: "list[int] | None" = None,
+    prefix_cache: "dict[int, list[int]] | None" = None,
 ) -> List[int]:
-    """Build a fallback loss mask that supervises every assistant turn."""
+    """Build a fallback loss mask that supervises every assistant turn.
+
+    Each assistant span is located by tokenizing the conversation prefixes
+    before and after the turn, which is O(turns) ``apply_chat_template`` calls.
+    Two reductions keep that from re-doing work:
+
+    - ``unpadded_full_ids`` is the caller's already-known unpadded tokenization
+      of the whole conversation. When the dialogue ends on an assistant turn
+      its closing boundary is the full conversation, so passing it skips
+      re-tokenizing the entire prefix (the single most expensive call in the
+      loop). When omitted, the full conversation is tokenized once here.
+    - Each prefix length is memoized so a boundary shared by adjacent turns (a
+      turn's end and the next turn's start) is tokenized at most once. When the
+      caller passes a ``prefix_cache`` dict (``k`` -> ids of
+      ``formatted_text[:k]``) the rendered ids are kept in it as well, so
+      :func:`_build_generation_prompt_mask` can reuse these renders instead of
+      repeating them; without one only the lengths are retained, since holding
+      every prefix render would cost O(turns x sequence length) per sample.
+
+    Every tokenized prefix is validated against ``unpadded_full_ids`` (see
+    :func:`_is_consistent_render_prefix`). A known trailing EOS may differ when
+    the prefix is rendered alone. Any other mismatch raises :class:`ValueError`
+    because prefix arithmetic cannot place the spans safely.
+    """
     assistant_mask = [0] * len(input_ids)
     found_assistant = False
+
+    if unpadded_full_ids is None:
+        unpadded_full_ids = _tokenize_chat(
+            tokenizer,
+            formatted_text,
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+    length_cache: Dict[int, int] = {len(formatted_text): len(unpadded_full_ids)}
+
+    def prefix_length(k: int) -> int:
+        if k not in length_cache:
+            prefix_ids = _tokenize_chat(
+                tokenizer,
+                formatted_text[:k],
+                tools=tools,
+                truncation=truncation,
+                seq_length=seq_length,
+            )
+            if not _is_consistent_render_prefix(
+                prefix_ids, unpadded_full_ids, trailing_token_id=getattr(tokenizer, "eos_token_id", None)
+            ):
+                raise ValueError(
+                    f"Cannot build an answer-only loss mask from conversation prefixes: rendering "
+                    f"the first {k} message(s) alone does not reproduce a prefix of the fully "
+                    f"rendered conversation. The chat template rewrites earlier turns based on "
+                    f"later ones (for example, Qwen3's template drops <think> blocks from "
+                    f"assistant turns that precede the last user turn), so prefix-length "
+                    f"arithmetic would mislabel supervised tokens. Provide a chat template that "
+                    f"wraps assistant turns in {{% generation %}}...{{% endgeneration %}} so the "
+                    f"tokenizer returns the assistant mask directly."
+                )
+            length_cache[k] = len(prefix_ids)
+            if prefix_cache is not None:
+                prefix_cache[k] = prefix_ids
+        return length_cache[k]
 
     for idx, message in enumerate(formatted_text):
         if message["role"] != "assistant":
             continue
 
         found_assistant = True
-        start = _tokenized_chat_length(
-            tokenizer,
-            formatted_text[:idx],
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
-        end = _tokenized_chat_length(
-            tokenizer,
-            formatted_text[: idx + 1],
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
+        start = prefix_length(idx)
+        end = prefix_length(idx + 1)
         for pos in range(min(start, len(assistant_mask)), min(end, len(assistant_mask))):
             assistant_mask[pos] = 1
 
@@ -177,14 +246,42 @@ def _masked_reasoning_message(message: Dict[str, Any]) -> Dict[str, Any]:
     return masked
 
 
-def _find_reasoning_span(full_segment: List[int], masked_segment: List[int]) -> Optional[tuple[int, int]]:
+def _truncation_window_offset(
+    tokenizer: "PreTrainedTokenizer", unpadded_full_ids: list[int], reference_full_ids: list[int], what: str
+) -> int:
+    """Return where the retained (truncated) tokens start inside the untruncated render.
+
+    The retained window must be a contiguous prefix (right truncation) or suffix
+    (left truncation) of ``reference_full_ids``. A short window can match both
+    ends of a render that starts and ends with the same tokens, so the side the
+    tokenizer actually truncates on (``tokenizer.truncation_side``) is tried first.
+    """
+    prefix_offset, suffix_offset = 0, len(reference_full_ids) - len(unpadded_full_ids)
+    candidates = [prefix_offset, suffix_offset]
+    if getattr(tokenizer, "truncation_side", "right") == "left":
+        candidates.reverse()
+    for offset in candidates:
+        if unpadded_full_ids == reference_full_ids[offset : offset + len(unpadded_full_ids)]:
+            return offset
+    raise ValueError(
+        f"Cannot mask {what} after truncation because the retained tokens are not a contiguous "
+        "prefix or suffix of the untruncated conversation render."
+    )
+
+
+def _common_prefix_length(left: list[int], right: list[int]) -> int:
+    """Return the number of leading elements ``left`` and ``right`` share."""
+    n = 0
+    for a, b in zip(left, right):
+        if a != b:
+            break
+        n += 1
+    return n
+
+
+def _find_reasoning_span(full_segment: List[int], masked_segment: List[int]) -> tuple[int, int] | None:
     """Locate the contiguous token span attributable to reasoning content."""
-    prefix_len = 0
-    while (
-        prefix_len < min(len(full_segment), len(masked_segment))
-        and full_segment[prefix_len] == masked_segment[prefix_len]
-    ):
-        prefix_len += 1
+    prefix_len = _common_prefix_length(full_segment, masked_segment)
 
     suffix_len = 0
     max_suffix = min(len(full_segment) - prefix_len, len(masked_segment) - prefix_len)
@@ -204,59 +301,282 @@ def _build_reasoning_mask(
     formatted_text: List[Dict[str, Any]],
     input_ids: List[int],
     *,
-    tools: Optional[List[Dict]] = None,
+    tools: List[Dict] | None = None,
     truncation: Union[str, bool] = "do_not_truncate",
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
+    unpadded_full_ids: "list[int] | None" = None,
 ) -> List[int]:
-    """Build a token mask for reasoning_content spans inside assistant turns."""
+    """Build a token mask for reasoning_content spans inside assistant turns.
+
+    Each span is isolated by comparing the full conversation render with a
+    second full render where only that message's ``reasoning_content`` is
+    cleared. This remains correct when the template rewrites earlier turns
+    based on later messages. If clearing the field does not change the render,
+    that turn's reasoning is not present and no tokens need to be masked.
+    """
     reasoning_mask = [0] * len(input_ids)
+
+    if unpadded_full_ids is None:
+        unpadded_full_ids = _tokenize_chat(
+            tokenizer,
+            formatted_text,
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+
+    # Truncation only changes the render when it actually cut something; a sample
+    # that fits keeps identical truncated and untruncated renders.
+    truncation_enabled = truncation not in (False, None, "do_not_truncate") and (
+        seq_length is None or len(unpadded_full_ids) >= seq_length
+    )
+    reference_full_ids = unpadded_full_ids
+    reference_offset = 0
+    if truncation_enabled:
+        reference_full_ids = _tokenize_chat(
+            tokenizer,
+            formatted_text,
+            tools=tools,
+            truncation=False,
+            seq_length=None,
+        )
+        reference_offset = _truncation_window_offset(
+            tokenizer, unpadded_full_ids, reference_full_ids, "reasoning_content"
+        )
 
     for idx, message in enumerate(formatted_text):
         if message.get("role") != "assistant" or not message.get("reasoning_content"):
             continue
 
-        prefix_ids = _tokenize_chat(
-            tokenizer,
-            formatted_text[:idx],
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
-        full_ids = _tokenize_chat(
-            tokenizer,
-            formatted_text[: idx + 1],
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
+        masked_messages = formatted_text[:idx] + [_masked_reasoning_message(message)] + formatted_text[idx + 1 :]
         masked_ids = _tokenize_chat(
             tokenizer,
-            formatted_text[:idx] + [_masked_reasoning_message(message)],
+            masked_messages,
             tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
+            truncation=False if truncation_enabled else truncation,
+            seq_length=None if truncation_enabled else seq_length,
         )
 
-        start = len(prefix_ids)
-        full_segment = full_ids[start:]
-        masked_segment = masked_ids[start:]
-        span = _find_reasoning_span(full_segment, masked_segment)
+        span = _find_reasoning_span(reference_full_ids, masked_ids)
         if span is None:
             logger.warning(
-                "Could not isolate reasoning_content tokens for assistant message %s. "
-                "Leave `mask_reasoning_content=False` or ensure the chat template renders "
-                "reasoning_content in a distinct block.",
+                "Could not isolate reasoning_content tokens for assistant message %s. The chat template may not "
+                "render that field, or it may not render it in a distinct block.",
                 idx,
             )
             continue
 
         reasoning_start, reasoning_end = span
-        for pos in range(
-            min(start + reasoning_start, len(reasoning_mask)), min(start + reasoning_end, len(reasoning_mask))
-        ):
+        reasoning_start = max(0, reasoning_start - reference_offset)
+        reasoning_end = min(len(unpadded_full_ids), reasoning_end - reference_offset)
+        for pos in range(reasoning_start, reasoning_end):
             reasoning_mask[pos] = 1
 
     return reasoning_mask
+
+
+_warned_generation_prompt: set[str] = set()
+
+
+def _appended_generation_prompt_length(base_ids: list[int], generation_ids: list[int], turn: list[int]) -> int:
+    """Return how many leading tokens of ``turn`` a generation prompt render supplies, or ``0``.
+
+    ``base_ids`` is the conversation prefix rendered plain, ``generation_ids``
+    the same prefix rendered with ``add_generation_prompt=True`` and ``turn``
+    the tokens the full render has after ``base_ids``. The prompt counts only
+    when the prompt render is the plain render plus an appended block and the
+    turn opens with that whole block: the block is then exactly what the
+    template emits at inference with no assistant message present, so it holds
+    no token of the message. A prompt render that rewrites the prefix, or a
+    turn that reproduces the block only partly, proves nothing and gives ``0``
+    (see :func:`_build_generation_prompt_mask` for why).
+    """
+    if not _is_consistent_render_prefix(base_ids, generation_ids):
+        return 0
+    block = generation_ids[len(base_ids) :]
+    return len(block) if block and turn[: len(block)] == block else 0
+
+
+def _build_generation_prompt_mask(
+    tokenizer: "PreTrainedTokenizer",
+    formatted_text: list[dict[str, Any]],
+    input_ids: list[int],
+    *,
+    tools: list[dict] | None = None,
+    truncation: str | bool = "do_not_truncate",
+    seq_length: int | None = None,
+    unpadded_full_ids: list[int] | None = None,
+    prefix_cache: dict[int, list[int]] | None = None,
+) -> list[int]:
+    """Mark the tokens of each assistant turn that the generation prompt supplies.
+
+    At inference the chat template, not the model, emits the assistant role
+    header plus whatever it inserts ahead of the first generated token. For a
+    turn without reasoning that is typically an empty reasoning block such as
+    ``<think></think>`` (Nemotron), ``<think>\\n\\n</think>\\n\\n`` (Qwen3) or
+    ``</think>`` (DeepSeek V3.1); for a thinking turn it may be an opening
+    ``<think>\\n``. The model never produces these tokens, so supervising them
+    only teaches template boilerplate, and an empty reasoning block also
+    teaches an immediate ``<think>`` -> ``</think>`` transition.
+
+    The span is located without knowing any tag string, from what a generation
+    prompt is by definition: the tokens ``add_generation_prompt=True`` appends
+    to the rendered conversation prefix. For every assistant turn,
+    ``messages[:idx]`` is rendered plain and with the generation prompt; when
+    the template reads ``enable_thinking``, the prompt is rendered in both
+    modes (True and False), because the data alone cannot tell them apart: a
+    thinking turn may carry its reasoning in ``reasoning_content`` or inline
+    in ``content``. A template that never reads the variable renders one
+    prompt, without the keyword (a backend without Jinja templates may reject
+    it). A mode counts only when its prompt render appends a block to the
+    unchanged plain render and the turn in the full render opens with that
+    whole block (see :func:`_appended_generation_prompt_length`); the longest
+    such block is marked. No token of the message is compared or inferred, so
+    assistant content is never reached, and everything else fails closed:
+
+    - a plain prefix render that is not an exact prefix of the full render
+      (the template rewrites history as the conversation grows, or replaces
+      its terminator) leaves the turn supervised, warned once per process;
+    - a prompt render that rewrites the prefix instead of appending to it
+      (Gemma 4 prepends a thinking system block, GLM 4.5 appends ``/nothink``
+      to the user turn) is ignored, since its added tokens cannot be told
+      from rendered history;
+    - a turn that reproduces the appended block only partly (SmolLM3, or
+      Qwen3-Thinking without reasoning text, render fewer tokens than the
+      prompt emits) is left supervised. A partial match says nothing about
+      where the template stops and the message starts, because a message
+      token can equal the prompt token at the same position: Gemma 4's
+      ``<|channel>thought\\n`` is generated in thinking mode but appended by
+      the non-thinking prompt.
+
+    Truncation is handled like :func:`_build_reasoning_mask`: spans are located
+    in the untruncated render and mapped back through the retained window,
+    which must be a contiguous prefix or suffix of it. A leading assistant turn
+    whose template cannot render an empty conversation is left untouched
+    (warned once per process); any other render error propagates. Positions
+    are computed from unpadded (left-aligned) ids, like
+    :func:`_build_multiturn_assistant_mask`, whose prefix renders are read
+    from ``prefix_cache`` (nothing is written back). One or two extra
+    ``apply_chat_template`` renders per assistant turn are the price, which is
+    why this is opt-in.
+    """
+    generation_prompt_mask = [0] * len(input_ids)
+
+    if unpadded_full_ids is None:
+        unpadded_full_ids = _tokenize_chat(
+            tokenizer,
+            formatted_text,
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+    if prefix_cache is None:
+        prefix_cache = {}
+
+    # Truncation only changes the render when it actually cut something; a sample
+    # that fits keeps identical truncated and untruncated renders.
+    truncation_enabled = truncation not in (False, None, "do_not_truncate") and (
+        seq_length is None or len(unpadded_full_ids) >= seq_length
+    )
+    reference_full_ids = unpadded_full_ids
+    reference_offset = 0
+    render_kwargs: dict[str, Any] = dict(tools=tools, truncation=truncation, seq_length=seq_length)
+    if truncation_enabled:
+        reference_full_ids = _tokenize_chat(tokenizer, formatted_text, tools=tools, truncation=False, seq_length=None)
+        reference_offset = _truncation_window_offset(
+            tokenizer, unpadded_full_ids, reference_full_ids, "the generation prompt"
+        )
+        render_kwargs = dict(tools=tools, truncation=False, seq_length=None)
+        # The shared cache holds truncated prefix renders; this builder needs untruncated ones.
+        prefix_cache = {}
+
+    # enable_thinking is a template variable: a template that never reads it renders the same
+    # prompt in both modes, and a backend without Jinja templates may reject the keyword.
+    template = getattr(tokenizer, "chat_template", None)
+    template_text = " ".join(template.values()) if isinstance(template, dict) else str(template or "")
+    prompt_modes = [{"enable_thinking": mode} for mode in (True, False)] if "enable_thinking" in template_text else [{}]
+
+    def skip(reason: str, idx: int) -> None:
+        if reason not in _warned_generation_prompt:
+            _warned_generation_prompt.add(reason)
+            logger.warning(
+                "Could not %s for assistant message %s; its template-supplied tokens stay in the loss. "
+                "This warning is shown once.",
+                reason,
+                idx,
+            )
+
+    for idx, message in enumerate(formatted_text):
+        if message.get("role") != "assistant":
+            continue
+
+        prefix = formatted_text[:idx]
+        try:
+            base_ids = prefix_cache.get(idx)
+            if base_ids is None:
+                base_ids = _tokenize_chat(tokenizer, prefix, **render_kwargs)
+            if not _is_consistent_render_prefix(base_ids, reference_full_ids):
+                skip("align the generation prompt", idx)
+                continue
+            prompt_renders = [
+                _tokenize_chat(tokenizer, prefix, add_generation_prompt=True, **mode, **render_kwargs)
+                for mode in prompt_modes
+            ]
+        except Exception:
+            if idx:
+                raise
+            # A leading assistant turn has an empty prefix, which templates that read
+            # messages[0] cannot render (with or without the generation prompt).
+            skip("render the generation prompt of a leading assistant turn", idx)
+            continue
+        turn = reference_full_ids[len(base_ids) :]
+        matched = max(_appended_generation_prompt_length(base_ids, ids, turn) for ids in prompt_renders)
+
+        first = len(base_ids) - reference_offset
+        for pos in range(max(first, 0), min(first + matched, len(generation_prompt_mask))):
+            generation_prompt_mask[pos] = 1
+
+    return generation_prompt_mask
+
+
+def _subtract_mask(mask: list[int], removed: list[int]) -> list[int]:
+    """Zero every position of ``mask`` that ``removed`` marks."""
+    return [keep if not drop else 0 for keep, drop in zip(mask, removed)]
+
+
+def _mask_labels_to_last_turn(mask: List[int], ignore_index: int = -100) -> List[int]:
+    """Restrict supervision to the final assistant turn (``mask_history``).
+
+    Operates on any per-token sequence where ``ignore_index`` marks
+    unsupervised positions: a label list (``ignore_index=-100``) or a 0/1
+    assistant mask (``ignore_index=0``). Each assistant turn renders as a
+    single contiguous supervised span, so this keeps only the last such run
+    and rewrites every earlier supervised position to ``ignore_index``.
+
+    Apply this to the assistant mask **before** any reasoning_content holes are
+    punched into it; running it on already-holed labels would treat the
+    reasoning gap as a turn boundary and drop in-turn content before the hole.
+
+    Args:
+        mask: per-token labels or 0/1 mask (``ignore_index`` marks unsupervised).
+        ignore_index: the value marking unsupervised positions.
+
+    Returns:
+        The same list, mutated so only the final supervised run is kept.
+    """
+    last = -1
+    for i in range(len(mask) - 1, -1, -1):
+        if mask[i] != ignore_index:
+            last = i
+            break
+    if last < 0:
+        return mask
+    start = last
+    while start - 1 >= 0 and mask[start - 1] != ignore_index:
+        start -= 1
+    for i in range(start):
+        mask[i] = ignore_index
+    return mask
 
 
 @torch.no_grad()
@@ -477,7 +797,7 @@ def format_prompt_completion(
     answer: str,
     eos_token_id: int,
     pad_token_id: int,
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     padding: Union[str, bool] = "do_not_pad",
     truncation: Union[str, bool] = "do_not_truncate",
     answer_only_loss_mask: bool = True,
@@ -557,13 +877,15 @@ def format_chat_template(
     formatted_text: List[Dict[str, Any]],
     eos_token_id: int,
     pad_token_id: int,
-    seq_length: Optional[int] = None,
+    seq_length: int | None = None,
     padding: Union[str, bool] = "do_not_pad",
     truncation: Union[str, bool] = "do_not_truncate",
-    tools: Optional[List[Dict]] = None,
+    tools: List[Dict] | None = None,
     answer_only_loss_mask: bool = True,
     mask_reasoning_content: bool = False,
+    train_on_last_turn_only: bool = False,
     unshifted: bool = False,
+    mask_generation_prompt: bool = False,
 ) -> Dict[str, List[int]]:
     """
     Format a chat template style example.
@@ -577,6 +899,14 @@ def format_chat_template(
         tools: Optional list of tool definitions for function calling.
         answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
         mask_reasoning_content: Whether to exclude rendered reasoning_content tokens from loss.
+        train_on_last_turn_only: Whether to supervise only the final assistant turn,
+            masking every earlier assistant turn (``mask_history``). Applied to the
+            assistant mask before reasoning_content is masked out.
+        mask_generation_prompt: Whether to exclude from the loss the tokens of each
+            assistant turn that the chat template's generation prompt supplies at
+            inference: the role header and any template-inserted empty reasoning
+            block (for example ``<think></think>``). See
+            :func:`_build_generation_prompt_mask`.
 
     Returns:
         A dictionary with the formatted example.
@@ -615,6 +945,28 @@ def format_chat_template(
     )
 
     input_ids = tokenized_chat.get("input_ids")
+
+    # Unpadded full-conversation ids from this tokenization, already known
+    # without another tokenizer call; the mask builders use them to skip
+    # re-tokenizing the full prefix and to validate prefix renders. Computed
+    # lazily (the common generation-kwd path never needs it) but memoized so
+    # the multiturn and reasoning-mask builders share one computation instead
+    # of each rebuilding it. None (recompute in the builder) when no
+    # attention_mask is available.
+    _unpadded_full_ids_memo: "dict[str, list[int] | None]" = {}
+    # Prefix renders (k -> ids of formatted_text[:k]) shared by the mask builders. Only
+    # the generation-prompt builder reuses the ids; without it the multiturn builder
+    # keeps prefix lengths alone rather than every render.
+    prefix_cache: dict[int, list[int]] | None = {} if mask_generation_prompt else None
+
+    def unpadded_full_ids() -> "list[int] | None":
+        if "value" not in _unpadded_full_ids_memo:
+            attn = tokenized_chat.get("attention_mask")
+            _unpadded_full_ids_memo["value"] = (
+                [token for token, keep in zip(input_ids, attn) if keep] if attn is not None else None
+            )
+        return _unpadded_full_ids_memo["value"]
+
     if template_has_generation_kwd:
         mask = tokenized_chat["assistant_masks"]
     elif not template_has_generation_kwd and answer_only_loss_mask:
@@ -625,6 +977,8 @@ def format_chat_template(
             tools=tools,
             truncation=truncation,
             seq_length=seq_length,
+            unpadded_full_ids=unpadded_full_ids(),
+            prefix_cache=prefix_cache,
         )
         # _build_multiturn_assistant_mask computes indices from unpadded
         # lengths — shift for left-padding tokenizers.
@@ -640,6 +994,32 @@ def format_chat_template(
             if not tokenizer_attn_mask[i]:
                 mask[i] = 0
 
+    # Restrict to the last assistant turn before reasoning is masked, so the
+    # contiguous-run heuristic sees a hole-free mask (one run per turn).
+    if train_on_last_turn_only:
+        _mask_labels_to_last_turn(mask, ignore_index=0)
+
+    # Drop the template-supplied prefix of every assistant turn (role header and
+    # any empty reasoning block). Independent of the reasoning mask below: that one
+    # removes rendered reasoning text, this one removes what the generation prompt
+    # would emit around it.
+    if mask_generation_prompt:
+        generation_prompt_mask = _build_generation_prompt_mask(
+            tokenizer,
+            formatted_text,
+            input_ids,
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+            unpadded_full_ids=unpadded_full_ids(),
+            prefix_cache=prefix_cache,
+        )
+        # Computed from unpadded lengths, like the builders above.
+        generation_prompt_mask = _maybe_shift_mask_for_left_padding(
+            generation_prompt_mask, tokenizer, tokenized_chat.get("attention_mask")
+        )
+        mask = _subtract_mask(mask, generation_prompt_mask)
+
     if mask_reasoning_content and has_reasoning_content:
         reasoning_mask = _build_reasoning_mask(
             tokenizer,
@@ -648,12 +1028,13 @@ def format_chat_template(
             tools=tools,
             truncation=truncation,
             seq_length=seq_length,
+            unpadded_full_ids=unpadded_full_ids(),
         )
         # _build_reasoning_mask also computes from unpadded lengths.
         reasoning_mask = _maybe_shift_mask_for_left_padding(
             reasoning_mask, tokenizer, tokenized_chat.get("attention_mask")
         )
-        mask = [assistant if not reasoning else 0 for assistant, reasoning in zip(mask, reasoning_mask)]
+        mask = _subtract_mask(mask, reasoning_mask)
 
     return _package_tokenized_example(
         tokenizer=tokenizer,

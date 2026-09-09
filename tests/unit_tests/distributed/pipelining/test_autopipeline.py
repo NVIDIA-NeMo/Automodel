@@ -18,6 +18,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.pipelining.microbatch import TensorChunkSpec, split_args_kwargs_into_chunks
 
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import (
@@ -75,6 +76,7 @@ class FakePPMesh:
 
 class FakeDeviceMesh:
     """Mock DeviceMesh that behaves like the real DeviceMesh but without distributed setup."""
+
     def __init__(self, device_type="cpu", mesh=None, mesh_dim_names=None, pp_size=2, local_rank=0):
         self.device_type = device_type
         self.mesh = mesh or [[0, 1]]
@@ -97,6 +99,7 @@ class FakeDeviceMesh:
 
 class FakeWorldMesh(dict):
     """Mock for DeviceMesh that behaves like a dict."""
+
     pass
 
 
@@ -178,7 +181,9 @@ class TestAutoPipelineValidation:
         world_mesh = FakeDeviceMesh()
 
         # Test missing schedule validation
-        with pytest.raises(ValueError, match="Either pipeline_parallel_schedule or pipeline_parallel_schedule_csv must be provided"):
+        with pytest.raises(
+            ValueError, match="Either pipeline_parallel_schedule or pipeline_parallel_schedule_csv must be provided"
+        ):
             AutoPipeline(
                 world_mesh=world_mesh,
                 pp_axis_name="pp",
@@ -217,9 +222,150 @@ class TestAutoPipelineValidation:
         assert ap.pp_mesh is not None
 
 
+class _KwargsChunkHookPart(nn.Module):
+    def __init__(self, chunk_dims: dict[str, int]):
+        super().__init__()
+        self.chunk_dims = chunk_dims
+
+    def get_pipeline_kwargs_chunk_dims(self, kwargs):
+        return {key: dim for key, dim in self.chunk_dims.items() if key in kwargs}
+
+
+class _UnknownKwargsChunkHookPart(nn.Module):
+    def get_pipeline_kwargs_chunk_dims(self, kwargs):
+        return {"unknown": 0}
+
+
+class _KwargsChunkSchedule:
+    def __init__(self, *, fail_on_step: bool = False):
+        self._kwargs_chunk_spec = None
+        self.fail_on_step = fail_on_step
+        self.args_during_step = None
+        self.kwargs_chunk_spec_during_step = None
+        self.kwargs_split = None
+
+    def step(self, *args, target=None, losses=None, **kwargs):
+        """Split schedule inputs using the chunk spec active during the call.
+
+        Args:
+            *args: Positional schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+            target: Optional tensor of shape [batch, sequence] containing loss
+                targets.
+            losses: Optional mutable list populated with scalar loss tensors.
+            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+
+        Returns:
+            A sentinel string identifying the schedule result.
+        """
+        del target, losses
+        self.args_during_step = args
+        self.kwargs_chunk_spec_during_step = self._kwargs_chunk_spec
+        if self.fail_on_step:
+            raise RuntimeError("schedule failed")
+        _, self.kwargs_split = split_args_kwargs_into_chunks(
+            args,
+            kwargs,
+            2,
+            kwargs_chunk_spec=self._kwargs_chunk_spec,
+        )
+        return "schedule-result"
+
+
+class TestAutoPipelineKwargsChunkSpec:
+    def _pipeline_with_parts(self, *parts: nn.Module, schedule=None, has_first_stage: bool = True):
+        ap = AutoPipeline(
+            world_mesh=FakeDeviceMesh(),
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            device=torch.device("cpu"),
+        )
+        ap._info.schedule = schedule or _KwargsChunkSchedule()
+        ap._info.model_parts = list(parts)
+        ap._info.has_first_stage = has_first_stage
+        return ap
+
+    def test_step_splits_mrope_position_ids_on_model_owned_batch_axis(self):
+        """AutoPipeline.step keeps all mRoPE axes in every microbatch."""
+        input_ids = torch.zeros(2, 8, dtype=torch.long)
+        position_ids = torch.arange(8, dtype=torch.long).view(1, 1, -1).expand(3, 2, -1).clone()
+        kwargs = {
+            "position_ids": position_ids,
+            "attention_mask": torch.ones(2, 8, dtype=torch.bool),
+            "qkv_format": "thd",
+        }
+
+        _, default_kwargs_split = split_args_kwargs_into_chunks((input_ids,), kwargs, 2)
+        assert default_kwargs_split[0]["position_ids"].shape == (2, 2, 8)
+
+        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}))
+        result = ap.step(input_ids, **kwargs)
+
+        fixed_kwargs_split = ap.info.schedule.kwargs_split
+        assert result == "schedule-result"
+        assert fixed_kwargs_split[0]["position_ids"].shape == (3, 1, 8)
+        assert fixed_kwargs_split[1]["position_ids"].shape == (3, 1, 8)
+        torch.testing.assert_close(fixed_kwargs_split[0]["position_ids"], position_ids[:, :1])
+        torch.testing.assert_close(fixed_kwargs_split[1]["position_ids"], position_ids[:, 1:])
+        assert fixed_kwargs_split[0]["attention_mask"].shape == (1, 8)
+        assert fixed_kwargs_split[0]["qkv_format"] == "thd"
+        assert fixed_kwargs_split[1]["qkv_format"] == "thd"
+        assert ap.info.schedule.args_during_step == (input_ids,)
+        assert ap.info.schedule._kwargs_chunk_spec is None
+
+    def test_step_without_model_hook_uses_pytorch_default_chunking(self):
+        ap = self._pipeline_with_parts(nn.Module())
+
+        ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+
+        assert ap.info.schedule.kwargs_chunk_spec_during_step is None
+        assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
+        assert ap.info.schedule._kwargs_chunk_spec is None
+
+    def test_only_canonical_model_part_supplies_chunk_policy(self):
+        ap = self._pipeline_with_parts(
+            _KwargsChunkHookPart({"position_ids": 1}),
+            _KwargsChunkHookPart({"position_ids": 0}),
+        )
+
+        ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8))
+
+        assert ap.info.schedule.kwargs_split[0]["position_ids"].shape == (3, 1, 8)
+
+    def test_nonfirst_stage_ignores_model_input(self):
+        ap = self._pipeline_with_parts(nn.Module(), has_first_stage=False)
+
+        ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+
+        assert ap.info.schedule.args_during_step == ()
+        assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
+
+    def test_step_restores_schedule_chunk_spec_after_failure(self):
+        schedule = _KwargsChunkSchedule(fail_on_step=True)
+        original_chunk_spec = {"position_ids": TensorChunkSpec(0)}
+        schedule._kwargs_chunk_spec = original_chunk_spec
+        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}), schedule=schedule)
+
+        with pytest.raises(RuntimeError, match="schedule failed"):
+            ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8))
+
+        assert schedule.kwargs_chunk_spec_during_step["position_ids"].split_dim == 1
+        assert schedule._kwargs_chunk_spec is original_chunk_spec
+
+    def test_model_hook_cannot_configure_unknown_kwarg(self):
+        ap = self._pipeline_with_parts(_UnknownKwargsChunkHookPart())
+
+        with pytest.raises(ValueError, match="unknown kwarg"):
+            ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+
+
 # -----------------------------
 # Core build/materialize/step tests
 # -----------------------------
+
 
 class TestAutoPipelineBuildAndStep:
     """Test AutoPipeline build, materialize, and step functionality."""
@@ -407,6 +553,7 @@ class TestAutoPipelineErrorHandling:
         with pytest.raises(RuntimeError, match="Autopipeline not built"):
             _ = ap.parts
 
+
 class TestAutoPipelineProperties:
     """Test AutoPipeline properties and state management."""
 
@@ -579,6 +726,7 @@ class TestAutoPipelineDebugUtilities:
 
         # Test log_debug_summary
         import logging
+
         with caplog.at_level(logging.INFO):
             ap.log_debug_summary()
 
@@ -590,7 +738,7 @@ class TestAutoPipelineDebugUtilities:
         # Create a simple module with known parameter count
         module = nn.Sequential(
             nn.Linear(10, 5, bias=True),  # 10*5 + 5 = 55 params
-            nn.Linear(5, 1, bias=False)   # 5*1 = 5 params
+            nn.Linear(5, 1, bias=False),  # 5*1 = 5 params
         )
 
         # Total params: 60
@@ -698,8 +846,8 @@ class TestAutoPipelineDebugUtilities:
 
         # Create stages with is_first and is_last attributes to trigger line 268 coverage
         for i, stage in enumerate(ap._info.stages):
-            stage.is_first = (i == 0)
-            stage.is_last = (i == len(ap._info.stages) - 1)
+            stage.is_first = i == 0
+            stage.is_last = i == len(ap._info.stages) - 1
 
         # Test pretty_print_stages with module limit to trigger line 275-276
         pretty_print = ap.pretty_print_stages(max_modules_per_stage=1)
@@ -806,24 +954,34 @@ class TestAutoPipelineUpdateSeqLen:
 
         model = DummyQwenForCausalLM(num_layers=4)
         module_fqns = generate_hf_model_fqn_per_model_part(
-            num_stages=2, num_layers=4, include_embeddings=True,
-            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
         )
         world_mesh = FakeWorldMesh()
         world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
 
         ap = AutoPipeline(
-            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
-            pp_microbatch_size=1, pp_batch_size=2,
-            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
         )
         ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
 
         # Patch reset_pp_stage_shapes to track calls (mock to avoid needing real config)
         call_count = [0]
         import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
+
         def counting_reset(*args, **kwargs):
             call_count[0] += 1
+
         monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", counting_reset)
 
         # First call should trigger reset
@@ -841,24 +999,35 @@ class TestAutoPipelineUpdateSeqLen:
 
         model = DummyQwenForCausalLM(num_layers=4)
         module_fqns = generate_hf_model_fqn_per_model_part(
-            num_stages=2, num_layers=4, include_embeddings=True,
-            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
         )
         world_mesh = FakeWorldMesh()
         world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
 
         ap = AutoPipeline(
-            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
-            pp_microbatch_size=2, pp_batch_size=4,
-            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=2,
+            pp_batch_size=4,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
         )
         ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
 
         # Track the call args
         import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
+
         captured_args = []
+
         def mock_reset(schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype=None):
             captured_args.append((schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype))
+
         monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", mock_reset)
 
         ap.update_seq_len(256)
@@ -875,23 +1044,34 @@ class TestAutoPipelineUpdateSeqLen:
 
         model = DummyQwenForCausalLM(num_layers=4)
         module_fqns = generate_hf_model_fqn_per_model_part(
-            num_stages=2, num_layers=4, include_embeddings=True,
-            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
         )
         world_mesh = FakeWorldMesh()
         world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
 
         ap = AutoPipeline(
-            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
-            pp_microbatch_size=1, pp_batch_size=2,
-            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
         )
         ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
 
         import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
+
         call_count = [0]
+
         def mock_reset(*a, **kw):
             call_count[0] += 1
+
         monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", mock_reset)
 
         ap.update_seq_len(100)
@@ -913,16 +1093,24 @@ class TestAutoPipelineUpdateSeqLen:
 
         model = DummyQwenForCausalLM(num_layers=4)
         module_fqns = generate_hf_model_fqn_per_model_part(
-            num_stages=2, num_layers=4, include_embeddings=True,
-            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
         )
         world_mesh = FakeWorldMesh()
         world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
 
         ap = AutoPipeline(
-            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
-            pp_microbatch_size=1, pp_batch_size=2,
-            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
         )
 
         assert ap._model_config is None

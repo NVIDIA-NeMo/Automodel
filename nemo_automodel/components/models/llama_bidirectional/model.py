@@ -22,7 +22,8 @@ To add support for other backbones (e.g., Qwen2, Mistral), create a similar
 module in a new directory (e.g., qwen2_bidirectional/) with its own ModelClass export.
 """
 
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -89,6 +90,15 @@ class LlamaBidirectionalModel(LlamaModel):
 
     config_class = LlamaBidirectionalConfig
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
+
     def __init__(self, config: LlamaConfig):
         """
         Initialize LlamaBidirectionalModel.
@@ -104,13 +114,13 @@ class LlamaBidirectionalModel(LlamaModel):
     @check_model_inputs
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -190,6 +200,15 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
 
     config_class = LlamaBidirectionalConfig
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
+
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -214,16 +233,16 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Union[Cache, List[torch.FloatTensor]] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
         **kwargs,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -296,12 +315,12 @@ ModelClass = [LlamaBidirectionalModel, LlamaBidirectionalForSequenceClassificati
 
 
 def _register_with_hf_auto_classes():
-    """Register bidirectional models with HuggingFace Auto classes.
+    """Register bidirectional Llama types with Hugging Face Auto classes.
 
-    This is needed so that AutoModel.from_config(LlamaBidirectionalConfig)
-    works inside LlamaForSequenceClassification.__init__.
+    Enables ``AutoConfig``, ``AutoModel``, and ``AutoModelForSequenceClassification``
+    to resolve their corresponding bidirectional config and model classes.
     """
-    from transformers import AutoConfig, AutoModel
+    from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
 
     try:
         AutoConfig.register(LlamaBidirectionalConfig.model_type, LlamaBidirectionalConfig)
@@ -309,6 +328,12 @@ def _register_with_hf_auto_classes():
         pass  # Already registered
     try:
         AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
+    except ValueError:
+        pass  # Already registered
+    try:
+        AutoModelForSequenceClassification.register(
+            LlamaBidirectionalConfig, LlamaBidirectionalForSequenceClassification
+        )
     except ValueError:
         pass  # Already registered
 

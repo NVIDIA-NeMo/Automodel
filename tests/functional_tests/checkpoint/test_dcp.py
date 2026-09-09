@@ -29,9 +29,11 @@ import yaml
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
+from nemo_automodel.components.loss.utils import calculate_loss
+from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 datasets.disable_caching()
+
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
     """Loads a DCP checkpoint in a state dictionary from a directory."""
@@ -65,13 +67,15 @@ def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
 
 
 def compare_configs(source_config: dict, restored_config: dict):
-    """ Recursively compare two configs."""
+    """Recursively compare two configs."""
     for k, v in source_config.items():
         if k in restored_config:
             if isinstance(v, dict):
                 compare_configs(v, restored_config[k])
             else:
-                assert v == restored_config[k], f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                assert v == restored_config[k], (
+                    f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                )
 
 
 def to_cpu(
@@ -82,7 +86,12 @@ def to_cpu(
 
 
 def get_validation_loss(
-    model_parts: list[nn.Module], val_batch: dict[str, torch.Tensor], loss_fn: nn.Module, device: torch.device, pp_enabled: bool, pp,
+    model_parts: list[nn.Module],
+    val_batch: dict[str, torch.Tensor],
+    loss_fn: nn.Module,
+    device: torch.device,
+    pp_enabled: bool,
+    pp,
 ) -> torch.Tensor:
     """Gets the validation loss for a model."""
     loss_buffer = []
@@ -99,13 +108,12 @@ def get_validation_loss(
         with torch.no_grad():
             out = model_parts[0](**val_batch)
             loss = calculate_loss(
-                    loss_fn,
-                    logits=out.logits,
-                    labels=labels,
-                    model=model_parts[0],
-                    num_label_tokens=num_label_tokens,
-
-                )
+                loss_fn,
+                logits=out.logits,
+                labels=labels,
+                model=model_parts[0],
+                num_label_tokens=num_label_tokens,
+            )
             return [loss]
     else:
         losses = [] if pp.info.has_last_stage else None
@@ -930,10 +938,10 @@ def _get_test_dcp_checkpoint_expected_keys_v4():
 
     return expected_model_keys, expected_optim_keys
 
+
 def test_dcp_checkpoint():
     """Tests DCP checkpoint"""
     expected_model_keys, expected_optim_keys = get_test_dcp_checkpoint_expected_keys()
-
 
     cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(cfg_path)
@@ -964,7 +972,7 @@ def test_dcp_checkpoint():
         "optim",
         "step_scheduler.pt",
         "dataloader/dataloader_dp_rank_0.pt",
-        "rng/rng_dp_rank_0.pt",
+        *[f"rng/rng_global_rank_{global_rank}.pt" for global_rank in range(torch.distributed.get_world_size())],
         "model/__0_0.distcp",
         "model/__1_0.distcp",
         "model/.metadata",
@@ -977,7 +985,6 @@ def test_dcp_checkpoint():
     ]
     if trainer._get_dp_group_size() > 1:
         output_files.append("dataloader/dataloader_dp_rank_1.pt")
-        output_files.append("rng/rng_dp_rank_1.pt")
 
     for file in output_files:
         path = Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / file
@@ -1023,11 +1030,20 @@ def test_dcp_checkpoint():
     )
 
     # check if new model and current model give the same CE loss
-    val_batch = next(iter(trainer.val_dataloaders['default']))
+    val_batch = next(iter(trainer.val_dataloaders["default"]))
     restored_model = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     restored_model.setup()
-    source_model_loss = get_validation_loss(trainer.model_parts, val_batch, trainer.loss_fn, trainer.dist_env.device, trainer.pp_enabled, trainer.pp)
-    restored_model_loss = get_validation_loss(restored_model.model_parts, val_batch, trainer.loss_fn, trainer.dist_env.device, restored_model.pp_enabled, restored_model.pp)
+    source_model_loss = get_validation_loss(
+        trainer.model_parts, val_batch, trainer.loss_fn, trainer.dist_env.device, trainer.pp_enabled, trainer.pp
+    )
+    restored_model_loss = get_validation_loss(
+        restored_model.model_parts,
+        val_batch,
+        trainer.loss_fn,
+        trainer.dist_env.device,
+        restored_model.pp_enabled,
+        restored_model.pp,
+    )
     assert sum(source_model_loss) == sum(restored_model_loss), "Model loss mismatch"
 
     # compare the recipe configs
@@ -1074,7 +1090,6 @@ def test_dcp_checkpoint():
                 restored_model_dict[k],
                 restored_model_dict[k].shape[0] // 2,
             )[torch.distributed.get_rank()]
-
 
         assert list(curr_shard.shape) == expected_shape, (
             f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {curr_shard.shape}"
@@ -1123,7 +1138,7 @@ def test_dcp_checkpoint():
         try:
             assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
         except Exception as e:
-            if 'moe' in k and 'step' in k:
+            if "moe" in k and "step" in k:
                 pass
             else:
                 raise e
@@ -1137,8 +1152,7 @@ def test_dcp_checkpoint():
 
 
 def _rename_keys(d: dict, prepend: str):
-    """Rename the keys of *d* by prepending *prepend* to each key.
-    """
+    """Rename the keys of *d* by prepending *prepend* to each key."""
     flat: dict[str, torch.Tensor] = {}
     for k, v in d.items():
         key = f"{prepend}{k}"

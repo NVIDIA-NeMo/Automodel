@@ -20,7 +20,7 @@ The workflow has two stages:
 
 ### Built-In Builder: `make_hf_audio_asr_dataset`
 
-`nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset`
+`nemo_automodel.components.datasets.audio.datasets.make_hf_audio_asr_dataset`
 returns a Hugging Face `Dataset` whose `__getitem__` lazily produces a single
 `{"conversation": [...]}` dict suitable for `qwen3_omni_asr_collate_fn`. Key
 design points:
@@ -41,7 +41,7 @@ design points:
   WenetSpeech out of the box; per-dataset overrides go in the recipe YAML.
 
 ```python
-from nemo_automodel.components.datasets.vlm.datasets import (
+from nemo_automodel.components.datasets.audio.datasets import (
     make_hf_audio_asr_dataset,
 )
 
@@ -62,7 +62,7 @@ dataset = make_hf_audio_asr_dataset(
 
 ### Built-In Collate: `qwen3_omni_asr_collate_fn`
 
-`nemo_automodel.components.datasets.vlm.collate_fns.qwen3_omni_asr_collate_fn`
+`nemo_automodel.components.datasets.audio.collate_fns.qwen3_omni_asr_collate_fn`
 batches the lazy samples into model inputs without depending on
 `qwen_omni_utils`:
 
@@ -98,7 +98,7 @@ YAML override snippet for CommonVoice (note `text_column: sentence`):
 
 ```yaml
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset
+  _target_: nemo_automodel.components.datasets.audio.datasets.make_hf_audio_asr_dataset
   path_or_dataset: mozilla-foundation/common_voice_18_0
   name: en
   text_column: sentence
@@ -108,6 +108,33 @@ dataset:
 
 Audio columns are universally named `audio` across these datasets, so the
 default `audio_column="audio"` rarely needs an override.
+
+### Mixture of Datasets: `multi_en`
+
+For a stronger general-purpose English model, train on a **mixture** of public
+ASR corpora rather than a single dataset.
+`nemo_automodel.components.datasets.audio.multi_en` concatenates several HF
+sources into one training set, normalizing each to `{audio, text, source}` with
+per-source transcript cleanup (e.g. stripping GigaSpeech bracket tags such as
+`<COMMA>` / `<SIL>`). The default English composition is ~500k clips:
+
+| Source | HF repo | config / split | clips |
+|---|---|---|---:|
+| AMI IHM | `edinburghcstr/ami` | `ihm` / `train` | 108,502 |
+| Earnings22 | `sanchit-gandhi/earnings22_split` | `train` | 52,006 |
+| VoxPopuli (en) | `facebook/voxpopuli` | `en` / `train` (capped) | 4,000 |
+| GigaSpeech (s) | `speechcolab/gigaspeech` | `s` / `train` | 230,068 |
+| SPGISpeech (S) | `kensho/spgispeech` | `S` / `train` | 77,073 |
+| LibriSpeech | `openslr/librispeech_asr` | `clean` / `train.100` | 28,539 |
+| **Total** | | | **~500,188** |
+
+GigaSpeech and SPGISpeech are gated on the Hub — accept their terms (and allow
+`trust_remote_code` for GigaSpeech) before launching. The source list is fully
+overridable from YAML via `dataset.sources` (pass a trimmed list to drop gated
+corpora), and `dataset.max_audio_duration_seconds` caps clip length to bound
+activation memory. Ready-to-run recipe:
+`examples/audio_finetune/qwen3_omni_asr/multi_en_sft.yaml` (and
+`examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml` for the 3B).
 
 ---
 
@@ -126,7 +153,7 @@ public AMI IHM corpus. Defaults:
 | `freeze_config`    | `freeze_vision_tower=true`, `freeze_audio_tower=false`, `freeze_language_model=false`  |
 | `step_scheduler`   | `global_batch_size=64`, `local_batch_size=8`, `ckpt_every_steps=200`, `num_epochs=1`   |
 | `optimizer`        | `AdamW(lr=2.0e-5, betas=[0.9, 0.95], weight_decay=0.0)`                                |
-| `checkpoint`       | `result/checkpoints/...`, `model_save_format=safetensors`, `save_consolidated=true`    |
+| `checkpoint`       | `result/checkpoints/...`, `model_save_format=safetensors`, `save_consolidated=final`   |
 | `dataset`          | `make_hf_audio_asr_dataset(path_or_dataset="edinburghcstr/ami", name="ihm")`           |
 
 `peft:` is intentionally omitted — both the language model and the audio
@@ -156,7 +183,12 @@ dry run.
 
 ### What Gets Saved
 
-Every `ckpt_every_steps` steps the recipe writes a consolidated checkpoint:
+The config uses `save_consolidated: final`. Every checkpoint written at
+`ckpt_every_steps` contains the full restart state and sharded model weights,
+plus a generated `model/consolidate.sh` helper. Only the final checkpoint is
+exported inline to `model/consolidated/`. To export an intermediate checkpoint
+for Hugging Face-compatible inference tools, run that checkpoint's helper
+after training.
 
 ```
 epoch_E_step_S/
@@ -167,8 +199,9 @@ epoch_E_step_S/
 ├── rng/                       # PyTorch + numpy + python RNG state
 ├── step_scheduler.pt
 └── model/
+    ├── consolidate.sh                                  # exports this checkpoint on demand
     ├── shard-XXXXX-model-00001-of-00001.safetensors  # DCP sharded
-    ├── consolidated/                                  # HF-format export
+    ├── consolidated/                                  # final checkpoint only, or after consolidate.sh
     │   ├── config.json                               # thinker subtree only
     │   ├── model.safetensors.index.json
     │   ├── model-00001-of-00013.safetensors
@@ -176,7 +209,9 @@ epoch_E_step_S/
     └── chat_template.jinja, tokenizer*.json, processor_config.json
 ```
 
-The `consolidated/` directory is the artifact to use for inference. It already
+The final checkpoint's `consolidated/` directory is the artifact to use for
+inference. Intermediate checkpoints can produce the same directory after
+running `bash <ckpt>/model/consolidate.sh`. The exported directory already
 holds the trained weights and the right tokenizer + processor — but its
 `config.json` describes the *thinker sub-model only*
 (`model_type=qwen3_omni_moe_thinker`), which neither `transformers.AutoConfig`
@@ -228,9 +263,9 @@ materialisation.
 
 ```bash
 python tools/wrap_thinker_ckpt_as_omni.py \
-    --ckpt-dir   result/checkpoints/<run>/epoch_0_step_199/model/consolidated \
+    --ckpt-dir   result/checkpoints/<run>/epoch_0_step_<final>/model/consolidated \
     --base-dir   ~/.cache/huggingface/hub/models--Qwen--Qwen3-Omni-30B-A3B-Instruct/snapshots/<rev> \
-    --out-dir    /tmp/qwen3_omni_asr_step_199_wrapped
+    --out-dir    /tmp/qwen3_omni_asr_final_wrapped
 ```
 
 The output directory is a drop-in replacement for the public Qwen3-Omni
@@ -251,3 +286,33 @@ roughly half:
 |-----------------|-------------------------------------------------------|--------------------|
 | Before training | Base `Qwen/Qwen3-Omni-30B-A3B-Instruct` (zero-shot)   | 15.81%             |
 | After training  | 1 epoch full FT (audio tower trainable)               | **8.31%**          |
+
+## Results: `multi_en` mixture
+
+Training the same model for 3 epochs on the ~500k-clip `multi_en` mixture (see
+[Mixture of Datasets](#mixture-of-datasets-multi_en)) generalizes across all 7
+[open-ASR-leaderboard](https://huggingface.co/datasets/hf-audio/open-asr-leaderboard)
+English test subsets, not just AMI. WER below is Whisper-normalized
+(`EnglishTextNormalizer`), greedy decode, comparing the zero-shot base against
+the `multi_en` fine-tune:
+
+| Subset | N | Base (zero-shot) | `multi_en` FT |
+|---|---:|---:|---:|
+| LibriSpeech test.clean | 2,620 | 1.49 | 1.89 |
+| LibriSpeech test.other | 2,939 | 2.62 | 3.54 |
+| SPGISpeech | 39,341 | 3.12 | **2.11** |
+| VoxPopuli | 1,842 | 7.07 | **6.67** |
+| GigaSpeech | 19,931 | 8.54 | 9.46 |
+| Earnings22 | 2,741 | 9.79 | **8.89** |
+| AMI (IHM) | 12,643 | 11.07 | **8.22** |
+| **Macro avg** | — | 6.24 | **5.83** |
+
+Fine-tuning concentrates its gains on the harder conversational / domain sets
+(AMI −2.85, Earnings22 −0.90, SPGISpeech −1.01, VoxPopuli −0.40), while the
+strong base keeps a small edge on clean read speech (LibriSpeech, GigaSpeech) —
+a hint that the mix can be rebalanced toward those styles. Net macro WER
+improves from 6.24% to **5.83%**.
+
+The same recipe on **Qwen2.5-Omni-3B** (`multi_en_sft_3b.yaml`) shows a much
+larger fine-tuning gain, since the small model's zero-shot baseline is weaker:
+macro WER **8.97% → 6.55%** (−2.42).

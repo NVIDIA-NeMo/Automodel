@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import random
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar
 
 from datasets import Dataset, Features, Sequence, Value
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 
 def make_vocab(vocab_size: int = 100):
@@ -89,6 +96,38 @@ def build_unpacked_dataset(
     )
     ds = Dataset.from_list(examples, features=features)
     return ds
+
+
+@dataclass
+class MockUnpackedDatasetConfig:
+    """Construction-time configuration for the mock unpacked dataset (tokenizer is a build arg)."""
+
+    accepts_tokenizer: ClassVar[bool] = True
+
+    num_sentences: int = 10
+    """Number of sentence examples to generate."""
+    mean_len: float = 20.0
+    """Mean sentence length (Gaussian)."""
+    std_len: float = 6.0
+    """Standard deviation of sentence length (Gaussian)."""
+    vocab_size: int = 100
+    """Vocabulary size for the synthetic tokens."""
+    max_sentence_len: int = 64
+    """Maximum sentence length."""
+    seed: int = 0
+    """Seed for the random generator."""
+
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None" = None) -> Dataset:
+        """Build the mock unpacked :class:`~datasets.Dataset` from this :class:`MockUnpackedDatasetConfig`."""
+        return build_unpacked_dataset(
+            num_sentences=self.num_sentences,
+            mean_len=self.mean_len,
+            std_len=self.std_len,
+            vocab_size=self.vocab_size,
+            max_sentence_len=self.max_sentence_len,
+            seed=self.seed,
+            tokenizer=tokenizer,
+        )
 
 
 if __name__ == "__main__":

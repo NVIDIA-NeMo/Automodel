@@ -27,16 +27,15 @@ import torch.distributed.tensor
 import torch.nn as nn
 import yaml
 from safetensors import safe_open
+from transformers import AutoModelForCausalLM
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
-from transformers import AutoModelForCausalLM
+from nemo_automodel.components.loss.utils import calculate_loss
+from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 datasets.disable_caching()
-
-
 
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
@@ -312,7 +311,6 @@ def _get_test_consolidated_llm_checkpoint_expected_keys_v5():
         return v5_model_keys, v5_optim_keys
 
     return _convert_v4_keys_to_v5(*_get_test_consolidated_llm_checkpoint_expected_keys_v4())
-
 
 
 def _get_test_consolidated_llm_checkpoint_expected_keys_v4():
@@ -998,7 +996,7 @@ def test_consolidated_llm_checkpoint():
         "optim",
         "step_scheduler.pt",
         "dataloader/dataloader_dp_rank_0.pt",
-        "rng/rng_dp_rank_0.pt",
+        *[f"rng/rng_global_rank_{global_rank}.pt" for global_rank in range(torch.distributed.get_world_size())],
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
         "model/consolidated/model-00001-of-00001.safetensors",
@@ -1018,7 +1016,6 @@ def test_consolidated_llm_checkpoint():
     ]
     if trainer._get_dp_group_size() > 1:
         output_files.append("dataloader/dataloader_dp_rank_1.pt")
-        output_files.append("rng/rng_dp_rank_1.pt")
 
     for file in output_files:
         path = Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / file

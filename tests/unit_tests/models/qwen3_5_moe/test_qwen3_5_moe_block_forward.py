@@ -135,3 +135,54 @@ class TestQwen3_5MoeBlockForward:
         assert la["indices"].tolist() == [0, 1, 2, 3, 4]
         # linear_attn sees the indexed mask, not the 4D SDPA mask.
         assert torch.equal(la["attention_mask"], packed_seq_ids)
+
+    def test_linear_attention_forwards_seq_index(self):
+        """seq_index in attn_kwargs is threaded through to linear_attn (CP dense index)."""
+        block, recorded = _build_block("linear_attention")
+        x = torch.zeros(1, 5, 4)
+        seq_index = torch.arange(5).unsqueeze(0)
+        block(
+            x,
+            freqs_cis=torch.zeros(3, 1, 5, 2),
+            attention_mask=torch.ones(1, 5, dtype=torch.long),
+            padding_mask=None,
+            position_ids=torch.arange(5).unsqueeze(0),
+            seq_index=seq_index,
+        )
+        assert torch.equal(recorded["linear_attn_kwargs"]["seq_index"], seq_index)
+
+    def test_linear_attention_seq_index_defaults_to_none(self):
+        """When seq_index is absent, linear_attn still receives the kwarg as None."""
+        block, recorded = _build_block("linear_attention")
+        x = torch.zeros(1, 5, 4)
+        block(
+            x,
+            freqs_cis=torch.zeros(3, 1, 5, 2),
+            attention_mask=torch.ones(1, 5, dtype=torch.long),
+            padding_mask=None,
+            position_ids=torch.arange(5).unsqueeze(0),
+        )
+        assert recorded["linear_attn_kwargs"]["seq_index"] is None
+
+    def test_full_attention_strips_seq_index_before_super(self, monkeypatch):
+        """Full-attention path must drop seq_index so Block.forward gets no unexpected kwarg."""
+        from nemo_automodel.components.models.qwen3_next.model import Block
+
+        block, _ = _build_block("full_attention")
+        called: dict = {}
+
+        def _fake_super_forward(self, x, **kwargs):
+            called["kwargs"] = kwargs
+            return x
+
+        monkeypatch.setattr(Block, "forward", _fake_super_forward, raising=True)
+
+        block(
+            torch.zeros(1, 5, 4),
+            freqs_cis=torch.zeros(3, 1, 5, 2),
+            attention_mask=torch.ones(1, 5, dtype=torch.long),
+            padding_mask=None,
+            position_ids=torch.arange(5).unsqueeze(0),
+            seq_index=torch.arange(5).unsqueeze(0),
+        )
+        assert "seq_index" not in called["kwargs"], "seq_index must be stripped on the full-attention path"

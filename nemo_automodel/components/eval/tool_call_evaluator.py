@@ -31,7 +31,7 @@ recipe), which already has the dist environment in hand.
 
 import gc
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 import torch
 
@@ -44,16 +44,6 @@ from nemo_automodel.components.eval.tool_call_parser import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-_METRIC_KEYS = (
-    "has_call",
-    "name_correct",
-    "args_json_valid",
-    "args_field_recall",
-    "args_field_precision",
-    "args_exact_match",
-)
 
 
 class ToolCallAccuracyEvaluator:
@@ -86,19 +76,32 @@ class ToolCallAccuracyEvaluator:
             returned ``_count`` and weighted-summed metrics.
     """
 
+    #: Fixed metric names returned by :meth:`evaluate` (one mean each). Exposed
+    #: so a caller can all-reduce a stable key set across ranks instead of the
+    #: data-dependent ``_skip_<reason>`` diagnostics, which differ per rank and
+    #: would desync collectives.
+    METRIC_KEYS = (
+        "has_call",
+        "name_correct",
+        "args_json_valid",
+        "args_field_recall",
+        "args_field_precision",
+        "args_exact_match",
+    )
+
     def __init__(
         self,
         *,
-        dataset_name: Optional[str] = None,
-        path: Optional[Union[str, List[str]]] = None,
+        dataset_name: str | None = None,
+        path: Union[str, List[str]] | None = None,
         split: str = "train",
-        limit_dataset_samples: Optional[int] = None,
-        max_eval_samples: Optional[int] = None,
+        limit_dataset_samples: int | None = None,
+        max_eval_samples: int | None = None,
         max_new_tokens: int = 256,
-        max_prompt_tokens: Optional[int] = None,
+        max_prompt_tokens: int | None = None,
         do_sample: bool = False,
         metric_prefix: str = "tool_call",
-        sample_shard: Optional[tuple] = None,
+        sample_shard: tuple | None = None,
         raise_on_cuda_oom: bool = True,
         run_on_fsdp2: bool = False,
     ) -> None:
@@ -118,7 +121,21 @@ class ToolCallAccuracyEvaluator:
         self._raise_on_cuda_oom = raise_on_cuda_oom
         self.run_on_fsdp2 = run_on_fsdp2
 
-        self._samples_cache: Optional[List[Dict[str, Any]]] = None
+        self._samples_cache: List[Dict[str, Any]] | None = None
+
+    @property
+    def sample_shard(self) -> tuple | None:
+        """``(rank, world_size)`` shard, or ``None`` to score every sample.
+
+        The training recipe sets this so each data-parallel rank scores a
+        disjoint subset, but only when the model is replicated per rank (DDP);
+        sharded strategies must keep every rank on the same samples.
+        """
+        return self._sample_shard
+
+    @sample_shard.setter
+    def sample_shard(self, value: tuple | None) -> None:
+        self._sample_shard = value
 
     def _cleanup_cuda(self) -> None:
         gc.collect()
@@ -131,7 +148,7 @@ class ToolCallAccuracyEvaluator:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         max_new_tokens: int,
-        eos_token_id: Optional[int],
+        eos_token_id: int | None,
     ) -> torch.Tensor:
         """Greedy decode using only ``model.forward()``.
 
@@ -187,8 +204,8 @@ class ToolCallAccuracyEvaluator:
         self,
         tokenizer,
         sample: Dict[str, Any],
-        skip_reasons: Optional[Dict[str, int]] = None,
-    ) -> Optional[List[int]]:
+        skip_reasons: Dict[str, int] | None = None,
+    ) -> List[int] | None:
         """Render one eval sample's prompt through ``apply_chat_template``.
 
         We deliberately split the chat-template render (``tokenize=False``)
@@ -278,7 +295,7 @@ class ToolCallAccuracyEvaluator:
             samples actually scored on this rank.
         """
         samples = self._iter_my_samples()
-        sums = {k: 0.0 for k in _METRIC_KEYS}
+        sums = {k: 0.0 for k in self.METRIC_KEYS}
         n_scored = 0
         skip_reasons: Dict[str, int] = {}
 
@@ -369,7 +386,7 @@ class ToolCallAccuracyEvaluator:
             decoded = tokenizer.decode(new_tokens, skip_special_tokens=False)
             pred_calls = parse_tool_calls(decoded)
             metrics = compute_sample_metrics(pred_calls, sample["gt_tool_calls"])
-            for k in _METRIC_KEYS:
+            for k in self.METRIC_KEYS:
                 sums[k] += metrics[k]
             n_scored += 1
             del input_ids, attention_mask, output
@@ -389,10 +406,10 @@ class ToolCallAccuracyEvaluator:
 
         result: Dict[str, float] = {}
         if n_scored > 0:
-            for k in _METRIC_KEYS:
+            for k in self.METRIC_KEYS:
                 result[f"{self.metric_prefix}/{k}"] = sums[k] / n_scored
         else:
-            for k in _METRIC_KEYS:
+            for k in self.METRIC_KEYS:
                 result[f"{self.metric_prefix}/{k}"] = 0.0
         result[f"{self.metric_prefix}/_count"] = float(n_scored)
         result[f"{self.metric_prefix}/_skipped"] = float(n_skipped)

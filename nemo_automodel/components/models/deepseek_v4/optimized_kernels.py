@@ -39,6 +39,7 @@ from typing import Literal
 
 import torch
 
+from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
 
 Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "auto"]
@@ -93,9 +94,9 @@ def is_dsv4_kernel_available(name: Literal["sinkhorn", "sparse_attn", "indexer"]
     if name == "sinkhorn":
         return _HAS_TILE_KERNELS_SINKHORN and _HAS_TILE_KERNELS_SINKHORN_FWD and _HAS_TILE_KERNELS_SINKHORN_BWD
     if name == "sparse_attn":
-        return _HAS_MILES_SPARSE_ATTN
+        return HAS_TILELANG and _HAS_MILES_SPARSE_ATTN
     if name == "indexer":
-        return _HAS_MILES_INDEXER and _HAS_MILES_CU_SEQLENS and _HAS_MILES_INDEXER_AUTOGRAD
+        return HAS_TILELANG and _HAS_MILES_INDEXER and _HAS_MILES_CU_SEQLENS and _HAS_MILES_INDEXER_AUTOGRAD
     raise ValueError(f"Unknown DeepSeek V4 kernel name: {name}")
 
 
@@ -211,30 +212,78 @@ def build_dsv4_sparse_topk_indices(
     compress_ratio: int = 0,
     compressed_topk: torch.Tensor | None = None,
     n_pooled: int = 0,
+    vanilla_key_len: int | None = None,
+    q_positions: torch.Tensor | None = None,
+    vision_token_types: torch.Tensor | None = None,
+    max_image_tokens: int = 0,
 ) -> torch.Tensor:
-    """Build Miles-style top-k key indices for DSV4 local-window + compressed KV attention."""
-    window = min(seq_len, window_size)
-    q_pos = torch.arange(seq_len, device=device)
-    k_pos = (q_pos.unsqueeze(1) - window_size + 1).clamp(min=0) + torch.arange(window, device=device)
-    window_topk = torch.where(k_pos > q_pos.unsqueeze(1), torch.full_like(k_pos, -1), k_pos)
-    topk = window_topk.unsqueeze(0).expand(batch_size, -1, -1)
+    """Build Miles-style top-k key indices for DSV4 local-window + compressed KV attention.
+
+    Args:
+        vision_token_types: Optional pseudo-token types with shape ``[batch, sequence]``. Text positions
+            contain ``-1``; image spans contain ``IMAGE_START``, ``IMAGE``, and ``IMAGE_END`` token types.
+            When provided with ``max_image_tokens > 0``, image queries additionally see the full image span.
+        max_image_tokens: Maximum number of tokens in an image span. ``0`` disables visual windowing.
+    """
+    vanilla_key_len = seq_len if vanilla_key_len is None else vanilla_key_len
+    window = min(vanilla_key_len, window_size)
+    if q_positions is None:
+        q_pos = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    else:
+        if q_positions.dim() == 1:
+            q_positions = q_positions.unsqueeze(0)
+        q_pos = q_positions.to(device=device, dtype=torch.long)
+        if q_pos.shape[0] == 1 and batch_size > 1:
+            q_pos = q_pos.expand(batch_size, -1)
+    if vision_token_types is not None and max_image_tokens > 0:
+        if vision_token_types.dim() == 1:
+            vision_token_types = vision_token_types.unsqueeze(0)
+        vision_token_types = vision_token_types.to(device=device)
+        if vision_token_types.shape != (batch_size, seq_len):
+            raise ValueError(
+                f"vision_token_types must have shape {(batch_size, seq_len)}, got {tuple(vision_token_types.shape)}"
+            )
+
+        # Exact training-time counterpart of the released inference dump's
+        # get_image_visible/get_window_topk_idxs_visible.  Image queries keep
+        # the normal left sliding window and additionally see the complete
+        # [IMAGE_START, IMAGE_END] span in both directions.  Text queries keep
+        # the ordinary causal window.  Visual CP/THD is rejected by the model,
+        # so query and key positions are local contiguous sequence positions.
+        idx = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+        is_start = vision_token_types == 0
+        is_end = vision_token_types == 4
+        valid = (is_start.cumsum(1) > is_end.cumsum(1)) | is_end
+        starts = torch.where(is_start, idx, 0).cummax(1).values
+        left = ((idx - starts) * valid).clamp(max=max_image_tokens - 1)
+        ends = torch.where(is_end, idx, seq_len).flip(1).cummin(1).values.flip(1)
+        right = ((ends - idx) * valid).clamp(max=max_image_tokens)
+
+        width = min(seq_len, window_size + max_image_tokens)
+        left_add = (left - (window_size - 1)).clamp(min=0)
+        window_starts = (idx - (window_size - 1) - left_add).clamp(min=0)
+        topk = window_starts.unsqueeze(-1) + torch.arange(width, device=device, dtype=torch.long)
+        topk = torch.where(topk > (idx + right).unsqueeze(-1), torch.full_like(topk, -1), topk)
+    else:
+        offsets = torch.arange(window, device=device, dtype=torch.long)
+        k_pos = (q_pos.unsqueeze(-1) - window_size + 1).clamp(min=0) + offsets.view(1, 1, window)
+        topk = torch.where(k_pos > q_pos.unsqueeze(-1), torch.full_like(k_pos, -1), k_pos)
 
     if n_pooled > 0:
         if compressed_topk is not None:
             compressed = torch.where(
                 compressed_topk >= 0,
-                compressed_topk + seq_len,
+                compressed_topk + vanilla_key_len,
                 torch.full_like(compressed_topk, -1),
             )
         else:
-            pooled_pos = torch.arange(n_pooled, device=device).unsqueeze(0).expand(seq_len, -1)
-            threshold = ((q_pos + 1) // compress_ratio).unsqueeze(1)
+            pooled_pos = torch.arange(n_pooled, device=device, dtype=torch.long).view(1, 1, n_pooled)
+            threshold = ((q_pos + 1) // compress_ratio).unsqueeze(-1)
             compressed = torch.where(
                 pooled_pos < threshold,
-                pooled_pos + seq_len,
+                pooled_pos + vanilla_key_len,
                 torch.full_like(pooled_pos, -1),
-            ).unsqueeze(0)
-            compressed = compressed.expand(batch_size, -1, -1)
+            )
         topk = torch.cat([topk, compressed], dim=-1)
 
     topk = torch.where((topk >= 0) & (topk < key_len), topk, torch.full_like(topk, -1))
@@ -383,6 +432,8 @@ def dsv4_indexer_scores(
     compress_ratio: int,
     softmax_scale: float,
     backend: Dsv4IndexerBackend,
+    query_start: int = 0,
+    query_total_len: int | None = None,
 ) -> torch.Tensor:
     """Run DSV4 C4 indexer scores through Miles TileLang kernels or torch fallback."""
     if _should_use_tilelang(
@@ -394,7 +445,11 @@ def dsv4_indexer_scores(
     ):
         seq_len = q.shape[1]
         seq_len_kv = pooled_kv.shape[1]
-        cu_ks, cu_ke = _miles_make_causal_cu_seqlens(seq_len, seq_len_kv, compress_ratio, q.device)
+        query_total_len = seq_len if query_total_len is None else query_total_len
+        cu_ks, cu_ke = _miles_make_causal_cu_seqlens(query_total_len, seq_len_kv, compress_ratio, q.device)
+        if query_start or query_total_len != seq_len:
+            cu_ks = cu_ks[query_start : query_start + seq_len]
+            cu_ke = cu_ke[query_start : query_start + seq_len]
         return _miles_batched_indexer_fwd(
             q.transpose(0, 1).contiguous(),
             pooled_kv.transpose(0, 1).contiguous(),

@@ -45,6 +45,7 @@ model:
     rms_norm: torch_fp32
     experts: te
     dispatcher: deepep
+    rope_fusion: false  # fused TE RoPE produces NaN gradients on packed (THD) sequences
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -52,7 +53,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2

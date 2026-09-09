@@ -329,7 +329,7 @@ class TestForwardShapes:
         batch, seq = 1, 4
         input_ids = torch.randint(0, tiny_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.shape == (batch, seq, tiny_config.vocab_size)
 
     def test_forward_with_explicit_position_ids(self, tiny_config, backend_config):
@@ -338,7 +338,7 @@ class TestForwardShapes:
         input_ids = torch.randint(0, tiny_config.vocab_size, (batch, seq))
         position_ids = torch.arange(seq).unsqueeze(0)
         with torch.no_grad():
-            logits = model(input_ids, position_ids=position_ids)
+            logits = model(input_ids, position_ids=position_ids).logits
         assert logits.shape == (batch, seq, tiny_config.vocab_size)
 
     def test_forward_logits_to_keep_int(self, tiny_config, backend_config):
@@ -346,7 +346,7 @@ class TestForwardShapes:
         batch, seq = 1, 6
         input_ids = torch.randint(0, tiny_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids, logits_to_keep=2)
+            logits = model(input_ids, logits_to_keep=2).logits
         assert logits.shape == (batch, 2, tiny_config.vocab_size)
 
 
