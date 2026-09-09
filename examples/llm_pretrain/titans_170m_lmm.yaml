@@ -50,6 +50,8 @@ model:
     memory_residual_norm: true
     qkv_conv_kernel_size: 4
     chunk_size: 16
+    deep_memory_backend: titans_pytorch
+    memory_batch_size: 4096
     tie_word_embeddings: false
     initializer_range: 0.02
     # Keep fp32 master weights; FSDP2 casts parameters to bf16 for compute.

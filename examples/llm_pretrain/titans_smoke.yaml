@@ -48,6 +48,8 @@ model:
     memory_residual_norm: true
     qkv_conv_kernel_size: 4
     chunk_size: 16
+    deep_memory_backend: titans_pytorch
+    memory_batch_size: 128
     tie_word_embeddings: false
     initializer_range: 0.02
     torch_dtype: bfloat16

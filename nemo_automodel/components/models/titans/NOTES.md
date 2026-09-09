@@ -97,13 +97,22 @@ Implementation (ported from the validated standalone kernel in
   init) together with `mem_norm_weight`. They are the **outer-loop** params and
   the **chunk-0 anchor** re-used each forward; the inner loop updates a
   per-sequence copy.
-- **Analytic gradients (no `torch.func`).** `_mem_grads` computes the exact
-  per-token MLP gradient by hand (cached layer inputs + exact erf-GELU
-  derivative). `_deep_chunk_update` runs the within-chunk momentum+forget scan in
-  closed form (`_deep_scan_matrix`); the cross-chunk recurrence is sequential.
-- **Chunking is a parallelization knob.** `chunk_size=1` is *exact* per-token GD;
-  `chunk_size>1` re-anchors the gradient at each chunk start (the Titans
-  approximation), retrieval being anchor-causal at chunk granularity.
+- **Analytic gradients (no `torch.func`).** `_mem_grads` computes the exact MLP
+  gradient by hand (cached layer inputs + exact erf-GELU derivative). It can
+  aggregate a weighted chunk directly, avoiding a materialized
+  `[batch, chunk, in, out]` gradient.
+- **Two explicit semantics.** `deep_memory_backend=reference` retains the
+  standalone kernel's per-token within-chunk update and re-anchors every chunk.
+  `deep_memory_backend=titans_pytorch` matches the public implementation's
+  chunk-aggregated surprises and scans momentum/decay across all chunks sharing
+  one anchor. Retrieval uses its one-token left shift, making a chunk's update
+  visible at that chunk's final token. `memory_batch_size` controls the
+  re-anchoring interval.
+- **Accelerated public scan.** The public backend delegates its two
+  `state_t = gate_t * state_(t-1) + input_t` scans to an attributed,
+  MIT-licensed port of `accelerated-scan==0.3.1`. The port fixes an upstream
+  out-of-bounds load in the Triton backward for scan lengths below 2048. A
+  pure-PyTorch log-space scan remains available when Triton is unavailable.
 - **Keys/queries L2-normalized** (like the linear path) for stable GD, and the
   recurrence runs in fp32 for bf16/fp16 inputs (fp64 preserved).
 - **Numerical-stability fix vs. the standalone kernel.** The scan matrix masks the

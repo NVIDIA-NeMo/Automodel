@@ -62,6 +62,9 @@ from torch import nn
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAVE_FLA, _fla = safe_import("fla.ops.gated_delta_rule")
+_HAVE_ACCELERATED_SCAN, _accelerated_scan = safe_import(
+    "nemo_automodel.components.models.titans.accelerated_scan"
+)
 
 
 @dataclass
@@ -187,6 +190,11 @@ class NeuralMemory(nn.Module):
         chunk_size: Chunk size. For ``mem_depth==1`` it is the hint forwarded to the
             fla GDN kernel; for ``mem_depth>=2`` it is the test-time-GD chunk length
             (``1`` is exact per-token GD, larger re-anchors the gradient per chunk).
+        deep_memory_backend: ``"reference"`` for the per-token research kernel or
+            ``"titans_pytorch"`` for chunk-aggregated gradients and an associative
+            scan across chunks.
+        memory_batch_size: Re-anchoring interval in tokens for the public backend.
+            Must be divisible by ``chunk_size``; ``None`` uses the whole call.
         momentum: Enable the data-dependent momentum (Titans). If ``False``, the
             recurrence is exactly Gated DeltaNet (delegates to fla).
         forget: Enable the data-dependent decay/forget gate. If ``False``, decay is
@@ -204,6 +212,8 @@ class NeuralMemory(nn.Module):
         memory_residual_norm: bool = True,
         qkv_conv_kernel_size: int = 4,
         chunk_size: int = 16,
+        deep_memory_backend: str = "reference",
+        memory_batch_size: int | None = None,
         momentum: bool = True,
         forget: bool = True,
         dtype: torch.dtype = torch.bfloat16,
@@ -211,6 +221,17 @@ class NeuralMemory(nn.Module):
         super().__init__()
         if mem_depth < 1:
             raise ValueError(f"NeuralMemory mem_depth must be >= 1 (1 = linear, >=2 = deep MLP); got {mem_depth}.")
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive; got {chunk_size}.")
+        if deep_memory_backend not in {"reference", "titans_pytorch"}:
+            raise ValueError(
+                "deep_memory_backend must be 'reference' or 'titans_pytorch'; "
+                f"got {deep_memory_backend!r}."
+            )
+        if memory_batch_size is not None and (
+            memory_batch_size <= 0 or memory_batch_size % chunk_size != 0
+        ):
+            raise ValueError("memory_batch_size must be positive and divisible by chunk_size.")
         if num_heads is None:
             if dim % mem_dim != 0:
                 raise ValueError(f"dim ({dim}) must be divisible by mem_dim ({mem_dim}) when num_heads is None.")
@@ -224,6 +245,8 @@ class NeuralMemory(nn.Module):
         self.memory_residual_norm = memory_residual_norm
         self.qkv_conv_kernel_size = qkv_conv_kernel_size
         self.chunk_size = chunk_size
+        self.deep_memory_backend = deep_memory_backend
+        self.memory_batch_size = memory_batch_size
         self.momentum = momentum
         self.forget = forget
         self.inner_dim = num_heads * mem_dim
@@ -360,16 +383,26 @@ class NeuralMemory(nn.Module):
             h = residual + h * inv_rms * norm_weight[:, None, :]
         return h
 
-    def _mem_grads(self, k: torch.Tensor, v: torch.Tensor, weights: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Analytic per-token gradients of ``(1/m)||M_W(k) - v||^2`` w.r.t. each weight.
+    def _mem_grads(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        weights: list[torch.Tensor],
+        loss_weights: torch.Tensor | None = None,
+        aggregate_tokens: bool = False,
+    ) -> list[torch.Tensor]:
+        """Analytic gradients of ``(1/m)||M_W(k) - v||^2`` w.r.t. each weight.
 
         Args:
             k: Keys ``[N, c, mem_dim]`` (the MLP inputs).
             v: Targets ``[N, c, mem_dim]``.
             weights: Anchor weights, each ``[N, in, out]``.
+            loss_weights: Optional scalar multiplier for each token's loss.
+            aggregate_tokens: Sum over the token axis before returning.
 
         Returns:
-            Per-token gradients, one tensor per layer shaped ``[N, c, in, out]``.
+            One gradient per layer. Shapes are ``[N, c, in, out]`` by default
+            and ``[N, in, out]`` when ``aggregate_tokens`` is true.
         """
         mlp_weights = weights
         norm_weight = None
@@ -395,6 +428,8 @@ class NeuralMemory(nn.Module):
 
         m = out.shape[-1]
         delta = (2.0 / m) * (out - v)  # dL/d(out)  [N, c, mem_dim]
+        if loss_weights is not None:
+            delta = delta * loss_weights[..., None]
         norm_grad = None
         if norm_weight is not None:
             norm_grad = delta * normalized
@@ -407,13 +442,18 @@ class NeuralMemory(nn.Module):
 
         grads: list[torch.Tensor] = [torch.empty(0)] * len(mlp_weights)
         for i in reversed(range(len(mlp_weights))):
-            grads[i] = torch.einsum("ncm,nco->ncmo", layer_inputs[i], delta)
+            if aggregate_tokens:
+                grads[i] = torch.einsum("ncm,nco->nmo", layer_inputs[i], delta)
+            else:
+                grads[i] = torch.einsum("ncm,nco->ncmo", layer_inputs[i], delta)
             if i > 0:
                 delta = torch.einsum("nco,nmo->ncm", delta, mlp_weights[i])
                 pre = pre_acts[i - 1]
                 dgelu = 0.5 * (1.0 + torch.erf(pre / sqrt2)) + pre * torch.exp(-0.5 * pre * pre) / sqrt2pi
                 delta = delta * dgelu
         if norm_grad is not None:
+            if aggregate_tokens:
+                norm_grad = norm_grad.sum(dim=1)
             grads.append(norm_grad)
         return grads
 
@@ -479,6 +519,100 @@ class NeuralMemory(nn.Module):
             new_weights.append(W[:, -1])
             new_momentum.append(S[:, -1])
         return new_weights, new_momentum
+
+    def _deep_associative_scan(
+        self,
+        gates: torch.Tensor,
+        inputs: torch.Tensor,
+        carry: torch.Tensor,
+    ) -> torch.Tensor:
+        """Scan ``state_t = gate_t * state_{t-1} + input_t`` over chunk indices."""
+        gate_shape = (gates.shape[0], gates.shape[1], *((1,) * (inputs.ndim - 2)))
+        expanded_gates = gates.reshape(gate_shape)
+        first = inputs[:, :1] + expanded_gates[:, :1] * carry[:, None]
+        adjusted_inputs = torch.cat((first, inputs[:, 1:]), dim=1)
+
+        if _HAVE_ACCELERATED_SCAN and inputs.is_cuda and inputs.dtype == torch.float32:
+            original_shape = adjusted_inputs.shape
+            flat_inputs = adjusted_inputs.reshape(*original_shape[:2], -1).transpose(1, 2).contiguous()
+            flat_gates = (
+                expanded_gates.expand_as(adjusted_inputs)
+                .reshape(*original_shape[:2], -1)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            scanned = _accelerated_scan.scan(flat_gates, flat_inputs)
+            return scanned.transpose(1, 2).reshape(original_shape)
+
+        gate_cum = torch.cumsum(torch.log(gates.clamp_min(1e-20)), dim=1)
+        scan_matrix = self._deep_scan_matrix(gate_cum)
+        return torch.einsum("ntj,nj...->nt...", scan_matrix, adjusted_inputs)
+
+    def _deep_public_segment(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        theta: torch.Tensor,
+        keep: torch.Tensor,
+        eta: torch.Tensor,
+        weights: list[torch.Tensor],
+        momentum: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+        """Vectorized titans-pytorch-style storage for one re-anchoring segment."""
+        N, num_chunks, chunk_size, dim = q.shape
+        flat_count = N * num_chunks
+
+        anchor_weights = [
+            weight[:, None].expand(N, num_chunks, *weight.shape[1:]).reshape(flat_count, *weight.shape[1:])
+            for weight in weights
+        ]
+        flat_k = k.reshape(flat_count, chunk_size, dim)
+        flat_v = v.reshape(flat_count, chunk_size, dim)
+        grads = self._mem_grads(
+            flat_k,
+            flat_v,
+            anchor_weights,
+            loss_weights=theta.reshape(flat_count, chunk_size),
+            aggregate_tokens=True,
+        )
+        surprises = [-grad.reshape(N, num_chunks, *grad.shape[1:]) for grad in grads]
+
+        chunk_eta = eta.mean(dim=2)
+        chunk_keep = keep.mean(dim=2)
+        momentum_trajectories = []
+        weight_trajectories = []
+        for surprise, weight_carry, momentum_carry in zip(surprises, weights, momentum):
+            if self.momentum:
+                momentum_trajectory = self._deep_associative_scan(chunk_eta, surprise, momentum_carry)
+            else:
+                momentum_trajectory = surprise
+            weight_trajectory = self._deep_associative_scan(chunk_keep, momentum_trajectory, weight_carry)
+            momentum_trajectories.append(momentum_trajectory)
+            weight_trajectories.append(weight_trajectory)
+
+        # titans-pytorch left-pads queries by one token and pairs them with
+        # [anchor, update_0, ..., update_n]. The update from a chunk therefore
+        # becomes visible at that chunk's final token.
+        padded_q = F.pad(q.reshape(N, num_chunks * chunk_size, dim), (0, 0, 1, chunk_size - 1))
+        retrieval_count = num_chunks + 1
+        retrieval_weights = [
+            torch.cat((weight[:, None], trajectory), dim=1).reshape(
+                N * retrieval_count, *weight.shape[1:]
+            )
+            for weight, trajectory in zip(weights, weight_trajectories)
+        ]
+        retrieved = self._mem_forward(
+            padded_q.reshape(N * retrieval_count, chunk_size, dim),
+            retrieval_weights,
+        )
+        retrieved = retrieved.reshape(N, retrieval_count * chunk_size, dim)[:, 1 : num_chunks * chunk_size + 1]
+        retrieved = retrieved.reshape(N, num_chunks, chunk_size, dim)
+        return (
+            retrieved,
+            [trajectory[:, -1] for trajectory in weight_trajectories],
+            [trajectory[:, -1] for trajectory in momentum_trajectories],
+        )
 
     def _deep_recurrence(
         self,
@@ -555,6 +689,30 @@ class NeuralMemory(nn.Module):
             weights, momentum = past_state
             weights = [w.to(device=q.device, dtype=compute_dtype) for w in weights]
             momentum = [m.to(device=q.device, dtype=compute_dtype) for m in momentum]
+
+        if self.deep_memory_backend == "titans_pytorch":
+            segment_chunks = (
+                n_chunks if self.memory_batch_size is None else self.memory_batch_size // self.chunk_size
+            )
+            retrieved_segments = []
+            for start in range(0, n_chunks, segment_chunks):
+                stop = min(start + segment_chunks, n_chunks)
+                retrieved, weights, momentum = self._deep_public_segment(
+                    qc[:, start:stop],
+                    kc[:, start:stop],
+                    vc[:, start:stop],
+                    thetac[:, start:stop],
+                    keepc[:, start:stop],
+                    etac[:, start:stop],
+                    weights,
+                    momentum,
+                )
+                retrieved_segments.append(retrieved.reshape(N, -1, D))
+            retrieved = torch.cat(retrieved_segments, dim=1)[:, :S]
+            retrieved = retrieved.reshape(B, H, S, D).transpose(1, 2).reshape(B, S, H, D)
+            if return_state:
+                return retrieved, (weights, momentum)
+            return retrieved
 
         retrieved_chunks = []
         for i in range(n_chunks):
@@ -709,6 +867,8 @@ class TitansBlock(nn.Module):
             memory_residual_norm=config.memory_residual_norm,
             qkv_conv_kernel_size=config.qkv_conv_kernel_size,
             chunk_size=config.chunk_size,
+            deep_memory_backend=config.deep_memory_backend,
+            memory_batch_size=config.memory_batch_size,
             momentum=config.momentum,
             forget=config.forget,
             dtype=dtype,

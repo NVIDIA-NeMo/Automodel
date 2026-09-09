@@ -61,6 +61,12 @@ class TitansConfig(PretrainedConfig):
             after each Q/K/V projection. ``0`` disables the convolutions.
         chunk_size: Chunk size hint for the (future) chunked momentum kernel and
             for the fla GDN kernel reduction path.
+        deep_memory_backend: Deep-memory update semantics. ``"reference"`` uses
+            per-token updates within each chunk; ``"titans_pytorch"`` uses the
+            public implementation's chunk-aggregated vectorized update.
+        memory_batch_size: Number of tokens sharing one deep-memory gradient
+            anchor for the ``"titans_pytorch"`` backend. Must be divisible by
+            ``chunk_size``. ``None`` uses the full input sequence.
         tie_word_embeddings: Whether ``lm_head`` shares weights with ``embed_tokens``.
         initializer_range: Stddev for truncated-normal weight init.
         torch_dtype: Default compute dtype (``A_log`` / ``dt_bias`` always stay fp32).
@@ -87,6 +93,8 @@ class TitansConfig(PretrainedConfig):
         memory_residual_norm: bool = True,
         qkv_conv_kernel_size: int = 4,
         chunk_size: int = 16,
+        deep_memory_backend: str = "reference",
+        memory_batch_size: int | None = None,
         tie_word_embeddings: bool = True,
         initializer_range: float = 0.02,
         torch_dtype: str = "bfloat16",
@@ -112,6 +120,8 @@ class TitansConfig(PretrainedConfig):
         self.memory_residual_norm = memory_residual_norm
         self.qkv_conv_kernel_size = qkv_conv_kernel_size
         self.chunk_size = chunk_size
+        self.deep_memory_backend = deep_memory_backend
+        self.memory_batch_size = memory_batch_size
         self.initializer_range = initializer_range
         self.torch_dtype = torch_dtype
 
@@ -123,6 +133,21 @@ class TitansConfig(PretrainedConfig):
             )
         if qkv_conv_kernel_size < 0:
             raise ValueError(f"TitansConfig: qkv_conv_kernel_size must be non-negative; got {qkv_conv_kernel_size}.")
+        if chunk_size <= 0:
+            raise ValueError(f"TitansConfig: chunk_size must be positive; got {chunk_size}.")
+        if deep_memory_backend not in {"reference", "titans_pytorch"}:
+            raise ValueError(
+                "TitansConfig: deep_memory_backend must be 'reference' or 'titans_pytorch'; "
+                f"got {deep_memory_backend!r}."
+            )
+        if memory_batch_size is not None:
+            if memory_batch_size <= 0:
+                raise ValueError("TitansConfig: memory_batch_size must be positive when provided.")
+            if memory_batch_size % chunk_size != 0:
+                raise ValueError(
+                    "TitansConfig: memory_batch_size must be divisible by chunk_size; "
+                    f"got {memory_batch_size} and {chunk_size}."
+                )
 
         super().__init__(
             pad_token_id=pad_token_id,

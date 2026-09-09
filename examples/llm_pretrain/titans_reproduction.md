@@ -11,6 +11,8 @@ the authoritative target for the added 1.3B/100B-token and RULER results.
 - Tokenizer: Llama 2, vocabulary size 32K.
 - Training sequence length: 4096 tokens (2048 for sliding-window attention).
 - Neural-memory chunk size: 16.
+- Deep-memory update: public `titans-pytorch` chunk-aggregated semantics, with
+  the full 4096-token training sequence as one gradient-anchor batch.
 - Persistent memory: 128 tokens.
 - Long-term-memory output: 256 memory tokens for hybrid architectures.
 - Memory MLP: two layers by default, expansion factor 4, GELU, residual
@@ -81,6 +83,12 @@ Validated on 2026-09-08 with RTX 6000 Ada GPUs:
 - The NanoGPT writer/reader round trip now records BOS locations consistently
   as token offsets. Validation datasets use `repeat: false`; otherwise the
   iterable validation loop never terminates.
+- The first cw-dfw 4K attempt exposed an invalid one-step warmup and the second
+  exposed uncheckpointed neural-memory activations at 79 GiB/H100. Both are
+  fixed. Checkpointing reduced the measured allocation to about 22.4 GiB/H100,
+  but the per-chunk Python reference backend then exceeded the 30-minute NCCL
+  watchdog. The production recipe now selects the vectorized public backend
+  and its Triton associative scan; that path still requires this gate.
 
 The next execution gate is a full-shape, 4096-token, one-node FSDP2 smoke on
 the target cluster. Do not start the 15B-token run until that job establishes

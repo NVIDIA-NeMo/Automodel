@@ -44,9 +44,17 @@ from nemo_automodel.components.models.titans.layers import (
     titans_delta_rule_recurrence,
 )
 from nemo_automodel.components.models.titans.model import TitansForCausalLM
+from nemo_automodel.shared.import_utils import safe_import
 
 CUDA = torch.cuda.is_available()
 cuda_only = pytest.mark.skipif(not CUDA, reason="fla GDN kernel requires CUDA")
+HAVE_ACCELERATED_SCAN, accelerated_scan = safe_import(
+    "nemo_automodel.components.models.titans.accelerated_scan"
+)
+accelerated_scan_only = pytest.mark.skipif(
+    not (CUDA and HAVE_ACCELERATED_SCAN),
+    reason="Titans accelerated scan requires CUDA and Triton",
+)
 
 
 def _tiny_config(**overrides):
@@ -339,6 +347,8 @@ def test_170m_lmm_recipe_matches_paper_scale():
     assert model["memory_expansion_factor"] == 4
     assert model["qkv_conv_kernel_size"] == 4
     assert model["chunk_size"] == 16
+    assert model["deep_memory_backend"] == "titans_pytorch"
+    assert model["memory_batch_size"] == 4096
     assert model["torch_dtype"] == "float32"
     assert recipe["dataset"]["seq_len"] == 4096
 
@@ -425,6 +435,175 @@ def _deep_per_token_reference(mem, x, chunk_size):
                 keepf[:, idx].reshape(w.shape[0], *((1,) * (w.ndim - 1))) * w + s for w, s in zip(weights, momentum)
             ]
     return torch.stack(retrieved, dim=1)  # [N, S, D]
+
+
+def _deep_public_chunk_reference(mem, q, k, v, beta, g, eta, memory_batch_size):
+    """Sequential reference for titans-pytorch's chunk-aggregated update semantics."""
+    B, S, H, D = q.shape
+    c = mem.chunk_size
+    assert S % c == 0
+    assert memory_batch_size % c == 0
+
+    def fold(t):
+        tt = t.transpose(1, 2)
+        return tt.reshape(B * H, *tt.shape[2:]).double()
+
+    qf = F.normalize(fold(q), dim=-1)
+    kf = F.normalize(fold(k), dim=-1)
+    vf = fold(v)
+    thetaf = fold(beta)
+    keepf = fold(g).exp()
+    etaf = fold(eta) if eta is not None else torch.zeros_like(thetaf)
+    weights = mem._deep_init_weights(B, torch.float64)
+    momentum = [torch.zeros_like(w) for w in weights]
+    retrieved = []
+
+    for segment_start in range(0, S, memory_batch_size):
+        segment_end = min(segment_start + memory_batch_size, S)
+        anchor = [w.clone() for w in weights]
+        surprises = [[] for _ in anchor]
+        chunk_etas = []
+        chunk_keeps = []
+        updates = [[weight] for weight in weights]
+        for start in range(segment_start, segment_end, c):
+            stop = start + c
+            grads = mem._mem_grads(kf[:, start:stop], vf[:, start:stop], anchor)
+            for layer_surprises, grad in zip(surprises, grads):
+                shape = (grad.shape[0], c, *((1,) * (grad.ndim - 2)))
+                layer_surprises.append((-thetaf[:, start:stop].reshape(shape) * grad).sum(dim=1))
+            chunk_etas.append(etaf[:, start:stop].mean(dim=1))
+            chunk_keeps.append(keepf[:, start:stop].mean(dim=1))
+
+        for chunk_index in range(len(chunk_etas)):
+            for layer_index, surprise_by_chunk in enumerate(surprises):
+                surprise = surprise_by_chunk[chunk_index]
+                gate_shape = (surprise.shape[0], *((1,) * (surprise.ndim - 1)))
+                if mem.momentum:
+                    momentum[layer_index] = (
+                        chunk_etas[chunk_index].reshape(gate_shape) * momentum[layer_index] + surprise
+                    )
+                else:
+                    momentum[layer_index] = surprise
+                weights[layer_index] = (
+                    chunk_keeps[chunk_index].reshape(gate_shape) * weights[layer_index] + momentum[layer_index]
+                )
+                updates[layer_index].append(weights[layer_index])
+
+        for offset in range(segment_end - segment_start):
+            update_index = (offset + 1) // c
+            token_weights = [layer_updates[update_index] for layer_updates in updates]
+            start = segment_start + offset
+            retrieved.append(mem._mem_forward(qf[:, start : start + 1], token_weights))
+
+    return torch.cat(retrieved, dim=1), (weights, momentum)
+
+
+@cuda_only
+def test_deep_public_backend_matches_sequential_chunk_reference():
+    torch.manual_seed(2026)
+    B, S, H, D = 2, 32, 2, 8
+    mem = (
+        NeuralMemory(
+            dim=H * D,
+            mem_dim=D,
+            num_heads=H,
+            mem_depth=2,
+            chunk_size=4,
+            momentum=True,
+            forget=True,
+            deep_memory_backend="titans_pytorch",
+            memory_batch_size=16,
+        )
+        .cuda()
+        .double()
+    )
+    x = torch.randn(B, S, H * D, device="cuda", dtype=torch.float64)
+    q = mem.q_proj(x).view(B, S, H, D)
+    k = mem.k_proj(x).view(B, S, H, D)
+    v = mem.v_proj(x).view(B, S, H, D)
+    beta = mem.b_proj(x).sigmoid()
+    g = mem._decay_gate(mem.a_proj(x))
+    eta = mem.m_proj(x).sigmoid()
+
+    with torch.no_grad():
+        actual, actual_state = mem._deep_recurrence(q, k, v, beta, g, eta, return_state=True)
+        expected, expected_state = _deep_public_chunk_reference(mem, q, k, v, beta, g, eta, 16)
+
+    actual = actual.transpose(1, 2).reshape(B * H, S, D)
+    torch.testing.assert_close(actual, expected, rtol=1e-8, atol=1e-8)
+    for actual_group, expected_group in zip(actual_state, expected_state):
+        for actual_tensor, expected_tensor in zip(actual_group, expected_group):
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=1e-8, atol=1e-8)
+
+
+@cuda_only
+def test_deep_public_backend_has_finite_backward():
+    torch.manual_seed(2027)
+    memory = (
+        NeuralMemory(
+            dim=32,
+            mem_dim=8,
+            num_heads=4,
+            mem_depth=2,
+            chunk_size=4,
+            deep_memory_backend="titans_pytorch",
+            memory_batch_size=16,
+            dtype=torch.float32,
+        )
+        .cuda()
+        .float()
+    )
+    x = torch.randn(2, 32, 32, device="cuda", requires_grad=True)
+
+    memory(x).square().mean().backward()
+
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert all(weight.grad is not None and torch.isfinite(weight.grad).all() for weight in memory.mem_weights)
+
+
+@accelerated_scan_only
+def test_accelerated_scan_256_step_forward_and_backward():
+    torch.manual_seed(2028)
+    gates = torch.sigmoid(torch.randn(2, 17, 256, device="cuda", requires_grad=True))
+    inputs = torch.randn(2, 17, 256, device="cuda", requires_grad=True)
+    output_weights = torch.randn_like(inputs)
+
+    actual = accelerated_scan.scan(gates.contiguous(), inputs.contiguous())
+    states = []
+    state = torch.zeros_like(inputs[..., 0])
+    for index in range(inputs.shape[-1]):
+        state = gates[..., index] * state + inputs[..., index]
+        states.append(state)
+    expected = torch.stack(states, dim=-1)
+    actual_grads = torch.autograd.grad((actual * output_weights).sum(), (gates, inputs), retain_graph=True)
+    expected_grads = torch.autograd.grad((expected * output_weights).sum(), (gates, inputs))
+
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=2e-4, atol=2e-4)
+
+
+def test_deep_public_backend_state_matches_aligned_calls():
+    torch.manual_seed(2029)
+    memory = NeuralMemory(
+        dim=32,
+        mem_dim=8,
+        num_heads=4,
+        mem_depth=2,
+        chunk_size=4,
+        deep_memory_backend="titans_pytorch",
+        memory_batch_size=8,
+        qkv_conv_kernel_size=4,
+        dtype=torch.float64,
+    ).double()
+    x = torch.randn(2, 16, 32, dtype=torch.float64)
+
+    with torch.no_grad():
+        expected = memory(x)
+        first, state = memory(x[:, :8], return_state=True)
+        second, _ = memory(x[:, 8:], past_state=state, return_state=True)
+
+    torch.testing.assert_close(torch.cat((first, second), dim=1), expected, rtol=1e-10, atol=1e-10)
 
 
 @cuda_only
