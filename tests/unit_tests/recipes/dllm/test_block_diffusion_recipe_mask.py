@@ -272,3 +272,37 @@ def test_attention_mask_limits_response_window_and_padding_masks():
     assert not window["decoder_padding_mask"][1, :shorter_response].any()
     assert window["decoder_padding_mask"][1, shorter_response:].all()
     assert window["loss_mask"][1, shorter_response:].sum() == 0
+
+
+def test_loss_denominators_cache_global_nonempty_ar_example_count():
+    """Unequal AR lengths use a DP-global example denominator, not token count."""
+    seq_length = 16
+    recipe = _make_recipe(block_size=4)
+
+    class _DistEnv:
+        device = torch.device("cpu")
+
+    recipe.dist_env = _DistEnv()
+    recipe._dp_allreduce = lambda tensor: tensor * 2
+
+    clean = torch.arange(1, seq_length + 1, dtype=torch.long).unsqueeze(0).repeat(2, 1)
+    attention_mask = torch.zeros(2, seq_length, dtype=torch.long)
+    attention_mask[0, :12] = 1
+    attention_mask[1, :8] = 1
+    loss_mask = torch.zeros_like(attention_mask)
+    loss_mask[:, 4:] = attention_mask[:, 4:]
+    batch = {
+        "_clean_input_ids": clean,
+        "_noisy_input_ids": clean.clone(),
+        "_noise_mask": loss_mask.bool(),
+        "_p_mask": torch.ones_like(clean, dtype=torch.float32),
+        "loss_mask": loss_mask,
+        "attention_mask": attention_mask,
+    }
+
+    _, num_ar_tokens = recipe._compute_loss_denominators([batch], 0, 0)
+
+    # Local examples have 11 and 7 next-token pairs; the fake all-reduce
+    # represents two data replicas.
+    assert num_ar_tokens == 36
+    assert batch["_num_ar_examples"] == 4

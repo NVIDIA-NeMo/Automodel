@@ -250,3 +250,101 @@ def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     # The stub returns 20, so after division by 10 we expect 2.0
     assert torch.is_tensor(out)
     assert out.item() == pytest.approx(2.0)
+
+
+def test_fused_cross_entropy_uses_autocast_compute_dtype_with_fp32_parameters(monkeypatch):
+    """FP32 resident parameters reach CCE as BF16 under BF16 autocast."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    seen_dtypes = None
+
+    def _fake_linear_ce(hidden, weight, **_kwargs):
+        nonlocal seen_dtypes
+        seen_dtypes = (hidden.dtype, weight.dtype)
+        return hidden.sum() + weight.sum()
+
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
+    hidden = torch.randn(2, 3, 4, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(5, 4, dtype=torch.float32, requires_grad=True)
+    labels = torch.zeros(2, 3, dtype=torch.long)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss = FusedLinearCrossEntropy()(hidden, labels, weight)
+    loss.backward()
+
+    assert seen_dtypes == (torch.bfloat16, torch.bfloat16)
+    assert hidden.grad is not None and hidden.grad.dtype == torch.float32
+    assert weight.grad is not None and weight.grad.dtype == torch.float32
+
+
+def test_fused_cross_entropy_cp_example_mean_matches_reference_gradient(monkeypatch):
+    """Summed CP token shards match full-sequence unequal-length example means."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+
+    def _pytorch_linear_ce(hidden, weight, targets=None, ignore_index=-100, reduction="sum", **kwargs):
+        logits = hidden @ weight.t()
+        flat_loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            targets.reshape(-1),
+            ignore_index=ignore_index,
+            reduction=reduction,
+        )
+        return flat_loss.reshape_as(targets) if reduction == "none" else flat_loss
+
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _pytorch_linear_ce, raising=False)
+    torch.manual_seed(23)
+    labels = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6],
+            [2, 3, -100, -100, -100, -100],
+            [-100, -100, -100, -100, -100, -100],
+        ]
+    )
+    token_counts = torch.tensor([6, 2, 0])
+    actual_hidden = torch.randn(3, 6, 4, requires_grad=True)
+    actual_weight = torch.randn(7, 4, requires_grad=True)
+    reference_hidden = actual_hidden.detach().clone().requires_grad_(True)
+    reference_weight = actual_weight.detach().clone().requires_grad_(True)
+
+    loss_fn = FusedLinearCrossEntropy(reduction="sum")
+    actual = sum(
+        loss_fn(
+            actual_hidden[:, shard],
+            labels[:, shard],
+            actual_weight,
+            label_token_counts=token_counts,
+            num_label_examples=2,
+        )
+        for shard in (slice(None, None, 2), slice(1, None, 2))
+    )
+    reference_logits = reference_hidden @ reference_weight.t()
+    per_token = F.cross_entropy(
+        reference_logits.reshape(-1, 7), labels.reshape(-1), ignore_index=-100, reduction="none"
+    ).reshape_as(labels)
+    expected = (per_token.sum(dim=1) / token_counts.clamp_min(1)).sum() / 2
+
+    actual.backward()
+    expected.backward()
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_hidden.grad, reference_hidden.grad)
+    torch.testing.assert_close(actual_weight.grad, reference_weight.grad)
+
+
+def test_fused_cross_entropy_requires_complete_example_normalization(monkeypatch):
+    """Per-example normalization metadata must be supplied as a complete pair."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    loss_fn = FusedLinearCrossEntropy(reduction="sum")
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        loss_fn(
+            torch.randn(2, 3, 4),
+            torch.zeros(2, 3, dtype=torch.long),
+            torch.randn(5, 4),
+            label_token_counts=torch.tensor([3, 3]),
+        )

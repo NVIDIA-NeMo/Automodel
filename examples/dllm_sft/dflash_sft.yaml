@@ -49,7 +49,7 @@ model:
   _target_: transformers.AutoModel.from_pretrained
   pretrained_model_name_or_path: z-lab/Qwen3-4B-DFlash-b16
   trust_remote_code: true
-  dtype: bfloat16
+  dtype: float32
 
 checkpoint:
   enabled: true
@@ -65,7 +65,7 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: false
   mp_policy:
-    param_dtype: bfloat16
+    param_dtype: float32
     reduce_dtype: float32
     output_dtype: float32
   autocast_dtype: bfloat16
