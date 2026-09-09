@@ -3,9 +3,9 @@ title: "Nemotron 3.5 Super VL"
 description: "Fine-tune Nemotron 3.5 Super VL on CORD-v2 for receipt field extraction, then run inference and evaluation."
 position: 15
 ---
-**A step-by-step guide for fine-tuning Nemotron 3.5 Super VL (121B hybrid Mamba+Attention MoE VLM)
-to extract structured receipt data from scanned images using
-[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel). Full SFT on 4 nodes or LoRA on a single node,
+**A step-by-step guide for fine-tuning Nemotron 3.5 Super VL (121B hybrid Mamba and Attention
+Mixture-of-Experts (MoE) VLM) to extract structured receipt data from scanned images using
+[NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). Full SFT on 4 nodes or LoRA on a single node,
 then inference and evaluation on the CORD-v2 validation split.**
 
 ---
@@ -25,7 +25,7 @@ Key architectural details:
 
 ## Fine-Tune for Receipt Field Extraction
 
-We fine-tune on **CORD-v2**
+This guide fine-tunes the model on **CORD-v2**
 (Consolidated Receipt Dataset) to extract structured fields from scanned receipts:
 
 | Field | Example |
@@ -79,6 +79,7 @@ Nemotron 3.5 Super VL requires `mamba_ssm` and `causal_conv1d` (the `cuda` extra
 NeMo AutoModel container), Transformer Engine (`attn: te`, `linear: te`), and DeepEP for
 expert dispatch. The checkpoint is ~227 GB in bf16 (63 safetensors shards); download it into
 `$HF_HOME` before launching so that all 32 ranks read from the shared cache.
+
 </Note>
 
 ---
@@ -112,9 +113,9 @@ Test       : 100 samples
 Ground-truth keys: ['menu', 'sub_total', 'total']
 ```
 
-### Target Format: JSON-to-Token Conversion
+### Target Format for JSON-to-Token Conversion
 
-NeMo Automodel converts structured JSON into an XML-like **token sequence** using
+NeMo AutoModel converts structured JSON into an XML-like **token sequence** using
 the `json2token()` function. This is the format the model is trained to produce:
 
 ```
@@ -250,7 +251,7 @@ Without fp32 master weights and optimizer state for the frozen 121B parameters, 
 **a single node of 8 H100** (~39 GiB per GPU).
 177M trainable parameters (0.15%).
 
-### Collate function
+### Collate Function
 
 Nemotron 3.5 Super VL uses InternVL-style image handling: each
 `<image>` token is expanded to 256 vision embeddings per tile during the forward pass.
@@ -270,7 +271,7 @@ srun --nodes=4 --ntasks-per-node=8 --gpus-per-node=8 \
     -c examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml
 ```
 
-or with the launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 4`.
+You can also launch the same recipe with the `automodel` launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 4`.
 W&B logging is opt-in: add `--wandb.enable=true --wandb.entity=<entity> --wandb.project=<project>` to either command.
 
 ### LoRA PEFT
@@ -281,9 +282,9 @@ srun --nodes=1 --ntasks-per-node=8 --gpus-per-node=8 \
     -c examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml
 ```
 
-or on any 8-GPU machine: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml --nproc-per-node 8`.
+You can also launch it on any 8-GPU machine with the `automodel` launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml --nproc-per-node 8`.
 
-### Training log — LoRA PEFT
+### Training Log for LoRA PEFT
 
 ```
 Trainable parameters: 177,012,736
@@ -307,7 +308,7 @@ Validation:
 400 steps take ~13 min on 8 H100 (including the four validation passes). Each checkpoint holds the adapter only (~355 MB), so
 `vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/` stays small even with a checkpoint per validation step.
 
-### Training log — Full SFT
+### Training Log for Full SFT
 
 ```
 Trainable parameters: 120,668,687,360
@@ -331,7 +332,7 @@ Validation:
 Training loss keeps falling through epoch 4 while validation loss bottoms out at epoch 3 and rises
 in the last epoch — the 800-receipt training set is small enough for a 121B model to start memorizing it.
 
-### Checkpoints saved
+### Checkpoints Saved
 
 ```
 vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/
@@ -364,7 +365,7 @@ master weights and Adam moments each sharded checkpoint of this model is ~1.4 TB
 
 ## Step 4 — Run Inference and Evaluation
 
-### Full SFT inference
+### Full SFT Inference
 
 Load the consolidated HF export across all visible GPUs (`device_map="auto"`; the bf16 weights need
 ~227 GB, so use one node with 8x H100), greedy-decode CORD-v2 validation receipts with the training
@@ -436,7 +437,7 @@ print(f"exact match {exact}/{NUM_SAMPLES} | mean similarity {similarity / NUM_SA
 Pointing `CKPT` at the base checkpoint id (`nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`)
 scores the un-tuned model the same way.
 
-### LoRA PEFT inference
+### LoRA PEFT Inference
 
 LoRA checkpoints contain only `adapter_model.safetensors` + `adapter_config.json`, saved under the
 training wrapper's module names (`language_model.model.layers.N.mixer.in_proj`, ...), which match the
@@ -476,8 +477,8 @@ print(f"merged {len(pairs)} LoRA modules (r={cfg['r']}, alpha={cfg['lora_alpha']
 # ... then build `prompt` and run the `predict` loop from the SFT example above.
 ```
 
-**Resources** — one node with 8x H100 (bf16 weights spread over the GPUs).
-**Runtime** — ~2-4 min to load the 227 GB export, then ~26 s per receipt (greedy, up to 1024 new
+**Resources:** One node with 8x H100 (bf16 weights spread over the GPUs).
+**Runtime:** About 2–4 min to load the 227 GB export, then about 26 s per receipt (greedy, up to 1024 new
 tokens); 20 samples take about 13 min. The un-tuned base model is slower (~55 s per sample) because
 its free-form descriptions run to the token limit.
 
@@ -485,7 +486,7 @@ its free-form descriptions run to the token limit.
 
 ## Step 5 — Results
 
-### Evaluation on the first 20 CORD-v2 validation samples
+### Evaluation on the First 20 CORD-v2 Validation Samples
 
 | Model | Exact match | Mean similarity | Structured output |
 |---|---|---|---|
@@ -502,7 +503,7 @@ restaurant, likely a pizzeria ..."). After fine-tuning every prediction is a wel
 `<s_total>...</s_total><s_menu>...</s_menu>` sequence; the remaining errors are field-level (a
 dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or OCR digits.
 
-### Sample predictions (fine-tuned, step 299 / `LOWEST_VAL`)
+### Sample Predictions (Fine-Tuned, Step 299, `LOWEST_VAL`)
 
 | Sample | Ground-truth menu items | Prediction vs. ground truth | Similarity |
 |--------|-------------------------|-----------------------------|------------|
