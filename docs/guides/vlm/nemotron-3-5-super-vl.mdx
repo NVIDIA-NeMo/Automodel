@@ -14,8 +14,6 @@ then inference and evaluation on the CORD-v2 validation split.**
 
 Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`,
 architecture `NemotronH_Omni_Reasoning_V3`) is the 121B member of the Nemotron 3.5 family.
-It reuses the NemotronOmni wrapper, vision tower and state-dict adapter of the 33B
-NemotronOmni; only the LLM backbone scale differs.
 
 Key architectural details:
 - **LLM backbone**: NemotronV3 hybrid, 88 layers (40 Mamba2, 8 attention, 40 MoE), hidden dim 4096
@@ -27,7 +25,7 @@ Key architectural details:
 
 ## Fine-Tune for Receipt Field Extraction
 
-As in the [NemotronOmni guide](/recipes-e2e-examples/nemotron-omni), we fine-tune on **CORD-v2**
+We fine-tune on **CORD-v2**
 (Consolidated Receipt Dataset) to extract structured fields from scanned receipts:
 
 | Field | Example |
@@ -242,7 +240,7 @@ optimizer:
   lr: 2e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
-  master_weights: true              # fp32 master copy of the bf16 LoRA weights, as in the SFT recipe
+  master_weights: true              # fp32 master copy of the bf16 LoRA weights
   store_param_remainders: true
   exp_avg_dtype: torch.bfloat16
   exp_avg_sq_dtype: torch.bfloat16
@@ -254,7 +252,7 @@ Without fp32 master weights and optimizer state for the frozen 121B parameters, 
 
 ### Collate function
 
-Nemotron 3.5 Super VL uses the same InternVL-style image handling as NemotronOmni: each
+Nemotron 3.5 Super VL uses InternVL-style image handling: each
 `<image>` token is expanded to 256 vision embeddings per tile during the forward pass.
 The collate function extracts the images from the conversation, applies the chat template
 (which adds the `<think></think>` prefix for the assistant turn), runs the processor, and
