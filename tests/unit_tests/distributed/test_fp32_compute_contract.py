@@ -262,7 +262,8 @@ def test_intrinsic_fp32_holder_models_declare_strict_pin():
     _keep_in_fp32_modules_strict; the MoE parallelizer keys the fp32 compute
     pin on that list, so a missing entry silently drops A_log/dt_bias to bf16."""
     from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
+    from nemo_automodel.components.models.qwen3_8_flash_next.model import Qwen3_8_FlashNextForConditionalGeneration
     from nemo_automodel.components.models.qwen3_next.model import Qwen3NextForCausalLM
 
-    for cls in (Qwen3_5MoeForConditionalGeneration, Qwen3NextForCausalLM):
+    for cls in (Qwen3_5MoeForConditionalGeneration, Qwen3NextForCausalLM, Qwen3_8_FlashNextForConditionalGeneration):
         assert "_fp32_params" in getattr(cls, "_keep_in_fp32_modules_strict", [])

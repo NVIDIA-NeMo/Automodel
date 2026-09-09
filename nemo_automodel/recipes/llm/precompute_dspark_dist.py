@@ -280,6 +280,7 @@ def run(cfg) -> int:
     train_split = recipe_cfg.get("train_split", None)
     shuffle_seed = int(recipe_cfg.get("shuffle_seed", 42))
     mask_reasoning_content = bool(recipe_cfg.get("mask_reasoning_content", False))
+    mask_generation_prompt = bool(recipe_cfg.get("mask_generation_prompt", False))
     dataloader = build_eagle3_dataloader(
         data_path=recipe_cfg.train_data_path,
         tokenizer=tokenizer,
@@ -291,6 +292,7 @@ def run(cfg) -> int:
         distributed=False,
         shuffle_seed=shuffle_seed,
         mask_reasoning_content=mask_reasoning_content,
+        mask_generation_prompt=mask_generation_prompt,
     )
     num_samples = len(dataloader.dataset)
 
@@ -308,6 +310,7 @@ def run(cfg) -> int:
         shuffle_seed=shuffle_seed,
         mask_reasoning_content=mask_reasoning_content,
         chat_template_sha256=tokenizer_chat_template_sha256(tokenizer),
+        mask_generation_prompt=mask_generation_prompt,
     )
 
     # Gather the (possibly DTensor-sharded) target embed_tokens / lm_head to full

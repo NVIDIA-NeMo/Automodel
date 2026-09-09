@@ -88,5 +88,4 @@ ci:
   time: "00:30:00"
   nproc_per_node: 1
   checkpoint_robustness:
-    hf_kl_threshold: 5e-3
     tokenizer_name: meta-llama/Llama-3.2-1B-Instruct
