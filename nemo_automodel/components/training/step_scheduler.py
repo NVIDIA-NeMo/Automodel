@@ -66,6 +66,7 @@ class StepScheduler(Stateful):
         dataloader: DataLoader | None,
         ckpt_every_steps: int | None = None,
         save_checkpoint_every_epoch: bool = True,
+        validate_on_checkpoint: bool = True,
         val_every_steps: int | None = None,
         log_remote_every_steps: int = 1,
         loss_average_window_steps: int = 50,
@@ -90,6 +91,8 @@ class StepScheduler(Stateful):
                 When True, checkpoints are saved at the end of each epoch (is_last_batch).
                 When False, only periodic, last-step, and SIGTERM checkpoints are saved.
                 Default: True.
+            validate_on_checkpoint (bool): Whether checkpoint steps should also run validation. Keeping this enabled
+                preserves historical best-checkpoint behavior; memory-constrained recipes can disable it and still save.
             val_every_steps (int | None): Number of training steps between validation.
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
             loss_average_window_steps (int): Rolling window size for averaged training loss metrics.
@@ -178,6 +181,7 @@ class StepScheduler(Stateful):
             raise ValueError(f"ckpt_every_steps must be greater than 0, got {ckpt_every_steps}")
         self.ckpt_every_steps = ckpt_every_steps
         self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
+        self.validate_on_checkpoint = validate_on_checkpoint
         if preemption_signal is None:
             self.sig_handler = None
         else:
@@ -234,7 +238,10 @@ class StepScheduler(Stateful):
         is_val = False
         if self.val_every_steps and self.val_every_steps > 0:
             is_val = self.step % self.val_every_steps == self.val_every_steps - 1
-        return (is_val or self.is_ckpt_step) and not self.sigterm_flag
+        # Historically, checkpoint steps also validated so best-checkpoint
+        # metrics were available. Tiny-UMA recipes can opt out and still save.
+        is_checkpoint_validation = self.validate_on_checkpoint and self.is_ckpt_step
+        return (is_val or is_checkpoint_validation) and not self.sigterm_flag
 
     @property
     def is_ckpt_step(self):
@@ -362,6 +369,7 @@ class StepSchedulerConfig:
         ckpt_every_steps: Save a checkpoint every N optimizer steps.
             ``None`` defaults to once per epoch.
         save_checkpoint_every_epoch: Also checkpoint at every epoch boundary.
+        validate_on_checkpoint: Also run validation on checkpoint steps.
         val_every_steps: Run validation every N optimizer steps.
             ``None`` disables periodic validation.
         log_remote_every_steps: Log to WandB / MLflow every N steps.
@@ -381,6 +389,7 @@ class StepSchedulerConfig:
     max_steps: int | None = None
     ckpt_every_steps: int | None = 100
     save_checkpoint_every_epoch: bool = True
+    validate_on_checkpoint: bool = True
     val_every_steps: int | None = None
     log_remote_every_steps: int = 1
     loss_average_window_steps: int = 50
