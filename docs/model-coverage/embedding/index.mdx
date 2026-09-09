@@ -1,6 +1,6 @@
 ---
 title: "Embedding Models"
-description: ""
+description: "Overview of NeMo AutoModel embedding models, including bidirectional Llama and Ministral3 backbones, Hugging Face AutoModel fallback, and bi-encoder recipes."
 position: 1
 ---
 
@@ -32,7 +32,9 @@ Any Hugging Face model that can be loaded with `AutoModel` can be used as an emb
 |---|---|
 | [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml) | Bi-encoder — Llama 3.2 1B embedding model |
 | [llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) | Bi-encoder — Llama-Embed-Nemotron-8B reproduction recipe |
-| [ministral3_3b_instruct.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml) | Bi-encoder — Ministral3-3B recipe |
+| [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml) | Bi-encoder Llama 3.2 1B embedding model |
+| [llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) | Bi-encoder Llama-Embed-Nemotron-8B reproduction recipe |
+| [ministral3_3b_instruct.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml) | Bi-encoder Ministral3-3B recipe |
 
 ## Supported Models
 
@@ -45,7 +47,7 @@ This table combines recipe-backed checkpoints with documented model families. Da
 
 - **Fine-tuning (Bi-Encoder):** Contrastive learning on query-document pairs to produce embedding models
 - **LoRA/PEFT:** Parameter-efficient fine-tuning for embedding backbones
-- **ONNX Export:** Export trained embedding models for deployment (case by case, model dependent)
+- **ONNX Export:** Export trained embedding models for deployment (case-by-case, model-dependent)
 
 ## Dataset
 

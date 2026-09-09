@@ -38,7 +38,7 @@ a small candidate set and you want a stronger reranking stage.
 
 Before running the examples:
 
-- Use an AutoModel environment with the full GPU training dependencies installed. For multi-GPU runs, use the NGC
+- Use a NeMo AutoModel environment with the full GPU training dependencies installed. For multi-GPU runs, use the NGC
   container. For source checkouts, refer to [Installation](/get-started/installation) and run
   `uv sync --locked --all-groups --extra all`.
 - Run the commands from a source checkout or an NGC container workspace that contains the repository `examples/` tree.
@@ -127,7 +127,7 @@ The following table summarizes the supported model families and their effective 
 | `ministral3` | Uses the stock Hugging Face `Ministral3Model` with configurable text attention. | Uses the stock Hugging Face `Ministral3ForSequenceClassification` | Bi-encoder: wrapper-level `pooling`, `l2_normalize`, `is_causal`, plus top-level recipe `temperature`. Cross-encoder: forwards `num_labels`; custom `pooling` and `temperature` are ignored. |
 | `ministral3_bidirec` | Uses the legacy custom `Ministral3BidirectionalModel` with configurable text attention. | Direct cross-encoder scoring is not supported by the custom retrieval registry. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, `is_causal`, and top-level recipe `temperature`. |
 | `llama_nemotron_vl` | Uses `LlamaNemotronVLModel` and applies the attention policy only to its language tower. | Direct cross-encoder scoring is not supported by the custom retrieval registry today. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, `is_causal`, and top-level recipe `temperature`. |
-| Any model type without a retrieval registry entry | Falls back to `AutoModel` and applies the resolved attention policy. | Falls back to `AutoModelForSequenceClassification` | Bi-encoder fallback receives standard Hugging Face `from_pretrained` keyword arguments. `pooling`, `l2_normalize`, and `is_causal` apply in the AutoModel wrapper. Cross-encoder fallback forwards only `num_labels`. Custom `pooling` and `temperature` are ignored. |
+| Any model type without a retrieval registry entry | Falls back to `AutoModel` and applies the resolved attention policy. | Falls back to `AutoModelForSequenceClassification` | Bi-encoder fallback receives standard Hugging Face `from_pretrained` keyword arguments. `pooling`, `l2_normalize`, and `is_causal` apply in the NeMo AutoModel wrapper. Cross-encoder fallback forwards only `num_labels`. Custom `pooling` and `temperature` are ignored. |
 
 For bi-encoders, `model.is_causal` selects text self-attention. An explicit YAML or API value takes precedence over a
 saved `is_causal` value in the checkpoint's text config; when neither exists, the model defaults to `false` for
@@ -158,7 +158,7 @@ matches the workflow you need:
 
 | Data Path | Use When | Notes |
 |-----------|----------|-------|
-| `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
+| `hf://` NeMo AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires a NeMo AutoModel-style Hugging Face subset with a companion corpus split. |
 | Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. Pure inline records do not provide document IDs for same-document masking. |
 | Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets`. |
 | Normalized Arrow | You are training on a full-scale or image-heavy VL retrieval dataset | Prepare local corpus ID-based JSON sources on CPU, then train from portable Arrow shards with `NormalizedRetrievalDatasetConfig`. |
@@ -179,7 +179,7 @@ The key field requirements differ by source:
 | Source | Required Query Field | Required Document Fields |
 |--------|----------------------|--------------------------|
 | Corpus ID JSON | `question` | `question_id`, `corpus_id`, non-empty `pos_doc`, and present `neg_doc` |
-| `hf://` AutoModel schema | `question` | Non-empty `pos_doc`. `neg_doc` is optional in the source but required before training with negatives. |
+| `hf://` NeMo AutoModel schema | `question` | Non-empty `pos_doc`. `neg_doc` is optional in the source but required before training with negatives. |
 | Inline JSONL | `query` or `question` | Non-empty `pos_doc`, and present `neg_doc` |
 
 `neg_doc` must be present for local JSON and JSONL sources. It can be `[]` only when `n_passages: 1`. When
@@ -209,7 +209,7 @@ relevant passage as a negative. The detailed source schemas and conversion rules
 
 For larger corpora, use the corpus ID-based JSON format from the dataset guide. The same
 `nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig` also loads `hf://` sources that
-already follow the AutoModel retrieval schema, such as:
+already follow the NeMo AutoModel retrieval schema, such as:
 
 ```yaml
 data_dir_list:
@@ -544,7 +544,7 @@ for RAG candidate generation, evaluate against a fixed held-out corpus and qrels
 3. Encode held-out queries with the matching query prefix and `q_max_len`.
 4. Report full-corpus Recall@K, MRR@K, and nDCG@K for the K values your application uses.
 
-AutoModel does not currently provide a one-command full-corpus retrieval evaluator in this guide. Use your existing
+NeMo AutoModel does not currently provide a one-command full-corpus retrieval evaluator in this guide. Use your existing
 information retrieval evaluation stack or a small script around the consolidated checkpoint. Report enough run details
 to make the result repeatable. Include the query count, corpus size, qrels source, judged and unjudged handling, exact
 or ANN search settings, K values, and baseline checkpoint. State whether you used confidence intervals or significance
@@ -575,7 +575,7 @@ The examples include a commented `wandb` block. Enable it when you want remote t
 
 ## Enable Low-Rank Adaptation (LoRA)
 
-Retrieval recipes support the same parameter-efficient fine-tuning (PEFT) block used by other AutoModel recipes.
+Retrieval recipes support the same parameter-efficient fine-tuning (PEFT) block used by other NeMo AutoModel recipes.
 Uncomment or add `peft` to train low-rank adaptation (LoRA) adapters instead of updating every weight:
 
 ```yaml
@@ -678,7 +678,7 @@ uv run torchrun \
   --mining.passage_max_length 512
 ```
 
-The mining script loads a concrete Hugging Face model path. It does not resolve AutoModel's `LATEST` keyword or pointer
+The mining script loads a concrete Hugging Face model path. It does not resolve NeMo AutoModel's `LATEST` keyword or pointer
 files. It creates the output parent directory and overwrites `train_file_output_path` if that file already exists. The
 miner preserves the input's top-level `corpus` value without rewriting relative paths.
 
@@ -716,7 +716,7 @@ training. If the previous run used multiple sources, list each mined source file
 but it cannot read external qrels or identify semantic duplicates. It also drops extra row metadata such as
 `original_question_id`.
 
-AutoModel does not provide a mined-negative audit or cleanup utility. Before training, verify the output:
+NeMo AutoModel does not provide a mined-negative audit or cleanup utility. Before training, verify the output:
 
 1. Every question ID is unique, every row references the declared corpus, and every document ID exists.
 2. No known positive or sibling positive appears in `neg_doc`.
@@ -749,7 +749,7 @@ Checkpoint directory names use the scheduler step at save time. The saved schedu
 for exact paths prefer the `Saving checkpoint to ...` log line or the `LATEST` pointer over hand-constructing a step
 number.
 
-With `save_consolidated: true` and full fine-tuning, AutoModel also writes a Hugging Face-compatible model under the
+With `save_consolidated: true` and full fine-tuning, NeMo AutoModel also writes a Hugging Face-compatible model under the
 following path:
 
 ```text
@@ -775,10 +775,11 @@ checkpoint:
   restore_from: LATEST
 ```
 
-`LATEST` is a resolver keyword: AutoModel follows the symlink or pointer file and can fall back to the highest
+`LATEST` is a resolver keyword: NeMo AutoModel follows the symlink or pointer file and can fall back to the highest
 `epoch_*_step_*` checkpoint directory if the pointer is not usable. An explicit restore target, including `LATEST`,
 is authoritative: AutoModel warns about an incompatibility but still restores the selected checkpoint. If
-`checkpoint.restore_from` is omitted, AutoModel selects the latest candidate and resumes only when that candidate is
+is authoritative: NeMo AutoModel warns about an incompatibility but still restores the selected checkpoint. If
+`checkpoint.restore_from` is omitted, NeMo AutoModel selects the latest candidate and resumes only when that candidate is
 compatible. It does not continue scanning older checkpoints when the newest candidate is incompatible. Use a new or
 empty `checkpoint_dir` for fresh experiments, and rotate or clear `training.jsonl` and `validation.jsonl` if you do
 not want logs from multiple runs appended together.
@@ -881,7 +882,7 @@ Use the following checks to diagnose common retrieval training problems:
 | Distributed launch times out | Increase `dist_env.timeout_minutes`, especially for first model downloads, slow filesystems, or multi-node runs. |
 | Batch-size assertion fails | Set `global_batch_size` to a multiple of `local_batch_size * data_parallel_size`. |
 | `training.jsonl` does not update during a basic verification test | Use standard output and error for live monitoring. JSONL metrics are buffered before flush. |
-| Run resumes unexpectedly | Use a new or empty `checkpoint_dir`. AutoModel auto-detects compatible checkpoints when `restore_from` is omitted. |
+| Run resumes unexpectedly | Use a new or empty `checkpoint_dir`. NeMo AutoModel auto-detects compatible checkpoints when `restore_from` is omitted. |
 | Different mining and training behavior | Match tokenizer settings, max lengths, and prefix text including trailing spaces across training and mining. |
 
 ## Related Files
