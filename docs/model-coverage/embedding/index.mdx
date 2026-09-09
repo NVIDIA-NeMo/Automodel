@@ -24,7 +24,9 @@ The stock `ministral3` path is preferred. The `ministral3_bidirec` model type re
 
 ### Hugging Face Auto Backbones
 
-Any Hugging Face model that can be loaded with `AutoModel` can be used as an embedding backbone. The fallback path applies `model.is_causal`, restores a saved text-config value when the option is omitted, and otherwise defaults to bidirectional attention. Verify that an unregistered architecture honors the selected policy before using it for retrieval training.
+Unregistered text architectures load through Hugging Face `AutoModel`. The fallback path applies `model.is_causal`, restores a saved text-config value when the option is omitted, and otherwise defaults to bidirectional attention. Verify that an unregistered architecture honors the selected policy before using it for retrieval training.
+
+Composite backbones must expose matching text configuration and decoder objects through `get_text_config(decoder=True)` and `get_decoder()`. Loading fails if these methods do not identify the same text tower. The attention policy changes only that tower, leaving vision attention unchanged.
 
 ## Example Recipes
 

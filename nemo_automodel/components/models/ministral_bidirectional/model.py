@@ -11,6 +11,7 @@ remains available for ``ministral3_bidirec`` checkpoints.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from transformers import AutoConfig, AutoModel
@@ -34,8 +35,16 @@ class Ministral3BidirectionalConfig(Ministral3Config):
         pooling: str = "avg",
         temperature: float = 1.0,
         is_causal: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
+        """Configure text attention and retrieval pooling.
+
+        Args:
+            pooling: Retrieval pooling strategy.
+            temperature: Temperature for scaling retrieval logits.
+            is_causal: Whether to use causal rather than bidirectional attention.
+            **kwargs: Additional Hugging Face Ministral3 configuration options.
+        """
         self.pooling = pooling
         self.temperature = temperature
         super().__init__(is_causal=is_causal, **kwargs)
@@ -85,12 +94,28 @@ class Ministral3BidirectionalModel(Ministral3Model):
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> BaseModelOutputWithPast:
         """Forward pass with the attention mode stored in the model config.
 
         Causal mode delegates to the Hugging Face parent implementation. Non-causal
         mode uses the retrieval-specific bidirectional mask.
+
+        Args:
+            input_ids: Integer token IDs [batch, sequence], exclusive with inputs_embeds.
+            attention_mask: Optional padding mask [batch, sequence], with zero for padding.
+            position_ids: Integer positions [batch, sequence] or [1, sequence].
+            past_key_values: Optional Transformers cache in its native layout.
+            inputs_embeds: Floating-point embeddings [batch, sequence, hidden].
+            use_cache: Whether to populate the returned cache.
+            cache_position: Integer cache positions [sequence].
+            **kwargs: Additional Hugging Face forward options.
+
+        Returns:
+            Output with floating-point last_hidden_state [batch, sequence, hidden],
+            where hidden is config.hidden_size, and the optional Transformers cache.
+            In causal mode, optional hidden states and attentions follow the Hugging
+            Face Ministral3Model.forward output contract.
         """
         if getattr(self.config, "is_causal", False):
             return super().forward(

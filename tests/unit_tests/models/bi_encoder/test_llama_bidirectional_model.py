@@ -17,8 +17,9 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, LlamaConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaModel
 
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
@@ -189,15 +190,17 @@ def test_score_head_init_weights_initializes_in_place():
     model._init_weights(model.model.embed_tokens)
 
 
-def test_bidirectional_attention_is_symmetric():
+@pytest.mark.parametrize("config_class", [LlamaConfig, LlamaBidirectionalConfig])
+def test_bidirectional_attention_is_symmetric(config_class: type[LlamaConfig]) -> None:
     """Verify that the bidirectional model produces symmetric attention behavior:
     changing a token at position i should affect the hidden state at position j
     and vice versa (unlike causal models where earlier tokens can't see later ones)."""
-    cfg = LlamaBidirectionalConfig(
+    cfg = config_class(
         vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
     )
     model = LlamaBidirectionalModel(cfg)
     model.eval()
+    assert model.config.is_causal is False
 
     input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
     attn = torch.ones(1, 4, dtype=torch.long)
@@ -238,6 +241,62 @@ def test_causal_attention_blocks_future_token_influence():
 
     assert all(layer.self_attn.is_causal is True for layer in model.layers)
     torch.testing.assert_close(original[0, 0], changed[0, 0])
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
+def test_attention_modes_preserve_hf_outputs_and_gradients(is_causal: bool, attn_implementation: str) -> None:
+    """Both modes retain native output capture and gradients on padded CPU/fp32 inputs."""
+    config_kwargs = dict(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        pad_token_id=0,
+        attention_dropout=0.0,
+        is_causal=is_causal,
+    )
+    config = LlamaBidirectionalConfig(**config_kwargs)
+    reference_config = LlamaConfig(**config_kwargs)
+    config._attn_implementation = reference_config._attn_implementation = attn_implementation
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        model = LlamaBidirectionalModel(config).eval()
+        reference = LlamaModel(reference_config).eval()
+        reference.load_state_dict(model.state_dict())
+        upstream_gradient = torch.randn(2, 4, config.hidden_size)
+    for layer in reference.layers:
+        layer.self_attn.is_causal = is_causal
+
+    inputs = dict(
+        input_ids=torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]),
+        attention_mask=torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]]),
+        use_cache=False,
+        output_hidden_states=True,
+        output_attentions=attn_implementation == "eager",
+    )
+    actual = model(**inputs)
+    expected = reference(**inputs)
+
+    torch.testing.assert_close(actual.last_hidden_state, expected.last_hidden_state, rtol=1e-5, atol=1e-6)
+    assert len(actual.hidden_states) == len(expected.hidden_states) == config.num_hidden_layers + 1
+    for actual_hidden, expected_hidden in zip(actual.hidden_states, expected.hidden_states, strict=True):
+        torch.testing.assert_close(actual_hidden, expected_hidden, rtol=1e-5, atol=1e-6)
+    if attn_implementation == "eager":
+        assert len(actual.attentions) == len(expected.attentions) == config.num_hidden_layers
+        for actual_attention, expected_attention in zip(actual.attentions, expected.attentions, strict=True):
+            torch.testing.assert_close(actual_attention, expected_attention, rtol=1e-5, atol=1e-6)
+
+    actual.last_hidden_state.backward(upstream_gradient)
+    expected.last_hidden_state.backward(upstream_gradient)
+    for (name, parameter), (reference_name, reference_parameter) in zip(
+        model.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        assert name == reference_name
+        assert parameter.grad is not None and reference_parameter.grad is not None
+        torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=1e-5, atol=1e-6)
 
 
 # --- Fakes for classification and encoder tests ---

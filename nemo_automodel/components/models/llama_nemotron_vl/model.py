@@ -43,8 +43,16 @@ class LlamaBidirectionalConfig(LlamaConfig):
         pooling: str = "avg",
         temperature: float = 1.0,
         is_causal: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
+        """Configure language attention and retrieval pooling.
+
+        Args:
+            pooling: Retrieval pooling strategy.
+            temperature: Temperature for scaling retrieval logits.
+            is_causal: Whether to use causal rather than bidirectional attention.
+            **kwargs: Additional Hugging Face Llama configuration options.
+        """
         self.pooling = pooling
         self.temperature = temperature
         super().__init__(
@@ -320,8 +328,28 @@ class LlamaBidirectionalModel(LlamaModel):
         cache_position: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> BaseModelOutputWithPast:
+        """Encode the language sequence using the configured attention mode.
+
+        Args:
+            input_ids: Integer token IDs [batch, sequence], exclusive with inputs_embeds.
+            attention_mask: Optional padding mask [batch, sequence], with zero for padding.
+            position_ids: Integer positions [batch, sequence] or [1, sequence].
+            past_key_values: Optional Transformers cache in its native layout.
+            inputs_embeds: Floating-point embeddings [batch, sequence, hidden], which
+                may include projected vision embeddings at image-token positions.
+            cache_position: Integer cache positions [sequence].
+            use_cache: Whether to populate the returned cache.
+            output_hidden_states: Whether to return intermediate hidden states.
+            **kwargs: Additional Hugging Face forward options.
+
+        Returns:
+            Output with floating-point last_hidden_state [batch, sequence, hidden],
+            optional hidden states of the same shape, and the optional Transformers
+            cache. The hidden axis is config.hidden_size. In causal mode, optional
+            attentions follow the Hugging Face LlamaModel.forward output contract.
+        """
         if getattr(self.config, "is_causal", False):
             return super().forward(
                 input_ids=input_ids,

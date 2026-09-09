@@ -787,10 +787,14 @@ class BiEncoderModel(nn.Module):
         """Encode inputs and return pooled embeddings.
 
         Args:
-            input_dict: Tokenized inputs (input_ids, attention_mask, etc.)
+            input_dict: Tokenized backbone inputs with integer input_ids and a padding
+                attention_mask of shape [batch, sequence]. Optional multimodal inputs
+                follow the wrapped model's forward contract.
 
         Returns:
-            Embeddings [batch_size, hidden_dim], or None if input_dict is empty.
+            Contiguous floating-point embeddings of shape [batch, hidden] for pooled
+            output or [batch, sequence, hidden] for colbert/multi_vector pooling. The
+            hidden axis is the backbone's hidden size. Returns None for empty inputs.
         """
         if not input_dict:
             return None
@@ -825,7 +829,18 @@ class BiEncoderModel(nn.Module):
         return embeds.contiguous()
 
     def forward(self, input_dict: Mapping[str, Any] | None = None, **kwargs: Any) -> torch.Tensor | None:
-        """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
+        """Encode inputs while preserving PyTorch module hook semantics.
+
+        Args:
+            input_dict: Tokenized inputs with input_ids and attention_mask of shape
+                [batch, sequence]. Other inputs follow the wrapped model's contract.
+            **kwargs: Unused; inputs must be supplied through input_dict.
+
+        Returns:
+            Floating-point embeddings [batch, hidden] for pooled output or
+            [batch, sequence, hidden] for colbert/multi_vector pooling, or None
+            for empty inputs.
+        """
         return self.encode(input_dict)
 
 
@@ -868,6 +883,18 @@ class CrossEncoderModel(nn.Module):
         input_dict: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> ModelOutput | tuple[torch.Tensor, ...]:
+        """Score tokenized query-document pairs with the wrapped backbone.
+
+        Args:
+            input_dict: Backbone inputs with input_ids and attention_mask of shape
+                [batch, sequence]. Other tensors follow the backbone's forward contract.
+            **kwargs: Keyword-form backbone inputs, used only when input_dict is None.
+
+        Returns:
+            Backbone output with floating-point logits of shape [batch, num_labels],
+            or its native tuple when return_dict=False. Optional loss, cache, hidden
+            states, and attentions follow the backbone's documented output contract.
+        """
         inputs = dict(input_dict) if input_dict is not None else dict(kwargs)
         inputs.setdefault("return_dict", True)
         return self.model(**inputs)
