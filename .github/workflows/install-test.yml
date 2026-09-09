@@ -32,8 +32,8 @@ jobs:
           echo "cuda_image=${CUDA_CONTAINER_IMAGE}" >> "$GITHUB_OUTPUT"
 
   pip-test:
-    runs-on: ${{ matrix.arch }}
-    name: Pip - Python${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || (matrix.arch == 'ubuntu-24.04-arm' && 'ARM64/Linux' || 'ARM64/Darwin') }} - No CUDA
+    runs-on: ${{ matrix.platform.runner }}
+    name: Pip - Python${{ matrix.python-version }} - ${{ matrix.platform.name }} - No CUDA
     needs: [pre-flight]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
@@ -41,7 +41,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ["ubuntu-latest", "macos-latest"] # After setting the repo to public: "ubuntu-24.04-arm"]
+        platform:
+          - runner: ubuntu-latest
+            name: AMD64/Linux
+          - runner: macos-latest
+            name: ARM64/Darwin
+          - runner: windows-latest
+            name: AMD64/Windows
+          # Add ubuntu-24.04-arm (ARM64/Linux) after the repository becomes public.
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository
