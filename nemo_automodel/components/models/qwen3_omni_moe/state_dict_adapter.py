@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Converts between HF Qwen3OmniMoe checkpoints and grouped-experts native format."""
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,
@@ -48,7 +48,7 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
-        hf_state_dict = self._to_hf_w_split_experts(state_dict)
+        hf_state_dict = self._to_hf_w_split_experts(state_dict, quantization=quantization, **kwargs)
 
         if self._uses_thinker_prefix:
             hf_state_dict_with_prefix = {}

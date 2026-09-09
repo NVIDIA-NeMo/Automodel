@@ -31,9 +31,12 @@ from tests.utils.test_utils import run_test_script
 TEST_FOLDER = "parallelism"
 GEMMA4_PP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_PP2_Parity.sh"
 GEMMA4_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_TP2_Parity.sh"
+GEMMA4_KV_SHARED_AC_FILENAME = "L2_Parallelism_VLM_Gemma4_KVShared_AC.sh"
 PP_GRAD_ACCUM_PARITY_FILENAME = "L2_Parallelism_PP_Grad_Accum_Parity.sh"
 DEEPSEEK_V4_PP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_PP2_Parity.sh"
 DEEPSEEK_V4_EP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_EP2_Parity.sh"
+QWEN3_5_MOE_PP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_PP2_Parity.sh"
+QWEN3_5_MOE_EP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_EP2_Parity.sh"
 
 
 class TestParallelismParity:
@@ -43,6 +46,9 @@ class TestParallelismParity:
     def test_gemma4_tp2_parity(self):
         run_test_script(TEST_FOLDER, GEMMA4_TP2_PARITY_FILENAME)
 
+    def test_gemma4_kv_shared_activation_checkpointing(self):
+        run_test_script(TEST_FOLDER, GEMMA4_KV_SHARED_AC_FILENAME)
+
     def test_pp_grad_accum_parity(self):
         run_test_script(TEST_FOLDER, PP_GRAD_ACCUM_PARITY_FILENAME)
 
@@ -51,3 +57,9 @@ class TestParallelismParity:
 
     def test_deepseek_v4_ep2_parity(self):
         run_test_script(TEST_FOLDER, DEEPSEEK_V4_EP2_PARITY_FILENAME)
+
+    def test_qwen3_5_moe_pp2_parity(self):
+        run_test_script(TEST_FOLDER, QWEN3_5_MOE_PP2_PARITY_FILENAME)
+
+    def test_qwen3_5_moe_ep2_parity(self):
+        run_test_script(TEST_FOLDER, QWEN3_5_MOE_EP2_PARITY_FILENAME)

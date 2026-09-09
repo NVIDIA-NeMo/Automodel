@@ -83,6 +83,15 @@ class PipelineConfig:
             compatible with the model's output format.
         pp_seq_len (Optional[int]): Sequence length hint for pipeline parallel
             shape inference. If None, it will be inferred from the dataset config.
+        pp_recv_buffer_pool (bool): Pool the per-microbatch P2P recv buffers into
+            a ring sized to the 1F1B in-flight depth instead of pre-allocating one
+            buffer set per microbatch and direction. Cuts pipeline-stage buffer
+            memory roughly by num_microbatches / (num_stages - stage_index + slack)
+            on early/middle stages. Only applied for schedules with a bounded
+            in-flight depth (currently "1f1b"); ignored with a warning otherwise.
+            Defaults to False.
+        pp_recv_buffer_pool_slack (int): Extra buffer sets beyond the 1F1B
+            in-flight depth when pp_recv_buffer_pool is enabled. Defaults to 2.
     """
 
     pp_schedule: str | None = "1f1b"
@@ -99,6 +108,13 @@ class PipelineConfig:
     scale_grads_in_schedule: bool = False
     loss_fn: Callable | None = None
     pp_seq_len: int | None = None
+    pp_recv_buffer_pool: bool = False
+    pp_recv_buffer_pool_slack: int = 2
+
+    def __post_init__(self) -> None:
+        """Validate the recv-buffer-pool knobs."""
+        if self.pp_recv_buffer_pool_slack < 0:
+            raise ValueError(f"pp_recv_buffer_pool_slack must be >= 0, got {self.pp_recv_buffer_pool_slack}")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
@@ -117,4 +133,6 @@ class PipelineConfig:
             "scale_grads_in_schedule": self.scale_grads_in_schedule,
             "loss_fn": self.loss_fn,
             "pp_seq_len": self.pp_seq_len,
+            "pp_recv_buffer_pool": self.pp_recv_buffer_pool,
+            "pp_recv_buffer_pool_slack": self.pp_recv_buffer_pool_slack,
         }

@@ -61,7 +61,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
       4. Expert-parallel sharding when a device mesh is provided
     """
 
-    _supports_checkpoint_load_without_full_copy = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,
@@ -381,24 +381,6 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             or (isinstance(placement, Replicate) and tensor.device_mesh.mesh_dim_names[mesh_dim] != "ep")
             for mesh_dim, placement in enumerate(tensor.placements)
         )
-
-    def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
-        """Return converted keys without gathering real expert weights.
-
-        Args:
-            state_dict: Native Gemma4 state mapping. Expert tensors have shape
-                ``[local_experts, hidden, 2 * expert_hidden]`` for fused gate-up
-                weights or ``[local_experts, expert_hidden, hidden]`` for down
-                weights. Other tensor values retain their model-owned layouts.
-
-        Returns:
-            Hugging Face state-dict keys in adapter iteration order.
-        """
-        meta_state_dict = {
-            key: torch.empty_like(value, device="meta") if isinstance(value, torch.Tensor) else value
-            for key, value in state_dict.items()
-        }
-        return list(self.to_hf(meta_state_dict, exclude_key_regex=r".*_extra_state.*"))
 
     def _gather_expert_tensor(
         self,
