@@ -15,6 +15,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 from safetensors.torch import load_file, save_file
 from torch import nn
@@ -185,3 +186,32 @@ def test_export_restores_moe_rank_scaled_peft_v5_and_writes_canonical_hf_shards(
             exported[f"backbone.layers.0.mixer.experts.{expert_id}.down_proj.weight"],
             expected_down[expert_id].transpose(0, 1),
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required to exercise in-place expert views")
+def test_export_cuda_grouped_experts_writes_serializable_tensors(tmp_path):
+    """CUDA export materializes grouped-expert transposes before safetensors serialization."""
+    torch.manual_seed(1234)
+    model = _TinyAutoModelPeftModel()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_()
+
+    adapter_dir = tmp_path / "adapter"
+    _write_legacy_automodel_adapter(model, adapter_dir)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if any(part.startswith("lora_") for part in name.split(".")):
+                parameter.zero_()
+    model.cuda()
+
+    output_dir = export_merged_peft_checkpoint(
+        model,
+        adapter_path=adapter_dir,
+        output_dir=tmp_path / "merged",
+        max_shard_size=300,
+    )
+
+    exported = _load_sharded_state_dict(output_dir)
+    assert "backbone.layers.0.mixer.experts.0.up_proj.weight" in exported
+    assert "backbone.layers.0.mixer.experts.0.down_proj.weight" in exported
