@@ -1,0 +1,71 @@
+recipe: TrainEagle3Recipe
+
+# EAGLE-3 with Ulysses context parallelism on the draft, composed with sequence
+# packing.
+#
+# Unlike the ring CP mode (qwen3_eagle3_cp.yaml), Ulysses redistributes the
+# draft's block-0 attention with an all-to-all so each cp rank holds the FULL
+# sequence for a subset of the heads. Block-0 then runs one packed varlen
+# FlashAttention over the whole sequence, so document boundaries (cu_seqlens)
+# carry through and CP composes with sequence packing. The per-position TTT
+# diagonals stay shard-local. The frozen target is NOT sharded in this mode: it
+# runs its normal block-causal forward and the recipe slices its hidden states to
+# each draft shard. Notes:
+#   * cp_mode: ulysses (default is ring, which cannot pack).
+#   * num_attention_heads of the draft must be divisible by cp_size (heads are
+#     split across cp ranks by the all-to-all).
+#   * seq_length and packed_sequence_size must both be divisible by cp_size.
+#   * Ulysses uses the public flash-attn dense/varlen API, so flash-attn must be
+#     installed; it does not need the ring's target_force_hf / sdpa target.
+#
+# Run (single node, cp_size=2 over 2 GPUs):
+#   automodel examples/speculative/eagle3/qwen3_eagle3_cp_ulysses_packed.yaml \
+#       --nproc-per-node 2 --distributed.cp_size=2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-4B
+  # Ulysses leaves the target on its normal forward, so it may use flash_attention_2.
+  draft_attn_implementation: flash_attention_2
+  train_data_path: ./cache/dataset/perfectblend-messages
+  val_data_path: null
+  train_split: "train[:64]"
+  val_split: null
+  output_dir: ./outputs/eagle3_qwen3_4b_cp_ulysses_packed
+  seq_length: 2048
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 7
+  draft_vocab_size: 32000
+  freeze_embeddings: true
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 1
+  max_grad_norm: 1.0
+  # Ulysses draft CP: all-to-all sequence<->head redistribution (composes with
+  # packing), vs the default "ring" (single-document causal, packing-incompatible).
+  cp_mode: ulysses
+  # Sequence packing: concatenate documents up to this length (block-causal via
+  # cu_seqlens). Must be divisible by cp_size. Ulysses is what makes CP + packing
+  # work; the ring mode gates this off.
+  packed_sequence_size: 2048
+
+rng:
+  seed: 42
+
+distributed:
+  strategy: fsdp2
+  cp_size: 1
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: false

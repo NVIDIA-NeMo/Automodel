@@ -179,6 +179,28 @@ def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
     clip_grads_with_norm_mock.assert_not_called()
 
 
+def test_clip_grad_norm_disables_torch_fast_path_for_owner_shard(monkeypatch):
+    """A model-owned local shard requires the contract's global norm group."""
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0, 4.0]])
+    model.weight._nemo_model_owned_grad_divisor = 1.0
+
+    torch_clip_mock = Mock(return_value=torch.tensor(-1.0))
+    sharding_aware_clip_mock = Mock()
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", torch_clip_mock)
+    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", sharding_aware_clip_mock)
+
+    grad_norm = clip_grad_norm(
+        max_grad_norm=10.0,
+        model_parts=[model],
+        use_torch_clip_grad_norm=True,
+    )
+
+    torch.testing.assert_close(grad_norm, torch.tensor(5.0, dtype=torch.float64))
+    torch_clip_mock.assert_not_called()
+    sharding_aware_clip_mock.assert_called_once()
+
+
 def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
     model = torch.nn.Linear(10, 10)
     model.weight.grad = torch.randn_like(model.weight)
@@ -550,6 +572,20 @@ class _MoEModule(nn.Module):
 
 class TestScaleGradsAndClipGradNorm:
     """Tests for scale_grads_and_clip_grad_norm with EP scaling."""
+
+    def test_owner_shard_uses_explicit_gradient_divisor(self):
+        """Owner scaling is declared by the model and independent of DP arguments."""
+        model = nn.Linear(2, 1, bias=False)
+        model.weight.grad = torch.full_like(model.weight, 8.0)
+        model.weight._nemo_model_owned_grad_divisor = 4.0
+
+        scale_grads_and_clip_grad_norm(
+            max_grad_norm=None,
+            model_parts=[model],
+            dp_group_size=999,
+        )
+
+        torch.testing.assert_close(model.weight.grad, torch.full_like(model.weight, 2.0))
 
     def test_ep_scaling_for_expert_params_by_name(self):
         """Test that expert params are scaled by EP ratio based on param name."""

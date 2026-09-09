@@ -113,7 +113,6 @@ ci:
   vllm_deploy_known_issue_id: AM-176
   recipe_owner: HuiyingLi
   checkpoint_robustness:
-    hf_kl_threshold: 5e-3
     training_reproducibility_loss_threshold: 5e-2
     trust_remote_code: true
     distributed.tp_size: 2

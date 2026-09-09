@@ -15,6 +15,7 @@
 import importlib.util
 import sys
 import types
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -240,6 +241,7 @@ class TestGlmMoeDsaModel:
         assert model.moe_config.n_activated_experts == config.num_experts_per_tok
         assert model.moe_config.score_func == "sigmoid"
         assert model.moe_config.softmax_before_topk is False
+        assert model.moe_config.router_weights_fp32 is True
         assert model.moe_config.route_scale == config.routed_scaling_factor
 
     def test_model_initializes_moe_config_with_expert_groups(self, config, backend_config):
@@ -439,7 +441,8 @@ class TestGlmMoeDsaClassmethods:
 
         assert isinstance(model, GlmMoeDsaForCausalLM)
         assert model.config == config
-        assert model.backend == backend_config
+        assert model.backend == replace(backend_config, gate_precision=torch.float32)
+        assert backend_config.gate_precision is None
 
     def test_from_pretrained_classmethod(self, config):
         with patch(

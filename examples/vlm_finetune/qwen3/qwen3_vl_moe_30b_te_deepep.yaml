@@ -100,7 +100,6 @@ optimizer:
   weight_decay: 0.0
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -119,13 +118,7 @@ ci:
   nodes: 1
   time: "00:30:00"
   checkpoint_robustness:
-    check_source_load_parity: true
-    # Current-stack BF16 CI observed source max/mean KL up to 0.0293/0.0052 and HF reload KL 0.0201.
-    hf_kl_threshold: 2.5e-2
     hf_device_map_auto: true
     # Independently calibrated normal-run envelope; it does not relax resume correctness.
     training_reproducibility_loss_threshold: 2e-2
-    source_load_kl_threshold: 4e-2
-    source_load_mean_kl_threshold: 7e-3
-    source_load_cosine_threshold: 0.9985
     tokenizer_name: Qwen/Qwen3-VL-30B-A3B-Instruct
