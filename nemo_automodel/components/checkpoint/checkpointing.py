@@ -444,12 +444,16 @@ def _warn_if_large_inline_consolidation(
         return
     if config.save_consolidated != SaveConsolidatedMode.EVERY:
         return
+    # Only rank 0 emits this warning, so bail out before estimating. Neither
+    # helper below is collective -- one is a local file read, the other walks
+    # the state dict without materializing tensors -- so skipping them on the
+    # other ranks cannot deadlock.
+    if not is_rank_0():
+        return
     estimated_bytes = _get_original_hf_index_total_size(config)
     is_hf_index_estimate = estimated_bytes is not None
     if estimated_bytes is None:
         estimated_bytes = estimate_state_dict_bytes(state_dict)
-    if not is_rank_0():
-        return
     if estimated_bytes is None or estimated_bytes < _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES:
         return
     world_size = get_world_size_safe()
