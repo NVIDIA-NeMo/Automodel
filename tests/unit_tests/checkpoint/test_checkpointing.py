@@ -653,7 +653,7 @@ def test_fully_pruned_original_index_uses_size_based_consolidated_mapping(tmp_pa
 
 
 def test_fully_pruned_original_index_uses_consistent_global_sizes_across_pp_ranks(tmp_path):
-    """Allium: RankAgreement, CompleteCoverage, DensePositiveIndices, TargetBoundaries."""
+    """All PP ranks derive the same complete shard mapping from global tensor sizes."""
 
     class FakeTensor:
         def __init__(self, bytes_: int):
@@ -728,7 +728,9 @@ def test_fully_pruned_original_index_uses_consistent_global_sizes_across_pp_rank
     assert set(expected_mapping) == set(global_keys)
 
 
-def _run_fully_pruned_index_pp_worker(rank: int, world_size: int, init_file: str, checkpoint_dir: str) -> None:
+def _run_size_based_index_pp_worker(
+    rank: int, world_size: int, init_file: str, checkpoint_dir: str, has_source_reference: bool
+) -> None:
     """Verify real PP ranks derive the same size-based consolidated index."""
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     torch.distributed.init_process_group(
@@ -769,7 +771,7 @@ def _run_fully_pruned_index_pp_worker(rank: int, world_size: int, init_file: str
         with (
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
-                return_value=os.path.join(checkpoint_dir, "source"),
+                return_value=os.path.join(checkpoint_dir, "source") if has_source_reference else None,
             ),
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
@@ -789,11 +791,12 @@ def _run_fully_pruned_index_pp_worker(rank: int, world_size: int, init_file: str
 
 
 @pytest.mark.run_only_on("CPU")
-def test_fully_pruned_original_index_agrees_across_real_pp_processes(tmp_path):
-    """Disjoint PP stages complete the collective and produce one identical global index."""
+@pytest.mark.parametrize("has_source_reference", [True, False], ids=["fully_pruned_index", "missing_reference"])
+def test_size_based_index_agrees_across_real_pp_processes(tmp_path, has_source_reference):
+    """Pruned and missing source indices yield identical size-based mappings across disjoint PP stages."""
     torch.multiprocessing.spawn(
-        _run_fully_pruned_index_pp_worker,
-        args=(2, str(tmp_path / "dist_init"), str(tmp_path)),
+        _run_size_based_index_pp_worker,
+        args=(2, str(tmp_path / "dist_init"), str(tmp_path), has_source_reference),
         nprocs=2,
         join=True,
     )
