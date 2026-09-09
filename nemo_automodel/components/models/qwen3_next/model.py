@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -133,7 +133,10 @@ class Block(nn.Module):
             linear_list = [self.linear_attn.in_proj_qkvz, self.linear_attn.in_proj_ba, self.linear_attn.out_proj]
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            self.linear_attn.norm.reset_parameters()
+            # transformers 5.15 dropped the FusedRMSNormGated branch, so this is always
+            # Qwen3NextRMSNormGated, which has no reset_parameters(). Its weight is an
+            # RMSNorm gain, initialized to ones.
+            nn.init.ones_(self.linear_attn.norm.weight)
         self.mlp.init_weights(buffer_device)
 
 
@@ -268,6 +271,8 @@ class Qwen3NextModel(nn.Module):
 class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
+    _keep_in_fp32_modules_strict = ["_fp32_params"]
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -343,7 +348,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (

@@ -55,9 +55,10 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 32
+  ep_size: 64
 
   sequence_parallel: false
+  activation_checkpointing: false
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -113,6 +114,6 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
-  local_batch_size: 16
-  nodes: 4
+  local_batch_size: 8
+  nodes: 8
   time: "01:00:00"

@@ -352,6 +352,44 @@ class TestComputeLmHeadLogits:
         out = compute_lm_head_logits(None, hidden, fp32_lm_head=True)
         assert out.logits is hidden
 
+    def test_lm_head_dtype_casts_after_slicing(self):
+        lm_head = self._lm_head().to(torch.bfloat16)
+        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
+
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
+
+        expected = lm_head(hidden[:, -2:, :].to(torch.bfloat16))
+        assert out.logits.shape == (2, 2, self.VOCAB)
+        assert out.logits.dtype == torch.bfloat16
+        torch.testing.assert_close(out.logits, expected)
+
+    def test_fsdp_lm_head_uses_policy_compute_dtype(self):
+        hidden_size = self.HIDDEN
+        vocab_size = self.VOCAB
+
+        class FakeFSDPHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(vocab_size, hidden_size, dtype=torch.float32))
+
+            def _get_fsdp_state(self):
+                return SimpleNamespace(_mp_policy=SimpleNamespace(param_dtype=torch.bfloat16))
+
+            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+                """Project hidden states of shape [batch, sequence, hidden]."""
+                assert hidden_states.dtype == torch.bfloat16
+                return hidden_states @ self.weight.to(hidden_states.dtype).T
+
+        lm_head = FakeFSDPHead()
+        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
+
+        with patch("nemo_automodel.components.models.common.utils.FSDPModule", FakeFSDPHead):
+            out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
+
+        assert lm_head.weight.dtype == torch.float32
+        assert out.logits.shape == (2, 2, self.VOCAB)
+        assert out.logits.dtype == torch.bfloat16
+
     def test_output_hidden_states_attaches_hidden(self):
         """output_hidden_states attaches the final hidden states; default leaves them None."""
         lm_head = self._lm_head()

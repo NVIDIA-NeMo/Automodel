@@ -37,6 +37,12 @@ from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+def _has_thd_metadata(attn_kwargs: dict[str, Any]) -> bool:
+    return attn_kwargs.get("cu_seqlens") is not None or (
+        attn_kwargs.get("cu_seqlens_q") is not None and attn_kwargs.get("cu_seqlens_kv") is not None
+    )
+
+
 class GptOssAttention(nn.Module):
     def __init__(self, config: "GptOssConfig", backend: BackendConfig, use_sliding_attention: bool = False):
         super().__init__()
@@ -97,14 +103,15 @@ class GptOssAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        # Detect THD format: either 2D [T, hidden] or 3D [1, T, hidden] with
-        # cu_seqlens in kwargs (from PP schedule splitting [N, T, hidden] → [1, T, hidden]).
-        if len(x.shape) == 2:
+        # Detect THD format: either 2D [T, hidden], explicit THD metadata, or
+        # 3D [1, T, hidden] with cu_seqlens from PP schedule splitting.
+        explicit_thd = attn_kwargs.get("qkv_format") == "thd" or _has_thd_metadata(attn_kwargs)
+        if len(x.shape) == 2 or explicit_thd:
             qkv_format = "thd"
-            num_tokens = x.shape[0]
-        elif "cu_seqlens" in attn_kwargs and x.shape[0] == 1:
-            qkv_format = "thd"
-            x = x.squeeze(0)
+            if len(x.shape) == 3:
+                if x.shape[0] != 1:
+                    raise ValueError("GPT-OSS THD attention expects a singleton batch dimension before flattening.")
+                x = x.squeeze(0)
             num_tokens = x.shape[0]
         else:
             qkv_format = "bshd"
@@ -145,6 +152,9 @@ class GptOssAttention(nn.Module):
             }
         else:
             updated_attn_kwargs = attn_kwargs
+            if qkv_format == "thd":
+                updated_attn_kwargs = {**updated_attn_kwargs, "qkv_format": "thd"}
+                attention_mask = None
             if self.sliding_window is not None:
                 updated_attn_kwargs["window_size"] = (self.sliding_window, 0)
 

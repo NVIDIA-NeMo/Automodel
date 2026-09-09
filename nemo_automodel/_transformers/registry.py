@@ -14,6 +14,7 @@
 
 
 import importlib
+import importlib.metadata
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -87,8 +88,22 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
         ),
         (
+            "Glm5NextForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.glm5_next.model",
+                "Glm5NextForConditionalGeneration",
+            ),
+        ),
+        (
             "Gemma4ForConditionalGeneration",
             ("nemo_automodel.components.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
+        ),
+        (
+            "Gemma4UnifiedForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.gemma4_unified.model",
+                "Gemma4UnifiedForConditionalGeneration",
+            ),
         ),
         (
             "Gemma4AssistantForCausalLM",
@@ -107,8 +122,20 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLForConditionalGeneration"),
         ),
         (
+            "KimiK3ForConditionalGeneration",
+            ("nemo_automodel.components.models.kimi_k3.multimodal", "KimiK3ForConditionalGeneration"),
+        ),
+        (
+            "KimiK3ForCausalLM",
+            ("nemo_automodel.components.models.kimi_k3.model", "KimiK3ForCausalLM"),
+        ),
+        (
             "KimiVLForConditionalGeneration",
             ("nemo_automodel.components.models.kimivl.model", "KimiVLForConditionalGeneration"),
+        ),
+        (
+            "KimiLinear48BForCausalLM",
+            ("nemo_automodel.components.models.kimi_linear.model", "KimiLinear48BForCausalLM"),
         ),
         (
             "LlamaBidirectionalForSequenceClassification",
@@ -188,8 +215,19 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "NemotronH_Omni_Reasoning_V3",
+            (
+                "nemo_automodel.components.models.nemotron_omni.model",
+                "NemotronOmniForConditionalGeneration",
+            ),
+        ),
+        (
             "NemotronParseForConditionalGeneration",
             ("nemo_automodel.components.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
+        ),
+        (
+            "MuseGlimmerForConditionalGeneration",
+            ("nemo_automodel.components.models.muse_glimmer.model", "MuseGlimmerForConditionalGeneration"),
         ),
         (
             "LLaVAOneVision1_5_ForConditionalGeneration",
@@ -209,6 +247,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Qwen2ForCausalLM",
             ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
+        ),
+        (
+            "Qwen3ForCausalLM",
+            ("nemo_automodel.components.models.qwen3.model", "Qwen3ForCausalLM"),
         ),
         (
             "Qwen2_5OmniModel",
@@ -259,8 +301,25 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_vl_moe.model", "Qwen3VLMoeForConditionalGeneration"),
         ),
         (
+            "Qwen3VLForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_vl.model", "Qwen3VLForConditionalGeneration"),
+        ),
+        (
+            "Qwen3_5MoeForCausalLM",
+            ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForCausalLM"),
+        ),
+        (
             "Qwen3_5MoeForConditionalGeneration",
             ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
+        ),
+        (
+            "Qwen3_8_FlashNextForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_8_flash_next.model", "Qwen3_8_FlashNextForConditionalGeneration"),
+        ),
+        (
+            # Immutable checkpoint dumps predate the Qwen3.8-Flash-Next rename.
+            "Qwen4ExpForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_8_flash_next.model", "Qwen3_8_FlashNextForConditionalGeneration"),
         ),
         (
             "Step3p6ForConditionalGeneration",
@@ -290,33 +349,58 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
+    "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
+    "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
+    "kimi_k3": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3Config"),
+    "kimi_linear": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3TextConfig"),
+    "kimi_linear_48b_a3b": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinear48BConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "laguna": ("nemo_automodel.components.models.laguna.config", "LagunaConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
     "minimax_m3_vl": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
+    "ministral3_bidirec": (
+        "nemo_automodel.components.models.ministral_bidirectional.model",
+        "Ministral3BidirectionalConfig",
+    ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),
+    "qwen3_8_flash_next": ("nemo_automodel.components.models.qwen3_8_flash_next.config", "Qwen3_8_FlashNextConfig"),
+    "qwen3_8_flash_next_text": (
+        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "Qwen3_8_FlashNextTextConfig",
+    ),
+    # Immutable checkpoint dumps predate the Qwen3.8-Flash-Next rename.
+    "qwen4_exp": (
+        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "Qwen3_8_FlashNextLegacyConfig",
+    ),
+    "qwen4_exp_text": (
+        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "Qwen3_8_FlashNextLegacyTextConfig",
+    ),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
 
-# model_types whose custom model implementation reads fields that only our
-# config class provides. When a transformers release starts shipping its own
-# config for one of these model_types (same model_type string, often the same
-# class name), the skip-if-built-in registration below would silently hand the
-# native config to our custom model and break its field protocol at init
-# (transformers 5.12 added minimax_m3_vl whose vision config drops rope_theta
-# -> ``'MiniMaxM3VLVisionConfig' object has no attribute 'rope_theta'``).
-# These entries override the built-in registration instead. Entries NOT listed
-# here keep the built-in config when one exists (mistral4's custom model was
-# written against the native config and runs green with it).
+# model_types whose custom model implementation should win over a transformers
+# built-in config when one exists. A registration means the custom model reads
+# fields only our config class provides, so the built-in must NOT win by
+# default: when a transformers release starts shipping a config for a registered
+# model_type (same model_type string, often the same class name) it would
+# silently replace ours and break the model's field protocol at init -- e.g.
+# transformers 5.12 added minimax_m3_vl whose vision config drops rope_theta
+# (``'MiniMaxM3VLVisionConfig' object has no attribute 'rope_theta'``), and its
+# deepseek_v4 config renames ``compress_ratios`` to ``compress_rates``, which
+# silently collapses the DSV4 context-parallel shard multiple to 1.
+# Remove a model_type only once its custom model is verified to run on the
+# native config (mistral4 was written against it and runs green).
 _CUSTOM_CONFIG_OVERRIDES_BUILTIN = {
-    "laguna",
-    "minimax_m3_vl",
+    *(_CUSTOM_CONFIG_REGISTRATIONS.keys() - {"mistral4"}),
 }
 
 
@@ -413,9 +497,15 @@ class _LazyArchMapping:
         self._extra[key] = value
 
     def register(self, key: str, value: Type[nn.Module], exist_ok: bool = False) -> None:
-        """Register a model class under the given architecture name."""
-        if not exist_ok and key in self._extra:
+        """Register a model class under the given architecture name.
+
+        Conflicts, including built-in architectures, require ``exist_ok=True``.
+        """
+        if not exist_ok and (key in self._auto_map or key in self._extra):
             raise ValueError(f"Duplicated model implementation for {key}")
+
+        self._auto_map.pop(key, None)
+        self._loaded.pop(key, None)
         self._extra[key] = value
 
     def has_tag(self, key: str, tag: str) -> bool:
@@ -445,6 +535,19 @@ class _ModelRegistry:
         if self.model_arch_name_to_cls is None:
             self.model_arch_name_to_cls = _LazyArchMapping(MODEL_ARCH_MAPPING)
         self._retrieval_archs = self.model_arch_name_to_cls.keys_with_tag("retrieval")
+        self._discover_entry_points()
+
+    def _discover_entry_points(self) -> None:
+        """Register architecture entry points without importing their modules."""
+        mapping = self.model_arch_name_to_cls
+        for ep in importlib.metadata.entry_points(group="nemo_automodel.architectures"):
+            if ep.name in mapping.keys():
+                logger.warning("Architecture %s is already registered; skipping entry point %s", ep.name, ep.value)
+                continue
+            module_path, _, class_name = ep.value.rpartition(":")
+            if not module_path or not class_name:
+                raise ValueError(f"Entry point {ep.name!r} value must be module.path:ClassName, got {ep.value!r}")
+            mapping._auto_map[ep.name] = (module_path, class_name)
 
     @property
     def supported_models(self):
@@ -492,6 +595,21 @@ class _ModelRegistry:
 @lru_cache
 def get_registry():
     return _ModelRegistry()
+
+
+def register_architecture(arch_name: str, model_cls: type[nn.Module], *, exist_ok: bool = False) -> None:
+    """Register a custom model class for an architecture name.
+
+    Args:
+        arch_name: Architecture name (e.g. ``"LlavaExampleNemotronForCausalLM"``).
+        model_cls: The model class (not a string path; the class object itself).
+        exist_ok: If True, replace an existing registration.
+
+    Raises:
+        ValueError: If *arch_name* is already a built-in or registered to a
+            different class and *exist_ok* is False.
+    """
+    ModelRegistry.register(arch_name, model_cls, exist_ok=exist_ok)
 
 
 ModelRegistry = get_registry()

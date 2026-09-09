@@ -1,0 +1,136 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Fine-tune Inkling-Small on MedPix-VQA.
+#
+# Hardware target: 8 nodes x 8 H100 GPUs with FSDP2 and EP64.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 50
+  log_remote_every_steps: 1
+  gc_every_steps: 10
+  num_epochs: 2
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: thinkingmachines/Inkling-Small
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    gate_precision: float32
+    experts: torch_mm
+    dispatcher: hybridep
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: nemo_automodel.components.models.inkling.processing.build_inkling_processor
+  pretrained_model_name_or_path: thinkingmachines/Inkling-Small
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/inkling-small-medpix-ep64/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 64
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 512
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 512
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+  foreach: false
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+wandb:
+  enable: false
+  project: automodel-inkling-small
+  entity: <your_wandb_entity>
+  name: inkling-small-medpix-ep64
+  dir: wandb
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 8
+  time: "01:00:00"

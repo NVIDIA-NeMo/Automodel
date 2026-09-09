@@ -17,8 +17,8 @@
 #
 # Inkling is a sparse Mixture-of-Experts VLM (66 layers, 256 routed experts with
 # top-6 routing plus 2 shared experts, hierarchical vision tower + dMel audio
-# tower). NeMo AutoModel reuses the HuggingFace towers/attention verbatim and runs
-# the routed experts through grouped-GEMM with expert parallelism (EP).
+# tower). NeMo AutoModel owns the text, vision, audio, and multimodal modules and
+# runs routed experts through grouped-GEMM with expert parallelism (EP).
 #
 # To run this recipe:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

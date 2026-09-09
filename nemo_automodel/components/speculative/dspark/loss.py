@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -42,7 +41,7 @@ def _build_loss_weight_mask(
     eval_mask: torch.Tensor,
     block_size: int,
     device: torch.device,
-    loss_decay_gamma: Optional[float],
+    loss_decay_gamma: float | None,
 ) -> torch.Tensor:
     loss_weight_mask = eval_mask.to(torch.float32)
     if loss_decay_gamma is not None and loss_decay_gamma > 0:
@@ -94,7 +93,7 @@ def _compute_l1_dist_per_token(
     return torch.cat(distances).reshape(output_shape)
 
 
-def _compute_accept_rate_3d(l1_dist_per_token: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+def _compute_accept_rate_3d(l1_dist_per_token: torch.Tensor | None) -> torch.Tensor | None:
     if l1_dist_per_token is None:
         return None
     return (1.0 - 0.5 * l1_dist_per_token).clamp_(0.0, 1.0)
@@ -102,7 +101,7 @@ def _compute_accept_rate_3d(l1_dist_per_token: Optional[torch.Tensor]) -> Option
 
 def _compute_local_l1_term(
     *,
-    l1_dist_per_token: Optional[torch.Tensor],
+    l1_dist_per_token: torch.Tensor | None,
     loss_weight_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     zero = loss_weight_mask.new_zeros(())
@@ -116,7 +115,7 @@ def _compute_local_l1_term(
 def _collect_acceptance_diagnostics(
     *,
     outputs: DSparkForwardOutput,
-    accept_rate_3d: Optional[torch.Tensor],
+    accept_rate_3d: torch.Tensor | None,
     loss_weight_mask: torch.Tensor,
     has_confidence: bool,
 ) -> dict[str, torch.Tensor]:
@@ -176,7 +175,7 @@ def _collect_acceptance_diagnostics(
 def _collect_local_terms(
     *,
     outputs: DSparkForwardOutput,
-    loss_decay_gamma: Optional[float],
+    loss_decay_gamma: float | None,
     l1_loss_alpha: float,
 ) -> tuple[dict[str, torch.Tensor], bool]:
     draft_logits = outputs.draft_logits
@@ -281,7 +280,7 @@ def _build_loss(
 def compute_dspark_loss(
     *,
     outputs: DSparkForwardOutput,
-    loss_decay_gamma: Optional[float],
+    loss_decay_gamma: float | None,
     ce_loss_alpha: float,
     l1_loss_alpha: float,
     confidence_head_alpha: float,

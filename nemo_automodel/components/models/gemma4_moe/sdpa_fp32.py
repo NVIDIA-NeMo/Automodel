@@ -14,8 +14,6 @@
 
 """fp32 SDPA attention for Gemma4 (fix for #2208: fused bf16 SDPA NaNs on Hopper)."""
 
-from typing import Optional
-
 import torch
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
@@ -25,9 +23,9 @@ def sdpa_fp32_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
+    attention_mask: torch.Tensor | None = None,
     **kwargs,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run SDPA with fp32 query/key/value and cast the output back to the input dtype."""
     in_dtype = query.dtype
     if attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dtype.is_floating_point:

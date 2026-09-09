@@ -14,7 +14,7 @@
 
 import contextlib
 from functools import partial
-from typing import Any, List, Optional, Set
+from typing import Any, List, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -27,7 +27,10 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_identity,
     shard_batch_load_balanced,
 )
-from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
+from nemo_automodel.components.distributed.thd_utils import (
+    split_batch_into_thd_chunks,
+    thd_padding_mask_from_token_ids,
+)
 
 
 @contextlib.contextmanager
@@ -115,7 +118,7 @@ def create_context_parallel_ctx(
     cp_buffers: List[torch.Tensor],
     cp_seq_dims: List[int],
     cp_no_restore_buffers: Set[torch.Tensor],
-    cp_rotate_method: Optional[str] = None,
+    cp_rotate_method: str | None = None,
 ):
     """
     Create a context parallel context.
@@ -185,6 +188,66 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
     for name, module in model.named_modules():
         if name.endswith("self_attn"):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
+
+
+def attach_te_context_parallel(
+    model: torch.nn.Module,
+    cp_mesh: DeviceMesh | None = None,
+    tp_mesh: DeviceMesh | None = None,
+) -> int:
+    """Configure Transformer Engine attention modules for context and tensor parallelism.
+
+    Args:
+        model: Model or pipeline stage containing ``self_attn`` modules.
+        cp_mesh: Optional one-dimensional context-parallel device mesh. When its
+            size is greater than one, every attention module communicates over
+            this mesh; no tensor is mutated.
+        tp_mesh: Optional one-dimensional tensor-parallel device mesh. When its
+            size is greater than one, Q/K/V use per-rank head shards and every
+            attention module is configured with the corresponding process group.
+
+    Returns:
+        Number of Transformer Engine attention modules configured.
+    """
+    from nemo_automodel.shared.import_utils import safe_import_from
+
+    has_te, dot_product_attention_cls = safe_import_from("transformer_engine.pytorch.attention", "DotProductAttention")
+    if not has_te:
+        raise ImportError("Transformer Engine attention is required for dense TE parallelism.")
+
+    cp_size = cp_mesh.size() if cp_mesh is not None else 1
+    cp_group = cp_mesh.get_group() if cp_size > 1 else None
+    cp_ranks = torch.distributed.get_process_group_ranks(cp_group) if cp_group is not None else None
+    cp_stream = torch.cuda.Stream() if cp_group is not None else None
+    tp_size = tp_mesh.size() if tp_mesh is not None else 1
+    tp_group = tp_mesh.get_group() if tp_size > 1 else None
+    configured = 0
+    for name, module in model.named_modules():
+        if not name.endswith("self_attn"):
+            continue
+        attn_module = getattr(module, "attn_module", None)
+        if not isinstance(attn_module, dot_product_attention_cls):
+            continue
+        if tp_size > 1:
+            if attn_module.num_attention_heads % tp_size != 0 or attn_module.num_gqa_groups % tp_size != 0:
+                raise ValueError(
+                    "Transformer Engine attention head counts must be divisible by tensor-parallel size: "
+                    f"num_attention_heads={attn_module.num_attention_heads}, "
+                    f"num_gqa_groups={attn_module.num_gqa_groups}, tp_size={tp_size}."
+                )
+            attn_module.tp_size = tp_size
+            attn_module.num_gqa_groups_per_partition = attn_module.num_gqa_groups // tp_size
+            attn_module.set_tensor_parallel_group(tp_group)
+        if cp_group is not None:
+            cp_comm_type = "all_gather" if getattr(module, "sliding_window", None) is not None else "p2p"
+            attn_module.set_context_parallel_group(
+                cp_group,
+                cp_ranks,
+                cp_stream,
+                cp_comm_type=cp_comm_type,
+            )
+        configured += 1
+    return configured
 
 
 def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
@@ -324,7 +387,7 @@ def _prepare_cp_sharder(
     num_chunks: int = 1,
     loss_mask: torch.Tensor | None = None,
     invoke_pre_embed: bool = True,
-    extra_seq_buffers: Optional[dict[str, int]] = None,
+    extra_seq_buffers: dict[str, int] | None = None,
 ) -> ContextParallelSharder:
     """Resolve and configure a CP sharder for its public constructor.
 
@@ -401,14 +464,14 @@ def _prepare_cp_sharder(
 
 def _resolve_cp_sharder(
     cp_mesh,
-    model_sharder: Optional[ContextParallelSharder],
+    model_sharder: ContextParallelSharder | None,
     *,
     magi,
     is_thd: bool,
     num_chunks: int,
     seq_lens_padding_value: int,
     model,
-    extra_seq_buffers: Optional[dict[str, int]] = None,
+    extra_seq_buffers: dict[str, int] | None = None,
 ) -> ContextParallelSharder:
     """Resolve the ContextParallelSharder for this forward: model-owned > magi > TE > generic > none.
 
@@ -553,8 +616,8 @@ def _make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
     magi=None,
     model=None,
-    cp_sharder: Optional[ContextParallelSharder] = None,
-    extra_seq_buffers: Optional[dict[str, int]] = None,
+    cp_sharder: ContextParallelSharder | None = None,
+    extra_seq_buffers: dict[str, int] | None = None,
 ):
     """
     Resolve a ContextParallelSharder and shard the batch; a no-op when no CP prep applies.
@@ -695,7 +758,10 @@ def make_cp_batch_for_te(
         raise ValueError(f"Currently only 'thd' format is supported, got: {qkv_format}")
 
     batch = split_batch_into_thd_chunks(
-        batch, num_chunks=num_chunks, seq_lens_padding_value=seq_lens_padding_value, padding_token_id=padding_token_id
+        batch,
+        num_chunks=num_chunks,
+        seq_lens_padding_value=seq_lens_padding_value,
+        padding_token_id=padding_token_id,
     )
 
     if cp_mesh is None or cp_mesh.size() <= 1:
@@ -775,17 +841,35 @@ def _shard_thd_chunk_for_te(
         if key in batch:
             batch[key] = batch[key].index_select(0, local_indices)
 
+    # Keep model-owned payloads (for example VLM media) by default. Only remove
+    # source metadata that is invalid after the THD CP conversion; the update
+    # below replaces every transformed field with its authoritative local value.
+    output_batch = batch.copy()
+    output_batch.pop("attention_mask", None)
+    output_batch.pop("cu_seqlens_padded", None)
+
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
-    output_batch = {
-        "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
-        "labels": batch["labels"].to(torch.int64).contiguous(),
-        "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
-        "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
-        "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
-        "qkv_format": qkv_format,
-        "padding_mask": (batch["input_ids"] == padding_token_id).bool().contiguous(),
-        "cp_size": cp_size,
-        "cp_rank": cp_rank,
-    }
+    output_batch.update(
+        {
+            "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
+            "labels": batch["labels"].to(torch.int64).contiguous(),
+            "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
+            "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
+            "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
+            "qkv_format": qkv_format,
+            "cp_size": cp_size,
+            "cp_rank": cp_rank,
+        }
+    )
+
+    # Already partitioned above with the same local_indices as input_ids. Only
+    # fall back to the token-value comparison when the caller supplied no mask;
+    # it rejects a pad id that is also content instead of silently masking it.
+    if "padding_mask" in batch:
+        output_batch["padding_mask"] = batch["padding_mask"].bool().contiguous()
+    else:
+        output_batch["padding_mask"] = thd_padding_mask_from_token_ids(
+            output_batch["input_ids"], padding_token_id
+        ).contiguous()
 
     return output_batch, local_indices

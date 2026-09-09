@@ -94,5 +94,5 @@ checkpoint:
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
   save_consolidated: final
-  diffusers_compatible: false
+  diffusers_compatible: true
   restore_from: null

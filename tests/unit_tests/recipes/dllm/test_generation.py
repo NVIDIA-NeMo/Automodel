@@ -28,7 +28,10 @@ sys.path.insert(0, str(EXAMPLE_DIR))
 from generate import (  # noqa: E402
     SAMPLERS,
     DiffusionGemmaSampler,
+    IDLMSampler,
     LLaDA2Sampler,
+    LLaDASampler,
+    SCDDSampler,
     encode_generation_prompts,
     generate_gemma,
     generate_llada2,
@@ -133,6 +136,73 @@ def test_generate_llada2_requires_special_token_ids(mask_id, eos_id):
         generate_llada2(_FakeLLaDA2(), _FakeTokenizer(), [[1]], LLaDA2Sampler.default_config, mask_id, eos_id)
 
 
+class _FakeShiftModel(torch.nn.Module):
+    """Causal LM stub whose row ``i`` predicts a position-determined token.
+
+    Row ``i`` votes for token id ``i % (vocab-1)`` (always a real token, never
+    ``mask_id = vocab-1``) with strictly-decreasing confidence in ``i`` so ties
+    never arise. The prediction depends only on the position, so a shifted
+    (``logit_shift=1``) decode fills mask ``p`` with ``(p-1) % (vocab-1)`` while
+    an unshifted decode fills it with ``p % (vocab-1)`` — isolating the shift.
+    """
+
+    def __init__(self, vocab_size: int):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.vocab_size = vocab_size
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        """Args: input_ids: Tensor of shape [batch, sequence]."""
+        B, T = input_ids.shape
+        V = self.vocab_size
+        # Non-target logits at 0; target logit stays positive (always the argmax)
+        # but decreases with position so softmax confidence is strictly ordered
+        # (earlier positions win topk first) with resolvable, non-tied gaps.
+        logits = torch.zeros((B, T, V), device=input_ids.device)
+        for i in range(T):
+            logits[:, i, i % (V - 1)] = 5.0 - 0.5 * i
+        return type("_Out", (), {"logits": logits})()
+
+
+def test_idlm_sampler_is_registered_with_shift_and_strided_defaults():
+    assert SAMPLERS["idlm"] is IDLMSampler
+    assert IDLMSampler.logit_shift == 1
+    config = IDLMSampler.default_config
+    assert config.block_size == 4  # paper stride N=4
+    assert config.use_kv_cache is False  # shifted decode is full-forward only
+    assert config.remasking == "low_confidence"
+
+
+def test_idlm_shift_rejects_kv_cache():
+    sampler = IDLMSampler(_FakeShiftModel(vocab_size=8), mask_id=7, eos_id=0)
+    with pytest.raises(ValueError, match="use_kv_cache=False"):
+        sampler.sample([[1, 2]], use_kv_cache=True)
+
+
+def test_idlm_shift_reads_the_preceding_position():
+    """The shifted decode fills mask ``p`` from the logit at ``p-1``.
+
+    With the position-only stub, a correct ``logit_shift=1`` decode yields
+    ``(p-1) % (vocab-1)`` at each generated position; the unshifted decode yields
+    ``p % (vocab-1)``. Asserting both proves the shift is load-bearing.
+    """
+    vocab, mask_id, eos_id = 16, 15, 0
+    model = _FakeShiftModel(vocab_size=vocab)
+    prompt = [1, 2, 3]
+    kwargs = dict(block_size=1, max_new_tokens=4, steps=4, threshold=None, eos_token_id=None)
+
+    out = IDLMSampler(model, mask_id=mask_id, eos_id=eos_id).sample([prompt], **kwargs)
+    assert out[0, :3].tolist() == prompt  # prompt preserved
+    assert (out == mask_id).sum().item() == 0  # every mask resolved
+    assert out[0, 3:].tolist() == [(p - 1) % (vocab - 1) for p in range(3, 7)]
+
+    unshifted = IDLMSampler(model, mask_id=mask_id, eos_id=eos_id)
+    unshifted.logit_shift = 0
+    out0 = unshifted.sample([prompt], **kwargs)
+    assert out0[0, 3:].tolist() == [p % (vocab - 1) for p in range(3, 7)]
+    assert not torch.equal(out0, out)
+
+
 def test_llada2_infill_is_rejected_before_loading(monkeypatch, capsys):
     monkeypatch.setattr(
         sys,
@@ -144,6 +214,125 @@ def test_llada2_infill_is_rejected_before_loading(monkeypatch, capsys):
         main()
 
     assert "--infill is not supported by the LLaDA2 generation path" in capsys.readouterr().err
+
+
+class _FakeDenoiser(torch.nn.Module):
+    """Rigged denoiser: always predicts token 7, with confidence strictly
+    increasing by position. Under multi-block decoding, the highest-confidence
+    masked positions therefore always sit in FUTURE blocks — the exact setup
+    where selecting over the full sequence (instead of the current block)
+    wastes transfer slots and strands mask tokens."""
+
+    def __init__(self, vocab_size: int = 16):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.vocab_size = vocab_size
+
+    def forward(self, x, attention_mask=None):
+        B, L = x.shape
+        logits = torch.zeros(B, L, self.vocab_size)
+        logits[:, :, 7] = 5.0 + 0.1 * torch.arange(L, dtype=torch.float32).unsqueeze(0)
+        return types.SimpleNamespace(logits=logits)
+
+
+def test_multi_block_sampling_unmasks_every_scheduled_position():
+    """Regression: with block_size < max_new_tokens, out-of-window positions
+    must not win top-k transfer slots — every block's schedule must fully
+    unmask its own window, leaving zero mask tokens in the output."""
+    mask_id = 9
+    sampler = LLaDASampler(
+        _FakeDenoiser(),
+        mask_id=mask_id,
+        # A real EOS id (any int distinct from mask_id=9 and the denoiser's
+        # prediction 7): sample() fills the canvas with eos_id, so None would
+        # break torch.full. 0 keeps the assertions strict — a stranded position
+        # would read back as 0, not 7.
+        eos_id=0,
+        steps=4,
+        max_new_tokens=8,
+        block_size=4,
+        temperature=0.0,
+        use_kv_cache=False,
+        eos_token_id=None,
+    )
+
+    out = sampler.sample([[1, 2]])
+
+    assert (out == mask_id).sum().item() == 0, "residual mask tokens: block schedules were underfilled"
+    assert (out[0, 2:] == 7).all(), "every generated position should hold the denoiser's prediction"
+
+
+def test_ragged_prompts_decode_nonempty_when_eos_active():
+    """Unequal-length prompts + a real eos_id: sample()'s batched EOS-stop and block
+    windows assume every row has the longest prompt, so a ragged batch strands the
+    shorter rows. The CLI dispatch guards this by decoding one prompt at a time (B=1)
+    when an eos_token_id is set — verify that path fully decodes each prompt."""
+    mask_id = 9
+    prompts = [[1, 2, 3, 4], [1]]  # unequal lengths
+    sampler = LLaDASampler(
+        _FakeDenoiser(),
+        mask_id=mask_id,
+        eos_id=0,
+        steps=4,
+        max_new_tokens=8,
+        block_size=4,
+        temperature=0.0,
+        use_kv_cache=False,
+        eos_token_id=0,  # real EOS activates the ragged-batch-prone stop path
+    )
+
+    # Mirror the CLI B=1 guard: decode each prompt on its own.
+    outputs = [sampler.sample([p]) for p in prompts]
+    for prompt, out in zip(prompts, outputs):
+        gen = out[0, len(prompt) :]
+        assert gen.numel() > 0, "empty generation"
+        assert (gen == mask_id).sum().item() == 0, "residual masks: prompt not fully decoded"
+
+
+def test_infill_fills_every_masked_position_per_block_window():
+    """infill() carries the same block-window restriction as sample(): the
+    candidate set is clamped to the current block before top-k, so out-of-window
+    masks cannot steal a block's transfer slots. With block_size < sequence
+    length and the confidence-increasing _FakeDenoiser (future positions look
+    most confident), a naive full-sequence selection would strand near masks —
+    the fix must fill every scheduled mask while leaving supplied tokens intact.
+    """
+    mask_id = 9
+    sampler = LLaDASampler(
+        _FakeDenoiser(),
+        mask_id=mask_id,
+        eos_id=0,
+        steps=4,
+        max_new_tokens=8,
+        block_size=4,  # 8-token sequence -> 2 blocks
+        temperature=0.0,
+        use_kv_cache=False,
+        eos_token_id=None,
+    )
+    # Masks scattered across BOTH blocks; positions 0/3/7 carry real tokens.
+    seq = [1, mask_id, mask_id, 2, mask_id, mask_id, mask_id, 3]
+
+    out = sampler.infill([seq])
+
+    assert (out == mask_id).sum().item() == 0, "residual masks: block-window restriction failed in infill"
+    # Supplied (non-mask) tokens are preserved; filled masks hold the prediction 7.
+    assert out[0, 0].item() == 1 and out[0, 3].item() == 2 and out[0, 7].item() == 3
+    assert (out[0, torch.tensor([1, 2, 4, 5, 6])] == 7).all(), (
+        "masked positions not filled with the denoiser prediction"
+    )
+
+
+def test_nemotron_infill_is_rejected_before_loading(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate.py", "--checkpoint", "unused", "--prompt", "hello", "--sampler", "nemotron", "--infill"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        main()
+
+    assert "--infill is not supported by the Nemotron generation path" in capsys.readouterr().err
 
 
 class _FakeGemma(torch.nn.Module):
@@ -270,3 +459,173 @@ def test_translate_adapter_reparents_gemma_module_paths(tmp_path):
     cfg = json.loads((out / "adapter_config.json").read_text())
     assert cfg["target_modules"] == ["model.decoder.layers.3.self_attn.q_proj"]
     assert cfg["r"] == 2  # non-key fields untouched
+
+
+class _FakeSCDDDenoiser(torch.nn.Module):
+    """Denoiser that puts (almost) all mass on one token, position-independent.
+
+    ``switch_after`` flips the prediction from ``target`` to ``revised`` once
+    that many forward passes have run, which simulates a model changing its mind
+    about tokens it already committed.
+    """
+
+    def __init__(self, target: int, vocab_size: int = 16, revised: int | None = None, switch_after: int = 0):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.target = target
+        self.revised = revised
+        self.switch_after = switch_after
+        self.vocab_size = vocab_size
+        self.calls = 0
+
+    def forward(self, x, attention_mask=None):
+        """Run the fake denoiser.
+
+        Args:
+            x: Token IDs of shape ``[batch, sequence]``.
+            attention_mask: Binary mask of shape ``[batch, sequence]``; unused.
+
+        Returns:
+            Namespace whose ``logits`` have shape ``[batch, sequence, vocab]``.
+        """
+        B, L = x.shape
+        token = self.target
+        if self.revised is not None and self.calls >= self.switch_after:
+            token = self.revised
+        self.calls += 1
+        logits = torch.zeros(B, L, self.vocab_size)
+        logits[:, :, token] = 30.0
+        return types.SimpleNamespace(logits=logits)
+
+
+def test_scdd_sampler_is_registered():
+    assert SAMPLERS["scdd"] is SCDDSampler
+    cfg = SCDDSampler.default_config
+    # Ancestral sampling must be stochastic, and every position is rewritten each
+    # step so there is nothing to cache.
+    assert cfg.temperature == 1.0
+    assert cfg.use_kv_cache is False
+
+
+def test_scdd_rejects_kv_cache():
+    sampler = SCDDSampler(_FakeSCDDDenoiser(target=7), mask_id=9, eos_id=0)
+    with pytest.raises(ValueError, match="use_kv_cache"):
+        sampler.sample([[1, 2]], use_kv_cache=True)
+
+
+def test_scdd_leaves_no_mask_tokens_and_preserves_the_prompt():
+    mask_id = 9
+    sampler = SCDDSampler(
+        _FakeSCDDDenoiser(target=7),
+        mask_id=mask_id,
+        eos_id=0,
+        steps=8,
+        max_new_tokens=6,
+        temperature=1.0,
+        uniform_ratio=0.1,
+    )
+
+    out = sampler.sample([[1, 2]])
+
+    assert out.shape == (1, 8)
+    assert torch.equal(out[0, :2], torch.tensor([1, 2])), "the prompt must never be resampled"
+    assert (out == mask_id).sum().item() == 0, "residual [MASK] survived the final denoise"
+    assert (out[0, 2:] == 7).all(), "a near-deterministic denoiser should drive every canvas position"
+
+
+def test_scdd_corrects_tokens_it_already_committed():
+    """The defining SCDD behaviour: a non-[MASK] token the denoiser no longer
+    agrees with is overwritten. An absorbing sampler, which only ever fills
+    [MASK], would leave the stale token in place."""
+    mask_id = 9
+    model = _FakeSCDDDenoiser(target=3, revised=7, switch_after=2)
+    sampler = SCDDSampler(model, mask_id=mask_id, eos_id=0, steps=16, max_new_tokens=4, uniform_ratio=0.2)
+
+    torch.manual_seed(0)
+    out = sampler.sample([[1]])
+
+    assert model.calls > 2, "the switch must happen mid-decode for this to test anything"
+    assert (out[0, 1:] == 7).all(), "positions committed as 3 were never revised to 7"
+
+
+def test_scdd_infill_is_rejected_before_loading(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate.py", "--checkpoint", "unused", "--prompt", "hello", "--sampler", "scdd", "--infill"],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        main()
+    assert "--infill is not supported by the SCDD sampler" in capsys.readouterr().err
+
+
+def test_scdd_schedule_flags_reach_the_sampler_config(monkeypatch):
+    captured = {}
+
+    def _fake_load(checkpoint_path, sampler_name="llada", mask_id_override=None):
+        return _FakeSCDDDenoiser(target=7), _FakeChatTokenizer(), 9, 0
+
+    import generate as generate_mod
+
+    monkeypatch.setattr(generate_mod, "load_model_and_tokenizer", _fake_load)
+    monkeypatch.setattr(generate_mod, "resolve_checkpoint", lambda p: p)
+    monkeypatch.setattr(
+        generate_mod,
+        "encode_generation_prompts",
+        lambda tokenizer, prompts, raw: (_ for _ in ()).throw(_Captured(captured)),
+    )
+
+    class _Captured(Exception):
+        def __init__(self, store):
+            super().__init__("stop")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate.py",
+            "--checkpoint",
+            "unused",
+            "--prompt",
+            "hello",
+            "--sampler",
+            "scdd",
+            "--uniform_ratio",
+            "0.3",
+            "--schedule_shape",
+            "2.0",
+            "--schedule_peak",
+            "0.25",
+        ],
+    )
+    with pytest.raises(_Captured):
+        main()
+
+
+def test_scdd_zero_temperature_collapses_the_denoiser():
+    """``temperature=0`` must give a one-hot distribution over the argmax and
+    never put mass on [MASK] — the path the final residual-mask denoise uses."""
+    mask_id = 9
+    sampler = SCDDSampler(_FakeSCDDDenoiser(target=7), mask_id=mask_id, eos_id=0)
+    x = torch.tensor([[1, mask_id, mask_id]])
+    attention_mask = torch.ones_like(x)
+
+    log_p = sampler._denoiser_log_probs(x, attention_mask, 0.0)
+    probs = log_p.exp()
+
+    assert torch.allclose(probs.sum(-1), torch.ones(1, 3), atol=1e-5)
+    assert (probs.argmax(-1) == 7).all()
+    assert torch.allclose(probs[..., mask_id], torch.zeros(1, 3)), "[MASK] must be outside the domain"
+
+
+def test_scdd_degenerate_schedule_still_terminates():
+    """uniform_ratio=0 removes the correction channel, which makes the
+    visible-token posterior unreachable; the sampler must fall back to keeping
+    the current token rather than handing multinomial an all-zero row."""
+    mask_id = 9
+    sampler = SCDDSampler(
+        _FakeSCDDDenoiser(target=7), mask_id=mask_id, eos_id=0, steps=4, max_new_tokens=4, uniform_ratio=0.0
+    )
+    out = sampler.sample([[1]])
+    assert out.shape == (1, 5)
+    assert (out == mask_id).sum().item() == 0

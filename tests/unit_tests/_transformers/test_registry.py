@@ -16,6 +16,8 @@ import types
 
 import pytest
 
+from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+
 
 def _new_registry_instance(registry_module):
     """Create a fresh registry with an empty auto_map for testing."""
@@ -88,6 +90,29 @@ def test_duplicate_register_exist_ok():
     inst.register("MyArch", ReplacementClass, exist_ok=True)
 
     assert inst.model_arch_name_to_cls["MyArch"] is ReplacementClass
+
+
+def test_builtin_register_requires_explicit_override():
+    """Built-in architecture names are preserved unless the caller opts into replacement."""
+    from nemo_automodel._transformers.registry import _LazyArchMapping
+
+    class BuiltInClass:
+        pass
+
+    class ReplacementClass:
+        pass
+
+    mapping = _LazyArchMapping({"BuiltInArch": ("built.in", "BuiltInClass")})
+    mapping._modules["built.in"] = types.SimpleNamespace(BuiltInClass=BuiltInClass)
+
+    with pytest.raises(ValueError, match="Duplicated model implementation for BuiltInArch"):
+        mapping.register("BuiltInArch", ReplacementClass)
+    assert mapping["BuiltInArch"] is BuiltInClass
+
+    mapping.register("BuiltInArch", ReplacementClass, exist_ok=True)
+    assert mapping["BuiltInArch"] is ReplacementClass
+    assert "BuiltInArch" not in mapping._auto_map
+    assert "BuiltInArch" not in mapping._loaded
 
 
 def test_supported_models_and_getter():
@@ -225,15 +250,28 @@ def test_resolve_custom_config_cls_uses_registry_for_non_builtin(monkeypatch):
     assert reg.resolve_custom_config_cls("am_future") is FakeConfig
 
 
-def test_resolve_custom_config_cls_defers_to_transformers_builtin(monkeypatch):
+def test_resolve_custom_config_cls_returns_none_for_unregistered_model_type():
+    from nemo_automodel._transformers import registry as reg
+
+    assert reg.resolve_custom_config_cls("not_registered") is None
+
+
+def test_custom_config_overrides_default_to_registered_models_except_verified_opt_outs():
+    from nemo_automodel._transformers import registry as reg
+
+    assert reg._CUSTOM_CONFIG_OVERRIDES_BUILTIN == set(reg._CUSTOM_CONFIG_REGISTRATIONS) - {"mistral4"}
+
+
+def test_resolve_custom_config_cls_defers_to_builtin_only_when_opted_out(monkeypatch):
     from nemo_automodel._transformers import registry as reg
 
     monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+    monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", set())
 
     assert reg.resolve_custom_config_cls("bert") is None
 
 
-def test_resolve_custom_config_cls_can_override_transformers_builtin(monkeypatch):
+def test_resolve_custom_config_cls_overrides_transformers_builtin_by_default(monkeypatch):
     from nemo_automodel._transformers import registry as reg
 
     class FakeConfig:
@@ -247,6 +285,40 @@ def test_resolve_custom_config_cls_can_override_transformers_builtin(monkeypatch
     )
 
     assert reg.resolve_custom_config_cls("bert") is FakeConfig
+
+
+def test_resolve_custom_config_cls_returns_none_when_registered_import_fails(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    def raise_import_error(name):
+        raise ImportError(name)
+
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "am_broken", ("fake.missing_module", "MissingConfig"))
+    monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", {"am_broken"})
+    monkeypatch.setattr(reg.importlib, "import_module", raise_import_error)
+
+    assert reg.resolve_custom_config_cls("am_broken") is None
+
+
+@pytest.mark.parametrize("model_type", sorted(_CUSTOM_CONFIG_REGISTRATIONS))
+def test_registered_config_wins_over_transformers_builtin(model_type):
+    """A registered model_type must resolve to Automodel's config, not the built-in.
+
+    A registration means the custom model reads fields only our config provides,
+    so a transformers release that starts shipping the same ``model_type`` must
+    not silently take over. Model types absent from
+    ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN`` opt out to the transformers-native config.
+    """
+    from nemo_automodel._transformers import registry as reg
+
+    if model_type not in reg._CUSTOM_CONFIG_OVERRIDES_BUILTIN:
+        pytest.skip(f"{model_type} is verified to run on the transformers built-in config")
+
+    resolved = reg.resolve_custom_config_cls(model_type)
+    assert resolved is not None, f"{model_type} resolves to no config class"
+    assert resolved.__module__.startswith("nemo_automodel"), (
+        f"{model_type} resolves to {resolved.__module__}.{resolved.__name__}, not Automodel's config"
+    )
 
 
 def test_resolve_custom_model_cls_found():
@@ -378,6 +450,78 @@ def test_kimi_k2_config_loads_without_trust_remote_code(tmp_path):
     assert cfg.architectures == ["DeepseekV3ForCausalLM"]
 
 
+@pytest.mark.parametrize(
+    ("model_type", "expected_config_name"),
+    [
+        ("kimi_linear", "KimiK3TextConfig"),
+        ("kimi_k3", "KimiK3Config"),
+    ],
+)
+def test_kimi_k3_configs_load_without_transformers_builtin(
+    tmp_path,
+    monkeypatch,
+    model_type,
+    expected_config_name,
+):
+    """Kimi K3 checkpoint model types resolve to local configs on stale Transformers."""
+    import json
+
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers import registry as reg
+    from nemo_automodel.components.models.kimi_k3 import config as kimi_config
+
+    expected_config = getattr(kimi_config, expected_config_name)
+    monkeypatch.delitem(CONFIG_MAPPING._mapping, model_type, raising=False)
+    assert reg.resolve_custom_config_cls(model_type) is expected_config
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    cfg = AutoConfig.from_pretrained(tmp_path, trust_remote_code=False)
+
+    assert isinstance(cfg, expected_config)
+    assert cfg.model_type == model_type
+
+
+def test_kimi_linear_48b_has_its_own_model_type(monkeypatch):
+    """Kimi Linear 48B and the Kimi K3 text backbone must resolve to different configs."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers import registry as reg
+    from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
+    from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
+
+    monkeypatch.delitem(CONFIG_MAPPING._mapping, "kimi_linear", raising=False)
+    monkeypatch.delitem(CONFIG_MAPPING._mapping, "kimi_linear_48b_a3b", raising=False)
+
+    assert reg.resolve_custom_config_cls("kimi_linear_48b_a3b") is KimiLinear48BConfig
+    assert reg.resolve_custom_config_cls("kimi_linear") is KimiK3TextConfig
+
+
+def test_kimi_linear_48b_checkpoint_config_resolves_through_get_hf_config(tmp_path):
+    """A Kimi Linear 48B checkpoint must load KimiLinear48BConfig, not the K3 text config."""
+    import json
+
+    from nemo_automodel._transformers.model_init import get_hf_config
+    from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "kimi_linear_48b_a3b",
+                "architectures": ["KimiLinear48BForCausalLM"],
+                "num_hidden_layers": 2,
+                "hidden_size": 64,
+                "vocab_size": 256,
+            }
+        )
+    )
+
+    cfg = get_hf_config(tmp_path, attn_implementation="eager")
+
+    assert isinstance(cfg, KimiLinear48BConfig)
+
+
 def test_kimi_k25_arch_alias_in_model_arch_mapping():
     """KimiK25ForConditionalGeneration (checkpoint arch) must map to KimiK25VLForConditionalGeneration."""
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
@@ -416,6 +560,29 @@ def test_deepseek_v4_in_custom_config_registrations():
     module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS["deepseek_v4"]
     assert module_path == "nemo_automodel.components.models.deepseek_v4.config"
     assert cls_name == "DeepseekV4Config"
+
+
+def test_nemotron_h_omni_reasoning_v3_registered_in_arch_mapping():
+    """NemotronH_Omni_Reasoning_V3 (Super-scale omni checkpoints) must be registered.
+
+    Reuses the same NemotronOmniForConditionalGeneration wrapper as the Nano-scale
+    NemotronH_Nano_Omni_Reasoning_V3 checkpoints: the model class is config-driven
+    (LLM scale, presence of sound_config) rather than hardcoded to one checkpoint
+    size.
+    """
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+
+    assert "NemotronH_Omni_Reasoning_V3" in MODEL_ARCH_MAPPING, (
+        "NemotronH_Omni_Reasoning_V3 missing from MODEL_ARCH_MAPPING. "
+        "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained (and other "
+        "Super-scale omni checkpoints) declare this architecture and need it routed "
+        "to the in-tree model implementation."
+    )
+    module_path, cls_name = MODEL_ARCH_MAPPING["NemotronH_Omni_Reasoning_V3"]
+    assert module_path == "nemo_automodel.components.models.nemotron_omni.model"
+    assert cls_name == "NemotronOmniForConditionalGeneration"
+    # Same target class as the Nano variant -- one implementation, two architecture keys.
+    assert MODEL_ARCH_MAPPING["NemotronH_Omni_Reasoning_V3"] == MODEL_ARCH_MAPPING["NemotronH_Nano_Omni_Reasoning_V3"]
 
 
 def test_all_model_folders_registered_in_auto_map():
@@ -459,8 +626,9 @@ def test_minimax_m3_vl_config_overrides_transformers_builtin():
     names as ours). The skip-if-built-in registration then handed the native
     config to our custom MiniMaxM3SparseForConditionalGeneration, whose vision
     encoder reads ``config.rope_theta`` that the native vision config does not
-    carry -> AttributeError at model init. ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN``
-    forces our config class for such model_types.
+    carry -> AttributeError at model init. Automodel now prefers registered
+    local config classes by default; only model_types absent from
+    ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN`` opt out to the transformers-native config.
     """
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
@@ -474,3 +642,83 @@ def test_minimax_m3_vl_config_overrides_transformers_builtin():
     )
     # The concrete field the crash was about: our vision sub-config must default it.
     assert MiniMaxM3VLConfig().vision_config.rope_theta is not None
+
+
+def test_public_register_architecture(monkeypatch):
+    """register_architecture is importable from nemo_automodel."""
+    from nemo_automodel import register_architecture
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+    monkeypatch.setattr(reg, "ModelRegistry", inst)
+
+    class PublicModel:
+        pass
+
+    class ReplacementModel:
+        pass
+
+    register_architecture("PublicArch", PublicModel)
+    assert inst.get_model_cls_from_model_arch("PublicArch") is PublicModel
+
+    register_architecture("PublicArch", ReplacementModel, exist_ok=True)
+    assert inst.get_model_cls_from_model_arch("PublicArch") is ReplacementModel
+
+
+def test_entry_point_discovery_adds_lazy_entry(monkeypatch):
+    """Entry points in nemo_automodel.architectures are discovered and lazily loaded."""
+    import importlib.metadata
+
+    from nemo_automodel._transformers import registry as reg
+
+    class EntryModel:
+        pass
+
+    fake_ep = types.SimpleNamespace(name="EntryArch", value="fake.module:EntryModel")
+    monkeypatch.setattr(
+        importlib.metadata,
+        "entry_points",
+        lambda **kwargs: [fake_ep] if kwargs.get("group") == "nemo_automodel.architectures" else [],
+    )
+
+    inst = _new_registry_instance(reg)
+    assert "EntryArch" in inst.model_arch_name_to_cls._auto_map
+
+    # First resolution triggers import.
+    inst.model_arch_name_to_cls._modules["fake.module"] = types.SimpleNamespace(EntryModel=EntryModel)
+    assert inst.get_model_cls_from_model_arch("EntryArch") is EntryModel
+
+
+def test_entry_point_discovery_skips_registered_architecture(monkeypatch, caplog):
+    """Entry points cannot silently replace an architecture already in the registry."""
+    import importlib.metadata
+
+    from nemo_automodel._transformers import registry as reg
+
+    fake_ep = types.SimpleNamespace(name="ExistingArch", value="plugin.module:PluginModel")
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda **kwargs: [fake_ep])
+
+    mapping = reg._LazyArchMapping({"ExistingArch": ("built.in", "BuiltInModel")})
+    reg._ModelRegistry(model_arch_name_to_cls=mapping)
+
+    assert mapping._auto_map["ExistingArch"] == ("built.in", "BuiltInModel")
+    assert (
+        "Architecture ExistingArch is already registered; skipping entry point plugin.module:PluginModel" in caplog.text
+    )
+
+
+@pytest.mark.parametrize("entry_point_value", [":EntryModel", "fake.module:"])
+def test_entry_point_discovery_rejects_invalid_value(monkeypatch, entry_point_value):
+    """Architecture entry points require both a module path and class name."""
+    import importlib.metadata
+
+    from nemo_automodel._transformers import registry as reg
+
+    fake_ep = types.SimpleNamespace(name="BrokenArch", value=entry_point_value)
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda **kwargs: [fake_ep])
+
+    with pytest.raises(
+        ValueError,
+        match=r"Entry point 'BrokenArch' value must be module\.path:ClassName",
+    ):
+        _new_registry_instance(reg)

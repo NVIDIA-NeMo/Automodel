@@ -16,6 +16,8 @@ import builtins
 import json
 import logging
 import os
+from datetime import timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -467,8 +469,15 @@ def test_resolve_dtype_cast_accepts_aliases_and_none():
 
 
 @pytest.mark.run_only_on("CPU")
-def test_every_rank_consolidation_uses_supplied_group_for_barrier():
+def test_every_rank_consolidation_uses_supplied_group_for_failure_sync():
     process_group = MagicMock()
+    call_order = []
+
+    def _record_sync(*args, **kwargs):
+        call_order.append("sync")
+
+    def _record_index_write(*args, **kwargs):
+        call_order.append("index")
 
     with (
         patch(
@@ -487,13 +496,17 @@ def test_every_rank_consolidation_uses_supplied_group_for_barrier():
             "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.get_world_size",
             return_value=2,
         ) as get_world_size,
-        patch("nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.barrier") as barrier,
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.all_gather_object",
+            side_effect=_record_sync,
+        ) as all_gather_object,
         patch(
             "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors._consolidate_safetensors_files"
         ),
         patch(
             "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors."
-            "_write_overall_metadata_file_from_shards"
+            "_write_overall_metadata_file_from_shards",
+            side_effect=_record_index_write,
         ),
     ):
         consolidate_safetensors_files_on_every_rank(
@@ -505,7 +518,119 @@ def test_every_rank_consolidation_uses_supplied_group_for_barrier():
 
     get_rank.assert_called_once_with(group=process_group)
     get_world_size.assert_called_once_with(group=process_group)
-    barrier.assert_called_once_with(group=process_group)
+    assert all_gather_object.call_count == 2
+    for call in all_gather_object.call_args_list:
+        failures, local_failure = call.args
+        assert failures == [None, None]
+        assert local_failure is None
+        assert call.kwargs == {"group": process_group}
+    # The index is published only after every rank has finished writing its assigned shards.
+    assert call_order == ["sync", "index", "sync"]
+
+
+@pytest.mark.run_only_on("CPU")
+def test_every_rank_consolidation_explains_peer_failure_during_sync():
+    process_group = MagicMock()
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.is_available",
+            return_value=True,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.is_initialized",
+            return_value=True,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.get_rank",
+            return_value=1,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.get_world_size",
+            return_value=2,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.all_gather_object",
+            side_effect=RuntimeError("Connection closed by peer"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="A peer may have exited before reporting its original exception") as exc:
+            consolidate_safetensors_files_on_every_rank(
+                input_dir="input",
+                output_dir="output",
+                fqn_to_index_mapping={"weight": 1},
+                process_group=process_group,
+            )
+
+    assert "Synchronization error: RuntimeError: Connection closed by peer" in str(exc.value)
+
+
+def _run_two_rank_consolidation_failure_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    input_dir: str,
+    output_dir: str,
+    error_dir: str,
+) -> None:
+    """Verify that both Gloo ranks receive the originating consolidation error."""
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        try:
+            consolidate_safetensors_files_on_every_rank(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                fqn_to_index_mapping={"weight": 1},
+            )
+        except RuntimeError as exc:
+            Path(error_dir, f"rank_{rank}.txt").write_text(str(exc))
+        else:
+            raise AssertionError("Expected distributed consolidation to fail")
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.run_only_on("CPU")
+def test_every_rank_consolidation_surfaces_originating_rank_error(tmp_path):
+    """A rank-0 index failure is reported identically instead of closing peers."""
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    tensors = {
+        "weight": torch.ones(2),
+        "adapter.created.bias": torch.zeros(2),
+    }
+    dcp_metadata = {fqn: {"saved_offsets": [0]} for fqn in tensors}
+    save_file(
+        tensors,
+        input_dir / "model-00001-of-00001.safetensors",
+        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
+    )
+
+    torch.multiprocessing.spawn(
+        _run_two_rank_consolidation_failure_worker,
+        args=(
+            2,
+            str(tmp_path / "gloo_init"),
+            str(input_dir),
+            str(output_dir),
+            str(tmp_path),
+        ),
+        nprocs=2,
+        join=True,
+    )
+
+    errors = [(tmp_path / f"rank_{rank}.txt").read_text() for rank in range(2)]
+    assert errors[0] == errors[1]
+    assert "rank 0 while writing the consolidated safetensors index: KeyError: 'adapter.created.bias'" in errors[0]
 
 
 # =============================================================================

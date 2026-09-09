@@ -116,6 +116,7 @@ _IDENTITY_KWARGS = dict(
     shuffle_seed=42,
     mask_reasoning_content=False,
     chat_template_sha256="0" * 64,
+    mask_generation_prompt=False,
 )
 
 
@@ -146,6 +147,7 @@ def test_build_manifest_schema():
     assert manifest["train_split"] == "train"
     assert manifest["shuffle_seed"] == 42
     assert manifest["mask_reasoning_content"] is False
+    assert manifest["mask_generation_prompt"] is False
     assert manifest["chat_template_sha256"] == "0" * 64
 
 
@@ -179,6 +181,7 @@ def test_ensure_output_dir_compatible_rejects_different_input_identity(tmp_path)
         ("train_split", "train[:50]"),
         ("shuffle_seed", 7),
         ("mask_reasoning_content", True),
+        ("mask_generation_prompt", True),
         ("chat_template_sha256", "f" * 64),
     ]:
         with pytest.raises(ValueError, match=field):
@@ -402,10 +405,12 @@ def test_run_writes_cache_single_process(monkeypatch, tmp_path):
         lambda *_a, **_k: SimpleNamespace(chat_template="{{ messages }}", apply_chat_template=lambda *a, **k: None),
     )
     monkeypatch.setattr(pdd, "HFDSparkTargetModel", _FakeWrapper)
+    loader_kwargs = {}
     monkeypatch.setattr(
         pdd,
         "build_eagle3_dataloader",
-        lambda **_kw: DataLoader(
+        lambda **_kw: loader_kwargs.update(_kw)
+        or DataLoader(
             _TokenDataset(3),
             batch_size=2,
             shuffle=False,
@@ -418,13 +423,16 @@ def test_run_writes_cache_single_process(monkeypatch, tmp_path):
     cfg = _Cfg(
         {
             "dist_env": {"backend": "gloo"},
-            "recipe_args": _recipe_cfg(cache_output_dir=cache_dir),
+            "recipe_args": _recipe_cfg(cache_output_dir=cache_dir, mask_generation_prompt=True),
         }
     )
     assert pdd.run(cfg) == 0
 
     manifest = read_manifest(cache_dir)
     assert manifest["num_samples"] == 3
+    # The loss-mask option reaches both the dataloader and the recorded input identity.
+    assert loader_kwargs["mask_generation_prompt"] is True
+    assert manifest["mask_generation_prompt"] is True
     assert manifest["target_layer_ids"] == _LAYERS
     dataset = CachedDSparkDataset(cache_dir)
     assert len(dataset) == 3
@@ -453,3 +461,25 @@ def test_main_parses_config_and_runs(monkeypatch):
     monkeypatch.setattr(pdd, "run", _fake_run)
     assert pdd.main("some.yaml") == 0
     assert seen["cfg"] is sentinel_cfg
+
+
+def test_manifest_without_mask_generation_prompt_matches_default(tmp_path):
+    """Caches written before the field existed compare as ``mask_generation_prompt=False``."""
+    from nemo_automodel.components.datasets.llm.dspark_cache import (
+        manifest_mismatch_fields,
+        read_manifest,
+        write_manifest,
+    )
+
+    current = pdd.build_cache_manifest(**_manifest_kwargs())
+    legacy = {k: v for k, v in current.items() if k != "mask_generation_prompt"}
+    write_manifest(str(tmp_path), legacy)
+
+    # The reader fills the field in, so the legacy cache compares (and trains) as False.
+    recorded = read_manifest(str(tmp_path), allow_incomplete=True)
+    assert recorded["mask_generation_prompt"] is False
+    assert manifest_mismatch_fields(recorded, current) == []
+    assert manifest_mismatch_fields(
+        recorded, pdd.build_cache_manifest(**_manifest_kwargs(mask_generation_prompt=True))
+    ) == ["mask_generation_prompt"]
+    pdd._ensure_output_dir_compatible(str(tmp_path), current)  # no raise

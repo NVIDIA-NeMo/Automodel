@@ -45,7 +45,7 @@ model:
     rms_norm: torch_fp32
     rope_fusion: false
     experts: gmm
-    dispatcher: deepep
+    dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -119,8 +119,12 @@ ci:
   time: "00:30:00"
   # Keep failures blocking; source/reload defects are tracked by AM-711/AM-717.
   checkpoint_robustness:
-    check_source_load_parity: true
+    experts_implementation: grouped_mm
     hf_device_map_auto: true
+    loss_fn._target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+    model.backend.experts: torch_mm
+    step_scheduler.global_batch_size: 16
+    step_scheduler.local_batch_size: 1
     tokenizer_name: Qwen/Qwen3.5-35B-A3B
 
 # Uncomment and configure for W&B logging

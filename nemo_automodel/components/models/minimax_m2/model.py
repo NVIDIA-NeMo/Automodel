@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from typing import Any, Optional, Union
+from dataclasses import dataclass, replace
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -98,6 +98,14 @@ class MiniMaxM2Model(nn.Module):
         moe_overrides: dict | None = None,
     ):
         super().__init__()
+        # Released MiniMax-M2 checkpoints store the router gate weight in fp32,
+        # and the HF reference projects with hidden_states.to(weight.dtype), so
+        # the checkpoint-faithful router runs an fp32 projection, fp32 scoring,
+        # and fp32 selected weights. Keep that default while preserving an
+        # explicit backend override (see AMINT-286; ERNIE follows the same
+        # pattern for its fp32 router).
+        if backend.gate_precision is None:
+            backend = replace(backend, gate_precision=torch.float32)
         self.backend = backend
         self.config = config
         if moe_config is not None and moe_overrides is not None:
@@ -133,6 +141,14 @@ class MiniMaxM2Model(nn.Module):
             expert_activation="swiglu",
             softmax_before_topk=(score_func == "softmax"),
             force_e_score_correction_bias=True,
+            # The HF reference returns selected weights in the fp32 router
+            # logits dtype; keep them fp32 through the expert combine.
+            router_weights_fp32=True,
+            # The checkpoint stores the gate weight in fp32; allocate it fp32 so
+            # every construction path (including meta-device init before FSDP
+            # sharding) keeps the gate's dtype group uniform with its fp32
+            # correction-bias buffer.
+            gate_dtype=torch.float32,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -229,7 +245,7 @@ class MiniMaxM2Model(nn.Module):
 
 class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
+    _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -318,7 +334,7 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass returning :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.

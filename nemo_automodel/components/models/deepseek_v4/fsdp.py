@@ -22,6 +22,8 @@ _DSV4_CLASS_NAMES = {
     "DeepseekV4ForCausalLM",
     "DeepseekV4Model",
     "DeepseekV4Block",
+    "DeepseekV4VisionBlock",
+    "DeepseekV4VisionTransformer",
 }
 
 _DSV4_FP32_MODULE_SUFFIXES = (
@@ -36,10 +38,22 @@ _DSV4_FP32_MODULE_SUFFIXES = (
     "self_attn.compressor.indexer.wkv",
     "self_attn.compressor.indexer.wgate",
     "self_attn.compressor.indexer.ape_param",
+    "norm1",
+    "norm2",
+    "vision.norm",
 )
 
 _DSV4_RETURNED_FP32_PARAMETER_CLASS_NAMES = {
     "DeepseekV4FP32Parameter",
+}
+
+# These modules own fp32 parameters but explicitly upcast their arithmetic and
+# cast the result back to the incoming activation dtype.  Their nested FSDP
+# unit must therefore be transparent at the module boundary: casting the input
+# and forcing an fp32 output would leak fp32 activations into the following
+# bf16 projection.
+_DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES = {
+    "DeepseekV4VisionRMSNorm",
 }
 
 
@@ -115,15 +129,15 @@ def _floating_param_dtypes(module: nn.Module) -> set[torch.dtype]:
     return {param.dtype for param in module.parameters() if torch.is_floating_point(param)}
 
 
-def _fp32_mp_policy(mp_policy):
+def _fp32_mp_policy(mp_policy, *, preserve_activation_dtype: bool = False):
     if not isinstance(mp_policy, MixedPrecisionPolicy):
         return mp_policy
 
     return MixedPrecisionPolicy(
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
-        cast_forward_inputs=mp_policy.cast_forward_inputs,
+        output_dtype=None if preserve_activation_dtype else torch.float32,
+        cast_forward_inputs=False if preserve_activation_dtype else mp_policy.cast_forward_inputs,
     )
 
 
@@ -152,7 +166,14 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
     return fully_shard(
         module,
         mesh=mesh,
-        mp_policy=_fp32_mp_policy(mp_policy) if fp32_policy else mp_policy,
+        mp_policy=(
+            _fp32_mp_policy(
+                mp_policy,
+                preserve_activation_dtype=module.__class__.__name__ in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES,
+            )
+            if fp32_policy
+            else mp_policy
+        ),
         offload_policy=offload_policy,
         **_fsdp_kwargs_for_module(module, fsdp_kwargs),
     )
@@ -202,12 +223,22 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
     This is intentionally model-specific.  DeepSeek-V4 keeps a small set of
     reference-sensitive tensors in fp32, while the existing DeepEP path expects
     the transformer block itself to remain the main FSDP unit.
+
+    Uniform fp32 storage does not necessarily mean fp32 compute: full-parameter
+    training commonly keeps fp32 master weights while the FSDP mixed-precision
+    policy requests bf16 compute.  In that case, preserve fp32 compute only for
+    the explicitly listed reference-sensitive islands and let the parent block
+    use the caller's bf16 policy.
     """
     is_dsv4 = _is_deepseek_v4_module(module)
     if is_dsv4:
         _attach_hca_param_sync_group(module, mesh)
 
-    if _floating_param_dtypes(module) == {torch.float32}:
+    policy_param_dtype = getattr(mp_policy, "param_dtype", None)
+    use_all_fp32_fast_path = _floating_param_dtypes(module) == {torch.float32} and (
+        not is_dsv4 or policy_param_dtype in (None, torch.float32)
+    )
+    if use_all_fp32_fast_path:
         fsdp_kwargs = _fp32_module_fsdp_kwargs(module, fsdp_kwargs)
         return _fully_shard_once(
             module,

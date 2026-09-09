@@ -29,7 +29,7 @@ cache stays clearly separated from any existing Wan2.1 cache.
 import html
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -182,7 +182,7 @@ class WanProcessor(BaseVideoProcessor):
         self,
         video_path: str,
         target_size: Tuple[int, int],
-        num_frames: Optional[int] = None,
+        num_frames: int | None = None,
         resize_mode: str = "bilinear",
         center_crop: bool = True,
         **kwargs,

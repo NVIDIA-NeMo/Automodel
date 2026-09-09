@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -101,14 +101,14 @@ class Llavaonevision1_5Config(PretrainedConfig):
 
     def __init__(
         self,
-        text_config: Optional[Union[Dict, PretrainedConfig]] = None,
-        vision_config: Optional[Union[Dict, RiceConfig]] = None,
+        text_config: Union[Dict, PretrainedConfig] | None = None,
+        vision_config: Union[Dict, RiceConfig] | None = None,
         image_token_id: int = 151655,
         video_token_id: int = 151656,
         vision_start_token_id: int = 151652,
         vision_end_token_id: int = 151653,
         vocab_size: int = 152064,
-        architectures: Optional[List[str]] = None,
+        architectures: List[str] | None = None,
         **kwargs,
     ):
         if isinstance(vision_config, dict):
@@ -238,16 +238,16 @@ class LLaVAOneVision1_5_Model(nn.Module):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: List[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
         **kwargs,
     ):
         if inputs_embeds is None:
@@ -314,7 +314,7 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
     def __init__(
         self,
         config,
-        attn_implementation: Optional[str] = None,
+        attn_implementation: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -360,18 +360,18 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        output_hidden_states: Optional[bool] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: List[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        output_hidden_states: bool | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:

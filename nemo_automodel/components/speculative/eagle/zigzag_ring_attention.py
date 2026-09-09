@@ -31,8 +31,6 @@ varlen kernels; ``causal=True`` only (zig-zag is meaningless otherwise).
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -58,7 +56,7 @@ class RingComm:
             recv = dist.get_global_rank(process_group, recv)
         self.send_rank, self.recv_rank = send, recv
 
-    def send_recv(self, to_send: torch.Tensor, recv_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def send_recv(self, to_send: torch.Tensor, recv_tensor: torch.Tensor | None = None) -> torch.Tensor:
         res = torch.empty_like(to_send) if recv_tensor is None else recv_tensor
         self._ops.append(dist.P2POp(dist.isend, to_send.contiguous(), self.send_rank, group=self._pg))
         self._ops.append(dist.P2POp(dist.irecv, res, self.recv_rank, group=self._pg))

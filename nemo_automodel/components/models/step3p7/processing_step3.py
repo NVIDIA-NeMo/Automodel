@@ -14,7 +14,7 @@
 
 from itertools import product
 from math import ceil
-from typing import Literal, Optional, TypedDict, Union
+from typing import Literal, TypedDict, Union
 
 import numpy as np
 import torch
@@ -35,7 +35,7 @@ MAX_IMAGE_SIZE: int = 3024
 class Step3VLImagePixelInputs(TypedDict):
     type: Literal["pixel_values"]
     pixel_values: torch.Tensor
-    patch_pixel_values: Optional[torch.Tensor]
+    patch_pixel_values: torch.Tensor | None
     num_patches: list[int]
 
 
@@ -329,7 +329,7 @@ class Step3VLProcessor(ProcessorMixin):
         self,
         num_images: int,
         num_patches: int,
-        patch_new_line_idx: Optional[list[bool]],
+        patch_new_line_idx: list[bool] | None,
     ) -> tuple[str, list[int]]:
         if num_patches > 0:
             patch_repl, patch_repl_ids = self._get_patch_repl(num_patches, patch_new_line_idx)
@@ -381,9 +381,9 @@ class Step3VLProcessor(ProcessorMixin):
 
     def __call__(
         self,
-        text: Optional[Union[str, list[str]]] = None,
+        text: Union[str, list[str]] | None = None,
         images: ImageInput | None = None,
-        return_tensors: Optional[Union[str, TensorType]] = None,
+        return_tensors: Union[str, TensorType] | None = None,
         **kwargs,
     ) -> BatchFeature:
         tokenizer_kwargs = {}

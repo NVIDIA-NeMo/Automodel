@@ -21,7 +21,7 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
 ``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
-``embedding_row_repair`` map to component config dataclasses; the ``optimizer``
+``embedding_row_repair``/``mfu`` map to component config dataclasses; the ``optimizer``
 and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
@@ -51,6 +51,7 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
+    from nemo_automodel._transformers.mfu import MFUConfig
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
@@ -131,8 +132,7 @@ class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
     ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
-    ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
-    ``.build(...)`` (``optimizer`` is an
+    ``loss_fn`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
     :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig`);
@@ -328,17 +328,25 @@ class RecipeConfig:
     @staticmethod
     def _resolve_vlm_processor(node: Any) -> "VlmProcessorConfig":
         """Resolve an optional processor section into its typed component config."""
-        from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig
+        from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig, VlmVideoProcessorConfig
 
         if node is None:
             return VlmProcessorConfig()
         kwargs = _as_dict(node)
+        video_processor_node = kwargs.pop("video_processor", None)
+        video_processor = None
+        if video_processor_node is not None:
+            video_factory, video_kwargs = _callable_and_kwargs(video_processor_node)
+            if not callable(video_factory):
+                raise TypeError(f"VLM video processor _target_ must resolve to a callable, got {video_factory!r}")
+            video_processor = VlmVideoProcessorConfig(factory=video_factory, kwargs=video_kwargs)
+
         target = kwargs.pop("_target_", None)
         if target is None:
-            return VlmProcessorConfig(kwargs=kwargs)
+            return VlmProcessorConfig(kwargs=kwargs, video_processor=video_processor)
         if not callable(target):
             raise TypeError(f"VLM processor _target_ must resolve to a callable, got {target!r}")
-        return VlmProcessorConfig(factory=target, kwargs=kwargs)
+        return VlmProcessorConfig(factory=target, kwargs=kwargs, video_processor=video_processor)
 
     @classmethod
     def resolve_vlm_dataloader(
@@ -368,6 +376,10 @@ class RecipeConfig:
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
+        # `tokenizer`/`processor` are runtime build args, not declarative dataset fields.
+        # Drop them here as the LLM path (`_resolve_dataloader`) does, so a `dataset.tokenizer`
+        # block (valid on the LLM path) does not reach the dataset config, which rejects unknown fields.
+        dataset_kwargs.pop("tokenizer", None)
         chat_template = dataset_kwargs.pop("chat_template", None)
         legacy_packing = dataset_kwargs.pop("packing", None)
         dataset_pretokenize = dataset_kwargs.pop("pretokenize", None)
@@ -548,6 +560,12 @@ class RecipeConfig:
         return self.resolve_diffusion_dataloader(node) if node is not None else None
 
     @cached_property
+    def diffusion_validation_dataloader(self) -> "DiffusionDataloaderConfig" | None:
+        """Typed diffusion validation dataloader config resolved from ``data.validation_dataloader``."""
+        node = self._raw.get("data.validation_dataloader", None)
+        return self.resolve_diffusion_dataloader(node) if node is not None else None
+
+    @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:
         """Typed packed-dataset and dataloader config for BAGEL recipes."""
         from nemo_automodel.components.datasets.multimodal.datasets import BagelDatasetConfig
@@ -607,6 +625,13 @@ class RecipeConfig:
 
         node = self._raw.get("prewarm", None)
         return PrewarmConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def mfu(self) -> "MFUConfig":
+        from nemo_automodel._transformers.mfu import MFUConfig
+
+        node = self._raw.get("mfu", None)
+        return MFUConfig(**_section_kwargs(node)) if node else MFUConfig()
 
     @cached_property
     def embedding_row_repair(self) -> "EmbeddingRowRepairConfig | None":

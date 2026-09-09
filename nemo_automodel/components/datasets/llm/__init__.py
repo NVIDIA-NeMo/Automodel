@@ -29,6 +29,7 @@ from .retrieval_collator import (  # noqa: F401
     make_vision_collator_from_processor_method,
 )
 from .retrieval_dataset import make_retrieval_dataset  # noqa: F401
+from .retrieval_dataset_normalized import make_normalized_retrieval_dataset  # noqa: F401
 from .retrieval_distill_collator import BiEncoderDistillCollator  # noqa: F401
 from .squad import make_squad_dataset  # noqa: F401
 from .xlam import make_xlam_dataset  # noqa: F401
@@ -37,6 +38,7 @@ __all__ = [
     "NanogptDataset",
     "make_squad_dataset",
     "make_retrieval_dataset",
+    "make_normalized_retrieval_dataset",
     "make_xlam_dataset",
     "make_agent_chat_dataset",
     "BiEncoderCollator",

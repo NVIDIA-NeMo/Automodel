@@ -29,6 +29,7 @@ For a few samples it reports:
 """
 
 import argparse
+import os
 
 from transformers import AutoTokenizer
 
@@ -36,6 +37,10 @@ from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
 
 GEMMA4 = "/path/to/checkpoints/hf_gemma4_31b"
 JSONL = "/path/to/coderforge_cache/togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl"
+# Generation-block template lives one directory up from this script (data/../).
+_DEFAULT_CHAT_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gemma4_coderforge_chat_template.jinja"
+)
 
 
 def contiguous_spans(labels, keep):
@@ -59,11 +64,22 @@ def main():
     ap.add_argument("--n", type=int, default=4)
     ap.add_argument("--seq-length", type=int, default=65536)
     ap.add_argument("--jsonl", default=JSONL)
+    ap.add_argument(
+        "--chat-template",
+        default=_DEFAULT_CHAT_TEMPLATE,
+        help="Chat template with {% generation %} blocks for direct assistant masking. "
+        "Empty string uses the tokenizer's own template (the prefix-arithmetic fallback).",
+    )
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(GEMMA4)
     ds = ChatDataset(
-        path_or_dataset_id=args.jsonl, tokenizer=tok, split="train", seq_length=args.seq_length, padding="do_not_pad"
+        path_or_dataset_id=args.jsonl,
+        tokenizer=tok,
+        split="train",
+        seq_length=args.seq_length,
+        padding="do_not_pad",
+        chat_template=args.chat_template or None,
     )
     print(f"Dataset size: {len(ds)}")
 

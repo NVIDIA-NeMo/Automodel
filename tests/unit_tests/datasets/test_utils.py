@@ -866,3 +866,51 @@ class TestPackedSequenceTHDCollaterVlm:
         )
         direct_out = sftp.packed_sequence_thd_collater(batch)
         self._assert_same_as_direct(adapter_out, direct_out)
+
+
+class TestPackFeaturesForThd:
+    """Tests for pack_features_for_thd."""
+
+    def test_concatenates_and_restarts_positions(self):
+        record = sftp.pack_features_for_thd(
+            [
+                {"input_ids": [10, 11, 12], "labels": [11, 12, -100]},
+                {"input_ids": [20, 21], "labels": [21, 22]},
+            ]
+        )
+        assert record["input_ids"] == [10, 11, 12, 20, 21]
+        assert record["labels"] == [11, 12, -100, 21, 22]
+        assert record["position_ids"] == [0, 1, 2, 0, 1]
+        assert record["seq_lens"] == [3, 2]
+        assert record["seq_lens_padded"] == [3, 2]
+
+    def test_missing_labels_fill_ignore_index(self):
+        record = sftp.pack_features_for_thd([{"input_ids": [1, 2]}, {"input_ids": [3], "labels": [4]}])
+        assert record["labels"] == [-100, -100, 4]
+
+    def test_accepts_tensor_fields(self):
+        record = sftp.pack_features_for_thd([{"input_ids": torch.tensor([1, 2]), "labels": torch.tensor([2, 3])}])
+        assert record["input_ids"] == [1, 2]
+        assert record["labels"] == [2, 3]
+
+    def test_label_length_mismatch_raises(self):
+        with pytest.raises(ValueError, match="does not match"):
+            sftp.pack_features_for_thd([{"input_ids": [1, 2], "labels": [2]}])
+
+    def test_empty_inputs_raise(self):
+        with pytest.raises(ValueError, match="at least one"):
+            sftp.pack_features_for_thd([])
+        with pytest.raises(ValueError, match="empty sequence"):
+            sftp.pack_features_for_thd([{"input_ids": []}])
+
+    def test_round_trips_through_thd_collater(self):
+        record = sftp.pack_features_for_thd(
+            [
+                {"input_ids": [10, 11, 12], "labels": [11, 12, -100]},
+                {"input_ids": [20, 21], "labels": [21, 22]},
+            ]
+        )
+        batch = sftp.packed_sequence_thd_collater([record])
+        assert batch["qkv_format"] == "thd"
+        assert batch["input_ids"].shape == (1, 5)
+        assert batch["seq_lens"][0].tolist() == [3, 2]

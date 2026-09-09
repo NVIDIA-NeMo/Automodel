@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
+    _sliding_window_mask,
     build_target_layer_ids,
     extract_context_feature,
 )
@@ -125,3 +128,130 @@ def test_draft_forward_output_shape():
     out = draft(position_ids=position_ids, attention_mask=None, noise_embedding=noise, target_hidden=target_hidden)
     assert out.shape == (B, Q, H)
     assert torch.isfinite(out).all()
+
+
+class _ConstantTarget(torch.nn.Module):
+    """Minimal stand-in for the verifier: always samples ``forced_token_id``.
+
+    Only the surface ``spec_generate`` touches is implemented (``model.embed_tokens``,
+    ``lm_head``, and a forward returning logits + per-layer hidden states).
+    """
+
+    def __init__(self, cfg: Qwen3Config, forced_token_id: int):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.embed_tokens = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.lm_head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.num_layers = cfg.num_target_layers
+        self.vocab_size = cfg.vocab_size
+        self.forced_token_id = forced_token_id
+        self.device = torch.device("cpu")
+
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=True,
+        logits_to_keep=None,
+        output_hidden_states=False,
+    ):
+        hidden = self.model.embed_tokens(input_ids)
+        keep = input_ids.shape[1] if logits_to_keep is None else logits_to_keep
+        logits = torch.zeros(input_ids.shape[0], keep, self.vocab_size)
+        logits[..., self.forced_token_id] = 1.0
+        return SimpleNamespace(logits=logits, hidden_states=[hidden] * (self.num_layers + 1))
+
+
+def test_spec_generate_keeps_generated_tokens_equal_to_the_mask_id():
+    """A generated token that happens to equal ``mask_token_id`` must survive.
+
+    The output buffer is pre-filled with ``mask_token_id`` as padding, so filtering
+    the padding out by value also deleted real tokens of that id and shifted the
+    rest of the sequence left. The generated span is tracked by the commit counter
+    instead.
+    """
+    torch.manual_seed(0)
+    cfg = _draft_cfg(bs=4)
+    draft = Qwen3DFlashDraftModel(cfg)
+    target = _ConstantTarget(cfg, forced_token_id=cfg.dflash_config["mask_token_id"])
+
+    prompt = torch.tensor([[1, 2, 3]])
+    max_new_tokens = 5
+    out = draft.spec_generate(target, prompt, max_new_tokens, stop_token_ids=None, temperature=0.0)
+
+    assert out.shape == (1, prompt.shape[1] + max_new_tokens)
+    torch.testing.assert_close(out[:, : prompt.shape[1]], prompt)
+    generated = out[0, prompt.shape[1] :]
+    assert torch.all(generated == cfg.dflash_config["mask_token_id"])
+
+
+def test_sliding_attention_layers_pick_up_the_window():
+    """``layer_types`` decides whether a draft layer is windowed at decode time.
+
+    Training enforces the same window through the block mask; the attention module
+    covers ``spec_generate``, where no explicit mask is passed. A draft left on
+    ``full_attention`` must stay unwindowed.
+    """
+    cfg = _draft_cfg()
+    cfg.layer_types = ["sliding_attention"] * cfg.num_hidden_layers
+    cfg.sliding_window = 32
+    assert all(layer.self_attn.sliding_window == 32 for layer in Qwen3DFlashDraftModel(cfg).layers)
+
+    full = _draft_cfg()
+    full.layer_types = ["full_attention"] * full.num_hidden_layers
+    full.sliding_window = 32
+    assert all(layer.self_attn.sliding_window is None for layer in Qwen3DFlashDraftModel(full).layers)
+
+
+def test_sliding_window_mask_is_a_symmetric_band_around_the_query_position():
+    """Queries are the trailing rows of the ``[context | noise-block]`` key axis.
+
+    A query at row ``i`` therefore sits at key position ``k_len - q_len + i``, and
+    both bounds are strict -- the convention shared by transformers'
+    ``sliding_window_overlay`` and the reference DFlash decode mask.
+    """
+    q_len, k_len, window = 3, 10, 4
+    mask = _sliding_window_mask(torch.zeros(1, 1, q_len, 8), torch.zeros(1, 1, k_len, 8), window)
+    assert mask.shape == (1, 1, q_len, k_len)
+    assert mask.dtype == torch.float32
+    for i in range(q_len):
+        q_pos = k_len - q_len + i
+        expected = [abs(q_pos - k) < window for k in range(k_len)]
+        assert (mask[0, 0, i] == 0).tolist() == expected
+        assert torch.isneginf(mask[0, 0, i][torch.tensor(expected).logical_not()]).all()
+
+
+def test_windowed_decode_forward_matches_an_explicit_additive_mask():
+    """The implicit decode mask must match an additive reference on real backends.
+
+    The trainer supplies an explicit mask, while decoding reaches the implicit
+    sliding-window path by passing ``attention_mask=None``. Compare that path
+    against an independently constructed ``0``/``-inf`` mask on both eager and
+    SDPA; this catches a boolean keep mask being misread as ``+1``/``0`` by eager.
+    """
+    torch.manual_seed(7)
+    noise = torch.randn(1, 4, 32)
+    target_hidden = torch.randn(1, 8, 3 * 32)
+    position_ids = torch.arange(12).unsqueeze(0)
+    query_position = torch.arange(4).unsqueeze(-1) + 8
+    key_position = torch.arange(12).unsqueeze(0)
+    distance = query_position - key_position
+    keep = ((distance < 4) & (-distance < 4))[None, None]
+    explicit_mask = torch.where(keep, torch.tensor(0.0), torch.tensor(float("-inf")))
+
+    for backend in ("eager", "sdpa"):
+        cfg = _draft_cfg()
+        cfg.layer_types = ["sliding_attention"] * cfg.num_hidden_layers
+        cfg.sliding_window = 4
+        cfg._attn_implementation = backend
+        draft = Qwen3DFlashDraftModel(cfg).eval()
+        with torch.inference_mode():
+            implicit = draft(position_ids=position_ids, noise_embedding=noise, target_hidden=target_hidden)
+            explicit = draft(
+                position_ids=position_ids,
+                attention_mask=explicit_mask,
+                noise_embedding=noise,
+                target_hidden=target_hidden,
+            )
+        torch.testing.assert_close(implicit, explicit)

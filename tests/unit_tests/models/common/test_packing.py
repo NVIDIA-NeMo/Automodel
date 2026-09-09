@@ -138,6 +138,52 @@ class TestGetAttnImplementation:
         cfg.get = MagicMock(return_value="flash_attention_2")
         assert get_attn_implementation(cfg) == "te"
 
+    def test_built_model_wins_over_stale_config(self):
+        """A packed run force-switches the model to flash; the config keeps saying sdpa."""
+        cfg = MagicMock()
+        del cfg.backend
+        cfg.get.return_value = "sdpa"
+        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
+        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+
+    def test_backend_config_wins_over_built_model(self):
+        """Custom models keep naming their backend; ``te`` inits through sdpa."""
+        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
+        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
+        assert get_attn_implementation(cfg, model=model) == "te"
+
+    def test_reads_through_ddp_wrapper(self):
+        """DDP holds the model as ``.module`` and does not proxy attribute access."""
+        cfg = MagicMock()
+        del cfg.backend
+        cfg.get.return_value = "sdpa"
+        inner = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
+        assert get_attn_implementation(cfg, model=SimpleNamespace(module=inner)) == "flash_attention_2"
+
+    def test_kernels_hub_id_maps_back_to_mainline_flash(self):
+        """Transformers records a kernels-hub id when only ``kernels`` provides FA2."""
+        cfg = MagicMock()
+        del cfg.backend
+        cfg.get.return_value = "flash_attention_2"
+        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="kernels-community/flash-attn2"))
+        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            SimpleNamespace(),
+            SimpleNamespace(config=SimpleNamespace()),
+            SimpleNamespace(config=SimpleNamespace(_attn_implementation=None)),
+            # A dispatch key naming no layout packing knows about must not select one.
+            SimpleNamespace(config=SimpleNamespace(_attn_implementation="some_future_backend")),
+        ],
+    )
+    def test_falls_back_to_config_when_model_names_no_known_backend(self, model):
+        cfg = MagicMock()
+        del cfg.backend
+        cfg.get.return_value = "eager"
+        assert get_attn_implementation(cfg, model=model) == "eager"
+
 
 # ---------------------------------------------------------------------------
 # configure_packing

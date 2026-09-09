@@ -24,6 +24,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.blockdiag_cp import kernels
 from nemo_automodel.components.distributed.blockdiag_cp import state as state_module
+from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
 
 
 def _cp_blockdiag_doc_ids(batch: dict, seq_len: int, device, batch_size: int) -> torch.Tensor:
@@ -66,41 +67,47 @@ def make_cp_blockdiag_batch_and_ctx(
     *,
     loss_mask: torch.Tensor | None = None,
     padding_token_id: int = 0,
-) -> tuple[Callable[[], ContextManager], dict[str, Any]]:
-    """Sequentially shard a pre-embedded batch for block-diagonal CP.
+    shard_primary: bool = True,
+) -> tuple[Callable[[], ContextManager], dict[str, Any], ShardLayout | None]:
+    """Sequentially shard a batch for block-diagonal CP.
 
-    Pads the sequence to a multiple of the CP world size, slices each
-    sequence-aligned tensor to this rank's contiguous chunk (a differentiable
-    slice for ``inputs_embeds``, so gradients flow back to the trainable vision
-    tower / embedding table), and returns ``(train_ctx, batch)`` where entering
-    ``train_ctx`` activates the per-document CP SDPA state for the step.
+    Pads the sequence to a multiple of twice the CP world size, slices each
+    selected sequence-aligned tensor to this rank's contiguous chunk, and
+    returns a context whose lifetime activates per-document CP SDPA state.
+    ``shard_primary=False`` leaves token ids or embeddings untouched for models
+    that embed multimodal inputs inside ``forward``.
 
     Softmax attention must route through
     :func:`~nemo_automodel.components.distributed.blockdiag_cp.runtime.cp_blockdiag_sdpa`
-    while this context is active. A model opts in by attaching this callable to
-    the batch as ``_cp_make_batch_fn`` (the model-owned CP hook honored by
-    :func:`nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx`)
-    and rebinding its attention's SDPA call for the step.
+    while this context is active. A model opts in by returning a
+    :class:`~nemo_automodel.components.distributed.context_parallel.sharder.ContextParallelSharder`
+    whose batch verb is this callable.
 
     Args:
         cp_mesh: The context-parallel device (sub)mesh.
-        tp_mesh: Accepted for ``_cp_make_batch_fn`` signature compatibility;
-            unused (block-diagonal CP shards only the sequence dimension).
-        batch: The training batch. Must contain pre-embedded ``inputs_embeds``
-            ``[B, S, H]`` (multimodal token replacement happens pre-shard) and is
-            mutated in place: ``attention_mask`` is dropped, ``padding_mask``
-            ``[B, S]`` (bool, True == pad) is added, and every sequence-aligned
-            tensor is padded then sliced to this rank's ``[row_offset,
-            row_offset + S_full/cp)`` chunk.
+        tp_mesh: Accepted for the shared sharder signature; unused
+            (block-diagonal CP shards only the sequence dimension).
+        batch: The training batch. Contains exactly one primary stream:
+            ``inputs_embeds`` of shape ``[batch, sequence, hidden]`` or
+            ``input_ids`` of shape ``[batch, sequence]``. The batch is mutated in
+            place: ``attention_mask`` is dropped, ``padding_mask`` of shape
+            ``[batch, sequence]`` (bool, True == pad) is added, and auxiliary
+            sequence-aligned tensors are padded then sliced to this rank's
+            ``[row_offset, row_offset + sequence/cp)`` chunk.
         loss_mask: Optional per-token loss mask ``[B, S]``; padded with 0 and
             sharded like the other sequence-aligned tensors (stored back into
             ``batch["loss_mask"]``).
-        padding_token_id: Accepted for signature compatibility; unused (the
-            batch is pre-embedded, so there are no token ids to pad).
+        padding_token_id: Fill value for ``input_ids`` padding when the primary
+            stream is sharded here.
+        shard_primary: Whether to pad and shard the primary stream. Leave False
+            for models that embed multimodal inputs and shard the resulting
+            embeddings inside ``forward`` so FSDP hooks own the vision/embedding
+            parameter lifecycle.
 
     Returns:
-        ``(train_ctx, batch)``: a zero-arg callable returning the per-step
-        context manager, and the sharded batch.
+        ``(train_ctx, batch, layout)``: a zero-arg callable returning the
+        per-step context manager, the sharded batch, and its contiguous
+        :class:`~nemo_automodel.components.distributed.context_parallel.sharder.ShardLayout`.
     """
     from contextlib import nullcontext
 
@@ -108,17 +115,23 @@ def make_cp_blockdiag_batch_and_ctx(
 
     world = cp_mesh.size()
     if world <= 1:
-        return nullcontext, batch
+        primary = batch.get("inputs_embeds", batch.get("input_ids"))
+        layout = None
+        if primary is not None:
+            layout = ShardLayout(original_seq_len=primary.shape[1], padded_seq_len=primary.shape[1])
+        return nullcontext, batch, layout
 
     rank = cp_mesh.get_local_rank()
     group = cp_mesh.get_group()
 
-    if "inputs_embeds" not in batch:
-        raise ValueError("block-diagonal CP requires pre-embedded 'inputs_embeds' in the batch")
-
-    ie = batch["inputs_embeds"]
-    B, S = ie.shape[0], ie.shape[1]
-    device = ie.device
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    if has_inputs_embeds == has_input_ids:
+        raise ValueError("block-diagonal CP requires exactly one of 'inputs_embeds' or 'input_ids' in the batch")
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
+    primary = batch[primary_key]
+    B, S = primary.shape[0], primary.shape[1]
+    device = primary.device
 
     # Resolve document ids BEFORE dropping attention_mask: for single-document /
     # text-only packs ``_packed_seq_ids`` is absent and the per-position validity
@@ -140,7 +153,10 @@ def make_cp_blockdiag_batch_and_ctx(
     if loss_mask is not None:
         batch["loss_mask"] = loss_mask
 
-    pad_len = (-S) % world
+    # Match the in-forward contiguous primary sharder, which pads to
+    # ``cp_size * 2`` so all model-owned CP layouts share one aux/primary shape
+    # contract after the #2937 sharder refactor.
+    pad_len = (-S) % (2 * world)
     if pad_len:
         doc_ids = torch.cat(
             [doc_ids, torch.zeros(B, pad_len, device=device, dtype=doc_ids.dtype)],
@@ -149,6 +165,21 @@ def make_cp_blockdiag_batch_and_ctx(
     S_full = S + pad_len
     local_len = S_full // world
     row_offset = rank * local_len
+
+    # GatedDeltaNet's FLA CP context consumes GLOBAL packed boundaries. Compute
+    # them once here, outside layer forwards and activation-checkpoint recompute,
+    # so every recurrent layer observes the same document-reset contract without
+    # introducing dynamic host synchronization between collectives.
+    flat_doc_ids = doc_ids.reshape(-1)
+    boundaries = torch.where(flat_doc_ids[1:] != flat_doc_ids[:-1])[0].to(torch.long) + 1
+    packed_cu_seqlens = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.long, device=device),
+            boundaries,
+            torch.tensor([flat_doc_ids.numel()], dtype=torch.long, device=device),
+        )
+    )
+    packed_cu_seqlens_cpu = packed_cu_seqlens.detach().cpu()
 
     # Defense-in-depth (do not remove): the per-document SDPA all-gathers K/V over
     # ``group`` (``exchange._AllGatherSeqDiff``) to rebuild the full sequence, while
@@ -172,7 +203,7 @@ def make_cp_blockdiag_batch_and_ctx(
     # unsupported: the deepstack visual-embed sharding below indexes batch row 0
     # (``vpm[0, ...]``), so B>1 would die with a cryptic size mismatch deep in the
     # model. Fail loud here.
-    _cp_bsz = batch["inputs_embeds"].shape[0]
+    _cp_bsz = primary.shape[0]
     if _cp_bsz != 1:
         raise ValueError(
             f"block-diagonal context parallelism requires local_batch_size=1 (one packed "
@@ -183,6 +214,7 @@ def make_cp_blockdiag_batch_and_ctx(
     # Per-tensor padding fill: each tensor's "ignore" value is semantic, not
     # dtype-derived (mirrors make_cp_batch_and_ctx's PAD_FILL).
     PAD_FILL = {
+        "input_ids": padding_token_id,
         "labels": -100,
         "_packed_seq_ids": 0,
         "loss_mask": 0,
@@ -239,6 +271,7 @@ def make_cp_blockdiag_batch_and_ctx(
 
     seq_aligned = (
         "inputs_embeds",
+        "input_ids",
         "labels",
         "position_ids",
         "_packed_seq_ids",
@@ -247,6 +280,8 @@ def make_cp_blockdiag_batch_and_ctx(
         "visual_pos_masks",
     )
     for key in seq_aligned:
+        if not shard_primary and key == primary_key:
+            continue
         if key in batch and isinstance(batch[key], torch.Tensor):
             batch[key] = _shard(key, batch[key])
 
@@ -254,6 +289,8 @@ def make_cp_blockdiag_batch_and_ctx(
     step_state = {
         "group": group,
         "doc_ids": doc_ids,
+        "packed_cu_seqlens": packed_cu_seqlens,
+        "packed_cu_seqlens_cpu": packed_cu_seqlens_cpu,
         "row_offset": row_offset,
         "seq_dim": 2,
         # Per-step snapshot of the runtime config, so cp_blockdiag_sdpa selects its
@@ -267,6 +304,11 @@ def make_cp_blockdiag_batch_and_ctx(
         # GPU->CPU .item() syncs. The flash/te varlen path reads this; the dense
         # fallback ignores it.
         "varlen_meta": kernels.precompute_blockdiag_varlen_meta(doc_ids, row_offset, local_len, device),
+        "model_state": state_module.BlockdiagCpModelState(
+            group=group,
+            packed_cu_seqlens=packed_cu_seqlens,
+            packed_cu_seqlens_cpu=packed_cu_seqlens_cpu,
+        ),
     }
 
     @contextlib.contextmanager
@@ -280,4 +322,4 @@ def make_cp_blockdiag_batch_and_ctx(
             finally:
                 state_module._CP_BLOCKDIAG_STATE.reset(token)
 
-    return _ctx, batch
+    return _ctx, batch, ShardLayout(original_seq_len=S, padded_seq_len=S_full)

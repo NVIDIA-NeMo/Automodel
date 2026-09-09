@@ -41,6 +41,7 @@ from nemo_automodel.shared.tied_weights import (
 logger = logging.getLogger(__name__)
 _AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_\d+_step_(\d+)$")
 _CHECKPOINT_STEP_RE = re.compile(r"step_(\d+)$")
+_INCOMPLETE_CHECKPOINT_MARKER = ".incomplete"
 
 
 def get_rank_safe() -> int:
@@ -122,6 +123,47 @@ def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
 def list_automodel_checkpoints(ckpt_root: Path) -> list[Path]:
     """Return canonical AutoModel ``epoch_<E>_step_<S>`` checkpoint directories."""
     return [path for path in _list_existing_checkpoints(ckpt_root) if _AUTOMODEL_CHECKPOINT_RE.fullmatch(path.name)]
+
+
+def is_cloud_path(path: str | Path) -> bool:
+    """Check if path is a cloud storage path (MSC)."""
+    return os.fspath(path).startswith("msc://")
+
+
+def mark_checkpoint_incomplete(checkpoint_dir: str | Path) -> None:
+    """Mark a checkpoint directory as still being written.
+
+    A save that is interrupted (wall-clock limit, preemption, OOM) leaves the
+    directory behind with only some of its components written. The marker makes
+    that state observable so a resumed run neither loads nor retains it; it is
+    removed by :func:`clear_checkpoint_incomplete` once the checkpoint is
+    published.
+
+    Args:
+        checkpoint_dir: Directory of the checkpoint being written.
+    """
+    (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).touch(exist_ok=True)
+
+
+def clear_checkpoint_incomplete(checkpoint_dir: str | Path) -> None:
+    """Clear the marker written by :func:`mark_checkpoint_incomplete`.
+
+    Args:
+        checkpoint_dir: Directory of the checkpoint that finished writing.
+    """
+    (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).unlink(missing_ok=True)
+
+
+def is_checkpoint_incomplete(checkpoint_dir: str | Path) -> bool:
+    """Return whether a checkpoint directory was left behind by an interrupted save.
+
+    Args:
+        checkpoint_dir: Directory to inspect.
+
+    Returns:
+        True when the in-progress marker is still present.
+    """
+    return (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).exists()
 
 
 def _resolve_checkpoint_pointer_target(ckpt_root: Path, raw_target: str) -> Path | None:
@@ -226,20 +268,49 @@ def resolve_restore_from_to_checkpoint_dir(checkpoint_dir: str | Path, restore_f
     Returns:
         - str: resolved checkpoint directory
         - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
+
+    Raises:
+        RuntimeError: If restore_from selects a checkpoint that an interrupted save
+            left incomplete.
     """
-    # Handle checkpoint-root pointers such as LATEST and LOWEST_VAL.
+    # Handle checkpoint-root pointers such as LATEST and LOWEST_VAL. A pointer whose
+    # target an interrupted save left incomplete is not resumable. LATEST falls back
+    # to the most recent complete checkpoint below; any other pointer raises, because
+    # falling through would return the pointer path itself, which resolves straight
+    # back to the incomplete target.
     if os.path.sep not in restore_from and not os.path.isabs(restore_from):
         pointed_checkpoint = read_checkpoint_pointer(checkpoint_dir, restore_from)
         if pointed_checkpoint is not None and pointed_checkpoint.is_dir():
-            return os.fspath(pointed_checkpoint)
+            if not is_checkpoint_incomplete(pointed_checkpoint):
+                return os.fspath(pointed_checkpoint)
+            if restore_from.upper() != "LATEST":
+                raise RuntimeError(
+                    f"checkpoint.restore_from={restore_from!r} points at {pointed_checkpoint}, which an "
+                    "interrupted save left incomplete. Set checkpoint.restore_from to a complete "
+                    "checkpoint directory, or remove the pointer to fall back to the most recent one."
+                )
+            logger.warning(
+                "checkpoint.restore_from=%r points at %s, which an interrupted save left incomplete; "
+                "falling back to the most recent complete checkpoint",
+                restore_from,
+                pointed_checkpoint,
+            )
     if restore_from.upper() == "LATEST":
         return find_latest_checkpoint(checkpoint_dir)
 
     # If restore_from is just a directory name (no path separator), treat it as
     # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
     if os.path.sep not in restore_from and not os.path.isabs(restore_from):
-        return os.path.join(checkpoint_dir, restore_from)
-    return restore_from
+        resolved_checkpoint = os.path.join(checkpoint_dir, restore_from)
+    else:
+        resolved_checkpoint = restore_from
+
+    if is_checkpoint_incomplete(resolved_checkpoint):
+        raise RuntimeError(
+            f"checkpoint.restore_from={restore_from!r} resolves to {resolved_checkpoint}, which an interrupted "
+            "save left incomplete. Set checkpoint.restore_from to a complete checkpoint directory."
+        )
+    return resolved_checkpoint
 
 
 def format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
@@ -280,6 +351,12 @@ def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | Path | None:
       1) Valid LATEST symlink or txt file under checkpoint_dir
       2) Highest step directory under checkpoint_dir whose name ends in ``step_<N>``
 
+    Directories left behind by an interrupted save are skipped at both steps.
+    The LATEST target needs the same filter as the step scan: re-saving a step
+    whose directory LATEST already points at leaves the pointer aimed at a
+    directory that is being rewritten, so an interruption there would otherwise
+    resume from a partially written checkpoint.
+
     Returns:
         Path (or str) of the latest checkpoint directory, or None.
     """
@@ -289,9 +366,15 @@ def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | Path | None:
 
     latest = read_checkpoint_pointer(root, "LATEST")
     if latest is not None and latest.is_dir():
-        return os.fspath(latest)
+        if not is_checkpoint_incomplete(latest):
+            return os.fspath(latest)
+        logger.warning(
+            "LATEST points at %s, which an interrupted save left incomplete; "
+            "falling back to the most recent complete checkpoint",
+            latest,
+        )
 
-    checkpoint_files = _list_existing_checkpoints(root)
+    checkpoint_files = [path for path in _list_existing_checkpoints(root) if not is_checkpoint_incomplete(path)]
     if not checkpoint_files:
         return
 

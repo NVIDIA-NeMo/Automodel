@@ -29,8 +29,8 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.utils.data
+from datasets import Dataset, load_dataset
 from datasets import Image as HfImage
-from datasets import load_dataset
 from PIL import Image
 
 if TYPE_CHECKING:
@@ -44,6 +44,21 @@ from nemo_automodel.components.datasets.vlm.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _replacement_rng(idx: int) -> random.Random:
+    """Per-sample RNG for picking a substitute when sample ``idx`` is unusable.
+
+    Seeded from the ORIGINAL sample index only, so every rank (and every
+    dp/cp world size) that materializes sample ``idx`` substitutes the same
+    replacement. Drawing from the process-global ``random`` instead made the
+    substitute rank-dependent: ranks whose global RNG stream had advanced
+    differently (e.g. the per-node dataset-building rank) picked a different
+    document, so context-parallel ranks in one CP group ended up with
+    different packs / ``cu_seqlens`` for the same microbatch -- corrupting the
+    ring-attention gradient accumulation (inf/nan or silently wrong dk/dv).
+    """
+    return random.Random(0x9E3779B9 + 2654435761 * int(idx))
 
 
 @dataclass
@@ -522,7 +537,98 @@ def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", 
     return [format(example) for example in dataset]
 
 
-def _convert_sharegpt_to_conversation(
+SHOPIFY_PRODUCT_CATALOGUE_PROMPT = "What product category does this item belong to?"
+
+
+@dataclass
+class ShopifyProductCatalogueDatasetConfig:
+    """Construction-time configuration for the Shopify product-catalogue dataset."""
+
+    path_or_dataset: str = "Shopify/product-catalogue"
+    """HuggingFace dataset id or local path for the Shopify product catalogue."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+    limit_dataset_samples: int | None = None
+    """Optional maximum number of samples to load."""
+
+    def build(self) -> Dataset:
+        """Build the Shopify product-catalogue dataset from this config."""
+        return make_shopify_product_catalogue_dataset(
+            path_or_dataset=self.path_or_dataset,
+            split=self.split,
+            limit_dataset_samples=self.limit_dataset_samples,
+        )
+
+
+def make_shopify_product_catalogue_dataset(
+    path_or_dataset="Shopify/product-catalogue",
+    split="train",
+    limit_dataset_samples: int | None = None,
+    **kwargs,
+) -> Dataset:
+    """Load the Shopify product-catalogue dataset for image-to-text fine-tuning.
+
+    The task is product image -> taxonomy category, supervised on the dataset's
+    ``ground_truth_category`` field.
+
+    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
+    dataset stays Arrow-backed, as in :func:`make_medpix_dataset`. The train
+    split holds 38,631 product photos; materialising formatted rows measured
+    ~8.1 GB per 1,500 rows (~209 GB for the full split) because each retained
+    row pins its decoded image. Images are loaded undecoded
+    (``Image(decode=False)``) and wrapped as lazy ``PIL`` handles, so the pixel
+    decode happens in the DataLoader workers.
+
+    Note:
+        Product photos are full resolution (up to 2084x2084). Bound the visual
+        token count through the processor (e.g. Qwen2.5-VL's ``max_pixels``) or
+        via ``max_length`` on the collate function.
+
+    Args:
+        path_or_dataset: HuggingFace dataset id or local path.
+        split: Dataset split to load.
+        limit_dataset_samples: Optional maximum number of samples to load.
+        **kwargs: Unused; accepted for parity with the other dataset builders.
+
+    Returns:
+        Dataset: Arrow-backed dataset yielding ``{"conversation": [...]}`` rows.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    if limit_dataset_samples is not None:
+        dataset = dataset.select(range(min(limit_dataset_samples, len(dataset))))
+    if "product_image" in getattr(dataset, "features", {}):
+        dataset = dataset.cast_column("product_image", HfImage(decode=False))
+
+    def lazy_image(value):
+        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
+
+    def transform(batch):
+        return {
+            "conversation": [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": lazy_image(image)},
+                            {"type": "text", "text": SHOPIFY_PRODUCT_CATALOGUE_PROMPT},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": category}]},
+                ]
+                for image, category in zip(batch["product_image"], batch["ground_truth_category"])
+            ]
+        }
+
+    return dataset.with_transform(transform)
+
+
+def convert_sharegpt_to_conversation(
     example,
     columns=None,
     tags=None,
@@ -641,6 +747,14 @@ def _convert_sharegpt_to_conversation(
         result["_text_tokens"] = example["_text_tokens"]
 
     return result
+
+
+# The parser was private, but it is also the contract the ViSpec regeneration
+# script checks its output against (it verifies the prompt it writes rebuilds the
+# prompt it generated under). A caller outside this module needs a name that is
+# not declared unstable, so the public spelling above is canonical and this alias
+# keeps the existing in-module callers and their tests unchanged.
+_convert_sharegpt_to_conversation = convert_sharegpt_to_conversation
 
 
 def _load_json_or_jsonl(file_path):
@@ -1368,6 +1482,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        rng = _replacement_rng(idx)
         from nemo_automodel.components.datasets.vlm.collate_fns import (
             _extract_media_from_conversations,
             build_labels_from_template,
@@ -1446,7 +1561,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                             seq_len,
                             self.max_length,
                         )
-                        idx = random.randint(0, len(self.dataset) - 1)
+                        idx = rng.randint(0, len(self.dataset) - 1)
                         continue
 
                 # Build labels BEFORE truncation so the full assistant text
@@ -1481,7 +1596,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         idx,
                         mismatch,
                     )
-                    idx = random.randint(0, len(self.dataset) - 1)
+                    idx = rng.randint(0, len(self.dataset) - 1)
                     continue
 
                 output = {
@@ -1517,7 +1632,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     self.max_retries,
                     e,
                 )
-                idx = random.randint(0, len(self.dataset) - 1)
+                idx = rng.randint(0, len(self.dataset) - 1)
 
         raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
 
@@ -1546,6 +1661,7 @@ class RobustDatasetWrapper(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        rng = _replacement_rng(idx)
         from nemo_automodel.components.datasets.vlm.fake_image import (
             _conversation_has_media,
             inject_fake_image_into_conversation,
@@ -1564,7 +1680,7 @@ class RobustDatasetWrapper(torch.utils.data.Dataset):
                 return example
             except Exception as e:
                 logger.warning(f"Error loading sample {idx}: {e}. Retrying with a different sample.")
-                idx = random.randint(0, len(self.dataset) - 1)
+                idx = rng.randint(0, len(self.dataset) - 1)
         raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
 
     def robust_collate(self, collate_fn):

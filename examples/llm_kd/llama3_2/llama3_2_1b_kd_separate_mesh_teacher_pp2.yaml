@@ -8,7 +8,7 @@ recipe: KnowledgeDistillationRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 1
+  local_batch_size: 2
   ckpt_every_steps: 200
   val_every_steps: 100
   num_epochs: 2

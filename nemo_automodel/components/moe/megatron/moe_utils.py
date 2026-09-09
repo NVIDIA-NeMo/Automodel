@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -32,8 +31,8 @@ if HAS_TE:
 def permute(
     tokens,
     routing_map,
-    probs: Optional[torch.Tensor] = None,
-    num_out_tokens: Optional[int] = None,
+    probs: torch.Tensor | None = None,
+    num_out_tokens: int | None = None,
     fused: bool = False,
     drop_and_pad: bool = False,
 ):

@@ -1,6 +1,7 @@
 ---
 title: "Hy-MT2 (Hunyuan-MT2)"
 description: ""
+slug: model-coverage/large-language-models/tencent/hy-mt2
 ---
 [Hy-MT2-30B-A3B](https://huggingface.co/tencent/Hy-MT2-30B-A3B) is Tencent's translation Mixture-of-Experts language model with 30B total parameters and 3B activated per token. It features 48 transformer layers (layer 0 dense, layers 1–47 MoE), 128 routed experts plus 1 shared expert with top-8 sigmoid routing, Grouped Query Attention (32 Q / 4 KV heads), per-head QK RMSNorm, RoPE, and an in-forward fp32 upcast on the language-model head (`enable_lm_head_fp32`). It supports a 256K context window.
 

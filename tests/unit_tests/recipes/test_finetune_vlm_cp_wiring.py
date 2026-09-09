@@ -38,6 +38,7 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -106,7 +107,102 @@ class _FakeCPMesh:
 
     def __getitem__(self, key):
         assert key == "cp"
-        return SimpleNamespace(size=lambda: 2)
+        return SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group")
+
+
+class _UnsupportedVisionModel:
+    supports_cp_vision_frame_sharding = False
+
+
+class _SupportedVisionModel:
+    supports_cp_vision_frame_sharding = True
+
+
+class _PackedCPModel:
+    def __init__(self, *, supported):
+        self.supports_cp_with_sequence_packing = supported
+
+
+def test_cp_vision_frame_sharding_rejects_model_without_capability():
+    policy = CpVisionFrameShardingConfig(enabled=True)
+
+    with pytest.raises(
+        ValueError,
+        match=r"_UnsupportedVisionModel declares supports_cp_vision_frame_sharding=False",
+    ):
+        vlm_finetune._validate_cp_vision_frame_sharding_support(_UnsupportedVisionModel(), policy)
+
+
+def test_cp_vision_frame_sharding_accepts_model_with_capability():
+    policy = CpVisionFrameShardingConfig(enabled=True)
+
+    vlm_finetune._validate_cp_vision_frame_sharding_support(_SupportedVisionModel(), policy)
+
+
+def test_disabled_cp_vision_frame_sharding_accepts_model_without_capability():
+    policy = CpVisionFrameShardingConfig(enabled=False)
+
+    vlm_finetune._validate_cp_vision_frame_sharding_support(_UnsupportedVisionModel(), policy)
+
+
+def test_packed_cp_rejects_unsupported_qwen_backend_before_dataloader_build():
+    with pytest.raises(ValueError, match="Disable sequence packing, use cp_size=1"):
+        vlm_finetune._validate_cp_packing_support(
+            _PackedCPModel(supported=False),
+            packing_enabled=True,
+            cp_size=8,
+        )
+
+
+@pytest.mark.parametrize(("packing_enabled", "cp_size"), [(False, 8), (True, 1)])
+def test_packed_cp_validation_is_inactive_without_composed_path(packing_enabled, cp_size):
+    vlm_finetune._validate_cp_packing_support(
+        _PackedCPModel(supported=False),
+        packing_enabled=packing_enabled,
+        cp_size=cp_size,
+    )
+
+
+def test_packed_cp_accepts_model_owned_backend():
+    vlm_finetune._validate_cp_packing_support(
+        _PackedCPModel(supported=True),
+        packing_enabled=True,
+        cp_size=8,
+    )
+
+
+def test_cp_vision_frame_sharding_context_resets_published_group_after_failure(monkeypatch):
+    """The recipe must restore vision frame-sharding state when the model forward raises."""
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    group = object()
+    token = object()
+    policy = CpVisionFrameShardingConfig(enabled=True)
+
+    class _Mesh(dict):
+        mesh_dim_names = ("cp",)
+
+    recipe.device_mesh = _Mesh(cp=SimpleNamespace(size=lambda: 2, get_group=lambda: group))
+    recipe.cp_vision_frame_sharding = policy
+    events = []
+
+    def _set(actual_group, *, config):
+        events.append(("set", actual_group, config))
+        return token
+
+    def _reset(actual_token):
+        events.append(("reset", actual_token))
+
+    monkeypatch.setattr(vlm_finetune, "set_cp_vision_group", _set)
+    monkeypatch.setattr(vlm_finetune, "reset_cp_vision_group", _reset)
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        with recipe._cp_vision_frame_sharding_context():
+            events.append(("forward",))
+            raise RuntimeError("forward failed")
+
+    assert events[0] == ("set", group, policy)
+    assert events[1] == ("forward",)
+    assert events[2] == ("reset", token)
 
 
 class _ScheduleSpy:
@@ -117,6 +213,31 @@ class _ScheduleSpy:
         self.calls.append({"model_input": model_input, "target": target, "batch": batch})
         if losses is not None:
             losses.append(torch.tensor(1.25))
+
+
+class _PPSpy(SimpleNamespace):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.step_batches = []
+
+    def step(self, model_input, *, target=None, losses=None, **kwargs):
+        """Record and forward an AutoPipeline step.
+
+        Args:
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input.
+            target: Optional tensor of shape [batch, sequence] containing loss
+                targets.
+            losses: Optional mutable list populated with scalar loss tensors.
+            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+
+        Returns:
+            The value returned by the schedule spy.
+        """
+        self.step_batches.append(dict(kwargs))
+        schedule_args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
 
 def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monkeypatch):
@@ -132,10 +253,11 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     recipe = object.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
+    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
-    recipe.pp = SimpleNamespace(
+    recipe.pp = _PPSpy(
         pp_microbatch_size=2,
         info=SimpleNamespace(
             has_first_stage=True,
@@ -187,6 +309,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
     assert "inputs_embeds" not in seen_cp_batch
     assert seq_lens == [6]
+    assert [set(call.keys()) for call in recipe.pp.step_batches] == [{"pixel_values"}]
     assert len(schedule.calls) == 1
     assert tuple(schedule.calls[0]["model_input"].shape) == (2, 6)
     assert torch.equal(schedule.calls[0]["target"], labels)
@@ -216,10 +339,11 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     recipe = object.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
+    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
-    recipe.pp = SimpleNamespace(
+    recipe.pp = _PPSpy(
         pp_microbatch_size=2,
         info=SimpleNamespace(
             has_first_stage=False,
@@ -258,7 +382,7 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     FinetuneRecipeForVLM._forward_backward_step(
         recipe, 0, batch, loss_buffer=[], num_label_tokens=labels.numel(), num_batches=1
     )
-    return seen_cp_batch, seq_lens
+    return seen_cp_batch, seq_lens, recipe.pp.step_batches, schedule.calls
 
 
 def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(monkeypatch):
@@ -268,7 +392,7 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
     the generic sharder would produce, which would ÷cp a second time and truncate
     the inter-stage hidden (the text-decoder RoPE size mismatch)."""
     model = _SunkSpyVLM()
-    seen_cp_batch, seq_lens = _run_nonfirst_stage_fbstep(monkeypatch, model)
+    seen_cp_batch, seq_lens, step_batches, schedule_calls = _run_nonfirst_stage_fbstep(monkeypatch, model)
 
     # Hook invoked on the non-first stage (this is the fix).
     assert len(model.calls) == 1
@@ -277,6 +401,8 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
     # All pp ranks feed the FULL seq_len to update_seq_len.
     assert seq_lens == [6]
+    assert step_batches == [{}]
+    assert schedule_calls[0]["model_input"] is None
 
 
 class _FakePPModel:
@@ -447,6 +573,7 @@ def test_setup_always_stages_pp_media_under_pp(
     trainer.setup()
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
+    assert dataloader_calls[0]["cp_size"] == cp_size
 
 
 # -----------------------------------------------------------------------------
@@ -593,7 +720,8 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.model_parts = [_Model()]
     recipe.loss_fn = object()
-    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2))
+    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group"))
+    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
     recipe.pp_enabled = False
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)

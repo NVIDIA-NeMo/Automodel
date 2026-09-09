@@ -120,16 +120,22 @@ class TrainDominoRecipe(TrainDFlashRecipe):
             float(m.lambda_base),
         )
 
-    def _extra_train_wandb_metrics(self, metrics) -> dict[str, float]:
-        """Return Domino head and curriculum diagnostics for W&B."""
-        values = super()._extra_train_wandb_metrics(metrics)
+    def _extra_train_metric_sums(self, metrics) -> dict[str, tuple[float, float]]:
+        """Return Domino head and curriculum diagnostics as window sums.
+
+        ``lambda_base`` is a schedule value rather than a statistic, so its
+        denominator is the micro-batch count: averaging it over the window is
+        what makes it comparable with the loss curves beside it.
+        """
+        values = super()._extra_train_metric_sums(metrics)
+        valid_tokens = float(metrics.valid_tokens)
         values.update(
             {
-                "train/final_loss": float(metrics.final_loss),
-                "train/base_loss": float(metrics.base_loss),
-                "train/base_accuracy": float(metrics.base_accuracy),
-                "train/base_accept_len": float(metrics.base_accept_len),
-                "train/lambda_base": float(metrics.lambda_base),
+                "train/final_loss": (float(metrics.final_loss), 1.0),
+                "train/base_loss": (float(metrics.base_loss), 1.0),
+                "train/base_accuracy": (float(metrics.base_correct_tokens), valid_tokens),
+                "train/base_accept_len": (float(metrics.base_accept_len_sum), float(metrics.valid_blocks)),
+                "train/lambda_base": (float(metrics.lambda_base), 1.0),
             }
         )
         return values
