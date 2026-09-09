@@ -252,6 +252,28 @@ class TestNemotronV3AdapterDense:
         assert list(restored) == [native_key]
         torch.testing.assert_close(restored[native_key], tensor)
 
+    @pytest.mark.parametrize("base_prefix", ["backbone", "model"])
+    @pytest.mark.parametrize("adapter_prefix", ["backbone", "model"])
+    def test_adapter_restore_preserves_base_checkpoint_namespace(self, adapter, base_prefix, adapter_prefix):
+        """Legacy LoRA names must not rename frozen embeddings in the merged export."""
+        base_state = {
+            f"{base_prefix}.embeddings.weight": torch.randn(16, 8),
+            f"{base_prefix}.norm_f.weight": torch.randn(8),
+        }
+        native_base = adapter.from_hf(dict(base_state))
+        lora_tensor = torch.randn(2, 8)
+        native_lora = adapter.from_hf(
+            {f"base_model.model.{adapter_prefix}.layers.0.mixer.in_proj.lora_A.weight": lora_tensor}
+        )
+        native_key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
+        assert set(native_lora) == {native_key}
+        torch.testing.assert_close(native_lora[native_key], lora_tensor, rtol=0, atol=0)
+
+        exported = adapter.to_hf(dict(native_base))
+        assert set(exported) == set(base_state)
+        for key in base_state:
+            torch.testing.assert_close(exported[key], base_state[key], rtol=0, atol=0)
+
 
 class TestNemotronV3AdapterMTP:
     """MTP checkpoint namespace regressions."""
