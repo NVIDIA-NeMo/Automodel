@@ -34,7 +34,6 @@ stages:
 
 variables:
   CUDA_VISIBLE_DEVICES: ""
-  GIT_DEPTH: "0"
   HF_HUB_OFFLINE: "1"
   TRANSFORMERS_OFFLINE: "1"
   UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
@@ -51,24 +50,9 @@ lint:
     - uv sync --locked --only-group linting
   script:
     - uv run --no-sync ruff --version
-    - |-
-      git diff --name-only --diff-filter=ACMR -z \
-        "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" -- '*.py' '*.pyi' '*.ipynb' \
-        | xargs -0 -r uv run --no-sync ruff check --force-exclude --verbose
-    - |-
-      git diff --name-only --diff-filter=ACMR -z \
-        "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" -- '*.py' '*.pyi' '*.ipynb' \
-        | xargs -0 -r uv run --no-sync ruff format --check --force-exclude --verbose
-    - |-
-      git diff --name-only --diff-filter=ACMR -z \
-        "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" -- \
-        app.py \
-        ':(glob)nemo_automodel/**/*.py' \
-        ':(glob)examples/**/*.py' \
-        ':(glob)scripts/**/*.py' \
-        ':(glob)tools/**/*.py' \
-        ':(glob)tutorials/**/*.py' \
-        | xargs -0 -r uv run --no-sync bandit -t B614
+    - uv run --no-sync ruff check --verbose .
+    - uv run --no-sync ruff format --check --verbose .
+    - uv run --no-sync bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
 
 retrieval-unit-tests:
   stage: test
