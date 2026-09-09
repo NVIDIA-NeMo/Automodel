@@ -268,6 +268,7 @@ def test_dense_grouped_adapter_does_not_require_an_expert_backend():
 def test_nemotron_omni_delegates_low_memory_dcp_support_to_language_adapter():
     adapter = object.__new__(NemotronOmniStateDictAdapter)
     adapter._llm_adapter = SimpleNamespace(supports_low_memory_dcp_load=True)
+    adapter.vision_uses_native_radio = False
     assert adapter.supports_low_memory_dcp_load is True
 
     adapter._llm_adapter.supports_low_memory_dcp_load = False
