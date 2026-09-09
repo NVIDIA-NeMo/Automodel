@@ -798,6 +798,11 @@ def apply_fsdp(
             )
         experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
+            if (
+                isinstance(moe_module.experts, GroupedExpertsMoK)
+                and moe_module.experts.runtime.mok_config.precision == "mxfp8"
+            ):
+                raise ValueError("MoK MXFP8 currently requires ep_shard size 1")
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
             # Preserve the enclosing policy's parameter, reduction, and input-cast

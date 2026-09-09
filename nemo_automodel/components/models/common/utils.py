@@ -207,6 +207,9 @@ class MoKBackendConfig:
     """Configuration for the optional Mixture-of-Kittens MoE backend.
 
     Attributes:
+        precision: Routed-expert compute precision. ``"bf16"`` passes the
+            materialized BF16 weights directly to MoK; ``"mxfp8"`` quantizes
+            them with MoK's E4M3 data and E8M0 block-scale format.
         fwd_num_comm_sms: Communication SMs reserved during the forward megakernel.
         bwd_num_comm_sms: Communication SMs reserved during the backward megakernel.
         minibatch_size: Routed-token overlap granularity, divisible by 256.
@@ -216,6 +219,7 @@ class MoKBackendConfig:
         all_gather_top_experts_chunk_bytes: Routing all-gather chunk size in bytes.
     """
 
+    precision: Literal["bf16", "mxfp8"] = "bf16"
     fwd_num_comm_sms: int = 40
     bwd_num_comm_sms: int = 28
     minibatch_size: int = 4096
@@ -225,6 +229,8 @@ class MoKBackendConfig:
 
     def __post_init__(self) -> None:
         """Validate settings that do not depend on a CUDA device or EP group."""
+        if self.precision not in ("bf16", "mxfp8"):
+            raise ValueError(f"mok.precision must be 'bf16' or 'mxfp8'; got {self.precision!r}")
         for name, value in (
             ("fwd_num_comm_sms", self.fwd_num_comm_sms),
             ("bwd_num_comm_sms", self.bwd_num_comm_sms),

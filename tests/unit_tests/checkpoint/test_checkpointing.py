@@ -1584,8 +1584,8 @@ class TestLoadModelCustomModelGuard:
 
     Under multi-rank (sharded) loading, custom models use the standard DCP path so each
     rank slices its local DTensor shard. On a single device (world_size == 1) there is no
-    sharding, so adapters that cannot expose write-through destinations take the frugal
-    full-state path instead. Adapters with an explicit write-through guarantee use DCP.
+    sharding, so adapters that need large temporary tensors take the frugal full-state path
+    instead. Adapters that need zero or small temporary tensors use DCP.
     """
 
     def _make_checkpointer(self):
@@ -1695,7 +1695,7 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
     def test_single_device_custom_model_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_st, caplog):
-        """A custom model without a write-through guarantee uses the full-state path.
+        """A custom model without low-memory DCP support uses the full-state path.
 
         The fast path applies the state_dict_adapter from_hf conversion on CPU (via
         _maybe_adapt_state_dict_from_hf) and copies into the model, keeping device memory at
@@ -1732,25 +1732,22 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    @pytest.mark.parametrize("load_capability", ["write_through", "without_full_copy"])
     @pytest.mark.parametrize("dequantize_base_checkpoint", [False, True])
-    def test_single_device_adapter_without_full_copy_routes_by_quantization(
+    def test_single_device_low_memory_dcp_routes_by_quantization(
         self,
         mock_load_full,
         mock_load_hf,
         mock_is_st,
         caplog,
         dequantize_base_checkpoint,
-        load_capability,
     ):
-        """Quantized conversion keeps the full CPU fallback for both direct-load capabilities."""
+        """Quantized conversion keeps the full CPU fallback despite low-memory DCP support."""
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
         CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
-        model.state_dict_adapter.supports_write_through_checkpoint_load = load_capability == "write_through"
-        model.state_dict_adapter.supports_checkpoint_load_without_full_copy = load_capability == "without_full_copy"
+        model.state_dict_adapter.supports_low_memory_dcp_load = True
         mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
         mock_load_hf.return_value = mock_state_dict
 
@@ -1770,7 +1767,7 @@ class TestLoadModelCustomModelGuard:
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
                 side_effect=lambda model_part, state_dict, **kwargs: state_dict,
             ),
-            patch.object(checkpointer, "_get_storage_reader", return_value=None),
+            patch.object(checkpointer, "_get_storage_reader", return_value=MagicMock()),
             patch.object(checkpointer, "_do_load", return_value=mock_state_dict) as mock_dcp_load,
         ):
             mock_model_state = mock_model_state_cls.return_value
@@ -2626,6 +2623,56 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert "size from HF index" in caplog.text
         assert "1 output file, world_size=64" in caplog.text
         assert "~64.0 GiB" in caplog.text
+
+    def test_non_rank_0_skips_size_estimation_entirely(self, tmp_path, monkeypatch):
+        """Only rank 0 logs, so no other rank should pay for the estimate.
+
+        Both helpers are local (a file read and a state-dict walk), so every
+        rank was opening the same HF index on shared storage and walking its
+        state dict on every save, only for all but one to discard the result.
+        """
+        import nemo_automodel.components.checkpoint.checkpointing as ckpt_mod
+
+        monkeypatch.setenv("WORLD_SIZE", "256")
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+
+        calls = {"index": 0, "walk": 0}
+
+        def _count_index(_config):
+            calls["index"] += 1
+            return None
+
+        def _count_walk(_state_dict):
+            calls["walk"] += 1
+            return 0
+
+        monkeypatch.setattr(ckpt_mod, "is_rank_0", lambda: False)
+        monkeypatch.setattr(ckpt_mod, "_get_original_hf_index_total_size", _count_index)
+        monkeypatch.setattr(ckpt_mod, "estimate_state_dict_bytes", _count_walk)
+
+        _warn_if_large_inline_consolidation(checkpointer.config, {"w": object()}, {"w": 1})
+
+        assert calls == {"index": 0, "walk": 0}
+
+    def test_rank_0_still_estimates(self, tmp_path, monkeypatch):
+        """The guard must not silence the warning on the rank that emits it."""
+        import nemo_automodel.components.checkpoint.checkpointing as ckpt_mod
+
+        monkeypatch.setenv("WORLD_SIZE", "256")
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+
+        calls = {"index": 0}
+
+        def _count_index(_config):
+            calls["index"] += 1
+            return 64 * 1024**3
+
+        monkeypatch.setattr(ckpt_mod, "is_rank_0", lambda: True)
+        monkeypatch.setattr(ckpt_mod, "_get_original_hf_index_total_size", _count_index)
+
+        _warn_if_large_inline_consolidation(checkpointer.config, {"w": object()}, {"w": 1})
+
+        assert calls["index"] == 1
 
 
 class TestOfflineHFConsolidationTool:

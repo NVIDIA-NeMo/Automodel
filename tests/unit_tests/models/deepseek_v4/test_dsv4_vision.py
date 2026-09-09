@@ -586,7 +586,8 @@ def test_parallelizer_discovers_language_and_vision_blocks():
     assert "mtp.layers.0.mlp.gate.bias_vl" in model.state_dict()
 
 
-def test_causal_lm_consumes_staged_pp_media_chunk():
+@pytest.mark.parametrize("image_microbatches", [(True,), (False, True, False, True)])
+def test_causal_lm_consumes_staged_pp_media_chunk(image_microbatches: tuple[bool, ...]) -> None:
     config = _vision_config(
         hidden_size=64,
         moe_intermediate_size=32,
@@ -613,25 +614,52 @@ def test_causal_lm_consumes_staged_pp_media_chunk():
         dispatcher="torch",
         experts="torch_mm",
     )
+    torch.manual_seed(42)
     model = DeepseekV4ForCausalLM(config, backend=backend).eval()
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     types, _ = build_image_block(1, 1, start_pos=0)
     vision_token_types = torch.cat([types, torch.tensor([-1])]).unsqueeze(0)
     input_ids = torch.cat([config.vocab_size + types, torch.tensor([3])]).unsqueeze(0)
-    patches = torch.randn(9, 3, config.vision_patch_size, config.vision_patch_size)
-    image_grid_hws = torch.tensor([[3, 3]])
-    model._vlm_pixel_values_chunks = [patches]
-    model._vlm_image_grid_hws_chunks = [image_grid_hws]
+    pixel_chunks = [
+        torch.randn(9 if has_image else 0, 3, config.vision_patch_size, config.vision_patch_size)
+        for has_image in image_microbatches
+    ]
+    grid_chunks = [
+        torch.tensor([[3, 3]]) if has_image else torch.empty((0, 2), dtype=torch.long)
+        for has_image in image_microbatches
+    ]
+    input_chunks = [input_ids if has_image else torch.full_like(input_ids, 3) for has_image in image_microbatches]
+    type_chunks = [
+        vision_token_types if has_image else torch.full_like(vision_token_types, -1) for has_image in image_microbatches
+    ]
+
+    with torch.inference_mode():
+        expected = [
+            model(
+                ids,
+                attention_mask=torch.ones_like(ids),
+                vision_token_types=token_types,
+                pixel_values=pixels if has_image else None,
+                image_grid_hws=grid if has_image else None,
+            ).logits
+            for has_image, ids, token_types, pixels, grid in zip(
+                image_microbatches, input_chunks, type_chunks, pixel_chunks, grid_chunks
+            )
+        ]
+
+    model._vlm_pixel_values_chunks = pixel_chunks
+    model._vlm_image_grid_hws_chunks = grid_chunks
     model._vlm_chunk_idx = 0
 
     with torch.inference_mode():
-        output = model(
-            input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            vision_token_types=vision_token_types,
-        )
-
-    assert output.logits.shape[:2] == input_ids.shape
-    assert model._vlm_chunk_idx == 1
+        for chunk_idx, (ids, token_types, expected_logits) in enumerate(zip(input_chunks, type_chunks, expected)):
+            output = model(
+                ids,
+                attention_mask=torch.ones_like(ids),
+                vision_token_types=token_types,
+            )
+            torch.testing.assert_close(output.logits, expected_logits, rtol=0, atol=0)
+            assert model._vlm_chunk_idx == chunk_idx + 1
 
 
 def test_vision_blocks_expose_fp32_norm_islands_to_dsv4_fsdp():

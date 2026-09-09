@@ -1379,24 +1379,25 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # PP VLM batches keep variable-length patch tensors off the pipeline
         # schedule and stage them per microbatch on the first model part. Pull
         # the matching chunk back here, where the DSV4-owned embedding bridge
-        # consumes it. Later PP stages have no embed_tokens and must neither
+        # consumes it. Text-only microbatches consume their empty media slots.
+        # Later PP stages have no embed_tokens and must neither
         # read nor advance the shared media cursor.
         on_first_stage = getattr(self.model, "embed_tokens", None) is not None
         if pixel_values is None and on_first_stage and getattr(self, "_vlm_pixel_values_chunks", None) is not None:
+            chunk_idx = int(getattr(self, "_vlm_chunk_idx", 0) or 0)
+            if chunk_idx >= len(self._vlm_pixel_values_chunks):
+                raise RuntimeError(
+                    f"DeepSeek-V4 PP media cursor {chunk_idx} exceeds "
+                    f"{len(self._vlm_pixel_values_chunks)} staged chunks"
+                )
             has_visual_tokens = vision_token_types is not None and bool((vision_token_types >= 0).any().item())
             if has_visual_tokens:
-                chunk_idx = int(getattr(self, "_vlm_chunk_idx", 0) or 0)
-                if chunk_idx >= len(self._vlm_pixel_values_chunks):
-                    raise RuntimeError(
-                        f"DeepSeek-V4 PP media cursor {chunk_idx} exceeds "
-                        f"{len(self._vlm_pixel_values_chunks)} staged chunks"
-                    )
                 pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
                 grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
                 if grid_chunks is None or chunk_idx >= len(grid_chunks):
                     raise RuntimeError("DeepSeek-V4 PP media is missing image_grid_hws for the current chunk")
                 image_grid_hws = grid_chunks[chunk_idx]
-                self._vlm_chunk_idx = chunk_idx + 1
+            self._vlm_chunk_idx = chunk_idx + 1
 
         use_mtp = self.mtp is not None and self.training
         if use_mtp and vision_token_types is not None and bool((vision_token_types >= 0).any().item()):
