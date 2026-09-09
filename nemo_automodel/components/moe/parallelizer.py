@@ -798,6 +798,11 @@ def apply_fsdp(
             )
         experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
+            if (
+                isinstance(moe_module.experts, GroupedExpertsMoK)
+                and moe_module.experts.runtime.mok_config.precision == "mxfp8"
+            ):
+                raise ValueError("MoK MXFP8 currently requires ep_shard size 1")
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
             # Preserve the enclosing policy's parameter, reduction, and input-cast
@@ -1049,8 +1054,15 @@ def parallelize_model(
     sequence_parallel: bool = False,
     enable_async_tensor_parallel: bool = False,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+    reapply_trainability: Callable[[nn.Module], None] | None = None,
 ) -> None:
-    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism."""
+    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism.
+
+    Args:
+        reapply_trainability: Optional callback that re-resolves parameter
+            trainability after TP/EP/AC surgery and immediately before FSDP
+            construction.
+    """
 
     tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
     if tp_enabled:
@@ -1116,6 +1128,9 @@ def parallelize_model(
             selective=_is_selective_ac(activation_checkpointing),
             activation_checkpointing_scope=activation_checkpointing_scope,
         )
+
+    if reapply_trainability is not None:
+        reapply_trainability(model)
 
     if ep_shard_axis_names is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]

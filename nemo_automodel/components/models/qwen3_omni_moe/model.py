@@ -456,7 +456,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # Images
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values, image_grid_thw)
+            # transformers >=5.15 returns one tensor per image; earlier versions
+            # return them already stacked.
             image_embeds = image_features.pooler_output
+            if not torch.is_tensor(image_embeds):
+                image_embeds = torch.cat(image_embeds, dim=0)
             image_embeds_multiscale = image_features.deepstack_features
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _, _ = self.get_placeholder_mask(
@@ -469,7 +473,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # Videos
         if pixel_values_videos is not None:
             video_features = self.get_video_features(pixel_values_videos, video_grid_thw)
+            # transformers >=5.15 returns one tensor per video; earlier versions
+            # return them already stacked.
             video_embeds = video_features.pooler_output
+            if not torch.is_tensor(video_embeds):
+                video_embeds = torch.cat(video_embeds, dim=0)
             video_embeds_multiscale = video_features.deepstack_features
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask, _ = self.get_placeholder_mask(

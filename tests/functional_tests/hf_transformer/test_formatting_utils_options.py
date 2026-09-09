@@ -194,3 +194,67 @@ def test_format_chat_template_options(seq_length, padding, truncation):
             assert input_ids[i] == pad_token_id, (
                 f"Position {i}: expected pad_token_id={pad_token_id} in padding region, got {input_ids[i]}"
             )
+
+
+def test_format_chat_template_mask_generation_prompt_real_tokenizer():
+    """``mask_generation_prompt`` on a real chat template removes exactly the generation prompt.
+
+    The expected span is derived from the tokenizer itself (what ``add_generation_prompt``
+    appends to the conversation prefix), so the test holds for any template version:
+    the ids are unchanged, the tokens right after the prefix leave the loss, and every
+    token the model generates (the answer and its terminator) stays supervised.
+    """
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    TOKENIZER_DIR = f"{os.environ['TEST_DATA_DIR']}/qwen3_4b_instruct_2407"
+    assert os.path.exists(TOKENIZER_DIR), "Tokenizer directory does not exist"
+    tok = NeMoAutoTokenizer.from_pretrained(TOKENIZER_DIR)
+    if not getattr(tok, "chat_template", None):
+        pytest.skip("Tokenizer qwen3_4b_instruct_2407 has no chat_template; skipping chat-template tests.")
+
+    eos_token_id = getattr(tok, "eos_token_id", 0)
+    pad_token_id = _add_pad_token(tok) or eos_token_id
+    # An answer that starts with a digit, right after the generation prompt.
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "How many legs does a spider have?"},
+        {"role": "assistant", "content": "8 legs."},
+    ]
+
+    def run(mask_generation_prompt):
+        return format_chat_template(
+            tokenizer=tok,
+            formatted_text=[dict(m) for m in messages],
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            answer_only_loss_mask=True,
+            unshifted=True,
+            mask_generation_prompt=mask_generation_prompt,
+        )
+
+    default = run(False)
+    masked = run(True)
+    assert masked["input_ids"] == default["input_ids"]
+
+    def render(add_generation_prompt):
+        text = tok.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=add_generation_prompt)
+        return tok(text, add_special_tokens=False)["input_ids"]
+
+    prefix_ids = render(False)
+    prompt_ids = render(True)
+    assert prompt_ids[: len(prefix_ids)] == prefix_ids
+    generation_prompt = prompt_ids[len(prefix_ids) :]
+    assert generation_prompt, "template must add a generation prompt"
+    assert default["input_ids"][len(prefix_ids) : len(prompt_ids)] == generation_prompt
+
+    answer_ids = tok("8 legs.", add_special_tokens=False)["input_ids"]
+    expected = list(default["loss_mask"])
+    for pos in range(len(prefix_ids), len(prompt_ids)):
+        expected[pos] = 0
+    assert masked["loss_mask"] == expected
+    # The generation prompt is the only difference, and the answer (starting with the digit)
+    # and its terminator are still supervised.
+    assert all(default["loss_mask"][pos] == 1 for pos in range(len(prefix_ids), len(prompt_ids)))
+    answer_start = len(prompt_ids)
+    assert masked["input_ids"][answer_start : answer_start + len(answer_ids)] == answer_ids
+    assert all(masked["loss_mask"][answer_start : answer_start + len(answer_ids) + 1])

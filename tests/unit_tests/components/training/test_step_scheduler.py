@@ -410,6 +410,68 @@ def test_gc_every_steps_must_be_positive():
         )
 
 
+def test_validation_still_runs_on_checkpoint_steps_by_default():
+    dataloader = SizedDataLoader(num_batches=3)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=3,
+        ckpt_every_steps=2,
+        val_every_steps=None,
+    )
+
+    observed = []
+    for _ in scheduler:
+        observed.append((scheduler.step, scheduler.is_ckpt_step, scheduler.is_val_step))
+
+    assert observed == [(0, False, False), (1, True, True), (2, True, True)]
+
+
+def test_validate_on_checkpoint_can_be_disabled_without_disabling_checkpointing():
+    dataloader = SizedDataLoader(num_batches=3)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=3,
+        ckpt_every_steps=2,
+        val_every_steps=None,
+        validate_on_checkpoint=False,
+    )
+
+    observed = []
+    for _ in scheduler:
+        observed.append((scheduler.step, scheduler.is_ckpt_step, scheduler.is_val_step))
+
+    assert observed == [(0, False, False), (1, True, False), (2, True, False)]
+
+
+def test_validate_on_checkpoint_false_preserves_periodic_validation():
+    dataloader = SizedDataLoader(num_batches=4)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=4,
+        ckpt_every_steps=3,
+        val_every_steps=2,
+        validate_on_checkpoint=False,
+    )
+
+    observed = []
+    for _ in scheduler:
+        observed.append((scheduler.step, scheduler.is_ckpt_step, scheduler.is_val_step))
+
+    assert observed == [(0, False, False), (1, False, True), (2, True, False), (3, True, True)]
+
+
 def test_set_epoch():
     dataloader = SizedDataLoader(num_batches=10)
     scheduler = StepScheduler(

@@ -16,6 +16,7 @@ import getpass
 import logging
 import os
 import socket
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -221,6 +222,13 @@ class BaseRecipe:
             return
         for key in keys:
             tracked.discard(key)
+
+    def _autocast_context(self):
+        """Return the recipe-level autocast context configured by the strategy."""
+        autocast_dtype = getattr(getattr(self, "distributed_config", None), "autocast_dtype", None)
+        if autocast_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.dist_env.device.type, dtype=autocast_dtype)
 
     def save_checkpoint(
         self,

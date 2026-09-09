@@ -65,6 +65,8 @@ def _build_gemma4_draft():
     draft_config = build_gemma4_draft_config(target_config, margs)
     assert draft_config.architectures == ["Gemma4DSparkModel"]
     assert draft_config.num_hidden_layers == 2
+    assert draft_config.global_head_dim == draft_config.per_layer_config[0].head_dim
+    assert draft_config.num_global_key_value_heads == draft_config.per_layer_config[0].num_key_value_heads
     draft_config._attn_implementation = "sdpa"
     model = Gemma4DSparkModel(draft_config).to(dtype=torch.float32).eval()
     model.initialize_embeddings_and_head(

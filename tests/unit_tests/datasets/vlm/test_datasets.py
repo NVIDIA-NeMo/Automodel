@@ -2092,3 +2092,85 @@ def test_shopify_product_catalogue_dataset_config_build(monkeypatch):
 
     assert captured == {"path_or_dataset": "Shopify/product-catalogue", "split": "test"}
     assert len(dataset) == 2
+
+
+class _LengthByTextProcessor:
+    """Processor whose token count depends on the rendered text: ``LONG`` -> 10 tokens
+    (over the test max_length), anything else -> 4 tokens whose ids encode the sample."""
+
+    def apply_chat_template(self, conversations, tokenize=False):
+        return [conversations[0][0]["content"][0]["text"]]
+
+    def __call__(self, **kwargs):
+        import torch
+
+        text = kwargs["text"][0]
+        if text == "LONG":
+            ids = list(range(100, 110))
+        else:
+            ids = [int(text)] * 4
+        return {
+            "input_ids": torch.tensor([ids]),
+            "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+        }
+
+
+class TestPreTokenizedDatasetWrapperReplacementDeterminism:
+    """Over-long (or otherwise unusable) samples are replaced by a substitute chosen
+    from a per-sample RNG, never from the process-global ``random`` state.
+
+    Regression test: with the global RNG, ranks whose ``random`` stream had
+    advanced differently (e.g. the per-node dataset-building rank) substituted a
+    different document, so context-parallel ranks of one CP group saw different
+    packs / ``cu_seqlens`` for the same microbatch and TE's ring-attention gradient
+    accumulation produced inf/nan (or silently wrong) dk/dv.
+    """
+
+    def _stub_pipeline(self, monkeypatch):
+        import torch
+
+        import nemo_automodel.components.datasets.vlm.collate_fns as collate_fns
+        import nemo_automodel.components.datasets.vlm.fake_image as fake_image
+
+        monkeypatch.setattr(ds, "_preload_media", lambda example, processor, **kw: example)
+        monkeypatch.setattr(ds, "_build_video_metadata", lambda conversation: None)
+        monkeypatch.setattr(fake_image, "_conversation_has_media", lambda conversation: False)
+        monkeypatch.setattr(collate_fns, "_extract_media_from_conversations", lambda conversations: ([], []))
+        monkeypatch.setattr(
+            collate_fns,
+            "build_labels_from_template",
+            lambda input_ids, conversations, processor: torch.zeros_like(input_ids),
+        )
+
+    def _make_dataset(self, n=64):
+        def conv(text):
+            return {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": text}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                ]
+            }
+
+        return [conv("LONG")] + [conv(str(i)) for i in range(1, n)]
+
+    def test_substitute_is_independent_of_global_random_state(self, monkeypatch):
+        import random
+
+        self._stub_pipeline(monkeypatch)
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            self._make_dataset(), _LengthByTextProcessor(), max_length=4, truncate=False, inject_fake_images=False
+        )
+
+        random.seed(1)
+        first = wrapper[0]["input_ids"].tolist()
+        random.seed(2)
+        second = wrapper[0]["input_ids"].tolist()
+        random.seed(3)
+        third = wrapper[0]["input_ids"].tolist()
+
+        assert first != list(range(100, 110)), "the over-long sample must have been replaced"
+        assert first == second == third, "the substitute must not depend on the process-global RNG state"
+
+    def test_different_samples_get_different_substitute_streams(self):
+        draws = {ds._replacement_rng(idx).randint(0, 10**9) for idx in range(32)}
+        assert len(draws) > 1
