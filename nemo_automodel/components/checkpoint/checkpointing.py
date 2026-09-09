@@ -199,6 +199,23 @@ def _should_dequantize_base_checkpoint(model: nn.Module, requested: bool | None)
     return quantization_method is not None
 
 
+def _get_shared_parameter_names(model_parts: list[nn.Module]) -> list[list[str]]:
+    """Find checkpoint names referring to the same live parameter.
+
+    Args:
+        model_parts: Model or pipeline parts after state-dict normalization.
+
+    Returns:
+        Groups of canonical names sharing one parameter object. Equal-valued
+        independent parameters are not aliases, including after sharding.
+    """
+    names_by_parameter: dict[int, list[str]] = {}
+    for part in model_parts:
+        for name, parameter in _unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
+            names_by_parameter.setdefault(id(parameter), []).append(canonical_parameter_fqn(name))
+    return [names for names in names_by_parameter.values() if len(names) > 1]
+
+
 def _normalize_dtype_mapping_to_state_dict_keys(
     fqn_to_dtype_mapping: dict[str, str], state_dict_keys: list[str], base_model_prefix: str | None = None
 ) -> dict[str, str]:
@@ -995,7 +1012,10 @@ class Checkpointer:
         )
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys:
+        shared_parameter_names = (
+            _get_shared_parameter_names(model_state.model) if is_init_step and uses_standard_hf_state_dict else []
+        )
+        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys or shared_parameter_names:
             checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
         if extra_state_keys:
             missing_extra_state_keys = [key for key in extra_state_keys if key not in checkpoint_metadata_keys]
@@ -1033,6 +1053,18 @@ class Checkpointer:
                         lm_head_param_name,
                     )
                     state_dict.pop(lm_head_param_name, None)
+
+        # HF safetensors can omit any alias of a shared parameter, not just the LM head. Only omit a destination
+        # when the same live parameter has a saved source; genuinely missing parameters must still fail DCP planning.
+        shared_alias_sources: dict[str, str] = {}
+        for names in shared_parameter_names:
+            source_name = next((name for name in names if name in checkpoint_metadata_keys), None)
+            if source_name is None:
+                continue
+            for name in names:
+                if name in state_dict and name not in checkpoint_metadata_keys:
+                    state_dict.setdefault(source_name, state_dict.pop(name))
+                    shared_alias_sources[name] = source_name
 
         if allow_checkpoint_key_subset:
             missing_checkpoint_keys = sorted(key for key in state_dict if key not in checkpoint_metadata_keys)
@@ -1079,6 +1111,13 @@ class Checkpointer:
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
+
+        for alias_name, source_name in shared_alias_sources.items():
+            state_dict[alias_name] = state_dict[source_name]
+        # A checkpoint may keep only an alias omitted from the original destinations (e.g. a local tied LM head).
+        # It was needed for the read, but restore the original key set for installation and mismatch reporting.
+        for source_name in set(shared_alias_sources.values()) - expected_keys:
+            state_dict.pop(source_name)
 
         state_dict = _maybe_adapt_state_dict_from_hf(
             model_state.model[0],
