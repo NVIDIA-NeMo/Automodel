@@ -22,13 +22,14 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from nemo_automodel import export_merged_peft_checkpoint
+from nemo_automodel._transformers.peft_export import _merge_and_get_hf_state_dict
 from nemo_automodel.components._peft.lora import LinearLoRA
-from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 
 _NUM_EXPERTS = 4
 _REQUESTED_RANK = 6
@@ -215,3 +216,20 @@ def test_export_cuda_grouped_experts_writes_serializable_tensors(tmp_path):
     exported = _load_sharded_state_dict(output_dir)
     assert "backbone.layers.0.mixer.experts.0.up_proj.weight" in exported
     assert "backbone.layers.0.mixer.experts.0.down_proj.weight" in exported
+
+
+def test_merge_rejects_mixed_supported_and_unsupported_lora_before_mutating_weights():
+    """A dense adapter must not hide unsupported DeepEP expert adapters."""
+    model = _TinyAutoModelPeftModel()
+    mixer = model.model.layers[0].mixer
+    mixer.experts = GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP(_moe_config()), lora_dim=_EXPERT_RANK)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(0.5)
+    original_state = {key: tensor.clone() for key, tensor in model.state_dict().items()}
+
+    with pytest.raises(RuntimeError, match="does not support.*mixer.experts.lora_"):
+        _merge_and_get_hf_state_dict(model)
+
+    for key, tensor in model.state_dict().items():
+        torch.testing.assert_close(tensor, original_state[key], rtol=0, atol=0)
