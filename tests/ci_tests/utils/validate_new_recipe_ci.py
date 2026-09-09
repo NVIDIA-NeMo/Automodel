@@ -48,7 +48,7 @@ UTILS_DIR = Path(__file__).resolve().parent
 if str(UTILS_DIR) not in sys.path:
     sys.path.insert(0, str(UTILS_DIR))
 
-from generate_ci_tests import AUTO_DISCOVER_SCOPES  # noqa: E402
+from generate_ci_tests import AUTO_DISCOVER_SCOPES, MODEL_VERIFICATION_CARD_SUFFIX  # noqa: E402
 
 # ci: keys every newly added CI recipe must declare.
 REQUIRED_CI_FIELDS = ("recipe_owner", "time", "nodes")
@@ -92,6 +92,8 @@ def listed_recipe_paths(automodel_dir: Path) -> set[Path]:
 
 def is_ci_enabled(rel_path: Path, subpaths: set[str], listed: set[Path]) -> bool:
     """Whether ``rel_path`` (relative to the repo root) is a recipe CI will run."""
+    if rel_path.name.endswith(MODEL_VERIFICATION_CARD_SUFFIX):
+        return False
     if rel_path in listed:
         return True
     return any(_is_relative_to(rel_path, Path("examples") / subpath) for subpath in subpaths)

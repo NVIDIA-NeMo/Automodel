@@ -23,6 +23,7 @@ To invoke a skill manually, use `/<skill-name>` in your Claude Code session.
 | `nemo-automodel-recipe-development` | Create and modify training/eval recipes |
 | `nemo-automodel-distributed-training` | FSDP2, HSDP, pipeline/context parallelism |
 | `nemo-automodel-launcher-config` | Slurm and SkyPilot job submission |
+| `nemo-automodel-model-verification-card` | Create and validate model verification cards beside examples |
 
 ## Contributor Skills
 

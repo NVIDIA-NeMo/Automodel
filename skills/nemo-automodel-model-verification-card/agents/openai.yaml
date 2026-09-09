@@ -1,0 +1,4 @@
+interface:
+  display_name: "NeMo AutoModel Verification Cards"
+  short_description: "Create and validate AutoModel verification cards"
+  default_prompt: "Use $nemo-automodel-model-verification-card to create or update a model verification card."
