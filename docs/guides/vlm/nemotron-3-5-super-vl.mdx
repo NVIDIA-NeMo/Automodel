@@ -19,8 +19,8 @@ Key architectural details:
 - **LLM backbone**: NemotronV3 hybrid, 88 layers (40 Mamba2, 8 attention, 40 MoE), hidden dim 4096
 - **MoE**: 512 routed experts per MoE layer, top-22 routing plus 1 shared expert
 - **Vision encoder**: RADIO v2.5-H (ViT-Huge), 512x512 tiles, 256 vision tokens per tile
-- **Audio**: this vision-pretrained checkpoint ships no `sound_config`, so no audio tower is built
-- **MTP**: the checkpoint ships one multi-token-prediction head; the recipe below keeps it off (`num_nextn_predict_layers: 0`)
+- **Audio**: This vision-pretrained checkpoint ships no `sound_config`, so no audio tower is built
+- **MTP**: The checkpoint ships one multi-token-prediction head; the recipe below keeps it off (`num_nextn_predict_layers: 0`)
 - **Parameters**: 120.7B trainable with the vision tower frozen (99.31% of the model); ~227 GB in bf16
 
 ## Fine-Tune for Receipt Field Extraction
