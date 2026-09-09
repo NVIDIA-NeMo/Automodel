@@ -19,6 +19,7 @@ import pathlib
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -27,7 +28,6 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
-from nemo_automodel.shared.tp_replicas import synchronize_tp_replica_gradients
 
 logger = logging.getLogger(__name__)
 

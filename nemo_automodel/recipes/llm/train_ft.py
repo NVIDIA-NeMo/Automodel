@@ -63,6 +63,7 @@ from nemo_automodel.components.distributed.context_parallel.magi import MagiStat
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -1244,6 +1245,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,

@@ -25,14 +25,14 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.shared.tp_replicas import (
+from nemo_automodel.components.distributed.tp_replicas import (
     _is_tp_replicated,
     broadcast_tp_replicas,
     exclude_from_tp_replica_sync,
     mark_tp_replica_gradient_reduction,
     synchronize_tp_replica_gradients,
 )
+from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
 
 class _ParameterHolder(nn.Module):
@@ -278,7 +278,7 @@ def _run_replica_sync_worker(rank: int, world_size: int, init_file: str) -> None
         bfloat_replica.weight.grad = torch.tensor([1.0 + rank], dtype=torch.bfloat16)
         original_all_reduce = torch.distributed.all_reduce
         with patch(
-            "nemo_automodel.shared.tp_replicas.dist.all_reduce",
+            "nemo_automodel.components.distributed.tp_replicas.dist.all_reduce",
             wraps=original_all_reduce,
         ) as all_reduce:
             assert synchronize_tp_replica_gradients([bfloat_replica], tp_mesh) == 1
@@ -366,6 +366,7 @@ def _run_replica_sync_case(rank: int, world_size: int, accumulation_steps: int, 
     clip_coefficient = min(1.0, 1.0 / (expected_norm.item() + 1.0e-6))
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
+    synchronize_tp_replica_gradients([model], tp_mesh)
     actual_norm = scale_grads_and_clip_grad_norm(
         1.0,
         [model],

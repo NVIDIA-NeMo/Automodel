@@ -133,32 +133,6 @@ def test_clip_grad_norm_works_without_pp():
     assert grad_norm > 0
 
 
-def test_clip_grad_norm_does_not_synchronize_tp_replicas(monkeypatch):
-    """Gradient clipping remains independent from optimizer-boundary synchronization."""
-    model = torch.nn.Linear(2, 2)
-    device_mesh = object()
-    sync_mock = Mock(return_value=1)
-    monkeypatch.setattr(training_utils, "synchronize_tp_replica_gradients", sync_mock)
-
-    grad_norm = clip_grad_norm(max_grad_norm=None, model_parts=[model], device_mesh=device_mesh)
-
-    assert grad_norm == 0.0
-    sync_mock.assert_not_called()
-
-
-def test_scale_grads_and_clip_grad_norm_synchronizes_tp_replicas_once(monkeypatch):
-    """The scaling boundary does not repeat the synchronization during clipping."""
-    model = torch.nn.Linear(2, 2)
-    device_mesh = object()
-    sync_mock = Mock(return_value=1)
-    monkeypatch.setattr(training_utils, "synchronize_tp_replica_gradients", sync_mock)
-
-    grad_norm = scale_grads_and_clip_grad_norm(None, [model], device_mesh=device_mesh)
-
-    assert grad_norm == 0.0
-    sync_mock.assert_called_once_with([model], device_mesh)
-
-
 @pytest.mark.parametrize(
     ("gradient", "expected"),
     [

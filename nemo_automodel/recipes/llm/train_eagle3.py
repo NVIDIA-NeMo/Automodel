@@ -53,6 +53,7 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
 from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
@@ -78,7 +79,6 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     should_sync_grads,
 )
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
-from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 
 logger = logging.getLogger(__name__)
 

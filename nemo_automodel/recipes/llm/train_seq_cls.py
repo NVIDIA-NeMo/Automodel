@@ -25,6 +25,7 @@ import wandb
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -41,7 +42,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     _get_model_name,
     build_model,
 )
-from nemo_automodel.shared.tp_replicas import synchronize_tp_replica_gradients
 
 logger = logging.getLogger(__name__)
 

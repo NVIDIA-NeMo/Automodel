@@ -51,6 +51,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
@@ -68,7 +69,6 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     raise_if_peft_configured,
     should_sync_grads,
 )
-from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 
 logger = logging.getLogger(__name__)
 

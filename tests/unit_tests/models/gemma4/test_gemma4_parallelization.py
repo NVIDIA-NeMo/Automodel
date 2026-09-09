@@ -18,8 +18,8 @@ from types import SimpleNamespace
 
 import torch.nn as nn
 
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 from nemo_automodel.components.models.gemma4_moe.parallelization import _gemma4_tp_plan
-from nemo_automodel.shared.tp_replicas import ReplicatedWithGradAllReduce
 
 
 def test_gemma4_tp_plan_sums_head_local_qk_norm_gradients() -> None:

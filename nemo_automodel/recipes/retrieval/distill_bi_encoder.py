@@ -15,6 +15,7 @@ import torch.distributed
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.embedding_distill import EmbeddingDistillLoss, EmbeddingMSELoss, ScoreDistillLoss
@@ -555,6 +556,7 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
 
         self._sync_projection_gradients()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,

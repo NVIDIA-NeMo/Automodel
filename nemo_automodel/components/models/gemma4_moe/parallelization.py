@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from nemo_automodel.shared.tp_replicas import ReplicatedWithGradAllReduce
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 
 
 class _ReduceFromTensorParallelRegion(torch.autograd.Function):

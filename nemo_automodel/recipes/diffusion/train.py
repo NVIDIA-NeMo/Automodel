@@ -28,6 +28,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -43,7 +44,6 @@ from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.import_utils import safe_import_from
-from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.shared.utils import dtype_from_str
 
 # Removed diffusion-only YAML keys and their standard replacements. The diffusion

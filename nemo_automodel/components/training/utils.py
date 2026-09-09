@@ -22,7 +22,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
-from nemo_automodel.shared.tp_replicas import synchronize_tp_replica_gradients
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -435,10 +434,11 @@ def scale_grads_and_clip_grad_norm(
     expert_tp_replication_factor: int = 1,
     use_torch_clip_grad_norm: bool = False,
 ) -> torch.Tensor | float:
-    """Synchronize TP replicas, scale gradients for PP/EP, then clip.
+    """Scale gradients for PP/EP and model-owned shards, then clip.
 
-    - TP replica synchronization: reduce once after gradient accumulation and
-      before any scaling, norm calculation, or clipping.
+    The caller must synchronize TP-replicated gradients once after accumulation
+    and before calling this function. This helper does not synchronize replicas.
+
     - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
     - EP scaling: for parameters on the expert axis, divide grads by
       ``(dp_group_size / ep_shard_size) * expert_tp_replication_factor``.
@@ -450,8 +450,6 @@ def scale_grads_and_clip_grad_norm(
         Scalar tensor containing the total gradient norm without synchronizing it to the host,
         or 0.0 when clipping is disabled.
     """
-
-    synchronize_tp_replica_gradients(model_parts, device_mesh)
 
     # Precompute scale factors
     pp_divisor: float | None = None

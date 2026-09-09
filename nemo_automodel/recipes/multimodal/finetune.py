@@ -47,6 +47,7 @@ import torch.distributed as dist
 import wandb
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
@@ -62,7 +63,6 @@ from nemo_automodel.components.training.utils import clip_grad_norm  # noqa: E40
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
 from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
-from nemo_automodel.shared.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 
 try:
     from pydantic.warnings import UnsupportedFieldAttributeWarning

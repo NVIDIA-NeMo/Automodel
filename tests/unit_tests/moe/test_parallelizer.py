@@ -665,9 +665,9 @@ def test_apply_ep_excludes_te_owned_experts_from_tp_replica_sync(monkeypatch):
 
     monkeypatch.setattr(P, "GroupedExpertsTE", DummyGroupedExpertsTE)
     exclude_mock = MagicMock()
-    tp_replicas_stub = types.ModuleType("nemo_automodel.shared.tp_replicas")
+    tp_replicas_stub = types.ModuleType("nemo_automodel.components.distributed.tp_replicas")
     tp_replicas_stub.exclude_from_tp_replica_sync = exclude_mock
-    monkeypatch.setitem(sys.modules, "nemo_automodel.shared.tp_replicas", tp_replicas_stub)
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.tp_replicas", tp_replicas_stub)
 
     P.apply_ep(model, ep_mesh, moe_mesh=moe_mesh)
 
