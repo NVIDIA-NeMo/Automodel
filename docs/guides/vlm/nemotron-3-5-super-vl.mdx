@@ -5,7 +5,7 @@ position: 15
 ---
 **A step-by-step guide for fine-tuning Nemotron 3.5 Super VL (121B hybrid Mamba+Attention MoE VLM)
 to extract structured receipt data from scanned images using
-[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel). Full SFT on 8 nodes or LoRA on a single node,
+[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel). Full SFT on 4 nodes or LoRA on a single node,
 then inference and evaluation on the CORD-v2 validation split.**
 
 ---
@@ -46,19 +46,20 @@ The **base model** produces free-form descriptions. After fine-tuning, it output
 | **Step 0** | Environment setup |
 | **Step 1** | Explore the CORD-v2 dataset |
 | **Step 2** | Training configuration (full SFT and LoRA) |
-| **Step 3** | Launch fine-tuning (8 nodes for SFT, 1 node for LoRA) |
+| **Step 3** | Launch fine-tuning (4 nodes for SFT, 1 node for LoRA) |
 | **Step 4** | Run inference and evaluation on the fine-tuned model |
 | **Step 5** | Results |
 
 ## Hardware Requirements
 
-- **8 nodes x 8 H100 80 GB** (512 experts sharded with
-  `ep_size=32`; `cp_size=8` so the 8-sample global batch is one sample per data-parallel rank)
-- **SFT memory**: ~31.8 GiB per GPU (fp32 master weights, bf16 Adam moments, activation checkpointing),
-  leaving headroom for the validation-time checkpoint saves.
-- **Training time**: ~26 min on 8x8 H100 for 400 steps (4 epochs of the 800 training samples), including four
-  validation passes with checkpoint saves and the final consolidated export (~1 min); about 32 min wall clock
-  with model loading
+- **4 nodes x 8 H100 80 GB** (512 experts sharded with
+  `ep_size=32`; `cp_size=4` so the 8-sample global batch is one sample per data-parallel rank)
+- **SFT memory**: ~65 GiB per GPU (fp32 master weights, bf16 Adam moments, activation checkpointing). The frozen
+  RADIO tower is replicated on every rank (`frozen_sharding: replicate`) and checkpoint state dicts are moved to
+  CPU before they are written (`checkpoint.cpu_offload: true`), so the validation-time saves need no GPU headroom.
+- **Training time**: ~21 min on 4x8 H100 for 400 steps (4 epochs of the 800 training samples), including four
+  validation passes with checkpoint saves; about 26 min wall clock with model loading and the final consolidated
+  export
 - **LoRA PEFT**: one node x 8 H100 (`cp_size 1` / `ep_size 8`, ~39 GiB per GPU). The frozen base needs no fp32
   master copy or optimizer state.
 
@@ -81,7 +82,7 @@ uv sync --locked --all-groups --all-extras
 Nemotron 3.5 Super VL requires `mamba_ssm` and `causal_conv1d` (the `cuda` extra, pre-built in the
 NeMo AutoModel container), Transformer Engine (`attn: te`, `linear: te`) and DeepEP for
 expert dispatch. The checkpoint is ~227 GB in bf16 (63 safetensors shards); download it into
-`$HF_HOME` before launching so that all 64 ranks read from the shared cache.
+`$HF_HOME` before launching so that all 32 ranks read from the shared cache.
 </Note>
 
 ---
@@ -163,15 +164,18 @@ checkpoint:
   checkpoint_dir: vlm_checkpoints/nemotron_3_5_super_vl_cord_v2
   model_save_format: safetensors
   save_consolidated: final
+  cpu_offload: true     # stage model/optimizer state dicts on CPU before writing
 
 distributed:
   strategy: fsdp2
-  cp_size: 8            # dp 8 on 64 GPUs -> one sample per rank per step
+  cp_size: 4            # dp 8 on 32 GPUs -> one sample per rank per step
   ep_size: 32           # 512 MoE experts across 32 GPUs
   activation_checkpointing: true
   reshard_after_forward: true
   moe:
     reshard_after_forward: true
+  multimodal:
+    frozen_sharding: replicate   # frozen RADIO tower kept whole on every rank
 
 freeze_config:
   freeze_embeddings: true
@@ -201,7 +205,7 @@ optimizer:
 ```
 
 Compared with the 33B NemotronOmni recipe: `ep_size` grows from 8 to 32 (512 experts),
-`cp_size=8` on 64 GPUs maps the 8-sample global batch to one sample per rank, the optimizer keeps **fp32 master weights** with
+`cp_size=4` on 32 GPUs maps the 8-sample global batch to one sample per rank, the optimizer keeps **fp32 master weights** with
 bf16 Adam moments, and the learning rate is lowered to 5e-5 for full-parameter SFT of a 121B model.
 
 ### LoRA PEFT Config
@@ -266,15 +270,15 @@ builds the training labels.
 
 ## Step 3 — Launch Fine-Tuning
 
-On a Slurm cluster (one task per GPU, 8 nodes):
+On a Slurm cluster (one task per GPU, 4 nodes):
 
 ```bash
-srun --nodes=8 --ntasks-per-node=8 --gpus-per-node=8 \
+srun --nodes=4 --ntasks-per-node=8 --gpus-per-node=8 \
     python examples/vlm_finetune/finetune.py \
     -c examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml
 ```
 
-or with the launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 8`.
+or with the launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 4`.
 W&B logging is opt-in: add `--wandb.enable=true --wandb.entity=<entity> --wandb.project=<project>` to either command.
 
 ### LoRA PEFT
@@ -317,24 +321,23 @@ Validation:
 Trainable parameters: 120,668,687,360
 Trainable parameters percentage: 99.31%
 
-step    0 | loss 0.5063 | grad_norm  6.40 | lr 5.00e-05 | mem 31.83 GiB
-step   10 | loss 0.1666 | grad_norm  2.93 | lr 5.00e-05 | mem 31.83 GiB
-step   50 | loss 0.0911 | grad_norm  1.13 | lr 5.00e-05 | mem 31.83 GiB
-step  100 | loss 0.0581 | grad_norm  1.33 | lr 5.00e-05 | mem 31.83 GiB
-step  200 | loss 0.0279 | grad_norm  0.96 | lr 5.00e-05 | mem 31.83 GiB
-step  300 | loss 0.0669 | grad_norm  1.18 | lr 5.00e-05 | mem 31.83 GiB
-step  399 | loss 0.0046 | grad_norm  0.26 | lr 5.00e-05 | mem 31.83 GiB
+step    0 | loss 0.5057 | grad_norm  6.11 | lr 5.00e-05 | mem 65.02 GiB
+step   10 | loss 0.1518 | grad_norm  3.28 | lr 5.00e-05 | mem 65.02 GiB
+step   50 | loss 0.0806 | grad_norm  1.01 | lr 5.00e-05 | mem 65.02 GiB
+step  100 | loss 0.0839 | grad_norm  1.96 | lr 5.00e-05 | mem 65.02 GiB
+step  200 | loss 0.0219 | grad_norm  0.58 | lr 5.00e-05 | mem 65.02 GiB
+step  300 | loss 0.0298 | grad_norm  0.88 | lr 5.00e-05 | mem 65.02 GiB
+step  399 | loss 0.0114 | grad_norm  0.39 | lr 5.00e-05 | mem 65.02 GiB
 
 Validation:
-  step  99 | val_loss 0.0610  <-- LOWEST_VAL
-  step 199 | val_loss 0.0676
-  step 299 | val_loss 0.0726
-  step 399 | val_loss 0.0755
+  step  99 | val_loss 0.0753
+  step 199 | val_loss 0.0710
+  step 299 | val_loss 0.0684  <-- LOWEST_VAL
+  step 399 | val_loss 0.0796
 ```
 
-As with the 33B model, training loss keeps falling through epoch 4 while validation loss is lowest
-after the first epoch and then drifts up slowly — the 800-receipt training set is small enough for a
-121B model to start memorizing it.
+Training loss keeps falling through epoch 4 while validation loss bottoms out at epoch 3 and rises
+in the last epoch — the 800-receipt training set is small enough for a 121B model to start memorizing it.
 
 ### Checkpoints saved
 
@@ -355,7 +358,7 @@ vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/
     rng/
     dataloader/
   LATEST -> epoch_3_step_399
-  LOWEST_VAL -> epoch_0_step_99
+  LOWEST_VAL -> epoch_2_step_299
   training.jsonl
   validation.jsonl
 ```
@@ -418,30 +421,30 @@ its free-form descriptions run to the token limit.
 | Model | Exact match | Mean similarity | Structured output |
 |---|---|---|---|
 | Base (`NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`) | 0/20 | 0.048 | 0/20 (free-form description of the photo) |
-| Full SFT, step 99 (`LOWEST_VAL`, val loss 0.061) | **8/20** | **0.956** (median 0.995; 17/20 above 0.9) | 20/20 |
-| Full SFT, step 399 (`LATEST`, lr=5e-5, 400 steps) | 6/20 | 0.889 (median 0.985; 15/20 above 0.9) | 20/20 |
+| Full SFT, step 399 (`LATEST`, lr=5e-5, 400 steps) | 5/20 | 0.923 (median 0.989; 14/20 above 0.9) | 20/20 |
 | LoRA PEFT, step 199 (`LOWEST_VAL`, val loss 0.039) | 8/20 | 0.954 (median 0.997; 15/20 above 0.9) | 20/20 |
 
-The checkpoint with the lowest validation loss also decodes best, so evaluate `LOWEST_VAL` (run its
-`model/consolidate.sh` first; the final step is the only one exported inline).
+Validation loss is lowest at step 299 (`LOWEST_VAL`); that checkpoint is stored sharded, so run its
+`model/consolidate.sh` and point `eval_cord_v2.py` at the export to score it the same way (the final step is the
+only one exported inline).
 
 The base model answers `Describe this image.` with prose ("This is a photograph of a receipt from a
 restaurant, likely a pizzeria ..."). After fine-tuning every prediction is a well-formed
 `<s_total>...</s_total><s_menu>...</s_menu>` sequence; the remaining errors are field-level (a
 dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or OCR digits.
 
-### Sample predictions (fine-tuned, step 99 / `LOWEST_VAL`)
+### Sample predictions (fine-tuned, step 399 / `LATEST`)
 
 | Sample | Ground-truth menu items | Prediction vs. ground truth | Similarity |
 |--------|-------------------------|-----------------------------|------------|
 | 1 | `REAL GANACHE, EGG TART, PIZZA TOAST` | Exact match | 1.00 |
 | 2 | `Kopi Susu Kolonel` | Exact match | 1.00 |
-| 3 | `S-Ovaltine 50%` | Missing `<s_vatyn>`; items nested in an extra `<s_sub>` block | 0.91 |
-| 4 | `70%, Less Ice, M-Caramel Black Tea` | Missing `<s_tax_price>` | 0.96 |
-| 5 | `Sedang, BBQ Chicken` | Same fields, one value differs | 1.00 |
-| 6 | `LE MINERAL` | Extra `<s_unitprice>` field | 0.84 |
+| 3 | `S-Ovaltine 50%` | Missing `<s_vatyn>`; items nested in an extra `<s_sub>` block | 0.72 |
+| 4 | `70%, Less Ice, M-Caramel Black Tea` | Same fields, one value differs | 0.99 |
+| 5 | `Sedang, BBQ Chicken` | `<s_menutype_cnt>` where the label has `<s_menuqty_cnt>` | 0.61 |
+| 6 | `LE MINERAL` | Extra menu item (`<s_nm>`, `<s_price>`, `<s_unitprice>`) | 0.61 |
 | 7 | `POTATO SAUSAGE BREAD, OREO GREEN TEA SPREAD, ...` | Exact match | 1.00 |
-| 8 | `Choco Devil` | Missing `<s_cnt>` and `<s_discountprice>` | 0.88 |
+| 8 | `Choco Devil` | Missing `<s_discountprice>`; extra menu item | 0.86 |
 
 ### Summary
 
@@ -449,9 +452,9 @@ dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or
 |---|---|---|
 | Trainable params | 120.7B (99.31%) | 177M (0.15%) |
 | Learning rate | 5e-5 | 2e-4 (both TE FusedAdam, fp32 master weights) |
-| GPU memory | ~31.8 GiB / GPU (64 GPUs) | ~39 GiB / GPU (8 GPUs) |
-| Training time | ~26 min on 8x8 H100 (~32 min wall clock) | ~13 min on 1x8 H100 |
-| Best val loss | 0.061 (step 99) | 0.039 (step 199) |
-| Final train loss | 0.0046 (step 399; mean of last 10 steps 0.029) | 0.0067 (step 399; mean of last 10 steps 0.014) |
+| GPU memory | ~65 GiB / GPU (32 GPUs) | ~39 GiB / GPU (8 GPUs) |
+| Training time | ~21 min on 4x8 H100 (~26 min wall clock) | ~13 min on 1x8 H100 |
+| Best val loss | 0.068 (step 299) | 0.039 (step 199) |
+| Final train loss | 0.0114 (step 399; mean of last 10 steps 0.029) | 0.0067 (step 399; mean of last 10 steps 0.014) |
 | Checkpoint size | ~227 GB (consolidated bf16) | ~355 MB (adapter only) |
-| Exact matches (20 val) | 8/20 at step 99 (`LOWEST_VAL`, mean similarity 0.96); 6/20 at step 399 (0.89) | 8/20 at step 199 (`LOWEST_VAL`, mean similarity 0.95) |
+| Exact matches (20 val) | 5/20 at step 399 (`LATEST`, mean similarity 0.92) | 8/20 at step 199 (`LOWEST_VAL`, mean similarity 0.95) |
