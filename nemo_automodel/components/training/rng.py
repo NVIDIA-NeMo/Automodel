@@ -47,7 +47,7 @@ def init_all_rng(seed: int, ranked: bool = False):
         torch.cuda.manual_seed_all(seed)
 
 
-class _RNGState(TypedDict):
+class RNGStateDict(TypedDict):
     """Weights-only-safe snapshot of Python, NumPy, Torch, and CUDA RNG states."""
 
     random_rng_state: tuple[int, tuple[int, ...], float | None]
@@ -70,7 +70,7 @@ class RNGState:
     cuda_rng_state: list[torch.Tensor]
 
 
-def _get_rng_state() -> _RNGState:
+def get_rng_state() -> RNGStateDict:
     """Get current RNG states.
 
     Returns:
@@ -90,7 +90,7 @@ def _get_rng_state() -> _RNGState:
     }
 
 
-def _restore_rng_state(state: _RNGState | RNGState) -> None:
+def restore_rng_state(state: RNGStateDict | RNGState) -> None:
     """Restore RNG states from a saved state.
 
     Args:
@@ -133,21 +133,21 @@ class StatefulRNG:
         self.ranked = ranked
         init_all_rng(self.seed, self.ranked)
 
-    def state_dict(self) -> _RNGState:
+    def state_dict(self) -> RNGStateDict:
         """Get current RNG states.
 
         Returns:
             dict: RNG states for random, NumPy, and PyTorch.
         """
-        return _get_rng_state()
+        return get_rng_state()
 
-    def load_state_dict(self, state: _RNGState | RNGState) -> None:  # pragma: no cover
+    def load_state_dict(self, state: RNGStateDict | RNGState) -> None:  # pragma: no cover
         """Restore RNG states from a saved state.
 
         Args:
             state (dict): RNG states as returned by state_dict().
         """
-        _restore_rng_state(state)
+        restore_rng_state(state)
 
 
 class ScopedRNG:
@@ -167,11 +167,12 @@ class ScopedRNG:
     def __enter__(self):
         """Save current RNG states."""
         assert self._saved_state is None
-        self._saved_state = _get_rng_state()
+        self._saved_state = get_rng_state()
         init_all_rng(self.seed, self.ranked)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         """Restore RNG states on context exit."""
-        _restore_rng_state(self._saved_state)
+        assert self._saved_state is not None
+        restore_rng_state(self._saved_state)
         self._saved_state = None

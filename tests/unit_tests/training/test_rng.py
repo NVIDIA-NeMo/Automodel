@@ -20,7 +20,14 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.components.training.rng import RNGState, ScopedRNG, StatefulRNG, init_all_rng
+from nemo_automodel.components.training.rng import (
+    RNGState,
+    ScopedRNG,
+    StatefulRNG,
+    get_rng_state,
+    init_all_rng,
+    restore_rng_state,
+)
 
 
 def _next_values():
@@ -129,6 +136,18 @@ def test_stateful_rng_round_trips_with_restricted_torch_load(tmp_path):
     expected = _next_values()
     loaded_state = torch.load(checkpoint, weights_only=True)
     rng.load_state_dict(loaded_state)
+
+    assert _next_values() == expected
+
+
+def test_rng_state_helpers_restore_state():
+    """Public helpers restore the state of every CPU RNG backend."""
+    init_all_rng(1618)
+    state = get_rng_state()
+    expected = _next_values()
+
+    _next_values()
+    restore_rng_state(state)
 
     assert _next_values() == expected
 
