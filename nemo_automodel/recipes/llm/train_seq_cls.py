@@ -229,10 +229,18 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        # Each backward() adds to .grad, so accumulating N micro-batch means
-        # gives N x the mean over the full accumulated batch. Divide it back out
-        # so gradients do not depend on how a global batch is split.
-        num_batches = len(batches)
+        # Global number of labels over the whole accumulated batch and every DP
+        # rank. Normalizing the backward loss by this -- rather than by a local
+        # per-microbatch mean -- is what makes the gradient invariant to both the
+        # micro-batch split and dp_size. It is the convention train_ft.py uses
+        # with num_label_tokens, and it is what makes the `* dp_size` below
+        # correct: that factor cancels the DP gradient average, which only
+        # reconstructs the global mean when the denominator is already global.
+        num_label_samples = torch.tensor(
+            sum(batch["labels"].numel() for batch in batches),
+            dtype=torch.long,
+        )
+        num_label_samples = max(int(self._dp_allreduce(num_label_samples).item()), 1)
 
         for batch in batches:
             batch = {
@@ -250,7 +258,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds.detach())
             all_labels.append(labels.view(-1).detach())
-            (loss * self._get_dp_group_size(include_cp=True) / num_batches).backward()
+            # `loss` is the mean over this micro-batch, so `loss * n_local` is its
+            # summed loss; dividing by the global count gives this micro-batch's
+            # share of the global mean. Every sequence-classification sample
+            # carries exactly one label, so `numel()` is the supervised count and
+            # matches how num_label_samples above was accumulated.
+            local_loss = loss * labels.numel() / num_label_samples
+            (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
         # Calculate gradient norm (distributed-aware)
         grad_norm = clip_grad_norm(

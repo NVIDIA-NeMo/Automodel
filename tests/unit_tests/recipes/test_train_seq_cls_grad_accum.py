@@ -118,3 +118,86 @@ def test_gradients_are_invariant_to_microbatch_split(split):
         assert torch.allclose(g_many, g_one, rtol=1e-5, atol=1e-6), (
             f"{split} micro-batches scaled the gradient by ~{ratio:.2f}x"
         )
+
+
+# ---------------------------------------------------------------------------
+# Data-parallel scaling
+# ---------------------------------------------------------------------------
+
+
+def _ddp_averaged_grads(dp_size, accum, per_rank_bs, seed=0):
+    """Run one step on every simulated DP rank and average the grads, as DDP does.
+
+    ``_dp_allreduce`` is a SUM across ranks, so with equally sized shards it
+    multiplies a per-rank count by ``dp_size``.
+    """
+    torch.manual_seed(seed)
+    reference = _TinyClassifier()
+    init_state = {k: v.clone() for k, v in reference.state_dict().items()}
+
+    total = dp_size * accum * per_rank_bs
+    torch.manual_seed(123)
+    input_ids = torch.randint(0, VOCAB, (total, 4))
+    labels = torch.randint(0, N_CLASSES, (total,))
+
+    per_rank_grads = []
+    for rank in range(dp_size):
+        model = _TinyClassifier()
+        model.load_state_dict(init_state)
+        recipe = _make_recipe(model)
+        recipe._get_dp_group_size = lambda include_cp=False: dp_size
+        recipe._dp_allreduce = lambda t, *a, **k: t * dp_size
+
+        batches = []
+        for a in range(accum):
+            lo = (rank * accum + a) * per_rank_bs
+            hi = lo + per_rank_bs
+            batches.append(
+                {
+                    "input_ids": input_ids[lo:hi],
+                    "attention_mask": torch.ones_like(input_ids[lo:hi]),
+                    "labels": labels[lo:hi],
+                }
+            )
+
+        captured = {}
+
+        def _capture(**kwargs):
+            captured["grads"] = [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
+            return torch.tensor(0.0)
+
+        with (
+            mock.patch.object(seq_cls_mod, "clip_grad_norm", _capture),
+            mock.patch.object(torch.cuda, "max_memory_allocated", lambda: 0),
+        ):
+            recipe._run_train_optim_step(batches)
+        per_rank_grads.append(captured["grads"])
+
+    averaged = [torch.stack(g).mean(0) for g in zip(*per_rank_grads)]
+
+    # Truth: gradient of the mean loss over the entire global batch.
+    truth_model = _TinyClassifier()
+    truth_model.load_state_dict(init_state)
+    logits = truth_model(input_ids).logits
+    nn.CrossEntropyLoss()(logits, labels).backward()
+    truth = [p.grad.detach().clone() for p in truth_model.parameters() if p.grad is not None]
+
+    return averaged, truth
+
+
+@pytest.mark.parametrize("dp_size,accum", [(1, 1), (1, 4), (2, 1), (2, 2), (4, 2)])
+def test_gradients_match_global_mean_across_dp_and_accumulation(dp_size, accum):
+    """The DP-averaged gradient must equal the global-mean gradient.
+
+    `* dp_size` cancels DDP's averaging, but only reconstructs the global mean
+    when the loss is already normalized by a global denominator. Normalizing by
+    a local per-microbatch mean instead over-scaled by `dp_size * accum`.
+    """
+    averaged, truth = _ddp_averaged_grads(dp_size, accum, per_rank_bs=2)
+
+    assert len(averaged) == len(truth)
+    for g_got, g_ref in zip(averaged, truth):
+        ratio = (g_got.norm() / g_ref.norm()).item()
+        assert torch.allclose(g_got, g_ref, rtol=1e-5, atol=1e-6), (
+            f"dp_size={dp_size}, accum={accum}: gradient scaled by ~{ratio:.2f}x"
+        )
