@@ -140,6 +140,60 @@ def _compile_situ_cores() -> None:
     _SITU_CORES_COMPILED = True
 
 
+def _rms_norm_core(hidden_states: torch.Tensor, weight: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
+    """fp32 RMSNorm chain shared by every ``KimiRMSNorm`` instance.
+
+    Args:
+        hidden_states: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: RMSNorm weight of shape [hidden].
+        variance_epsilon: RMSNorm epsilon.
+
+    Returns:
+        Normalized tensor with the same shape and dtype as ``hidden_states``.
+    """
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
+    return weight * hidden_states.to(input_dtype)
+
+
+_rms_norm_dispatch = _rms_norm_core
+_RMS_NORM_COMPILED = False
+
+
+def _compile_norm_core() -> None:
+    """Wrap the RMSNorm core with ``torch.compile`` (``BackendConfig.compile_norm``).
+
+    Runs once per process, same lazy pattern as :func:`_compile_situ_cores`:
+    the compiled function replaces the module-level eager core, so every
+    ``KimiRMSNorm`` instance shares one compiled kernel. Compiled numerics are
+    allclose to eager, not bitwise-identical.
+    """
+    global _rms_norm_dispatch, _RMS_NORM_COMPILED
+    if _RMS_NORM_COMPILED:
+        return
+    _rms_norm_dispatch = torch.compile(_rms_norm_core, dynamic=True)
+    _RMS_NORM_COMPILED = True
+
+
+def _rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
+    """Dispatch RMSNorm through the current (eager or compiled) core.
+
+    Indirection so ``KimiRMSNorm.forward`` picks up the compiled core even when
+    :func:`_compile_norm_core` runs after modules were constructed.
+
+    Args:
+        hidden_states: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: RMSNorm weight of shape [hidden].
+        variance_epsilon: RMSNorm epsilon.
+
+    Returns:
+        Normalized tensor with the same shape and dtype as ``hidden_states``.
+    """
+    return _rms_norm_dispatch(hidden_states, weight, variance_epsilon)
+
+
 def _situ_rw_is_row_aligned(gate_up: torch.Tensor, routing_weights: torch.Tensor) -> bool:
     """Return True when ``routing_weights`` carries one entry per ``gate_up`` row.
 

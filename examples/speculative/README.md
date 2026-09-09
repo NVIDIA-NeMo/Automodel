@@ -247,6 +247,58 @@ Offline cache is produced by `precompute_eagle3.py`
 then consumed through `cached_target_path`. DSpark also supports a text-only offline cache through `precompute_dspark.py`
 for HF-loadable single-process text targets.
 
+The loss-mask options live under `recipe_args` in the speculative recipes (not under a
+`dataset:` block): `mask_reasoning_content` drops rendered reasoning traces from the loss, and
+`mask_generation_prompt` drops the prefix of each assistant turn that the chat template's
+generation prompt supplies at inference (the role header and any empty reasoning block such as the
+`<think>\n\n</think>\n\n` Qwen3 inserts). Only a generation prompt the template appends to the
+unchanged conversation prefix, and that the rendered turn reproduces in full, is removed; anything
+else leaves the turn supervised. Both default to `false`. The offline cache stores the loss mask,
+so a cache is tied to the options it was produced with: the producer takes the same two flags,
+records them in the manifest, and the cached trainer refuses to start when the recipe setting
+differs from the manifest. To train with `mask_generation_prompt` on a cache, pass the flag at
+both ends.
+
+Both options locate assistant turns by rendering conversation prefixes, like answer-only
+masking on a template without `{% generation %}` blocks, so they need a template that renders
+earlier turns the same way as the conversation grows. The stock Qwen3 template (`Qwen/Qwen3-8B`)
+does not: it drops the `<think>` block from every assistant turn before the last user query, so
+a multi-turn sample fails while rendering its first assistant turn, whether or not the flags are
+set. With that template keep the data single-turn (PerfectBlend holds 2-72-turn conversations),
+or supply a prefix-stable or `{% generation %}` template; Qwen3-Instruct-2507 renders history
+stably and needs no filtering.
+
+```python
+from pathlib import Path
+from datasets import load_dataset
+
+def single_turn(row):
+    roles = [m["role"] for m in row["messages"]]
+    return roles.count("assistant") == 1 and roles[-1] == "assistant"
+
+out = Path("./cache/dataset/perfectblend-qwen3-8b-regen-single-turn")
+out.mkdir(parents=True, exist_ok=True)
+ds = load_dataset("./cache/dataset/perfectblend-qwen3-8b-regen-messages", split="train")
+ds.filter(single_turn).to_parquet(out / "train.parquet")
+```
+
+```bash
+python -m nemo_automodel.components.speculative.precompute_eagle3 \
+  --target-model Qwen/Qwen3-8B \
+  --input-data ./cache/dataset/perfectblend-qwen3-8b-regen-single-turn \
+  --output-dir ./cache/eagle3_qwen3_8b_maskgen \
+  --mask-generation-prompt
+```
+
+```yaml
+recipe_args:
+  cached_target_path: ./cache/eagle3_qwen3_8b_maskgen
+  mask_generation_prompt: true
+```
+
+The online backends (`colocated`, `remote`) need only the `recipe_args` key, under the same
+template constraint; see the commented line in `eagle3/qwen3_eagle3_perfectblend.yaml`.
+
 For DSpark targets too large to fit on one node (DeepSeek-V4-Flash, GLM-5.2), a
 **distributed** precompute (`precompute_dspark_dist.py`) loads the target frozen
 through the same expert-parallel and FSDP2 path as online training and writes the

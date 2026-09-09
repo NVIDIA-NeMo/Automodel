@@ -19,6 +19,7 @@ import torch
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.gemma4_moe.parallelization import _get_attention_head_counts
 from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4ForConditionalGeneration,
     Gemma4Gate,
@@ -360,8 +361,8 @@ class TestGemma4MoEDecoderLayer:
         batch, seq = 2, 4
         x = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
         pos_emb = (
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
         )
 
         with (
@@ -384,8 +385,8 @@ class TestGemma4MoEDecoderLayer:
         batch, seq = 2, 4
         x = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
         pos_emb = (
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
-            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.per_layer_config[0].head_dim // 2, device=device, dtype=torch.bfloat16),
         )
         # Sentinel distinguishable by value — what pre_feedforward_layernorm_2 returns.
         sentinel = torch.full_like(x, 7.0)
@@ -838,3 +839,18 @@ class TestGemma4MoEModel:
     def test_norm_property(self, gemma4_config, backend_config):
         model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
         assert model.model.norm is model.model.language_model.norm
+
+
+def test_attention_head_counts_use_per_layer_config():
+    """Gemma4 TP validation must account for heterogeneous KV-head counts."""
+    config = _make_text_config(
+        enable_moe_block=False,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        num_global_key_value_heads=2,
+        attention_k_eq_v=True,
+        layer_types=["sliding_attention", "full_attention"],
+        num_hidden_layers=2,
+    )
+
+    assert _get_attention_head_counts(config) == {(8, 4), (8, 2)}
