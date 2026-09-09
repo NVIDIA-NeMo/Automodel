@@ -396,7 +396,7 @@ from transformers import AutoModel, AutoProcessor
 
 from nemo_automodel.components.datasets.vlm.utils import json2token
 
-CKPT = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidated"
+CKPT = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidated"  # pragma: allowlist secret
 NUM_SAMPLES = 20
 
 processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
@@ -458,7 +458,7 @@ from pathlib import Path
 from safetensors import safe_open
 
 BASE = "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained"
-ADAPTER = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/LOWEST_VAL/model"
+ADAPTER = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/LOWEST_VAL/model"  # pragma: allowlist secret
 
 processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
 model = AutoModel.from_pretrained(BASE, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto")
