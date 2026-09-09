@@ -928,6 +928,34 @@ def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
     guard_mock.assert_called_once_with()
 
 
+def test_apply_fsdp_rejects_mok_mxfp8_with_ep_shard(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class MoKExperts(DummyExperts):
+        def __init__(self):
+            super().__init__()
+            self.runtime = types.SimpleNamespace(mok_config=types.SimpleNamespace(precision="mxfp8"))
+
+    class MoEModule:
+        def __init__(self):
+            self.experts = MoKExperts()
+            self.gate = None
+
+    monkeypatch.setattr(P, "MoE", MoEModule)
+    monkeypatch.setattr(P, "GroupedExpertsMoK", MoKExperts)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    with pytest.raises(ValueError, match="MoK MXFP8 currently requires ep_shard size 1"):
+        P.apply_fsdp(
+            model=DummyModel([DummyBlock(mlp=MoEModule())]),
+            fsdp_mesh=object(),
+            ep_enabled=True,
+            ep_shard_enabled=True,
+            ep_shard_mesh=object(),
+        )
+
+
 def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_sharder(monkeypatch):
     """MoE uses the dense dtype-aware sharder with the model and EP contracts."""
     P = _import_parallelizer_with_stubs(monkeypatch)
@@ -1741,9 +1769,10 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
         tp_axis_name="tp",
         ep_axis_name="ep",
         activation_checkpointing=True,
+        reapply_trainability=lambda _model: calls.append("trainability"),
     )
 
-    assert calls == ["tp", "tie", "cp", "ep", "ac", "fsdp"]
+    assert calls == ["tp", "tie", "cp", "ep", "ac", "trainability", "fsdp"]
     assert model._nemo_moe_tp_requires_replica_sync is True
     assert model._nemo_moe_tp_requires_pretrained_weights is True
     P._resolve_moe_tp_plan.assert_called_once_with(
