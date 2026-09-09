@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -237,6 +238,7 @@ class TestGlm4MoeModel:
         assert model.moe_config.score_func == "sigmoid"  # GLM4 uses sigmoid
         assert model.moe_config.softmax_before_topk is False
         assert model.moe_config.apply_router_weight_after_down is True
+        assert model.moe_config.router_weights_fp32 is True
         assert model.moe_config.route_scale == glm_config.routed_scaling_factor
 
     def test_model_initializes_moe_config_with_expert_groups(self, glm_config, backend_config):
@@ -473,7 +475,8 @@ class TestGlm4MoeModelClassmethods:
 
         assert isinstance(model, Glm4MoeForCausalLM)
         assert model.config == glm_config
-        assert model.backend == backend_config
+        assert model.backend == replace(backend_config, gate_precision=torch.float32)
+        assert backend_config.gate_precision is None
 
     def test_from_pretrained_classmethod(self):
         """Ensure classmethod from_pretrained builds config then delegates to from_config."""

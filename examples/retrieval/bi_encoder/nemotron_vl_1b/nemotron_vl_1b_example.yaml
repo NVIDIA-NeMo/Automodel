@@ -129,10 +129,7 @@ ci:
     lr_scheduler.lr_warmup_steps: 1
     step_scheduler.global_batch_size: 8
     step_scheduler.local_batch_size: 1
-    cosine_threshold: 0.999
-    hf_cosine_threshold: 0.999
-    check_hf_reload: true
-    check_resume: true
+    parity_tolerance_profile: standard
     # Shared-trajectory CI observed later-step loss deltas of 0.0137 and 0.0215.
     # Keep the exact first resumed step strict, but allow BF16 distributed
     # contrastive-loss drift to accumulate across the following optimizer steps.

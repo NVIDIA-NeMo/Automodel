@@ -39,7 +39,23 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class MLA(nn.Module):
-    def __init__(self, config: DeepseekV3Config, backend: BackendConfig):
+    def __init__(
+        self,
+        config: DeepseekV3Config,
+        backend: BackendConfig,
+        *,
+        latent_norm_eps: float,
+    ):
+        """Initialize multi-head latent attention.
+
+        Args:
+            config: Model configuration that defines the MLA dimensions.
+            backend: Kernel backend selections for attention, linear layers, and normalization.
+            latent_norm_eps: Epsilon for the internal query and key/value latent RMSNorms. Required so each
+                model states its checkpoint's contract explicitly: upstream Hugging Face MLA implementations
+                construct these two norms with the reference RMSNorm default of ``1e-6`` rather than
+                ``config.rms_norm_eps``, and the HF config carries no field for it.
+        """
         super().__init__()
 
         self.n_heads = config.num_attention_heads
@@ -78,7 +94,7 @@ class MLA(nn.Module):
                 dtype=dtype,
             )
             self.q_a_layernorm = initialize_rms_norm_module(
-                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=config.rms_norm_eps, dtype=dtype
+                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=latent_norm_eps, dtype=dtype
             )
             self.q_b_proj = initialize_linear_module(
                 linear_impl=linear_impl,
@@ -96,7 +112,7 @@ class MLA(nn.Module):
             dtype=dtype,
         )
         self.kv_a_layernorm = initialize_rms_norm_module(
-            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=config.rms_norm_eps, dtype=dtype
+            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=latent_norm_eps, dtype=dtype
         )
         self.kv_b_proj = initialize_linear_module(
             linear_impl=linear_impl,

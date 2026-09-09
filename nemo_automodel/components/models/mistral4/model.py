@@ -64,7 +64,7 @@ class Mistral4MLA(MLA):
     """
 
     def __init__(self, config, backend: BackendConfig):
-        super().__init__(config, backend)
+        super().__init__(config, backend, latent_norm_eps=1e-6)
         # DeepSeek V3 folds YaRN's mscale into the attention softmax scale. Mistral 4
         # instead keeps the standard qk head-dimension scale and applies its separate
         # Llama 4 position-dependent multiplier directly to the query.
