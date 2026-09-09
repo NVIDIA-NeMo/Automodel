@@ -625,15 +625,29 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
         return torch.cat([remote_doc_ids, tensor], dim=0)
 
     captured = {}
+    cross_entropy = tbe.F.cross_entropy
 
-    def fake_cross_entropy(scores, labels):
+    def capture_cross_entropy(
+        scores: torch.Tensor, labels: torch.Tensor, *, reduction: str = "mean"
+    ) -> torch.Tensor:
+        """Capture loss inputs while preserving the real cross-entropy computation.
+
+        Args:
+            scores: Tensor of shape [batch, passages] containing similarity scores.
+            labels: Tensor of shape [batch] containing positive passage indices.
+            reduction: Reduction applied to the per-query losses.
+
+        Returns:
+            Tensor of shape [batch] for no reduction, or a scalar tensor otherwise.
+        """
         captured["scores"] = scores.detach().clone()
         captured["labels"] = labels.detach().clone()
-        return -scores.gather(1, labels.unsqueeze(1)).mean()
+        captured["reduction"] = reduction
+        return cross_entropy(scores, labels, reduction=reduction)
 
     monkeypatch.setattr(inbatch_neg_utils, "dist_gather_tensor_with_dim1_padding", fake_gather_with_dim1_padding)
     monkeypatch.setattr(inbatch_neg_utils, "dist_gather_tensor", fake_gather_tensor)
-    monkeypatch.setattr(tbe.F, "cross_entropy", fake_cross_entropy)
+    monkeypatch.setattr(tbe.F, "cross_entropy", capture_cross_entropy)
 
     batch = {
         "q_input_ids": torch.tensor(
@@ -663,6 +677,7 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
         ((4, 2), False, False),
     ]
     assert gather_tensor_calls == [((4,), False)]
+    assert captured["reduction"] == "none"
     assert torch.equal(captured["labels"], torch.tensor([4, 6]))
     assert captured["scores"].shape == (2, 8)
     assert captured["scores"][0, 0].item() == torch.finfo(captured["scores"].dtype).min
@@ -671,4 +686,6 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     assert captured["scores"][1, 6].item() > torch.finfo(captured["scores"].dtype).min
     assert len(loss_buffer) == 1
     assert torch.isfinite(loss_buffer[0])
+    torch.testing.assert_close(loss_buffer[0], cross_entropy(captured["scores"], captured["labels"]))
     assert model.scale.grad is not None
+    assert torch.isfinite(model.scale.grad)

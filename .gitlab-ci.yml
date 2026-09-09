@@ -83,9 +83,7 @@ retrieval-unit-tests:
       tests/unit_tests/datasets/llm/test_retrieval_distill_collator.py
       tests/unit_tests/datasets/test_retrieval_group_aware_split.py
       tests/unit_tests/loss/test_embedding_distill.py
-      tests/unit_tests/models/bi_encoder/test_export_onnx.py
-      tests/unit_tests/models/bi_encoder/test_ministral_retrieval_tokenizer.py
-      tests/unit_tests/models/bi_encoder/test_state_dict_adapter.py
+      tests/unit_tests/models/bi_encoder
       tests/unit_tests/models/test_qwen3_reranker_collator_epoch.py
       tests/unit_tests/models/test_qwen3_reranker_scoring.py
       tests/unit_tests/recipes/retrieval

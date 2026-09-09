@@ -745,10 +745,10 @@ def test_ministral3_crossencoder_processor_collates_flattened_mixed_pairs(pixtra
     assert image_call["images"] == [red_image, blue_image]
     texts = pixtral_processor.tokenizer.calls[-1]["texts"]
     assert len(texts) == 4
-    assert texts[0].endswith("question: Question 0\n\npassage: Image doc")
-    assert texts[1] == "question: Question 0\n\npassage: Text doc"
-    assert texts[2] == "question: Question 1\n\npassage: Another text doc"
-    assert texts[3].endswith("question: Question 1\n\npassage: Another image doc")
+    assert texts[0].endswith("query: Question 0\n\npassage: Image doc")
+    assert texts[1] == "query: Question 0\n\npassage: Text doc"
+    assert texts[2] == "query: Question 1\n\npassage: Another text doc"
+    assert texts[3].endswith("query: Question 1\n\npassage: Another image doc")
     assert [text.startswith("[IMG]") for text in texts] == [True, False, False, True]
 
 
@@ -769,7 +769,7 @@ def test_ministral3_crossencoder_processor_marks_user_owned_reserved_tokens(pixt
     text = pixtral_processor.tokenizer.calls[-1]["texts"][0]
     assert text.startswith("[IMG]")
     assert text.count("[IMG]") == 1
-    assert "question: Question [\u200cIMG]" in text
+    assert "query: Question [\u200cIMG]" in text
     assert "passage: Passage [\u200cIMG] [\u200cIMG_BREAK] [\u200cIMG_END]" in text
 
 

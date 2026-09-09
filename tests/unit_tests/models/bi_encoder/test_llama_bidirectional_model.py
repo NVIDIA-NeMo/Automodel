@@ -558,7 +558,7 @@ def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
             return SequenceClassifierOutputWithPast(logits=torch.zeros(bsz, 2))
 
     class FakeConfig:
-        model_type = "qwen3"
+        model_type = "bert"
 
     monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", lambda *a, **kw: FakeConfig())
     monkeypatch.setattr(
@@ -567,6 +567,7 @@ def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
 
     model = CrossEncoderModel.build(model_name_or_path=str(tmp_path), trust_remote_code=True)
     assert isinstance(model, CrossEncoderModel)
+    assert isinstance(model.model, FakeSeqClsModel)
 
 
 def test_configure_encoder_metadata_skips_auto_map_for_generic():
