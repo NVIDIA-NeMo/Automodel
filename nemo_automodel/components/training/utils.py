@@ -14,6 +14,7 @@
 
 import gc
 import math
+import os
 import re
 from typing import Iterable
 
@@ -22,6 +23,21 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
+
+try:
+    from nemo_automodel.components.training.triton.grad_norm import (
+        HAVE_TRITON as _HAVE_TRITON,
+    )
+    from nemo_automodel.components.training.triton.grad_norm import (
+        multi_tensor_absmax,
+        multi_tensor_sumsq,
+    )
+
+    HAVE_FUSED_GRAD_NORM = _HAVE_TRITON
+except ImportError:  # pragma: no cover - Triton not installed
+    HAVE_FUSED_GRAD_NORM = False
+    multi_tensor_absmax = multi_tensor_sumsq = None
+
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -107,6 +123,26 @@ def count_tail_padding(labels, ignore_label=-100):
     return prod_mask.view(-1).sum().item()
 
 
+_FUSED_GRAD_NORM_ENV = "NEMO_AUTOMODEL_FUSED_GRAD_NORM"
+
+
+def _use_fused_grad_norm(params, norm_type: float) -> bool:
+    """Whether the fused multi-tensor reduction applies to this group.
+
+    Only the 2-norm and inf-norm are implemented by the kernel, and the whole
+    group has to be CUDA -- a mixed CPU/CUDA group would silently take two
+    different reduction paths. Set NEMO_AUTOMODEL_FUSED_GRAD_NORM=0 to force
+    the per-tensor path (useful when bisecting a numerics regression).
+    """
+    if not HAVE_FUSED_GRAD_NORM:
+        return False
+    if os.environ.get(_FUSED_GRAD_NORM_ENV, "1") == "0":
+        return False
+    if not (math.isinf(norm_type) or norm_type == 2.0):
+        return False
+    return all(p.grad is not None and p.grad.is_cuda for p in params)
+
+
 @torch.no_grad()
 def _clip_grad_norm_impl(
     parameters: torch.Tensor | Iterable[torch.Tensor],
@@ -184,6 +220,42 @@ def _clip_grad_norm_impl(
     for group_params in sharding_groups.values():
         first = group_params[0]
         is_dtensor = isinstance(first, DTensor)
+        # Partial placements can't be reduced via sum-of-local-norms; materialize
+        # those per-grad (each full_tensor() is a same-shape collective, safe).
+        _has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
+
+        # Fused path: one kernel launch per dtype instead of ~7 per parameter.
+        # Restricted to the 2- and inf-norms, the only orders the kernel
+        # implements; anything else falls through to the loops below.
+        if _use_fused_grad_norm(group_params, norm_type):
+            locals_ = []
+            for p in group_params:
+                g = p.grad
+                if isinstance(g, DTensor):
+                    g = g.full_tensor() if _has_partial else g.to_local()
+                if g.numel():
+                    locals_.append(g.detach())
+
+            if is_inf:
+                group_val = multi_tensor_absmax(locals_)
+                reduce_op = torch.distributed.ReduceOp.MAX
+            else:
+                # fp64 accumulation removes the need to divide by the max first
+                # (that pass exists only to keep BF16 squares from overflowing),
+                # so this is a single pass over the gradients.
+                group_val = multi_tensor_sumsq(locals_)
+                reduce_op = torch.distributed.ReduceOp.SUM
+
+            if is_dtensor and not _has_partial:
+                mesh = first.device_mesh
+                for dim_idx, pl in enumerate(first.placements):
+                    if isinstance(pl, Replicate):
+                        continue
+                    group_val = _all_reduce_scalar(group_val, reduce_op, mesh, dim_idx)
+
+            group_norms.append(group_val if is_inf else group_val.pow(1.0 / norm_type))
+            continue
+
         # Partial placements can't be reduced via sum-of-local-norms; materialize
         # those per-grad (each full_tensor() is a same-shape collective, safe).
         has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
