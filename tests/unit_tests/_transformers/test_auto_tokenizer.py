@@ -22,6 +22,7 @@ import pytest
 from tokenizers import AddedToken, Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
+from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
@@ -367,7 +368,8 @@ class TestNeMoAutoTokenizerFromPretrained:
         assert "auto_map" not in saved_config
         assert not (saved_dir / "tekken.json").exists()
 
-        reloaded = NeMoAutoTokenizer.from_pretrained(saved_dir, tokenizer_backend="tokenizers")
+        reloaded = AutoTokenizer.from_pretrained(saved_dir)
+        assert isinstance(reloaded, TokenizersBackend)
         assert reloaded.encode("hello") == [1, 4]
         assert reloaded.encode("[INST]", add_special_tokens=False) == [5, 6, 7]
 

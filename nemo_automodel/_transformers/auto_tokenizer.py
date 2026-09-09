@@ -115,8 +115,9 @@ class NeMoAutoTokenizer:
 
         Args:
             pretrained_model_name_or_path: Model identifier or path
-            force_default: Backward-compatible alias for ``tokenizer_backend="nemo_wrapped_auto"``. An explicit
-                ``tokenizer_backend="nemo_auto"`` remains compatible with this legacy modifier.
+            force_default: Legacy flag equivalent to ``tokenizer_backend="nemo_wrapped_auto"``. It may be combined
+                with ``tokenizer_backend=None``, ``"nemo_auto"``, or ``"nemo_wrapped_auto"`` for backward
+                compatibility; when set, it selects the wrapped AutoTokenizer route.
             force_hf: Backward-compatible alias for ``tokenizer_backend="transformers_auto"``.
             tokenizer_backend: Tokenizer loading route. ``"nemo_auto"`` preserves the default NeMo dispatch,
                 ``"nemo_wrapped_auto"`` uses Transformers AutoTokenizer with NeMo's compatibility wrapper while
