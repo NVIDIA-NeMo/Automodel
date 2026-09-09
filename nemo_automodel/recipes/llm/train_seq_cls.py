@@ -252,7 +252,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 out = model(**batch)
                 logits = getattr(out, "logits", out)
                 loss = self.loss_fn(logits, labels.view(-1))
-            losses.append(loss.detach().clone())
+            # Keep the summed loss, not the per-microbatch mean: means cannot be
+            # added back together, and the reported metric is normalized by the
+            # same global label count the gradient uses.
+            losses.append((loss * labels.numel()).detach().clone())
 
             # Collect predictions for accuracy calculation
             preds = torch.argmax(logits, dim=-1)
@@ -330,9 +333,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                     reference_mfu=mfu_calculator.reference_mfu,
                 )
 
+        # Global summed loss over every micro-batch and DP rank, divided by the
+        # same global label count as the gradient. Dividing by len(batches)
+        # instead would report a mean of means: inflated by dp_size, and wrong
+        # whenever micro-batches are unevenly sized.
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
-        loss = total_loss / len(batches)
+        loss = total_loss / num_label_samples
 
         return MetricsSample(
             step=self.step_scheduler.step,
