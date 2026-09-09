@@ -39,7 +39,14 @@ model:
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
   torch_dtype: bf16
   trust_remote_code: true
-  force_hf: true
+  # Dense Nemotron-H now routes to the custom nemotron_v3 model (issue #2004),
+  # so force_hf is no longer needed to load this checkpoint.
+
+# Repair checkpoint input rows whose near-zero norm can produce extreme gradients
+# when those token IDs first occur during continued pretraining.
+embedding_row_repair:
+  min_norm: 1.0e-4
+  max_rows: 256
 
 compile:
   enabled: false
@@ -94,4 +101,11 @@ lr_scheduler:
 
 ci:
   recipe_owner: adil-a
+  time: "00:25:00"
   known_issue_id: AM-153
+  checkpoint_robustness:
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+    trust_remote_code: true
+    hf_device_map_auto: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

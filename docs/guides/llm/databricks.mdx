@@ -20,8 +20,10 @@ Start by [provisioning](https://docs.databricks.com/aws/en/compute/configure) a 
 ```bash
 #!/bin/bash
 
-# Install AutoModel on all nodes
-/databricks/python3/bin/pip install git+https://github.com/NVIDIA-NeMo/Automodel
+# Install uv, then install AutoModel into the Databricks Python environment on all nodes.
+curl -LsSf https://astral.sh/uv/install.sh | sh
+/root/.local/bin/uv pip install --python /databricks/python3/bin/python \
+  "nemo-automodel @ git+https://github.com/NVIDIA-NeMo/Automodel.git"
 ```
 
 This provisions three compute nodes: one driver node that you can attach a notebook to, and two worker nodes to use for multi-node training.

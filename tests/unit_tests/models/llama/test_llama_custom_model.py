@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import torch
@@ -20,6 +22,11 @@ from transformers import AutoModelForCausalLM, LlamaConfig, set_seed
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.llama.model import LlamaAttention
+from nemo_automodel.components.models.llama.rope_utils import (
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_quack,
+)
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 set_seed(42)
@@ -64,6 +71,48 @@ ROPE_CONFIGS = {
     "default": TINY_DEFAULT_ROPE_CONFIG,
     "llama3": TINY_LLAMA3_ROPE_CONFIG,
 }
+
+
+def test_quack_rope_layout_matches_torch_for_batch_specific_tables():
+    batch, q_heads, kv_heads, seq_len, head_dim = 2, 4, 2, 8, 64
+    q = torch.randn(batch, q_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, kv_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn(batch, seq_len, head_dim // 2, device="cuda", dtype=torch.float32)
+    cos_half = angles.cos().to(torch.bfloat16)
+    sin_half = angles.sin().to(torch.bfloat16)
+    cos = torch.cat((cos_half, cos_half), dim=-1)
+    sin = torch.cat((sin_half, sin_half), dim=-1)
+
+    def fake_quack_apply(x, cos_table, sin_table, inplace=False):
+        x0, x1 = x.chunk(2, dim=-1)
+        out = torch.cat(
+            (
+                x0 * cos_table[None, :, None, :] - x1 * sin_table[None, :, None, :],
+                x0 * sin_table[None, :, None, :] + x1 * cos_table[None, :, None, :],
+            ),
+            dim=-1,
+        )
+        if inplace:
+            x.copy_(out)
+            return x
+        return out
+
+    expected_q, expected_k = apply_rotary_pos_emb(q.clone(), k.clone(), cos, sin)
+    actual_q, actual_k = apply_rotary_pos_emb_quack(q, k, cos, sin, fake_quack_apply)
+    torch.testing.assert_close(actual_q, expected_q)
+    torch.testing.assert_close(actual_k, expected_k)
+
+
+def test_quack_rope_reports_missing_dependency():
+    config = LlamaConfig(**TINY_DEFAULT_ROPE_CONFIG)
+    with (
+        patch(
+            "nemo_automodel.components.models.llama.model.safe_import_from",
+            return_value=(False, None),
+        ),
+        pytest.raises(ImportError, match="quack-kernels"),
+    ):
+        LlamaAttention(config, layer_idx=0, backend=BackendConfig(rope="quack"))
 
 
 def _create_checkpoint(config_kwargs, tmpdir):

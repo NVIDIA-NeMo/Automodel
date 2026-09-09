@@ -71,6 +71,9 @@ def create_dflash_sdpa_mask(
     device: torch.device,
     dtype: torch.dtype,
     causal: bool = False,
+    ctx_doc_id: torch.Tensor | None = None,
+    anchor_doc_id: torch.Tensor | None = None,
+    sliding_window: int | None = None,
 ) -> torch.Tensor:
     """Build a dense additive attention mask for the SDPA backend.
 
@@ -83,6 +86,15 @@ def create_dflash_sdpa_mask(
         dtype:            dtype for the additive mask (typically the model dtype).
         causal:           When True, make in-block attention causal (JetSpec);
             otherwise it is bidirectional (DFlash).
+        ctx_doc_id:       ``[B, S]`` long per-context-token document id (sequence
+            packing), or ``None`` to disable the per-document constraint.
+        anchor_doc_id:    ``[B, N]`` long document id of each anchor. Required when
+            ``ctx_doc_id`` is given; a block then attends only to context tokens in
+            its anchor's document.
+        sliding_window:   When set, a block additionally attends only to context
+            tokens within ``sliding_window`` positions of the query's own sequence
+            position (``anchor + offset``), matching the published DFlash drafters'
+            ``sliding_attention`` layers. ``None`` (default) keeps the full prefix.
 
     Returns:
         ``[B, 1, N*block_size, S + N*block_size]`` float tensor: ``0`` at
@@ -96,10 +108,28 @@ def create_dflash_sdpa_mask(
     kv_idx = torch.arange(KV_LEN, device=device).view(1, 1, 1, -1)
 
     q_block = q_idx // block_size
+    q_in_block = q_idx - q_block * block_size
     anchor_exp = anchor_positions.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
     is_ctx = kv_idx < ctx_len
     ctx_visible = is_ctx & (kv_idx < anchor_exp)
+    if sliding_window is not None:
+        # The query's own sequence position is ``anchor + offset``; keep context
+        # within ``sliding_window`` of it, strictly, matching the convention shared
+        # by transformers and the reference DFlash decode mask. The symmetric
+        # forward bound the reference also applies is vacuous here: context keys
+        # are all strictly before the anchor, and in-block keys are at most
+        # ``block_size - 1`` away, far inside any real window.
+        ctx_visible = ctx_visible & ((anchor_exp + q_in_block) - kv_idx < sliding_window)
+    if ctx_doc_id is not None:
+        assert anchor_doc_id is not None, "anchor_doc_id is required when ctx_doc_id is given"
+        # Packing: a block attends only to context tokens in its anchor's
+        # document. Build a per-kv doc id whose noise slots are a sentinel (-1)
+        # that never matches an anchor's (>=0) doc id, then compare per block.
+        kv_doc = torch.full((B, KV_LEN), -1, dtype=torch.long, device=device)
+        kv_doc[:, :ctx_len] = ctx_doc_id
+        anchor_doc_exp = anchor_doc_id.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
+        ctx_visible = ctx_visible & (kv_doc.view(B, 1, 1, KV_LEN) == anchor_doc_exp)
 
     is_noise = kv_idx >= ctx_len
     kv_block = (kv_idx - ctx_len) // block_size
@@ -107,7 +137,6 @@ def create_dflash_sdpa_mask(
     if causal:
         # Block-causal in-block attention (JetSpec): offset i sees only offsets
         # j <= i. Offset 0 (anchor) still sees itself, so no row is fully masked.
-        q_in_block = q_idx - q_block * block_size
         kv_in_block = (kv_idx - ctx_len) - kv_block * block_size
         noise_visible = noise_visible & (kv_in_block <= q_in_block)
 
@@ -124,6 +153,68 @@ def create_dflash_sdpa_mask(
     return torch.where(bool_mask, zero, neg_inf)
 
 
+def build_dflash_mask_mod(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    ctx_len: int,
+    block_size: int,
+    num_blocks: int,
+    causal: bool = False,
+    ctx_doc_id: torch.Tensor | None = None,
+    anchor_doc_id: torch.Tensor | None = None,
+    sliding_window: int | None = None,
+):
+    """Return the FlexAttention ``mask_mod`` closure encoding the DFlash mask.
+
+    Factored out of :func:`create_dflash_block_mask` so the doc-aware gating can be
+    materialised with ``torch.nn.attention.flex_attention.create_mask`` and tested on
+    CPU (FlexAttention's kernel is CUDA-only). The closure uses only tensor ops (no
+    Python control flow) so ``torch.compile`` can trace it; see the module docstring
+    for the mask semantics and the ``ctx_doc_id`` / ``anchor_doc_id`` packing args.
+    """
+    N = num_blocks
+    doc_aware = ctx_doc_id is not None
+
+    def dflash_mask_mod(b, h, q_idx, kv_idx):
+        q_block = q_idx // block_size
+        safe_q_block = q_block.clamp(max=N - 1)
+        anchor = anchor_positions[b, safe_q_block]
+
+        is_ctx = kv_idx < ctx_len
+        ctx_visible = is_ctx & (kv_idx < anchor)
+        if sliding_window is not None:
+            # See create_dflash_sdpa_mask: window measured from the query's own
+            # sequence position, ``anchor + offset``.
+            ctx_visible = ctx_visible & ((anchor + (q_idx - q_block * block_size)) - kv_idx < sliding_window)
+        if doc_aware:
+            # Narrow the captured ``Tensor | None`` args for ty; narrowing from
+            # the enclosing scope does not reach the closure body.
+            assert ctx_doc_id is not None and anchor_doc_id is not None
+            # Packing: restrict the context prefix to the anchor's document.
+            # Clamp the kv index into range for the ctx lookup; the result only
+            # gates ``ctx_visible`` (already False on the noise half).
+            kv_doc = ctx_doc_id[b, kv_idx.clamp(max=ctx_len - 1)]
+            ctx_visible = ctx_visible & (kv_doc == anchor_doc_id[b, safe_q_block])
+
+        is_noise = kv_idx >= ctx_len
+        kv_block = (kv_idx - ctx_len) // block_size
+        noise_visible = is_noise & (q_block == kv_block)
+        if causal:
+            # Block-causal in-block attention (JetSpec): offset i sees only
+            # offsets j <= i. Offset 0 (anchor) still sees itself.
+            kv_in_block = (kv_idx - ctx_len) - kv_block * block_size
+            noise_visible = noise_visible & (kv_in_block <= q_idx - q_block * block_size)
+
+        keep = block_keep_mask[b, safe_q_block]
+        in_bounds = q_block < N
+        # Padding blocks keep in-block attention so no query row is fully masked
+        # (see create_dflash_sdpa_mask; kept consistent across backends, and the
+        # output is dropped by the loss block mask anyway).
+        return ((ctx_visible & keep) | noise_visible) & in_bounds
+
+    return dflash_mask_mod
+
+
 def create_dflash_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
@@ -132,6 +223,9 @@ def create_dflash_block_mask(
     device: torch.device,
     use_compile: bool = True,
     causal: bool = False,
+    ctx_doc_id: torch.Tensor | None = None,
+    anchor_doc_id: torch.Tensor | None = None,
+    sliding_window: int | None = None,
 ) -> "BlockMask":
     """Build a sparse FlexAttention :class:`BlockMask` for DFlash training.
 
@@ -151,6 +245,15 @@ def create_dflash_block_mask(
             builds that hit Inductor errors during compile.
         causal:           When True, make in-block attention causal (JetSpec);
             otherwise it is bidirectional (DFlash).
+        ctx_doc_id:       ``[B, S]`` long per-context-token document id (sequence
+            packing), or ``None`` to disable the per-document constraint.
+        anchor_doc_id:    ``[B, N]`` long document id of each anchor. Required when
+            ``ctx_doc_id`` is given; a block then attends only to context tokens in
+            its anchor's document.
+        sliding_window:   When set, a block additionally attends only to context
+            tokens within ``sliding_window`` positions of the query's own sequence
+            position (``anchor + offset``), matching the published DFlash drafters'
+            ``sliding_attention`` layers. ``None`` (default) keeps the full prefix.
 
     Returns:
         :class:`torch.nn.attention.flex_attention.BlockMask`.
@@ -159,32 +262,9 @@ def create_dflash_block_mask(
     Q_LEN = N * block_size
     KV_LEN = ctx_len + N * block_size
 
-    # Capture the input tensors via closure. mask_mod must use only tensor ops
-    # (no Python control flow) so torch.compile can trace it.
-    def dflash_mask_mod(b, h, q_idx, kv_idx):
-        q_block = q_idx // block_size
-        safe_q_block = q_block.clamp(max=N - 1)
-        anchor = anchor_positions[b, safe_q_block]
-
-        is_ctx = kv_idx < ctx_len
-        ctx_visible = is_ctx & (kv_idx < anchor)
-
-        is_noise = kv_idx >= ctx_len
-        kv_block = (kv_idx - ctx_len) // block_size
-        noise_visible = is_noise & (q_block == kv_block)
-        if causal:
-            # Block-causal in-block attention (JetSpec): offset i sees only
-            # offsets j <= i. Offset 0 (anchor) still sees itself.
-            q_in_block = q_idx - q_block * block_size
-            kv_in_block = (kv_idx - ctx_len) - kv_block * block_size
-            noise_visible = noise_visible & (kv_in_block <= q_in_block)
-
-        keep = block_keep_mask[b, safe_q_block]
-        in_bounds = q_block < N
-        # Padding blocks keep in-block attention so no query row is fully masked
-        # (see create_dflash_sdpa_mask; kept consistent across backends, and the
-        # output is dropped by the loss block mask anyway).
-        return ((ctx_visible & keep) | noise_visible) & in_bounds
+    dflash_mask_mod = build_dflash_mask_mod(
+        anchor_positions, block_keep_mask, ctx_len, block_size, N, causal, ctx_doc_id, anchor_doc_id, sliding_window
+    )
 
     # ``BLOCK_SIZE`` is left at the default (128). It MUST be a multiple of the
     # underlying flex_attention kernel's BLOCK_M / BLOCK_N (128 on H100); setting

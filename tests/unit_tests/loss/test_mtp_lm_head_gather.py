@@ -142,6 +142,42 @@ def test_mtp_loss_matches_reference(ref_cce):
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_mtp_loss_optionally_returns_unscaled_per_depth_losses(ref_cce):
+    torch.manual_seed(7)
+    m = _TinyModel()
+    hs, labels = _inputs(requires_grad=True)
+    output = calculate_mtp_loss(
+        FusedLinearCrossEntropy(reduction="sum"),
+        mtp_per_depth_h=hs,
+        labels=labels,
+        model=m,
+        scaling_factor=SF,
+        num_label_tokens=NLT,
+        ignore_index=IGN,
+        return_per_depth=True,
+    )
+    assert isinstance(output, _mtp.MTPLossOutput)
+
+    expected_per_depth = []
+    cur_labels = labels
+    for depth, hidden_states in enumerate(hs, start=1):
+        cur_labels = roll_tensor(cur_labels, shifts=-1, dim=-1)
+        masked = cur_labels.clone()
+        masked[..., -depth:] = IGN
+        logits = hidden_states.float() @ m.lm_head.weight.float().t()
+        expected_per_depth.append(
+            F.cross_entropy(logits.reshape(-1, V), masked.reshape(-1), ignore_index=IGN, reduction="sum") / NLT
+        )
+
+    assert len(output.per_depth_losses) == D
+    for actual, expected in zip(output.per_depth_losses, expected_per_depth):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(output.loss, sum(expected_per_depth) * (SF / D), rtol=1e-5, atol=1e-6)
+
+    output.loss.backward()
+    assert all(loss.grad_fn is not None for loss in output.per_depth_losses)
+
+
 def test_lm_head_gathered_once(ref_cce):
     torch.manual_seed(1)
     m = _TinyModel()
@@ -197,6 +233,47 @@ def test_mtp_loss_grads_match_reference(ref_cce):
     torch.testing.assert_close(m.lm_head.weight.grad, W2.grad, rtol=1e-4, atol=1e-6)
     for a, b in zip(hs1, hs2):
         torch.testing.assert_close(a.grad, b.grad, rtol=1e-4, atol=1e-6)
+
+
+def test_pipeline_loss_fused_ce_routes_bare_tensor_as_hidden_states():
+    """PP fused-CE contract: the last stage skips lm_head and emits a bare
+    hidden-states tensor"""
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    m = _TinyModel()
+    m.training = False  # a bare tensor carries no MTP tail regardless
+    loss_mod = PipelineCausalLMLoss(FusedLinearCrossEntropy(), m)
+
+    hidden = torch.randn(B, S, H)  # what the last PP stage now emits
+    labels = torch.randint(0, V, (B, S))
+
+    captured = {}
+
+    def fake_calc(loss_fn, **kw):
+        captured.update(kw)
+        return torch.zeros((), requires_grad=True)
+
+    with mock.patch.object(_mtp, "calculate_loss", side_effect=fake_calc):
+        loss_mod(hidden, labels)
+
+    assert captured["hidden_states"] is hidden
+    assert captured["logits"] is None
+
+
+def test_pipeline_loss_fused_ce_with_mtp_tuple_raises():
+    """FusedLinearCrossEntropy cannot consume an MTP tuple output (it carries
+    logits, not the hidden states the fused loss needs), so the last-stage loss
+    must reject it explicitly instead of silently mishandling the tensors."""
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    loss_mod = PipelineCausalLMLoss(FusedLinearCrossEntropy(), _TinyModel())
+
+    logits = torch.randn(B, S, V)
+    mtp_h = torch.randn(B, S, H)  # per-depth hidden states appended by an MTP model
+    labels = torch.randint(0, V, (B, S))
+
+    with pytest.raises(ValueError, match="FusedLinearCrossEntropy is not supported with MTP"):
+        loss_mod((logits, mtp_h), labels)
 
 
 def test_non_fused_path_does_not_gather_lm_head():

@@ -179,6 +179,7 @@ def test_attach_sets_metadata_keys_and_method():
         "_packed_seq_ids",
         "padding_mask",
         "_gemma4_vision_group_ids",
+        "_gemma4_has_vision_tokens",
     )
     assert module._cp_manual_metadata_seq_dims == {
         "mm_token_type_ids": 1,
@@ -784,20 +785,57 @@ def test_manual_attention_entry_sets_gqa_when_head_counts_differ(monkeypatch):
     assert out.shape == q.shape
 
 
+def test_manual_attention_entry_promotes_rank_uniform_vision_flag(monkeypatch):
+    module = _flex_module(sliding_window=4, use_bidirectional_attention="vision")
+    module._cp_manual_metadata = {
+        "_gemma4_vision_group_ids": torch.zeros(1, 4, dtype=torch.long),
+        "_gemma4_has_vision_tokens": True,
+    }
+    q = torch.randn(1, 2, 4, 8)
+    cp_mesh = SimpleNamespace(get_group=lambda: object(), size=lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    captured = {}
+
+    def fake_run(attention_module, ctx):
+        captured["ctx"] = ctx
+        return ctx.query
+
+    monkeypatch.setattr(cpa, "_run_gemma4_cp_ring_attention", fake_run)
+    cpa._gemma4_cp_manual_attention(
+        module,
+        q,
+        q.clone(),
+        q.clone(),
+        cp_mesh=cp_mesh,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=True,
+        scale=None,
+        enable_gqa=False,
+        kwargs={},
+    )
+    assert captured["ctx"].use_vision_bidirectional is True
+    assert "_gemma4_has_vision_tokens" not in captured["ctx"].metadata
+
+
 # ---------------------------------------------------------------------------
 # _patch_fsdp_accumulated_grad_guard
 # ---------------------------------------------------------------------------
 def test_fsdp_guard_skips_uninitialized_and_runs_orig_and_is_idempotent(monkeypatch):
-    """The guard wraps FSDPParam.to_accumulated_grad_if_needed so it skips params
-    with no _unsharded_param (returns None) and otherwise calls the original."""
+    """The guard only skips the exact missing lazy ``_unsharded_param`` case."""
     import sys
     import types
 
     calls = {"n": 0}
 
     class FakeFSDPParam:
+        def __init__(self, mode="ok"):
+            self.mode = mode
+
         def to_accumulated_grad_if_needed(self):
             calls["n"] += 1
+            if self.mode == "missing":
+                return self._unsharded_param.grad
             return "ran"
 
     fake_mod = types.ModuleType("torch.distributed.fsdp._fully_shard._fsdp_param")
@@ -807,13 +845,11 @@ def test_fsdp_guard_skips_uninitialized_and_runs_orig_and_is_idempotent(monkeypa
     cpa._patch_fsdp_accumulated_grad_guard()
 
     p = FakeFSDPParam()
-    # No _unsharded_param -> guarded wrapper returns None without calling orig.
-    assert p.to_accumulated_grad_if_needed() is None
-    assert calls["n"] == 0
-    # With _unsharded_param -> original runs.
-    p._unsharded_param = object()
     assert p.to_accumulated_grad_if_needed() == "ran"
     assert calls["n"] == 1
+    p.mode = "missing"
+    assert p.to_accumulated_grad_if_needed() is None
+    assert calls["n"] == 2
     # Marked guarded; a second patch is a no-op (does not double-wrap).
     assert FakeFSDPParam.to_accumulated_grad_if_needed._gemma4_guarded is True
     wrapped = FakeFSDPParam.to_accumulated_grad_if_needed

@@ -15,6 +15,7 @@
 """Device mesh construction and access utilities for distributed training."""
 
 import datetime
+import itertools
 from dataclasses import dataclass, field
 
 import torch
@@ -64,6 +65,7 @@ def _create_device_meshes(
     *,
     world_size: int,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[DeviceMesh | None, DeviceMesh | None]:
     """Create raw device meshes based on distributed config type."""
     if (
@@ -78,6 +80,7 @@ def _create_device_meshes(
             parallelism,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
     elif isinstance(strategy_config, MegatronFSDPConfig):
         _require_size_one("megatron_fsdp", parallelism.pp_size, "pipeline parallelism")
@@ -86,6 +89,7 @@ def _create_device_meshes(
             parallelism,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
         return mesh, None
     elif isinstance(strategy_config, DDPConfig):
@@ -124,16 +128,45 @@ def _mesh_device_type() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _init_named_mesh(spec: _MeshSpec, *, timeout_minutes: int | None = None) -> DeviceMesh:
+def _init_named_mesh(
+    spec: _MeshSpec,
+    *,
+    timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
+) -> DeviceMesh:
     _validate_mesh_spec(spec)
     device_type = _mesh_device_type()
-    device_mesh = init_device_mesh(
-        device_type=device_type,
-        mesh_shape=spec.shape,
-        mesh_dim_names=spec.axes,
-        backend_override=_nccl_backend_override(spec.axes, device_type=device_type, timeout_minutes=timeout_minutes),
-    )
-    _register_flattened_axes(device_mesh, spec.flattened_axes, timeout_minutes=timeout_minutes)
+    backend_override = _nccl_backend_override(spec.axes, device_type=device_type, timeout_minutes=timeout_minutes)
+    if ranks is None:
+        device_mesh = init_device_mesh(
+            device_type=device_type,
+            mesh_shape=spec.shape,
+            mesh_dim_names=spec.axes,
+            backend_override=backend_override,
+        )
+    else:
+        expected_size = 1
+        for size in spec.shape:
+            expected_size *= size
+        if len(ranks) != expected_size:
+            raise ValueError(f"mesh ranks ({len(ranks)}) must match mesh size ({expected_size})")
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("mesh ranks must be unique")
+        device_mesh = DeviceMesh(
+            device_type=device_type,
+            mesh=torch.tensor(ranks, dtype=torch.int64).reshape(spec.shape),
+            mesh_dim_names=spec.axes,
+            backend_override=backend_override,
+        )
+    if ranks is None:
+        _register_flattened_axes(device_mesh, spec.flattened_axes, timeout_minutes=timeout_minutes)
+    else:
+        _register_flattened_axes_for_rank_subset(
+            device_mesh,
+            spec,
+            ranks=ranks,
+            timeout_minutes=timeout_minutes,
+        )
     return device_mesh
 
 
@@ -161,6 +194,11 @@ def _nccl_backend_override(
     return override
 
 
+def _can_reuse_default_group(group_size: int) -> bool:
+    """Return whether a derived mesh dimension spans the default process group."""
+    return dist.is_initialized() and group_size == dist.get_world_size()
+
+
 def _validate_mesh_spec(spec: _MeshSpec) -> None:
     for shape, axis in zip(spec.shape, spec.axes):
         assert isinstance(shape, int), f"Expected {axis} to be an int, but got {type(shape)}"
@@ -183,10 +221,66 @@ def _register_flattened_axes(
         timeout_minutes=timeout_minutes,
     )
     for flattened_axis, source_axes in flattened_axes.items():
-        flattened_mesh = device_mesh[source_axes]._flatten(
+        source_mesh = device_mesh[source_axes]
+        backend_override = backend_overrides.get(flattened_axis) if backend_overrides else None
+        # The default process group already has the configured timeout. Supplying
+        # an override for the same world-sized ranks would allocate another NCCL communicator.
+        if backend_override is not None and _can_reuse_default_group(source_mesh.size()):
+            backend_override = None
+        flattened_mesh = source_mesh._flatten(
             mesh_dim_name=flattened_axis,
-            backend_override=backend_overrides.get(flattened_axis) if backend_overrides else None,
+            backend_override=backend_override,
         )
+        device_mesh._flatten_mapping.setdefault(flattened_axis, flattened_mesh)
+
+
+def _register_flattened_axes_for_rank_subset(
+    device_mesh: DeviceMesh,
+    spec: _MeshSpec,
+    *,
+    ranks: list[int] | tuple[int, ...],
+    timeout_minutes: int | None,
+) -> None:
+    """Register flattened axes without slicing a mesh on non-member ranks.
+
+    PyTorch cannot slice an explicit ``DeviceMesh`` on ranks outside that mesh.
+    Separate-model jobs still need every global rank to create process groups in
+    the same order, so construct each flattened subgroup explicitly and retain
+    the subgroup local to the current rank.
+    """
+    if not spec.flattened_axes:
+        return
+    if not hasattr(device_mesh, "_flatten_mapping"):
+        device_mesh._flatten_mapping = {}
+
+    rank_tensor = torch.tensor(ranks, dtype=torch.int64).reshape(spec.shape)
+    current_rank = dist.get_rank()
+    for flattened_axis, source_axes in spec.flattened_axes.items():
+        source_indices = tuple(spec.axes.index(axis) for axis in source_axes)
+        other_indices = tuple(index for index in range(len(spec.axes)) if index not in source_indices)
+        other_shapes = tuple(spec.shape[index] for index in other_indices)
+        local_ranks = None
+        local_group = None
+        first_ranks = None
+        for other_coordinate in itertools.product(*(range(size) for size in other_shapes)):
+            index = [slice(None)] * len(spec.axes)
+            for axis_index, coordinate in zip(other_indices, other_coordinate):
+                index[axis_index] = coordinate
+            subgroup_ranks = rank_tensor[tuple(index)].reshape(-1).tolist()
+            first_ranks = first_ranks or subgroup_ranks
+            group = dist.new_group(ranks=subgroup_ranks)
+            if current_rank in subgroup_ranks:
+                local_ranks = subgroup_ranks
+                local_group = group
+
+        flat_ranks = local_ranks or first_ranks
+        flattened_mesh = DeviceMesh(
+            device_mesh.device_type,
+            mesh=torch.tensor(flat_ranks, dtype=torch.int64),
+            mesh_dim_names=(flattened_axis,),
+            _init_backend=False,
+        )
+        flattened_mesh._dim_group_names = [local_group.group_name] if local_group is not None else []
         device_mesh._flatten_mapping.setdefault(flattened_axis, flattened_mesh)
 
 
@@ -195,6 +289,7 @@ def _create_fsdp2_device_mesh(
     *,
     world_size: int,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[DeviceMesh, DeviceMesh | None]:
     """Create the FSDP2 root mesh and optional MoE mesh."""
     tp_size = _degree(parallelism.tp_size)
@@ -241,6 +336,7 @@ def _create_fsdp2_device_mesh(
             },
         ),
         timeout_minutes=timeout_minutes,
+        ranks=ranks,
     )
 
     moe_mesh = None
@@ -249,7 +345,9 @@ def _create_fsdp2_device_mesh(
             device_mesh,
             ep_shard_size=ep_shard_size,
             ep_size=ep_size,
+            pp_size=pp_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
 
     return device_mesh, moe_mesh
@@ -260,6 +358,7 @@ def _create_megatron_fsdp_device_mesh(
     *,
     world_size: int,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
 ) -> DeviceMesh:
     """Create the Megatron FSDP mesh."""
     tp_size = _degree(parallelism.tp_size)
@@ -279,6 +378,7 @@ def _create_megatron_fsdp_device_mesh(
             flattened_axes={MeshAxisName.DP_CP: (MeshAxisName.DP, MeshAxisName.CP)} if cp_size > 1 else {},
         ),
         timeout_minutes=timeout_minutes,
+        ranks=ranks,
     )
 
 
@@ -287,9 +387,36 @@ def _create_moe_mesh(
     *,
     ep_shard_size: int,
     ep_size: int,
+    pp_size: int = 1,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
 ) -> DeviceMesh:
     non_pp_axes = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
+    if ranks is not None:
+        current_rank = dist.get_rank()
+        ranks_per_stage = ep_shard_size * ep_size
+        backend_override = _nccl_backend_override(
+            (MeshAxisName.EP_SHARD, MeshAxisName.EP),
+            device_type=device_mesh.device_type,
+            timeout_minutes=timeout_minutes,
+        )
+        local_mesh = None
+        first_mesh = None
+        for stage in range(pp_size):
+            stage_ranks = ranks[stage * ranks_per_stage : (stage + 1) * ranks_per_stage]
+            stage_mesh = DeviceMesh(
+                device_mesh.device_type,
+                mesh=torch.tensor(stage_ranks, dtype=torch.int64).reshape(ep_shard_size, ep_size),
+                mesh_dim_names=(MeshAxisName.EP_SHARD, MeshAxisName.EP),
+                backend_override=backend_override,
+            )
+            if first_mesh is None:
+                first_mesh = stage_mesh
+            if current_rank in stage_ranks:
+                local_mesh = stage_mesh
+        if first_mesh is None:
+            raise RuntimeError("Failed to construct an expert-parallel mesh")
+        return local_mesh if local_mesh is not None else first_mesh
     return _unflatten_compat(
         device_mesh[non_pp_axes]._flatten(),
         axis=0,
@@ -307,19 +434,30 @@ def _unflatten_compat(
     *,
     timeout_minutes: int | None = None,
 ) -> DeviceMesh:
-    """Unflatten a mesh with its NCCL timeout, including the PyTorch 2.9 fallback."""
+    """Unflatten a mesh with its NCCL timeout, including the PyTorch 2.9 fallback.
+
+    PyTorch reuses the default process group for a world-sized dimension only
+    when no backend override is supplied. The default group already has the
+    configured distributed timeout, so omitting that redundant override avoids
+    allocating another NCCL communicator.
+    """
     if hasattr(flat_mesh, "_unflatten"):
         if timeout_minutes is not None and flat_mesh.device_type == "cuda":
-            return flat_mesh._unflatten(
-                axis,
-                sizes,
+            backend_override = _nccl_backend_override(
                 names,
-                backend_override=_nccl_backend_override(
-                    names,
-                    device_type=flat_mesh.device_type,
-                    timeout_minutes=timeout_minutes,
-                ),
+                device_type=flat_mesh.device_type,
+                timeout_minutes=timeout_minutes,
             )
+            backend_override = {
+                name: backend_override[name] for name, size in zip(names, sizes) if not _can_reuse_default_group(size)
+            }
+            if backend_override:
+                return flat_mesh._unflatten(
+                    axis,
+                    sizes,
+                    names,
+                    backend_override=backend_override,
+                )
         return flat_mesh._unflatten(axis, sizes, names)
     new_mesh_tensor = flat_mesh.mesh.reshape(sizes)
     from torch.distributed.device_mesh import DeviceMesh as _DeviceMesh
@@ -453,3 +591,40 @@ def get_fsdp_dp_mesh(
             return device_mesh[dp_shard_name]
 
     return get_submesh(device_mesh, (dp_replicate_name, dp_shard_cp_name))
+
+
+def create_ring_ulysses_mesh(
+    device_mesh: "DeviceMesh",
+    *,
+    ring_degree: int,
+    ulysses_degree: int,
+) -> "DeviceMesh":
+    """Derive a 2D ``("ring", "ulysses")`` view of the mesh's ``"cp"`` axis.
+
+    Diffusers' context-parallel API (``ContextParallelConfig.mesh``) requires a
+    device mesh with dimensions named ``"ring"`` and ``"ulysses"``. This reshapes
+    the 1D ``"cp"`` axis of an existing root mesh into that layout so context
+    parallelism shares the process groups already created for FSDP2, instead of
+    initializing a second world mesh.
+
+    Args:
+        device_mesh: Root mesh containing a ``"cp"`` dimension (as created by
+            ``_create_fsdp2_device_mesh``).
+        ring_degree: Size of the ring-attention dimension.
+        ulysses_degree: Size of the Ulysses (all-to-all) attention dimension.
+
+    Returns:
+        A 2D DeviceMesh of shape ``(ring_degree, ulysses_degree)`` with dim
+        names ``("ring", "ulysses")`` covering this rank's CP group.
+
+    Raises:
+        ValueError: If ``ring_degree * ulysses_degree`` does not equal the size
+            of the mesh's ``"cp"`` dimension.
+    """
+    cp_mesh = device_mesh[MeshAxisName.CP]
+    if ring_degree * ulysses_degree != cp_mesh.size():
+        raise ValueError(
+            f"ring_degree ({ring_degree}) * ulysses_degree ({ulysses_degree}) must equal "
+            f"the cp mesh size ({cp_mesh.size()})."
+        )
+    return _unflatten_compat(cp_mesh, 0, (ring_degree, ulysses_degree), ("ring", "ulysses"))

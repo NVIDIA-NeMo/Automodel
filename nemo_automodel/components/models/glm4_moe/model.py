@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from typing import Any, Optional, Union
+from dataclasses import dataclass, replace
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -28,8 +27,11 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
-from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 from nemo_automodel.components.models.glm4_moe.layers import Glm4MoeAttention
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
@@ -145,7 +147,9 @@ class Glm4MoeModel(nn.Module):
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
+            apply_router_weight_after_down=True,
             softmax_before_topk=False,  # GLM4 uses sigmoid, not softmax
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -234,6 +238,7 @@ class Glm4MoeModel(nn.Module):
 
 
 class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @dataclass(frozen=True)
@@ -272,11 +277,14 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         **kwargs,
     ):
-        warn_deprecated_model_class("Glm4MoeForCausalLM")
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
-        self.backend = backend or BackendConfig()
+        reject_unsupported_tie_word_embeddings(type(self), config)
+        resolved_backend = backend or BackendConfig()
+        # HF computes the GLM router projection and selected mixture weights in fp32.
+        if resolved_backend.gate_precision is None:
+            resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
+        self.backend = resolved_backend
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Glm4MoeModel(
             config,
@@ -313,7 +321,7 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (

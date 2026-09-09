@@ -18,8 +18,7 @@ import importlib
 
 _LAZY_ATTRS = {
     "TrainDiffusionRecipe": (".train", "TrainDiffusionRecipe"),
-    "build_model_and_optimizer": (".train", "build_model_and_optimizer"),
-    "build_lr_scheduler": (".train", "build_lr_scheduler"),
+    "build_diffusion_pipeline": (".train", "build_diffusion_pipeline"),
 }
 
 __all__ = sorted(_LAZY_ATTRS.keys())

@@ -4,7 +4,7 @@
 import inspect
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -89,8 +89,8 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         pre_feature_reduction=False,
         keep_aspect_ratio=False,
         vocab_size=-1,
-        q_max_length: Optional[int] = 512,
-        p_max_length: Optional[int] = 10240,
+        q_max_length: int | None = 512,
+        p_max_length: int | None = 10240,
         query_prefix: str = "query:",
         passage_prefix: str = "passage:",
         pooling: str = "last",
@@ -242,7 +242,7 @@ def _replace_image_token_embeddings(
 
 def _filter_vision_embeddings_by_image_flags(
     vit_embeds: torch.Tensor,
-    image_flags: Optional[torch.Tensor],
+    image_flags: torch.Tensor | None,
 ) -> torch.Tensor:
     """Keep only vision embeddings marked as real images."""
     if image_flags is None or isinstance(image_flags, list):
@@ -404,8 +404,8 @@ class LlamaNemotronVLModel(PreTrainedModel):
     def __init__(
         self,
         config: LlamaNemotronVLConfig,
-        vision_model: Optional[PreTrainedModel] = None,
-        language_model: Optional[PreTrainedModel] = None,
+        vision_model: PreTrainedModel | None = None,
+        language_model: PreTrainedModel | None = None,
     ):
         super().__init__(config)
 
@@ -488,7 +488,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
                 f"Please use transformers <=4.53.x or >=4.56.0."
             )
 
-    def _embed_batch(self, inputs: Dict[str, Any], pool_type: Optional[str] = None):
+    def _embed_batch(self, inputs: Dict[str, Any], pool_type: str | None = None):
         """
         Encodes the inputs into a tensor of embeddings.
         Args:
@@ -519,7 +519,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
         queries_embeddings = self._embed_batch(inputs=queries_dict, **kwargs)
         return queries_embeddings
 
-    def encode_documents(self, images: Optional[List[Any]] = None, texts: Optional[List[str]] = None, **kwargs):
+    def encode_documents(self, images: List[Any] | None = None, texts: List[str] | None = None, **kwargs):
         """
         Encodes the input document images and texts into a tensor of embeddings.
         Args:
@@ -547,17 +547,17 @@ class LlamaNemotronVLModel(PreTrainedModel):
         self,
         pixel_values: torch.FloatTensor = None,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        image_flags: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        num_patches_list: Optional[List[torch.Tensor]] = None,
-        run_dummy_vision: Optional[bool] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        image_flags: torch.LongTensor | None = None,
+        past_key_values: List[torch.FloatTensor] | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        num_patches_list: List[torch.Tensor] | None = None,
+        run_dummy_vision: bool | None = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 

@@ -1,0 +1,227 @@
+# Retrieval Data Tools
+
+This directory contains CPU-side utilities for preparing retrieval training data before launching GPU training jobs.
+
+## Which Option Should I Use?
+
+For full-scale vision-language (VL) retrieval, prepare **normalized Arrow** on CPU nodes before requesting GPUs.
+
+**Do not start full-scale VL training directly from unprepared raw sources.** Loading a large image corpus and building
+its dataset cache can substantially delay the first training step. In a multi-GPU job, the GPUs remain allocated during
+that startup, which can waste GPU-hours before optimization begins. Run the normalized dataset preparation script on CPU
+nodes first, then point the training config at the generated Arrow dataset.
+
+- **Original dataset config:** use `RetrievalDatasetConfig` for typical text-only retrieval, `hf://` sources, inline
+  JSONL, and small verification runs.
+- **Normalized Arrow:** recommended for full-scale or image-heavy VL retrieval. Prepare a portable dataset bundle once,
+  then train with
+  `nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig`.
+- **Warm HF cache:** use the CPU cache-warming script when direct source loading starts slowly and you want to keep the
+  original dataset configuration.
+
+Although some file names include `vl`, normalization also accepts text-only corpus ID-based JSON sources. It can help
+with an unusually large text corpus or when you need a portable prepared dataset.
+
+## Normalized Arrow (Recommended for Full-Scale VL)
+
+Normalized Arrow keeps the original retrieval structure, but prepares the corpus once and saves it as a reusable Arrow
+bundle:
+
+- Train rows store query text plus positive/negative document IDs.
+- Each source's local corpus shards store every referenced document and optional image once.
+- Training still resolves `doc_id -> document`, but it reads from local Arrow instead of rebuilding Hugging Face cache
+  state in the GPU job.
+
+This is the recommended format for full-scale VL datasets because it is portable and avoids duplicating image payload
+in every training row.
+
+### Prepare
+
+The normalization tool accepts local corpus ID-based JSON sources. Before running it, make sure every entry in the
+config's `dataset.data_dir_list` points to that local format. The tool does not accept `hf://` URIs or inline JSONL
+directly. Materialize those sources as corpus ID-based JSON first, or keep using `RetrievalDatasetConfig` and optionally
+warm its Hugging Face cache.
+
+```bash
+uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
+  --config /path/to/retrieval_config_with_local_json_sources.yaml \
+  --output-dir /path/to/normalized_vl_retrieval
+```
+
+On Slurm CPU nodes, use the array launcher for full-scale VL datasets before submitting the GPU training job. Set
+`NUM_SOURCES` to the number of entries in the config's `dataset.data_dir_list`. Each array task prepares one source,
+then a dependent finalizer writes the top-level metadata after every source succeeds:
+
+```bash
+CONFIG=/path/to/retrieval_config_with_local_json_sources.yaml \
+OUT_DIR=/path/to/normalized_vl_retrieval \
+NUM_SOURCES=7 \
+PARTITION=cpu_short \
+TIME=04:00:00 \
+CPUS_PER_TASK=32 \
+ARRAY_PARALLELISM=7 \
+EXTRA_CONTAINER_MOUNTS=/path/to/source_data:/path/to/source_data \
+tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu_array.sh
+```
+
+The non-array `submit_prepare_normalized_vl_retrieval_data_cpu.sh` launcher is useful for small verification runs and
+short source lists, but it prepares sources serially.
+
+### Train
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
+  data_path: /path/to/normalized_vl_retrieval
+  model_type: bi_encoder
+  data_type: train
+  n_passages: 5
+```
+
+### Choose Sources Or Sample Caps
+
+A normalized bundle stores each original `data_dir_list` entry as a separate numeric source directory:
+`sources/source-00000`, `sources/source-00001`, and so on. The top-level metadata records the readable `source_name`,
+stable `source_key`, original `source_entry`, and source path.
+
+For normal training with one bundle, pass its top-level path as `data_path`, as shown above. If you want to choose
+specific prepared sources, cap samples per source, or combine bundles, use `data_dir_list` instead. Do not set both
+fields.
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
+  data_dir_list:
+    - path: /path/to/normalized_vl_retrieval/sources/source-00000
+      num_samples: 10000
+    - path: /path/to/normalized_vl_retrieval/sources/source-00001
+      num_samples: null
+  model_type: bi_encoder
+  data_type: train
+  n_passages: 5
+```
+
+The same `data_dir_list` form can also combine different normalized bundle roots:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
+  data_dir_list:
+    - path: /path/to/normalized_vl_retrieval_a
+      num_samples: 20000
+    - path: /path/to/normalized_vl_retrieval_b
+      num_samples: null
+  model_type: bi_encoder
+  data_type: train
+  n_passages: 5
+```
+
+You can mix top-level bundle roots and individual `sources/source-*` paths in the same list. Avoid overlapping entries,
+for example listing both `/path/to/normalized_vl_retrieval` and
+`/path/to/normalized_vl_retrieval/sources/source-00000`, unless you intentionally want duplicated samples.
+
+### Add More Normalized Data
+
+There are two supported workflows.
+
+The simplest workflow is to prepare the new source into a separate normalized bundle, then list both bundle roots in
+the training `data_dir_list`. This avoids modifying the existing bundle and is the recommended approach when you need
+to reproduce earlier training runs from the same paths.
+
+If you want one shared bundle path, use append mode. Run prep with a config that contains only the new source(s), the
+same `OUT_DIR`, and `APPEND=1`:
+
+```bash
+CONFIG=/path/to/new_source_only_config.yaml \
+OUT_DIR=/path/to/normalized_vl_retrieval \
+APPEND=1 \
+tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu.sh
+```
+
+Append mode skips exact duplicate source entries already present in metadata. It stages each new source in a temporary
+directory and updates top-level metadata only after all new sources finish. It does not deduplicate documents across
+different sources, so do not re-list old sources under a modified path or config entry.
+
+Append changes the bundle's source composition. Once you use a bundle for a reproducible training run, treat that
+bundle as immutable or use separate bundles for later additions. When training loads normalized data, it logs the
+existing top-level and source metadata, including the format version, source list, record counts, and shard paths.
+
+### Resume an Interrupted Preparation Run
+
+If the local preparation command stops before it finishes, run the same command again with `--resume`:
+
+```bash
+uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
+  --config /path/to/retrieval_config_with_local_json_sources.yaml \
+  --output-dir /path/to/normalized_vl_retrieval \
+  --resume
+```
+
+The tool keeps work that finished successfully and rebuilds incomplete output. Use the same input data, config, output
+directory, and preparation settings as the original run. If the input data changed, or the tool cannot confirm that it is
+unchanged, start again with a new output directory.
+
+For Slurm array preparation, submit the same launcher command again. Resume is enabled by default, so no extra option is
+needed. Keep `CONFIG`, `OUT_DIR`, `NUM_SOURCES`, and the other preparation settings unchanged.
+
+Use resume only to continue an interrupted run. To add new sources to a finished bundle, use
+[append mode](#add-more-normalized-data).
+
+## Warm Hugging Face Dataset Cache
+
+This option keeps the original `RetrievalDatasetConfig` in the training config unchanged.
+
+The script populates the Hugging Face cache on CPU nodes so the GPU job can reuse it. It does not create a portable
+dataset.
+
+```bash
+CONFIG=/path/to/original_retrieval_config.yaml \
+CACHE_DIR=/path/to/hf_cache \
+PARTITION=cpu_short \
+TIME=02:00:00 \
+CPUS_PER_TASK=32 \
+TOUCH_SAMPLES=128 \
+EXTRA_CONTAINER_MOUNTS=/path/to/source_data:/path/to/source_data \
+tools/retrieval/submit_warm_retrieval_hf_cache_cpu.sh
+```
+
+The same `CACHE_DIR` should be mounted into GPU training and exported as `HF_HOME`, `HF_DATASETS_CACHE`,
+`HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, and `TRANSFORMERS_CACHE`.
+
+HF cache reuse is exact-key based. A warm cache is reused only when the later training run uses the same cache directory
+and the same effective dataset fingerprint. The fingerprint can change if the same source data is referenced through a
+different mount alias, symlink, or config path, for example `/lustre/fsw/...` compared to `/lustre/fs11/...`.
+
+For local/non-Slurm use:
+
+```bash
+uv run python tools/retrieval/warm_retrieval_hf_cache.py \
+  --config /path/to/original_retrieval_config.yaml \
+  --cache-dir /path/to/hf_cache \
+  --touch-samples 128
+```
+
+`--touch-samples` reads transformed examples to validate corpus lookup and image decoding. Decoded images are not
+persisted.
+
+## Storage Comparison
+
+Measured on the Nemotron VL 1B image-retrieval training set used in debugging, with 262,197 train rows:
+
+| Path | What it stores | Size observed | Recommendation |
+| --- | --- | ---: | --- |
+| Original HF cache | Hugging Face cache fingerprints and materialized source corpora under `HF_DATASETS_CACHE` | `3.7 TB` in one observed active cache dir, which varies by cache history | Fast when warm, but not portable and can grow with each fingerprint/config/path variant |
+| Normalized Arrow | Train refs plus deduplicated local corpus Arrow shards | `176 GB` | Recommended full-dataset portable format |
+
+The exact HF cache size can vary because Hugging Face Datasets may keep multiple fingerprints, source downloads,
+intermediate Arrow files, and old variants. Normalized Arrow is an explicit dataset artifact, so the size is much more
+predictable.
+
+## Add New Corpus Schemas
+
+For new corpus schemas, use the original AutoModel extension point:
+
+1. Add an `AbstractDataset` implementation with `get_document_by_id()` and `get_all_ids()`.
+2. Register it in `DATASETS`.
+3. Add the source JSON to the original retrieval config.
+4. Prepare a normalized bundle or warm the original Hugging Face cache.

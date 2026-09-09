@@ -168,6 +168,24 @@ class TestHelperMethods:
         assert "pp_axis_name" not in kwargs
         assert kwargs["dp_axis_names"] == (MeshAxisName.DP_SHARD_CP,)
 
+    def test_dp_axis_names_include_replicate_axis_for_flattened_shard_cp(self):
+        flattened_dp_mesh = Mock()
+        flattened_dp_mesh.size.return_value = 8
+        device_mesh = Mock()
+        device_mesh.mesh_dim_names = (
+            MeshAxisName.PP,
+            MeshAxisName.DP_REPLICATE,
+            MeshAxisName.DP_SHARD,
+            MeshAxisName.CP,
+            MeshAxisName.TP,
+        )
+        device_mesh._get_root_mesh.return_value = device_mesh
+        device_mesh._flatten_mapping = {MeshAxisName.DP_SHARD_CP: flattened_dp_mesh}
+
+        ctx = MeshContext(device_mesh=device_mesh)
+
+        assert ctx._dp_axis_names() == (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD_CP)
+
 
 # ---------------------------------------------------------------------------
 # DistributedSetup – simple runtime bundle

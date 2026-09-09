@@ -13,10 +13,40 @@
 # limitations under the License.
 
 import math
-import torch
+
 import pytest
+import torch
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
+
+
+def test_flex_attention_without_sinks_matches_causal_sdpa(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(371)
+    query = torch.randn(2, 3, 8, 16)
+    key = torch.randn(2, 3, 8, 16)
+    value = torch.randn(2, 3, 8, 12)
+    scale = 0.2
+
+    monkeypatch.setattr(FlexAttention, "flex_attn", flex_attention)
+    monkeypatch.setattr(FlexAttention, "block_masks", {})
+
+    attention = FlexAttention()
+    actual = attention(query, key, value, scale=scale)
+    expected = F.scaled_dot_product_attention(query, key, value, scale=scale, is_causal=True)
+
+    torch.testing.assert_close(actual, expected)
+    assert len(FlexAttention.block_masks) == 1
+
+    repeated = attention(query, key, value, scale=scale)
+    torch.testing.assert_close(repeated, expected)
+    assert len(FlexAttention.block_masks) == 1
+
+    smaller_batch = attention(query[:1], key[:1], value[:1], scale=scale)
+    smaller_batch_expected = F.scaled_dot_product_attention(query[:1], key[:1], value[:1], scale=scale, is_causal=True)
+    torch.testing.assert_close(smaller_batch, smaller_batch_expected)
+    assert len(FlexAttention.block_masks) == 2
 
 
 def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
@@ -29,9 +59,7 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
     S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)
     mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
     if sliding_window > 0:
-        mask += torch.tril(
-            mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
-        )
+        mask += torch.tril(mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window)
     QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
     QK *= sm_scale
     QK += mask[None, None, :, :]
@@ -67,10 +95,11 @@ def _flex_forward_from_qkm(Q, K, V, S_vec, sm_scale, sliding_window=0, device=No
     out = out.squeeze(0).permute(1, 0, 2).contiguous().view(S, -1)
     return out
 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_flex_attention_matches_sdpa():
     torch.manual_seed(123)
-    device = f"cuda:0"
+    device = "cuda:0"
     dtype = torch.bfloat16
 
     S = 64

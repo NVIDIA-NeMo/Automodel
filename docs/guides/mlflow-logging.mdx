@@ -19,14 +19,14 @@ With MLflow integration, you can:
 
 Before using MLflow logging in NeMo AutoModel, ensure you have:
 
-1. **MLflow installed**: MLflow is installed with `nemo-automodel` by default. If you see an import error in your environment, install it manually:
+1. **MLflow installed**: MLflow is installed with `nemo-automodel` by default. If you see an import error in a released-package environment, recreate that environment and install NeMo AutoModel there:
    ```bash
-   pip install mlflow
-   # or:
-   uv pip install mlflow
+   uv venv
+   source .venv/bin/activate
+   uv pip install "nemo-automodel"
    ```
 
-2. **MLflow tracking server** (optional): For production use, set up a tracking server to centralize experiment data. For local development, MLflow will use a local file-based store by default.
+2. **MLflow tracking server** (optional): For production use, set up a tracking server to centralize experiment data. For local development, current MLflow releases use a local SQLite database at `sqlite:///mlflow.db` by default.
 
 ## Configuration
 
@@ -52,17 +52,23 @@ mlflow:
 |-----------|------|---------|-------------|
 | `experiment_name` | str | "automodel-experiment" | Name of the MLflow experiment. All runs are grouped under this experiment. |
 | `run_name` | str | "" | Optional name for the current run. If empty, MLflow generates a unique name. |
-| `tracking_uri` | str | null | URI of the MLflow tracking server. If null, uses local file-based storage. |
+| `tracking_uri` | str | null | URI of the MLflow tracking server. If null, delegates to MLflow, which currently defaults to `sqlite:///mlflow.db` for a new local store. |
 | `artifact_location` | str | null | Location to store artifacts. If null, uses default MLflow location. |
 | `tags` | dict | {} | Dictionary of tags to attach to the run for organization and filtering. |
 
 ### Tracking URI Options
 
-The `tracking_uri` parameter determines where MLflow stores experiment data:
+The `tracking_uri` parameter determines where MLflow stores experiment metadata such as runs, parameters, metrics, tags, and statuses:
 
-- **Local file storage (default)**: `null` or `file:///path/to/mlruns`
+- **Local SQLite database (default)**: `null` or `sqlite:///mlflow.db`
 - **Remote tracking server**: `http://your-mlflow-server:5000`
-- **Database backend**: `postgresql://user:password@host:port/database`
+- **Shared database backend**: `postgresql://user:password@host:port/database`
+
+Artifacts remain separate from tracking metadata. For example, you can use SQLite for tracking while storing configuration files and models in a local directory or object store through `artifact_location`.
+
+<Warning>
+The legacy filesystem tracking backend (`file:///path/to/mlruns`) is in maintenance mode in MLflow and requires an explicit opt-out in current releases. Migrate existing tracking data to SQLite rather than using the filesystem escape hatch for new workflows.
+</Warning>
 
 For team collaboration, we recommend setting up a remote tracking server.
 
@@ -120,7 +126,7 @@ model:
 mlflow:
   experiment_name: "llama3-squad-finetune"
   run_name: "baseline-run-1"
-  tracking_uri: null  # Uses local storage
+  tracking_uri: null  # Uses MLflow's default local SQLite database
   tags:
     task: "question-answering"
     dataset: "squad"
@@ -137,7 +143,7 @@ During training, you'll see MLflow logging messages:
 
 ```
 MLflow run started: abc123def456
-View run at: file:///path/to/mlruns/#/experiments/1/runs/abc123def456
+View run at: sqlite:///mlflow.db/#/experiments/1/runs/abc123def456
 ```
 
 ### View Results in MLflow UI
@@ -145,7 +151,7 @@ View run at: file:///path/to/mlruns/#/experiments/1/runs/abc123def456
 Launch the MLflow UI to visualize your experiments:
 
 ```bash
-mlflow ui
+mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
 By default, the UI runs at `http://localhost:5000`. Open this URL in your browser to:
@@ -231,12 +237,33 @@ If you see an import error:
 ImportError: MLflow is not installed. Please install it (e.g. pip install mlflow).
 ```
 
-Install MLflow:
+Recreate the released-package environment so its declared MLflow dependency is installed:
 ```bash
-pip install mlflow
-# or:
-uv pip install mlflow
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel"
 ```
+
+### Existing Filesystem Tracking Store
+
+Current MLflow releases no longer enable the legacy filesystem tracking backend by default. Migrate an existing local `mlruns` store losslessly to SQLite:
+
+```bash
+mlflow migrate-filestore --source ./mlruns --target sqlite:///mlflow.db
+```
+
+Then point AutoModel and the MLflow UI at the migrated database:
+
+```yaml
+mlflow:
+  tracking_uri: "sqlite:///mlflow.db"
+```
+
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+If migration is not possible, set `MLFLOW_ALLOW_FILE_STORE=true` before running AutoModel to explicitly retain the maintenance-only filesystem backend.
 
 ### Connection Issues
 

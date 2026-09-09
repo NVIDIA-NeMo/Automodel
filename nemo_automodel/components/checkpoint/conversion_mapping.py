@@ -30,7 +30,7 @@ The primary entry points are:
 - `requires_tensor_merging(model_type)`: Check if model needs tensor operations
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torch import nn
@@ -98,7 +98,7 @@ def requires_tensor_merging(model_type: str) -> bool:
     return model_type in MODELS_REQUIRING_TENSOR_MERGING
 
 
-def get_checkpoint_conversion_mapping(model_type: str) -> Optional[list]:
+def get_checkpoint_conversion_mapping(model_type: str) -> list | None:
     """
     Get the checkpoint conversion mapping for a given model type.
 
@@ -125,8 +125,8 @@ def get_checkpoint_conversion_mapping(model_type: str) -> Optional[list]:
 
 def get_model_conversion_mapping(
     model: "nn.Module",
-    key_mapping: Optional[dict[str, str]] = None,
-    hf_quantizer: Optional[object] = None,
+    key_mapping: dict[str, str] | None = None,
+    hf_quantizer: object | None = None,
     add_legacy: bool = True,
 ) -> list:
     """
@@ -185,8 +185,8 @@ _VLM_KEY_MAPPINGS: dict[str, dict[str, str]] = {
 
 def get_combined_key_mapping(
     model_type: str,
-    model_key_mapping: Optional[dict[str, str]] = None,
-) -> Optional[dict[str, str]]:
+    model_key_mapping: dict[str, str] | None = None,
+) -> dict[str, str] | None:
     """
     Get combined key mapping for simple regex-based key renaming.
 

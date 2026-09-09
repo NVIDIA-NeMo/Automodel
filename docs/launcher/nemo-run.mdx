@@ -3,19 +3,19 @@ title: "Run with NeMo-Run"
 description: ""
 position: 4
 ---
-In this guide, you will learn how to launch NeMo AutoModel training jobs using [NeMo-Run](https://github.com/NVIDIA-NeMo/Run). NeMo-Run supports multiple backends including Slurm, Kubernetes, Docker, and local execution. For cloud-based training, see [Run on Any Cloud with SkyPilot](/job-launchers/skypilot). For direct sbatch usage, see [Run on a Cluster (Slurm)](/job-launchers/slurm-cluster). For single-node workstation usage, see [Run on Your Local Workstation](/job-launchers/local-workstation).
+In this guide, you will learn how to launch NeMo AutoModel training jobs using [NeMo-Run](https://github.com/NVIDIA-NeMo/Run). NeMo-Run itself supports several executor backends, but AutoModel's current integration relies on a packaged config at `/nemo_run/code/automodel_config.yaml`; the Slurm container path is the end-to-end path documented here. The [Local execution](#local-execution-no-cluster) and [Kubernetes executor](#kubernetes-executor) sections describe current path-staging limitations. For cloud-based training, see [Run on Any Cloud with SkyPilot](/job-launchers/skypilot). For direct sbatch usage, see [Run on a Cluster (Slurm)](/job-launchers/slurm-cluster). For single-node workstation usage, see [Run on Your Local Workstation](/job-launchers/local-workstation).
 
-NeMo-Run is an open-source tool from NVIDIA that manages job submission across different execution backends. You define your compute configuration once in a Python file and reuse it across all your training jobs.
+NeMo-Run is an open-source tool from NVIDIA that manages job submission across different execution backends. You can define a compute configuration in Python and reuse it across compatible jobs.
 
 ## Before You Begin
 
-1. **Install NeMo-Run** (it is not bundled with AutoModel):
+1. **Install the source checkout and its launcher dependencies**. The `all` extra includes AutoModel's `cli` extra, which depends on NeMo-Run:
 
 ```bash
-pip install nemo-run
+uv sync --locked --all-groups --extra all
 ```
 
-2. **Create an executor definitions file** at `$NEMORUN_HOME/executors.py`. `NEMORUN_HOME` defaults to `~/.nemo_run`; set the environment variable to use a different location. This file tells NeMo-Run how to reach your compute target. Every executor you reference in a YAML config must be defined here. See [Executor Setup](#executor-setup) for a complete example.
+2. **For a named non-local executor, create an executor definitions file** at `$NEMORUN_HOME/executors.py`. `NEMORUN_HOME` defaults to `~/.nemo_run`; set the environment variable to use a different location. Each custom executor name referenced by YAML must be defined here. `executor: local` is constructed directly and does not read this file. See [Executor Setup](#executor-setup) for a complete example.
 
 3. **Verify connectivity** to the target in your executor (e.g. SSH for Slurm, kubeconfig for Kubernetes).
 
@@ -28,7 +28,7 @@ export WANDB_API_KEY=...        # Optional: Weights & Biases logging
 
 ## Executor Setup
 
-The `executor:` field in your YAML config is a name that maps to an entry in `$NEMORUN_HOME/executors.py`. This file must define a module-level `EXECUTOR_MAP` dictionary. NeMo-Run supports several executor types -- here are examples of the most common ones:
+For a non-local custom executor, the `executor:` field in YAML names an entry in `$NEMORUN_HOME/executors.py`. This file must define a module-level `EXECUTOR_MAP` dictionary. The Slurm example below matches AutoModel's current packaged-config path. The Kubeflow example documents its native fields and the additional integration constraints that currently prevent the unmodified AutoModel launcher from being an end-to-end Kubeflow path.
 
 ### Slurm Executor
 
@@ -74,12 +74,16 @@ def my_k8s_cluster():
         num_nodes=1,
         nprocs_per_node=8,
         gpus_per_node=8,
+        workdir_pvc="nemo-run-workdir",
+        workdir_pvc_path="/nemo_run",
     )
 
 EXECUTOR_MAP = {
     "my_k8s": my_k8s_cluster(),
 }
 ```
+
+`KubeflowExecutor` requires an environment with the `nemo-run[kubeflow]` extra, a working kubeconfig or in-cluster configuration, and an existing `workdir_pvc`. Without `workdir_pvc`, NeMo-Run's Kubeflow `package()` method returns without copying any work directory. With the PVC, that method syncs the executor's assigned task directory to the username-scoped `executor.code_dir` (by default `/nemo_run/<username>/code`); it does not consume AutoModel's `PatternPackager`, and AutoModel does not copy its separately written timestamped config into that task directory. The generated command also still uses `/nemo_run/code/automodel_config.yaml`. The AutoModel launcher does not make that path equivalent to `executor.code_dir`, so this executor definition alone is not currently runnable through `automodel`; config staging and the Kubeflow work directory must first be aligned in the integration.
 
 ### Multiple Executors
 
@@ -95,25 +99,25 @@ EXECUTOR_MAP = {
 
 - Keys in `EXECUTOR_MAP` are names you reference in YAML (`executor: slurm_dev`).
 - Values can be executor instances or zero-argument callables that return one.
-- Override fields in the YAML (`nodes`, `devices`, `container_image`, etc.) are applied on top of the executor defaults.
+- Override fields in YAML are applied on top of executor defaults. Use the executor's actual field names: for example, Slurm and Local use `ntasks_per_node`, while Kubeflow uses `nprocs_per_node` (falling back to `gpus_per_node`). A `devices` key is not consumed by these executors.
 
 ## Quickstart
 
-Any existing AutoModel YAML config can be run via NeMo-Run by adding a `nemo_run:` section at the top. For example, given an existing config that you run locally:
+To submit a compatible AutoModel YAML through the current packaged remote path, add a `nemo_run:` section that selects a configured Slurm executor. For example, given an existing config that you run locally:
 
 ```bash
 automodel examples/llm_finetune/qwen/qwen3_moe_30b_te_packed_sequence.yaml
 ```
 
-Add a `nemo_run:` block to submit it to a remote executor instead:
+Add a `nemo_run:` block to submit it to the named Slurm executor instead:
 
 ```yaml
-# -- Add this section to any existing config ----------------------------------
+# -- Add this section to a compatible config ----------------------------------
 nemo_run:
   executor: my_slurm             # Name from EXECUTOR_MAP in $NEMORUN_HOME/executors.py
   container_image: /images/custom.sqsh  # Override executor's default image
   nodes: 1                       # Override number of nodes
-  ntasks_per_node: 8             # GPUs per node
+  ntasks_per_node: 8             # Training processes per node
   time: "04:00:00"               # Override time limit
   job_name: qwen3_moe_finetune   # Experiment and job name
 
@@ -131,7 +135,7 @@ Then run the same command:
 automodel your_config.yaml
 ```
 
-The CLI detects the `nemo_run:` key, strips it from the training config, loads the named executor from `$NEMORUN_HOME/executors.py`, and submits the job -- all in one command.
+The CLI detects the `nemo_run:` key, strips it from the training config, loads the named Slurm executor from `$NEMORUN_HOME/executors.py`, and submits the job.
 
 ## Configuration Reference
 
@@ -139,13 +143,13 @@ The CLI detects the `nemo_run:` key, strips it from the training config, loads t
 
 | Field | Default | Description |
 |---|---|---|
-| `executor` | `"local"` | Name from `EXECUTOR_MAP` in `$NEMORUN_HOME/executors.py`, or `"local"` for local execution |
+| `executor` | `"local"` | Name from `EXECUTOR_MAP` for a custom non-local executor, or `"local"` to construct `LocalExecutor` (subject to the config-path limitation below) |
 | `job_name` | `<recipe_class_name>` | Experiment and job name |
-| `detach` | `true` | Return immediately after submission |
+| `detach` | `true` | Requested NeMo-Run behavior. NeMo-Run supports detaching for Slurm and selected remote executors, but forces it to `false` for Local and Kubeflow executors |
 | `tail_logs` | `false` | Stream logs after submission |
-| `executors_file` | `$NEMORUN_HOME/executors.py` | Path to the executor definitions file |
-| `job_dir` | `./nemo_run_jobs` | Local directory for job artifacts (config snapshot) |
-| *(any other key)* | *(from executor)* | Applied directly to the executor via `setattr`. Use the executor's native attribute names (e.g. `nodes`, `ntasks_per_node`, `partition`, `container_image`, `time`, `env_vars`). Dicts are merged, lists are extended. |
+| `executors_file` | `$NEMORUN_HOME/executors.py` | Path to custom non-local executor definitions; unused for `executor: local` |
+| `job_dir` | `./nemo_run_jobs` | Local directory used to create the timestamped config snapshot and packaging input |
+| *(any other key)* | *(from executor)* | Applied directly with `setattr`; dicts are merged and lists extended. Use exact native names such as Slurm/Local `ntasks_per_node` or Kubeflow `nprocs_per_node`. Unknown names can become inert attributes instead of raising an error. |
 
 ## Examples
 
@@ -170,7 +174,7 @@ nemo_run:
   job_name: multinode_pretrain
 ```
 
-For multi-node jobs the launcher automatically adds `--nnodes`, `--node-rank`, `--rdzv-backend`, `--master-addr`, and `--master-port` to the `torchrun` command.
+AutoModel sets the executor's launcher to NeMo-Run's native torchrun launcher; AutoModel does not assemble torchrun rendezvous flags itself. For the generic multi-node path, NeMo-Run generates `--nnodes`, `--nproc-per-node`, `--node-rank`, `--rdzv-backend`, `--rdzv-endpoint`, and `--rdzv-id`. The endpoint uses NeMo-Run's rank-zero host macro and rendezvous port.
 
 ### Custom Container Image and Mounts
 
@@ -188,13 +192,19 @@ nemo_run:
 
 ### Local Execution (No Cluster)
 
-Use `executor: local` to run on the current machine. No `$NEMORUN_HOME/executors.py` entry is needed:
+The launcher can construct `LocalExecutor` without an `$NEMORUN_HOME/executors.py` entry, and its process-count field is `ntasks_per_node`. However, the current AutoModel script always opens `/nemo_run/code/automodel_config.yaml`, while LocalExecutor does not stage or mount the `PatternPackager` output at `/nemo_run/code`. Therefore the following shape is not currently an end-to-end runnable AutoModel launch:
 
 ```yaml
 nemo_run:
   executor: local
   ntasks_per_node: 2
   job_name: local_test
+```
+
+For a working local two-process launch, omit `nemo_run:` and use AutoModel's interactive launcher:
+
+```bash
+uv run automodel your_config.yaml --nproc-per-node 2
 ```
 
 ## Monitor and Manage Jobs
@@ -205,20 +215,21 @@ For Slurm-based executors, standard Slurm commands also work:
 
 ```bash
 squeue -u $USER                 # List your queued and running jobs
-scancel <job_id>                # Cancel a running or pending job
-sacct -j <job_id>               # View job accounting information
+JOB_ID=12345                    # Replace with the Slurm job ID
+sacct -j "$JOB_ID"               # View job accounting information
+scancel "$JOB_ID"                # Cancel a running or pending job
 ```
 
-For Kubernetes-based executors, use `kubectl` to monitor pods and jobs.
+For Kubeflow jobs launched after independently resolving the packaging/path constraints above, use `kubectl` to monitor pods and jobs.
 
 ## How It Works
 
 1. The `automodel` CLI detects the `nemo_run:` key and imports `NemoRunLauncher`.
-2. The `nemo_run:` section is popped from the config. The remaining training config is written to `nemo_run_jobs/<timestamp>/job_config.yaml` for record-keeping.
-3. The launcher loads a pre-configured executor from `$NEMORUN_HOME/executors.py` by name (or creates a `LocalExecutor` for `executor: local`). Override fields are applied on top of the executor defaults.
-4. The training config YAML is embedded in a self-contained inline bash script via a heredoc, so no separate file transfer is needed.
-5. A `torchrun` command is built with `--nproc-per-node` and (for multi-node) distributed rendezvous arguments.
-6. The script is submitted via `nemo_run.Experiment`. By default the call returns immediately (`detach=True`).
+2. The `nemo_run:` section is popped from the config, and the remaining training config is passed to the launcher.
+3. For a named non-local executor, the launcher loads a pre-configured executor from `$NEMORUN_HOME/executors.py`; for `executor: local`, it directly creates `LocalExecutor`. Override fields are applied on top of executor defaults.
+4. The launcher writes the training config to `<job_dir>/<timestamp>/automodel_config.yaml`. It then assigns a NeMo-Run `PatternPackager` to the executor, with the timestamped directory as its relative root. Whether that package is extracted or mounted at the path used by the script is backend-specific; it is not done for Local, and Kubeflow uses its separate PVC-backed `code_dir` flow.
+5. AutoModel creates a script that launches the recipe module with `-c /nemo_run/code/automodel_config.yaml` and selects NeMo-Run's native torchrun launcher. NeMo-Run, not AutoModel, derives the torchrun arguments from `executor.nnodes()` and `executor.nproc_per_node()`; the generic path uses `--rdzv-endpoint`.
+6. The script is submitted via `nemo_run.Experiment` with the requested `detach` value. NeMo-Run forces `detach=False` for executor types that do not support detachment, including Local and Kubeflow.
 
 ## Customize Configuration
 
@@ -233,8 +244,8 @@ automodel config_with_nemo_run.yaml \
 
 | | NeMo-Run | SkyPilot | Slurm (sbatch) |
 |---|---|---|---|
-| **Infrastructure** | Slurm, Kubernetes, Docker, local | Public cloud (AWS, GCP, Azure) | On-prem HPC |
-| **Container support** | Yes (Pyxis/Enroot, Docker, K8s pods) | N/A (cloud VMs) | Manual (in sbatch script) |
-| **Setup required** | `nemo-run` + `$NEMORUN_HOME/executors.py` | Cloud credentials + `sky check` | Cluster access + sbatch script |
-| **Job submission** | `automodel config.yaml` | `automodel config.yaml` | `sbatch slurm.sub` |
-| **Good for** | Managed multi-backend execution, reusable executor configs | Cloud burst, cost optimization, spot instances | Direct Slurm scripts, full control over sbatch |
+| **Infrastructure** | Current documented AutoModel path: Slurm; NeMo-Run has other backends with the limitations above | Public cloud (AWS, GCP, Azure) | On-prem HPC |
+| **Container support** | Backend-specific; the documented Slurm path uses Pyxis/Enroot | N/A (cloud VMs) | Manual (in sbatch script) |
+| **Setup required** | Locked AutoModel environment + a named non-local executor definition; Kubeflow needs its extra and PVC path work | Cloud credentials + `sky check` | Cluster access + sbatch script |
+| **Job submission** | `uv run automodel config.yaml` for the compatible Slurm path | `uv run automodel config.yaml` | `sbatch slurm.sub` |
+| **Good for** | Reusable Slurm executor configuration through the current AutoModel integration | Cloud burst, cost optimization, spot instances | Direct Slurm scripts, full control over sbatch |

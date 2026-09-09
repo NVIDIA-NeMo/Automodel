@@ -88,12 +88,19 @@ def test_masked_cross_entropy_gpu():
 
 
 def test_masked_cross_entropy_zero_label_tokens_no_nan():
-    """Loss must be exactly 0.0 (not NaN) when num_label_tokens=0 (empty supervision)."""
-    logits = torch.randn(2, 10, 1000)
+    """Empty supervision returns a graph-connected zero loss."""
+    logits = torch.randn(2, 10, 1000, requires_grad=True)
     labels = torch.full((2, 10), -100, dtype=torch.long)
     loss = MaskedCrossEntropy(reduction="sum")(logits, labels, num_label_tokens=0)
+
     assert not torch.isnan(loss), "Loss should not be NaN when num_label_tokens=0"
     assert loss.item() == 0.0, f"Loss should be 0.0 when num_label_tokens=0, got {loss.item()}"
+    assert loss.requires_grad
+
+    loss.backward()
+
+    assert logits.grad is not None
+    assert torch.count_nonzero(logits.grad) == 0
 
 
 def test_masked_cross_entropy_num_label_tokens_normalization():

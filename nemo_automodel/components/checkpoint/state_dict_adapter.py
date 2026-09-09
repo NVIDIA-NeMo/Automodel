@@ -15,6 +15,8 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
+import torch
+
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -25,6 +27,18 @@ class StateDictAdapter(ABC):
     This class defines the interface for converting between native model
     state dict format and other model state dict formats.
     """
+
+    _supports_low_memory_dcp_load: bool = False
+
+    @property
+    def supports_low_memory_dcp_load(self) -> bool:
+        """Whether DCP can load the checkpoint with zero or small temporary tensors.
+
+        Most checkpoint tensors must load directly into the model's existing weight memory. Small temporary tensors
+        are allowed when they are converted and released after the read. Enable this only when the extra memory is
+        safely below a full model copy, including when loading on one GPU.
+        """
+        return self._supports_low_memory_dcp_load
 
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
@@ -71,3 +85,37 @@ class StateDictAdapter(ABC):
             Returns a list because some native tensors may split into multiple HF tensors.
         """
         pass
+
+    def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
+        """Return the Hugging Face keys produced by ``to_hf`` without converting real weights.
+
+        Args:
+            state_dict: Native model state mapping. Tensor values may have
+                arbitrary rank and axis order and retain their exact parameter
+                or buffer layouts.
+
+        Returns:
+            Hugging Face state-dict keys in adapter iteration order.
+        """
+        shape_only_state = {
+            key: torch.empty_like(value, device="meta") if isinstance(value, torch.Tensor) else value
+            for key, value in state_dict.items()
+        }
+        return list(self.to_hf(shape_only_state, exclude_key_regex=r".*_extra_state.*", quantization=False))
+
+    def map_peft_target_module_to_hf(self, name: str) -> str:
+        """Translate a PEFT target-module name to the HuggingFace layout.
+
+        adapter_config.json's target_modules are collected from native module
+        names. Adapters whose ``to_hf`` renames modules (e.g. Kimi K3's
+        ``mlp.experts.{E}.gate_proj`` -> ``block_sparse_moe.experts.{E}.w1``)
+        should override this with the same renames so PEFT can resolve the
+        entries against the converted checkpoint.
+
+        Args:
+            name: A target-module name in native layout.
+
+        Returns:
+            The name in HuggingFace layout. Defaults to the name unchanged.
+        """
+        return name

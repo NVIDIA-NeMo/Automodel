@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import yaml
 
@@ -55,7 +55,7 @@ class SkyPilotLauncher(Launcher):
         job_conf_path: str,
         gpus_per_node: int,
         num_nodes: int,
-        extra_args: Optional[List[str]] = None,
+        extra_args: List[str] | None = None,
     ) -> str:
         repo_root = "~/sky_workdir"
         script_path = _recipe_module_path(recipe_target, repo_root)
@@ -88,7 +88,7 @@ class SkyPilotLauncher(Launcher):
         config_path: Path,
         recipe_target: str,
         launcher_config: Dict[str, Any],
-        extra_args: Optional[List[str]] = None,
+        extra_args: List[str] | None = None,
     ) -> int:
         from nemo_automodel.components.launcher.skypilot.utils import submit_skypilot_job
 
