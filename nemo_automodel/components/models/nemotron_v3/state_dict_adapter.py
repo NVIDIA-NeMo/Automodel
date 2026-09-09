@@ -89,7 +89,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
     Note: NemotronV3 uses 'mixer' instead of 'mlp' in layer paths.
     """
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,
@@ -272,14 +272,18 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             # reset_view_loaded_keys=False: this is the second merge of a single from_hf (after the
             # backbone merge above), so accumulate MTP view-loaded keys onto the backbone's record.
             prior_view_keys = set(self.view_loaded_native_keys)
-            merged_mtp = self._from_hf_w_merged_experts(stripped, device_mesh, reset_view_loaded_keys=False)
+            merged_mtp = (
+                stripped
+                if self.moe_config is None
+                else self._from_hf_w_merged_experts(stripped, device_mesh, reset_view_loaded_keys=False)
+            )
             for key, value in merged_mtp.items():
                 merged[f"mtp.{key}"] = value
             # The merge loop records view-loaded keys in mtp.-stripped form (it only ever sees
             # stripped keys); re-prefix them so the checkpoint loader's key-diff matches them
             # against the model's real mtp.* parameter names instead of flagging them as
             # missing/unexpected.
-            new_view_keys = self._view_loaded_native_keys - prior_view_keys
+            new_view_keys = self.view_loaded_native_keys - prior_view_keys
             self._view_loaded_native_keys = prior_view_keys | {f"mtp.{key}" for key in new_view_keys}
 
         return merged
@@ -302,7 +306,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # emitted HF keys stay under ``mtp.`` instead of ``backbone.``.
         if fqn.startswith("mtp."):
             fqn = _strip_mamba_fp32_holder_key(fqn)
-            expert_split = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, prefix_override="mtp.")
+            expert_split = (
+                None
+                if self.moe_config is None
+                else self._convert_single_merged_expert_to_hf_split_experts(
+                    fqn,
+                    tensor,
+                    prefix_override="mtp.",
+                    **kwargs,
+                )
+            )
             result = expert_split if expert_split is not None else [(fqn, tensor)]
             result = [(key, _upcast_mamba_fp32_state_tensor(key, value)) for key, value in result]
             if exclude_key_regex:
