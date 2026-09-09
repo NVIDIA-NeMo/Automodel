@@ -21,13 +21,13 @@ import torch
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
-    clip_grad_norm,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+from nemo_automodel.shared.tp_replicas import synchronize_tp_replica_gradients
 
 logger = logging.getLogger(__name__)
 
@@ -375,11 +375,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
-                    clip_grad_norm(
-                        None,
-                        self.model_parts,
-                        device_mesh=self.device_mesh,
-                    )
+                    synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")

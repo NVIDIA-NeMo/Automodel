@@ -719,6 +719,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     monkeypatch.setattr(diffusion_train, "prepare_for_grad_accumulation", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
+    monkeypatch.setattr(diffusion_train, "synchronize_tp_replica_gradients", MagicMock())
     monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
     sync_ctx_mock = MagicMock(wraps=diffusion_train.get_sync_ctx)
     monkeypatch.setattr(diffusion_train, "get_sync_ctx", sync_ctx_mock)
@@ -782,6 +783,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     diffusion_train.prepare_for_grad_accumulation.assert_called_once_with([model], pp_enabled=False)
     diffusion_train.prepare_for_final_backward.assert_called_once_with([model], pp_enabled=False)
     diffusion_train.prepare_after_first_microbatch.assert_called_once()
+    diffusion_train.synchronize_tp_replica_gradients.assert_called_once_with([model], recipe.device_mesh)
     assert sync_ctx_mock.call_args_list == [
         call(model, False, defer_fsdp_grad_sync=True),
         call(model, True, defer_fsdp_grad_sync=True),
@@ -1042,6 +1044,7 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     monkeypatch.setattr(diffusion_train, "prepare_for_grad_accumulation", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
+    monkeypatch.setattr(diffusion_train, "synchronize_tp_replica_gradients", MagicMock())
     monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
     wandb_log = MagicMock()

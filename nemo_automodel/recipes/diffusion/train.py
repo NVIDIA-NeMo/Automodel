@@ -43,7 +43,7 @@ from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.import_utils import safe_import_from
-from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas
+from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.shared.utils import dtype_from_str
 
 # Removed diffusion-only YAML keys and their standard replacements. The diffusion
@@ -1067,6 +1067,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                     if microbatch_idx == 0:
                         prepare_after_first_microbatch()
 
+                synchronize_tp_replica_gradients([self.model], getattr(self, "device_mesh", None))
                 grad_norm = clip_grad_norm(
                     self.clip_grad_max_norm,
                     [self.model],

@@ -62,6 +62,7 @@ from nemo_automodel.components.training.utils import clip_grad_norm  # noqa: E40
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
 from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
+from nemo_automodel.shared.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 
 try:
     from pydantic.warnings import UnsupportedFieldAttributeWarning
@@ -813,6 +814,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         # Synchronize unsharded TP replicas once at the optimizer boundary,
         # then compute a sharding-aware norm and clip when configured.
         clip_threshold = max_grad_norm if max_grad_norm is not None and max_grad_norm > 0 else None
+        synchronize_tp_replica_gradients([self.model], self.device_mesh)
         grad_norm = clip_grad_norm(
             clip_threshold,
             [self.model],

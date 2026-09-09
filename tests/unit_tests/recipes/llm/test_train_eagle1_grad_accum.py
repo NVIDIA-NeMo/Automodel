@@ -37,6 +37,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
+from nemo_automodel.recipes.llm import train_eagle1
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 
 # ---------------------------------------------------------------------------
@@ -147,7 +148,7 @@ def _build_recipe(num_batches: int, grad_accum: int, trainer_module: nn.Module |
         (2, 4, 1),  # entire epoch is a single trailing window of 2
     ],
 )
-def test_trailing_flush_rescales_gradient_to_full_window_scale(num_batches, accum, expected_steps):
+def test_trailing_flush_rescales_gradient_to_full_window_scale(monkeypatch, num_batches, accum, expected_steps):
     """Every optimizer step -- full window and trailing flush alike -- sees a
     unit gradient. Without the trailing rescale the final step would see
     ``pending / accum * ones`` and this assertion would fail."""
@@ -155,6 +156,12 @@ def test_trailing_flush_rescales_gradient_to_full_window_scale(num_batches, accu
     module = recipe.trainer_module
 
     captured: list[torch.Tensor] = []
+    sync_calls = []
+    monkeypatch.setattr(
+        train_eagle1,
+        "synchronize_tp_replica_gradients",
+        lambda model_parts, device_mesh: sync_calls.append((model_parts, device_mesh)),
+    )
 
     def _pre_step_hook(optimizer, args, kwargs):
         # Fires right before each optimizer step, after the trailing rescale and
@@ -168,6 +175,7 @@ def test_trailing_flush_rescales_gradient_to_full_window_scale(num_batches, accu
 
     assert recipe.runtime.global_step == expected_steps
     assert len(captured) == expected_steps
+    assert sync_calls == [([module], None)] * expected_steps
     for grad in captured:
         torch.testing.assert_close(grad, torch.ones_like(grad))
 

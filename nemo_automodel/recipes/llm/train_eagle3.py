@@ -79,7 +79,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     should_sync_grads,
 )
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
-from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas
+from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 
 logger = logging.getLogger(__name__)
 
@@ -2072,6 +2072,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     if pending_micro_batches == self.grad_accumulation_steps:
                         if getattr(self, "cp_group", None) is not None:
                             self._all_reduce_draft_grads_over_cp()
+                        synchronize_tp_replica_gradients(
+                            [self.trainer_module],
+                            getattr(self, "device_mesh", None),
+                        )
                         grad_norm = clip_grad_norm(
                             self.max_grad_norm,
                             [self.trainer_module],
@@ -2169,6 +2173,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 # cp replicas of the draft desync permanently from here on.
                 if getattr(self, "cp_group", None) is not None:
                     self._all_reduce_draft_grads_over_cp()
+                synchronize_tp_replica_gradients(
+                    [self.trainer_module],
+                    getattr(self, "device_mesh", None),
+                )
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:

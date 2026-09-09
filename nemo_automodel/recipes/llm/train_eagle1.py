@@ -59,7 +59,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     raise_if_peft_configured,
     should_sync_grads,
 )
-from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas
+from nemo_automodel.shared.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 
 logger = logging.getLogger(__name__)
 
@@ -805,6 +805,10 @@ class TrainEagle1Recipe(BaseRecipe):
                     pending_micro_batches += 1
 
                     if pending_micro_batches == self.grad_accumulation_steps:
+                        synchronize_tp_replica_gradients(
+                            [self.trainer_module],
+                            getattr(self, "device_mesh", None),
+                        )
                         grad_norm = clip_grad_norm(
                             self.max_grad_norm,
                             [self.trainer_module],
@@ -890,6 +894,10 @@ class TrainEagle1Recipe(BaseRecipe):
                 # flush (and the gradient-sync/clip collectives inside it) while its
                 # peers step, hanging on the mismatched collective.
                 if pending_micro_batches > 0:
+                    synchronize_tp_replica_gradients(
+                        [self.trainer_module],
+                        getattr(self, "device_mesh", None),
+                    )
                     scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                     for p in self.trainer_module.parameters():
                         if p.grad is not None:

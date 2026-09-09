@@ -41,6 +41,7 @@ from nemo_automodel.recipes.llm.train_ft import (
     _get_model_name,
     build_model,
 )
+from nemo_automodel.shared.tp_replicas import synchronize_tp_replica_gradients
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +248,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             all_labels.append(labels.view(-1).detach())
             (loss * self._get_dp_group_size(include_cp=True)).backward()
 
-        # Calculate gradient norm (distributed-aware)
+        # Synchronize unsharded TP replicas, then calculate the distributed-aware gradient norm.
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = clip_grad_norm(
             max_grad_norm=self.max_grad_norm,
             model_parts=self.model_parts,

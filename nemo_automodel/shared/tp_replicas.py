@@ -295,10 +295,13 @@ def synchronize_tp_replica_gradients(
 ) -> int:
     """Reduce TP-replicated gradients once at the optimizer boundary.
 
+    Call this exactly once per optimizer update, after gradient accumulation and
+    before gradient scaling, norm calculation, clipping, or ``optimizer.step()``.
     Full-computation replicas are mean-reduced so each logical parameter has one
     optimizer update. Modules explicitly marked as producing disjoint partial
-    contributions are sum-reduced. Gradients are flattened into bounded buffers
-    by reduction, device, and dtype before communication. DTensor gradients are
+    contributions are sum-reduced, which makes repeated synchronization within
+    one update non-idempotent. Gradients are flattened into bounded buffers by
+    reduction, device, and dtype before communication. DTensor gradients are
     reduced through rank-local storage while retaining their global shape and
     placements. Model-owned shards and parameters or gradients sharded or partial
     on the TP axis are untouched. Low-precision gradients are reduced in FP32 and
