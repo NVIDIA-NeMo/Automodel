@@ -193,7 +193,9 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         (1 checkpoint tensor <-> 3 module tensors), which `convert_single_tensor_to_hf`
         cannot do correctly one tensor at a time.
         """
-        return self._llm_adapter.supports_write_through_checkpoint_load and not self.vision_uses_native_radio
+        return self._llm_adapter.supports_write_through_checkpoint_load and not getattr(
+            self, "vision_uses_native_radio", False
+        )
 
     def __init__(
         self,
