@@ -468,7 +468,14 @@ class GlmMoeDsaMLA(nn.Module):
             bias=False,
             dtype=dtype,
         )
-        self.q_a_layernorm = initialize_rms_norm_module(rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, dtype=dtype)
+        # Upstream GLM fixes the MLA latent RMSNorms at 1e-6 independently of
+        # the model-wide rms_norm_eps=1e-5 used by the decoder block norms.
+        self.q_a_layernorm = initialize_rms_norm_module(
+            rms_norm_impl=rms_norm_impl,
+            dim=self.q_lora_rank,
+            eps=1e-6,
+            dtype=dtype,
+        )
         self.q_b_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.q_lora_rank,
@@ -485,7 +492,10 @@ class GlmMoeDsaMLA(nn.Module):
             dtype=dtype,
         )
         self.kv_a_layernorm = initialize_rms_norm_module(
-            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, dtype=dtype
+            rms_norm_impl=rms_norm_impl,
+            dim=self.kv_lora_rank,
+            eps=1e-6,
+            dtype=dtype,
         )
         self.kv_b_proj = initialize_linear_module(
             linear_impl=linear_impl,

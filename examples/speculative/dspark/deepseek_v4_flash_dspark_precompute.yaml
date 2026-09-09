@@ -78,4 +78,5 @@ recipe_args:
   target_enable_fsdp_optimizations: true
 
   # mask_reasoning_content: true   # exclude <think>...</think> traces from loss (non-thinking data)
+  # mask_generation_prompt: true   # exclude the template-supplied turn prefix (role header, empty think block) from loss
   # target_num_hidden_layers: 4    # single-node validation only (see header); set target_layer_ids to match

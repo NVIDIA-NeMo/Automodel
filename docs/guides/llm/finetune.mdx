@@ -480,8 +480,10 @@ print(tokenizer.decode(output[0], skip_special_tokens=True))
 PEFT adapters must be loaded on top of the base model. Because the base NeMo AutoModel installation does not include the Hugging Face PEFT library, install a tested version in your active environment before running the inference code:
 
 ```bash
-uv pip install "peft>=0.18.1"
+uv pip install "peft>=0.19.1"
 ```
+
+LoRA adapters for models with fused MoE expert weights (for example Qwen3-MoE, MiniMax-M2, Nemotron 3) are exported in the ParamWrapper layout peft has used since 0.19.1, when peft changed it (huggingface/peft#3165); that is why the step above installs `peft>=0.19.1`. If such an adapter has to be loaded by a consumer pinned to an older peft, set `checkpoint.legacy_paramwrapper_layout: true` in the training config to export the pre-0.19.1 layout instead. An adapter exported that way does not load with peft 0.19.1 or newer.
 
 ```python
 import torch

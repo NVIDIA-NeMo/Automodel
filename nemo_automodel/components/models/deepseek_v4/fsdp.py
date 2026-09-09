@@ -22,6 +22,8 @@ _DSV4_CLASS_NAMES = {
     "DeepseekV4ForCausalLM",
     "DeepseekV4Model",
     "DeepseekV4Block",
+    "DeepseekV4VisionBlock",
+    "DeepseekV4VisionTransformer",
 }
 
 _DSV4_FP32_MODULE_SUFFIXES = (
@@ -36,10 +38,22 @@ _DSV4_FP32_MODULE_SUFFIXES = (
     "self_attn.compressor.indexer.wkv",
     "self_attn.compressor.indexer.wgate",
     "self_attn.compressor.indexer.ape_param",
+    "norm1",
+    "norm2",
+    "vision.norm",
 )
 
 _DSV4_RETURNED_FP32_PARAMETER_CLASS_NAMES = {
     "DeepseekV4FP32Parameter",
+}
+
+# These modules own fp32 parameters but explicitly upcast their arithmetic and
+# cast the result back to the incoming activation dtype.  Their nested FSDP
+# unit must therefore be transparent at the module boundary: casting the input
+# and forcing an fp32 output would leak fp32 activations into the following
+# bf16 projection.
+_DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES = {
+    "DeepseekV4VisionRMSNorm",
 }
 
 
@@ -115,15 +129,15 @@ def _floating_param_dtypes(module: nn.Module) -> set[torch.dtype]:
     return {param.dtype for param in module.parameters() if torch.is_floating_point(param)}
 
 
-def _fp32_mp_policy(mp_policy):
+def _fp32_mp_policy(mp_policy, *, preserve_activation_dtype: bool = False):
     if not isinstance(mp_policy, MixedPrecisionPolicy):
         return mp_policy
 
     return MixedPrecisionPolicy(
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
-        cast_forward_inputs=mp_policy.cast_forward_inputs,
+        output_dtype=None if preserve_activation_dtype else torch.float32,
+        cast_forward_inputs=False if preserve_activation_dtype else mp_policy.cast_forward_inputs,
     )
 
 
@@ -152,7 +166,14 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
     return fully_shard(
         module,
         mesh=mesh,
-        mp_policy=_fp32_mp_policy(mp_policy) if fp32_policy else mp_policy,
+        mp_policy=(
+            _fp32_mp_policy(
+                mp_policy,
+                preserve_activation_dtype=module.__class__.__name__ in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES,
+            )
+            if fp32_policy
+            else mp_policy
+        ),
         offload_policy=offload_policy,
         **_fsdp_kwargs_for_module(module, fsdp_kwargs),
     )
