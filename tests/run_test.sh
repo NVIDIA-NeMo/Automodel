@@ -80,7 +80,7 @@ coverage run \
     "${TEST_DIRS[@]}" \
     -o log_cli=true \
     -o log_cli_level=INFO \
-    -vs -m "not pleasefixme" --tb=short -rA \
+    -vs -m "not pleasefixme" --tb=short -ra \
     $SHARD_ARGS \
     $ADDITIONAL_ARGS
 coverage combine -q
