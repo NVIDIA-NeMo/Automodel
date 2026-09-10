@@ -1018,6 +1018,11 @@ class DeepseekV41Block(nn.Module):
             of shape [batch, sequence, hc_mult], and the updated shared state.
             State tensor layouts are documented in DeepseekV41SharedState.
         """
+        if pre_mix.dtype != torch.float32:
+            raise TypeError(
+                "Single-pass mHC requires FP32 carried coefficients. Configure the FSDP mixed precision policy "
+                "with cast_forward_inputs=False and output_dtype=None."
+            )
         # Own assignments locally and return them explicitly: FSDP may copy inputs.
         # Retaining tensor aliases preserves gradients through shared KV.
         state = replace(state)

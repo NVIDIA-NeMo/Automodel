@@ -14,8 +14,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import torch
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -26,13 +24,7 @@ _DSV4_CLASS_NAMES = {
     "DeepseekV4Block",
     "DeepseekV4VisionBlock",
     "DeepseekV4VisionTransformer",
-    # DeepSeek V4.1 shares the hyper-connection / compressor fp32 islands.
-    "DeepseekV41ForCausalLM",
-    "DeepseekV41Model",
-    "DeepseekV41Block",
 }
-
-_DSV4_MODEL_TYPES = {"deepseek_v4", "deepseek_v41"}
 
 _DSV4_FP32_MODULE_SUFFIXES = (
     "attn_hc",
@@ -119,7 +111,7 @@ def _module_config_model_type(module: nn.Module) -> str | None:
 
 
 def _is_deepseek_v4_module(module: nn.Module) -> bool:
-    if module.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(module) in _DSV4_MODEL_TYPES:
+    if module.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(module) == "deepseek_v4":
         return True
 
     wrapped = getattr(module, "_checkpoint_wrapped_module", None)
@@ -127,7 +119,7 @@ def _is_deepseek_v4_module(module: nn.Module) -> bool:
         return True
 
     return any(
-        sub.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(sub) in _DSV4_MODEL_TYPES
+        sub.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(sub) == "deepseek_v4"
         for sub in module.modules()
         if sub is not module
     )
@@ -238,12 +230,6 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
     the explicitly listed reference-sensitive islands and let the parent block
     use the caller's bf16 policy.
     """
-    block = getattr(module, "_checkpoint_wrapped_module", module)
-    if block.__class__.__name__ == "DeepseekV41Block" and isinstance(mp_policy, MixedPrecisionPolicy):
-        # The block owns mixed activation dtypes: residuals may be BF16, while
-        # pre_mix and shared indexer state must retain their original precision.
-        mp_policy = replace(mp_policy, cast_forward_inputs=False, output_dtype=None)
-
     is_dsv4 = _is_deepseek_v4_module(module)
     if is_dsv4:
         _attach_hca_param_sync_group(module, mesh)
