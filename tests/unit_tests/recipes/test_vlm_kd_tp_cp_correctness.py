@@ -113,9 +113,18 @@ def _batch():
 
 @pytest.fixture(scope="module")
 def trivial_pg(tmp_path_factory):
+    """Provide a single-rank gloo process group, torn down with the module.
+
+    The group must not outlive this module. A leaked group leaves
+    ``torch.distributed.is_initialized()`` true for the rest of the session, so
+    later tests read ``world_size=1`` from the live group instead of the
+    ``WORLD_SIZE`` environment variable they set, and tests that skip when a
+    group already exists stop running at all.
+    """
     if not torch.distributed.is_available():
         pytest.skip("torch.distributed not available")
-    if not torch.distributed.is_initialized():
+    created_here = not torch.distributed.is_initialized()
+    if created_here:
         store_path = tmp_path_factory.mktemp("dist") / "store"
         torch.distributed.init_process_group(
             backend="gloo",
@@ -123,7 +132,11 @@ def trivial_pg(tmp_path_factory):
             rank=0,
             world_size=1,
         )
-    return torch.distributed.group.WORLD
+    try:
+        yield torch.distributed.group.WORLD
+    finally:
+        if created_here:
+            torch.distributed.destroy_process_group()
 
 
 def test_vlm_kd_uses_tp_kd_loss_path(monkeypatch, trivial_pg):

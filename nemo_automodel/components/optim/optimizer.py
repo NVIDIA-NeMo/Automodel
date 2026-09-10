@@ -54,6 +54,7 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.optim.dion import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
@@ -141,7 +142,8 @@ def _build_param_groups(
     compiled = [re.compile(override.pattern) for override in overrides]
     default_params: list[torch.nn.Parameter] = []
     matched_params: list[list[torch.nn.Parameter]] = [[] for _ in overrides]
-    for name, param in named_params:
+    for raw_name, param in named_params:
+        name = canonical_parameter_fqn(raw_name)
         for idx, regex in enumerate(compiled):
             if regex.search(name):
                 matched_params[idx].append(param)
@@ -192,7 +194,6 @@ class OptimizerConfig:
     # Whether this optimizer can be sharded for Megatron-FSDP. The recipe layer
     # reads this to decide whether to shard the built optimizers.
     supports_megatron_fsdp_sharding: ClassVar[bool] = True
-    _uses_model_params_as_master_weights: ClassVar[bool] = False
 
     # Per-group LR/WD overrides matched by parameter name. Empty = single group
     # (unchanged behavior). Honored by the standard torch optimizers (typed configs
@@ -203,10 +204,6 @@ class OptimizerConfig:
     def __post_init__(self) -> None:
         # YAML delivers overrides as plain dicts; coerce them to the typed form.
         self.param_group_overrides = _coerce_param_group_overrides(self.param_group_overrides)
-
-    def uses_model_params_as_master_weights(self) -> bool:
-        """Return whether the optimizer updates resident model parameters without a separate master copy."""
-        return self._uses_model_params_as_master_weights
 
     def build(
         self,
@@ -262,8 +259,6 @@ class OptimizerConfig:
 class AdamConfig(OptimizerConfig):
     """``torch.optim.Adam``."""
 
-    _uses_model_params_as_master_weights: ClassVar[bool] = True
-
     lr: float = 1e-4
     weight_decay: float = 0.01
     betas: tuple[float, float] = (0.9, 0.999)
@@ -281,8 +276,6 @@ class AdamConfig(OptimizerConfig):
 @dataclass
 class AdamWConfig(OptimizerConfig):
     """``torch.optim.AdamW``."""
-
-    _uses_model_params_as_master_weights: ClassVar[bool] = True
 
     lr: float = 1e-4
     weight_decay: float = 0.01
@@ -500,11 +493,6 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
     factory: Callable[..., torch.optim.Optimizer] | None = None
     kwargs: dict[str, Any] = field(default_factory=dict)
 
-    def uses_model_params_as_master_weights(self) -> bool:
-        """Return whether the wrapped factory is a built-in ``torch.optim`` optimizer."""
-        module = getattr(self.factory, "__module__", "") or ""
-        return module == "torch.optim" or module.startswith("torch.optim.")
-
     def build(
         self,
         model: torch.nn.Module,
@@ -612,6 +600,14 @@ class LRSchedulerConfig:
         Returns:
             One :class:`OptimizerParamScheduler` per optimizer.
         """
+        # The removed diffusion-only LR builder accepted a float in (0, 1) as a
+        # fraction of total steps; here it would silently disable warmup (warmup
+        # ends before step 1), so reject it explicitly.
+        if self.lr_warmup_steps is not None and 0 < self.lr_warmup_steps < 1:
+            raise ValueError(
+                f"lr_warmup_steps must be an integer step count, got {self.lr_warmup_steps!r}. "
+                "Fractional warmup is not supported; set the number of warmup steps directly."
+            )
         # ``epoch_len`` is already expressed in optimizer steps (StepScheduler computes it as
         # ``ceil(len(dataloader) / grad_acc_steps)``) and is ``None`` for iterable/streaming
         # dataloaders, where ``len()`` is undefined.  Never call ``len(dataloader)`` here.

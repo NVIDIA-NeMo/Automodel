@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -47,9 +47,9 @@ class DSparkTargetBatch:
     target_last_hidden_states: torch.Tensor  # [B, S, H]
     input_ids: torch.Tensor
     loss_mask: torch.Tensor
-    position_ids: Optional[torch.Tensor] = None
-    seq_lens: Optional[torch.Tensor] = None
-    doc_remaining: Optional[torch.Tensor] = None
+    position_ids: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+    doc_remaining: torch.Tensor | None = None
 
 
 class HFDSparkTargetModel:
@@ -153,9 +153,9 @@ class HFDSparkTargetModel:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        doc_remaining: Optional[torch.Tensor] = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
         **mm_kwargs: torch.Tensor,
     ) -> DSparkTargetBatch:
         """Run the target model once and capture the DSpark context + last hidden state.

@@ -99,6 +99,7 @@ class TestCheckpointingConfig:
             is_peft=False,
         )
         assert cfg.is_async is False
+        assert cfg.allow_legacy_pickle_restore is False
         assert cfg.dequantize_base_checkpoint is None
         assert cfg.single_rank_consolidation is False
         assert cfg.staging_dir is None
@@ -107,6 +108,16 @@ class TestCheckpointingConfig:
         assert cfg.best_metric_key == "default"
         assert cfg.consolidation_timeout_minutes == 30
         assert cfg.max_recent_checkpoints is None
+
+    def test_allow_legacy_pickle_restore_override(self):
+        cfg = CheckpointingConfig(allow_legacy_pickle_restore=True)
+
+        assert cfg.allow_legacy_pickle_restore is True
+
+    @pytest.mark.parametrize("invalid_value", [None, 0, 1, "false", "true"])
+    def test_allow_legacy_pickle_restore_must_be_boolean(self, invalid_value):
+        with pytest.raises(ValueError, match="allow_legacy_pickle_restore must be a boolean"):
+            CheckpointingConfig(allow_legacy_pickle_restore=invalid_value)
 
     def test_consolidation_timeout_override(self):
         cfg = CheckpointingConfig(consolidation_timeout_minutes=45)
@@ -130,6 +141,33 @@ class TestCheckpointingConfig:
                 save_consolidated=False,
                 max_recent_checkpoints=1,
             )
+
+    @pytest.mark.parametrize("save_consolidated", [True, "final", "every"])
+    def test_consolidated_export_rejects_msc_checkpoint_dir(self, save_consolidated):
+        with pytest.raises(ValueError, match="not compatible with remote cloud storage"):
+            CheckpointingConfig(
+                checkpoint_dir="msc://bucket/checkpoints",
+                save_consolidated=save_consolidated,
+            )
+
+    def test_accepts_msc_dcp_checkpoint_dir(self):
+        cfg = CheckpointingConfig(
+            checkpoint_dir="msc://bucket/checkpoints",
+            save_consolidated=False,
+        )
+
+        assert cfg.checkpoint_dir == "msc://bucket/checkpoints"
+        assert cfg.save_consolidated.value == "false"
+        assert cfg.max_recent_checkpoints is None
+
+    def test_accepts_local_checkpoint_dir_with_retention(self):
+        """The rejection is scoped to remote roots; local paths keep working."""
+        cfg = CheckpointingConfig(
+            checkpoint_dir="/tmp/checkpoints",
+            save_consolidated=False,
+            max_recent_checkpoints=1,
+        )
+        assert cfg.max_recent_checkpoints == 1
 
     def test_importable_from_checkpointing(self):
         """Verify backward compat: import from checkpointing.py still works."""
@@ -221,3 +259,31 @@ def test_async_checkpointing_gate_uses_semantic_versioning(monkeypatch, version,
     cfg = CheckpointingConfig(is_async=True, save_consolidated=False)
 
     assert cfg.is_async is expected
+
+
+class TestBuild:
+    """CheckpointingConfig.build constructs a Checkpointer and forwards runtime arguments."""
+
+    def _build(self, **build_kwargs):
+        cfg = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/ckpt",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="org/model",
+            save_consolidated=False,
+        )
+        return cfg.build(dp_rank=0, tp_rank=0, pp_rank=0, **build_kwargs)
+
+    def test_build_constructs_checkpointer_with_config_and_ranks(self):
+        checkpointer = self._build()
+
+        assert checkpointer.config.model_repo_id == "org/model"
+        assert (checkpointer.dp_rank, checkpointer.tp_rank, checkpointer.pp_rank) == (0, 0, 0)
+
+    def test_build_forwards_pp_group(self):
+        pp_group = object()
+
+        checkpointer = self._build(pp_group=pp_group)
+
+        assert checkpointer.pp_group is pp_group

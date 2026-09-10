@@ -21,7 +21,12 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.training import prewarm
+from nemo_automodel.components.training import _mamba_ssd_prewarm, prewarm
+from nemo_automodel.components.training._mamba_ssd_prewarm import (
+    _collect_mamba_ssd_autotune_shapes,
+    _prewarm_mamba_ssd_autotune,
+    _prewarm_mamba_ssd_end_to_end,
+)
 from nemo_automodel.components.training.prewarm import (
     PrewarmConfig,
     _collect_gdn_autotune_shapes,
@@ -46,6 +51,27 @@ class _FakeGDN(torch.nn.Module):
         self.chunk_gated_delta_rule = object()  # presence is what the discovery checks
 
 
+class _FakeMambaSSD(torch.nn.Module):
+    """Minimal stand-in for a mixer backed by the Mamba SSD operators."""
+
+    def __init__(
+        self,
+        num_heads: int = 4,
+        head_dim: int = 8,
+        state_size: int = 16,
+        n_groups: int = 2,
+        chunk_size: int = 32,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.ssm_state_size = state_size
+        self.n_groups = n_groups
+        self.chunk_size = chunk_size
+        self.cp = None
+        self.in_proj = torch.nn.Linear(4, 4)
+
+
 @pytest.fixture
 def single_rank_gloo():
     """Initialize a single-rank gloo process group for the duration of a test."""
@@ -67,6 +93,7 @@ def test_prewarm_config_defaults_all_off():
     cfg = PrewarmConfig()
     assert cfg.cublas_backward is False
     assert cfg.fla_gdn_autotune is False
+    assert cfg.mamba_ssd_autotune is False
     assert cfg.comm_groups is False
 
 
@@ -78,19 +105,29 @@ def test_apply_runs_only_enabled_prewarms(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_automodel.components.training.prewarm._prewarm_fla_gdn_autotune",
-        lambda model_parts, device: calls.append(("fla", device)),
+        lambda model_parts, device, batch_size: calls.append(("fla", device, batch_size)),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.training.prewarm._prewarm_mamba_ssd_autotune",
+        lambda model_parts, device: calls.append(("mamba", device)),
     )
     monkeypatch.setattr(
         "nemo_automodel.components.training.prewarm._prewarm_comm_groups",
         lambda model_parts, device, pp_mesh=None: calls.append(("comm", pp_mesh)),
     )
 
-    PrewarmConfig(cublas_backward=True, comm_groups=True).apply(
+    PrewarmConfig(cublas_backward=True, fla_gdn_autotune=True, mamba_ssd_autotune=True, comm_groups=True).apply(
         model_parts=[torch.nn.Linear(2, 2)],
         device=torch.device("cpu"),
+        batch_size=4,
         pp_mesh="pp-mesh",
     )
-    assert calls == [("cublas", torch.device("cpu")), ("comm", "pp-mesh")]
+    assert calls == [
+        ("cublas", torch.device("cpu")),
+        ("fla", torch.device("cpu"), 4),
+        ("mamba", torch.device("cpu")),
+        ("comm", "pp-mesh"),
+    ]
 
     calls.clear()
     PrewarmConfig().apply(model_parts=[], device=None)
@@ -109,28 +146,36 @@ def test_apply_continues_after_prewarm_failures(monkeypatch, caplog):
 
     monkeypatch.setattr(prewarm, "_prewarm_cublas_backward", fail("cublas"))
     monkeypatch.setattr(prewarm, "_prewarm_fla_gdn_autotune", fail("fla"))
+    monkeypatch.setattr(prewarm, "_prewarm_mamba_ssd_autotune", fail("mamba"))
     monkeypatch.setattr(prewarm, "_prewarm_comm_groups", fail("comm"))
 
     with caplog.at_level(logging.ERROR, logger=prewarm.__name__):
-        PrewarmConfig(cublas_backward=True, fla_gdn_autotune=True, comm_groups=True).apply(
+        PrewarmConfig(
+            cublas_backward=True,
+            fla_gdn_autotune=True,
+            mamba_ssd_autotune=True,
+            comm_groups=True,
+        ).apply(
             model_parts=[torch.nn.Linear(2, 2)],
             device=torch.device("cpu"),
         )
 
-    assert calls == ["cublas", "fla", "comm"]
+    assert calls == ["cublas", "fla", "mamba", "comm"]
     assert "cuBLAS backward prewarm failed" in caplog.text
     assert "fla GDN autotune prewarm failed" in caplog.text
+    assert "Mamba SSD autotune prewarm failed" in caplog.text
     assert "Communication-group prewarm failed" in caplog.text
 
 
 def test_recipe_config_exposes_typed_prewarm_section():
     from nemo_automodel.recipes._typed_config import RecipeConfig
 
-    cfg = RecipeConfig({"prewarm": {"cublas_backward": True, "comm_groups": True}})
+    cfg = RecipeConfig({"prewarm": {"cublas_backward": True, "mamba_ssd_autotune": True, "comm_groups": True}})
     prewarm = cfg.prewarm
     assert isinstance(prewarm, PrewarmConfig)
     assert prewarm.cublas_backward is True
     assert prewarm.fla_gdn_autotune is False
+    assert prewarm.mamba_ssd_autotune is True
     assert prewarm.comm_groups is True
 
     assert RecipeConfig({}).prewarm is None
@@ -196,19 +241,36 @@ def test_fla_prewarm_skips_without_gdn_modules():
     assert _prewarm_fla_gdn_autotune([torch.nn.Linear(2, 2)], device) is False
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 def test_fla_end_to_end_prewarm_preserves_rng_with_stubbed_op(monkeypatch):
-    device = torch.device("cuda", torch.cuda.current_device())
-    output = torch.ones((1, 2, 2, 4), device=device, requires_grad=True)
-    fake_gdn_op = Mock(return_value=(output, None))
+    device = torch.device("cpu")
+    outputs = []
+
+    def fake_gdn_op(q, k, v, **kwargs):
+        output = torch.ones_like(v, requires_grad=True)
+        outputs.append(output)
+        return output, None
+
+    fake_gdn_op = Mock(side_effect=fake_gdn_op)
     monkeypatch.setattr(prewarm, "safe_import_from", lambda *args: (True, fake_gdn_op))
 
-    rng_before = torch.cuda.get_rng_state(device)
-    assert _prewarm_fla_gdn_end_to_end({(2, 4, 4, torch.float32): "gdn"}, device, seq_len=2) is True
-    assert torch.equal(torch.cuda.get_rng_state(device), rng_before)
-    fake_gdn_op.assert_called_once()
-    assert output.grad is not None
-    assert torch.equal(output.grad, torch.ones_like(output))
+    rng_before = torch.random.get_rng_state()
+    assert (
+        _prewarm_fla_gdn_end_to_end(
+            {(2, 4, 4, torch.float32): "gdn"},
+            device,
+            seq_len=2,
+            batch_size=3,
+        )
+        is True
+    )
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert fake_gdn_op.call_count == 2
+    dense_call, packed_call = fake_gdn_op.call_args_list
+    assert dense_call.args[0].shape == (3, 2, 2, 4)
+    assert dense_call.kwargs["cu_seqlens"] is None
+    assert packed_call.args[0].shape == (1, 2, 2, 4)
+    assert torch.equal(packed_call.kwargs["cu_seqlens"], torch.tensor([0, 2], device=device))
+    assert all(output.grad is not None for output in outputs)
 
 
 def test_triton_kernel_accepts_unwraps_wrappers_and_validates_args():
@@ -252,6 +314,71 @@ def test_fla_cp_kernel_prewarm_skips_on_kernel_signature_mismatch(monkeypatch, c
     assert launches == []  # nothing may be launched on signature drift
     assert "pre_process_bwd_kernel_merged" in caplog.text
     assert "merge_fwd_bwd_kernel" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Mamba SSD autotune prewarm
+# ---------------------------------------------------------------------------
+
+
+def test_collect_mamba_ssd_autotune_shapes_uses_local_cp_geometry_and_dedups():
+    class _Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mamba_a = _FakeMambaSSD()
+            self.mamba_b = _FakeMambaSSD()  # duplicate shape, deduped
+            self.mamba_cp = _FakeMambaSSD(num_heads=8, n_groups=4)
+            self.mamba_cp.cp = SimpleNamespace(num_heads_local=4, n_groups_local=2)
+            self.plain = torch.nn.Linear(4, 4)
+
+    shapes = _collect_mamba_ssd_autotune_shapes([_Wrapper()])
+    assert set(shapes) == {(4, 8, 16, 2, 32, torch.float32)}
+    assert shapes[(4, 8, 16, 2, 32, torch.float32)] == "mamba_a"
+
+
+def test_mamba_ssd_prewarm_skips_without_cuda_device():
+    assert _prewarm_mamba_ssd_autotune([_FakeMambaSSD()], torch.device("cpu")) is False
+
+
+def test_mamba_ssd_end_to_end_matches_keyed_geometry_and_preserves_rng(monkeypatch):
+    captured = {}
+
+    def fake_mamba_ssd_op(x, dt, a, b, c, chunk_size, *, D, z, dt_bias, seq_idx, dt_softplus):
+        captured.update(
+            x=x,
+            dt=dt,
+            a=a,
+            b=b,
+            c=c,
+            chunk_size=chunk_size,
+            d=D,
+            z=z,
+            dt_bias=dt_bias,
+            seq_idx=seq_idx,
+            dt_softplus=dt_softplus,
+        )
+        return x
+
+    monkeypatch.setattr(_mamba_ssd_prewarm, "safe_import_from", lambda *args: (True, fake_mamba_ssd_op))
+    rng_before = torch.random.get_rng_state()
+
+    shapes = {(4, 8, 16, 2, 32, torch.float32): "mamba"}
+    assert _prewarm_mamba_ssd_end_to_end(shapes, torch.device("cpu")) is True
+
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert captured["x"].shape == (1, 64, 4, 8)
+    assert captured["dt"].shape == (1, 64, 4)
+    assert captured["a"].shape == (4,)
+    assert captured["b"].shape == (1, 64, 2, 16)
+    assert captured["c"].shape == (1, 64, 2, 16)
+    assert captured["d"].shape == (4,)
+    assert captured["dt_bias"].shape == (4,)
+    assert captured["seq_idx"].shape == (1, 64)
+    assert captured["seq_idx"].dtype == torch.int32
+    assert captured["chunk_size"] == 32
+    assert captured["z"] is None
+    assert captured["dt_softplus"] is True
+    assert captured["x"].grad is not None
 
 
 # ---------------------------------------------------------------------------

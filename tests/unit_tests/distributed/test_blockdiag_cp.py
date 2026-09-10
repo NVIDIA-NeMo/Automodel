@@ -262,17 +262,27 @@ def test_blockdiag_batch_synthesizes_and_shards_padding_mask(monkeypatch):
         "_packed_seq_ids": torch.tensor([[1, 1, 2, 0, 0]], dtype=torch.long),
     }
 
-    ctx, sharded = bd_batch.make_cp_blockdiag_batch_and_ctx(_Mesh(), None, batch)
+    ctx, sharded, layout = bd_batch.make_cp_blockdiag_batch_and_ctx(_Mesh(), None, batch)
 
-    # rank 1 of 2 on a padded length-6 sequence -> local rows [3, 6): pad-only tail.
-    assert torch.equal(sharded["padding_mask"], torch.tensor([[True, True, True]]))
-    assert torch.equal(sharded["labels"], torch.tensor([[3, 4, -100]]))
+    # The shared CP contract pads to 2 * cp_size: length 5 -> 8, so rank 1 owns
+    # rows [4, 8), which are the input pad token plus the synthesized pad tail.
+    assert torch.equal(sharded["padding_mask"], torch.tensor([[True, True, True, True]]))
+    assert torch.equal(sharded["labels"], torch.tensor([[4, -100, -100, -100]]))
+    assert layout.original_seq_len == 5
+    assert layout.padded_seq_len == 8
     with ctx():
         state = bd_state._CP_BLOCKDIAG_STATE.get()
         assert state is not None
-        assert state["row_offset"] == 3
-        assert torch.equal(state["doc_ids"], torch.tensor([[1, 1, 2, 0, 0, 0]]))
+        assert state["row_offset"] == 4
+        assert torch.equal(state["doc_ids"], torch.tensor([[1, 1, 2, 0, 0, 0, 0, 0]]))
+        assert torch.equal(state["packed_cu_seqlens"], torch.tensor([0, 2, 3, 8]))
+        assert torch.equal(state["packed_cu_seqlens_cpu"], torch.tensor([0, 2, 3, 8]))
         assert state["varlen_meta"]["n_real"] == 0  # all-padding local chunk
+        model_state = bd_state.current_blockdiag_cp_state()
+        assert isinstance(model_state, bd_state.BlockdiagCpModelState)
+        assert model_state.group is state["group"]
+        assert model_state.packed_cu_seqlens is state["packed_cu_seqlens"]
+        assert model_state.packed_cu_seqlens_cpu is state["packed_cu_seqlens_cpu"]
     assert bd_state._CP_BLOCKDIAG_STATE.get() is None  # ctx exit restores the slot
 
 
@@ -296,10 +306,45 @@ def test_blockdiag_batch_shards_loss_mask(monkeypatch):
     }
     loss_mask = torch.tensor([[1, 1, 1, 1, 1, 0]], dtype=torch.long)
 
-    _, sharded = bd_batch.make_cp_blockdiag_batch_and_ctx(_Mesh(), None, batch, loss_mask=loss_mask)
+    _, sharded, layout = bd_batch.make_cp_blockdiag_batch_and_ctx(_Mesh(), None, batch, loss_mask=loss_mask)
 
-    assert torch.equal(sharded["loss_mask"], torch.tensor([[1, 1, 1]]))
-    assert sharded["inputs_embeds"].shape == (1, 3, 3)
+    assert torch.equal(sharded["loss_mask"], torch.tensor([[1, 1, 1, 1]]))
+    assert sharded["inputs_embeds"].shape == (1, 4, 3)
+    assert layout.original_seq_len == 6
+    assert layout.padded_seq_len == 8
+
+
+def test_blockdiag_batch_aux_only_keeps_primary_full(monkeypatch):
+    """In-forward multimodal embedding keeps input_ids full while aux tensors shard."""
+
+    class _Mesh:
+        def size(self):
+            return 2
+
+        def get_local_rank(self):
+            return 1
+
+        def get_group(self):
+            return object()
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+
+    input_ids = torch.arange(5).view(1, 5)
+    batch = {
+        "input_ids": input_ids,
+        "labels": torch.arange(5).view(1, 5),
+        "position_ids": torch.arange(15).view(3, 1, 5),
+        "_packed_seq_ids": torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long),
+    }
+
+    _, sharded, layout = bd_batch.make_cp_blockdiag_batch_and_ctx(_Mesh(), None, batch, shard_primary=False)
+
+    assert sharded["input_ids"] is input_ids
+    assert input_ids.shape == (1, 5)
+    assert torch.equal(sharded["labels"], torch.tensor([[4, -100, -100, -100]]))
+    assert torch.equal(sharded["position_ids"], torch.tensor([[[4, 0, 0, 0]], [[9, 0, 0, 0]], [[14, 0, 0, 0]]]))
+    assert layout.original_seq_len == 5
+    assert layout.padded_seq_len == 8
 
 
 def test_blockdiag_batch_rejects_batch_size_gt_one(monkeypatch):

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.06-py3
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.08-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -43,16 +43,54 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv; drop the base image's own /usr/local/bin copy (vulnerable rustls-webpki)
-ENV UV_VERSION="0.11.24"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
-    rm -f /usr/local/bin/uv /usr/local/bin/uvx
-ENV PATH="/root/.local/bin:$PATH"
+# Pin uv and uvx with patched quinn-proto (GHSA-4w2j-m93h-cj5j) on the system path.
+# Remove the base image's root-local copies so stale vulnerable binaries are not shipped.
+ENV UV_VERSION="0.11.26"
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) \
+            uv_arch="x86_64"; \
+            uv_sha256="6426a73c3837e6e2483ee344cbc00f36394d179afcba6183cb77437e67db4af0"; \
+            ;; \
+        arm64) \
+            uv_arch="aarch64"; \
+            uv_sha256="befa1a59c91e96eb601b0fd9a97c03dd666f17baba644b2b4db9c59a767e387e"; \
+            ;; \
+        *) \
+            echo "Unsupported TARGETARCH for uv: ${TARGETARCH}" >&2; \
+            exit 1; \
+            ;; \
+    esac && \
+    uv_archive="uv-${uv_arch}-unknown-linux-gnu.tar.gz" && \
+    curl -fLSs -o "/tmp/${uv_archive}" \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${uv_archive}" && \
+    echo "${uv_sha256}  /tmp/${uv_archive}" | sha256sum -c - && \
+    tar -xzf "/tmp/${uv_archive}" -C /tmp && \
+    install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uv" /usr/local/bin/uv && \
+    install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uvx" /usr/local/bin/uvx && \
+    rm -rf "/tmp/${uv_archive}" "/tmp/uv-${uv_arch}-unknown-linux-gnu" && \
+    rm -f /root/.local/bin/uv /root/.local/bin/uvx
+ENV PATH="/usr/local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
-RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+RUN if ! getent group "${RUNTIME_GID}" >/dev/null; then \
+        groupadd --gid "${RUNTIME_GID}" nemo-runtime; \
+    fi && \
+    if ! getent passwd "${RUNTIME_UID}" >/dev/null; then \
+        useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
+            --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime; \
+    fi && \
+    install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" \
+        /home/nemo-runtime \
+        /opt/Automodel \
+        /opt/uv_cache \
+        /opt/uv_cache/xdg && \
+    uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages && \
+    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
 
 # Torchrun uses uv venv
 RUN if [ -f /usr/local/bin/torchrun ]; then \
@@ -75,13 +113,8 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
-# and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
-# symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
-# DEEPEP_COMMIT to 42144303 (== 17cfb817 + DeepEP #638), which pads the HybridEP
-# max_num_of_tokens_per_rank up to the combine-kernel chunk size so a per-rank token
-# count that is not a multiple of 64 (e.g. 672) no longer fails the combine-kernel
-# static_assert (MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0).
+# Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
+# DEEPEP_COMMIT = 17cfb817 + DeepEP #638, padding max_num_of_tokens_per_rank to the combine-kernel chunk size.
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
 ENV HYBRID_EP_MULTINODE=1
@@ -113,13 +146,14 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True
 ARG BITSANDBYTES_COMMIT=0.49.2
+# Include native Blackwell targets, especially SM121 for DGX Spark, instead of relying on forward-compatible PTX.
 RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
     cd bitsandbytes && \
     git pull && \
     git fetch origin $BITSANDBYTES_COMMIT && \
     git checkout FETCH_HEAD && \
-    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
+    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110;120;121" -S . && \
     make && \
     cmake -DCOMPUTE_BACKEND=cpu -S . && \
     make && \
@@ -135,98 +169,26 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
     rm -f /opt/setup_uccl_ep.sh; \
     fi
 
-# Address base image CVE
-RUN pip install "aiohttp>=3.13.3" \
-        "black>=26.3.1" \
-        "GitPython>=3.1.50" \
-        "jaraco-context>=6.1.0" \
-        "jupyter-server>=2.18.0" \
-        "jupyterlab>=4.5.7" \
-        "mistune>=3.2.1" \
-        "nbconvert>=7.17.0" \
-        "notebook>=7.5.6" \
-        "onnx>=1.21.0" \
-        "pillow>=12.2.0" \
-        "protobuf>=6.33.5" \
-        "setuptools>=80.10.2" \
-        "tornado>=6.5.5" \
-        "urllib3>=2.7.0" && \
-    pip uninstall -y nvidia-dali-cuda130 wandb && \
-    rm -rf /opt/pytorch/pytorch/third_party/onnx
+# ---- Wheel builder: compile the heavy AOT source packages off the uv-sync path (cached across uv.lock bumps).
+# Build torchao then FA3/FA4 sequentially and cap compiler parallelism to stay within CI memory limits.
+FROM automodel_dep AS wheel_builder
 
-FROM automodel_dep as automodel_final
-
-WORKDIR /opt/Automodel
-
-COPY pyproject.toml uv.lock /opt/Automodel/
-COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
-COPY docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common/
-COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
-
-# Install Automodel
-ARG BASE_IMAGE=cuda
-ARG AUTOMODEL_INSTALL=all
-ARG UV_SYNC_ARGS="--locked"
-RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
-        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
-    fi && \
-    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
-
-# MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
-# torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
-# it. Install explicitly AFTER the sync so it is not pruned.
-#
-# Build FROM SOURCE (not `pip install torchao==0.14.0`): the MXFP8 grouped-GEMM path
-# needs the compiled mxfp8 CUDA kernels (torchao/csrc/cuda/mx_kernels), but PyPI ships
-# only a kernel-less `py3-none-any` wheel and an x86_64-only compiled wheel — no
-# aarch64 wheel and no sdist. On the sbsa/aarch64 build the pip wheel would silently
-# omit the kernels and MXFP8 would fall back to bf16 at runtime. setup.py has no
-# x86-only gate and cross-compiles the sm_100a kernels from the CUDA toolkit version
-# (build_for_sm100a = CUDA>=12.8; base is CUDA 13.x), so source builds on both arches.
-# --no-build-isolation reuses the container's torch ABI.
-# Pin v0.17.0 (NOT v0.14.1): v0.14.1's forward quantizes via EAGER unfused to_mx (no CUDA
-# kernel, ~49ms/iter) — a ~2.5x regression vs bf16. v0.17.0's forward is fully kernelized
-# (triton_to_mxfp8_dim0 for both activation and weight + device-side scale swizzle); it is
-# the torchao blog version (~1.43x MoE-layer speedup). NOT main: main's forward additionally
-# needs the nvidia-cutlass-dsl runtime for its CuTeDSL activation kernel, which this image
-# does not install (and _SM100_KERNELS_AVAILABLE doesn't gate it -> runtime crash); v0.17.0
-# is triton-only with no extra dep. CUTLASS is a git submodule the mxfp8 kernels need, so
-# clone with --recurse-submodules (pip's git+ submodule handling is unreliable). setup.py
-# self-gates the mxfp8/cutlass sm_100a kernels on CUDA>=12.8 and hardcodes their gencode
-# flags; TORCH_CUDA_ARCH_LIST + MAX_JOBS mirror the in-image DeepEP source build (above) to
-# cover torchao's other CUDAExtensions and bound the heavy CUTLASS sm_100 compile.
-RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodules \
+# torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
+ARG TORCHAO_REF=v0.17.0
+RUN mkdir -p /wheels && \
+    git clone --depth 1 --branch ${TORCHAO_REF} --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/ao.git /tmp/torchao && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
-        pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
+        pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/torchao && \
     rm -rf /tmp/torchao
 
-# ---- FlashAttention-3 (Hopper-only) + FlashAttention-4 (Hopper + Blackwell) ----
-# Installed AFTER uv sync (same reason as torchao: not resolvable by uv), and
-# with `pip` -- NOT `uv pip` -- like the torchao stage above: uv resolves against
-# the venv only and would reinstall torch from PyPI over the base image's torch
-# (FA3's sdist declares a torch dependency; pip sees the system-site torch and
-# leaves it alone; --no-deps additionally guards FA3). Verification uses dist
-# metadata because transformers' is_flash_attn_*_available() requires a visible
-# GPU, which docker builds do not have.
-# FA3 kernels are SM90a-locked (Hopper ISA; they do NOT run on SM100) -- Blackwell
-# is served by FA4, whose CuTe-DSL kernels JIT-compile per-arch at runtime
-# (Sm90 and Sm100 kernel classes ship in the package; no build-time arch work).
-# FA4 must be co-located with flash-attn's `flash_attn` package: it installs the
-# `flash_attn.cute` subpackage, which FA2's __init__.py shadows if the two live in
-# different site-packages prefixes (the PYTORCH_IMAGE base puts flash-attn in
-# /usr/local dist-packages while uv installs to /opt/venv).
-# INSTALL_FA4 defaults to false: flash-attn-4 requires apache-tvm-ffi>=0.1.12,
-# which conflicts with the tilelang-pinned apache-tvm-ffi<=0.1.11 (pyproject cuda
-# extra) -- enabling FA4 disables backend.attn="tilelang" until tilelang ships a
-# release built against ffi 0.1.12.
-ARG FLASH_ATTN_REF=002cce0a1
+# FA3 (Hopper-only, SM90a-locked, ~25 min nvcc) + FA4 cute (Blackwell, lightweight). arm64 -> skip FA3: GB200 target, QEMU cross-build impractical.
+# Pin >= #2762/#2507: older refs rebuilt the CuTe compile key every call when max_seqlen
+# is a tensor (varlen/packed), so HF models recompiled each step. Also picks up #2745
+# (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
+ARG FLASH_ATTN_REF=ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820
 ARG INSTALL_FA3=true
-ARG INSTALL_FA4=false
-# TARGETARCH is provided by buildx. FA3 is skipped on arm64 automatically: the
-# arm64 image targets GB200 (Blackwell), where the SM90a-only FA3 kernels are
-# dead weight, and CI cross-builds arm64 under QEMU where the ~25 min nvcc
-# compile is impractical.
+ARG INSTALL_FA4=true
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
@@ -236,23 +198,87 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     fi && \
     if [ "$INSTALL_FA3" = "true" ]; then \
         cd /tmp/fa/hopper && \
-        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=$(nproc) NVCC_THREADS=2 \
-        pip install --no-cache-dir --no-build-isolation --no-deps . && \
-        python -c "import importlib.metadata as m; print('flash-attn-3', m.version('flash-attn-3'))"; \
+        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=16 NVCC_THREADS=2 \
+        pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels . ; \
     fi && \
     if [ "$INSTALL_FA4" = "true" ]; then \
-        pip install --no-cache-dir /tmp/fa/flash_attn/cute "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" && \
-        FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
-        VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
-        { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; } && \
-        python -c "import importlib.metadata as m; print('flash-attn-4', m.version('flash-attn-4'))"; \
+        pip wheel --no-cache-dir --no-deps -w /wheels /tmp/fa/flash_attn/cute ; \
     fi && \
     rm -rf /tmp/fa
+
+FROM automodel_dep AS automodel_final
+
+WORKDIR /opt/Automodel
+
+# torchao MXFP8 + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
+# before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
+COPY --from=wheel_builder /wheels /tmp/wheels/
+ARG INSTALL_FA4=true
+RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
+    if [ "$INSTALL_FA4" = "true" ]; then \
+        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" && \
+        FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
+        VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
+        { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; }; \
+    fi && \
+    rm -rf /tmp/wheels
+
+# Address base image CVE
+RUN pip install "aiohttp>=3.14.3" \
+        "black>=26.3.1" \
+        "GitPython>=3.1.59" \
+        "jaraco-context>=6.1.0" \
+        "jupyter-server>=2.20.0" \
+        "jupyterlab>=4.5.10" \
+        "mistune>=3.3.0" \
+        "nbconvert>=7.17.0" \
+        "notebook>=7.5.6" \
+        "onnx>=1.21.0" \
+        "pillow>=12.3.0" \
+        "protobuf>=6.33.5" \
+        "setuptools>=80.10.2" \
+        "tornado>=6.5.5" \
+        "urllib3>=2.7.0" && \
+    pip uninstall -y nvidia-dali-cuda130 wandb && \
+    rm -rf /opt/pytorch/pytorch/third_party/onnx
+
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} pyproject.toml uv.lock /opt/Automodel/
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common/
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
+
+# Install Automodel
+ARG BASE_IMAGE=cuda
+ARG AUTOMODEL_INSTALL=all
+ARG UV_SYNC_ARGS="--locked"
+# Preserve locally built wheels for source-only CUDA packages such as flash-attn,
+# causal-conv1d, mamba-ssm, and nv-grouped-gemm across BuildKit builds.
+# ray/jars/ray_dist.jar vendors a flagged jackson (GHSA-r7wm-3cxj-wff9) that upstream
+# has not bumped; Automodel uses Ray from Python only, so drop the Java worker jars.
+RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
+    if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
+    fi && \
+    MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY="90,100" \
+        MAGI_ATTENTION_PREBUILD_FFA=0 \
+        MAX_JOBS=8 \
+        UV_CONCURRENT_INSTALLS=8 \
+        uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
+    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
+    rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
+    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
 
-COPY . /opt/Automodel
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} . /opt/Automodel
+
+# The checkout is owned by RUNTIME_UID but the image still runs as root by default,
+# so Git would reject /opt/Automodel for dubious ownership. Trust it system-wide to
+# keep both identities able to read the repository history.
+RUN git config --system --add safe.directory /opt/Automodel
 
 # Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
 RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
@@ -265,7 +291,7 @@ COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
 export PATH="/opt/venv/bin:$PATH"
 export UV_LINK_MODE=copy
-export PATH="/root/.local/bin:$PATH"
+export PATH="/usr/local/bin:$PATH"
 EOF
 
 RUN chmod +x /opt/venv/env.sh
@@ -281,3 +307,28 @@ ARG TARGETARCH
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-automodel/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
+
+# Runtime callers select this UID and set HOME/cache variables explicitly; the
+# published image remains root by default. Prove that the non-root contract
+# works before restoring that default.
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+RUN export HOME=/home/nemo-runtime \
+        XDG_CACHE_HOME=/opt/uv_cache/xdg && \
+    test "$(id -u)" = "${RUNTIME_UID}" && \
+    test -w "${HOME}" && \
+    test -w "${XDG_CACHE_HOME}" && \
+    test -w "${UV_CACHE_DIR}" && \
+    test -x /usr/local/bin/uv && \
+    test -x /usr/local/bin/uvx && \
+    test -x /opt/venv/bin/python && \
+    venv_site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
+    touch /opt/Automodel/.nonroot-write-probe \
+        /opt/venv/.nonroot-write-probe \
+        /opt/uv_cache/.nonroot-write-probe \
+        "${venv_site_packages}/.nonroot-write-probe" && \
+    rm /opt/Automodel/.nonroot-write-probe \
+        /opt/venv/.nonroot-write-probe \
+        /opt/uv_cache/.nonroot-write-probe \
+        "${venv_site_packages}/.nonroot-write-probe"
+
+USER root

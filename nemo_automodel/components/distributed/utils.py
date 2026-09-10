@@ -16,7 +16,7 @@
 import logging
 from contextlib import ContextDecorator, nullcontext
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.distributed
@@ -206,7 +206,7 @@ def reduce_loss(
     loss_store: list[torch.Tensor],
     total_num_tokens: torch.Tensor,
     per_token_loss: bool = True,
-    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_group: torch.distributed.ProcessGroup | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Reduce loss across all ranks.

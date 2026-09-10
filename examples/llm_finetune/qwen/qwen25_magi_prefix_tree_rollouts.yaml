@@ -106,3 +106,7 @@ optimizer:
   lr: 1.0e-4
   weight_decay: 0
   foreach: false
+
+ci:
+  recipe_owner: huiyingl
+  time: "00:20:00"

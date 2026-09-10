@@ -25,7 +25,7 @@ from copy import deepcopy
 from pathlib import Path
 
 # Security/Policy configuration
-from typing import Any, Mapping
+from typing import Any, Mapping, SupportsIndex
 
 import yaml
 
@@ -173,6 +173,10 @@ class _OrigValueStr(str):
         obj._orig_value = orig_value
         obj._no_env_resolve = True
         return obj
+
+    def __reduce_ex__(self, protocol: SupportsIndex, /) -> tuple[type["_OrigValueStr"], tuple[str, str]]:
+        """Preserve the resolved and original values when copying this string."""
+        return type(self), (str(self), self._orig_value)
 
 
 def resolve_yaml_env_vars(obj: Any) -> Any:
@@ -835,6 +839,6 @@ def load_yaml_config(path: str | Path) -> "ConfigNode":
     Returns:
         ConfigNode: A configuration node representing the YAML file.
     """
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     return ConfigNode(raw)

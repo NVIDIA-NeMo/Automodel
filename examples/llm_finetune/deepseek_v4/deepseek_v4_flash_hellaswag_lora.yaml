@@ -130,5 +130,16 @@ optimizer:
 ci:
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: hemildesai
-  time: "00:20:00"
+  time: "01:00:00"
   nodes: 4
+  checkpoint_robustness:
+    step_scheduler.global_batch_size: 32
+    step_scheduler.local_batch_size: 1
+    tokenizer_name: deepseek-ai/DeepSeek-V4-Flash
+    trust_remote_code: true
+    hf_device_map_auto: true
+    # EP32 sparse routing is inside the shared relaxed envelope; the separate
+    # vanilla-HF reload gate remains enabled so reference-load regressions still fail.
+    parity_tolerance_profile: relaxed
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

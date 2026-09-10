@@ -1,0 +1,184 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-parameter, language-only Qwen3.8-Flash-Next 180B SFT on HellaSwag.
+#
+# Hardware target: 8 nodes x 8 GPUs (64 GPUs), EP64, no PP/TP/CP.  The 512
+# routed experts and the 51.2B-parameter Engram table are both owner-sharded
+# over the world/EP group.  The model rejects other Engram group topologies
+# unless each rank's row range aligns with the checkpoint's 128 physical table
+# shards.
+#
+# From the AutoModel repository root:
+#   # Required on the validated cluster image: its injected NCCL network provider
+#   # corrupted cross-node Engram payloads, while NCCL's internal IB path passed
+#   # the full forward/backward/optimizer smoke.
+#   export NCCL_NET_PLUGIN=none
+#   export NCCL_NET=IB
+#   cp slurm.sub qwen3_8_flash_next_180b.sub
+#   # In qwen3_8_flash_next_180b.sub set CONFIG to this YAML, -N 8, and -t 01:00:00,
+#   # then configure the cluster account/container mounts and run:
+#   sbatch qwen3_8_flash_next_180b.sub
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  save_checkpoint_every_epoch: false
+  val_every_steps: 100
+  gc_every_steps: 10
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.qwen3_8_flash_next.config.Qwen3_8_FlashNextConfig.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3.8-Flash-Next
+    name_or_path: Qwen/Qwen3.8-Flash-Next
+    language_model_only: true
+  trust_remote_code: false
+  load_base_model: true
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: flex
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: hybridep
+    rope_fusion: false
+    fake_balanced_gate: false
+    gate_precision: float32
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/qwen3_8_flash_next_180b_hellaswag_ep64
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  num_samples_limit: 8192
+  pad_to_max_length: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3.8-Flash-Next
+    trust_remote_code: false
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: true
+  num_workers: 4
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
+  pad_to_max_length: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3.8-Flash-Next
+    trust_remote_code: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: false
+  drop_last: true
+  num_workers: 4
+
+optimizer:
+  # BF16 torch AdamW quantizes the update directly into BF16 model storage;
+  # at this model's 1e-5 LR most dense parameters would not change at all.
+  # TE keeps an exact FP32 master as a BF16 value plus a 16-bit remainder and
+  # uses FP32 moments while retaining BF16 model/checkpoint storage.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+  param_group_overrides:
+    - pattern: '\.ple\.ple_embedding\.ngram_embedding\.weight$'
+      lr_mult: 5.0
+      wd_mult: 0.0
+
+# Param-group multipliers are applied by OptimizerParamScheduler.step(), so a
+# scheduler is required even for a short run.  The table follows the same
+# warmup/decay shape at exactly 5x the base-model LR.
+lr_scheduler:
+  lr_warmup_steps: 10
+  lr_decay_steps: 100
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+clip_grad_norm:
+  max_norm: 1.0
+
+wandb:
+  enable: false
+  project: qwen3-8-flash-next-180b-sft
+  name: qwen3_8_flash_next_180b_hellaswag_ep64
+  dir: wandb
+
+ci:
+  recipe_owner: huiyingl
+  # pp_size(1) * ep_size(64) = 64 GPUs => 8 nodes (8 GPUs/node).
+  nodes: 8
+  time: "01:00:00"

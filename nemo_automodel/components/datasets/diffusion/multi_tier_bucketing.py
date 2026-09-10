@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ class MultiTierBucketCalculator:
         "1536p": 1536 * 1536,  # 2,359,296 pixels
     }
 
-    def __init__(self, quantization: int = 64, max_pixels: Optional[int] = None, debug_mode: bool = False):
+    def __init__(self, quantization: int = 64, max_pixels: int | None = None, debug_mode: bool = False):
         """
         Args:
             quantization: Resolution must be multiple of this (64 for Flux)
@@ -114,7 +114,7 @@ class MultiTierBucketCalculator:
     def _calculate_max_resolution(
         self,
         aspect_ratio: float,
-    ) -> Optional[Tuple[int, int]]:
+    ) -> Tuple[int, int] | None:
         """
         Calculate the maximum resolution for an aspect ratio within the pixel budget.
 
@@ -189,7 +189,7 @@ class MultiTierBucketCalculator:
 
         return best_bucket
 
-    def get_bucket_by_resolution(self, width: int, height: int) -> Optional[Dict]:
+    def get_bucket_by_resolution(self, width: int, height: int) -> Dict | None:
         """Get bucket by exact resolution."""
         return self.buckets_by_resolution.get((width, height))
 

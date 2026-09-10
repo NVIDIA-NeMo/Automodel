@@ -21,6 +21,8 @@ import nemo_automodel.components.datasets.llm.retrieval_collator as rc
 
 
 class FakeTokenizer:
+    model_input_names = ["input_ids", "attention_mask", "token_type_ids"]
+
     def __call__(
         self,
         texts: List[str],
@@ -69,6 +71,27 @@ class FakeTokenizer:
         }
 
 
+class StrictTokenizerWithoutTokenTypeIds(FakeTokenizer):
+    """Tokenizer that mirrors MistralCommonBackend's supported call surface."""
+
+    model_input_names = ["input_ids", "attention_mask"]
+
+    def __call__(
+        self,
+        texts: List[str],
+        max_length: int,
+        padding: Any,
+        truncation: bool,
+    ) -> Dict[str, List[List[int]]]:
+        return super().__call__(
+            texts,
+            max_length=max_length,
+            padding=padding,
+            truncation=truncation,
+            return_token_type_ids=False,
+        )
+
+
 def test_unpack_doc_values():
     features = [
         {"input_ids": [[1, 2], [3]], "attention_mask": [[1, 1], [1]]},
@@ -115,6 +138,57 @@ def test_collator_end_to_end_no_prefix():
     # Ensure attention masks align with input_ids shapes
     assert out["q_input_ids"].shape == out["q_attention_mask"].shape
     assert out["d_input_ids"].shape == out["d_attention_mask"].shape
+
+
+def test_collator_omits_unsupported_return_token_type_ids_kwarg():
+    collator = rc.BiEncoderCollator(
+        tokenizer=StrictTokenizerWithoutTokenTypeIds(), q_max_len=16, p_max_len=16, padding=True
+    )
+
+    out = collator(_make_batch(num_examples=2, docs_per_example=2))
+
+    assert out["q_input_ids"].shape[0] == 2
+    assert out["d_input_ids"].shape[0] == 4
+
+
+def test_collator_emits_passage_doc_ids_for_complete_nonempty_ids():
+    collator = rc.BiEncoderCollator(tokenizer=FakeTokenizer(), q_max_len=16, p_max_len=16, padding=True)
+    batch = _make_batch(num_examples=2, docs_per_example=2)
+    batch[0]["doc_id"] = ["positive-0", "negative-0"]
+    batch[1]["doc_id"] = ["positive-1", "negative-1"]
+
+    out = collator(batch)
+
+    expected = torch.tensor(
+        [
+            rc._doc_id_str_to_int64("positive-0"),
+            rc._doc_id_str_to_int64("negative-0"),
+            rc._doc_id_str_to_int64("positive-1"),
+            rc._doc_id_str_to_int64("negative-1"),
+        ],
+        dtype=torch.long,
+    )
+    torch.testing.assert_close(out["passage_doc_ids"], expected)
+
+
+@pytest.mark.parametrize(
+    "doc_id_groups",
+    [
+        [["", ""], ["", ""]],
+        [["positive-0", ""], ["positive-1", "negative-1"]],
+        [["positive-0", "negative-0"], None],
+    ],
+)
+def test_collator_omits_passage_doc_ids_when_any_id_is_missing(doc_id_groups):
+    collator = rc.BiEncoderCollator(tokenizer=FakeTokenizer(), q_max_len=16, p_max_len=16, padding=True)
+    batch = _make_batch(num_examples=2, docs_per_example=2)
+    for example, doc_ids in zip(batch, doc_id_groups):
+        if doc_ids is not None:
+            example["doc_id"] = doc_ids
+
+    out = collator(batch)
+
+    assert "passage_doc_ids" not in out
 
 
 def test_collator_with_prefix_and_pad_multiple():

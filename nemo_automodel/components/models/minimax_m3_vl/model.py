@@ -96,6 +96,11 @@ def build_moe_config(config: Any, dtype: torch.dtype) -> MoEConfig:
         activation_limit=float(getattr(config, "swiglu_limit", 7.0)),
         softmax_before_topk=False,
         force_e_score_correction_bias=bool(getattr(config, "use_routing_bias", True)),
+        # Released MiniMax-M3 checkpoints store the router gate weight in fp32
+        # (same 1e-3-quantized correction-bias lattice as MiniMax-M2.7); allocate
+        # it fp32 so every construction path keeps the gate's FSDP dtype group
+        # uniform with its fp32 bias buffer (AMINT-286 pattern).
+        gate_dtype=torch.float32,
         dtype=dtype,
     )
 
@@ -264,7 +269,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
-    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
+    _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
 
     # The state-dict adapter loads every tensor from the checkpoint, so skip HF
     # random init on load (also avoids DTensor-collective hangs under sharding/PP).
@@ -389,7 +394,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # (vision_encoder.py) fp32 — the bf16 cast would otherwise round it and degrade
     # vision RoPE (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb", "inv_freq"]
-    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
+    _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
     _pp_keep_self_forward: bool = True
     mtp_outputs_are_logits = True
     # Opt into context parallelism on the SDPA attention backend (M3's block-sparse DSA
@@ -397,6 +402,12 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # the standard CP path (mask-strip hook + is_causal); sparse layers require the
     # CP-aware indexer attention for a correct global-sequence bias.
     _supports_cp_sdpa = True
+    # MiniMaxM3CPSparseAttention derives per-document ids from the packed position ids
+    # and builds its own block mask, so packing needs no packing-aware attention backend.
+    _owns_packed_attention = True
+    # The same attention shards the packed sequence in forward and carries the document
+    # boundaries into every layer, so it owns the packed CP path end to end.
+    _owns_cp_attention = True
     # The state-dict adapter fully populates every tensor from the checkpoint
     # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
     # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
@@ -681,8 +692,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        logits_to_keep: int | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | MiniMaxM3CausalLMOutput | dict[str, torch.Tensor]:
         is_pp_stage = self._is_pipeline_parallel_stage()
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the
@@ -764,6 +776,18 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             attention_mask=attention_mask,
             **kwargs,
         )
+        # Fused-loss path: hand back hidden states and skip lm_head, so the
+        # [tokens, vocab_size] logits tensor is never materialised. Requesting this
+        # alongside MTP raises rather than returning something mtp_logits cannot
+        # consume, matching the MTP-under-PP guard above.
+        if logits_to_keep is not None and not is_pp_stage:
+            if self.model.mtp is not None and self.training and input_ids is not None:
+                raise NotImplementedError(
+                    "logits_to_keep (fused-loss path) is not supported together with MTP "
+                    "modules, which need full logits; set text_config.num_mtp_modules=0."
+                )
+            return {"hidden_states": hidden}
+
         # lm_head is None on non-final pipeline stages -> forward hidden states.
         logits = self.lm_head(hidden) if self.lm_head is not None else hidden
 

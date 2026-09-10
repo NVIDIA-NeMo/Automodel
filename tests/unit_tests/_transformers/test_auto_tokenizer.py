@@ -14,10 +14,18 @@
 
 import json
 import os
+import subprocess
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from tokenizers import AddedToken, Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
+from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
@@ -31,11 +39,13 @@ from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
 
 
 class _StubHFTokenizer:
-    def __init__(self, bos_id=101, eos_id=102):
+    def __init__(self, bos_id=101, eos_id=102, add_bos_token=False, add_eos_token=False):
         self.bos_token_id = bos_id
         self.eos_token_id = eos_id
-        self.add_bos_token = True
-        self.add_eos_token = True
+        self.bos_token = "<s>" if bos_id is not None else None
+        self.eos_token = "</s>" if eos_id is not None else None
+        self.add_bos_token = add_bos_token
+        self.add_eos_token = add_eos_token
 
     def __call__(self, *args, **kwargs):
         return BatchEncoding(
@@ -76,14 +86,57 @@ class _StubConfig:
     model_type = "stub"
 
 
+class _Ministral3Config:
+    model_type = "ministral3"
+
+
 class TestNeMoAutoTokenizerFromPretrained:
-    def test_patched_adds_bos_eos(self):
+    def test_import_is_lightweight_and_runtime_return_annotation_resolves(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys\n"
+                    "from typing import Any, get_type_hints\n"
+                    "from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer\n"
+                    'assert "transformers" not in sys.modules\n'
+                    'assert get_type_hints(NeMoAutoTokenizer.from_pretrained)["return"] is Any\n'
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_auto"])
+    def test_default_preserves_tokenizer_special_token_behavior(self, tokenizer_backend):
         stub = _StubHFTokenizer()
         with (
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", tokenizer_backend=tokenizer_backend)
+
+        assert tok.add_bos_token is False
+        assert tok.add_eos_token is False
+        assert tok(["x"])["input_ids"] == [[5, 6]]
+        assert tok.encode("x") == [5, 6]
+
+    @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_auto"])
+    def test_opt_in_adds_bos_eos(self, tokenizer_backend):
+        stub = _StubHFTokenizer()
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                tokenizer_backend=tokenizer_backend,
+                add_bos_token=True,
+                add_eos_token=True,
+            )
             out = tok(["x"])
             assert isinstance(out, BatchEncoding)
             assert out["input_ids"] == [[stub.bos_token_id, 5, 6, stub.eos_token_id]]
@@ -101,6 +154,25 @@ class TestNeMoAutoTokenizerFromPretrained:
 
             enc = tok.encode("x", add_special_tokens=False)
             assert enc == [5, 6]
+
+    def test_ministral3_uses_custom_tokenizer_offline(self, monkeypatch):
+        stub = _StubHFTokenizer()
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained", return_value=_Ministral3Config()),
+            patch(
+                "nemo_automodel._transformers.tokenization.tokenization_mistral_common."
+                "MistralCommonBackend.from_pretrained",
+                return_value=stub,
+            ) as custom_from_pretrained,
+            patch("transformers.AutoTokenizer.from_pretrained") as hf_from_pretrained,
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("mistralai/Devstral-2-123B-Instruct-2512")
+
+        assert tok is stub
+        custom_from_pretrained.assert_called_once_with("mistralai/Devstral-2-123B-Instruct-2512")
+        hf_from_pretrained.assert_not_called()
 
     def test_cls_sep_pattern_fixed_when_tokens_missing(self):
         """Transformers >=5.0 defaults special_tokens_pattern to 'cls_sep'.
@@ -242,15 +314,216 @@ class TestNeMoAutoTokenizerFromPretrained:
                 NeMoAutoTokenizer.from_pretrained("dummy/model", trust_remote_code=True)
             mock_resolve.assert_not_called()
 
+    def test_tokenizers_backend_initializes_pad_token_for_batched_padding(self, tmp_path):
+        backend = Tokenizer(WordLevel({"[UNK]": 0, "short": 1, "long": 2, "input": 3}, unk_token="[UNK]"))
+        backend.pre_tokenizer = Whitespace()
+        backend.save(str(tmp_path / "tokenizer.json"))
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps({"unk_token": "[UNK]"}))
+
+        tokenizer = NeMoAutoTokenizer.from_pretrained(tmp_path, tokenizer_backend="tokenizers")
+        batch = tokenizer(["short", "long input"], padding=True)
+
+        assert isinstance(tokenizer, TokenizersBackend)
+        assert tokenizer.pad_token_id == 0
+        assert len(batch["input_ids"][0]) == len(batch["input_ids"][1])
+
+        saved_dir = tmp_path / "saved"
+        tokenizer.save_pretrained(saved_dir)
+        reloaded = NeMoAutoTokenizer.from_pretrained(saved_dir, tokenizer_backend="tokenizers")
+        assert reloaded.pad_token_id == 0
+        assert len(reloaded(["short", "long input"], padding=True)["input_ids"][0]) == 2
+
+    def test_tokenizers_backend_preserves_policy_and_portable_save(self, tmp_path):
+        backend = Tokenizer(
+            WordLevel(
+                {
+                    "[UNK]": 0,
+                    "<s>": 1,
+                    "</s>": 2,
+                    "[INST]": 3,
+                    "hello": 4,
+                    "[": 5,
+                    "INST": 6,
+                    "]": 7,
+                },
+                unk_token="[UNK]",
+            )
+        )
+        backend.pre_tokenizer = Whitespace()
+        backend.add_special_tokens([AddedToken("[INST]", special=True)])
+        backend.save(str(tmp_path / "tokenizer.json"))
+        (tmp_path / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "tokenizer_class": "TokenizersBackend",
+                    "unk_token": "[UNK]",
+                    "bos_token": "<s>",
+                    "eos_token": "</s>",
+                    "additional_special_tokens": ["[INST]"],
+                }
+            )
+        )
+
+        tokenizer = NeMoAutoTokenizer.from_pretrained(
+            tmp_path,
+            tokenizer_backend="tokenizers",
+            split_special_tokens=True,
+            add_bos_token=True,
+            add_eos_token=False,
+            padding_side="left",
+        )
+
+        assert tokenizer.encode("hello") == [1, 4]
+        assert tokenizer.encode("[INST]", add_special_tokens=False) == [5, 6, 7]
+        assert tokenizer.padding_side == "left"
+        assert tokenizer.pad_token_id == 0
+
+        saved_dir = tmp_path / "saved"
+        tokenizer.save_pretrained(saved_dir)
+        saved_config = json.loads((saved_dir / "tokenizer_config.json").read_text())
+        assert saved_config["split_special_tokens"] is True
+        assert "auto_map" not in saved_config
+        assert not (saved_dir / "tekken.json").exists()
+
+        reloaded = AutoTokenizer.from_pretrained(saved_dir)
+        assert isinstance(reloaded, TokenizersBackend)
+        assert reloaded.encode("hello") == [1, 4]
+        assert reloaded.encode("[INST]", add_special_tokens=False) == [5, 6, 7]
+
+    def test_tokenizers_backend_forwards_retrieval_policy_directly(self):
+        expected = SimpleNamespace(pad_token_id=7)
+        with patch(
+            "transformers.tokenization_utils_tokenizers.TokenizersBackend.from_pretrained",
+            return_value=expected,
+        ) as load_backend:
+            actual = NeMoAutoTokenizer.from_pretrained(
+                "mistralai/Ministral-3-3B-Instruct-2512-BF16",
+                tokenizer_backend="tokenizers",
+                fix_mistral_regex=True,
+                split_special_tokens=True,
+                add_bos_token=True,
+                add_eos_token=False,
+            )
+
+        assert actual is expected
+        load_backend.assert_called_once_with(
+            "mistralai/Ministral-3-3B-Instruct-2512-BF16",
+            fix_mistral_regex=True,
+            split_special_tokens=True,
+            add_bos_token=True,
+            add_eos_token=False,
+        )
+
     def test_force_hf_passthrough(self):
         stub = _StubHFTokenizer()
-        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub) as load_transformers:
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model", force_hf=True)
             # Should be the original stub and unmodified outputs
             out = tok(["x"])
             assert out["input_ids"] == [[5, 6]]
             assert out["attention_mask"] == [[1, 1]]
             assert tok.encode("x") == [5, 6]
+        load_transformers.assert_called_once_with("dummy/model", trust_remote_code=False)
+
+    def test_transformers_auto_backend_matches_force_hf_route(self):
+        stub = _StubHFTokenizer()
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub) as load_transformers:
+            tokenizer = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                tokenizer_backend="transformers_auto",
+                padding_side="left",
+            )
+
+        assert tokenizer is stub
+        load_transformers.assert_called_once_with("dummy/model", trust_remote_code=False, padding_side="left")
+
+    def test_nemo_wrapped_auto_backend_bypasses_registry_dispatch(self):
+        stub = _StubHFTokenizer()
+        with (
+            patch(
+                "nemo_automodel._transformers.auto_tokenizer._get_model_type",
+            ) as get_model_type,
+            patch(
+                "nemo_automodel._transformers.tokenization.nemo_auto_tokenizer."
+                "NeMoAutoTokenizerWithBosEosEnforced.from_pretrained",
+                return_value=stub,
+            ) as load_wrapped,
+        ):
+            tokenizer = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                tokenizer_backend="nemo_wrapped_auto",
+                padding_side="left",
+            )
+
+        assert tokenizer is stub
+        get_model_type.assert_not_called()
+        load_wrapped.assert_called_once_with(
+            "dummy/model",
+            trust_remote_code=False,
+            padding_side="left",
+        )
+
+    def test_force_hf_accepts_equivalent_explicit_backend(self):
+        stub = _StubHFTokenizer()
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
+            tokenizer = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_hf=True,
+                tokenizer_backend="transformers_auto",
+            )
+
+        assert tokenizer is stub
+
+    @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_wrapped_auto"])
+    def test_force_default_accepts_compatible_backend_and_selects_wrapped_auto(self, tokenizer_backend):
+        stub = _StubHFTokenizer()
+        with (
+            patch("nemo_automodel._transformers.auto_tokenizer._get_model_type") as get_model_type,
+            patch(
+                "nemo_automodel._transformers.tokenization.nemo_auto_tokenizer."
+                "NeMoAutoTokenizerWithBosEosEnforced.from_pretrained",
+                return_value=stub,
+            ) as load_wrapped,
+        ):
+            tokenizer = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_default=True,
+                tokenizer_backend=tokenizer_backend,
+            )
+
+        assert tokenizer is stub
+        get_model_type.assert_not_called()
+        load_wrapped.assert_called_once_with("dummy/model", trust_remote_code=False)
+
+    @pytest.mark.parametrize("tokenizer_backend", ["nemo_auto", "nemo_wrapped_auto", "tokenizers"])
+    def test_force_hf_rejects_conflicting_backend(self, tokenizer_backend):
+        with pytest.raises(ValueError, match="cannot be combined"):
+            NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_hf=True,
+                tokenizer_backend=tokenizer_backend,
+            )
+
+    @pytest.mark.parametrize("tokenizer_backend", ["nemo_auto", "transformers_auto", "tokenizers"])
+    def test_force_default_rejects_conflicting_backend(self, tokenizer_backend):
+        with pytest.raises(ValueError, match="force_default=True"):
+            NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_default=True,
+                tokenizer_backend=tokenizer_backend,
+            )
+
+    def test_force_flags_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_default=True,
+                force_hf=True,
+            )
+
+    def test_rejects_unknown_tokenizer_backend(self):
+        with pytest.raises(ValueError, match="tokenizer_backend must be one of"):
+            NeMoAutoTokenizer.from_pretrained("dummy/model", tokenizer_backend="unknown")
 
     def test_add_bos_token_falls_back_on_value_error(self):
         """When tokenizer.add_bos_token setter raises ValueError (e.g. transformers v5
@@ -281,7 +554,7 @@ class TestNeMoAutoTokenizerFromPretrained:
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_bos_token=True)
             assert tok._add_bos_token is True
 
     def test_add_eos_token_falls_back_on_value_error(self):
@@ -313,7 +586,7 @@ class TestNeMoAutoTokenizerFromPretrained:
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_eos_token=True)
             assert tok._add_eos_token is True
 
 
@@ -878,7 +1151,7 @@ class TestTikTokenLikeTokenizerGuards:
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_bos_token=True, add_eos_token=True)
             assert tok.add_bos_token is True
             assert tok.add_eos_token is True
 

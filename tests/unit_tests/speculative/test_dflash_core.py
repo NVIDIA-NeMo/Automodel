@@ -20,7 +20,11 @@ import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
-from nemo_automodel.components.speculative.dflash.core import DFlashStepMetrics, DFlashTrainerModule
+from nemo_automodel.components.speculative.dflash.core import (
+    DFlashStepMetrics,
+    DFlashTrainerModule,
+    NoValidAnchorsError,
+)
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 VOCAB = 64
@@ -31,7 +35,7 @@ BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 
 
-def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa"):
+def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa", sliding_window=None):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -61,6 +65,7 @@ def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa
         attention_backend=attention_backend,
         num_anchors=num_anchors,
         loss_decay_gamma=loss_decay_gamma,
+        sliding_window=sliding_window,
     )
 
 
@@ -310,3 +315,67 @@ def test_variable_prefix_loss_uniform_weights_without_gamma():
     )
     expected = (nll * supervised).sum() / (supervised.sum() + 1e-6)
     torch.testing.assert_close(out.loss, expected)
+
+
+def test_no_valid_anchors_error_states_the_actual_condition():
+    """The message must describe what is actually checked, not a token count.
+
+    An anchor is a supervised position with a full block ahead of it, so a batch
+    whose supervision starts too late fails even though it has many supervised
+    tokens; reporting "fewer than block_size+1 supervised tokens" sent readers
+    looking at the wrong thing.
+    """
+    trainer = _build_trainer()
+    seq_len = 8
+    # Plenty of supervised tokens, but all of them past seq_len - block_size.
+    loss_mask = torch.zeros(2, seq_len)
+    loss_mask[:, seq_len - BLOCK_SIZE + 1 :] = 1.0
+    with pytest.raises(NoValidAnchorsError) as excinfo:
+        trainer._sample_anchor_positions(seq_len, loss_mask, torch.device("cpu"))
+    message = str(excinfo.value)
+    assert f"[0, {seq_len - BLOCK_SIZE}]" in message
+    assert f"block_size={BLOCK_SIZE}" in message
+    assert "document" not in message
+
+
+def test_no_valid_anchors_error_mentions_the_document_bound_when_packing():
+    """With packing the block must also fit inside the anchor's own document."""
+    trainer = _build_trainer()
+    seq_len = 16
+    loss_mask = torch.ones(2, seq_len)
+    # Every document is shorter than a block, so no anchor has room for one.
+    doc_remaining = torch.zeros(2, seq_len, dtype=torch.long)
+    with pytest.raises(NoValidAnchorsError, match="document"):
+        trainer._sample_anchor_positions(seq_len, loss_mask, torch.device("cpu"), doc_remaining=doc_remaining)
+
+
+def test_sliding_window_narrows_the_context_without_breaking_training():
+    """A windowed draft must still train, and must not be a silent no-op.
+
+    The window bounds how far back a block reads the target context (what the
+    published DFlash 2 drafters do, and what keeps the flex BlockMask sparse on
+    long sequences), so the loss has to move while gradients stay finite.
+    """
+    full = _build_trainer(loss_decay_gamma=7.0)
+    windowed = _build_trainer(loss_decay_gamma=7.0, sliding_window=4)
+    windowed.draft_model.load_state_dict(full.draft_model.state_dict())
+    assert windowed.sliding_window == 4
+
+    input_ids, hidden, loss_mask = _inputs()
+    torch.manual_seed(7)
+    out_full = full(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    torch.manual_seed(7)
+    out_win = windowed(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+
+    assert torch.isfinite(out_win.loss)
+    assert not torch.allclose(out_win.loss, out_full.loss), "the window must change what the draft sees"
+
+    out_win.loss.backward()
+    for name, param in windowed.draft_model.named_parameters():
+        assert param.grad is None or torch.isfinite(param.grad).all(), name
+
+
+def test_sliding_window_defaults_to_off_and_rejects_non_positive():
+    assert _build_trainer().sliding_window is None
+    with pytest.raises(ValueError, match="sliding_window"):
+        _build_trainer(sliding_window=0)

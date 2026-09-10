@@ -66,6 +66,9 @@ def test_review_workflow_keeps_main_caller_wiring():
         ("CI dependency case", "CI, build, or dependency changes"),
         ("docs Fern case", "Documentation, examples, or Fern changes"),
         ("model parity case", "Models, kernels, or state-dict adapters"),
+        ("model arch mapping", "`MODEL_ARCH_MAPPING`"),
+        ("model config mapping", "`_CUSTOM_CONFIG_REGISTRATIONS`"),
+        ("model AutoConfig resolution", "config-class / `AutoConfig` resolution"),
         ("recipe config case", "Recipes, config, YAML, or CLI changes"),
         ("distributed case", "Distributed, parallelism, or gradient changes"),
         ("launcher case", "Launcher, Slurm, or SkyPilot changes"),
@@ -94,6 +97,10 @@ def test_review_workflow_keeps_main_caller_wiring():
         ("local tensor documentation", "own docstring is the default source of truth"),
         ("docstring scope", "specific changed tensor input whose layout remains ambiguous"),
         ("quality-gate bypass", "Quality-gate bypasses introduced or expanded"),
+        ("model registry completeness", "Model registry and config mapping completeness"),
+        ("checkpoint architectures", "checkpoint `architectures`"),
+        ("stale transformers config mapping", "installed Transformers `CONFIG_MAPPING`"),
+        ("local config proof", "checkpoint-style `config.json`"),
         ("minimal API surface", "Minimal public API surface"),
         ("API compatibility cost", "long-lived compatibility obligations"),
         ("canonical API", "Prefer one canonical typed entry point"),
@@ -168,4 +175,7 @@ def test_agents_uses_review_prompt_as_development_guidance():
     assert _normalize("new free-standing `build_*` helpers") in guidance
     assert _normalize("Do not add hand-written `to_dict()` or `from_dict()`") in guidance
     assert _normalize("do not add new calls to those methods") in guidance
+    assert _normalize("`MODEL_ARCH_MAPPING`") in guidance
+    assert _normalize("`_CUSTOM_CONFIG_REGISTRATIONS`") in guidance
+    assert _normalize("checkpoint-style `config.json`") in guidance
     assert _normalize("exposes `to_dict()` and `from_dict()`") not in guidance

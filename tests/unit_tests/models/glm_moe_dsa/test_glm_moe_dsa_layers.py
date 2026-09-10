@@ -183,6 +183,14 @@ class TestGlmMoeDsaIndexer:
 
 
 class TestGlmMoeDsaMLA:
+    def test_initialization_uses_upstream_latent_norm_epsilon(self, config, sdpa_backend):
+        config.rms_norm_eps = 1e-5
+
+        mla = GlmMoeDsaMLA(config, sdpa_backend)
+
+        assert mla.q_a_layernorm.eps == 1e-6
+        assert mla.kv_a_layernorm.eps == 1e-6
+
     def test_initialization_can_skip_local_indexer_for_shared_layers(self, config, sdpa_backend):
         full = GlmMoeDsaMLA(config, sdpa_backend, skip_topk=False)
         shared = GlmMoeDsaMLA(config, sdpa_backend, skip_topk=True)

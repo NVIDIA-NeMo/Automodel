@@ -81,6 +81,10 @@ from nemo_automodel.components.datasets.llm.offline_cache import (
 _EMBEDDINGS_NAME = "target_embeddings.safetensors"
 _FORMAT_VERSION = 2
 _CACHE_NAME = "EAGLE-3"
+# Manifest fields added after the first release, with the value a producer that
+# predates them effectively used. ``read_manifest`` fills them in so a cache
+# written before a field existed compares and trains as if it recorded it.
+MANIFEST_DEFAULTS: dict[str, Any] = {"mask_reasoning_content": False, "mask_generation_prompt": False}
 
 # Fields the trainer's precomputed-distribution path consumes (what each
 # ``CachedEagle3Dataset`` item yields). ``target_probs`` is the full draft-vocab
@@ -135,12 +139,17 @@ def write_manifest(cache_dir: str, manifest: dict[str, Any]) -> str:
 
 
 def read_manifest(cache_dir: str) -> dict[str, Any]:
-    """Load the cache manifest, raising if it is missing or the wrong format version."""
+    """Load the cache manifest, raising if it is missing or the wrong format version.
+
+    Fields added after the first release (``MANIFEST_DEFAULTS``) are filled in
+    for manifests that predate them.
+    """
     return _read_manifest(
         cache_dir,
         cache_name=_CACHE_NAME,
         format_version=_FORMAT_VERSION,
         producer_name="precompute_eagle3",
+        defaults=MANIFEST_DEFAULTS,
     )
 
 

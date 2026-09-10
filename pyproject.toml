@@ -79,29 +79,30 @@ classifiers = [
 ]
 dependencies = [
     "datasets>=4.0.0",
-    "megatron-fsdp>=0.2.3",
+    "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]",
     "pybind11",
     "pyyaml",
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
-    "transformers==5.12.1",
-    "wandb>=0.28.0",
+    "transformers==5.15.1",
     "torchao",
-    "mlflow",
     "flashoptim>=0.1.3",
+    # 0.6.4 pins nvidia-cutlass-dsl==4.6.2, matching what flash_attn.cute requires at the
+    # pinned FLASH_ATTN_REF. Both import `cutlass`, so they have to agree. (0.6.1 pinned 4.6.0.)
+    "quack-kernels==0.6.4; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
 diffusion = [
-    "diffusers>=0.37.0",
+    "diffusers>=0.39.0",
     "ftfy",
     "imageio",
     "torchvision",
 ]
 diffusion_kernels = [
-    "nemo_automodel[diffusion]",
+    "nemo-automodel[diffusion]",
     "kernels",
 ]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
@@ -112,6 +113,7 @@ diffusion_kernels = [
 cuda = [
     "causal-conv1d",
     "mamba-ssm",
+    "nvidia-cudnn-frontend[cutedsl]>=1.27.0",
     "nv-grouped-gemm",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
@@ -122,11 +124,14 @@ cuda = [
     "tile-kernels==1.0.0",
     # tilelang 0.1.11 does not cap its TVM ffi dependency, but 0.1.12 is
     # incompatible with its bundled TVM. Keep pip installs on the known-good ffi.
-    # NOTE: flash-attn-4 (attn_implementation="flash_attention_4") requires
-    # apache-tvm-ffi>=0.1.12,<0.2 -- mutually exclusive with this pin until
-    # tilelang ships a release built against ffi 0.1.12. The container installs
-    # FA4 only when built with INSTALL_FA4=true (docker/Dockerfile), which
-    # upgrades ffi and disables the tilelang backend in that image.
+    # flash-attn-4 declares apache-tvm-ffi>=0.1.12,<0.2 but is installed --no-deps
+    # (docker/Dockerfile), so that bound is never resolved; the ffi actually present comes
+    # via quack-kernels (>=0.1.6,<0.2), which this cap pins to 0.1.11. FA4 does import
+    # tvm_ffi (flash_attn/cute/cache_utils.py, eagerly via flash_attn.cute.__init__), so it
+    # runs against an ffi older than it declares -- checked only as far as the symbols it
+    # references (tvm_ffi.Function, tvm_ffi.__version__), both present in 0.1.11.
+    # Do not lift this cap to satisfy FA4: 0.1.12 double-registers TVM FFI TypeAttrs and
+    # SIGABRTs the tilelang kernels.
     "apache-tvm-ffi<=0.1.11",
 ]
 cuda_source = [
@@ -134,17 +139,21 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-ffpa = ["ffpa-attn>=0.1.19", "nvidia-cutlass-dsl>=4.5.1,<4.6"]
+# ffpa-attn 0.2.3 first aligned on nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4,
+# i.e. the same cutlass-dsl flash_attn.cute (FA4) needs. 0.2.4 also fixes the persistent
+# CuTe cache callable ABI. 0.2.2 hard-pinned 4.6.0/0.6.1 and was unsatisfiable alongside
+# FA4, so do not relax this floor.
+ffpa = ["ffpa-attn>=0.2.4", "nvidia-cutlass-dsl==4.6.2"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
-    "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
+    "databricks-sql-connector>=4.4.0",  # Minimum connector compatible with patched Thrift 0.24.0
 ]
 moe = [
-    "nemo_automodel[cuda]",
-    "nemo_automodel[fla]",
+    "nemo-automodel[cuda]",
+    "nemo-automodel[fla]",
     "deep_ep",
 ]
 vlm = [
@@ -175,22 +184,41 @@ vlm-media = [
     "qwen-vl-utils",
 ]
 diffusion-media = [
+    "av",  # PyAV: audio decoding for LTX-2 video+audio preprocessing
     "imageio-ffmpeg",
     "opencv-python-headless==4.10.0.84",  # cv2: diffusion preprocessing entry point (also in vlm-media)
 ]
 media = [
-    "nemo_automodel[vlm-media]",
-    "nemo_automodel[diffusion-media]",
+    "nemo-automodel[vlm-media]",
+    "nemo-automodel[diffusion-media]",
+]
+mlflow = [
+    # mlflow-skinny: same Python tracking API, no server/UI/pyarrow/scipy/etc.
+    # Avoids the mlflow vs mlflow-skinny mutual-exclusion conflict that breaks
+    # environments using sagemaker-mlflow, kedro-mlflow, and managed ML platforms.
+    "mlflow-skinny",
+]
+mlflow-full = [
+    # Full mlflow stack: tracking server, UI, SQL backend, pyarrow, etc.
+    # Use when you need the MLflow UI or sql:// artifact stores.
+    "mlflow",
+]
+wandb = ["wandb>=0.28.0"]
+tracking = [
+    # Convenience meta-extra: installs both experiment-tracking backends.
+    "nemo-automodel[mlflow]",
+    "nemo-automodel[wandb]",
 ]
 all = [
-    "nemo_automodel[cli]",
-    "nemo_automodel[cuda]",
-    "nemo_automodel[delta-databricks]",
-    "nemo_automodel[diffusion]",
-    "nemo_automodel[extra]",
-    "nemo_automodel[fla]",
-    "nemo_automodel[s3]",
-    "nemo_automodel[vlm]",
+    "nemo-automodel[cli]",
+    "nemo-automodel[cuda]",
+    "nemo-automodel[delta-databricks]",
+    "nemo-automodel[diffusion]",
+    "nemo-automodel[extra]",
+    "nemo-automodel[fla]",
+    "nemo-automodel[s3]",
+    "nemo-automodel[tracking]",
+    "nemo-automodel[vlm]",
 ]
 
 [project.urls]
@@ -214,16 +242,28 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 linting = [
+    "bandit~=1.9.0",
     "pre-commit>=4.2.0",
-    "ruff~=0.9.0",
+    "ruff~=0.12.0",
     "import-linter~=2.4",
     "ty>=0.0.20",
 ]
-test = ["coverage", "pytest", "pytest-shard", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+test = [
+    "coverage",
+    "pytest",
+    "pytest-shard",
+    "peft>=0.19.1",
+    "ruamel.yaml",
+    "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "sentence-transformers>=5.6.0",
+]
 dev = [
     "cut-cross-entropy",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+]
+magi = [
+    "magi_attention",
 ]
 
 [tool.uv]
@@ -235,27 +275,34 @@ no-build-isolation-package = [
     "deep_ep",
     "flash-attn",
     "flash-attn-3",  # FA3: source build from Dao-AILab/flash-attention hopper/ (needs image torch)
+    "magi_attention",
     "mamba-ssm",
     "nv-grouped-gemm",
     "transformer-engine",
     "transformer-engine-torch",
 ]
 constraint-dependencies = [
-    "aiohttp>=3.13.3", # Address CVE GHSA-6mq8-rvhq-8wgg
-    "cryptography>=46.0.7",
+    "aiohttp>=3.14.3", # Address aiohttp security fixes through CVE-2026-69244
+    "cryptography>=48.0.1", # Address CVE GHSA-537c-gmf6-5ccf
     "diffusers>=0.38.0",
-    "gitpython>=3.1.50",
+    "gitpython>=3.1.59",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "mako>=1.3.11",
-    "pillow>=12.2.0",
+    "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
+    "pillow>=12.3.0", # Address the Pillow 12.3.0 security fixes
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
-    "pyasn1>=0.6.3",
-    "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
+    "pyarrow>=23.0.1", # Address CVE GHSA-rgxp-2hwp-jwgg
+    "pyasn1>=0.6.4", # Address GHSA-hm4w-wwcw-mr6r and GHSA-8ppf-4f7h-5ppj
+    "ray>=2.56.0", # Address CVE-2026-57516
+    "starlette>=1.3.1", # Address GHSA-wqp7-x3pw-xc5r and later Starlette security fixes
     "setuptools>=80.10.2",
+    "soupsieve>=2.8.4", # Address GHSA-836r-79rf-4m37 and GHSA-2wc2-fm75-p42x
     "urllib3>=2.7.0", # Address CVE GHSA-gm62-xv2j-4w53
+    "wandb>=0.28.2", # Address GO-2026-5970 in the golang.org/x/text bundled by wandb-core
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
     "fonttools>=4.60.2", # Address CVE-2025-66034
-    "mlflow>=3.11.1", # Address CVE (no fix available, pinning to latest)
+    "mlflow>=3.15.1", # No published security fix; advance past the reported 3.15.0
+    "thrift>=0.24.0", # Address CVE-2026-41608 and related Thrift 0.24.0 fixes
     "tornado>=6.5.5",
     "onnx>=1.21.0",
     "onnx-ir>=0.1.16", # PyTorch 26.04 needs onnx_ir.schemas
@@ -270,15 +317,18 @@ constraint-dependencies = [
 ]
 override-dependencies = [
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
+    # leptonai pins 7.0.0, which caps Starlette below its security-fixed 1.x releases
+    "prometheus-fastapi-instrumentator>=8.1.0",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
     "urllib3>=2.7.0",
-    "thrift>=0.23.0",
 ]
 prerelease = "allow"
 
 [tool.uv.sources]
-deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "7febc6e25660af0f54d95dd781ecdcd62265ecca" }
+megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }
+deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "42144303752422ade37f24bca9e2dde12df70e09" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
+magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
@@ -320,6 +370,13 @@ explicit = true
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
 deep_ep = [{ requirement = "torch", match-runtime = true }]
+magi_attention = [
+    "cmake",
+    "ninja",
+    "packaging",
+    "versioningit",
+    "wheel",
+]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 nv_grouped_gemm = ["setuptools"]
@@ -328,8 +385,13 @@ nv_grouped_gemm = ["setuptools"]
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+7febc6e"
+version = "v1.2.1+4214430"
 requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "magi_attention"
+version = "1.1.1"
+requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "nv_grouped_gemm"
@@ -396,6 +458,7 @@ select = [
     "D103",
     "S301", # no pickle
     "S403", # no pickle
+    "UP045", # Prefer `T | None` over `Optional[T]`
 ]
 
 ignore = [
@@ -482,7 +545,6 @@ ignore_imports = [
     # Dion needs the FSDP DP mesh resolver so its optimizer mesh matches parameter sharding.
     "nemo_automodel.components.optim.dion -> nemo_automodel.components.distributed.mesh_utils",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
-    "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.gemma4_moe.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.mistral3_vlm.model",
 ]
 
@@ -526,6 +588,8 @@ allowed-unresolved-imports = [
     "lmdb",
     "mamba_ssm.**",
     "megatron.**",
+    "mlflow",
+    "mlflow.**",
     "nemo_automodel.components.datasets.llm.megatron.helpers_cpp",
     "nemo_run",
     "pynvml",
@@ -537,6 +601,8 @@ allowed-unresolved-imports = [
     "transformers.tokenization_utils",
     "uccl",
     "uccl.**",
+    "wandb",
+    "wandb.**",
 ]
 
 [tool.ty.rules]

@@ -54,7 +54,7 @@ All layers share the same sliding-window causal mask on the local KV path.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -80,6 +80,7 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
 )
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -713,6 +714,7 @@ class DeepseekV4Indexer(nn.Module):
     def __init__(self, config: DeepseekV4Config, backend: BackendConfig | None = None):
         super().__init__()
         self.backend = backend or BackendConfig()
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.compress_ratio = 4
         # Indexer's pool is always at compress_ratio==4, which means overlap mode
         # (matching the released checkpoint's ``indexer.compressor.{ape,wkv,wgate}``
@@ -727,7 +729,9 @@ class DeepseekV4Indexer(nn.Module):
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.ape_param = DeepseekV4FP32Parameter(torch.zeros(self.compress_ratio, proj_dim, dtype=torch.float32))
-        self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
+        self.kv_norm = initialize_rms_norm_module(
+            "torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype
+        )
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
 
@@ -854,6 +858,7 @@ class DeepseekV4Compressor(nn.Module):
     ):
         super().__init__()
         self.backend = backend or BackendConfig()
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.compress_ratio = compress_ratio
         self.head_dim = head_dim
         self.rope_head_dim = config.qk_rope_head_dim
@@ -869,7 +874,7 @@ class DeepseekV4Compressor(nn.Module):
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.ape_param = DeepseekV4FP32Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
-        self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps)
+        self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps, dtype=model_dtype)
         self.indexer: DeepseekV4Indexer | None = (
             DeepseekV4Indexer(config, backend=self.backend) if compress_ratio == 4 else None
         )
@@ -1204,6 +1209,7 @@ class DeepseekV4Attention(nn.Module):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.layer_idx = layer_idx
         self.compress_ratio = int(config.compress_ratios[layer_idx]) if config.compress_ratios else 0
         self.num_heads = config.num_attention_heads
@@ -1217,10 +1223,14 @@ class DeepseekV4Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.q_norm = initialize_rms_norm_module("torch_fp32", config.q_lora_rank, eps=config.rms_norm_eps)
+        self.q_norm = initialize_rms_norm_module(
+            "torch_fp32", config.q_lora_rank, eps=config.rms_norm_eps, dtype=model_dtype
+        )
         self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
+        self.kv_norm = initialize_rms_norm_module(
+            "torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype
+        )
         self.wo_a = DeepseekV4GroupedLinear(
             self.num_heads * self.head_dim // config.o_groups,
             config.o_groups * config.o_lora_rank,
@@ -1253,7 +1263,7 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
-        position_embeddings_compress: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings_compress: tuple[torch.Tensor, torch.Tensor] | None = None,
         rotary_compress: nn.Module | None = None,
         start_pos: int = 0,
         position_ids: torch.Tensor | None = None,
@@ -1262,6 +1272,7 @@ class DeepseekV4Attention(nn.Module):
         cp_group = kwargs.get("_dsv4_cp_group") or getattr(self, "_cp_group", None)
         cp_active = dsv4_cp_enabled(cp_group)
         packed_seq_ids = kwargs.get("packed_seq_ids")
+        vision_token_types = kwargs.get("vision_token_types")
         if packed_seq_ids is not None and packed_seq_ids.dim() == 1:
             packed_seq_ids = packed_seq_ids.unsqueeze(0)
         batch, seq_len = hidden_states.shape[:2]
@@ -1414,6 +1425,8 @@ class DeepseekV4Attention(nn.Module):
                 n_pooled=n_pooled,
                 vanilla_key_len=vanilla_key_len,
                 q_positions=sparse_query_positions,
+                vision_token_types=vision_token_types,
+                max_image_tokens=int(getattr(self.config, "vision_max_n_token", 0) or 0),
             )
             attn_output = dsv4_sparse_attention(
                 q.transpose(1, 2).contiguous(),

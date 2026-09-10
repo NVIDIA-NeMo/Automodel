@@ -23,7 +23,6 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-import wandb
 from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -32,19 +31,26 @@ from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.optim.precision_warnings import (
-    resolve_storage_dtype,
-    warn_if_torch_adam_with_bf16_params,
+from nemo_automodel.components.loggers.metric_logger import (
+    DEFAULT_BUFFER_SIZE,
+    MetricsSample,
+    build_metric_logger,
 )
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+from nemo_automodel.recipes._dist_utils import (
+    create_distributed_setup_from_config,
+    shard_optimizers_for_megatron_fsdp,
+)
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.te_patches import apply_te_patches
+
+_, wandb = safe_import("wandb")
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +64,40 @@ def _uses_multi_vector_scoring(model) -> bool:
 def _unwrap_model_for_attrs(model):
     """Return the underlying model object for configuration-style attribute reads."""
     return getattr(model, "module", model)
+
+
+def _configure_sentence_transformer_export(model, collate_fn) -> None:
+    """Bind the training collator's exact static prompts to bi-encoder export metadata."""
+    model = _unwrap_model_for_attrs(model)
+    configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
+    if configure_prompts is None:
+        return
+    if hasattr(model, "sentence_transformer_export_config") and model.sentence_transformer_export_config is None:
+        return
+
+    if getattr(collate_fn, "use_dataset_instruction", False):
+        disable_export = getattr(model, "disable_sentence_transformer_export", None)
+        if disable_export is not None:
+            disable_export()
+            logger.warning(
+                "Standard Sentence Transformers export is disabled because per-example dataset instructions "
+                "cannot be represented by static checkpoint prompts."
+            )
+        return
+    else:
+        if not hasattr(collate_fn, "query_prefix") or not hasattr(collate_fn, "passage_prefix"):
+            disable_export = getattr(model, "disable_sentence_transformer_export", None)
+            if disable_export is not None:
+                disable_export()
+                logger.warning(
+                    "Standard Sentence Transformers export is disabled because the configured collator "
+                    "does not expose static query_prefix and passage_prefix metadata."
+                )
+            return
+        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
+        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
+
+    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
 
 
 def _get_autocast_ctx(distributed_config):
@@ -258,15 +298,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
-        optimizer_config = self.cfg.optimizer
-        model_torch_dtype = resolve_storage_dtype(
-            self.cfg.model.get("torch_dtype", None),
-            uses_model_params_as_master_weights=optimizer_config.uses_model_params_as_master_weights(),
-            is_peft=self.peft_config is not None,
-            context="retrieval",
-            logger=logger,
-        )
-
         checkpoint_config = self.cfg.checkpoint
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
@@ -284,8 +315,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             kwargs = _get_model_instantiate_kwargs(self.cfg, self.distributed_setup, self.peft_config)
-            if model_torch_dtype is not None:
-                kwargs["torch_dtype"] = model_torch_dtype
             model = self.cfg.model.instantiate(
                 **kwargs,
             )
@@ -294,8 +323,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.pp = None
 
         param_groups = self._build_optimizer_param_groups()
-        optimizer = optimizer_config.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
-        self.optimizer = [optimizer]
+        optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
+        # Megatron-FSDP ZeRO-1/2/3 requires registering the separately-built optimizer with the
+        # already-wrapped MegatronFSDP model (mirrors the LLM recipe train_ft.py). Without this,
+        # the deferred grad-sync / optimized-weight install hooks are never wired up. Assign
+        # self.optimizer exactly once so BaseRecipe.__setattr__ state-tracking does not reject a
+        # second "optimizer" registration.
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            self.model_parts[0], [optimizer], self.distributed_config, allow=allow_megatron_fsdp_sharding
+        )
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
             is_peft=self.peft_config is not None,
@@ -325,6 +362,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 )
 
         self.dataloader = materialize_loader(dataloader_config)
+        _configure_sentence_transformer_export(self.model_parts[0], self.dataloader.collate_fn)
         self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None
@@ -348,11 +386,24 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
+        # buffer_size bounds how many records can be pending, so a hard kill that runs no
+        # cleanup loses at most one checkpoint interval of train metrics; it is NOT what keeps
+        # metrics in step with checkpoints, since it counts records rather than watching
+        # checkpoint boundaries. The explicit flush after each successful checkpoint is what
+        # provides that. flush=True because a buffered write only reaches the file object,
+        # whose own buffer dies with the process. Validation is rare enough to write every
+        # point.
+        train_logger_kwargs = {"flush": True}
+        if self.step_scheduler.ckpt_every_steps > 0:
+            train_logger_kwargs["buffer_size"] = min(DEFAULT_BUFFER_SIZE, self.step_scheduler.ckpt_every_steps)
         self.metric_logger_train = build_metric_logger(
-            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl",
+            **train_logger_kwargs,
         )
         self.metric_logger_valid = build_metric_logger(
-            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl",
+            buffer_size=1,
+            flush=True,
         )
         self.loss_average_window = deque(maxlen=self.step_scheduler.loss_average_window_steps)
 
@@ -395,13 +446,37 @@ class TrainBiEncoderRecipe(BaseRecipe):
                             train_loss=train_log_data.metrics["loss"],
                             val_loss=val_loss,
                         )
+                        # Flush once the checkpoint save returns, so the metrics describing the
+                        # steps it covers are durable by the time the loop moves on rather than
+                        # waiting for the buffer to fill. This is a post-save boundary, not an
+                        # atomic one: a crash between the save completing and this flush leaves
+                        # the checkpoint on disk with those records still buffered. Buffer size alone
+                        # does not give this: it counts records, and the count only lines up
+                        # with checkpoint steps while training runs from step 0 with periodic
+                        # checkpoints. Resuming at a step that is not a multiple of
+                        # ckpt_every_steps, or a checkpoint taken at an epoch boundary or the
+                        # final step, leaves the two out of phase.
+                        if self.metric_logger_train is not None:
+                            self.metric_logger_train.flush()
+                        if self.metric_logger_valid is not None:
+                            self.metric_logger_valid.flush()
                     self._maybe_collect_garbage()
+
+                    # Poll per step; the StepScheduler iterators stop on the flag.
+                    if self.step_scheduler.sigterm_received:
+                        logger.info(
+                            "Preemption signal received at step %d; stopping cleanly.", self.step_scheduler.step
+                        )
         finally:
             if pbar is not None:
                 pbar.close()
+            # In the finally, not after it: an exception (OOM, NCCL timeout) would
+            # otherwise propagate past these and discard every buffered record.
+            if self.metric_logger_train is not None:
+                self.metric_logger_train.close()
+            if self.metric_logger_valid is not None:
+                self.metric_logger_valid.close()
 
-        self.metric_logger_train.close()
-        self.metric_logger_valid.close()
         self._finalize_and_close_checkpointer()
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):

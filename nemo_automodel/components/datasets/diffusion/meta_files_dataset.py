@@ -18,7 +18,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -78,11 +78,11 @@ class MetaFilesDataset(Dataset):
     def __init__(
         self,
         meta_folder: str,
-        transform_text: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        transform_video: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        filter_fn: Optional[Callable[[Dict], bool]] = None,
+        transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        filter_fn: Callable[[Dict], bool] | None = None,
         device: str = "cpu",
-        max_files: Optional[int] = None,
+        max_files: int | None = None,
     ) -> None:
         self.meta_folder = Path(meta_folder)
         self.transform_text = transform_text
@@ -207,7 +207,7 @@ def build_node_parallel_sampler(
     dp_rank: int,
     dp_world_size: int,
     shuffle: bool = True,
-) -> Optional["DistributedSampler"]:
+) -> "DistributedSampler" | None:
     """Build a distributed sampler when torch.distributed is initialized."""
     if not dist.is_initialized():
         return None
@@ -267,11 +267,11 @@ def build_dataloader(
     shuffle: bool = True,
     num_workers: int = 2,
     device: str = "cpu",
-    transform_text: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    transform_video: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    filter_fn: Optional[Callable[[Dict], bool]] = None,
-    max_files: Optional[int] = None,
-) -> Tuple[DataLoader, Optional[DistributedSampler]]:
+    transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    filter_fn: Callable[[Dict], bool] | None = None,
+    max_files: int | None = None,
+) -> Tuple[DataLoader, DistributedSampler | None]:
     """Build a dataloader for pre-encoded diffusion metadata files."""
     result = MetaFilesDataloaderConfig(
         meta_folder=meta_folder,
@@ -294,7 +294,7 @@ def create_dataloader(
     meta_folder: str,
     batch_size: int,
     num_nodes: int,
-) -> Tuple[DataLoader, Optional[DistributedSampler]]:
+) -> Tuple[DataLoader, DistributedSampler | None]:
     """Create a default metadata dataloader for node-parallel loading."""
     return build_dataloader(
         meta_folder=meta_folder,

@@ -16,7 +16,7 @@ import abc
 import logging
 from dataclasses import dataclass
 from itertools import chain
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 
@@ -52,8 +52,8 @@ class BaseMegatronSampler:
         data_parallel_rank: int,
         data_parallel_size: int,
         drop_last: bool = True,
-        global_batch_size: Optional[int] = None,
-        pad_samples_to_global_batch_size: Optional[bool] = False,
+        global_batch_size: int | None = None,
+        pad_samples_to_global_batch_size: bool | None = False,
     ) -> None:
         # Sanity checks.
         if total_samples <= 0:
@@ -132,8 +132,8 @@ class MegatronPretrainingSampler(BaseMegatronSampler):
         data_parallel_rank: int,
         data_parallel_size: int,
         drop_last: bool = True,
-        global_batch_size: Optional[int] = None,
-        pad_samples_to_global_batch_size: Optional[bool] = False,
+        global_batch_size: int | None = None,
+        pad_samples_to_global_batch_size: bool | None = False,
     ):
         super().__init__(
             total_samples=total_samples,
@@ -205,8 +205,8 @@ class MegatronPretrainingRandomSampler(BaseMegatronSampler):
         data_parallel_rank: int,
         data_parallel_size: int,
         drop_last: bool = True,
-        global_batch_size: Optional[int] = None,
-        pad_samples_to_global_batch_size: Optional[bool] = False,
+        global_batch_size: int | None = None,
+        pad_samples_to_global_batch_size: bool | None = False,
         seed: int = 0,
     ) -> None:
         super().__init__(

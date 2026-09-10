@@ -20,10 +20,11 @@ import copy
 import pytest
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper, checkpoint_wrapper
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.utils.checkpoint import CheckpointError
+from torch.utils.checkpoint import CheckpointError, CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed import activation_checkpointing as ac
 
@@ -132,6 +133,119 @@ def test_snapshot_context_fn_recompute_ctx_restores_captured_backend_set():
         assert _sdp_backend_state() == (True, True, False, False)
 
 
+def test_selective_checkpointing_to_layers_preserves_transformer_engine_attention_cache(monkeypatch):
+    """The shared selective-AC wrapper must preserve TE's checkpoint op sequence."""
+    attention_cache = {"attention_params": None, "backend": None}
+    monkeypatch.setattr(ac, "_get_transformer_engine_attention_backend_cache", lambda: attention_cache)
+    monkeypatch.setattr(
+        ac,
+        "_SELECTIVE_AC_MUST_SAVE_OPS",
+        ac._SELECTIVE_AC_MUST_SAVE_OPS | {torch.ops.aten.ne.Tensor},
+    )
+
+    class Attention(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Run a cache-dependent attention stand-in.
+
+            Args:
+                x: Tensor of shape [features].
+
+            Returns:
+                Tensor of shape [features].
+            """
+            params = x.detach()
+            if attention_cache["attention_params"] is None or params != attention_cache["attention_params"]:
+                attention_cache["attention_params"] = params
+                attention_cache["backend"] = "fused"
+            return x.sin()
+
+    model = nn.Module()
+    model.attention = Attention()
+    layers = [model.attention]
+    ac.apply_selective_checkpointing_to_layers(model, layers, has_kv_sharing=False)
+    assert isinstance(model.attention, CheckpointWrapper)
+    assert layers[0] is model.attention
+
+    x = torch.randn(8, requires_grad=True)
+    out = model.attention(x)
+    cache_after_forward = dict(attention_cache)
+
+    out.sum().backward()
+
+    assert torch.allclose(x.grad, x.detach().cos())
+    assert attention_cache["attention_params"] is cache_after_forward["attention_params"]
+    assert attention_cache["backend"] == cache_after_forward["backend"]
+
+
+def test_recompute_only_fsdp_unshard_op_bypasses_selective_ac_replay(monkeypatch):
+    """FSDP prefetch may make unshard ops recompute-only; they must bypass SAC indexing."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives  # noqa: F401
+
+    fsdp_copy_in = torch.ops.fsdp.all_gather_copy_in.default
+    fsdp_empty = torch.ops.aten.empty.memory_format
+    fsdp_empty_like = torch.ops.aten.empty_like.default
+    fsdp_view = torch.ops.aten.view.default
+    sac_ignored = set(torch.utils.checkpoint.SAC_IGNORED_OPS)
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored)
+    ac.ensure_fsdp_ops_sac_ignored()
+
+    def policy(ctx, func, *args, **kwargs):
+        if func in (fsdp_copy_in, fsdp_empty, fsdp_empty_like, fsdp_view):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    def selective_context_fn():
+        return create_selective_checkpoint_contexts(policy)
+
+    fsdp_state = {"unsharded": False}
+
+    def checkpointed_module(x: torch.Tensor) -> torch.Tensor:
+        """Run a checkpointed FSDP-unshard stand-in.
+
+        Args:
+            x: Tensor of shape [features].
+
+        Returns:
+            Tensor of shape [features].
+        """
+        if fsdp_state["unsharded"]:
+            all_gather_output = torch.empty_like(x)
+            torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            fsdp_copy_in([x.detach()], all_gather_output, [x.numel()], x.numel(), 0)
+            x = x.view(-1)
+        fsdp_state["unsharded"] = True
+        return x.sin()
+
+    x = torch.randn(8, requires_grad=True)
+    out = checkpoint(checkpointed_module, x, use_reentrant=False, context_fn=selective_context_fn)
+    out.sum().backward()
+
+    assert torch.allclose(x.grad, x.detach().cos())
+
+
+def test_fsdp_runtime_ops_are_all_ignored_by_selective_ac(monkeypatch):
+    """FSDP2 copy and all-gather ops must bypass SAC replay accounting."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives  # noqa: F401
+    import torch.distributed.fsdp._fully_shard._fsdp_param  # noqa: F401
+
+    sac_ignored = set()
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored)
+
+    ac.ensure_fsdp_ops_sac_ignored()
+
+    expected = {
+        torch.ops.fsdp.all_gather_copy_in.default,
+        torch.ops.fsdp.split_with_sizes_copy.default,
+        torch.ops.fsdp.chunk_cat.default,
+        torch.ops.fsdp.copy_.default,
+        torch.ops.c10d._allgather_base_.default,
+        torch.ops.aten.empty.memory_format,
+        torch.ops.aten.empty_like.default,
+        torch.ops.aten.view.default,
+    }
+    assert expected <= sac_ignored
+
+
 def test_submodule_checkpointing_with_snapshot_context_reruns_recompute_under_forward_backends():
     """Recompute must rerun under the forward-time SDPA backend set even after the pin exits."""
     block = _SdpaVisionBlock()
@@ -151,10 +265,31 @@ def test_submodule_checkpointing_with_snapshot_context_reruns_recompute_under_fo
     assert block.attn._checkpoint_wrapped_module.qkv.weight.grad is not None
 
 
+def test_submodule_checkpointing_recompute_restores_forward_sdpa_callable(monkeypatch):
+    """Recompute must preserve a forward-local suspension of CP's SDPA monkeypatch."""
+    original_sdpa = F.scaled_dot_product_attention
+    block = _SdpaVisionBlock()
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False)
+
+    out = block(torch.randn(4, _D))
+
+    def cp_ring_sdpa(*args, **kwargs):
+        raise RuntimeError("bidirectional vision attention reached the CP ring dispatcher")
+
+    # Model forward has now left cp_dispatcher_suspended(), so the outer train
+    # context has restored CP's ring-SDPA monkeypatch before backward starts.
+    monkeypatch.setattr(F, "scaled_dot_product_attention", cp_ring_sdpa)
+    out.sum().backward()
+
+    assert F.scaled_dot_product_attention is cp_ring_sdpa
+    assert ac.unwrap_checkpoint_wrapper(block.attn).qkv.weight.grad is not None
+    assert original_sdpa is not cp_ring_sdpa
+
+
 def test_submodule_checkpointing_without_snapshot_context_recompute_sees_divergent_backends():
     """Without the snapshot context_fn, the recompute runs under whatever is ambient at backward time."""
     block = _SdpaVisionBlock()
-    ac.apply_submodule_checkpointing([block], has_kv_sharing=False)
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False, context_fn=None)
 
     attn = ac.unwrap_checkpoint_wrapper(block.attn)
     with sdpa_kernel([SDPBackend.MATH]):
@@ -166,6 +301,43 @@ def test_submodule_checkpointing_without_snapshot_context_recompute_sees_diverge
         out.sum().backward()
     assert attn.backend_states[0] == _MATH_ONLY
     assert attn.backend_states[1] != _MATH_ONLY
+
+
+class _LinearAttnBlock(nn.Module):
+    """Minimal hybrid decoder block whose mixer is named ``linear_attn``.
+
+    Mirrors Qwen3-Next / Qwen3.5 Gated DeltaNet layers, which name their token
+    mixer ``linear_attn`` (not ``self_attn``). Used to check that
+    ``apply_submodule_checkpointing`` wraps that submodule.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.linear_attn = nn.Linear(_D, _D)
+        self.mlp = nn.Sequential(nn.Linear(_D, _D), nn.Linear(_D, _D))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the linear-attention mixer + MLP.
+
+        Args:
+            x: Input activations of shape ``[S, H]`` (``S`` = tokens, ``H`` = hidden).
+
+        Returns:
+            Output activations of shape ``[S, H]``.
+        """
+        return x + self.mlp(self.linear_attn(x))
+
+
+def test_submodule_checkpointing_wraps_linear_attn_mixer():
+    """Gated DeltaNet blocks name their mixer ``linear_attn``; it must be checkpoint-wrapped."""
+    block = _LinearAttnBlock()
+    inner = block.linear_attn
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False)
+
+    assert isinstance(block.linear_attn, CheckpointWrapper)
+    assert isinstance(block.mlp, CheckpointWrapper)
+    # The wrapper preserves the original mixer as its inner module.
+    assert ac.unwrap_checkpoint_wrapper(block.linear_attn) is inner
 
 
 def test_submodule_checkpointing_preserves_canonical_state_dict_keys_for_property_aliases():
@@ -211,7 +383,7 @@ def test_checkpointed_sdpa_replay_faults_without_snapshot_context_and_passes_wit
     # exited by backward time -> the recompute dispatches a fused backend that
     # saves different tensors -> deterministic CheckpointError.
     plain = _SdpaVisionBlock().to(device)
-    ac.apply_submodule_checkpointing([plain], has_kv_sharing=False)
+    ac.apply_submodule_checkpointing([plain], has_kv_sharing=False, context_fn=None)
     with sdpa_kernel([SDPBackend.MATH]):
         out = plain(x)
     with pytest.raises(CheckpointError):
@@ -330,3 +502,88 @@ def test_detect_kv_sharing_leaves_cache_enabled_for_kv_shared_models():
     assert has_kv_sharing is True
     assert model.config.use_cache is True
     assert model.config.text_config.use_cache is True
+
+
+def _sac_context_factory():
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+
+    def policy(ctx, func, *args, **kwargs):
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return lambda: create_selective_checkpoint_contexts(policy)
+
+
+def test_ignore_sac_ops_adds_available_ops(monkeypatch):
+    sac_ignored = set()
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored, raising=False)
+
+    ac.ignore_sac_ops([torch.ops.aten.sin.default, None, torch.ops.aten.cos.default])
+
+    assert sac_ignored == {torch.ops.aten.sin.default, torch.ops.aten.cos.default}
+
+
+def test_profiler_ops_sac_ignore_skips_before_torch_2_13(monkeypatch):
+    sac_ignored = set()
+    monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.12.0"))
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored, raising=False)
+
+    ac.ensure_profiler_ops_sac_ignored()
+
+    assert sac_ignored == set()
+
+
+def test_profiler_ops_sac_ignore_includes_torch_2_13_alpha(monkeypatch):
+    op = object()
+    packet = type("FakePacket", (), {"default": op, "overloads": lambda self: ("default",)})()
+    profiler_ops = type(
+        "FakeProfilerOps",
+        (),
+        {
+            "_record_function_enter": packet,
+            "_record_function_enter_new": packet,
+            "_record_function_exit": packet,
+        },
+    )()
+    sac_ignored = set()
+    monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.13.0a0+8145d630e8"))
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored, raising=False)
+    monkeypatch.setattr(torch.ops, "profiler", profiler_ops, raising=False)
+
+    ac.ensure_profiler_ops_sac_ignored()
+
+    assert sac_ignored == {op}
+
+
+def test_sac_replay_tolerates_recompute_only_record_function(monkeypatch):
+    """A profiler range entered only during backward recompute must not desync SAC replay.
+
+    torch 2.13's FSDP2 runs its hooks under ``record_function``; with an FSDP
+    boundary inside a SAC region the range ops fire a different number of times
+    in the recompute than in the forward, which shifts SAC's per-op replay
+    index and raises ``... encountered during backward but not found in
+    storage``. ``ensure_profiler_ops_sac_ignored`` keeps profiler ops out of
+    the replay accounting.
+    """
+    if not hasattr(torch.utils.checkpoint, "SAC_IGNORED_OPS"):
+        pytest.skip("torch build without SAC_IGNORED_OPS")
+
+    monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.13.0a0+8145d630e8"))
+    ac.ensure_profiler_ops_sac_ignored()
+    assert torch.ops.profiler._record_function_enter_new.default in torch.utils.checkpoint.SAC_IGNORED_OPS
+
+    linear = nn.Linear(4, 4)
+    calls = {"n": 0}
+
+    def fn(x):
+        calls["n"] += 1
+        if calls["n"] > 1:  # backward-time recompute takes a different hook path
+            with torch.autograd.profiler.record_function("recompute-only-range"):
+                return linear(x)
+        return linear(x)
+
+    x = torch.randn(2, 4, requires_grad=True)
+    out = torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=False, context_fn=_sac_context_factory())
+    out.sum().backward()
+
+    assert calls["n"] == 2
+    assert x.grad is not None

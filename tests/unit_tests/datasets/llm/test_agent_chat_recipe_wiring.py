@@ -67,16 +67,30 @@ class _ToolChatTokenizer:
         **kwargs,
     ):
         ids: List[int] = [self._id("<bos>")]
+        assistant_masks: List[int] = [0]
         for m in messages:
+            supervise = int(m.get("role") == "assistant")
             ids.append(self._id(f"<{m.get('role')}>"))
-            ids.extend(self._id(t) for t in str(m.get("content") or "").split())
+            assistant_masks.append(supervise)
+            content_ids = [self._id(t) for t in str(m.get("content") or "").split()]
+            ids.extend(content_ids)
+            assistant_masks.extend([supervise] * len(content_ids))
             for call in m.get("tool_calls") or []:
                 ids.append(self._id("<tc>"))
                 ids.append(self._id(call["function"]["name"]))
+                assistant_masks.extend([supervise, supervise])
         ids.append(self.eos_token_id)
+        assistant_masks.append(0)
         if return_dict:
-            return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+            result = {"input_ids": ids, "attention_mask": [1] * len(ids)}
+            if return_assistant_tokens_mask:
+                result["assistant_masks"] = assistant_masks
+            return result
         return ids
+
+
+class _GenerationToolChatTokenizer(_ToolChatTokenizer):
+    chat_template = "{% generation %}{{ message.reasoning_content }}{% endgeneration %}"
 
 
 def _write_mock_jsonl(path) -> None:
@@ -129,3 +143,53 @@ def test_agent_recipe_dataset_to_collator_wiring(tmp_path):
     assert (batch["labels"] == -100).any()
     assert (batch["labels"] != -100).any()
     assert batch["input_ids"].dtype == torch.long
+
+
+def test_synthtrace_openai_row_to_collator_wiring(tmp_path):
+    mock = tmp_path / "synthtrace_mock.jsonl"
+    row = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "Read a repository file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "How is this repository structured?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "I should inspect the top-level files.",
+                "tool_calls": [
+                    {
+                        "id": "call_read_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": {"path": "README.md"}},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "read",
+                "tool_call_id": "call_read_1",
+                "content": "# NeMo AutoModel",
+            },
+            {"role": "assistant", "content": "The repository contains training recipes and model components."},
+        ],
+    }
+    mock.write_text(json.dumps(row) + "\n")
+
+    tok = _GenerationToolChatTokenizer()
+    dataset = make_agent_chat_dataset(tok, path=str(mock), seq_length=128)
+    item = dataset[0]
+    batch = default_collater([item])
+
+    tool_name_id = tok._vocab["read"]
+    tool_name_positions = [idx for idx, token_id in enumerate(item["input_ids"]) if token_id == tool_name_id]
+    assert tool_name_positions
+    assert any(idx > 0 and item["labels"][idx - 1] == tool_name_id for idx in tool_name_positions)
+    assert (batch["labels"] != -100).any()

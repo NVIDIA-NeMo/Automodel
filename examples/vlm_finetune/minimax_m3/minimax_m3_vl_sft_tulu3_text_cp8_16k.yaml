@@ -97,7 +97,6 @@ distributed:
     wrap_outer_model: true
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -156,3 +155,4 @@ wandb:
 ci:
   recipe_owner: athitten
   nodes: 16
+  time: "01:00:00"
