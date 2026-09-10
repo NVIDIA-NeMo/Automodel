@@ -375,6 +375,7 @@ class DeepseekV41Engram(nn.Module):
         self.layer_hash_index = layout.layer_ids.index(layer_idx)
         self.dim = int(config.hidden_size)
         self.hc_mult = int(config.hc_mult)
+        self.n_hash_cols = layout.n_hash_cols
         self.eps = float(config.rms_norm_eps)
         self.clamp_value = 1e-6
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
@@ -417,7 +418,65 @@ class DeepseekV41Engram(nn.Module):
         local_weight[valid_local_rows:].zero_()
 
     def forward(self, x: torch.Tensor, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """``x``: ``[B, L, hc_mult, dim]``; ``hash_ids``: ``[B, L, n_hash_cols]``; ``token_mask``: ``[B, L]``."""
+        """Inject memory rows through the normalized residual gate.
+
+        Args:
+            x: Floating-point residual streams [batch, sequence, hc_mult, dim].
+            hash_ids: Int32 or int64 logical row IDs [batch, sequence, n_hash_cols].
+                Physical padding rows beyond num_embeddings are not valid IDs.
+            token_mask: Optional boolean mask [batch, sequence]; false keeps the
+                corresponding residual streams unchanged. All inputs must be on
+                the same device as the owner table.
+
+        Returns:
+            Tensor with the shape and dtype of x, without modifying its storage.
+
+        Raises:
+            ValueError: Any owner rank supplies an invalid shape, dtype, device,
+                or logical row ID. Every owner validates before entering lookup.
+        """
+        owner_device = self.embed.weight.device
+        x_valid = (
+            isinstance(x, torch.Tensor)
+            and x.ndim == 4
+            and x.shape[-2:] == (self.hc_mult, self.dim)
+            and x.is_floating_point()
+            and x.device == owner_device
+        )
+        hashes_valid = (
+            x_valid
+            and isinstance(hash_ids, torch.Tensor)
+            and hash_ids.shape == (*x.shape[:2], self.n_hash_cols)
+            and hash_ids.dtype in (torch.int32, torch.int64)
+            and hash_ids.device == owner_device
+        )
+        if hashes_valid and hash_ids.numel():
+            hashes_valid = bool(((hash_ids >= 0) & (hash_ids < self.num_embeddings)).all())
+        mask_valid = token_mask is None or (
+            x_valid
+            and isinstance(token_mask, torch.Tensor)
+            and token_mask.shape == x.shape[:2]
+            and token_mask.dtype == torch.bool
+            and token_mask.device == owner_device
+        )
+        # The shared table validates physical IDs, but knows neither the model's
+        # logical row count nor its residual/mask shapes. Combine those checks
+        # into one collective so a local error cannot strand another requester.
+        validity = torch.tensor((x_valid, hashes_valid, mask_valid), device=owner_device, dtype=torch.int32)
+        if self.embed.process_group is not None:
+            dist.all_reduce(validity, op=dist.ReduceOp.MIN, group=self.embed.process_group)
+        x_valid, hashes_valid, mask_valid = validity.tolist()
+        if not x_valid:
+            raise ValueError(
+                "Engram x must be floating-point [batch, sequence, hc_mult, dim] on the table device on every owner rank"
+            )
+        if not hashes_valid:
+            raise ValueError(
+                "Engram hash_ids must be int32/int64 [batch, sequence, n_hash_cols] on the table device, "
+                f"with logical row IDs in [0, {self.num_embeddings}) on every owner rank"
+            )
+        if not mask_valid:
+            raise ValueError("Engram token_mask must be bool [batch, sequence] on the table device on every owner rank")
         rows = self.embed(hash_ids)  # [B, L, n_hash_cols, head_dim]
         kv = self.wkv(rows.flatten(-2).to(self.wkv.weight.dtype))
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
