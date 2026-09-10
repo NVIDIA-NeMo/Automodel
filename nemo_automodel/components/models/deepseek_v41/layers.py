@@ -56,7 +56,6 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4HyperConnection,
     _compressed_window_metadata,
     _dsv4_kernel_backend,
-    _dsv4_sinkhorn_backend,
 )
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
@@ -985,7 +984,7 @@ class DeepseekV41Block(nn.Module):
             hc_sinkhorn_iters=int(config.hc_sinkhorn_iters),
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
-            sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
+            sinkhorn_backend="tilelang" if backend.attn == "tilelang" else "torch",
         )
         self.attn_hc = DeepseekV41HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV41HyperConnection(**hc_kwargs)
