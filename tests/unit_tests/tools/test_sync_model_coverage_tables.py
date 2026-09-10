@@ -251,7 +251,10 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes():
 
     assert "meta-llama/Llama-3.2-1B" in models_by_type["Embedding"]
     assert "mistralai/Ministral-3-3B-Instruct-2512-BF16" in models_by_type["Embedding"]
-    assert models_by_type["Reranking"] == {"meta-llama/Llama-3.2-1B"}
+    assert models_by_type["Reranking"] == {
+        "meta-llama/Llama-3.2-1B",
+        "Qwen/Qwen3-Reranker-4B",
+    }
 
 
 def test_generated_model_coverage_tables_are_not_committed():

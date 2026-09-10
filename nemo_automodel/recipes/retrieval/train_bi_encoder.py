@@ -381,6 +381,12 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
         self._setup_garbage_collection(self.step_scheduler)
 
+        # Context dropout is redrawn each epoch by ``StepScheduler.set_epoch``, which
+        # forwards the epoch to this dataloader's collate function. The validation loader is
+        # built separately and never receives an epoch, so it keeps a fixed prompt mix --
+        # otherwise a val_loss that moved because the sampled modes changed would be
+        # indistinguishable from one that moved because the model did.
+
         self.lr_scheduler = (
             self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
             if self.cfg.lr_scheduler is not None

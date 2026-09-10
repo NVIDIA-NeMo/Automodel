@@ -1,0 +1,190 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# Qwen3-Reranker-4B, listwise: 1 positive + 7 hard negatives per query, scored as one
+# softmax per group.
+#
+# TODO: point this at the published Hugging Face dataset instead of a local JSONL, so the
+# example runs without first building data on a shared filesystem. The schema below is
+# what the loader expects either way and stays valid after the switch.
+#
+# EXPECTED DATA FORMAT
+# --------------------
+# JSONL, one training instance per line:
+#
+#   {
+#     "query_id":     "<str>",     required, unique per row
+#     "global_qid":   "<str>",     required, the session id -- shared by every turn of one
+#                                  trajectory, and by every labeling variant of the same
+#                                  question. This is the split key (validation_group_key)
+#     "query":        "<str>",     required, the sub-query actually issued
+#     "reasoning":    "<str>",     optional, the trace that motivated the sub-query
+#     "global_query": "<str>",     optional, the originating question the sub-query serves
+#     "pos_doc":      [{"docid": "<str>", "text": "<str>"}],   required, 1 used
+#     "neg_doc":      [{"docid": "<str>", "text": "<str>"}, ...] required, n_passages-1 used
+#   }
+#
+# pos_doc[0] is the positive; the first seven neg_doc entries are the negatives, giving the
+# n_passages: 8 group below. Rows with fewer than seven negatives have their negatives
+# CYCLED to fill the group -- _retrieval_transform_func indexes them modulo the list
+# length -- so a short row trains on repeated negatives rather than being dropped. A row
+# with NO negatives raises instead.
+#
+# reasoning and global_query are OPTIONAL per row. A missing, null, or whitespace-only value
+# is treated as absent rather than as an empty string: the field is left out of the prompt
+# entirely and the instruction changes to match, so the row simply trains a shorter mode. A
+# dataset carrying neither field trains base mode only, and the drop probabilities below have
+# nothing to act on.
+#
+# CONTEXT DROPOUT. reasoning_drop_prob and global_query_drop_prob drop each present field
+# independently per row, so a dataset carrying both yields all four prompt modes -- base,
+# reasoning, global-query, and both -- at roughly 25% each. Verified by decoding real batches:
+# 25.8 / 24.7 / 24.8 / 24.8 over 2,000 rows. The draw is a hash of
+# (drop_seed, epoch, field, query), so it is identical across runs, workers and ranks.
+#
+# VALIDATION SPLIT. validation_group_key: global_qid holds every sub-query of one
+# originating question on the same side of the split. Keying on query_id would place sibling
+# sub-queries on opposite sides, which leaks -- and in the mixes query_id is not even unique,
+# since one sub-query appears once per labeling variant. Keying on global_query text is also
+# wrong: it is a long free-text field, and a session whose rows disagree by one character
+# splits in two.
+#
+#   automodel examples/retrieval/cross_encoder/qwen3_4b_reranker_agentir.yaml --nproc-per-node 8
+recipe: TrainCrossEncoderRecipe
+
+seed: 42
+
+# Divides the listwise logits before cross-entropy. It belongs to the training objective,
+# not to the model, so it lives here and never reaches the checkpoint.
+temperature: 0.3
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 40
+  val_every_steps: 40
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-Reranker-4B
+  use_liger_kernel: true
+  use_sdpa_patching: true
+  torch_dtype: bfloat16
+
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-Reranker-4B
+  add_eos_token: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.ContextAwareRetrievalDatasetConfig
+  data_dir_list: ./data/agentir_v39_inline.jsonl
+  model_type: cross_encoder
+  n_passages: 8
+  data_type: train
+  # Held out by group so every row of a query lands on one side.
+  validation_fraction: 0.1
+  validation_group_key: global_qid
+  reasoning_column: reasoning
+  global_query_column: global_query
+  do_shuffle: false
+  seed: 42
+
+dataloader:
+  collate_fn:
+    _target_: nemo_automodel.components.models.qwen3_reranker.Qwen3ContextAwareRerankerCollator
+    rerank_max_length: 5120
+    global_query_max_length: 2048
+    sub_query_max_length: 256
+    reasoning_max_length: 512
+    pad_to_multiple_of: 8
+    # Each context field is dropped independently per query, so one model covers the
+    # base and reasoning prompt modes.
+    reasoning_drop_prob: 0.5
+    global_query_drop_prob: 0.5
+    drop_seed: 42
+  shuffle: true
+  num_workers: 0
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.ContextAwareRetrievalDatasetConfig
+  data_dir_list: ./data/agentir_v39_inline.jsonl
+  model_type: cross_encoder
+  n_passages: 8
+  data_type: validation
+  validation_fraction: 0.1
+  validation_group_key: global_qid
+  reasoning_column: reasoning
+  global_query_column: global_query
+  seed: 42
+
+validation_dataloader:
+  collate_fn:
+    _target_: nemo_automodel.components.models.qwen3_reranker.Qwen3ContextAwareRerankerCollator
+    rerank_max_length: 5120
+    global_query_max_length: 2048
+    sub_query_max_length: 256
+    reasoning_max_length: 512
+    pad_to_multiple_of: 8
+    # Mirrors the training probabilities so validation scores the same prompt-mode mix.
+    reasoning_drop_prob: 0.5
+    global_query_drop_prob: 0.5
+    drop_seed: 42
+  batch_size: 2
+  shuffle: false
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-6
+  weight_decay: 0.01
+
+lr_scheduler:
+  lr_warmup_steps: 20
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./output/qwen3_4b_reranker_agentir/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+wandb:
+  # Opt-in: flip to true to log this run to Weights & Biases.
+  enable: false
+  project: qwen3-reranker
+  name: qwen3_4b_reranker_agentir
+  dir: ./output/qwen3_4b_reranker_agentir/wandb
+  # A stable id plus resume: allow keeps every autoresume chunk attached to one run;
+  # without them each chunk calls wandb.init() fresh and the curve arrives split.
+  id: qwen3_4b_reranker_agentir
+  resume: allow
+
+ci:
+  recipe_owner: ssharifymogh
+  time: "08:00:00"
+  nodes: 1

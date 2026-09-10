@@ -543,7 +543,10 @@ def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
             return SequenceClassifierOutputWithPast(logits=torch.zeros(bsz, 2))
 
     class FakeConfig:
-        model_type = "qwen3"
+        # Must be a model type with NO registered retrieval backbone, or this stops
+        # exercising the generic fallback and starts exercising that backbone instead.
+        # "qwen3" used to be unregistered and is not any more.
+        model_type = "bert"
 
     monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", lambda *a, **kw: FakeConfig())
     monkeypatch.setattr(
