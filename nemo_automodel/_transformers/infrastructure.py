@@ -654,9 +654,11 @@ def apply_model_infrastructure(
     if get_hf_state_dict_keys is not None:
         pre_shard_hf_state_dict_keys = get_hf_state_dict_keys(model.state_dict())
     else:
-        pre_shard_hf_state_dict_keys = list(
-            _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
-        )
+        pre_shard_hf_state_dict_keys = [
+            key
+            for key in _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False)
+            if not key.endswith("_extra_state")
+        ]
 
     # Validate selectors on the complete pre-parallelization hierarchy. The
     # same policy is rebound after model surgery and before DDP/FSDP capture.

@@ -75,9 +75,6 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
-from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
-from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
-from nemo_automodel.components.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
@@ -1443,17 +1440,13 @@ def test_single_device_standard_hf_safetensors_loads_with_dcp(tmp_path, checkpoi
     torch.testing.assert_close(model.bias, checkpoint_bias)
 
 
-@pytest.mark.parametrize("adapter_type", [LlamaStateDictAdapter, Qwen2StateDictAdapter, Qwen3StateDictAdapter])
-def test_single_device_passthrough_adapter_loads_with_dcp(tmp_path, adapter_type):
-    """Dense custom adapters with unchanged tensor keys load directly into model storage."""
+def test_single_device_native_model_without_adapter_loads_with_dcp(tmp_path):
+    """Native models without conversion adapters load directly into model storage."""
 
-    class PassthroughModel(torch.nn.Linear):
-        def __init__(self):
-            super().__init__(3, 2)
-            self.state_dict_adapter = adapter_type(SimpleNamespace(tie_word_embeddings=False))
+    class NativeModel(torch.nn.Linear):
+        __module__ = "nemo_automodel.components.models.test.model"
 
-    PassthroughModel.__module__ = "nemo_automodel.components.models.test.model"
-    model = PassthroughModel()
+    model = NativeModel(3, 2)
     checkpoint_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     checkpoint_bias = torch.tensor([7.0, 8.0])
     model_path = tmp_path / "model"
@@ -1464,7 +1457,7 @@ def test_single_device_passthrough_adapter_loads_with_dcp(tmp_path, adapter_type
         checkpoint_dir=str(tmp_path),
         model_save_format="safetensors",
         model_cache_dir=str(tmp_path / "cache"),
-        model_repo_id="test/passthrough",
+        model_repo_id="test/native",
         save_consolidated=False,
         is_peft=False,
     )
@@ -1832,6 +1825,9 @@ class TestLoadModelCustomModelGuard:
         CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
+        model.state_dict_adapter = SimpleNamespace(
+            from_hf=lambda state_dict, **kwargs: state_dict,
+        )
         assert _is_custom_model(model) is True
 
         mock_load_hf.return_value = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
@@ -2094,6 +2090,48 @@ class TestLoadModelCheckpointKeySubset:
 
 class TestLoadModelExtraState:
     """Test checkpoint load compatibility for module extra-state keys."""
+
+    @pytest.mark.parametrize("model_save_format", ["safetensors", "torch_save"])
+    @pytest.mark.parametrize("tensor_metadata", [True, False])
+    def test_module_metadata_save_and_resume(self, tmp_path, model_save_format, tensor_metadata):
+        """HF exports omit module metadata; native DCP preserves it, and both resume strictly."""
+
+        class ExtraStateLinear(torch.nn.Linear):
+            def __init__(self, version):
+                super().__init__(2, 2)
+                self.metadata = torch.tensor([version], dtype=torch.uint8) if tensor_metadata else {"version": version}
+
+            def get_extra_state(self):
+                return self.metadata
+
+            def set_extra_state(self, state):
+                self.metadata = state
+
+        model = ExtraStateLinear(9)
+        checkpointer = Checkpointer(
+            CheckpointingConfig(
+                enabled=True,
+                checkpoint_dir=str(tmp_path),
+                model_cache_dir=str(tmp_path / "cache"),
+                model_repo_id="test/model",
+                model_save_format=model_save_format,
+                save_consolidated=False,
+            ),
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=0,
+            moe_mesh=None,
+        )
+        checkpointer.save_model(model, str(tmp_path / "saved"))
+        resumed = ExtraStateLinear(3)
+        checkpointer.load_model(resumed, str(tmp_path / "saved/model"))
+        torch.testing.assert_close(resumed.weight, model.weight, rtol=0, atol=0)
+        torch.testing.assert_close(resumed.bias, model.bias, rtol=0, atol=0)
+        expected_version = 3 if model_save_format == "safetensors" else 9
+        if tensor_metadata:
+            torch.testing.assert_close(resumed.metadata, torch.tensor([expected_version], dtype=torch.uint8))
+        else:
+            assert resumed.metadata == {"version": expected_version}
 
     def _make_checkpointer(self):
         config = CheckpointingConfig(

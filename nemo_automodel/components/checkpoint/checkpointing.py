@@ -675,6 +675,9 @@ class Checkpointer:
             v4_compatible=self.config.v4_compatible,
             legacy_paramwrapper_layout=self.config.legacy_paramwrapper_layout,
         )
+        if self.config.model_save_format == SerializationFormat.SAFETENSORS:
+            # Module metadata (e.g. Transformer Engine state) is not part of HF weights.
+            state_dict = {key: value for key, value in state_dict.items() if not key.endswith("_extra_state")}
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
@@ -896,7 +899,7 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
-        uses_standard_hf_state_dict = not is_custom_model and state_dict_adapter is None
+        uses_standard_hf_state_dict = state_dict_adapter is None
         can_use_low_memory_dcp = not should_dequantize_base_checkpoint and (
             uses_standard_hf_state_dict
             or (isinstance(state_dict_adapter, StateDictAdapter) and state_dict_adapter.supports_low_memory_dcp_load)
@@ -1017,16 +1020,23 @@ class Checkpointer:
         )
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
+        preserved_extra_state = {}
         shared_parameter_names = (
             _get_shared_parameter_names(model_state.model) if is_init_step and uses_standard_hf_state_dict else []
         )
         if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys or shared_parameter_names:
             checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
         if extra_state_keys:
-            missing_extra_state_keys = [key for key in extra_state_keys if key not in checkpoint_metadata_keys]
+            # DCP flattens dictionary metadata into dotted child keys.
+            missing_extra_state_keys = [
+                key
+                for key in extra_state_keys
+                if key not in checkpoint_metadata_keys
+                and not any(name.startswith(f"{key}.") for name in checkpoint_metadata_keys)
+            ]
             if missing_extra_state_keys:
                 for key in missing_extra_state_keys:
-                    state_dict.pop(key, None)
+                    preserved_extra_state[key] = state_dict.pop(key)
                 logging.warning(
                     "Checkpoint %s is missing %d requested module _extra_state keys. Keeping current module "
                     "extra state for those entries (examples=%s).",
@@ -1165,6 +1175,8 @@ class Checkpointer:
                 key_diff["missing_examples"],
                 key_diff["unexpected_examples"],
             )
+        # Omitted module metadata stays local while strict installation still checks real weights.
+        state_dict.update(preserved_extra_state)
         model_state.load_state_dict(
             state_dict,
             strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),

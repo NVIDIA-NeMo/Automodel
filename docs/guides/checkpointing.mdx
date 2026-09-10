@@ -117,6 +117,8 @@ Bounded retention supports only local filesystem checkpoint directories. If `che
 
 To ensure seamless integration with the Hugging Face ecosystem, NeMo AutoModel saves checkpoints in the [Safetensors](https://github.com/safetensors/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (PyTorch .bin). Hugging Face Transformers supports Safetensors natively, and Safetensors offers safety and performance advantages over Python pickle-based approaches.
 
+Most custom AutoModel implementations need a state dict adapter to convert HF weight names or tensor layouts. Models whose weights already match, such as Llama, Qwen2, and Qwen3, can omit it. See the [model-onboarding guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/skills/nemo-automodel-model-onboarding/SKILL.md) for implementation and validation guidance.
+
 ### Key Benefits
 
 - **Native Hugging Face Compatibility**: Checkpoints can be loaded directly into Hugging Face-compatible tools, including vLLM, SGLang, and others.
