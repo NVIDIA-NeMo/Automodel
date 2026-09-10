@@ -966,7 +966,7 @@ class DeepseekV41Block(nn.Module):
         self.hc_mult = int(config.hc_mult)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.self_attn = DeepseekV41Attention(config, layer_idx, backend=backend)
-        moe_backend = replace(backend, gate_precision=torch.float32) if backend.gate_precision is None else backend
+        moe_backend = replace(backend, gate_precision=torch.float32)
         self.mlp = MoE(moe_config, moe_backend)
         self.mlp.gate = DeepseekV4VisionGate(
             DeepseekV4Config(vocab_size=config.vocab_size),
