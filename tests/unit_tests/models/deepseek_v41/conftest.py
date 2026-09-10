@@ -14,16 +14,11 @@
 
 """Shared tiny DeepSeek V4.1 configs and model builders for the unit tests."""
 
-import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
-
-# ``MoE.forward`` allocates a ``torch.cuda.Stream`` for the shared expert, so
-# forward-running tests are gated on CUDA (same as the DeepSeek V4 tests).
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="MoE.forward needs a CUDA stream")
 
 
 def tiny_config(**overrides) -> DeepseekV41Config:

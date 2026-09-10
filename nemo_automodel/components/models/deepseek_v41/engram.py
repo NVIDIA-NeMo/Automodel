@@ -272,7 +272,7 @@ class DeepseekV41EngramHasher(nn.Module):
             if shift == 0:
                 source = compressed
             else:
-                source = F.pad(compressed[:, :-shift], (shift, 0), value=_DEAD_TOKEN)
+                source = F.pad(compressed, (shift, 0), value=_DEAD_TOKEN)[:, : compressed.shape[1]]
             blocked = blocked | (position_ids < shift) | (source == _DEAD_TOKEN)
             tokens.append(torch.where(blocked, torch.full_like(source, self.pad_id), source))
         tokens = torch.stack(tokens, dim=-1)  # [B, L, max_ngram_size]

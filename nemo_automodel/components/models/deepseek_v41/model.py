@@ -24,8 +24,9 @@ Forward contract (reference ``Transformer.forward`` of ``inference/model.py``):
    the fp32 ``lm_head``.
 
 Cross-layer CSA2 state (shared compressed KV, index keys, Top-K indices and the
-hierarchical candidate pool) lives in a per-forward
+hierarchical candidate pool) lives in per-layer snapshots of
 :class:`~nemo_automodel.components.models.deepseek_v41.layers.DeepseekV41SharedState`.
+Snapshots share tensors and preserve the state needed for activation recomputation.
 
 Scope: text-only training of the released backbone.  The vision tower, the
 DSpark draft layers (``mtp.*``) and inference-time KV caching / SWA bounded
@@ -35,7 +36,7 @@ state-dict adapter.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Union
 
 import torch
@@ -65,6 +66,7 @@ from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41Block,
     DeepseekV41RotaryEmbedding,
     DeepseekV41SharedState,
+    build_window_topk_indices,
     hc_collapse,
     make_identity_pre_mix,
 )
@@ -257,10 +259,13 @@ class DeepseekV41Model(nn.Module):
 
         h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = make_identity_pre_mix(h, self.config.hc_mult)
-        state = DeepseekV41SharedState()
+        state = DeepseekV41SharedState(window_topk_idxs=build_window_topk_indices(seq_ids, self.config.sliding_window))
         moe_padding_mask = padding_mask.to(device) if padding_mask is not None else None
 
         for layer in self.layers.values():
+            # Checkpoint recomputation must not observe later layers' assignments.
+            # A shallow copy preserves shared tensors and their autograd history.
+            state = replace(state)
             layer_hash_ids = None
             if engram_hash_ids is not None and layer.engram is not None:
                 layer_hash_ids = engram_hash_ids[:, :, layer.engram.layer_hash_index, :]

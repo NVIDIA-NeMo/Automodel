@@ -328,3 +328,24 @@ class TestAttentionStateSharing:
         out2 = attn(x2, state=DeepseekV41SharedState(), **kwargs)
         assert torch.allclose(out[:, :-1], out2[:, :-1], atol=1e-5)
         assert not torch.allclose(out[:, -1], out2[:, -1])
+
+
+@pytest.mark.parametrize("prefix", [1, 3, 5, 11])
+def test_candidate_blocks_follow_document_boundaries(prefix):
+    # Distinct scores isolate block alignment from unspecified Top-K tie ordering.
+    scores = torch.tensor([8.0, 1.0, 4.0, 9.0, 3.0, 2.0, 7.0, 6.0, 5.0, 11.0, 10.0]).view(1, 1, -1)
+    allowed = torch.ones_like(scores, dtype=torch.bool)
+    positions = torch.arange(scores.shape[-1]).unsqueeze(0)
+    expected = select_candidate_blocks(scores, allowed, 2, 4, pool_positions=positions)
+    packed_scores = torch.nn.functional.pad(scores, (prefix, 0), value=float("-inf"))
+    packed_allowed = torch.nn.functional.pad(allowed, (prefix, 0), value=False)
+    packed_positions = torch.cat([torch.arange(prefix).unsqueeze(0), positions], dim=1)
+    actual = select_candidate_blocks(packed_scores, packed_allowed, 2, 4, pool_positions=packed_positions)
+    torch.testing.assert_close(actual[..., prefix:], expected, rtol=0, atol=0)
+
+
+def test_candidate_blocks_with_no_visible_keys():
+    scores = torch.full((2, 3, 7), float("-inf"))
+    allowed = torch.zeros_like(scores, dtype=torch.bool)
+    positions = torch.tensor([[0, 1, 2, 0, 1, 2, 3], [0, 0, 1, 2, 3, 4, 5]])
+    assert not select_candidate_blocks(scores, allowed, 2, 4, pool_positions=positions).any()

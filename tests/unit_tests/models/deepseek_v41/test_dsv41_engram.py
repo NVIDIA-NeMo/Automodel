@@ -156,3 +156,15 @@ class TestEngramModule:
         config = tiny_config(engram_trainable=True)
         engram = DeepseekV41Engram(config, layer_idx=1, layout=EngramLayout.from_config(config))
         assert engram.embed.weight.requires_grad
+
+
+@pytest.mark.parametrize("max_ngram", [3, 4])
+@pytest.mark.parametrize("length", [0, 1, 2, 3])
+def test_short_hashes_match_reference(max_ngram, length):
+    config = tiny_config(engram_max_ngram_size=max_ngram)
+    hasher = DeepseekV41EngramHasher(config, EngramLayout.from_config(config))
+    tokens = torch.arange(5, 5 + length).expand(2, -1)
+    positions = torch.arange(length).expand(2, -1)
+    actual = hasher(tokens, positions)
+    expected = _reference_hash(hasher, tokens)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
