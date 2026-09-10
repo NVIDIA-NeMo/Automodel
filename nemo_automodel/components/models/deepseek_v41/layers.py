@@ -894,6 +894,7 @@ class DeepseekV41Attention(nn.Module):
             topk_idxs,
             self.scaling,
             backend=_dsv4_kernel_backend(self.backend),
+            reference_rounding=self.backend.attn == "tilelang",
         )  # [B, S, H, D]
 
         # Undo the query rotation on the output so the cache can stay in one shared rotated form.
