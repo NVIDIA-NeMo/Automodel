@@ -47,6 +47,9 @@ variables:
   CUDA_VISIBLE_DEVICES: ""
   HF_HUB_OFFLINE: "1"
   TRANSFORMERS_OFFLINE: "1"
+  HF_DATASETS_OFFLINE: "1"
+  # Unit-test defaults point at GitHub's /home/TestData mount, absent on GitLab.
+  HF_HOME: "$CI_PROJECT_DIR/.cache/huggingface"
   UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
   UV_LINK_MODE: copy
   UV_PYTHON_DOWNLOADS: never
@@ -111,8 +114,8 @@ retrieval-unit-tests:
     UV_PYTHON: "3.12"
   timeout: 20 minutes
   before_script:
-    # The retrieval processors register torchvision-backed Hugging Face classes at import time.
-    - uv sync --locked --no-default-groups --group build --group test --group linting --extra diffusion
+    # Retrieval processor imports need torchvision; mocked object-storage tests need boto3.
+    - uv sync --locked --no-default-groups --group build --group test --group linting --extra diffusion --extra s3
   script:
     - uv run --no-sync ty --version
     - |-
@@ -131,6 +134,9 @@ retrieval-unit-tests:
           raise SystemExit("No ty check targets configured in pyproject.toml")
       subprocess.run(["ty", "check", "--verbose", *targets], check=True)
       PY
+    # Prefer directories and path globs so new tests are included automatically.
+    # Keep optional-kernel/model and unrelated recipe suites outside this CPU/offline job.
+    # Unmatched shell globs reach pytest as invalid paths and fail rather than silently disappearing.
     - >-
       uv run --no-sync pytest
       --cpu
@@ -140,24 +146,21 @@ retrieval-unit-tests:
       --tb short
       -rA
       --junitxml pytest-report.xml
-      tests/unit_tests/_transformers/test_retrieval.py
-      tests/unit_tests/_transformers/test_retrieval_backbone_registry.py
-      tests/unit_tests/_transformers/test_sentence_transformer_export.py
-      tests/unit_tests/datasets/llm/test_bi_encoder_collator.py
-      tests/unit_tests/datasets/llm/test_cross_encoder_collator.py
-      tests/unit_tests/datasets/llm/test_retrieval_data_tools.py
-      tests/unit_tests/datasets/llm/test_retrieval_dataset.py
-      tests/unit_tests/datasets/llm/test_retrieval_distill_collator.py
-      tests/unit_tests/datasets/test_retrieval_group_aware_split.py
-      tests/unit_tests/loss/test_embedding_distill.py
+      tests/unit_tests/_transformers/test_*retrieval*.py
+      tests/unit_tests/_transformers/test_*tokenizer*.py
+      tests/unit_tests/_transformers/test_*export*.py
+      tests/unit_tests/config
+      tests/unit_tests/datasets/llm
+      tests/unit_tests/datasets/test_*.py
+      tests/unit_tests/loss
       tests/unit_tests/models/bi_encoder
-      tests/unit_tests/models/test_qwen3_reranker_collator_epoch.py
-      tests/unit_tests/models/test_qwen3_reranker_scoring.py
+      tests/unit_tests/models/test_*reranker*.py
       tests/unit_tests/recipes/retrieval
-      tests/unit_tests/recipes/test_retrieval_bi_encoder_recipe.py
-      tests/unit_tests/recipes/test_retrieval_distill_recipe.py
-      tests/unit_tests/recipes/test_retrieval_import.py
-      tests/unit_tests/recipes/test_train_cross_encoder.py
+      tests/unit_tests/recipes/test_*retrieval*.py
+      tests/unit_tests/recipes/test_train*encoder*.py
+      tests/unit_tests/recipes/test_mine*.py
+      tests/unit_tests/ci_tests/test_*config*.py
+      tests/unit_tests/ci_tests/test_generate_ci_tests.py
   artifacts:
     when: always
     reports:
