@@ -1,0 +1,162 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nemotron 3.5 Super VL LoRA fine-tuning on Spider (xlangai/spider), cross-domain
+# text-to-SQL: the user turn gives the full CREATE TABLE schema of the question's
+# database (rendered from richardr1126/spider-schema, with primary/foreign keys) and
+# the question, the assistant turn is the SQL query. The validation split covers 20
+# databases that never appear in training. Text-only: the vision tower is loaded but
+# never exercised. The base model stays frozen and LoRA adapters (rank 64, alpha 128)
+# are trained on the LLM linear projections (Mamba in/out projections, attention
+# q/k/v/o, MoE latent projections and shared experts); the vision tower, vision
+# projector and lm_head are excluded.
+#
+# Sizing: with the base weights frozen there are no fp32 master weights or
+# optimizer states for the base model, so the recipe fits on a single node of
+# 8 H100: 512 experts -> ep_size 8; global_batch_size 8 with cp_size 1 gives dp=8
+# -> one sample per rank per optimizer step; 400 steps cover 3,200 of the 7,000
+# training questions. Checkpoints hold the adapter weights only
+# (adapter_model.safetensors + adapter_config.json).
+#
+# Run:
+#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_spider_peft.yaml --nproc-per-node 8
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  max_steps: 400
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  trust_remote_code: true
+  num_nextn_predict_layers: 0
+  torch_dtype: torch.bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  exclude_modules:
+    - "*vision_tower*"
+    - "*vision_model*"
+    - "*vision_projector*"
+    - "*audio*"
+    - "*sound*"
+    - "*lm_head*"
+    - "*mlp1*"
+  dim: 64
+  alpha: 128
+  use_triton: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/nemotron_3_5_super_vl_spider_peft
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  # cp_size 1 -> dp 8 on 8 GPUs -> one 1-sample microbatch per rank per optimizer step.
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_spider_dataset
+  path_or_dataset: xlangai/spider
+  schema_dataset: richardr1126/spider-schema
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
+    max_length: 2048
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_spider_dataset
+  path_or_dataset: xlangai/spider
+  schema_dataset: richardr1126/spider-schema
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
+    max_length: 2048
+
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: huiyingl_workspace
+  name: nemotron_3_5_super_vl_spider_peft
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 2e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 1
+  time: "01:00:00"
+  max_steps: 2
