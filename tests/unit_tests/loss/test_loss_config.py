@@ -17,6 +17,7 @@
 import pytest
 
 from nemo_automodel.components.loss.loss import (
+    DFlashDecayLossConfig,
     FusedLinearCEConfig,
     KDLossConfig,
     LossConfig,
@@ -75,6 +76,32 @@ class TestKDLossConfig:
         loss = KDLossConfig(temperature=2.0).build()
         assert isinstance(loss, KDLoss)
         assert loss.temperature == 2.0
+
+
+class TestDFlashDecayLossConfig:
+    def test_defaults(self):
+        cfg = DFlashDecayLossConfig()
+        assert cfg.loss_gamma == 7.0
+        assert cfg.use_fused_linear_ce is False
+        assert cfg.chunk_size == 1024
+        assert cfg.normalize == "tokens"
+        assert cfg.loss_type == "dflash"
+        assert cfg.dpace_alpha == 0.5
+
+    def test_build(self):
+        from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+
+        loss = DFlashDecayLossConfig(loss_type="dpace", normalize="mean", dpace_alpha=0.3).build()
+        assert isinstance(loss, DFlashDecayLoss)
+        assert loss.loss_type == "dpace"
+        assert loss.normalize == "mean"
+        assert loss.dpace_alpha == 0.3
+
+    def test_registry_upgrades_loss_class(self):
+        loss = build_loss_module("DFlashDecayLoss")
+        from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+
+        assert isinstance(loss, DFlashDecayLoss)
 
 
 class TestLossConfigBase:

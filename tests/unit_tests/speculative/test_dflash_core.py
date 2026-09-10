@@ -35,7 +35,14 @@ BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 
 
-def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa", sliding_window=None):
+def _build_trainer(
+    num_anchors=8,
+    loss_decay_gamma=None,
+    loss_type="dflash",
+    dpace_alpha=0.5,
+    attention_backend="sdpa",
+    sliding_window=None,
+):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -65,6 +72,8 @@ def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa
         attention_backend=attention_backend,
         num_anchors=num_anchors,
         loss_decay_gamma=loss_decay_gamma,
+        loss_type=loss_type,
+        dpace_alpha=dpace_alpha,
         sliding_window=sliding_window,
     )
 
@@ -91,6 +100,39 @@ def test_forward_returns_finite_loss_and_grads_flow_to_draft():
     out.loss.backward()
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0
+
+
+def test_forward_supports_dpace_loss_and_grads_flow_to_draft():
+    trainer = _build_trainer(loss_type="dpace", dpace_alpha=0.4)
+    input_ids, hidden, loss_mask = _inputs()
+    bsz = input_ids.shape[0]
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    assert isinstance(out, DFlashStepMetrics)
+    assert torch.isfinite(out.loss) and out.loss.item() > 0
+    # D-PACE reports loss_weight = bsz * n_blocks (the denominator it divides by),
+    # not the decay-weight sum used for dflash, so the recipe's token-weighted
+    # validation average stays consistent with the objective. These inputs supply
+    # more valid anchors than num_anchors, so n_blocks is num_anchors exactly.
+    assert out.loss_weight.item() == float(bsz * trainer.num_anchors)
+    out.loss.backward()
+    grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
+    assert grad > 0
+
+
+def test_dpace_loss_weight_uses_num_anchors_not_the_achieved_block_count():
+    """DDP-partition-dependence regression: the achieved block count
+    (``min(num_anchors, valid_anchors_in_batch)``) varies with each
+    micro-batch's own content and therefore differs across DP ranks; the
+    D-PACE "mean" denominator must stay ``bsz * num_anchors`` even when a
+    batch supplies far fewer valid anchors than ``num_anchors``."""
+    trainer = _build_trainer(loss_type="dpace", dpace_alpha=0.4)
+    input_ids, hidden, loss_mask = _inputs()
+    bsz = input_ids.shape[0]
+    loss_mask[:, 4:] = 0.0  # every sample now has far fewer than num_anchors=8 valid positions
+
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+
+    assert out.loss_weight.item() == float(bsz * trainer.num_anchors)
 
 
 @pytest.mark.parametrize("attention_backend", ["eager", "sdpa"])
