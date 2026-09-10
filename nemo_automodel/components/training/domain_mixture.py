@@ -18,9 +18,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+
+#: Metric/validation-dataloader key holding the objective-weighted aggregate.
+#: Reserved, so a domain may not claim it (that would make the recipe both
+#: require and forbid ``validation_dataset_weighted``).
+WEIGHTED_AGGREGATE_NAME = "weighted"
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,11 @@ class DomainWeightConfig:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("domain_mixture domain names must be non-empty")
+        if self.name == WEIGHTED_AGGREGATE_NAME:
+            raise ValueError(
+                f"{WEIGHTED_AGGREGATE_NAME!r} is reserved for the objective-weighted aggregate "
+                "and cannot be used as a domain name"
+            )
         if not math.isfinite(self.sampling_weight) or self.sampling_weight <= 0:
             raise ValueError(
                 f"domain_mixture sampling_weight must be finite and positive for {self.name!r}, "
@@ -100,9 +110,33 @@ class DomainMixture:
     sampling_weights: tuple[float, ...]
     objective_weights: tuple[float, ...]
     loss_multipliers: tuple[float, ...]
+    #: Per-device cache of ``loss_multipliers``. Excluded from eq/hash so the
+    #: dataclass stays frozen-comparable; mutated in place, never rebound.
+    _multiplier_cache: dict = field(default_factory=dict, compare=False, repr=False)
 
-    def _domain_ids(self, dataset_ids: torch.Tensor) -> torch.Tensor:
-        """Validate and flatten per-sample dataset IDs to shape ``[batch]``."""
+    def _multiplier_tensor(self, device: torch.device) -> torch.Tensor:
+        """Return the multiplier vector on ``device``, building it at most once.
+
+        ``loss_multipliers`` is immutable after :meth:`DomainMixtureConfig.build`,
+        so rebuilding it per microbatch only adds a pageable host-to-device copy
+        on the critical path.
+        """
+        cached = self._multiplier_cache.get(device)
+        if cached is None:
+            cached = torch.tensor(self.loss_multipliers, dtype=torch.float32, device=device)
+            self._multiplier_cache[device] = cached
+        return cached
+
+    def _domain_ids(self, dataset_ids: torch.Tensor, *, validate_range: bool = True) -> torch.Tensor:
+        """Validate and flatten per-sample dataset IDs to shape ``[batch]``.
+
+        Args:
+            dataset_ids: Integer tensor of per-sample domain IDs.
+            validate_range: Bounds-check the IDs. This costs two blocking
+                device-to-host syncs, so callers on the per-microbatch critical
+                path pass ``False`` once a step-level pass has already validated
+                the very same batches.
+        """
         if not isinstance(dataset_ids, torch.Tensor):
             raise TypeError(f"dataset_id must be a torch.Tensor, got {type(dataset_ids).__name__}")
         if dataset_ids.dtype not in (
@@ -116,15 +150,22 @@ class DomainMixture:
         domain_ids = dataset_ids.reshape(-1).to(dtype=torch.long)
         if domain_ids.numel() == 0:
             raise ValueError("dataset_id must contain at least one value")
-        minimum = int(domain_ids.min().item())
-        maximum = int(domain_ids.max().item())
-        if minimum < 0 or maximum >= len(self.names):
-            raise ValueError(
-                f"dataset_id values must be in [0, {len(self.names) - 1}], got min={minimum}, max={maximum}"
-            )
+        if validate_range:
+            minimum = int(domain_ids.min().item())
+            maximum = int(domain_ids.max().item())
+            if minimum < 0 or maximum >= len(self.names):
+                raise ValueError(
+                    f"dataset_id values must be in [0, {len(self.names) - 1}], got min={minimum}, max={maximum}"
+                )
         return domain_ids
 
-    def loss_weights(self, dataset_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def loss_weights(
+        self,
+        dataset_ids: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        validate_range: bool = True,
+    ) -> torch.Tensor:
         """Expand per-sample importance weights to the label layout.
 
         Args:
@@ -132,6 +173,8 @@ class DomainMixture:
                 single sample). IDs follow the domain order in the config.
             labels: Target token IDs of shape ``[batch, sequence]`` or
                 ``[sequence]`` for a single flattened sample.
+            validate_range: Bounds-check ``dataset_ids``. Costs two device syncs;
+                see :meth:`_domain_ids`.
 
         Returns:
             Float32 tensor matching ``labels.shape``. Every row is constant
@@ -139,7 +182,7 @@ class DomainMixture:
         """
         if not isinstance(labels, torch.Tensor) or labels.ndim == 0:
             raise ValueError("labels must be a non-scalar torch.Tensor")
-        domain_ids = self._domain_ids(dataset_ids)
+        domain_ids = self._domain_ids(dataset_ids, validate_range=validate_range)
         if labels.ndim == 1:
             if domain_ids.numel() != 1:
                 raise ValueError(
@@ -152,7 +195,7 @@ class DomainMixture:
                 f"got labels.shape={tuple(labels.shape)} and {domain_ids.numel()} IDs"
             )
 
-        multipliers = torch.tensor(self.loss_multipliers, dtype=torch.float32, device=domain_ids.device)
+        multipliers = self._multiplier_tensor(domain_ids.device)
         per_sample = multipliers.index_select(0, domain_ids).to(labels.device)
         if labels.ndim == 1:
             return per_sample[0].expand_as(labels)

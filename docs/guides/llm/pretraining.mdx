@@ -55,6 +55,8 @@ DATA_DIR=./fineweb_edu
 python lingua/setup/download_prepare_hf_data.py fineweb_edu_10bt "$MEMORY_GB" --data_dir "$DATA_DIR" --seed 42 --nchunks 1
 ```
 Set `MEMORY_GB` to the amount of system memory allocated to `terashuf` (the tool used for sample shuffling), and set `DATA_DIR` to the root directory where the data will be stored. For example:
+
+```bash
 python lingua/setup/download_prepare_hf_data.py fineweb_edu_10bt 16 --data_dir ./fineweb_edu --seed 42 --nchunks 1
 ```
 
@@ -122,6 +124,8 @@ uv run tools/preprocess_megatron_dataset.py --input "fineweb_edu/fineweb_edu_10b
 ```
 
 The directory should look like this:
+
+```bash
 $ tree fineweb_edu/megatron_gpt2/
 fineweb_edu/megatron_gpt2/
 ├── processed_data_0_text_document.bin
@@ -167,8 +171,6 @@ This example demonstrates how to pretrain an LLM by using the NeMo AutoModel lib
 
 ### What is a Recipe?
 
-A recipe in NeMo AutoModel is a **self-contained orchestration module** that wires together all
-components needed to perform a specific task (e.g., pretraining).
 A recipe in NeMo AutoModel is a self-contained orchestration module that wires together all
 components needed to perform a specific task, such as pretraining.
 It is equivalent to a `Trainer` class but is highly modular, stateful, and reproducible.
@@ -372,9 +374,25 @@ packed batches do not currently preserve per-token domain IDs. Pipeline
 parallelism is also not currently supported because its target contract does
 not carry per-token objective weights. Context parallelism is disabled until
 its distributed gradient contract is covered by parity tests. The configured
-loss must use `reduction: sum`. The built-in masked, fused-linear, chunked, and
-Transformer Engine parallel cross-entropy losses accept these objective
-weights.
+loss must use `reduction: sum`. The built-in masked, fused-linear, and chunked
+cross-entropy losses accept these objective weights.
+
+`TEParallelCrossEntropy` is **not** supported: its Triton backward reads the
+upstream gradient as a single scalar, so per-token weights would apply the
+first sample's multiplier to the whole microbatch — the reported loss would
+look correct while the gradients were wrong. The recipe rejects that loss at
+setup rather than weighting it incorrectly.
+
+Only the cross-entropy term is domain-weighted. A MoE auxiliary/router loss is
+scaled independently of loss magnitude, so its strength relative to the
+weighted CE varies with each microbatch's domain composition; an
+`aux_loss_coeff` tuned without `domain_mixture` may need revisiting.
+
+The logged `domain_mixture/<name>_label_tokens` counts exclude the configured
+loss `ignore_index`. Datasets that mark padding through a separate `loss_mask`
+rather than by writing `ignore_index` into `labels` (Megatron's GPT dataset
+does this) therefore report one supervised token per position, so the logged
+fraction equals the raw sample fraction.
 
 ## Load Large Models
 

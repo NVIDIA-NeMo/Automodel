@@ -20,6 +20,8 @@ from contextlib import AbstractContextManager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import functools
+
 import pytest
 import torch
 import torch.nn as nn
@@ -45,6 +47,7 @@ from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_pp_collate_wrapper,
     _should_pack_validation,
+    _supports_loss_weights,
     _validate_domain_sampling_weights,
     build_model,
     compute_trust_remote_code_from_model,
@@ -2970,3 +2973,138 @@ def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch)
     assert captured["cu_seqlens"] is None
     assert model.scale.grad is not None
     assert len(loss_buffer) == 1
+
+
+# ---------------------------------------------------------------------------
+# domain_mixture guards
+#
+# Each guard below is the only thing standing between a misconfiguration and a
+# silently-wrong training objective, so they are asserted explicitly rather than
+# left to the happy-path tests.
+# ---------------------------------------------------------------------------
+
+
+class _LossWithWeights(torch.nn.Module):
+    reduction = "sum"
+
+    def forward(self, logits, labels, num_label_tokens=None, loss_weights=None):
+        return logits.sum()
+
+
+class _LossSwallowingKwargs(torch.nn.Module):
+    reduction = "sum"
+
+    def forward(self, logits, labels, **kwargs):
+        return logits.sum()
+
+
+def _plain_loss_without_weights(logits, labels, num_label_tokens=None):
+    return logits.sum()
+
+
+def _plain_loss_with_weights(logits, labels, num_label_tokens=None, loss_weights=None):
+    return logits.sum()
+
+
+@pytest.mark.parametrize(
+    "loss_fn, expected",
+    [
+        (_LossWithWeights(), True),
+        (_plain_loss_with_weights, True),
+        # A **kwargs catch-all silently swallows loss_weights (unweighted training
+        # while the domain metrics claim otherwise) -- it must not pass the gate.
+        (_LossSwallowingKwargs(), False),
+        # inspect.signature(fn.__call__) on a plain function reports (*args, **kwargs);
+        # the gate must introspect the function itself.
+        (_plain_loss_without_weights, False),
+        (functools.partial(_plain_loss_without_weights), False),
+    ],
+)
+def test_supports_loss_weights_requires_the_named_parameter(loss_fn, expected):
+    assert _supports_loss_weights(loss_fn) is expected
+
+
+def test_supports_loss_weights_rejects_te_parallel_ce():
+    """TE's backward reads grad_output as a scalar, so weighting it is unsound."""
+    from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy
+
+    assert _supports_loss_weights(TEParallelCrossEntropy(reduction="sum")) is False
+
+
+def test_domain_weight_config_rejects_reserved_aggregate_name():
+    """A domain named 'weighted' would collide with the aggregate metric key."""
+    from nemo_automodel.components.training.domain_mixture import (
+        WEIGHTED_AGGREGATE_NAME,
+        DomainWeightConfig,
+    )
+
+    with pytest.raises(ValueError, match="reserved"):
+        DomainWeightConfig(name=WEIGHTED_AGGREGATE_NAME, sampling_weight=0.5, objective_weight=0.5)
+
+
+def test_domain_mixture_rejects_blend_order_mismatch():
+    """Equal sampling weights must not let a reordered domains: list through."""
+    from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+    swapped = DomainMixtureConfig(
+        domains=(
+            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.75),
+            DomainWeightConfig(name="web", sampling_weight=0.5, objective_weight=0.25),
+        )
+    ).build()
+    # 50/50 blend: the weight comparison alone cannot detect the swap.
+    dataloader = DataloaderConfig(
+        dataset_config=MegatronPretrainingConfig(paths=["50", "/data/web", "50", "/data/code"])
+    )
+    with pytest.raises(ValueError, match="domain order must match"):
+        _validate_domain_sampling_weights(swapped, dataloader)
+
+    correct = DomainMixtureConfig(
+        domains=(
+            DomainWeightConfig(name="web", sampling_weight=0.5, objective_weight=0.25),
+            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.75),
+        )
+    ).build()
+    _validate_domain_sampling_weights(correct, dataloader)
+
+
+def test_domain_mixture_blend_order_allows_names_unrelated_to_paths():
+    """Names that match no prefix are unverifiable and must not be rejected."""
+    from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+    mixture = DomainMixtureConfig(
+        domains=(
+            DomainWeightConfig(name="alpha", sampling_weight=0.5, objective_weight=0.5),
+            DomainWeightConfig(name="beta", sampling_weight=0.5, objective_weight=0.5),
+        )
+    ).build()
+    dataloader = DataloaderConfig(
+        dataset_config=MegatronPretrainingConfig(paths=["1", "/data/corpus_a", "1", "/data/corpus_b"])
+    )
+    _validate_domain_sampling_weights(mixture, dataloader)
+
+
+def test_default_collater_batches_per_sample_dataset_id():
+    """BlendedDataset emits dataset_id as a bare numpy scalar next to sequences."""
+    import numpy as np
+
+    from nemo_automodel.components.datasets.utils import default_collater
+
+    batch = [
+        {
+            "input_ids": torch.ones(4, dtype=torch.long),
+            "labels": torch.ones(4, dtype=torch.long),
+            "dataset_id": np.int16(0),
+        },
+        {
+            "input_ids": torch.ones(4, dtype=torch.long),
+            "labels": torch.ones(4, dtype=torch.long),
+            "dataset_id": np.int16(1),
+        },
+    ]
+    out = default_collater(batch)
+    # [B], not [1, B] and not padded as a ragged sequence.
+    assert out["dataset_id"].tolist() == [0, 1]
+    assert out["input_ids"].shape == (2, 4)

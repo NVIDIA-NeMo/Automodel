@@ -136,7 +136,6 @@ class TEParallelCrossEntropy:
         labels: torch.Tensor,
         mask: torch.Tensor | None = None,
         num_label_tokens: int | None = None,
-        loss_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Compute parallel cross entropy loss that matches PyTorch's cross_entropy behavior.
@@ -146,11 +145,18 @@ class TEParallelCrossEntropy:
             labels: Target labels. Shape: [B, T]
             mask: Mask to apply to the loss. Shape: [B, T]
             num_label_tokens (int): The number of non-padding tokens.
-            loss_weights: Optional per-token multipliers matching
-                ``labels.shape``. Only supported with ``reduction="sum"``.
 
         Returns:
             Computed loss tensor
+
+        Note:
+            This loss deliberately does NOT accept ``loss_weights``. TE's Triton
+            backward reads ``grad_output`` as a single scalar
+            (``tl.load(grad_output_ptr)`` with no program-id offset), so a
+            per-token upstream gradient would silently collapse to the first
+            token's value: the loss would look right while every token trained
+            with one sample's multiplier. Omitting the parameter makes
+            ``_supports_loss_weights`` reject this class at recipe setup instead.
         """
         if not HAVE_TE_PARALLEL_CE:
             raise ImportError(MISSING_TE_PARALLEL_CE_MSG)
@@ -170,16 +176,6 @@ class TEParallelCrossEntropy:
         if HAVE_DTENSOR and isinstance(labels, DTensor):
             labels = labels.to_local()
 
-        if loss_weights is not None:
-            if self.reduction != "sum":
-                raise ValueError("loss_weights is only supported when reduction is 'sum'")
-            if loss_weights.shape != labels.shape:
-                raise ValueError(
-                    f"loss_weights.shape must match labels.shape, got {tuple(loss_weights.shape)} "
-                    f"and {tuple(labels.shape)}"
-                )
-            loss_weights = loss_weights.to(device=logits.device, dtype=torch.float32)
-
         if mask is not None:
             with torch.no_grad():
                 if mask.device != labels.device:
@@ -191,8 +187,6 @@ class TEParallelCrossEntropy:
 
         # Compute TE parallel cross entropy
         te_loss = parallel_cross_entropy(logits, labels, 0.0, reduce_loss, tp_group, self.ignore_index)
-        if loss_weights is not None:
-            te_loss = te_loss * loss_weights
 
         # Apply reduction
         if self.reduction == "none" or self.reduction == "mean":

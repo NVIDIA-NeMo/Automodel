@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -159,23 +161,17 @@ def test_te_parallel_cross_entropy_invalid_reduction_raises():
             TEParallelCrossEntropy(reduction="not-a-valid-reduction")(logits, targets)
 
 
-def test_te_parallel_cross_entropy_applies_per_token_weights(monkeypatch):
-    """The TE wrapper applies objective multipliers before sum normalization."""
-    from nemo_automodel.components.loss import te_parallel_ce as te_parallel_ce_mod
+def test_te_parallel_cross_entropy_rejects_per_token_weights():
+    """TE parallel CE must not accept loss_weights.
 
-    monkeypatch.setattr(te_parallel_ce_mod, "HAVE_TE_PARALLEL_CE", True)
-    monkeypatch.setattr(
-        te_parallel_ce_mod,
-        "parallel_cross_entropy",
-        lambda *args, **kwargs: torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-    )
-    loss_weights = torch.tensor([[0.5, 0.5], [1.5, 1.5]])
+    TE's Triton backward loads ``grad_output`` as a single scalar, so a
+    per-token upstream gradient silently collapses to the first token's value:
+    the loss would be right while every token trained with one sample's
+    multiplier. Omitting the parameter is what makes the recipe's
+    ``_supports_loss_weights`` gate reject this loss at setup.
+    """
+    from nemo_automodel.recipes.llm.train_ft import _supports_loss_weights
 
-    loss = te_parallel_ce_mod.TEParallelCrossEntropy(reduction="sum")(
-        torch.randn(2, 2, 3),
-        torch.zeros(2, 2, dtype=torch.long),
-        num_label_tokens=4,
-        loss_weights=loss_weights,
-    )
-
-    assert loss.item() == pytest.approx((0.5 + 1.0 + 4.5 + 6.0) / 4)
+    parameters = inspect.signature(TEParallelCrossEntropy.__call__).parameters
+    assert "loss_weights" not in parameters
+    assert _supports_loss_weights(TEParallelCrossEntropy(reduction="sum")) is False

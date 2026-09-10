@@ -35,7 +35,7 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
         ctx,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        loss_weights: torch.Tensor,
+        loss_weights: torch.Tensor | None,
         ignore_index: int,
         chunk_len: int,
     ) -> torch.Tensor:
@@ -61,7 +61,7 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
                 "_ChunkedCrossEntropySum requires logits shaped [tokens, vocab] and labels shaped [tokens]; "
                 f"got logits.shape={tuple(logits.shape)} and labels.shape={tuple(labels.shape)}."
             )
-        has_loss_weights = loss_weights.numel() > 0
+        has_loss_weights = loss_weights is not None
         if has_loss_weights and loss_weights.shape != labels.shape:
             raise ValueError(
                 f"loss_weights.shape must match labels.shape, got {tuple(loss_weights.shape)} and {tuple(labels.shape)}"
@@ -75,8 +75,10 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
             logits_chunk = logits[start:end].float()
             log_normalizer = torch.logsumexp(logits_chunk, dim=-1)
             target_logits = logits_chunk.gather(1, safe_labels[start:end].unsqueeze(1)).squeeze(1)
-            token_weights = loss_weights[start:end] if has_loss_weights else 1.0
-            total = total + ((log_normalizer - target_logits) * valid[start:end] * token_weights).sum()
+            term = (log_normalizer - target_logits) * valid[start:end]
+            if has_loss_weights:
+                term = term * loss_weights[start:end]
+            total = total + term.sum()
 
         ctx.save_for_backward(logits, safe_labels, valid, loss_weights)
         ctx.chunk_len = chunk_len
@@ -109,8 +111,10 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
                 safe_labels[start:end].unsqueeze(1),
                 torch.full((end - start, 1), -1.0, dtype=torch.float32, device=logits.device),
             )
-            token_weights = loss_weights[start:end].unsqueeze(1) if ctx.has_loss_weights else 1.0
-            grad_chunk = grad_chunk * (valid[start:end].unsqueeze(1) * token_weights * grad_out)
+            scale = valid[start:end].unsqueeze(1) * grad_out
+            if ctx.has_loss_weights:
+                scale = scale * loss_weights[start:end].unsqueeze(1)
+            grad_chunk = grad_chunk * scale
             grad[start:end] = grad_chunk.to(grad.dtype)
         return grad, None, None, None, None
 
@@ -211,8 +215,6 @@ class ChunkedCrossEntropy(nn.Module):
                     f"and {tuple(labels_shape)}"
                 )
             loss_weights = loss_weights.reshape(-1).to(device=logits.device, dtype=torch.float32)
-        else:
-            loss_weights = torch.empty(0, device=logits.device, dtype=logits.dtype)
 
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
