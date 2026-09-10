@@ -25,7 +25,7 @@ Forward contract (reference ``Transformer.forward`` of ``inference/model.py``):
 
 Cross-layer CSA2 state (shared compressed KV, index keys, Top-K indices and the
 hierarchical candidate pool) lives in per-layer snapshots of
-:class:`~nemo_automodel.components.models.deepseek_v41.layers.DeepseekV41SharedState`.
+:class:`~nemo_automodel.components.models.deepseek_v41.attention.DeepseekV41AttentionState`.
 Snapshots share tensors and preserve the state needed for activation recomputation.
 
 The optional vision tower inserts projected image patches and learned image
@@ -57,15 +57,17 @@ from nemo_automodel.components.models.common.utils import (
     cast_model_to_dtype,
     compute_lm_head_logits,
 )
+from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
+from nemo_automodel.components.models.deepseek_v41.attention import (
+    DeepseekV41Attention,
+    DeepseekV41AttentionState,
+)
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
-from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41NgramHash
+from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram, DeepseekV41NgramHash
 from nemo_automodel.components.models.deepseek_v41.layers import (
-    DeepseekV41Block,
     DeepseekV41HyperConnection,
     DeepseekV41RMSNorm,
-    DeepseekV41RotaryEmbedding,
-    DeepseekV41SharedState,
-    build_window_topk_indices,
 )
 from nemo_automodel.components.models.deepseek_v41.processing import (
     IMAGE,
@@ -81,7 +83,103 @@ from nemo_automodel.components.models.deepseek_v41.vision import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str
+
+
+class DeepseekV41Block(nn.Module):
+    """CSA2 and MoE sublayers with the single-pass mHC coefficient handoff."""
+
+    def __init__(
+        self,
+        config: DeepseekV41TextConfig,
+        layer_idx: int,
+        backend: BackendConfig,
+        moe_config: MoEConfig,
+        *,
+        engram_process_group: dist.ProcessGroup | None = None,
+    ) -> None:
+        super().__init__()
+        dtype = dtype_from_str(config.dtype, torch.bfloat16)
+        self.attn = DeepseekV41Attention(config, layer_idx, backend)
+        self.ffn = MoE(moe_config, backend)
+        # V4.1 uses exactly V4's modality-aware score routing with hash routing
+        # disabled. The shared MoE keeps ownership of gate, experts and dispatch.
+        self.ffn.gate = DeepseekV4VisionGate(
+            DeepseekV4Config(vocab_size=config.vocab_size),
+            moe_config,
+            gate_precision=torch.float32,
+            hash_routing=False,
+        )
+        self.attn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+        self.ffn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+        sinkhorn_backend = "tilelang" if backend.attn == "tilelang" else "torch"
+        self.attn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
+        self.ffn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
+        self.engram = (
+            DeepseekV41Engram(config, layer_idx, backend, process_group=engram_process_group)
+            if layer_idx in config.engram_layer_ids
+            else None
+        )
+
+    @property
+    def mlp(self) -> MoE:
+        """Expose the shared parallelizer's MoE interface without duplicate registration."""
+        return self.ffn
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        pre_mix: torch.Tensor,
+        state: DeepseekV41AttentionState,
+        *,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
+        engram_hash_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, DeepseekV41AttentionState]:
+        """Execute one block while retaining differentiable shared KV ownership.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, streams, hidden].
+            pre_mix: FP32 tensor of shape [batch, sequence, streams].
+            state: Shared CSA2 tensors with layouts documented by
+                DeepseekV41AttentionState; no tensor is mutated.
+            position_ids: Integer tensor of shape [batch, sequence].
+            attention_mask: Optional binary tensor of shape [batch, sequence].
+            image_mask: Optional boolean tensor of shape [batch, sequence].
+            engram_hash_ids: Optional logical memory rows [batch, sequence, hash_heads].
+
+        Returns:
+            Updated streams [batch, sequence, streams, hidden], the next pre-mix
+            [batch, sequence, streams], and the new immutable CSA2 state.
+        """
+        if pre_mix.dtype != torch.float32:
+            raise TypeError(
+                "Single-pass mHC requires FP32 carried coefficients. Configure the FSDP mixed precision policy "
+                "with cast_forward_inputs=False and output_dtype=None."
+            )
+        if self.engram is not None:
+            if engram_hash_ids is None:
+                raise ValueError("An Engram block requires engram_hash_ids")
+            token_mask = None if image_mask is None else ~image_mask
+            if attention_mask is not None:
+                token_mask = attention_mask.bool() if token_mask is None else token_mask & attention_mask.bool()
+            hidden_states = self.engram(hidden_states, engram_hash_ids, token_mask=token_mask)
+        attn_mix = self.attn_hc(hidden_states)
+        collapsed = self.attn_hc.collapse(hidden_states, pre_mix)
+        attended = self.attn(
+            self.attn_norm(collapsed), position_ids=position_ids, state=state, attention_mask=attention_mask
+        )
+        hidden_states = self.attn_hc.expand(attended.hidden_states, hidden_states, attn_mix)
+        ffn_mix = self.ffn_hc(hidden_states)
+        collapsed = self.ffn_hc.collapse(hidden_states, attn_mix.pre)
+        vision_types = None if image_mask is None else image_mask.to(torch.int32) - 1
+        self.ffn.gate.set_routing_context(None, vision_types)
+        padding_mask = None if attention_mask is None else ~attention_mask.bool()
+        output = self.ffn(self.ffn_norm(collapsed), padding_mask)
+        hidden_states = self.ffn_hc.expand(output, hidden_states, ffn_mix)
+        return hidden_states, ffn_mix.pre, attended.state
 
 
 class DeepseekV41Model(nn.Module):
@@ -99,57 +197,38 @@ class DeepseekV41Model(nn.Module):
         super().__init__()
         self.config = config
         self.moe_config = moe_config
-        model_dtype = dtype_from_str(config.dtype, torch.bfloat16)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
+        dtype = dtype_from_str(config.dtype, torch.bfloat16)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         active_engram = any(i < config.num_hidden_layers for i in config.engram_layer_ids)
         if active_engram and tokenizer is None:
             raise ValueError("DeepSeek V4.1 Engram requires its original fast tokenizer for compressed N-gram hashing")
         self.engram_hash = DeepseekV41NgramHash(config, tokenizer) if active_engram else None
-        self.layers = nn.ModuleDict()
-        for layer_id in range(config.num_hidden_layers):
-            self.layers[str(layer_id)] = DeepseekV41Block(
-                layer_id,
-                config,
-                self.moe_config,
-                backend,
-                engram_process_group=engram_process_group,
-            )
-        self.norm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)
-
-        # Base rope (no YaRN) for pure sliding-window layers, compress rope (YaRN)
-        # for every CSA2 layer and for the pooled latents (reference ``Attention.__init__``).
-        partial_rotary_factor = float(config.qk_rope_head_dim) / float(config.head_dim)
-        self.rotary_emb = DeepseekV41RotaryEmbedding(
-            rope_theta=float(config.rope_theta),
-            head_dim=int(config.head_dim),
-            partial_rotary_factor=partial_rotary_factor,
-            rope_scaling=None,
+        self.layers = nn.ModuleDict(
+            {
+                str(i): DeepseekV41Block(config, i, backend, moe_config, engram_process_group=engram_process_group)
+                for i in range(config.num_hidden_layers)
+            }
         )
-        self.rotary_emb_compress = DeepseekV41RotaryEmbedding(
-            rope_theta=float(config.compress_rope_theta),
-            head_dim=int(config.head_dim),
-            partial_rotary_factor=partial_rotary_factor,
-            rope_scaling=getattr(config, "rope_scaling", None),
-        )
+        self.norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         *,
-        inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         output_hidden_states: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
-        """Compute full sequences and optional per-block residual streams.
+        """Compute all positions without inference-only prefill shortcuts.
 
         Args:
-            input_ids: Integer token IDs [batch, sequence], also used for Engram.
-            inputs_embeds: Optional projected image/text embeddings [batch, sequence, hidden].
-            position_ids: Optional contiguous zero-based positions [batch, sequence].
-            attention_mask: Optional binary right-padding mask [batch, sequence].
-            image_mask: Optional boolean image-span mask [batch, sequence].
+            input_ids: Integer tensor of shape [batch, sequence], also used for Engram.
+            position_ids: Optional integer tensor of shape [batch, sequence].
+            attention_mask: Optional binary right-padding tensor [batch, sequence].
+            image_mask: Optional boolean image-span tensor [batch, sequence].
+            inputs_embeds: Optional projected multimodal embeddings [batch, sequence, hidden].
             output_hidden_states: Whether to retain streams before each block.
 
         Returns:
@@ -158,57 +237,34 @@ class DeepseekV41Model(nn.Module):
         """
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).expand_as(input_ids)
-        inputs_embeds = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-        batch, seq_len, _ = inputs_embeds.shape
-        device = inputs_embeds.device
-        seq_ids = torch.ones(batch, seq_len, dtype=torch.long, device=device)
-        padding_mask = None if attention_mask is None else ~attention_mask.bool()
-        if padding_mask is not None:
-            seq_ids = seq_ids.masked_fill(padding_mask, 0)
-        vision_token_types = None if image_mask is None else image_mask.to(torch.int32) - 1
-
-        engram_hash_ids = None
-        engram_mask = None
-        if self.engram_hash is not None:
-            engram_mask = seq_ids > 0
-            if vision_token_types is not None:
-                engram_mask = engram_mask & (vision_token_types < 0)
-            engram_hash_ids = self.engram_hash(input_ids, position_ids=position_ids, token_mask=engram_mask)
-
-        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
-        position_embeddings_compress = self.rotary_emb_compress(inputs_embeds, position_ids)
-
-        h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
-        pre_mix = torch.zeros(*input_ids.shape, self.config.hc_mult, device=device, dtype=torch.float32)
+        embedded = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        hidden_states = embedded.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+        pre_mix = torch.zeros(*input_ids.shape, self.config.hc_mult, device=embedded.device, dtype=torch.float32)
         pre_mix[..., 0] = 1
-        state = DeepseekV41SharedState(window_topk_idxs=build_window_topk_indices(seq_ids, self.config.sliding_window))
-        moe_padding_mask = padding_mask.to(device) if padding_mask is not None else None
-
+        token_mask = None if image_mask is None else ~image_mask
+        if attention_mask is not None:
+            token_mask = attention_mask.bool() if token_mask is None else token_mask & attention_mask.bool()
+        hashes = (
+            self.engram_hash(input_ids, token_mask=token_mask, position_ids=position_ids)
+            if self.engram_hash is not None
+            else None
+        )
+        state = DeepseekV41AttentionState()
         captured = [] if output_hidden_states else None
         for layer in self.layers.values():
             if captured is not None:
-                captured.append(h)
-            layer_hash_ids = None
-            if engram_hash_ids is not None and layer.engram is not None:
-                layer_hash_ids = engram_hash_ids[:, :, layer.engram.layer_hash_index, :]
-            h, pre_mix, state = layer(
-                h,
+                captured.append(hidden_states)
+            hidden_states, pre_mix, state = layer(
+                hidden_states,
                 pre_mix,
-                padding_mask=moe_padding_mask,
-                attention_mask=attention_mask,
-                engram_hash_ids=layer_hash_ids,
-                engram_mask=engram_mask,
-                vision_token_types=vision_token_types,
-                position_embeddings=position_embeddings,
-                position_embeddings_compress=position_embeddings_compress,
-                rotary_compress=self.rotary_emb_compress,
+                state,
                 position_ids=position_ids,
-                seq_ids=seq_ids,
-                state=state,
+                attention_mask=attention_mask,
+                image_mask=image_mask,
+                engram_hash_ids=None if layer.engram is None else hashes[:, :, layer.engram.layer_hash_index],
             )
-
-        h = DeepseekV41HyperConnection.collapse(h, pre_mix)
-        return self.norm(h), None if captured is None else tuple(captured)
+        hidden_states = DeepseekV41HyperConnection.collapse(hidden_states, pre_mix)
+        return self.norm(hidden_states), None if captured is None else tuple(captured)
 
 
 class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
@@ -225,24 +281,17 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     # Reference-sensitive tensors that must stay fp32 regardless of the outer cast policy.
     _keep_in_fp32_modules_strict = [
-        "attn_hc.fn",
-        "attn_hc.base",
-        "attn_hc.scale",
-        "ffn_hc.fn",
-        "ffn_hc.base",
-        "ffn_hc.scale",
+        "attn_hc",
+        "ffn_hc",
         "attn.sinks_param",
-        # Compressor weights stay fp32 in storage. Projection uses the incoming
-        # activation dtype via _InputDtypeLinear; pooling remains fp32.
-        "attn.compressor.wkv",
         "attn.compressor.wgate",
+        "attn.compressor.wkv",
         "e_score_correction_bias",
         "bias_vl",
+        "lm_head",
         "vision.norm",
         "norm1.weight",
         "norm2.weight",
-        "lm_head",
-        "rotary_emb",
     ]
 
     @dataclass(frozen=True)
@@ -322,10 +371,12 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepseekV41StateDictAdapter(config, moe_config, self.backend, dtype=dtype)
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
+        """Return the untied token embedding module."""
         return self.model.embed_tokens
 
-    def get_output_embeddings(self):
+    def get_output_embeddings(self) -> nn.Module:
+        """Return the independent vocabulary projection."""
         return self.lm_head
 
     def _image_embeddings(
@@ -488,7 +539,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             nn.init.ones_(layer.attn_norm.weight)
             nn.init.ones_(layer.ffn_norm.weight)
             layer.ffn.gate.bias_vl.zero_()
-            layer.attn.init_weights(buffer_device, init_std=std)
+            layer.attn.reset_parameters(std)
             if layer.engram is not None:
                 layer.engram.init_weights()
         nn.init.ones_(self.model.norm.weight)
