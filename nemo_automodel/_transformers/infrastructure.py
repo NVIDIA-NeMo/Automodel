@@ -24,6 +24,7 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
 from functools import partial
@@ -67,6 +68,7 @@ from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.compile_utils import compile_model
 from nemo_automodel.components.utils.model_utils import (
+    FreezeConfig,
     _supports_logits_to_keep,
     apply_parameter_freezing,
     count_model_parameters,
@@ -75,6 +77,7 @@ from nemo_automodel.components.utils.model_utils import (
     freeze_minimax_m3_indexer_params,
     freeze_unused_kv_sharing_params,
     init_empty_weights,
+    parse_freeze_config,
     print_trainable_parameters,
 )
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
@@ -189,7 +192,7 @@ def _apply_runtime_compatibility_fixes(model):
 
 
 #  Sharding helpers
-def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
+def _shard_pp(autopipeline, model, loss_fn, parallelize_fn, reapply_trainability):
     trainable_params, total_params = count_model_parameters(model)
     # Store param info on autopipeline before splitting so it can be accessed later
     # This captures the full model's param counts before PP shards it across ranks
@@ -198,22 +201,25 @@ def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
     if get_world_size_safe() == 1:
         logger.info("World size is 1, skipping autopipeline.")
     else:
+        if parallelize_fn is not None:
+            parallelize_fn = partial(parallelize_fn, reapply_trainability=reapply_trainability)
         autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
         model = autopipeline
     return model
 
 
-def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext):
+def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext, reapply_trainability):
     """Apply EP + FSDP sharding (non-PP path)."""
     if parallelize_fn is not None and get_world_size_safe() > 1:
         parallelize_fn(
             model,
             world_mesh=mesh.device_mesh,
             moe_mesh=mesh.moe_mesh,
+            reapply_trainability=reapply_trainability,
             **mesh.parallelize_axis_kwargs(),
         )
     elif callable(getattr(model_wrapper, "parallelize", None)):
-        model = model_wrapper.parallelize(model)
+        model = model_wrapper.parallelize(model, reapply_trainability=reapply_trainability)
         model = (
             model[0] if isinstance(model, tuple) else model
         )  # MegatronFSDP will return (model, None) since we don't pass optimizer here
@@ -318,6 +324,7 @@ def parallelize_for_pp(
     model: torch.nn.Module,
     *,
     model_wrapper: Union[FSDP2Manager, MegatronFSDPManager, DDPManager] | None = None,
+    reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
     **kwargs,
 ) -> torch.nn.Module:
     """Parallelize model for pipeline parallelism (non-MoE case).
@@ -328,6 +335,8 @@ def parallelize_for_pp(
     Args:
         model: The model to parallelize.
         model_wrapper: Distributed manager instance.
+        reapply_trainability: Callback that re-resolves the trainability policy
+            after pipeline-stage surgery and immediately before wrapping.
         **kwargs: Additional arguments (world_mesh, moe_mesh, axis names) passed by
             AutoPipeline but unused for non-MoE parallelization.
 
@@ -336,7 +345,7 @@ def parallelize_for_pp(
     """
     if model_wrapper is not None:
         if callable(getattr(model_wrapper, "parallelize", None)):
-            model = model_wrapper.parallelize(model)
+            model = model_wrapper.parallelize(model, reapply_trainability=reapply_trainability)
     return model
 
 
@@ -460,6 +469,40 @@ def _uses_thd_only_te_attention(model) -> bool:
         for name, module in part.named_modules()
         if name.endswith("self_attn")
     )
+
+
+def _apply_trainability_policy(
+    model: torch.nn.Module,
+    *,
+    peft_enabled: bool,
+    freeze_config: FreezeConfig | None,
+    strict: bool,
+) -> None:
+    """Resolve the complete trainability policy on the current module hierarchy.
+
+    Parallelization and checkpoint loading can replace modules and parameters.
+    Re-running this policy after each such surgery selects the current objects by
+    module path instead of transferring stale parameter-name state.
+
+    Args:
+        model: Model or pipeline stage whose trainability is being resolved.
+        peft_enabled: Whether the PEFT baseline should freeze non-LoRA parameters.
+        freeze_config: Optional user freeze/unfreeze policy.
+        strict: Whether every generic selector must match this model. Full-model
+            validation is strict; pipeline stages use non-strict rebinding because
+            each rank owns only part of the hierarchy.
+    """
+    if peft_enabled:
+        for name, param in model.named_parameters(remove_duplicate=False):
+            param.requires_grad_("lora_" in name)
+    if freeze_config is not None:
+        apply_parameter_freezing(model, freeze_config, strict=strict)
+
+    # These are framework invariants, so they are always applied last and cannot
+    # be overridden by a user unfreeze selector.
+    freeze_unused_kv_sharing_params(model)
+    freeze_deepseek_v4_indexer_params(model)
+    freeze_minimax_m3_indexer_params(model)
 
 
 #  apply_model_infrastructure  --  the main post-init orchestration function
@@ -593,9 +636,16 @@ def apply_model_infrastructure(
 
     checkpoint_already_loaded = False
     if load_before_shard:
-        if is_meta_device:
-            lora_a_init = getattr(peft_config, "lora_A_init", None)
-            checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+        if weights_already_loaded:
+            # HF's from_pretrained already populated the weights during model init.
+            # Still call load_base_model with load_base_model=False to
+            # handle weight tying
+            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
+        else:
+            # Only meta-device models need their parameter shells materialized first.
+            if is_meta_device:
+                lora_a_init = getattr(peft_config, "lora_A_init", None)
+                checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
             checkpointer.load_base_model(
                 model,
                 device,
@@ -603,11 +653,6 @@ def apply_model_infrastructure(
                 pretrained_model_name_or_path,
                 load_base_model=load_base_model,
             )
-        else:
-            # Non-meta models already have weights from from_pretrained.
-            # Still call load_base_model with load_base_model=False to
-            # handle weight tying
-            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
         checkpoint_already_loaded = True
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
@@ -620,16 +665,21 @@ def apply_model_infrastructure(
             _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
         )
 
-    # Apply freezing before sharding
-    freeze_config = _kwargs.get("freeze_config")
-    if freeze_config is not None:
-        apply_parameter_freezing(model, freeze_config)
-
-    # Freeze dead K/V parameters in KV-shared layers (e.g. Gemma4 E2B/E4B)
-    # so the optimizer never tracks them and checkpoint save/resume stay consistent.
-    freeze_unused_kv_sharing_params(model)
-    freeze_deepseek_v4_indexer_params(model)
-    freeze_minimax_m3_indexer_params(model)
+    # Validate selectors on the complete pre-parallelization hierarchy. The
+    # same policy is rebound after model surgery and before DDP/FSDP capture.
+    freeze_config = parse_freeze_config(_kwargs.get("freeze_config"))
+    _apply_trainability_policy(
+        model,
+        peft_enabled=peft_config is not None,
+        freeze_config=freeze_config,
+        strict=True,
+    )
+    reapply_trainability = partial(
+        _apply_trainability_policy,
+        peft_enabled=peft_config is not None,
+        freeze_config=freeze_config,
+        strict=False,
+    )
 
     # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
     enable_radio_vit_fused_attn(model)
@@ -642,11 +692,11 @@ def apply_model_infrastructure(
     # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
     mfsdp_param_attrs = None
     if autopipeline is not None:
-        model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
+        model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn, reapply_trainability)
         for part in model.parts:
             setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
-        model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh)
+        model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh, reapply_trainability)
         # Megatron-FSDP stamps load-bearing per-parameter state (owning-model back-ref,
         # tied-weight ``_is_shared`` marker, ``orig_param`` and friends) during wrapping.
         # The lm-head re-tie and post-wrap checkpoint reload below rebuild Parameter
@@ -722,14 +772,23 @@ def apply_model_infrastructure(
         checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
     )
 
-    # Freeze parameters after checkpoint loading and parallelization
-    # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)
-    if peft_config is not None:
-        models_to_freeze = model.parts if hasattr(model, "parts") else [model]
-        for mp in models_to_freeze:
-            for name, param in mp.named_parameters():
-                if "lora_" not in name and param.requires_grad:
-                    param.requires_grad_(False)
+    # Checkpoint loading can perform another round of parameter replacement, so
+    # re-resolve once more on the final model parts before optimizer construction.
+    trainability_models: list[torch.nn.Module]
+    if hasattr(model, "parts"):
+        trainability_models = list(model.parts)
+    elif isinstance(model_wrapper, (DDPManager, MegatronFSDPManager)):
+        trainability_models = [getattr(model, "module", model)]
+    else:
+        trainability_models = [model]
+    for mp in trainability_models:
+        reapply_trainability(mp)
+    if peft_config is not None or freeze_config is not None:
+        if not any(param.requires_grad for mp in trainability_models for param in mp.parameters()):
+            logger.warning(
+                "The configured trainability policy left no trainable parameters; "
+                "check freeze_config and the PEFT configuration."
+            )
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
@@ -807,8 +866,10 @@ def apply_model_infrastructure(
     # module also keeps its storage-dtype params. Under fp32 master weights + bf16 compute
     # that leaves frozen fp32 tensors feeding bf16 trainable modules -> dtype-mismatch
     # matmul at the seam. Cast frozen params/buffers to the compute dtype so the whole
-    # forward runs uniformly. No-op for pure-fp32 / pure-bf16 runs and when no mp_policy
-    # is available (DDP/PP).
+    # forward runs uniformly. Freeze configuration only controls requires_grad; trainable
+    # parameters keep their storage dtype (compute dtype is owned by autocast or the
+    # distributed mixed-precision policy). No-op for pure-fp32 / pure-bf16 runs and when
+    # no mp_policy is available (DDP/PP).
     compute_dtype = getattr(getattr(model_wrapper, "mp_policy", None), "param_dtype", None)
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:

@@ -34,10 +34,18 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-import mlflow
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_MLFLOW, mlflow = safe_import(
+    "mlflow",
+    msg="mlflow is not installed. To enable MLflow experiment tracking, run: uv add nemo-automodel[mlflow]. For the full MLflow stack: uv add nemo-automodel[mlflow-full]",
+)
 import torch
 import torch.nn as nn
-import wandb
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoConfig
@@ -54,6 +62,7 @@ from nemo_automodel._transformers.infrastructure import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
@@ -90,6 +99,7 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
+    FreezeConfig,
     _supports_logits_to_keep,
     _supports_seq_lens,
     filter_forward_kwargs,
@@ -182,7 +192,7 @@ def build_model(
     cfg_quantization=None,
     distributed_setup: DistributedSetup | None = None,
     cfg_qat=None,
-    unfreeze_modules: list[str] | None = None,
+    cfg_freeze: ConfigNode | dict[str, Any] | FreezeConfig | None = None,
     sdpa_method: list[str] | None = None,
     device_mesh=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
@@ -198,7 +208,8 @@ def build_model(
         cfg_quantization: Configuration for BitsAndBytes quantization.
         distributed_setup: Resolved distributed topology and policy object.
         cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
-        unfreeze_modules: List of module names/substrings to unfreeze.
+        cfg_freeze: Freeze configuration (``freeze_config`` YAML section as a
+            mapping, or a typed FreezeConfig) controlling parameter trainability.
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
@@ -208,6 +219,9 @@ def build_model(
         kwargs = {
             "has_packed_sequence": has_packed_sequence,
             "peft_config": cfg_peft,
+            # ConfigNode lives at the recipe boundary; downstream components take
+            # plain mappings or typed FreezeConfig objects.
+            "freeze_config": cfg_freeze.to_dict() if isinstance(cfg_freeze, ConfigNode) else cfg_freeze,
             "sdpa_method": sdpa_method,
         }
         if distributed_setup is not None:
@@ -289,17 +303,11 @@ def build_model(
                 fp8_config=kwargs.get("fp8_config"),
                 compile_config=kwargs.get("compile_config"),
                 quantization_config=kwargs.get("quantization_config"),
+                freeze_config=kwargs.get("freeze_config"),
                 pretrained_model_name_or_path=None,
                 load_base_model=False,
                 cache_dir=hf_constants.HF_HUB_CACHE,
             )
-
-    # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
-    if unfreeze_modules:
-        for name, param in model.named_parameters():
-            if any(module_name in name for module_name in unfreeze_modules):
-                param.requires_grad_(True)
-        logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
     return model
 
@@ -620,6 +628,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
             cfg_qat=self.cfg.get("qat", None),
+            cfg_freeze=self.cfg.get("freeze_config", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.embedding_row_repair_report = None
@@ -651,6 +660,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
+
+        from nemo_automodel.components.moe.mok_experts import enable_mok_mxfp8_optimizer_step_cache
+
+        enable_mok_mxfp8_optimizer_step_cache(self.model_parts, self.optimizer)
 
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
@@ -719,7 +732,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     dp_world_size=self._get_dp_group_size(),
                     pp_enabled=self.pp_enabled,
                     supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
-                    cp_size=self.cfg.get("distributed.cp_size", 1),
+                    # Models and backends that own their CP dispatch do not need
+                    # TE's per-document ``2 * cp_size`` packing alignment.
+                    cp_size=(
+                        1
+                        if (
+                            getattr(self.model_parts[0], "_owns_cp_attention", False)
+                            or (self.magi.enabled and self.magi.custom)
+                        )
+                        else self.cfg.get("distributed.cp_size", 1)
+                    ),
                     attn_implementation=attn_implementation,
                     collate_wrapper=collate_wrapper,
                 )
@@ -1328,7 +1350,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
                 "tps": tps,
-                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+                # tps is global tokens/sec (num_tokens_in_batch is summed over
+                # the DP group), so per-GPU must divide by the full world size.
+                # Dividing by dp*cp alone inflates it by the pp (and tp) factor.
+                "tps_per_gpu": tps / max(self.dist_env.world_size, 1),
                 "mfu": mfu,
                 "num_tokens_per_step": num_tokens_in_batch,
                 "num_label_tokens": num_label_tokens,
@@ -1481,14 +1506,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main or log_data is None:
             return
 
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             if val_name == "default":
                 wandb.log(log_data.metrics, step=log_data.step)
             else:
                 metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
                 wandb.log(metrics, step=log_data.step)
 
-        if mlflow.active_run() is not None:
+        if _HAS_MLFLOW and mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
         if self.comet_logger is not None:
@@ -1541,22 +1566,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-            if mlflow.active_run() is not None:
+            if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # Log MoE load balance metrics (already collected/reduced on all ranks)
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 self._log_moe_metrics(self.step_scheduler.step, wandb.log)
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
                 )
-            if mlflow.active_run() is not None:
+            if _HAS_MLFLOW and mlflow.active_run() is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: mlflow.log_metrics(to_float_metrics(m), step=step)
                 )

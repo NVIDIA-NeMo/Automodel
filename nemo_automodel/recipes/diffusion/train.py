@@ -22,7 +22,12 @@ from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
-import wandb
+
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
@@ -32,7 +37,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.rng import StatefulRNG, init_all_rng
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG, init_all_rng
 from nemo_automodel.components.training.utils import (
     clip_grad_norm,
     prepare_after_first_microbatch,
@@ -815,6 +820,34 @@ class TrainDiffusionRecipe(BaseRecipe):
         if len(self.dataloader) == 0:
             raise RuntimeError("Training dataloader is empty; cannot proceed with training")
 
+        # Optional held-out loader; same typed contract and dp sharding as the training one.
+        validation_dataloader_config = self.cfg.diffusion_validation_dataloader
+        self.val_dataloader = None
+        self.val_sampler = None
+        val_every_steps = self.cfg.get("step_scheduler.val_every_steps", None)
+        if validation_dataloader_config is not None:
+            validation_build = validation_dataloader_config.build(
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+                batch_size=self.cfg.get("step_scheduler.local_batch_size"),
+            )
+            self.val_dataloader = validation_build.dataloader
+            self.val_sampler = validation_build.sampler
+            if len(self.val_dataloader) == 0:
+                raise RuntimeError("Validation dataloader is empty; remove data.validation_dataloader or fix its path")
+            if val_every_steps is None:
+                # is_val_step is also true on checkpoint steps, so validation is not dead here.
+                logging.warning(
+                    "[WARN] data.validation_dataloader is set without step_scheduler.val_every_steps; "
+                    "validation will only run at checkpoint steps"
+                )
+        elif val_every_steps is not None:
+            logging.warning(
+                "[WARN] step_scheduler.val_every_steps=%s is set but no data.validation_dataloader is configured; "
+                "validation is skipped",
+                val_every_steps,
+            )
+
         # Derive DP size consistent with model parallel config
         # (manual until the distributed section is standardized; DistributedSetup owns this math)
         if ddp_cfg is not None:
@@ -896,6 +929,65 @@ class TrainDiffusionRecipe(BaseRecipe):
             recipe=self._te_fp8_recipe,
             amax_reduction_group=self._te_fp8_group,
         )
+
+    def _run_validation_epoch(self, global_step: int) -> float:
+        """Score the held-out set with the training flow-matching objective.
+
+        Seeding by data rank mirrors training: every evaluation draws the same timesteps, noise,
+        and CFG dropout, so ``val_loss`` tracks the model rather than the sampling, while
+        data-parallel ranks stay decorrelated and context-parallel peers of one rank draw
+        identical values for their shared batch. ``ScopedRNG`` restores the training RNG state
+        afterwards, leaving the training trajectory unchanged.
+
+        The forward runs under the same compute-dtype autocast as training, so a single-rank
+        split-dtype config evaluates the way it trains. FP8 autocast is left out: delayed-scaling
+        amax history is training state and must not be updated from held-out batches.
+
+        Args:
+            global_step: Current optimizer step, forwarded to the flow-matching pipeline for
+                its periodic diagnostics.
+
+        Returns:
+            Mean loss over the validation batches of the data-parallel group, comparable to the
+            logged ``train_loss``.
+        """
+        self.model.eval()
+        local_loss_sum = 0.0
+        local_num_batches = 0
+        try:
+            with (
+                ScopedRNG(seed=self.seed + self._get_dp_rank(), ranked=False),
+                torch.no_grad(),
+                self._autocast_context(),
+            ):
+                for batch in self.val_dataloader:
+                    _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
+                        model=self.model,
+                        batch=batch,
+                        device=self.device,
+                        dtype=self.compute_dtype,
+                        global_step=global_step,
+                        collect_metrics=False,
+                        check_loss=False,
+                    )
+                    local_loss_sum += float(average_weighted_loss.detach())
+                    local_num_batches += 1
+        finally:
+            self.model.train()
+
+        # Ranks can hold a different number of batches, so reduce sum and count and divide once.
+        # CP peers all compute the same full-sequence loss, so the reduction excludes the cp axis.
+        totals = torch.tensor(
+            [local_loss_sum, float(local_num_batches)],
+            device=self._get_collective_device(),
+            dtype=torch.float64,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=self._get_dp_group())
+        global_loss_sum, global_num_batches = totals.tolist()
+        if global_num_batches == 0:
+            raise RuntimeError("Validation produced no batches; cannot compute validation loss")
+        return global_loss_sum / global_num_batches
 
     def run_train_validation_loop(self):
         logging.info("[INFO] Starting T2V training with Flow Matching")
@@ -1031,7 +1123,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                         **throughput_metrics,
                         **memory_metrics,
                     }
-                    if wandb.run is not None:
+                    if _HAS_WANDB and wandb.run is not None:
                         wandb.log(log_dict, step=global_step)
                     logging.info(
                         "[TRAIN] step=%s epoch=%s loss=%.6f avg_loss=%.6f lr=%.3e grad_norm=%.3f "
@@ -1061,6 +1153,18 @@ class TrainDiffusionRecipe(BaseRecipe):
                             }
                         )
 
+                if self.val_dataloader is not None and self.step_scheduler.is_val_step:
+                    val_loss = self._run_validation_epoch(global_step)
+                    if self.dist_env.is_main:
+                        if _HAS_WANDB and wandb.run is not None:
+                            wandb.log({"val_loss": val_loss}, step=global_step)
+                        logging.info(
+                            "[VAL] step=%s epoch=%s val_loss=%.6f",
+                            global_step,
+                            epoch,
+                            val_loss,
+                        )
+
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
 
@@ -1070,12 +1174,12 @@ class TrainDiffusionRecipe(BaseRecipe):
             avg_loss = epoch_loss / num_steps
             logging.info(f"[INFO] Epoch {epoch + 1} complete. avg_loss={avg_loss:.6f}")
 
-            if self.dist_env.is_main and wandb.run is not None:
+            if self.dist_env.is_main and _HAS_WANDB and wandb.run is not None:
                 wandb.log({"epoch/avg_loss": avg_loss, "epoch/num": epoch + 1}, step=global_step)
 
         if self.dist_env.is_main:
             logging.info(f"[INFO] Saved final checkpoint at step {global_step}")
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.finish()
 
         self._finalize_and_close_checkpointer()

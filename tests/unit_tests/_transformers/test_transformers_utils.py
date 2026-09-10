@@ -327,6 +327,23 @@ class TestApplyCacheCompatibilityPatchesIntegration:
 
         assert hasattr(cu, "SlidingWindowCache")
 
+    def test_restores_output_recorder_in_utils_generic(self, monkeypatch):
+        """Pre-v5 remote code imports OutputRecorder from transformers.utils.generic.
+
+        Transformers v5.x moved the class to transformers.utils.output_capturing,
+        which breaks remote-code checkpoints (Kimi-Linear, MiniMax-M2) at module
+        import. The patch must alias the relocated class back to the old location.
+        """
+        import transformers.modeling_utils as modeling_utils
+        import transformers.utils.generic as generic_utils
+
+        monkeypatch.delattr(generic_utils, "OutputRecorder", raising=False)
+        apply_cache_compatibility_patches()
+
+        assert generic_utils.OutputRecorder is modeling_utils.OutputRecorder
+        # The exact import form used by the remote modeling files must work.
+        from transformers.utils.generic import OutputRecorder  # noqa: F401
+
     def test_patches_cache_get_usable_length(self):
         """Cache.get_usable_length should exist after patching."""
         apply_cache_compatibility_patches()

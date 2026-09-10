@@ -137,6 +137,9 @@ wandb:
 clip_grad_norm:
   max_norm: 1.0
 
+prewarm:
+  comm_groups: true
+
 ci:
   recipe_owner: huiyingl
   nodes: 64
