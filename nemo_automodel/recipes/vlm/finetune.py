@@ -158,6 +158,22 @@ def _validate_cp_packing_support(
     )
 
 
+def _consumes_packed_seq_ids(model: object) -> bool:
+    """Read the live model's declaration that it rebuilds document isolation from ``_packed_seq_ids``.
+
+    Args:
+        model: The first model part, possibly behind a DDP or Megatron-FSDP wrapper that exposes the
+            wrapped model as ``module`` without proxying its attributes. No tensor inputs.
+
+    Returns:
+        True only when the unwrapped model declares exactly ``True``. A missing declaration or any other
+        value stays False, so the packed dataloader keeps the dense mask for it outside the flash-attention
+        backends.
+    """
+    model = getattr(model, "module", model)
+    return getattr(model, "consumes_packed_seq_ids", False) is True
+
+
 def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
@@ -608,6 +624,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
             configure_packing(attn_implementation=packing_attn_implementation)
+        consumes_packed_seq_ids = _consumes_packed_seq_ids(self.model_parts[0])
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
@@ -619,6 +636,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 dataset_build_context=dataset_build_context,
                 get_rope_index=get_rope_index,
                 packing_attn_implementation=packing_attn_implementation,
+                consumes_packed_seq_ids=consumes_packed_seq_ids,
                 pp_n_microbatches=pp_n_microbatches,
                 cp_size=self.mesh_context.cp_size,
             )

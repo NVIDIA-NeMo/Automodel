@@ -278,7 +278,10 @@ def test_recipe_config_resolves_nested_vlm_video_processor():
 
 
 def test_vlm_dataloader_selects_thd_collater(build_packed_dataloader):
-    result = build_packed_dataloader(packing=NeatPackConfig(packing_format="thd"), cp_size=4)
+    # THD carries document bounds in ``cu_seqlens``; the consumer declaration only concerns NEAT packing.
+    result = build_packed_dataloader(
+        packing=NeatPackConfig(packing_format="thd"), cp_size=4, consumes_packed_seq_ids=True
+    )
 
     assert result.dataloader.collate_fn.func is packed_sequence_thd_vlm_collater
     assert result.dataloader.collate_fn.keywords == {"padding_idx": 0, "max_length": None}
@@ -294,7 +297,7 @@ def test_vlm_dataloader_selects_thd_collater(build_packed_dataloader):
 # through ``packed_sequence.attn_implementation`` -- while the decision this change makes is at
 # ``cp_size=1``.
 _DENSE_MASK_CASES = (
-    ("te", 1, False),
+    ("te", 1, True),
     ("flash_attention_2", 1, False),
     ("flash_attention_3", 1, False),
     ("flash_attention_4", 1, False),
@@ -313,22 +316,29 @@ _DENSE_MASK_CASES = (
 )
 
 
+@pytest.mark.parametrize("consumes_packed_seq_ids", [False, True], ids=["undeclared", "declared"])
 @pytest.mark.parametrize(("attn_implementation", "cp_size", "dense"), _DENSE_MASK_CASES)
 def test_vlm_dataloader_builds_the_dense_mask_only_for_backends_that_read_it(
-    build_packed_dataloader, attn_implementation, cp_size, dense
+    build_packed_dataloader, attn_implementation, cp_size, dense, consumes_packed_seq_ids
 ):
-    """Only a backend that reads the mask is handed the quadratic one.
+    """Only the flash-attention family, or a model that declares itself a consumer, skips the quadratic mask.
 
-    Flash attention rebuilds ``cu_seqlens`` from the indexed ``[batch, sequence]`` document map and
-    Transformer Engine drops ``cu_seqlens`` as soon as a mask is non-None, so neither ever reads the
-    dense ``[batch, 1, sequence, sequence]`` tensor that building it costs. A backend from neither
-    vocabulary keeps the dense mask, the representation this collater has always produced for it.
+    Flash attention rebuilds ``cu_seqlens`` from the indexed ``[batch, sequence]`` document map, so it
+    never reads the dense ``[batch, 1, sequence, sequence]`` tensor that building it costs. Every other
+    name -- ``te`` included, since Transformer Engine reads any non-None mask as a padding mask -- keeps
+    the dense mask unless ``consumes_packed_seq_ids`` says the model rebuilds document isolation from
+    ``_packed_seq_ids`` itself, in which case the name is irrelevant (such a model may not even read it).
     The one-document pack below also pins the second half of the contract: whenever the dense mask
     is skipped, the compact map has to reach the model as ``_packed_seq_ids``, because nothing else
     carries document bounds. What the mask *contains* is the collater's own contract and is pinned
     by ``test_collate_fns.py``; this test only decides which representation the collater is asked for.
     """
-    result = build_packed_dataloader(packing_attn_implementation=attn_implementation, cp_size=cp_size)
+    result = build_packed_dataloader(
+        packing_attn_implementation=attn_implementation,
+        cp_size=cp_size,
+        consumes_packed_seq_ids=consumes_packed_seq_ids,
+    )
+    expect_dense = dense and not consumes_packed_seq_ids
     collate_fn = result.dataloader.collate_fn
     assert collate_fn.func is neat_packed_vlm_collater
     assert collate_fn.keywords["attn_implementation"] == attn_implementation
@@ -342,10 +352,10 @@ def test_vlm_dataloader_builds_the_dense_mask_only_for_backends_that_read_it(
     }
     batch = collate_fn([pack])
 
-    assert batch["attention_mask"].shape == ((1, 1, 8, 8) if dense else (1, 8))
+    assert batch["attention_mask"].shape == ((1, 1, 8, 8) if expect_dense else (1, 8))
     # One document is the case that can see this change: a multi-document pack emits
     # ``_packed_seq_ids`` on either path, so only here does the key track the representation.
-    assert ("_packed_seq_ids" in batch) is not dense
+    assert ("_packed_seq_ids" in batch) is not expect_dense
 
 
 def test_compact_mask_backends_covers_every_flash_attention_name():

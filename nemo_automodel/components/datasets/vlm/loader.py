@@ -150,17 +150,15 @@ class VlmDataloaderBuild:
     processor: ProcessorMixin | None
 
 
-# Attention backends the packed collater must hand the compact ``[batch, sequence]`` document map
-# instead of a dense block-causal mask, because a dense mask is not a usable input for them: flash
-# attention rebuilds ``cu_seqlens`` from the compact map (``models/common/packing.get_unpad_data``),
-# and Transformer Engine reduces any non-None mask to a padding mask and drops ``cu_seqlens``
-# (``attention/utils.preprocess_args_and_kwargs_for_attn``), so document isolation has to reach it
-# through the model instead. A ``te`` model that does not rebuild its mask from ``_packed_seq_ids``
-# cannot honour the map either way; this set is about which representation a backend can use, not
-# about whether one arrives.
-_COMPACT_MASK_BACKENDS: frozenset[str] = frozenset(
-    {"flash_attention_2", "flash_attention_3", "flash_attention_4", "te"}
-)
+# Attention backends the packed collater hands the compact ``[batch, sequence]`` document map instead
+# of a dense block-causal mask: flash attention rebuilds ``cu_seqlens`` from the compact map through the
+# packing patches (``models/common/packing.get_unpad_data``), so the dense mask would never be read.
+# No other backend name belongs here. Transformer Engine reads any non-None mask as a padding mask and
+# drops ``cu_seqlens`` (``attention/utils.preprocess_args_and_kwargs_for_attn``), and a backend name is
+# not even read by a model whose attention comes from Transformers. A model that rebuilds document
+# isolation from ``_packed_seq_ids`` itself reaches the compact map through the
+# ``consumes_packed_seq_ids`` declaration on ``VlmDataloaderConfig.build`` instead.
+_COMPACT_MASK_BACKENDS: frozenset[str] = frozenset({"flash_attention_2", "flash_attention_3", "flash_attention_4"})
 
 
 @dataclass
@@ -253,6 +251,7 @@ class VlmDataloaderConfig:
         dataset_build_context: AbstractContextManager[object] | None = None,
         get_rope_index: Callable[..., object] | None = None,
         packing_attn_implementation: str | None = None,
+        consumes_packed_seq_ids: bool = False,
         pp_n_microbatches: int | None = None,
         cp_size: int = 1,
     ) -> VlmDataloaderBuild:
@@ -266,6 +265,10 @@ class VlmDataloaderConfig:
             dataset_build_context: Optional rank-ordering context used only for processor and source-dataset build.
             get_rope_index: Optional model callback used to create packed multimodal position IDs.
             packing_attn_implementation: Resolved attention backend for packed-mask construction.
+            consumes_packed_seq_ids: Declaration, read from the live model, that its active text path
+                rebuilds document isolation from ``_packed_seq_ids``. A declared consumer is handed the
+                compact map for NEAT packing at ``cp_size=1`` whatever ``packing_attn_implementation``
+                resolved to; without it only the flash-attention backends skip the dense mask.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
                 compact document IDs instead of a dense quadratic attention mask;
@@ -308,12 +311,18 @@ class VlmDataloaderConfig:
                     max_length=self.packing.collate_max_length,
                 )
             else:
-                materialize_4d_mask = cp_size <= 1 and packing_attn_implementation not in _COMPACT_MASK_BACKENDS
+                materialize_4d_mask = (
+                    cp_size <= 1
+                    and packing_attn_implementation not in _COMPACT_MASK_BACKENDS
+                    and not consumes_packed_seq_ids
+                )
                 if not materialize_4d_mask:
                     logger.info(
                         "Skipping the dense packed VLM attention mask (attn_implementation=%r, "
-                        "cp_size=%d); document boundaries travel as the compact _packed_seq_ids map",
+                        "consumes_packed_seq_ids=%s, cp_size=%d); document boundaries travel as the compact "
+                        "_packed_seq_ids map",
                         packing_attn_implementation,
+                        consumes_packed_seq_ids,
                         cp_size,
                     )
                 collate_fn = partial(

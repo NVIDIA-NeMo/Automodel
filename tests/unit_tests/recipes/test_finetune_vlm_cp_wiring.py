@@ -576,6 +576,26 @@ def test_setup_always_stages_pp_media_under_pp(
     assert dataloader_calls[0]["cp_size"] == cp_size
 
 
+@pytest.mark.parametrize(
+    ("stage0", "expected"),
+    [
+        (SimpleNamespace(consumes_packed_seq_ids=True), True),
+        (SimpleNamespace(consumes_packed_seq_ids=lambda: True), False),
+        (_StageWithoutCPPrepare(), False),
+        (SimpleNamespace(module=SimpleNamespace(consumes_packed_seq_ids=True)), True),
+    ],
+    ids=["declares", "callable-is-not-a-declaration", "silent", "wrapped-declares"],
+)
+def test_setup_hands_the_training_dataloader_the_consumer_declaration(monkeypatch, stage0, expected):
+    """Only an explicit ``True`` on the first model part, unwrapped from a DDP-shaped ``module``, reaches
+    the training ``build``; anything else is passed ``False`` and keeps the dense mask."""
+    dataloader_calls = []
+    _patch_pp_setup_minimals(monkeypatch, cp_size=1, stage0=stage0, dataloader_calls=dataloader_calls)
+    FinetuneRecipeForVLM(_minimal_pp_setup_cfg()).setup()
+
+    assert dataloader_calls[0]["consumes_packed_seq_ids"] is expected
+
+
 # -----------------------------------------------------------------------------
 # val-side wiring (the bug-fix territory)
 # -----------------------------------------------------------------------------

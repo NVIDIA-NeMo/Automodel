@@ -29,19 +29,32 @@ from tests.unit_tests.models.gemma4.test_gemma4_model import _make_gemma4_config
 SEQ_LEN = 6
 
 
-def _tiny_moe_model(attn_implementation: str) -> Gemma4ForConditionalGeneration:
-    """Two-layer MoE Gemma4 -- one sliding, one full attention layer -- in fp32 on CPU."""
+_BACKEND = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", experts="torch", dispatcher="torch")
+
+
+def _tiny_config(attn_implementation: str, **text_overrides):
+    """Two-layer Gemma4 config -- one sliding, one full attention layer -- in fp32.
+
+    Defaults to the MoE variant with the vision mask rule; ``text_overrides`` select the other variants.
+    """
     config = _make_gemma4_config(
-        num_hidden_layers=2,
-        layer_types=["sliding_attention", "full_attention"],
-        sliding_window=2,
-        use_bidirectional_attention="vision",
-        torch_dtype="float32",
+        **{
+            "num_hidden_layers": 2,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 2,
+            "use_bidirectional_attention": "vision",
+            "torch_dtype": "float32",
+            **text_overrides,
+        }
     )
     config._attn_implementation = config.text_config._attn_implementation = attn_implementation
-    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", experts="torch", dispatcher="torch")
+    return config
+
+
+def _tiny_moe_model(attn_implementation: str) -> Gemma4ForConditionalGeneration:
+    """Two-layer MoE Gemma4 -- one sliding, one full attention layer -- in fp32 on CPU."""
     torch.manual_seed(0)
-    model = Gemma4ForConditionalGeneration(config, backend=backend)
+    model = Gemma4ForConditionalGeneration(_tiny_config(attn_implementation), backend=_BACKEND)
     # Expert and router weights are allocated with ``torch.empty``; the production initializer fills them.
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     return model.eval()
@@ -93,3 +106,25 @@ def test_packed_batch_matches_documents_run_alone(attn_implementation, doc_lengt
     reference = torch.cat([_reference_logits(model, doc) for doc in input_ids.split(doc_lengths, dim=1)], dim=1)
 
     torch.testing.assert_close(packed, reference, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("attn_implementation", "text_overrides", "expected"),
+    [
+        ("eager", {}, True),
+        ("sdpa", {}, True),
+        ("flex_attention", {}, False),
+        ("eager", {"use_bidirectional_attention": None}, False),
+        ("eager", {"enable_moe_block": False}, False),
+    ],
+    ids=["moe-vision-eager", "moe-vision-sdpa", "moe-vision-flex", "moe-causal-only-eager", "dense-vision-eager"],
+)
+def test_consumes_packed_seq_ids_follows_the_active_text_path(attn_implementation, text_overrides, expected):
+    """The declaration that gets this model the compact map must track the path that really rebuilds masks
+    from it: the MoE text backend with the vision mask rule, dispatching through HF eager or SDPA, which the
+    test above gives numerical evidence for. Flex attention has a mask branch but no packed evidence; a
+    causal-only text config never enters that branch and the dense variant delegates to the HF forward, so
+    both would read the compact map as a padding mask."""
+    model = Gemma4ForConditionalGeneration(_tiny_config(attn_implementation, **text_overrides), backend=_BACKEND)
+
+    assert model.consumes_packed_seq_ids is expected

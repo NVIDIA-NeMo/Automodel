@@ -1201,6 +1201,30 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if getattr(self.config, "tie_word_embeddings", getattr(text_config, "tie_word_embeddings", False)):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
+    @property
+    def consumes_packed_seq_ids(self) -> bool:
+        """Whether the active text path rebuilds document isolation from ``_packed_seq_ids`` at ``cp_size=1``.
+
+        The VLM recipe reads this once after construction and passes it to the packed dataloader, which
+        then hands this model the compact document map instead of a dense mask whatever backend name the
+        config carries: ``backend.attn`` is not read by the HF attention this model runs. True only for
+        the path this repository has numerical evidence for: the MoE text backend with the vision mask
+        rule, dispatching through HF eager or SDPA attention, where ``Gemma4MoETextModelBackend.forward``
+        rebuilds the full and sliding masks from the compact map. Every other variant would read the
+        compact map as a padding mask: the dense variant delegates to the HF forward, a causal-only text
+        config never enters the packed-mask branch, and flex attention has a mask branch but no packed
+        evidence. Reads the final text config, so it reflects the resolved dispatch key at setup time;
+        packed context parallelism is gated separately and rewrites the dispatch key itself.
+        """
+        text_model = self.model.language_model
+        text_config = text_model.config
+        return (
+            isinstance(text_model, Gemma4MoETextModelBackend)
+            and bool(getattr(text_config, "enable_moe_block", False))
+            and getattr(text_config, "use_bidirectional_attention", None) == "vision"
+            and getattr(text_config, "_attn_implementation", None) in ("eager", "sdpa")
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
