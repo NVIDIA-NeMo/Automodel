@@ -70,14 +70,10 @@ from torch.distributed.tensor import DTensor, Partial, Shard
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import dequantize_from_fp8
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 from nemo_automodel.components.moe.state_dict_utils import is_dtensor, should_load_expert_for_rank
-
-FP8_BLOCK_SIZE = 32
-ENGRAM_SCALE_BLOCK = 32
 
 _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^vision\.(.+)$"), r"model.vision.\1"),
@@ -288,75 +284,6 @@ def dequantize_checkpoint_weight(
             stride=(global_shape[1], 1),
         )
     return output
-
-
-def infer_fp8_block_size(weight_shape: tuple[int, ...], scale_shape: tuple[int, ...]) -> int:
-    """Return the square block size that maps ``weight_shape`` onto ``scale_shape``."""
-    rows, cols = weight_shape[-2], weight_shape[-1]
-    block_rows, block_cols = scale_shape[-2], scale_shape[-1]
-    for block_size in (FP8_BLOCK_SIZE, 128):
-        if math.ceil(rows / block_size) == block_rows and math.ceil(cols / block_size) == block_cols:
-            return block_size
-    raise ValueError(f"Cannot infer an FP8 block size for weight {tuple(weight_shape)} and scale {tuple(scale_shape)}")
-
-
-def dequantize_fp8_blocks(
-    weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype, name: str = ""
-) -> torch.Tensor:
-    """Decode square-block FP8, with bounded scratch for the released V4.1 layout.
-
-    Args:
-        weight: FP8 tensor of shape [rows, columns], optionally a DTensor with
-            expert or inner matrix sharding as supported by the shared adapter.
-        scale: Tensor of shape [ceil(rows / block), ceil(columns / block)],
-            where block is 32 for released V4.1 or 128 for legacy V4 weights.
-            DTensor scales must cover the corresponding weight shard.
-        dtype: Dequantized floating-point dtype.
-        name: Checkpoint tensor name used by the legacy V3 decoder.
-
-    Returns:
-        Independent tensor of shape [rows, columns], preserving the input
-        DTensor global shape, mesh and placements. The released 32x32 path
-        bounds FP32 intermediates through ``dequantize_checkpoint_weight``.
-    """
-    block_size = infer_fp8_block_size(tuple(weight.shape), tuple(scale.shape))
-    if block_size == FP8_BLOCK_SIZE:
-        return dequantize_checkpoint_weight(weight, scale, dtype=dtype)
-    # Use the same dtype conversion as the released 32x32 decoder: E8M0
-    # byte 0 is 2**-127, and byte 255 represents NaN.
-    scale_f32 = (scale.to_local() if is_dtensor(scale) else scale).float()
-    if is_dtensor(weight) or is_dtensor(scale):
-        # Let the shared V3 helper handle DTensor slicing of the scale grid.
-        return dequantize_from_fp8(weight, scale_f32, dtype=dtype, BLOCK_SIZE=block_size, name=name)
-    rows, cols = weight.shape
-    pad_rows, pad_cols = (-rows) % block_size, (-cols) % block_size
-    w = weight.float()
-    if pad_rows or pad_cols:
-        w = torch.nn.functional.pad(w, (0, pad_cols, 0, pad_rows))
-    block_rows, block_cols = w.shape[0] // block_size, w.shape[1] // block_size
-    w.view(block_rows, block_size, block_cols, block_size).mul_(
-        scale_f32.to(w.device).view(block_rows, 1, block_cols, 1)
-    )
-    return w[:rows, :cols].to(dtype)
-
-
-def dequantize_engram_table(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Dequantize per-row / 32-column Engram scales on each row owner.
-
-    Args:
-        weight: FP8 tensor of shape [rows, channels], optionally a DTensor
-            with placement Shard(0) and uneven local shape [local_rows, channels].
-        scale: Scale tensor of shape [rows, channels / 32], with the same row
-            ownership as weight. Channels must be divisible by 32.
-        dtype: Output floating-point dtype.
-
-    Returns:
-        Independent tensor of shape [rows, channels], preserving the weight's
-        global shape, device and row ownership, including empty local shards.
-    """
-    if weight.shape[1] % ENGRAM_SCALE_BLOCK:
-        raise ValueError(f"Engram channels must be divisible by {ENGRAM_SCALE_BLOCK}, got {weight.shape[1]}")
-    return dequantize_checkpoint_weight(weight, scale, dtype=dtype, rowwise=True)
 
 
 class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
