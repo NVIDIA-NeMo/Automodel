@@ -66,7 +66,6 @@ from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41RotaryEmbedding,
     DeepseekV41SharedState,
     build_window_topk_indices,
-    make_identity_pre_mix,
 )
 from nemo_automodel.components.models.deepseek_v41.processing import (
     IMAGE,
@@ -179,8 +178,9 @@ class DeepseekV41Model(nn.Module):
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
         position_embeddings_compress = self.rotary_emb_compress(inputs_embeds, position_ids)
 
-        h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
-        pre_mix = make_identity_pre_mix(h, self.config.hc_mult)
+        h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+        pre_mix = torch.zeros(*input_ids.shape, self.config.hc_mult, device=device, dtype=torch.float32)
+        pre_mix[..., 0] = 1
         state = DeepseekV41SharedState(window_topk_idxs=build_window_topk_indices(seq_ids, self.config.sliding_window))
         moe_padding_mask = padding_mask.to(device) if padding_mask is not None else None
 
