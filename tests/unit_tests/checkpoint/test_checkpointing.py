@@ -28,7 +28,9 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 import yaml
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -47,6 +49,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     SaveConsolidatedMode,
+    _collect_global_tensor_sizes,
     _divide_keys_by_size,
     _ensure_dirs,
     _ensure_shared_dirs,
@@ -625,6 +628,205 @@ def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path
     assert dtype_mapping is None
     assert "No original HF safetensors reference path found for config-only/model" in caplog.text
     assert "2 output shard(s)" in caplog.text
+
+
+def _run_consolidated_index_pp_worker(rank: int, init_file: str, checkpoint_dir: str) -> None:
+    """Every stage must derive the expected global mapping using only its local tensors."""
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        checkpointer = CheckpointingConfig(checkpoint_dir=checkpoint_dir, save_consolidated=False).build(
+            dp_rank=0, tp_rank=0, pp_rank=rank, pp_group=torch.distributed.group.WORLD
+        )
+        keys = [f"layers.{index}.weight" for index in range(4)]
+        # For size fallback, each 4-GiB logical tensor needs its own shard; meta avoids allocating the payload.
+        state_dict = {
+            key: torch.empty(4 * 1024**3, dtype=torch.uint8, device="meta") for key in keys[rank * 2 : rank * 2 + 2]
+        }
+        cases = [
+            ("fully_pruned_index", {"language_model.weight": 1}, True, [1, 2, 3, 4]),
+            ("missing_reference", None, True, [1, 2, 3, 4]),
+            ("partial_index_no_global_keys", {"layers.0.weight": 2, "unused.weight": 1}, False, [2, 2, 2, 2]),
+            ("missing_reference_no_global_keys", None, False, [1, 2, 3, 4]),
+        ]
+        for case, source_mapping, has_global_keys, expected_indices in cases:
+            model = SimpleNamespace(_pre_shard_hf_state_dict_keys=keys if has_global_keys else None)
+            model_state = SimpleNamespace(model=[model])
+            with (
+                patch(
+                    "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                    return_value=checkpoint_dir if source_mapping is not None else None,
+                ),
+                patch(
+                    "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                    return_value=source_mapping,
+                ),
+            ):
+                mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+            # Spawn propagates assertion failures from either rank, including the failing case name.
+            assert mapping == dict(zip(keys, expected_indices)), case
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.run_only_on("CPU")
+def test_consolidated_index_agrees_across_pp_ranks(tmp_path):
+    """Exercise all source-index fallbacks in one process group, including absent global key metadata."""
+    torch.multiprocessing.spawn(
+        _run_consolidated_index_pp_worker,
+        args=(str(tmp_path / "dist_init"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_fully_pruned_original_index_does_not_readd_excluded_tied_lm_head(tmp_path):
+    """Rebuilding a parent index must not restore an explicitly excluded tied-weight alias."""
+    state_dict = {"embed_tokens.weight": torch.empty(1), "lm_head.weight": torch.empty(1)}
+    model_state = SimpleNamespace(
+        model=[SimpleNamespace(_pre_shard_hf_state_dict_keys=list(state_dict))],
+        has_local_tied_lm_head=True,
+        lm_head_param_name="lm_head.weight",
+    )
+    checkpointer = CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False).build(
+        dp_rank=0, tp_rank=0, pp_rank=0
+    )
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(tmp_path),
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+            return_value={"language_model.embed_tokens.weight": 1},
+        ),
+    ):
+        assert checkpointer._maybe_build_consolidated_index(model_state, state_dict) == {"embed_tokens.weight": 1}
+
+
+@pytest.mark.parametrize("has_global_keys", [True, False])
+def test_extracted_model_export_reloads_all_tensors_from_size_bounded_shards(tmp_path, monkeypatch, has_global_keys):
+    """A real parent index with different prefixes produces complete, reloadable output shards."""
+    model = torch.nn.Sequential(*(torch.nn.Linear(4, 4, dtype=torch.float32) for _ in range(3)))
+    expected = {key: tensor.clone() for key, tensor in model.state_dict().items()}
+    model._pre_shard_hf_state_dict_keys = list(expected) if has_global_keys else None
+    source = tmp_path / "source"
+    source.mkdir()
+    parent_state = {f"language_model.{key}": tensor for key, tensor in expected.items()}
+    source_filename = "model-00001-of-00001.safetensors"
+    save_file(parent_state, str(source / source_filename))
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(parent_state, source_filename)})
+    )
+    checkpointer = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_repo_id=str(source),
+        save_consolidated=True,
+        is_peft=False,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+    # One FP32 [4, 4] weight and [4] bias exactly fill an 80-byte payload shard.
+    monkeypatch.setattr(
+        "nemo_automodel.components.checkpoint.checkpointing._DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES", 80
+    )
+
+    checkpointer.save_model(model, str(tmp_path / "checkpoint"))
+
+    output = tmp_path / "checkpoint" / "model" / "consolidated"
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    weight_map = index["weight_map"]
+    assert set(weight_map) == set(expected)
+    assert len(set(weight_map.values())) == 3
+    assert {path.name for path in output.glob("*.safetensors")} == set(weight_map.values())
+    restored = {}
+    for filename in set(weight_map.values()):
+        tensors = load_file(str(output / filename))
+        assert set(tensors) == {key for key, mapped_file in weight_map.items() if mapped_file == filename}
+        assert not set(restored).intersection(tensors)
+        assert sum(tensor.numel() * tensor.element_size() for tensor in tensors.values()) == 80
+        restored.update(tensors)
+
+    reloaded = torch.nn.Sequential(*(torch.nn.Linear(4, 4, dtype=torch.float32) for _ in range(3)))
+    reloaded.load_state_dict(restored, strict=True)
+    for key, tensor in reloaded.state_dict().items():
+        assert restored[key].dtype == expected[key].dtype
+        torch.testing.assert_close(tensor, expected[key], rtol=0, atol=0, check_dtype=True)
+
+
+def test_collect_global_tensor_sizes_rejects_missing_rank_metadata():
+    """An incomplete collective result must fail explicitly instead of dropping a stage."""
+    group = object()
+
+    def omit_remote_mapping(gathered, local_sizes, group):
+        gathered[0] = local_sizes
+
+    with (
+        patch("torch.distributed.is_available", return_value=True),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.all_gather_object", side_effect=omit_remote_mapping),
+        pytest.raises(RuntimeError, match="Pipeline rank 1 did not provide tensor sizes for consolidated export"),
+    ):
+        _collect_global_tensor_sizes({"weight": torch.empty(2)}, group)
+
+
+def _run_logical_tensor_sizes_worker(rank: int, world_size: int, init_file: str) -> None:
+    """Exercise logical sizes, duplicate keys, empty stages, and conflicts over real Gloo collectives."""
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        group = torch.distributed.group.WORLD
+        mesh = DeviceMesh("cpu", list(range(world_size)))
+        state_dict = {
+            "row_shard": distribute_tensor(torch.arange(15, dtype=torch.float32).reshape(5, 3), mesh, [Shard(0)]),
+            "column_shard": distribute_tensor(torch.arange(15, dtype=torch.float64).reshape(3, 5), mesh, [Shard(1)]),
+            "replicated": distribute_tensor(torch.arange(15, dtype=torch.float16).reshape(5, 3), mesh, [Replicate()]),
+        }
+        assert {key: tensor.to_local().numel() * tensor.element_size() for key, tensor in state_dict.items()} == {
+            "row_shard": 36 if rank == 0 else 24,
+            "column_shard": 72 if rank == 0 else 48,
+            "replicated": 30,
+        }
+        expected_sizes = {"row_shard": 60, "column_shard": 120, "replicated": 30}
+        assert _collect_global_tensor_sizes(state_dict, None) == expected_sizes
+        global_sizes = _collect_global_tensor_sizes(state_dict, group)
+        assert global_sizes == expected_sizes
+        assert _divide_keys_by_size(list(state_dict), state_dict, 70, key_size_mapping=global_sizes) == {
+            "row_shard": 1,
+            "column_shard": 2,
+            "replicated": 3,
+        }
+        # An empty stage must still participate and receive the other stage's metadata.
+        assert _collect_global_tensor_sizes({} if rank else state_dict, group) == expected_sizes
+        # Matching element counts are insufficient: the saved dtype also determines the byte size.
+        for conflicting_tensor in (
+            torch.empty(3 if rank else 2, dtype=torch.float32),
+            torch.empty(2, dtype=torch.float64 if rank else torch.float32),
+        ):
+            with pytest.raises(ValueError, match="Conflicting logical sizes for 'weight' across pipeline ranks"):
+                _collect_global_tensor_sizes({"weight": conflicting_tensor}, group)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.run_only_on("CPU")
+def test_collect_global_tensor_sizes_with_real_dtensors_and_conflicting_pp_metadata(tmp_path):
+    """Uneven local storage cannot change shard assignments; incompatible metadata fails on both ranks."""
+    torch.multiprocessing.spawn(
+        _run_logical_tensor_sizes_worker,
+        args=(2, str(tmp_path / "dist_init")),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_normalize_dtype_mapping_to_state_dict_keys_uses_hf_base_model_prefix():

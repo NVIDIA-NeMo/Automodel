@@ -73,6 +73,13 @@ if [[ -n "$MEDIA_EXTRA" ]]; then
     uv pip install ".[$MEDIA_EXTRA]"
 fi
 
+# Report only failures and errors (-rfE), not every passing test (-rA). Because
+# we already run with -s and log_cli=true, each passing test's captured log is
+# streamed live as it runs, which makes the -rA "PASSES" section a verbatim
+# duplicate of output the log already contains. On the CPU unit-test suite that
+# duplicate measured 128s of the job's 900s budget -- on its own enough to push
+# the job past its timeout and into two full retries. Failure tracebacks are
+# controlled by --tb, so they are unaffected.
 coverage run \
     -m pytest \
     --durations 32 \
@@ -80,7 +87,7 @@ coverage run \
     "${TEST_DIRS[@]}" \
     -o log_cli=true \
     -o log_cli_level=INFO \
-    -vs -m "not pleasefixme" --tb=short -ra \
+    -vs -m "not pleasefixme" --tb=short -rfE \
     $SHARD_ARGS \
     $ADDITIONAL_ARGS
 coverage combine -q

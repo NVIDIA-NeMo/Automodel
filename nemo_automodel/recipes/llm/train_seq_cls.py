@@ -20,7 +20,12 @@ import time
 from contextlib import nullcontext
 
 import torch
-import wandb
+
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -405,7 +410,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main or log_data is None:
             return
 
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
@@ -442,7 +447,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         # Log to remote services (WandB) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
         # JSONL training log (always log for detailed local records)
