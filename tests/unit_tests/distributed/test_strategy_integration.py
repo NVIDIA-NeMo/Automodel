@@ -145,7 +145,7 @@ def test_backward_compatibility_standard_model(
 
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
-@patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+@patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
 @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
 def test_backward_compatibility_nemotron_model(mock_parallelize_module, mock_fully_shard, mock_gpgr, mock_device_mesh):
     """Test that the refactored code maintains backward compatibility for NemotronH models."""
@@ -206,10 +206,6 @@ def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
         patch("torch.distributed.get_process_group_ranks", return_value=[0]),
         patch(
             "nemo_automodel.components.distributed.parallelizer.fully_shard", side_effect=lambda model, **kwargs: model
-        ),
-        patch(
-            "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard",
-            side_effect=lambda model, **kwargs: model,
         ),
         patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"),
     ):

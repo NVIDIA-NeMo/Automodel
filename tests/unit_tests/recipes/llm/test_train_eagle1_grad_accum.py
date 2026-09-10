@@ -161,6 +161,12 @@ def test_trailing_flush_rescales_gradient_to_full_window_scale(
     module = recipe.trainer_module
 
     captured: list[torch.Tensor] = []
+    sync_calls = []
+    monkeypatch.setattr(
+        train_eagle1,
+        "synchronize_tp_replica_gradients",
+        lambda model_parts, device_mesh: sync_calls.append((model_parts, device_mesh)),
+    )
 
     def _pre_step_hook(optimizer, args, kwargs):
         # Fires right before each optimizer step, after rescaling and clipping,
@@ -174,6 +180,7 @@ def test_trailing_flush_rescales_gradient_to_full_window_scale(
 
     assert recipe.runtime.global_step == expected_steps
     assert len(captured) == expected_steps
+    assert sync_calls == [([module], None)] * expected_steps
     # Four unit-gradient elements have L2 norm 2 before clipping.
     expected_grad = torch.full_like(module.w, min(1.0, max_grad_norm / (2.0 + 1e-6)))
     for grad in captured:

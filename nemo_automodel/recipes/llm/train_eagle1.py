@@ -39,9 +39,9 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
-from nemo_automodel.components.distributed.ddp import fp32_allreduce_hook
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.mesh_utils import get_dp_tp_group, get_flat_mesh
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule, FeatureNoiseConfig
@@ -189,8 +189,8 @@ class TrainEagle1Recipe(BaseRecipe):
             # Tensor parallelism (distributed.tp_size>1) shards the target's
             # linears in place via ``from_pretrained`` below; the draft is small
             # and stays replicated. The flattened "dp" axis excludes "tp", so the
-            # dataloader sampler keys on it to replicate data across TP ranks
-            # (the target wrapper gathers the vocab-sharded
+            # draft DDP group and the dataloader sampler key on it to replicate
+            # across TP ranks (the target wrapper gathers the vocab-sharded
             # logits). EAGLE-1/2 has no context parallelism, so only "dp" matters.
             self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
             target_kwargs.update(
@@ -281,21 +281,30 @@ class TrainEagle1Recipe(BaseRecipe):
             feature_noise_config=_build_feature_noise(float(recipe_cfg.get("feature_noise", 0.1))),
         ).to(self.device)
         if self.dist_env.world_size > 1:
-            # DDP owns initialization and the mean gradient over every draft
-            # replica. The sampler still uses DP only; TP columns share samples.
+            # Restrict the draft's gradient all-reduce to the "dp" sub-axis. With
+            # tensor parallelism the draft is replicated across tp ranks, so a
+            # full-world all-reduce would average duplicate gradients; the dp
+            # group (which excludes tp) reduces only across real data replicas.
+            # Without a mesh (tp_size=1) dp_mesh is None -> full-world DDP,
+            # unchanged.
+            dp_process_group = (
+                self.dp_mesh.get_group()
+                if self.dp_mesh is not None and self.dp_mesh.size() < self.dist_env.world_size
+                else None
+            )
             trainer_module = DistributedDataParallel(
                 trainer_module,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 output_device=self.device.index if self.device.type == "cuda" else None,
-                broadcast_buffers=True,
+                broadcast_buffers=False,
                 find_unused_parameters=False,
-                process_group=get_dp_tp_group(self.device_mesh),
+                process_group=dp_process_group,
             )
-            # Include buffers in DDP's initialization sync, not in every forward.
-            trainer_module.broadcast_buffers = False
-            if self.device_mesh is not None and self.device_mesh["tp"].size() > 1:
-                trainer_module.register_comm_hook(trainer_module.process_group, fp32_allreduce_hook)
         self.trainer_module = trainer_module
+        # DDP broadcasts only inside the DP subgroup. The draft is replicated
+        # across TP, so align those independently initialized copies before the
+        # optimizer captures them and TP replica gradients are averaged.
+        broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
         self._finalize_setup(recipe_cfg=recipe_cfg, target_path=target_path, wandb_name_prefix="eagle1_")
 
@@ -795,6 +804,10 @@ class TrainEagle1Recipe(BaseRecipe):
                     pending_micro_batches += 1
 
                     if pending_micro_batches == self.grad_accumulation_steps:
+                        synchronize_tp_replica_gradients(
+                            [self.trainer_module],
+                            getattr(self, "device_mesh", None),
+                        )
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
@@ -873,8 +886,13 @@ class TrainEagle1Recipe(BaseRecipe):
                 # non-padding / variable-length sampler is ever introduced, revisit
                 # this: a divergent per-rank ``scale`` would desync parameters, and
                 # a rank that lands on ``pending_micro_batches == 0`` would skip the
-                # flush while its peers step, leaving different optimizer states.
+                # flush (and the TP gradient synchronization inside it) while its
+                # peers step, hanging on the mismatched collective.
                 if pending_micro_batches > 0:
+                    synchronize_tp_replica_gradients(
+                        [self.trainer_module],
+                        getattr(self, "device_mesh", None),
+                    )
                     scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                     for p in self.trainer_module.parameters():
                         if p.grad is not None:

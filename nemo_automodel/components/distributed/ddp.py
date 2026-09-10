@@ -35,29 +35,6 @@ from nemo_automodel.components.distributed.parallelizer import (
 logger = logging.getLogger(__name__)
 
 
-def fp32_allreduce_hook(
-    process_group: dist.ProcessGroup, bucket: dist.GradBucket
-) -> torch.futures.Future[torch.Tensor]:
-    """Average a DDP gradient bucket in FP32, retaining its storage dtype.
-
-    Used by BF16 speculative drafts replicated across DP and TP. DDP owns
-    bucketing, accumulation and asynchronous reduction; the hook preserves the
-    FP32 communication contract of the optimizer-boundary TP reduction.
-
-    Args:
-        process_group: DDP's combined DP/TP replica group.
-        bucket: Flat local gradient bucket, identical shape on all group ranks.
-
-    Returns:
-        Future containing the averaged flat gradient in the bucket's input
-        dtype and on the same device. No host synchronization is performed.
-    """
-    gradient = bucket.buffer()
-    buffer = gradient.float().div_(process_group.size())
-    future = dist.all_reduce(buffer, group=process_group, async_op=True).get_future()
-    return future.then(lambda result: result.value()[0].to(dtype=gradient.dtype))
-
-
 class DDPManager:
     """
     Manager for distributed training using PyTorch's DDP.

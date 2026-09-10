@@ -335,24 +335,22 @@ def test_build_target_model_tensor_parallel_path(monkeypatch):
 
 def test_draft_ddp_process_group_no_mesh():
     # tp_size=1 -> no mesh -> default full-world group (None).
-    recipe = _bare_recipe(device_mesh=None, dist_env=SimpleNamespace(world_size=2))
+    recipe = _bare_recipe(dp_mesh=None, dist_env=SimpleNamespace(world_size=2))
     assert recipe._draft_ddp_process_group() is None
 
 
-def test_draft_ddp_process_group_uses_combined_replica_owner(monkeypatch):
-    mesh = object()
-    recipe = _bare_recipe(device_mesh=mesh, dist_env=SimpleNamespace(world_size=2))
-    calls = []
-    monkeypatch.setattr(train_dflash, "get_dp_tp_group", lambda value: calls.append(value))
+def test_draft_ddp_process_group_full_world_when_dp_spans_world():
+    # dp spans the whole world (no tp) -> default full-world group (None).
+    dp_mesh = SimpleNamespace(size=lambda: 2, get_group=lambda: "DP_GROUP")
+    recipe = _bare_recipe(dp_mesh=dp_mesh, dist_env=SimpleNamespace(world_size=2))
     assert recipe._draft_ddp_process_group() is None
-    assert calls == [mesh]
 
 
-def test_draft_ddp_process_group_preserves_cp_subgroup(monkeypatch):
-    recipe = _bare_recipe(device_mesh=object(), dist_env=SimpleNamespace(world_size=4))
-    group = object()
-    monkeypatch.setattr(train_dflash, "get_dp_tp_group", lambda mesh: group)
-    assert recipe._draft_ddp_process_group() is group
+def test_draft_ddp_process_group_restricts_to_dp_axis():
+    # dp smaller than world (tp>1) -> reduce only over the dp sub-group.
+    dp_mesh = SimpleNamespace(size=lambda: 1, get_group=lambda: "DP_GROUP")
+    recipe = _bare_recipe(dp_mesh=dp_mesh, dist_env=SimpleNamespace(world_size=2))
+    assert recipe._draft_ddp_process_group() == "DP_GROUP"
 
 
 def test_build_checkpointer_keys_dp_rank_on_dp_mesh(monkeypatch, tmp_path):

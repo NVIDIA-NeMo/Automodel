@@ -30,16 +30,14 @@ _MAX_FLAT_BUFFER_BYTES = 256 * 1024 * 1024
 
 def mark_tp_replica_gradient_reduction(
     module: torch.nn.Module,
-    reduction: Literal["mean", "sum", "none"],
+    reduction: Literal["mean", "sum"],
 ) -> None:
     """Mark direct parameters of a module with their TP-replica reduction semantic.
 
     Args:
         module: Module whose direct parameters are replicated across TP ranks.
         reduction: ``"mean"`` for redundant full computation or ``"sum"`` for
-            disjoint partial contributions; "none" when the distributed owner
-            already reduces gradients. Unlike subtree exclusion, "none"
-            preserves the one-time parameter/buffer broadcast.
+            disjoint partial contributions.
     """
     setattr(module, _TP_REPLICA_GRAD_REDUCTION_ATTR, reduction)
 
@@ -120,15 +118,15 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
 
 def _iter_unique_parameters(
     model_parts: list[torch.nn.Module],
-) -> Iterator[tuple[torch.nn.Parameter, Literal["mean", "sum", "none"]]]:
+) -> Iterator[tuple[torch.nn.Parameter, Literal["mean", "sum"]]]:
     """Yield unmarked parameters once with their module reduction semantic."""
-    seen: dict[int, Literal["mean", "sum", "none"]] = {}
+    seen: dict[int, Literal["mean", "sum"]] = {}
     for model_part in model_parts:
         for module in model_part.modules():
             reduction = getattr(module, _TP_REPLICA_GRAD_REDUCTION_ATTR, "mean")
             if reduction == "skip":
                 continue
-            if reduction not in ("mean", "sum", "none"):
+            if reduction not in ("mean", "sum"):
                 raise ValueError(f"Unsupported TP replica gradient reduction: {reduction!r}")
             for parameter in module.parameters(recurse=False):
                 if getattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, None) is not None:
@@ -148,7 +146,7 @@ def _iter_unique_parameters(
 
 def _iter_unique_parameters_by_name(
     model_parts: list[torch.nn.Module],
-) -> Iterator[tuple[torch.nn.Parameter, Literal["mean", "sum", "none"]]]:
+) -> Iterator[tuple[torch.nn.Parameter, Literal["mean", "sum"]]]:
     """Yield parameters once in rank-stable fully qualified name order."""
     parameter_names: dict[int, tuple[int, str]] = {}
     for part_index, model_part in enumerate(model_parts):
@@ -297,9 +295,7 @@ def synchronize_tp_replica_gradients(
     reduced through rank-local storage while retaining their global shape and
     placements. Model-owned shards and parameters or gradients sharded or partial
     on the TP axis are untouched. Low-precision gradients are reduced in FP32 and
-    cast back to their storage dtype after synchronization. Modules marked
-    "none" already have a distributed gradient owner and are excluded before
-    any gradient metadata or data collective.
+    cast back to their storage dtype after synchronization.
 
     Args:
         model_parts: Local pipeline-stage modules whose gradients have arbitrary
@@ -325,7 +321,7 @@ def synchronize_tp_replica_gradients(
     placement_cache: dict[tuple[int, tuple[object, ...]], bool] = {}
     replicated_parameters = []
     for parameter, reduction in _iter_unique_parameters_by_name(model_parts):
-        if not parameter.requires_grad or reduction == "none":
+        if not parameter.requires_grad:
             continue
         if isinstance(parameter, DTensor):
             cache_key = (id(parameter.device_mesh), tuple(parameter.placements))

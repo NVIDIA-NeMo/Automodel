@@ -21,10 +21,8 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import OffloadPolicy
 from torch.distributed.tensor.parallel import ColwiseParallel
 
 from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
@@ -45,7 +43,6 @@ from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
     get_parallelization_strategy,
 )
-from nemo_automodel.components.models.nemotron_v3 import parallelization as nemotron_parallelization
 
 
 class MockModel(nn.Module):
@@ -115,11 +112,9 @@ class MockNemotronHModel(nn.Module):
                 layer.mixer = nn.Module()
                 layer.mixer.up_proj = nn.Linear(10, 10)
                 layer.mixer.down_proj = nn.Linear(10, 10)
-                layer.norm = nn.LayerNorm(10)
                 return layer
 
         self.backbone = MockBackbone()
-        self.lm_head = nn.Linear(10, 10)
         self.__class__.__name__ = "NemotronHForCausalLM"
 
     def forward(self, x):
@@ -180,7 +175,6 @@ def mock_device_mesh():
     """Create a mock device mesh for testing."""
     mesh = MagicMock(spec=DeviceMesh)
     mesh.device_type = "cuda"
-    mesh.mesh = torch.arange(4).reshape(1, 2, 2)
 
     # Mock submeshes
     dp_replicate_mesh = MagicMock()
@@ -568,12 +562,6 @@ class TestDefaultParallelizationStrategy:
 class TestNemotronHParallelizationStrategy:
     """Test the NemotronHParallelizationStrategy class."""
 
-    @pytest.fixture(autouse=True)
-    def replica_mesh(self, monkeypatch):
-        result = MagicMock(spec=DeviceMesh)
-        monkeypatch.setattr(nemotron_parallelization, "DeviceMesh", lambda *args, **kwargs: result)
-        return result
-
     @pytest.fixture
     def strategy(self):
         """Create a NemotronHParallelizationStrategy instance."""
@@ -588,58 +576,6 @@ class TestNemotronHParallelizationStrategy:
         """Test that NemotronHParallelizationStrategy can be instantiated."""
         assert isinstance(strategy, NemotronHParallelizationStrategy)
         assert isinstance(strategy, ParallelizationStrategy)
-
-    @pytest.mark.parametrize("feature", ["tp4", "cp", "pp", "dp_replicate", "moe", "mtp", "tied", "offload", "native"])
-    def test_unvalidated_compositions_keep_existing_ownership(
-        self, feature, mock_device_mesh, nemotron_model, monkeypatch
-    ):
-        mesh, dp_replicate_mesh, dp_mesh, tp_mesh = mock_device_mesh
-        tp_mesh.size.return_value = 2
-        meshes = {"tp": tp_mesh, "dp_replicate": dp_replicate_mesh}
-        offload_policy = None
-        if feature == "tp4":
-            tp_mesh.size.return_value = 4
-        elif feature in ("cp", "pp", "dp_replicate"):
-            axis = MagicMock()
-            axis.size.return_value = 2
-            meshes[feature] = axis
-            mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", feature, "tp")
-        elif feature == "moe":
-            nemotron_model.config.n_routed_experts = 4
-        elif feature == "mtp":
-            nemotron_model.mtp = nn.Linear(10, 10)
-        elif feature == "tied":
-            nemotron_model.config.tie_word_embeddings = True
-        elif feature == "offload":
-            offload_policy = OffloadPolicy()
-        else:
-            nemotron_model.model = nemotron_model.backbone
-            del nemotron_model.backbone
-        mesh.__getitem__.side_effect = meshes.__getitem__
-        monkeypatch.setattr(nemotron_parallelization, "get_fsdp_dp_mesh", lambda *args: dp_mesh)
-        layers = [nn.Linear(10, 10)]
-        with (
-            patch.object(nemotron_parallelization, "fully_shard", side_effect=lambda model, **kwargs: model) as shard,
-            patch.object(nemotron_parallelization.parallelizer_utils, "fully_shard_by_dtype") as shard_layer,
-            patch.object(nemotron_parallelization, "mark_tp_replica_gradient_reduction") as mark_owner,
-        ):
-            result = nemotron_parallelization.fully_shard_nemotronh(
-                nemotron_model,
-                layers,
-                device_mesh=mesh,
-                mp_policy=None,
-                offload_policy=offload_policy,
-                reshard_after_forward=True,
-                dp_replicate_mesh_name="dp_replicate",
-                dp_shard_cp_mesh_name="dp_shard_cp",
-                tp_mesh_name="tp",
-            )
-        assert result is nemotron_model
-        assert shard.call_count == shard_layer.call_count == 1
-        assert shard.call_args.kwargs["mesh"] is dp_mesh
-        assert shard_layer.call_args.kwargs["mesh"] is dp_mesh
-        assert shard_layer.call_args.kwargs["reshard_after_forward"] is True
-        mark_owner.assert_not_called()
 
     @pytest.mark.parametrize("mtp_enabled", [True, False])
     def test_configures_only_enabled_mtp_attention_and_mamba_for_cp(
@@ -713,7 +649,7 @@ class TestNemotronHParallelizationStrategy:
         cp_stream = object()
         monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", get_cp_ranks)
         monkeypatch.setattr(parallelizer_mod.torch.cuda, "Stream", lambda: cp_stream)
-        monkeypatch.setattr(nemotron_parallelization, "fully_shard", lambda model, **_kwargs: model)
+        monkeypatch.setattr(parallelizer_mod, "fully_shard", lambda model, **_kwargs: model)
         monkeypatch.setattr(
             parallelizer_mod.parallelizer_utils,
             "fully_shard_by_dtype",
@@ -847,7 +783,7 @@ class TestNemotronHParallelizationStrategy:
                 sequence_parallel=True,
             )
 
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
     def test_custom_tp_plan_not_supported(
         self,
@@ -883,7 +819,7 @@ class TestNemotronHParallelizationStrategy:
 
     @pytest.mark.parametrize("tp_size", [1, 2])
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
     def test_nemotron_specific_parallelization(
         self,
@@ -918,12 +854,10 @@ class TestNemotronHParallelizationStrategy:
             assert mock_parallelize_module.call_count == expected_calls
 
         # Should call fully_shard for each layer and the root model regardless of TP size
-        expected_fully_shard_calls = len(nemotron_model.backbone.layers) + 1
-        if tp_size > 1:
-            expected_fully_shard_calls += len(nemotron_model.backbone.layers) + 1  # Norms and lm_head
+        expected_fully_shard_calls = len(nemotron_model.backbone.layers) + 1  # +1 for root
         assert fully_shard_by_dtype.call_count + fully_shard.call_count == expected_fully_shard_calls
 
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
     def test_threads_reshard_after_forward_to_layer_sharding(
         self,
@@ -949,7 +883,7 @@ class TestNemotronHParallelizationStrategy:
             assert call_args.kwargs["reshard_after_forward"] is True
 
     @patch("nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper")
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     def test_activation_checkpointing(
@@ -1352,7 +1286,7 @@ class TestFsdp2StrategyParallelizeIntegration:
 
         with patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"):
             with patch(
-                "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard",
+                "nemo_automodel.components.distributed.parallelizer.fully_shard",
                 side_effect=lambda model, **kwargs: model,
             ):
                 model = MockNemotronHModel()
