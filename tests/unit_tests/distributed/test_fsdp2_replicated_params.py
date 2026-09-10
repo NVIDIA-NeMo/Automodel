@@ -19,6 +19,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.distributed.fsdp2_extensions.replicated import (
     make_fully_shard_with_replicated_parameter_grad_sync,
+    replicated_parameters,
     select_small_fp32_parameters,
 )
 
@@ -35,23 +36,13 @@ class _SensitiveModel(nn.Module):
 def test_select_small_fp32_parameters_uses_per_managed_module_byte_limit():
     model = _SensitiveModel()
 
-    selection = select_small_fp32_parameters(
-        model,
-        name_fragments=("_fp32_params",),
-        max_bytes_per_module=32,
-    )
-    assert selection.parameters == (model._fp32_params.A_log, model._fp32_params.dt_bias)
-    assert selection.replicated_bytes == 32
-    assert selection.oversized_modules == ()
+    selections = select_small_fp32_parameters(model, name_fragments=("_fp32_params",), max_bytes_per_module=32)
+    assert replicated_parameters(selections) == (model._fp32_params.A_log, model._fp32_params.dt_bias)
+    assert [(s.name, s.logical_bytes, s.sharded_reason) for s in selections] == [("_fp32_params", 32, None)]
 
-    selection = select_small_fp32_parameters(
-        model,
-        name_fragments=("_fp32_params",),
-        max_bytes_per_module=31,
-    )
-    assert selection.parameters == ()
-    assert selection.replicated_bytes == 0
-    assert [(module.name, module.logical_bytes) for module in selection.oversized_modules] == [("_fp32_params", 32)]
+    selections = select_small_fp32_parameters(model, name_fragments=("_fp32_params",), max_bytes_per_module=31)
+    assert replicated_parameters(selections) == ()
+    assert [(s.name, s.logical_bytes, s.sharded_reason) for s in selections] == [("_fp32_params", 32, "size_limit")]
 
 
 def test_select_small_fp32_parameters_applies_limit_independently():
@@ -62,28 +53,21 @@ def test_select_small_fp32_parameters_applies_limit_independently():
             self.large_fp32_params = nn.Linear(5, 2, bias=False, dtype=torch.float32)  # 40 bytes
 
     model = MultipleManagedModules()
-    selection = select_small_fp32_parameters(
-        model,
-        name_fragments=("_fp32_params",),
-        max_bytes_per_module=32,
-    )
+    selections = select_small_fp32_parameters(model, name_fragments=("_fp32_params",), max_bytes_per_module=32)
 
-    assert selection.parameters == (model.small_fp32_params.weight,)
-    assert selection.replicated_bytes == 32
-    assert [(module.name, module.logical_bytes) for module in selection.oversized_modules] == [
-        ("large_fp32_params", 40)
+    assert replicated_parameters(selections) == (model.small_fp32_params.weight,)
+    assert [(s.name, s.logical_bytes, s.sharded_reason) for s in selections] == [
+        ("small_fp32_params", 32, None),
+        ("large_fp32_params", 40, "size_limit"),
     ]
 
 
 def test_select_small_fp32_parameters_keeps_lower_precision_residency_sharded():
     model = _SensitiveModel(dtype=torch.bfloat16)
-    selection = select_small_fp32_parameters(model, name_fragments=("_fp32_params",))
+    selections = select_small_fp32_parameters(model, name_fragments=("_fp32_params",))
 
-    assert selection.parameters == ()
-    assert selection.oversized_modules == ()
-    assert [(module.name, module.sharded_reason) for module in selection.modules] == [
-        ("_fp32_params", "non_fp32_residency")
-    ]
+    assert replicated_parameters(selections) == ()
+    assert [(s.name, s.sharded_reason) for s in selections] == [("_fp32_params", "non_fp32_residency")]
 
 
 def test_replicated_grad_sync_reduces_across_both_hsdp_mesh_dimensions(monkeypatch):

@@ -40,6 +40,7 @@ from nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype import
 )
 from nemo_automodel.components.distributed.fsdp2_extensions.replicated import (
     make_fully_shard_with_replicated_parameter_grad_sync,
+    replicated_parameters,
     select_small_fp32_parameters,
 )
 from nemo_automodel.components.optim.optimizer import AdamWConfig, FusedAdamConfig
@@ -194,12 +195,13 @@ def _run_scenario(
     reference = _Root(reference_layer) if scenario.root_boundary else reference_layer
     model = _Root(layer) if scenario.root_boundary else layer
 
-    selection = select_small_fp32_parameters(
-        model,
-        name_fragments=("_fp32_params",),
-        max_bytes_per_module=scenario.replication_limit,
+    replicated_params = replicated_parameters(
+        select_small_fp32_parameters(
+            model,
+            name_fragments=("_fp32_params",),
+            max_bytes_per_module=scenario.replication_limit,
+        )
     )
-    replicated_params = selection.parameters
     fully_shard_fn = fully_shard
     if replicated_params:
         fully_shard_fn = make_fully_shard_with_replicated_parameter_grad_sync(

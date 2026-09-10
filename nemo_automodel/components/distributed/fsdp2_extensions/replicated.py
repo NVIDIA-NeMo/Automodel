@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import wraps
 from typing import Callable, Literal
@@ -45,39 +46,23 @@ class ManagedModuleSelection:
         parameters: Parameter tensors of arbitrary shape. DTensors retain their
             global shape, device mesh, and placements.
         logical_bytes: Total bytes over global parameter shapes.
-        replicated: Whether the parameters remain outside FSDP ownership.
-        sharded_reason: Reason a managed module retained sharded ownership.
+        sharded_reason: Why the module keeps sharded FSDP ownership, or ``None``
+            when its parameters stay replicated outside every FSDP unit.
     """
 
     name: str
     parameters: tuple[nn.Parameter, ...]
     logical_bytes: int
-    replicated: bool
     sharded_reason: _ShardedReason | None = None
 
-
-@dataclass(frozen=True)
-class ReplicatedParameterSelection:
-    """Model-wide result of independent per-managed-module decisions.
-
-    Attributes:
-        modules: Decisions containing parameter tensors of arbitrary shape for
-            every explicitly managed module.
-    """
-
-    modules: tuple[ManagedModuleSelection, ...]
-
     @property
-    def parameters(self) -> tuple[nn.Parameter, ...]:
-        return tuple(parameter for module in self.modules if module.replicated for parameter in module.parameters)
+    def replicated(self) -> bool:
+        return self.sharded_reason is None
 
-    @property
-    def replicated_bytes(self) -> int:
-        return sum(module.logical_bytes for module in self.modules if module.replicated)
 
-    @property
-    def oversized_modules(self) -> tuple[ManagedModuleSelection, ...]:
-        return tuple(module for module in self.modules if module.sharded_reason == "size_limit")
+def replicated_parameters(selections: Iterable[ManagedModuleSelection]) -> tuple[nn.Parameter, ...]:
+    """Return the parameter tensors of every replicated selection, in selection order."""
+    return tuple(parameter for selection in selections if selection.replicated for parameter in selection.parameters)
 
 
 def select_small_fp32_parameters(
@@ -85,7 +70,7 @@ def select_small_fp32_parameters(
     *,
     name_fragments: tuple[str, ...],
     max_bytes_per_module: int = DEFAULT_MAX_REPLICATED_PARAM_BYTES_PER_MODULE,
-) -> ReplicatedParameterSelection:
+) -> tuple[ManagedModuleSelection, ...]:
     """Select FP32 parameters using an independent limit per managed module.
 
     A managed module is a maximal named submodule whose qualified name matches
@@ -100,7 +85,8 @@ def select_small_fp32_parameters(
         max_bytes_per_module: Maximum logical bytes allowed for each managed module.
 
     Returns:
-        Per-module selection decisions and the flattened eligible parameter tensors.
+        One decision per managed module in ``named_modules`` order. Use
+        :func:`replicated_parameters` for the flattened eligible parameter tensors;
         DTensors preserve global shapes, meshes, and placements.
 
     Raises:
@@ -128,22 +114,13 @@ def select_small_fp32_parameters(
         resident_fp32 = all(
             not parameter.dtype.is_floating_point or parameter.dtype is torch.float32 for parameter in parameters
         )
-        replicated = resident_fp32 and logical_bytes <= max_bytes_per_module
-        sharded_reason = None
+        sharded_reason: _ShardedReason | None = None
         if not resident_fp32:
             sharded_reason = "non_fp32_residency"
-        elif not replicated:
+        elif logical_bytes > max_bytes_per_module:
             sharded_reason = "size_limit"
-        decisions.append(
-            ManagedModuleSelection(
-                name=module_name,
-                parameters=parameters,
-                logical_bytes=logical_bytes,
-                replicated=replicated,
-                sharded_reason=sharded_reason,
-            )
-        )
-    return ReplicatedParameterSelection(tuple(decisions))
+        decisions.append(ManagedModuleSelection(module_name, parameters, logical_bytes, sharded_reason))
+    return tuple(decisions)
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:

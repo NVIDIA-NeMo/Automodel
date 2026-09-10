@@ -24,6 +24,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionP
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
+    compiled_autograd_active,
     patch_fsdp_accumulated_grad_bucketing,
     patch_fsdp_uniform_reduce_dtype,
 )
@@ -33,43 +34,9 @@ from nemo_automodel.components.distributed.fsdp2_extensions.utils import (
 )
 
 _ComputeDtypeMetadata = tuple[torch.dtype, torch.Size, tuple[int, ...]]
-
-
-def _compiled_autograd_is_enabled() -> bool:
-    import torch._dynamo.compiled_autograd as compiled_autograd
-
-    return bool(
-        compiled_autograd.compiled_autograd_enabled
-        or compiled_autograd.compiled_autograd_enabled_force_eager
-        or compiled_autograd.in_compiled_autograd_region
-    )
-
-
-def _fsdp_shard_mesh_size(mesh: DeviceMesh) -> int:
-    """Return the dimension that shards parameters for FSDP or HSDP."""
-    return mesh.size() if mesh.ndim == 1 else mesh.shape[-1]
-
-
-def _parameters_owned_by_candidate_unit(
-    module: nn.Module,
-    ignored_params: set[nn.Parameter],
-) -> tuple[nn.Parameter, ...]:
-    """Return parameters not already owned by child FSDP units or another policy.
-
-    Args:
-        module: Candidate FSDP unit containing parameter tensors of arbitrary shape.
-        ignored_params: Parameter tensors of arbitrary shape whose ownership is
-            already established outside ``module``.
-
-    Returns:
-        Parameter tensors of arbitrary shape that the candidate unit would own.
-        DTensors retain their existing global shape, device mesh, and placements.
-    """
-    excluded_ids = {id(parameter) for parameter in ignored_params}
-    for child in module.modules():
-        if child is not module and isinstance(child, FSDPModule):
-            excluded_ids.update(id(parameter) for parameter in child.parameters())
-    return tuple(parameter for parameter in module.parameters() if id(parameter) not in excluded_ids)
+# ``(owning module, local parameter name) -> (parameter, compute dtype)`` for
+# every parameter one candidate FSDP unit would own.
+_ComputeDtypePlan = dict[tuple[nn.Module, str], tuple[nn.Parameter, torch.dtype]]
 
 
 def _child_fsdp_parameters(module: nn.Module) -> set[nn.Parameter]:
@@ -82,59 +49,84 @@ def _child_fsdp_parameters(module: nn.Module) -> set[nn.Parameter]:
     }
 
 
-def _supports_per_param_compute_dtype_extension(
+def _plan_per_param_compute_dtypes(
     module: nn.Module,
     *,
     fp32_compute_module_names: tuple[str, ...],
-    mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy | None,
-    offload_policy: OffloadPolicy | None,
     ignored_params: set[nn.Parameter],
-) -> bool:
-    """Return whether one candidate unit can use the optimized tensor extension.
+) -> _ComputeDtypePlan:
+    """Resolve the compute dtype of every parameter ``module`` would own as one FSDP unit.
 
     Args:
         module: Candidate FSDP unit containing parameter tensors of arbitrary shape.
         fp32_compute_module_names: Name fragments selecting parameters that must
             materialize in FP32 compute.
-        mesh: FSDP or HSDP mesh. HSDP shards on the last mesh dimension.
         mp_policy: Default parameter-compute and gradient-reduction dtypes.
-        offload_policy: Optional FSDP parameter offload policy.
         ignored_params: Parameter tensors of arbitrary shape owned outside the
-            candidate unit. DTensors retain their global shapes and placements.
+            candidate unit, including those of nested FSDP units. DTensors retain
+            their global shapes and placements.
 
     Returns:
-        ``True`` only when every resident floating parameter is FP32 and each
-        overridden tensor's rank-local dim 0 shards evenly over the FSDP shard mesh.
+        Mapping from ``(owner, name)`` to the owned parameter and its compute dtype.
     """
-    if isinstance(offload_policy, CPUOffloadPolicy) or _compiled_autograd_is_enabled():
-        return False
-
-    parameters = _parameters_owned_by_candidate_unit(module, ignored_params)
-    floating_parameters = tuple(parameter for parameter in parameters if parameter.dtype.is_floating_point)
-    if not floating_parameters or any(parameter.dtype is not torch.float32 for parameter in floating_parameters):
-        return False
-
+    ignored_param_ids = {id(parameter) for parameter in ignored_params}
     compute_dtype_of = make_parameter_compute_dtype_resolver(
         module,
         mp_policy,
         fp32_compute_module_names,
         ignored_params=ignored_params,
     )
-    policy_dtype = getattr(mp_policy, "param_dtype", None)
-    overrides = tuple(
-        parameter
-        for parameter in floating_parameters
-        if compute_dtype_of(parameter) is not (policy_dtype or parameter.dtype)
-    )
-    if not overrides:
-        return False
+    return {
+        (owner, name): (parameter, compute_dtype_of(parameter))
+        for owner in module.modules()
+        for name, parameter in owner.named_parameters(recurse=False)
+        if id(parameter) not in ignored_param_ids
+    }
 
-    shard_size = _fsdp_shard_mesh_size(mesh)
-    local_overrides = tuple(
-        parameter.to_local() if isinstance(parameter, DTensor) else parameter for parameter in overrides
-    )
-    return all(parameter.ndim > 0 and parameter.shape[0] % shard_size == 0 for parameter in local_overrides)
+
+def _overrides_unit_policy(
+    resident_dtype: torch.dtype,
+    compute_dtype: torch.dtype,
+    mp_policy: MixedPrecisionPolicy | None,
+) -> bool:
+    """Return whether a floating parameter computes in a dtype other than the unit's default."""
+    default_dtype = getattr(mp_policy, "param_dtype", None) or resident_dtype
+    return resident_dtype.is_floating_point and compute_dtype is not default_dtype
+
+
+def _supports_per_param_compute_dtype_extension(
+    plan: _ComputeDtypePlan,
+    *,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None,
+) -> bool:
+    """Return whether one candidate unit can use the optimized tensor extension.
+
+    Args:
+        plan: Per-parameter compute dtypes from :func:`_plan_per_param_compute_dtypes`.
+        mesh: FSDP or HSDP mesh. HSDP shards on the last mesh dimension.
+        mp_policy: Default parameter-compute and gradient-reduction dtypes.
+        offload_policy: Optional FSDP parameter offload policy.
+
+    Returns:
+        ``True`` only when every resident floating parameter is FP32, at least one
+        parameter overrides the unit policy, and each overriding tensor's rank-local
+        dim 0 shards evenly over the FSDP shard mesh.
+    """
+    if isinstance(offload_policy, CPUOffloadPolicy) or compiled_autograd_active():
+        return False
+    floating = [parameter for parameter, _ in plan.values() if parameter.dtype.is_floating_point]
+    if not floating or any(parameter.dtype is not torch.float32 for parameter in floating):
+        return False
+    overrides = [
+        parameter.to_local() if isinstance(parameter, DTensor) else parameter
+        for parameter, compute_dtype in plan.values()
+        if _overrides_unit_policy(parameter.dtype, compute_dtype, mp_policy)
+    ]
+    shard_size = mesh.shape[-1]
+    return bool(overrides) and all(local.ndim > 0 and local.shape[0] % shard_size == 0 for local in overrides)
 
 
 def _fsdp_pre_all_gather_in_compute_dtype(
@@ -219,26 +211,22 @@ def _fsdp_post_all_gather_in_compute_dtype(
 
 def _install_per_param_compute_dtypes(
     module: nn.Module,
-    compute_dtype_by_owner: dict[tuple[int, str], torch.dtype],
-    policy_dtype: torch.dtype | None,
+    compute_dtypes: dict[tuple[nn.Module, str], torch.dtype],
+    mp_policy: MixedPrecisionPolicy | None,
 ) -> int:
-    """Install FSDP tensor extensions on parameters overriding the unit policy."""
-    if _compiled_autograd_is_enabled():
-        raise NotImplementedError("per-parameter FSDP compute casting is incompatible with compiled autograd")
+    """Install FSDP tensor extensions on the unit's parameters that override the unit policy."""
     get_fsdp_state = getattr(module, "_get_fsdp_state", None)
     if get_fsdp_state is None:
         raise RuntimeError("per-parameter FSDP compute casting requires a PyTorch FSDPModule")
-    fsdp_state = get_fsdp_state()
-    param_group = getattr(fsdp_state, "_fsdp_param_group", None)
+    param_group = getattr(get_fsdp_state(), "_fsdp_param_group", None)
     if param_group is None:
         return 0
 
     installed = 0
     for fsdp_param in param_group.fsdp_params:
         module_info = fsdp_param._module_info
-        compute_dtype = compute_dtype_by_owner[(id(module_info.module), module_info.param_name)]
-        default_dtype = policy_dtype or fsdp_param.sharded_param.dtype
-        if compute_dtype is default_dtype:
+        compute_dtype = compute_dtypes[(module_info.module, module_info.param_name)]
+        if not _overrides_unit_policy(fsdp_param.sharded_param.dtype, compute_dtype, mp_policy):
             continue
         local_tensor = fsdp_param._sharded_local_tensor
         local_tensor._compute_dtype = compute_dtype
@@ -247,6 +235,35 @@ def _install_per_param_compute_dtypes(
         fsdp_param._init_extensions()
         installed += 1
     return installed
+
+
+def _fully_shard_with_plan(
+    module: nn.Module,
+    plan: _ComputeDtypePlan,
+    *,
+    mp_policy: MixedPrecisionPolicy | None,
+    ignored_params: set[nn.Parameter],
+    fully_shard_fn: Callable[..., nn.Module],
+    **fully_shard_kwargs,
+) -> nn.Module:
+    """Establish one FSDP unit for ``module`` and install the planned per-parameter extensions.
+
+    ``fully_shard_kwargs`` (mesh, offload and reshard policies) pass straight to
+    ``fully_shard_fn``. The extensions live on the sharded local tensors, which
+    checkpoint loading may replace, so they are reinstalled from a
+    ``load_state_dict`` post-hook.
+    """
+    compute_dtypes = {key: compute_dtype for key, (_, compute_dtype) in plan.items()}
+    wrapped = fully_shard_fn(module, mp_policy=mp_policy, ignored_params=ignored_params or None, **fully_shard_kwargs)
+
+    def install_extensions(*_args) -> None:
+        if _install_per_param_compute_dtypes(module, compute_dtypes, mp_policy):
+            patch_fsdp_accumulated_grad_bucketing()
+            patch_fsdp_uniform_reduce_dtype()
+
+    install_extensions()
+    module.register_load_state_dict_post_hook(install_extensions)
+    return wrapped
 
 
 def fully_shard_with_per_param_compute_dtypes(
@@ -282,49 +299,40 @@ def fully_shard_with_per_param_compute_dtypes(
 
     Returns:
         The FSDP-wrapped ``module`` returned by ``fully_shard_fn``.
+
+    Raises:
+        NotImplementedError: Under CPU offload or compiled autograd, which the
+            per-tensor extension does not support.
+        ValueError: If a resident floating parameter the unit would own is not FP32.
     """
     if isinstance(offload_policy, CPUOffloadPolicy):
         raise NotImplementedError("per-parameter FSDP compute casting does not support CPU offload")
+    if compiled_autograd_active():
+        raise NotImplementedError("per-parameter FSDP compute casting is incompatible with compiled autograd")
 
     ignored_params = set(ignored_params or ()) | _child_fsdp_parameters(module)
-    ignored_param_ids = {id(parameter) for parameter in ignored_params}
-    compute_dtype_of = make_parameter_compute_dtype_resolver(
+    plan = _plan_per_param_compute_dtypes(
         module,
-        mp_policy,
-        fp32_compute_module_names,
+        fp32_compute_module_names=fp32_compute_module_names,
+        mp_policy=mp_policy,
         ignored_params=ignored_params,
     )
-    compute_dtype_by_owner: dict[tuple[int, str], torch.dtype] = {}
-    for owner in module.modules():
-        for name, parameter in owner.named_parameters(recurse=False):
-            if id(parameter) in ignored_param_ids:
-                continue
-            if parameter.dtype.is_floating_point and parameter.dtype is not torch.float32:
-                raise ValueError(
-                    "per-parameter FSDP compute casting requires FP32 resident/master weights; "
-                    f"{type(owner).__name__}.{name} is {parameter.dtype}"
-                )
-            compute_dtype_by_owner[(id(owner), name)] = compute_dtype_of(parameter)
-
-    wrapped = fully_shard_fn(
+    for (owner, name), (parameter, _) in plan.items():
+        if parameter.dtype.is_floating_point and parameter.dtype is not torch.float32:
+            raise ValueError(
+                "per-parameter FSDP compute casting requires FP32 resident/master weights; "
+                f"{type(owner).__name__}.{name} is {parameter.dtype}"
+            )
+    return _fully_shard_with_plan(
         module,
+        plan,
         mesh=mesh,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
         reshard_after_forward=reshard_after_forward,
-        ignored_params=ignored_params or None,
+        ignored_params=ignored_params,
+        fully_shard_fn=fully_shard_fn,
     )
-    policy_dtype = getattr(mp_policy, "param_dtype", None)
-
-    def install_extensions(*_args) -> None:
-        installed = _install_per_param_compute_dtypes(module, compute_dtype_by_owner, policy_dtype)
-        if installed:
-            patch_fsdp_accumulated_grad_bucketing()
-            patch_fsdp_uniform_reduce_dtype()
-
-    install_extensions()
-    module.register_load_state_dict_post_hook(install_extensions)
-    return wrapped
 
 
 def fully_shard_with_compute_dtype_fallback(
@@ -364,22 +372,21 @@ def fully_shard_with_compute_dtype_fallback(
     # either the per-tensor extension or dtype-grouped compatibility path.
     patch_fsdp_accumulated_grad_bucketing()
     ignored_params = set(ignored_params or ()) | _child_fsdp_parameters(module)
-    if _supports_per_param_compute_dtype_extension(
+    plan = _plan_per_param_compute_dtypes(
         module,
         fp32_compute_module_names=fp32_compute_module_names,
-        mesh=mesh,
         mp_policy=mp_policy,
-        offload_policy=offload_policy,
         ignored_params=ignored_params,
-    ):
-        return fully_shard_with_per_param_compute_dtypes(
+    )
+    if _supports_per_param_compute_dtype_extension(plan, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy):
+        return _fully_shard_with_plan(
             module,
-            fp32_compute_module_names=fp32_compute_module_names,
+            plan,
             mesh=mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             reshard_after_forward=reshard_after_forward,
-            ignored_params=ignored_params or None,
+            ignored_params=ignored_params,
             fully_shard_fn=fully_shard_fn,
         )
 

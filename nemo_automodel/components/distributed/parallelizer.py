@@ -82,8 +82,8 @@ from nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype import
 )
 from nemo_automodel.components.distributed.fsdp2_extensions.replicated import (
     DEFAULT_MAX_REPLICATED_PARAM_BYTES_PER_MODULE,
-    ReplicatedParameterSelection,
     make_fully_shard_with_replicated_parameter_grad_sync,
+    replicated_parameters,
     select_small_fp32_parameters,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
@@ -252,6 +252,11 @@ def _apply_bagel_full_layer_activation_checkpointing(model: nn.Module) -> bool:
 
     logger.info("Applied BAGEL full-layer activation checkpointing to %d layers", wrapped_count)
     return wrapped_count > 0
+
+
+def _default_mp_policy(output_dtype: torch.dtype = torch.float32) -> MixedPrecisionPolicy:
+    """Return the default FSDP2 policy: BF16 compute with FP32 gradient reduction."""
+    return MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=output_dtype)
 
 
 class ParallelizationStrategy(ABC):
@@ -516,13 +521,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 ", ".join(frozen_multimodal_modules),
             )
 
-        # Set up mixed precision policy
-        if not mp_policy:
-            mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
-            )
+        mp_policy = mp_policy or _default_mp_policy()
 
         # Install this only when NeMo actually enters FSDP2 sharding.
         _patch_fsdp_accumulated_grad_guard()
@@ -738,23 +737,20 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
             "max_replicated_fp32_param_bytes_per_module",
             DEFAULT_MAX_REPLICATED_PARAM_BYTES_PER_MODULE,
         )
-        requested_mp_policy = kwargs.get("mp_policy")
-        requested_param_dtype = (
-            torch.bfloat16 if requested_mp_policy is None else getattr(requested_mp_policy, "param_dtype", None)
-        )
-        replicated_selection = (
+        mp_policy = kwargs.get("mp_policy") or _default_mp_policy()
+        kwargs["mp_policy"] = mp_policy
+        # With FP32 compute the holders need no special ownership, so replication
+        # is only considered when the bulk computes below FP32.
+        selections = (
             select_small_fp32_parameters(
                 model,
                 name_fragments=("_fp32_params",),
                 max_bytes_per_module=max_replicated_bytes,
             )
-            if requested_param_dtype is not None and requested_param_dtype is not torch.float32
-            else ReplicatedParameterSelection(())
+            if mp_policy.param_dtype not in (None, torch.float32)
+            else ()
         )
-        replicated_params = replicated_selection.parameters
-        non_fp32_modules = tuple(
-            module for module in replicated_selection.modules if module.sharded_reason == "non_fp32_residency"
-        )
+        replicated_params = replicated_parameters(selections)
 
         # Replication removes tiny, precision-sensitive parameters from FSDP's
         # materialization path. If the logical set is too large, preserve the
@@ -788,31 +784,30 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
             **kwargs,
         )
 
-        if replicated_params:
-            trainable_count = sum(parameter.requires_grad for parameter in replicated_params)
+        if selections:
+            replicated = [selection for selection in selections if selection.replicated]
+            oversized = [selection for selection in selections if selection.sharded_reason == "size_limit"]
             logger.info(
-                "Replicated %d trainable Qwen3.5 FP32 parameters (%d bytes); gradients use a coalesced FP32 "
-                "all-reduce from FSDP's synchronizing post-backward callback",
-                trainable_count,
-                replicated_selection.replicated_bytes,
-            )
-        if replicated_selection.oversized_modules:
-            logger.info(
-                "Keeping %d Qwen3.5 FP32 managed module(s) sharded because each exceeds the %d-byte limit: %s",
-                len(replicated_selection.oversized_modules),
+                "Qwen3.5 FP32 holders: %d module(s) replicated outside FSDP (%d trainable parameters, %d bytes; "
+                "gradients use one coalesced FP32 all-reduce from FSDP's synchronizing post-backward callback), "
+                "%d kept sharded above the %d-byte limit%s",
+                len(replicated),
+                sum(parameter.requires_grad for parameter in replicated_params),
+                sum(selection.logical_bytes for selection in replicated),
+                len(oversized),
                 max_replicated_bytes,
-                ", ".join(
-                    f"{module.name}={module.logical_bytes} bytes" for module in replicated_selection.oversized_modules
-                ),
+                ": " + ", ".join(f"{selection.name}={selection.logical_bytes} bytes" for selection in oversized)
+                if oversized
+                else "",
             )
-        if non_fp32_modules:
-            logger.warning(
-                "Keeping %d Qwen3.5 precision-sensitive managed module(s) sharded because their resident weights "
-                "are not FP32; dtype-based FSDP fallback preserves their explicit compute policy, but loading these "
-                "weights below FP32 may already have lost precision: %s",
-                len(non_fp32_modules),
-                ", ".join(module.name for module in non_fp32_modules),
-            )
+            non_fp32 = [selection.name for selection in selections if selection.sharded_reason == "non_fp32_residency"]
+            if non_fp32:
+                logger.warning(
+                    "Keeping %d Qwen3.5 precision-sensitive module(s) sharded because their resident weights are not "
+                    "FP32; loading them below FP32 may already have lost precision: %s",
+                    len(non_fp32),
+                    ", ".join(non_fp32),
+                )
 
         # Set CP mesh on CPAwareGatedDeltaNet modules
         if cp_enabled:
@@ -935,13 +930,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
                     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
                 )
 
-        # Mixed precision default like Default strategy
-        if not mp_policy:
-            mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
-            )
+        mp_policy = mp_policy or _default_mp_policy()
 
         if reapply_trainability is not None:
             reapply_trainability(model)
@@ -986,13 +975,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
     ) -> nn.Module:
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
-        # Mixed precision default like Default strategy
-        if not mp_policy:
-            mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32,
-                output_dtype=torch.bfloat16,
-            )
+        mp_policy = mp_policy or _default_mp_policy(output_dtype=torch.bfloat16)
         # Apply activation checkpointing to transformer blocks if requested
         if activation_checkpointing:
             for idx in range(len(model.transformer_blocks)):

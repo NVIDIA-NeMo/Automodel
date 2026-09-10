@@ -177,8 +177,8 @@ def test_uniform_reduce_dtype_widens_mixed_group(monkeypatch):
     assert torch.equal(grads[1], torch.full((2,), 5.0))
 
 
-def test_uniform_reduce_dtype_coalesces_narrow_grads_into_one_bucket(monkeypatch):
-    """Narrow gradients share one conversion allocation while FP32 peers alias."""
+def test_uniform_reduce_dtype_widens_narrow_grads(monkeypatch):
+    """Narrow gradients are widened to the widest float dtype while already-wide peers alias."""
     import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
     import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
 
@@ -198,11 +198,10 @@ def test_uniform_reduce_dtype_coalesces_narrow_grads_into_one_bucket(monkeypatch
         fp32_grad,
         torch.full((5,), 2.0, dtype=torch.bfloat16),
     ]
-    collectives.foreach_reduce(["p0", "p1", "p2"], grads)
+    assert collectives.foreach_reduce(["p0", "p1", "p2"], grads) == "reduced"
 
     assert [grad.dtype for grad in seen] == [torch.float32] * 3
     assert seen[1] is fp32_grad
-    assert seen[0].untyped_storage().data_ptr() == seen[2].untyped_storage().data_ptr()
     torch.testing.assert_close(seen[0], torch.ones((2, 2)))
     torch.testing.assert_close(seen[2], torch.full((5,), 2.0))
 
@@ -959,8 +958,8 @@ def test_per_param_compute_casting_keeps_one_fsdp_owner(monkeypatch):
         fully_shard_calls.append((module, kwargs))
         return module
 
-    def fake_install(module, mapping, policy_dtype):
-        installed_mappings.append((module, mapping, policy_dtype))
+    def fake_install(module, mapping, mp_policy):
+        installed_mappings.append((module, mapping, mp_policy))
         return 1
 
     monkeypatch.setattr(compute_dtype, "_install_per_param_compute_dtypes", fake_install)
@@ -978,10 +977,10 @@ def test_per_param_compute_casting_keeps_one_fsdp_owner(monkeypatch):
     assert result is mixer
     assert len(fully_shard_calls) == 1
     assert len(installed_mappings) == 1
-    _, mapping, policy_dtype = installed_mappings[0]
-    assert mapping[(id(mixer.projection), "weight")] is torch.float16
-    assert mapping[(id(mixer._fp32_params), "A_log")] is torch.float32
-    assert policy_dtype is torch.bfloat16
+    _, mapping, mp_policy = installed_mappings[0]
+    assert mapping[(mixer.projection, "weight")] is torch.float16
+    assert mapping[(mixer._fp32_params, "A_log")] is torch.float32
+    assert mp_policy.param_dtype is torch.bfloat16
     assert reduce_patch_calls == [1]
 
 
@@ -993,13 +992,17 @@ def test_per_param_compute_casting_rejects_compiled_autograd(monkeypatch, active
     """Every PyTorch compiled-autograd execution state must reject the extension."""
     import torch._dynamo.compiled_autograd as compiled_autograd
 
-    import nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype as compute_dtype
-
     for state in ("compiled_autograd_enabled", "compiled_autograd_enabled_force_eager", "in_compiled_autograd_region"):
         monkeypatch.setattr(compiled_autograd, state, state == active_state)
 
     with pytest.raises(NotImplementedError, match="incompatible with compiled autograd"):
-        compute_dtype._install_per_param_compute_dtypes(nn.Module(), {}, torch.bfloat16)
+        fully_shard_with_per_param_compute_dtypes(
+            nn.Linear(4, 4, bias=False),
+            fp32_compute_module_names=(),
+            fully_shard_fn=lambda module, **kwargs: module,
+            mesh=object(),
+            mp_policy=_make_mp_policy(),
+        )
 
 
 def test_per_param_compute_casting_rejects_non_fp32_master():
@@ -1044,8 +1047,8 @@ def _record_compute_dtype_path(
     calls = []
     monkeypatch.setattr(
         compute_dtype,
-        "fully_shard_with_per_param_compute_dtypes",
-        lambda model, **kwargs: calls.append(("single_owner", model)) or model,
+        "_fully_shard_with_plan",
+        lambda model, plan, **kwargs: calls.append(("single_owner", model)) or model,
     )
     monkeypatch.setattr(
         compute_dtype,
@@ -1109,7 +1112,7 @@ def test_compute_dtype_dispatch_falls_back_for_compiled_autograd(monkeypatch):
     import nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype as compute_dtype
 
     layer = _MixedComputeLayer()
-    monkeypatch.setattr(compute_dtype, "_compiled_autograd_is_enabled", lambda: True)
+    monkeypatch.setattr(compute_dtype, "compiled_autograd_active", lambda: True)
 
     calls = _record_compute_dtype_path(monkeypatch, layer, mp_policy=_make_mp_policy())
 

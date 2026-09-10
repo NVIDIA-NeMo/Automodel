@@ -21,6 +21,20 @@ from collections.abc import Iterable
 from typing import Any
 
 
+def compiled_autograd_active() -> bool:
+    """Return whether PyTorch compiled autograd is enabled or currently executing."""
+    try:
+        import torch._dynamo.compiled_autograd as compiled_autograd
+
+        return bool(
+            compiled_autograd.compiled_autograd_enabled
+            or compiled_autograd.compiled_autograd_enabled_force_eager
+            or compiled_autograd.in_compiled_autograd_region
+        )
+    except (ImportError, AttributeError):
+        return False
+
+
 def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
     """Return the float dtype among ``dtypes`` that every other one converts into losslessly.
 
@@ -77,7 +91,6 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
 
     @functools.wraps(original_foreach_reduce)
     def foreach_reduce_uniform_dtype(fsdp_params, unsharded_grads, *args, **kwargs):
-        import torch
         from torch.distributed.tensor import DTensor
 
         # PyTorch 2.13a0's unused-parameter branch can append a DTensor zero
@@ -90,23 +103,9 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
         dtypes = {grad.dtype for grad in unsharded_grads}
         if len(dtypes) > 1 and all(dtype.is_floating_point for dtype in dtypes):
             target = _widest_float_dtype(dtypes)
-            # Convert every narrower gradient through one flat bucket. Calling
-            # ``grad.to(target)`` independently emits one allocation and direct
-            # copy kernel per parameter. Foreach copy can coalesce those casts,
-            # while the same-dtype views still satisfy FSDP's ``chunk_cat``.
-            convert_indices = [index for index, grad in enumerate(unsharded_grads) if grad.dtype is not target]
-            convert_numels = [unsharded_grads[index].numel() for index in convert_indices]
-            conversion_bucket = unsharded_grads[convert_indices[0]].new_empty(sum(convert_numels), dtype=target)
-            conversion_views = tuple(
-                view.view(unsharded_grads[index].shape)
-                for index, view in zip(convert_indices, conversion_bucket.split(convert_numels))
-            )
-            torch._foreach_copy_(
-                conversion_views,
-                [unsharded_grads[index] for index in convert_indices],
-            )
-            for index, view in zip(convert_indices, conversion_views):
-                unsharded_grads[index] = view
+            # Mutate in place: ``foreach_reduce`` frees the gradients by clearing
+            # this list, and that must still release the caller's references.
+            unsharded_grads[:] = [grad if grad.dtype is target else grad.to(target) for grad in unsharded_grads]
         return original_foreach_reduce(fsdp_params, unsharded_grads, *args, **kwargs)
 
     foreach_reduce_uniform_dtype._automodel_uniform_reduce_dtype = True
@@ -155,18 +154,6 @@ def patch_fsdp_accumulated_grad_bucketing() -> None:
     original_post_backward = FSDPParamGroup.post_backward
     if getattr(original_post_backward, "_automodel_bucket_accumulated_grads", False):
         return
-
-    def compiled_autograd_active() -> bool:
-        try:
-            import torch._dynamo.compiled_autograd as compiled_autograd
-
-            return bool(
-                compiled_autograd.compiled_autograd_enabled
-                or compiled_autograd.compiled_autograd_enabled_force_eager
-                or compiled_autograd.in_compiled_autograd_region
-            )
-        except (ImportError, AttributeError):
-            return False
 
     def pending_conversion(fsdp_param) -> Any:
         """Return the gradient awaiting its first ``reduce_dtype`` conversion, else ``None``."""
@@ -314,7 +301,4 @@ def patch_fsdp_accumulated_grad_guard() -> None:
             return None
 
     setattr(guarded, "_nemo_automodel_guarded", True)
-    # Preserve the previous Gemma4 marker name for callers/tests that only need
-    # idempotency and do not care which entry point installed the patch.
-    setattr(guarded, "_gemma4_guarded", True)
     FSDPParam.to_accumulated_grad_if_needed = guarded
