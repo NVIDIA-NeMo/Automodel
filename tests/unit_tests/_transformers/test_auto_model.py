@@ -35,10 +35,12 @@ from nemo_automodel._transformers.auto_model import (
 )
 from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision, instantiate_infrastructure
 from nemo_automodel._transformers.model_init import (
+    _apply_hf_fp32_contract,
     _filter_kwargs_for_init,
     _filter_meta_device_from_init_context,
     _get_hf_meta_device_disabled,
     _get_mixin_wrapped_class,
+    _keep_model_owned_hf_modules_in_fp32,
     _patched_get_init_context,
     no_hf_meta_device,
 )
@@ -1222,6 +1224,163 @@ class TestModelMappingKeyErrorFallback:
         assert fake_model.linear.weight.dtype == torch.bfloat16
         # promote(fp32, bf16) == fp32 -> intrinsically-fp32 checkpoint param survives.
         assert fake_model.norm.weight.dtype == torch.float32
+
+    def test_force_hf_pretrained_preserves_model_owned_fp32_value_when_dtype_inspection_fails(self, tmp_path):
+        """The model-owned FP32 contract protects values during the initial Hugging Face load."""
+        from transformers import PretrainedConfig, PreTrainedModel
+
+        from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
+
+        class TinyConfig(PretrainedConfig):
+            model_type = "force-hf-fp32-contract-test"
+
+        class TinyHFModel(PreTrainedModel):
+            config_class = TinyConfig
+            _keep_in_fp32_modules_strict = ["existing_fp32_state"]
+
+            def __init__(self, config):
+                super().__init__(config)
+                self.router = torch.nn.Linear(2, 2, bias=False)
+                self.router.weight.requires_grad_(False)
+                self.router.register_buffer(
+                    "e_score_correction_bias",
+                    torch.tensor([36.6368637, 37.9461441], dtype=torch.float32),
+                )
+                self.post_init()
+
+        config = TinyConfig()
+        reference_model = TinyHFModel(config)
+        expected_bias = reference_model.router.e_score_correction_bias.detach().clone()
+        reference_model.save_pretrained(tmp_path)
+        previous_contract = TinyHFModel._keep_in_fp32_modules_strict
+
+        cls = self._make_cls({TinyConfig: TinyHFModel})
+        cls._from_pretrained_parent_class = MagicMock(side_effect=TinyHFModel.from_pretrained)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=config),
+            patch(
+                "nemo_automodel._transformers.model_init.ModelRegistry.get_force_hf_fp32_module_names",
+                return_value=("e_score_correction_bias",),
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                side_effect=FileNotFoundError("simulated incomplete cache"),
+            ),
+            patch(
+                "nemo_automodel._transformers.model_init._get_mixin_wrapped_class",
+                return_value=TinyHFModel,
+            ),
+        ):
+            _, model = _init_model(
+                cls,
+                str(tmp_path),
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+
+        actual_bias = model.router.e_score_correction_bias
+        assert actual_bias.dtype == torch.float32
+        assert torch.equal(actual_bias, expected_bias)
+        assert model._keep_in_fp32_modules_strict == {
+            "existing_fp32_state",
+            "e_score_correction_bias",
+        }
+        assert TinyHFModel._keep_in_fp32_modules_strict is previous_contract
+
+    def test_force_hf_fp32_contract_restores_target_class_after_exception(self):
+        class TinyHFModel:
+            _keep_in_fp32_modules_strict = ["existing_fp32_state"]
+
+        previous_contract = TinyHFModel._keep_in_fp32_modules_strict
+
+        with pytest.raises(RuntimeError, match="load failed"):
+            with _apply_hf_fp32_contract(TinyHFModel, ("e_score_correction_bias",)):
+                assert TinyHFModel._keep_in_fp32_modules_strict == {
+                    "existing_fp32_state",
+                    "e_score_correction_bias",
+                }
+                raise RuntimeError("load failed")
+
+        assert TinyHFModel._keep_in_fp32_modules_strict is previous_contract
+
+    def test_force_hf_fp32_contract_applies_to_trust_remote_code_class(self, tmp_path):
+        """The contract reaches the concrete class selected from a remote auto_map."""
+        import json
+
+        from safetensors.torch import save_file
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        (tmp_path / "configuration_tiny.py").write_text(
+            """from transformers import PretrainedConfig
+
+
+class TinyRemoteConfig(PretrainedConfig):
+    model_type = \"tiny_remote_fp32\"
+"""
+        )
+        (tmp_path / "modeling_tiny.py").write_text(
+            """import torch
+from transformers import PreTrainedModel
+
+from .configuration_tiny import TinyRemoteConfig
+
+
+class TinyRemoteForCausalLM(PreTrainedModel):
+    config_class = TinyRemoteConfig
+    _keep_in_fp32_modules_strict = [\"existing_fp32_state\"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.router = torch.nn.Linear(2, 2, bias=False)
+        self.router.register_buffer(
+            \"e_score_correction_bias\",
+            torch.zeros(2, dtype=torch.float32),
+        )
+        self.post_init()
+"""
+        )
+        config_dict = {
+            "architectures": ["NemotronHForCausalLM"],
+            "auto_map": {
+                "AutoConfig": "configuration_tiny.TinyRemoteConfig",
+                "AutoModelForCausalLM": "modeling_tiny.TinyRemoteForCausalLM",
+            },
+            "model_type": "tiny_remote_fp32",
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config_dict))
+
+        expected_bias = torch.tensor([36.6368637, 37.9461441], dtype=torch.float32)
+        save_file(
+            {
+                "router.weight": torch.zeros((2, 2), dtype=torch.float32),
+                "router.e_score_correction_bias": expected_bias,
+            },
+            tmp_path / "model.safetensors",
+            metadata={"format": "pt"},
+        )
+
+        config = AutoConfig.from_pretrained(tmp_path, trust_remote_code=True)
+        with _keep_model_owned_hf_modules_in_fp32(config):
+            model = AutoModelForCausalLM.from_pretrained(
+                tmp_path,
+                config=config,
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+            )
+
+        actual_bias = model.router.e_score_correction_bias
+        assert actual_bias.dtype == torch.float32
+        assert torch.equal(actual_bias, expected_bias)
+        assert model._keep_in_fp32_modules_strict == {
+            "existing_fp32_state",
+            "e_score_correction_bias",
+        }
+        assert type(model).__dict__["_keep_in_fp32_modules_strict"] == ["existing_fp32_state"]
 
     def test_fallback_path_known_config_type(self):
         """Fallback (non-force_hf, no custom model) path: _model_mapping succeeds."""

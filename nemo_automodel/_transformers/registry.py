@@ -340,6 +340,15 @@ MODEL_ARCH_MAPPING = OrderedDict(
     ]
 )
 
+# Optional architecture-owned metadata used by the vanilla-HF loading path.
+# Implementation details live in each model package and are imported lazily.
+FORCE_HF_FP32_CONTRACT_MAPPING: Dict[str, Tuple[str, str]] = {
+    "NemotronHForCausalLM": (
+        "nemo_automodel.components.models.nemotron_v3.fp32_contract",
+        "get_force_hf_fp32_module_names",
+    ),
+}
+
 
 # Custom model_type → config class for models that have auto_map in their
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
@@ -563,6 +572,18 @@ class _ModelRegistry:
     def has_retrieval_model(self, arch_name: str) -> bool:
         """Return ``True`` if *arch_name* is a registered retrieval/encoder architecture."""
         return arch_name in self._retrieval_archs
+
+    def get_force_hf_fp32_module_names(self, config: object) -> tuple[str, ...]:
+        """Resolve an architecture-owned FP32 contract for vanilla-HF loading."""
+        architectures = getattr(config, "architectures", None) or ()
+        for architecture in architectures:
+            registration = FORCE_HF_FP32_CONTRACT_MAPPING.get(architecture)
+            if registration is None:
+                continue
+            module_path, function_name = registration
+            function = getattr(importlib.import_module(module_path), function_name)
+            return tuple(function(config))
+        return ()
 
     def register_retrieval(self, arch_name: str) -> None:
         """Mark *arch_name* as a retrieval/encoder architecture."""
