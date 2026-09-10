@@ -19,10 +19,10 @@ reference inference module tree.  On-disk layout (from the shard headers):
 
 * FP8 E4M3 projections with ``float8_e8m0fnu`` scales over **32x32** blocks
   (``attn.{wq_a,wq_b,wkv,wo_a,wo_b}``, ``attn.indexer.wq_b``,
-  ``ffn.shared_experts.w{1,2,3}``, ``engram.wkv``).  DeepSeek V4 used 128x128
-  fp32 scales, so the block size is inferred from the scale shape here.
+  ``ffn.shared_experts.w{1,2,3}``, ``engram.wkv``). Initialization uses this
+  fixed 32-column layout rather than DeepSeek V4's 128x128 blocks.
 * FP4 E2M1 routed experts packed two per ``int8`` with per-row / 32-column
-  ``e8m0`` scales (same layout as V4-Flash, reused from the V4 adapter).
+  ``e8m0`` scales.
 * Engram tables: FP8 E4M3 ``[rows, 256]`` with per-row / 32-column ``e8m0``
   scales ``[rows, 8]``.
 * BF16 / FP32 for everything else (norms, gate, hyper-connection mixers,
@@ -70,10 +70,7 @@ from torch.distributed.tensor import DTensor, Partial, Shard
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import dequantize_from_fp8
-from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import (
-    DeepSeekV4StateDictAdapter,
-    _ExpertQuantLayout,
-)
+from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
@@ -373,8 +370,9 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
     """Convert released V4.1 layouts and stream directly into prepared model storage.
 
     Floating DCP initialization uses shared MoE views and skips rebuilding
-    experts already written into model storage. Export and quantized layouts
-    retain V4 conversion. Explicit streaming initialization copies one bounded
+    experts already written into model storage. Quantized load targets use the
+    released V4.1 layout; floating export retains V4 projection conversion.
+    Explicit streaming initialization copies one bounded
     quantized chunk at a time, without gathering experts or Engram owner rows.
     """
 
@@ -759,15 +757,9 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
                     raise ValueError(f"Quantized weight {key} is missing its scale tensor {scale_key}")
                 continue
             scale = state_dict.pop(scale_key)
-            if (
-                self._is_expert_weight_key(key)
-                and self._expert_quant_layout_from_tensors(weight, scale) is _ExpertQuantLayout.FP4
-            ):
-                state_dict[key] = dequantize_checkpoint_weight(weight, scale, dtype=self.dtype)
-            elif _ENGRAM_EMBED_PATTERN.match(key):
-                state_dict[key] = dequantize_engram_table(weight, scale, self.dtype)
-            else:
-                state_dict[key] = dequantize_fp8_blocks(weight, scale, self.dtype, name=key)
+            state_dict[key] = dequantize_checkpoint_weight(
+                weight, scale, dtype=self.dtype, rowwise=_ENGRAM_EMBED_PATTERN.match(key) is not None
+            )
         return state_dict
 
     # ------------------------------------------------------------------
@@ -782,46 +774,76 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
         return any(pattern.match(hf_key) for pattern in _FP8_ON_DISK_PATTERNS)
 
     @staticmethod
-    def _fp8_block_scale_placeholder(value: Any) -> torch.Tensor:
-        rows, cols = value.shape[-2], value.shape[-1]
-        shape = (math.ceil(rows / FP8_BLOCK_SIZE), math.ceil(cols / FP8_BLOCK_SIZE))
-        device = value.to_local().device if is_dtensor(value) else value.device
-        return torch.empty(shape, dtype=torch.float8_e8m0fnu, device=device)
-
-    @staticmethod
-    def _engram_placeholders(value: Any) -> tuple[Any, Any]:
-        """Allocate released-layout placeholders with explicit uneven shapes.
+    def _quantized_load_targets(key: str, value: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+        """Allocate rank-local destinations matching the original quantized dump.
 
         Args:
-            value: Table of global shape [rows, channels], optionally a DTensor
-                with placement Shard(0) and local shape [local_rows, channels].
+            key: Released checkpoint matrix name.
+            value: Dequantized matrix [rows, columns], possibly a DTensor. Row
+                scales retain row sharding; FP4 column shards must start and
+                end on 32-column block boundaries.
 
         Returns:
-            Independent FP8 weights [rows, channels] and E8M0 scales
-            [rows, channels / 32], preserving the input's row ownership.
+            Packed INT8 [rows, columns / 2] or FP8 [rows, columns] weight and
+            E8M0 scales. Dense FP8 scales cover the small global 32x32 grid;
+            expert/Engram scales [rows, columns / 32] are owner-local DTensors.
+            Buffers are uninitialized and must only be passed to DCP loading.
         """
-        local = value.to_local() if is_dtensor(value) else value
-        rows, dim = local.shape
-        packed = torch.empty(rows, dim, dtype=torch.float8_e4m3fn, device=local.device)
-        scale = torch.empty(rows, dim // ENGRAM_SCALE_BLOCK, dtype=torch.float8_e8m0fnu, device=local.device)
-        if is_dtensor(value):
-            return (
-                DTensor.from_local(packed, value.device_mesh, value.placements, shape=value.shape, stride=(dim, 1)),
-                DTensor.from_local(
-                    scale,
+        expert = re.fullmatch(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight", key) is not None
+        rowwise = expert or ".engram.embed." in key
+        local = value.to_local() if isinstance(value, DTensor) else value
+        if local.ndim != 2:
+            raise ValueError(f"Quantized checkpoint matrix {key} must be two-dimensional")
+        offsets = _local_offsets(value) if isinstance(value, DTensor) else (0, 0)
+        if rowwise and (value.shape[1] % 32 or local.shape[1] % 32 or offsets[1] % 32):
+            raise ValueError(f"Rowwise checkpoint matrix {key} requires 32-column-aligned shards")
+        divisor = 2 if expert else 1
+        local_weight = torch.empty(
+            (local.shape[0], local.shape[1] // divisor),
+            dtype=torch.int8 if expert else torch.float8_e4m3fn,
+            device=local.device,
+        )
+        shape = (value.shape[0], value.shape[1] // divisor)
+        if isinstance(value, DTensor):
+            weight = DTensor.from_local(
+                local_weight,
+                value.device_mesh,
+                value.placements,
+                shape=torch.Size(shape),
+                stride=(shape[1], 1),
+            )
+        else:
+            weight = local_weight
+        if rowwise:
+            local_scale = torch.empty(
+                (local.shape[0], local.shape[1] // 32), dtype=torch.float8_e8m0fnu, device=local.device
+            )
+            if isinstance(value, DTensor):
+                shape = (value.shape[0], value.shape[1] // 32)
+                scale = DTensor.from_local(
+                    local_scale,
                     value.device_mesh,
                     value.placements,
-                    shape=torch.Size((value.shape[0], dim // ENGRAM_SCALE_BLOCK)),
-                    stride=(dim // ENGRAM_SCALE_BLOCK, 1),
-                ),
+                    shape=torch.Size(shape),
+                    stride=(shape[1], 1),
+                )
+            else:
+                scale = local_scale
+        else:
+            scale = torch.empty(
+                ((value.shape[0] + 31) // 32, (value.shape[1] + 31) // 32),
+                dtype=torch.float8_e8m0fnu,
+                device=local.device,
             )
-        return packed, scale
+        return [(key, weight), (key.removesuffix(".weight") + ".scale", scale)]
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert one internal tensor to HF keys, optionally emitting on-disk quantized placeholders.
 
         With ``quantization=True`` the placeholders mirror the released layout so
         DCP can validate shapes / dtypes before the adapter dequantizes on load.
+        These uninitialized targets require ``for_checkpoint_load=True``;
+        trained weights must be exported without quantization.
 
         Args:
             fqn: Internal parameter name.
@@ -839,6 +861,10 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
             views alias input storage; quantized placeholders are independent.
         """
         quantization = kwargs.get("quantization", False)
+        if quantization and not kwargs.get("for_checkpoint_load", False):
+            raise ValueError(
+                "Quantization targets are for checkpoint loading only; export trained weights without quantization"
+            )
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
         result = self._split_merged_expert(
@@ -860,25 +886,12 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
 
         quantized: list[tuple[str, Any]] = []
         for key, value in result:
-            if not key.endswith(".weight"):
-                quantized.append((key, value))
-                continue
-            base = key[: -len(".weight")]
-            if self._is_expert_weight_key(key):
-                if self._checkpoint_expert_quant_layout() is _ExpertQuantLayout.FP4:
-                    packed, scale = self._build_fp4_expert_placeholders(value)
-                else:
-                    packed = self._fp8_cast(value)
-                    scale = self._fp8_block_scale_placeholder(value)
-                quantized.append((key, packed))
-                quantized.append((base + ".scale", scale))
-            elif _ENGRAM_EMBED_PATTERN.match(key):
-                packed, scale = self._engram_placeholders(value)
-                quantized.append((key, packed))
-                quantized.append((base + ".scale", scale))
-            elif self._is_fp8_on_disk(key):
-                quantized.append((key, self._fp8_cast(value)))
-                quantized.append((base + ".scale", self._fp8_block_scale_placeholder(value)))
+            if (
+                re.fullmatch(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight", key)
+                or _ENGRAM_EMBED_PATTERN.match(key)
+                or self._is_fp8_on_disk(key)
+            ):
+                quantized.extend(self._quantized_load_targets(key, value))
             else:
                 quantized.append((key, value))
         return quantized
@@ -950,13 +963,3 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
             and value.dtype == torch.float32
             and self._keep_hf_key(_internal_key_to_hf(key))
         }
-
-    @classmethod
-    def _fp8_cast(cls, value: Any) -> Any:
-        """Create FP8 storage while retaining the global layout of uneven shards."""
-        if is_dtensor(value):
-            local = cls._empty_or_cast_fp8(value.to_local())
-            return DTensor.from_local(
-                local, value.device_mesh, value.placements, shape=value.shape, stride=value.stride()
-            )
-        return cls._empty_or_cast_fp8(value)
