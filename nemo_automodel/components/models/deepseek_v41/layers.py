@@ -39,6 +39,7 @@ The model shares their tensors while isolating assignments during recomputation.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -52,8 +53,6 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4FP32Parameter,
     DeepseekV4GroupedLinear,
     DeepseekV4HyperConnection,
-    DeepseekV4RotaryEmbedding,
-    _apply_partial_rope,
     _compressed_window_metadata,
     _dsv4_kernel_backend,
     _dsv4_sinkhorn_backend,
@@ -93,13 +92,93 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-class DeepseekV41RotaryEmbedding(DeepseekV4RotaryEmbedding):
-    """V4 rotary embedding that accepts both ``rope_type`` and ``type`` YaRN keys."""
+class DeepseekV41RotaryEmbedding(nn.Module):
+    """Construct reference FP32 phases from scalar settings after any model cast."""
 
-    def __init__(self, *args, rope_scaling: dict | None = None, **kwargs):
-        if rope_scaling and "type" not in rope_scaling and "rope_type" in rope_scaling:
-            rope_scaling = {**rope_scaling, "type": rope_scaling["rope_type"]}
-        super().__init__(*args, rope_scaling=rope_scaling, **kwargs)
+    def __init__(
+        self,
+        rope_theta: float,
+        head_dim: int,
+        partial_rotary_factor: float,
+        attention_scaling: float = 1.0,
+        device: torch.device | None = None,
+        rope_scaling: dict | None = None,
+    ) -> None:
+        super().__init__()
+        del device  # Frequencies are constructed on the runtime input device.
+        self.dim = int(head_dim * partial_rotary_factor)
+        self.theta = rope_theta
+        self.attention_scaling = attention_scaling
+        scaling = rope_scaling or {}
+        self.factor = float(scaling.get("factor", 1.0))
+        self.original_length = int(scaling.get("original_max_position_embeddings", 0))
+        self.beta_fast = float(scaling.get("beta_fast", 32))
+        self.beta_slow = float(scaling.get("beta_slow", 1))
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build adjacent-pair rotations while retaining the existing cosine/sine API.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden], supplying the device.
+            position_ids: Integer tensor of shape [batch, sequence], including
+                document-relative positions for packed inputs.
+
+        Returns:
+            FP32 cosine and sine tensors of shape [batch, sequence, rotary_dim].
+            Their second halves repeat the first halves; rotary_dim equals
+            head_dim times partial_rotary_factor. No rounded frequency buffer
+            survives a model dtype conversion.
+        """
+        frequencies = 1.0 / (
+            self.theta ** (torch.arange(0, self.dim, 2, device=x.device, dtype=torch.float32) / self.dim)
+        )
+        if self.original_length > 0:
+            low = max(
+                math.floor(
+                    self.dim
+                    * math.log(self.original_length / (self.beta_fast * 2 * math.pi))
+                    / (2 * math.log(self.theta))
+                ),
+                0,
+            )
+            high = min(
+                math.ceil(
+                    self.dim
+                    * math.log(self.original_length / (self.beta_slow * 2 * math.pi))
+                    / (2 * math.log(self.theta))
+                ),
+                self.dim - 1,
+            )
+            ramp = (
+                (torch.arange(self.dim // 2, device=x.device, dtype=torch.float32) - low) / max(high - low, 1e-3)
+            ).clamp(0, 1)
+            frequencies = frequencies / self.factor * ramp + frequencies * (1 - ramp)
+        angles = position_ids.to(device=x.device, dtype=torch.float32).unsqueeze(-1) * frequencies
+        phases = torch.polar(torch.ones_like(angles), angles) * self.attention_scaling
+        return torch.cat((phases.real, phases.real), -1), torch.cat((phases.imag, phases.imag), -1)
+
+
+def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_head_dim: int) -> torch.Tensor:
+    """Rotate the final channels using the reference's complex multiplication.
+
+    Args:
+        x: Tensor of shape [batch, heads, sequence, channels] or
+            [batch, sequence, channels].
+        cos: FP32 tensor of shape [batch, sequence, rope_head_dim], with unique
+            pair frequencies in its first half.
+        sin: FP32 tensor with the same layout as cos; negate for inverse RoPE.
+        rope_head_dim: Even number of final channels rotated as adjacent pairs.
+
+    Returns:
+        Independent tensor with x's shape and dtype, preserving its other channels.
+    """
+    pairs = torch.view_as_complex(x[..., -rope_head_dim:].float().unflatten(-1, (-1, 2)).contiguous())
+    phases = torch.complex(cos[..., : rope_head_dim // 2], sin[..., : rope_head_dim // 2])
+    if x.ndim == 4:
+        phases = phases.unsqueeze(1)
+    rotated = torch.view_as_real(pairs * phases).flatten(-2).to(x.dtype)
+    return torch.cat((x[..., :-rope_head_dim], rotated), dim=-1)
 
 
 # ---------------------------------------------------------------------------
