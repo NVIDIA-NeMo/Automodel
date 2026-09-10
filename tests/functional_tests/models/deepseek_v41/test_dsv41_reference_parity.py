@@ -336,6 +336,41 @@ def test_logits_match_reference(engram: bool, attn_backend: str):
         layer.register_forward_hook(lambda _m, _i, out: our_streams.append(out[0].detach().float()))
         for layer in model.model.layers.values()
     ]
+    # CSA2 internals: compressed KV / index keys / Top-K selection per source layer.
+    ref_mod = sys.modules["model"]
+    ref_csa: dict[int, dict] = {}
+    our_csa: dict[int, dict] = {}
+    batch, seq_len = tokens.shape
+
+    def _ref_attn_hook(idx):
+        def hook(module, _inputs, _out):
+            if module.compress_ratio:
+                pool = seq_len // module.compress_ratio
+                ref_csa[idx] = dict(
+                    compress_kv=ref_mod.shared_attn.compress_kv[:batch, :pool].detach().float().clone(),
+                    index_k=ref_mod.shared_attn.index_k[:batch, :pool].detach().float().clone(),
+                    topk=ref_mod.shared_attn.topk_idxs.detach().clone(),
+                )
+
+        return hook
+
+    def _our_attn_hook(idx):
+        def hook(module, _args, kwargs, _out):
+            state = kwargs["state"]
+            if module.compress_ratio:
+                our_csa[idx] = dict(
+                    compress_kv=state.compress_kv.detach().float().clone(),
+                    index_k=state.index_k.detach().float().clone(),
+                    topk=state.topk_idxs.detach().clone(),
+                )
+
+        return hook
+
+    hooks += [layer.attn.register_forward_hook(_ref_attn_hook(i)) for i, layer in enumerate(ref_model.layers)]
+    hooks += [
+        layer.self_attn.register_forward_hook(_our_attn_hook(int(i)), with_kwargs=True)
+        for i, layer in model.model.layers.items()
+    ]
     prev_device = torch.get_default_device()
     torch.set_default_device("cuda")
     try:
@@ -347,6 +382,24 @@ def test_logits_match_reference(engram: bool, attn_backend: str):
         logits = model(tokens).logits
     for hook in hooks:
         hook.remove()
+    for idx in sorted(our_csa):
+        ref_c, our_c = ref_csa[idx], our_csa[idx]
+        kv_err = ((ref_c["compress_kv"] - our_c["compress_kv"]).norm() / ref_c["compress_kv"].norm()).item()
+        k_err = ((ref_c["index_k"] - our_c["index_k"]).norm() / ref_c["index_k"].norm()).item()
+        # Reference Top-K entries are offset by the window length (they index the concatenated KV).
+        ref_topk = torch.where(ref_c["topk"] >= 0, ref_c["topk"] - seq_len, ref_c["topk"])
+        our_topk = our_c["topk"]
+        agree = []
+        for b in range(batch):
+            for q in range(seq_len):
+                r = set(ref_topk[b, q].tolist()) - {-1}
+                o = set(our_topk[b, q].tolist()) - {-1}
+                if r or o:
+                    agree.append(len(r & o) / len(r | o))
+        jaccard = sum(agree) / max(len(agree), 1)
+        print(
+            f"  csa2 layer {idx}: compress_kv rel_err={kv_err:.5f} index_k rel_err={k_err:.5f} topk jaccard={jaccard:.3f}"
+        )
     for idx, (ref_h, our_h) in enumerate(zip(ref_streams, our_streams)):
         cos = torch.nn.functional.cosine_similarity(ref_h.flatten(2), our_h.flatten(2), dim=-1)
         rel = ((ref_h - our_h).norm() / ref_h.norm()).item()
