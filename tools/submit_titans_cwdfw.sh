@@ -1,5 +1,5 @@
 #!/bin/bash
-# Submit and optionally monitor the Titans 170M smoke through slurm-cli.
+# Submit Titans 170M cluster gates through slurm-cli.
 
 set -euo pipefail
 
@@ -8,14 +8,38 @@ REMOTE_ROOT=${TITANS_REMOTE_ROOT:-/lustre/fsw/portfolios/coreai/users/ffrujeri/t
 REMOTE_CHECKOUT=$REMOTE_ROOT/automodel
 REMOTE_URL=${TITANS_AUTOMODEL_REMOTE:-https://github.com/NVIDIA-NeMo/Automodel.git}
 BRANCH=${TITANS_AUTOMODEL_BRANCH:-ffrujeri/feat/titans-neural-memory}
-SBATCH_SCRIPT=examples/llm_pretrain/slurm/cwdfw_titans_170m_4k_smoke.sbatch
+MODE=smoke
 WAIT=false
 
-if [[ ${1:-} == "--wait" ]]; then
-  WAIT=true
-elif [[ $# -gt 0 ]]; then
-  echo "usage: $0 [--wait]" >&2
-  exit 2
+for argument in "$@"; do
+  case "$argument" in
+    --pilot)
+      MODE=pilot
+      ;;
+    --wait)
+      WAIT=true
+      ;;
+    *)
+      echo "usage: $0 [--pilot] [--wait]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ $MODE == pilot ]]; then
+  SBATCH_SCRIPT=examples/llm_pretrain/slurm/cwdfw_titans_fineweb_edu_prepare.sbatch
+  JOB_NAME=titans-fineweb-prepare
+  PARTITION=cpu
+  CPUS_PER_TASK=64
+  GPUS=0
+  TIME_LIMIT=4:00:00
+else
+  SBATCH_SCRIPT=examples/llm_pretrain/slurm/cwdfw_titans_170m_4k_smoke.sbatch
+  JOB_NAME=titans-170m-4k-smoke
+  PARTITION=batch
+  CPUS_PER_TASK=128
+  GPUS=8
+  TIME_LIMIT=1:00:00
 fi
 
 for command in slurm-cli git python3; do
@@ -71,24 +95,30 @@ if [[ $SYNC_OK != "True" ]]; then
   exit 1
 fi
 
-LOG_PATH=$REMOTE_ROOT/logs/titans-170m-4k-smoke_%j.out
+LOG_PATH=$REMOTE_ROOT/logs/${JOB_NAME}_%j.out
 JOB_BODY=$(mktemp)
 trap 'rm -f "$JOB_BODY"' EXIT
 awk 'NR == 1 {next} !/^#SBATCH/' "$SBATCH_SCRIPT" >"$JOB_BODY"
 
-echo "Submitting the full-shape 4K smoke"
+echo "Submitting $JOB_NAME"
+SUBMIT_ARGS=(
+  --script "$JOB_BODY"
+  --name "$JOB_NAME"
+  --partition "$PARTITION"
+  --account coreai_dlalgo_compeval
+  --nodes 1
+  --ntasks 1
+  --cpus-per-task "$CPUS_PER_TASK"
+  --memory 0
+  --time "$TIME_LIMIT"
+  --workdir "$REMOTE_CHECKOUT"
+  --output "$LOG_PATH"
+)
+if (( GPUS > 0 )); then
+  SUBMIT_ARGS+=(--gpus "$GPUS")
+fi
 SUBMIT_RESULT=$(slurm-cli --cluster "$CLUSTER" --json job submit \
-  --script "$JOB_BODY" \
-  --name titans-170m-4k-smoke \
-  --partition batch \
-  --account coreai_dlalgo_compeval \
-  --nodes 1 \
-  --ntasks 1 \
-  --gpus 8 \
-  --memory 0 \
-  --time 1:00:00 \
-  --workdir "$REMOTE_CHECKOUT" \
-  --output "$LOG_PATH")
+  "${SUBMIT_ARGS[@]}")
 JOB_ID=$(printf '%s' "$SUBMIT_RESULT" | json_field "data['job_id']")
 FINAL_LOG=${LOG_PATH//%j/$JOB_ID}
 

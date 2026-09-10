@@ -110,6 +110,19 @@ fast-forwards the Lustre checkout through `slurm-cli shell`, submits through
 `slurm-cli job submit`, and prints reproducible status/log commands. It refuses
 dirty or unpushed source trees.
 
+After the 4K gate, launch the production-shaped pilot with:
+
+```bash
+tools/submit_titans_cwdfw.sh --pilot
+```
+
+This submits a CPU preparation job that streams `HuggingFaceFW/fineweb-edu`
+(`sample-10BT`) through AutoModel's NanoGPT processor with the public
+`NousResearch/Llama-2-7b-hf` tokenizer. Once 64M tokens and the validation
+health shard are ready, that job submits a ten-step, eight-H100 pilot
+automatically. The pilot trains on 5,242,880 tokens, validates distributed
+control flow, and writes a job-specific checkpoint. It is not a paper result.
+
 Defaults:
 
 - account: `coreai_dlalgo_compeval`;
