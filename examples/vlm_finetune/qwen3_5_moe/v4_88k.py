@@ -218,9 +218,14 @@ def last_turn_collate_fn(
             if selected.numel() == 0:
                 continue
             start = int(selected[0])
-            end = start + len(suffix)
-            if end <= input_ids.shape[1] and torch.equal(input_ids[row, start:end], suffix_tensor):
-                keep[row, start:end] = False
+            # default_collate_fn applies the next-token shift (labels[:, 1:] against
+            # input_ids[:, :-1]), so the label at position p supervises the token at
+            # input_ids position p + 1. The label positions to drop are still
+            # [start, start + len(suffix)); the tokens they predict start one later.
+            token_start = start + 1
+            token_end = token_start + len(suffix)
+            if token_end <= input_ids.shape[1] and torch.equal(input_ids[row, token_start:token_end], suffix_tensor):
+                keep[row, start : start + len(suffix)] = False
 
     batch["labels"] = labels.masked_fill(~keep, IGNORE_INDEX)
     return batch

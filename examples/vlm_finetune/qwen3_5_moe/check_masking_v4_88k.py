@@ -111,12 +111,18 @@ def main() -> None:
             status = f"FAIL wrapper left {len(wrapped_runs)} runs, expected 1"
         else:
             start, end = wrapped_runs[0]
-            decoded = tokenizer.decode(wrapped["input_ids"][0, start:end])
+            # The label values are the target token ids themselves, so decoding them
+            # avoids re-deriving the next-token shift between labels and input_ids.
+            supervised_ids = wrapped["labels"][0, start:end]
+            decoded = tokenizer.decode(supervised_ids[supervised_ids.ne(IGNORE_INDEX)])
             expected = (messages[-1]["content"] or "").strip()
             if not decoded.replace("<|im_end|>", "").strip().endswith(expected[-120:]):
                 status = "FAIL supervised span does not match the final assistant message"
-            elif suffix and start >= len(suffix):
-                prefix = wrapped["input_ids"][0, start - len(suffix) : start].tolist()
+            elif suffix and start + 1 >= len(suffix):
+                # Labels are shifted against input_ids by default_collate_fn, so the
+                # supervised span starting at label position `start` begins at token
+                # `start + 1`; the generation-prompt suffix sits immediately before it.
+                prefix = wrapped["input_ids"][0, start + 1 - len(suffix) : start + 1].tolist()
                 if prefix != suffix:
                     status = "FAIL generation-prompt prefix was not excluded from the loss"
 
