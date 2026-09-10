@@ -364,26 +364,6 @@ def _avoid_redundant_te_master_weights_for_fp32_params(optimizer: torch.optim.Op
     optimizer.register_load_state_dict_post_hook(enforce_fp32_ownership)
 
 
-def _build_te_fused_adam(
-    factory: Callable[..., Any], params: list[Any], kwargs: dict[str, Any]
-) -> torch.optim.Optimizer:
-    """Construct Transformer Engine FusedAdam with the repository's TE-specific handling.
-
-    TE treats an omitted ``master_weight_dtype`` as its default but rejects an
-    explicit ``None``, which YAML/factory configs commonly produce for unset
-    optional fields. Its ``multi_tensor_apply`` faults on zero-numel local
-    shards (see :func:`_drop_empty_local_shards`), and resident FP32 parameters
-    keep TE moments without a redundant master copy
-    (see :func:`_avoid_redundant_te_master_weights_for_fp32_params`).
-    """
-    kwargs = dict(kwargs)
-    if kwargs.get("master_weight_dtype", ...) is None:
-        kwargs.pop("master_weight_dtype")
-    optimizer = factory(_drop_empty_local_shards(params), **kwargs)
-    _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
-    return optimizer
-
-
 @dataclass
 class FusedAdamConfig(OptimizerConfig):
     """``transformer_engine.pytorch.optimizers.FusedAdam``."""
@@ -403,7 +383,11 @@ class FusedAdamConfig(OptimizerConfig):
         kwargs = self._constructor_kwargs()
         if kwargs.get("master_weight_dtype") is not None:
             kwargs["master_weight_dtype"] = dtype_from_str(kwargs["master_weight_dtype"])
-        return _build_te_fused_adam(FusedAdam, params, kwargs)
+        else:
+            kwargs.pop("master_weight_dtype")
+        optimizer = FusedAdam(_drop_empty_local_shards(params), **kwargs)
+        _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
+        return optimizer
 
 
 @dataclass
@@ -601,7 +585,6 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         # so an override set either way is honored.
         kwargs_overrides = kwargs.pop("param_group_overrides", [])
         overrides = self.param_group_overrides or _coerce_param_group_overrides(kwargs_overrides)
-        is_te_fused_adam = _is_te_fused_adam(self.factory)
         for attr in _DTYPE_FIELDS:
             val = kwargs.get(attr, None)
             if isinstance(val, str):
@@ -618,10 +601,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             # trainable parameters, and returns either a flat param list or the
             # per-group dicts.
             params = _trainable_params_or_groups(part, overrides)
-            if is_te_fused_adam:
-                optimizers.append(_build_te_fused_adam(self.factory, params, kwargs))
-            else:
-                optimizers.append(self.factory(params=params, **kwargs))
+            optimizers.append(self.factory(params=params, **kwargs))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
@@ -635,7 +615,6 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         foreach = _foreach_for_mesh(device_mesh)
 
         kwargs = dict(self.kwargs)
-        is_te_fused_adam = _is_te_fused_adam(self.factory)
         for attr in _DTYPE_FIELDS:
             val = kwargs.get(attr, None)
             if isinstance(val, str):
@@ -643,8 +622,6 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
             kwargs["foreach"] = foreach
 
-        if is_te_fused_adam:
-            return _build_te_fused_adam(self.factory, param_groups, kwargs)
         return self.factory(params=param_groups, **kwargs)
 
 
