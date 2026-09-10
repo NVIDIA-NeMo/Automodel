@@ -355,9 +355,9 @@ vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/
   validation.jsonl
 ```
 
-Every validation step also writes a checkpoint so that `LOWEST_VAL` can be tracked; with fp32
-master weights and Adam moments each sharded checkpoint of this model is ~1.4 TB, so budget
-~6 TB for the run (or raise `val_every_steps`). Intermediate checkpoints stay sharded; run their
+A checkpoint is written at the end of every epoch (every 100 steps for the 800-receipt training set) and at the
+final step, so `LOWEST_VAL` can point at any of them; with fp32 master weights and Adam moments each sharded
+checkpoint of this model is ~1.4 TB, so budget ~6 TB for the run. Intermediate checkpoints stay sharded; run their
 `model/consolidate.sh` to get an HF export of `LOWEST_VAL`.
 
 ---
