@@ -77,7 +77,7 @@ from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import (
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
-from nemo_automodel.components.moe.state_dict_utils import is_dtensor
+from nemo_automodel.components.moe.state_dict_utils import is_dtensor, should_load_expert_for_rank
 
 FP8_BLOCK_SIZE = 32
 ENGRAM_SCALE_BLOCK = 32
@@ -608,14 +608,15 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
     ) -> dict[str, Any]:
         """Convert the released HF checkpoint to the internal format.
 
-        Steps: drop out-of-scope tensors, dequantize FP8 / FP4 weights, restore
-        Engram owner padding, rename, and merge the routed experts that were
-        not already loaded through views into model storage.
+        Steps: discard unconstructed layers, non-local experts and disabled
+        towers before dequantization, restore Engram owner padding, rename,
+        and merge experts not already loaded through views into model storage.
 
         Args:
-            hf_state_dict: Released-name tensors. Per-expert projections have
-                shape [output, input], with FP4 input columns packed two per
-                byte before dequantization. Engram tables have logical shape [rows, channels]
+            hf_state_dict: Consumed mapping of released-name tensors. Per-expert
+                projections have shape [output, input], with FP4 input columns
+                packed two per byte before dequantization. Engram tables have
+                logical shape [rows, channels]
                 and optionally placement Shard(0) on a one-dimensional owner
                 mesh, with uneven local shape [local_rows, channels]. Other
                 tensors retain the layouts documented in this module.
@@ -632,14 +633,35 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
             loaded through model-storage views are omitted and recorded in
             view_loaded_native_keys. Other tensors retain their layouts and
             can alias input storage when no conversion is needed.
+
+        Raises:
+            ValueError: A retained quantized weight has no scale, a scale has
+                no weight, or multiple released keys map to one native key.
+            RuntimeError: A retained expert layer lacks a required local projection.
         """
-        filtered = {key: value for key, value in hf_state_dict.items() if self._keep_hf_key(key)}
-        filtered = self._dequantize(filtered)
-        for key, value in filtered.items():
+        for key in list(hf_state_dict):
+            layer = re.match(r"layers\.(\d+)\.", key)
+            expert = re.match(r"layers\.\d+\.ffn\.experts\.(\d+)\.", key)
+            if (
+                not self._keep_hf_key(key)
+                or (layer and int(layer[1]) >= self.config.num_hidden_layers)
+                or (
+                    expert
+                    and not should_load_expert_for_rank(int(expert[1]), device_mesh, self.config.n_routed_experts)
+                )
+            ):
+                hf_state_dict.pop(key)
+        self._dequantize(hf_state_dict)
+        converted = {}
+        for key in list(hf_state_dict):
+            value = hf_state_dict.pop(key)
+            if key.endswith(".scale"):
+                raise ValueError(f"Checkpoint scale {key} has no matching weight")
+            target = _rename_hf_key(key)
+            if target in converted:
+                raise ValueError(f"Multiple checkpoint tensors map to {target}")
             match = _ENGRAM_EMBED_PATTERN.match(key)
-            if match:
-                filtered[key] = self._restore_engram_padding(value, int(match.group(1)))
-        converted = {_rename_hf_key(key): value for key, value in filtered.items()}
+            converted[target] = self._restore_engram_padding(value, int(match.group(1))) if match else value
         return self._from_hf_w_merged_experts(converted, device_mesh)
 
     def _engram_checkpoint_tensor(self, tensor: torch.Tensor, layer_id: int) -> torch.Tensor:
@@ -707,14 +729,35 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
         )
 
     def _dequantize(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        """Dequantize every ``<base>.weight`` that has a ``<base>.scale`` companion."""
+        """Dequantize paired weights and require scales for retained packed tensors.
+
+        Args:
+            state_dict: Mutated released-name mapping. Dense FP8 matrices have
+                shape [rows, columns] with scales [ceil(rows / 32), ceil(columns / 32)].
+                FP4 experts have shape [rows, columns / 2] with scales [rows, columns / 32].
+                FP8 Engram tables have shape [rows, channels] with scales [rows, channels / 32].
+                DTensors retain their global shape and mesh placements, including
+                uneven row owners and inner-axis expert shards. Other tensors
+                retain their registered shapes.
+
+        Returns:
+            The same mapping with consumed scale entries and dequantized weights
+            in self.dtype. Decoded matrices restore the unpacked input dimension
+            and preserve their global layout and rank-local ownership. Unchanged
+            tensors alias input storage; decoded tensors have independent storage.
+
+        Raises:
+            ValueError: A packed INT8 or FP8 E4M3 weight has no companion scale.
+        """
         for key in list(state_dict.keys()):
             if not key.endswith(".weight"):
                 continue
+            weight = state_dict[key]
             scale_key = key[: -len(".weight")] + ".scale"
             if scale_key not in state_dict:
+                if weight.dtype in (torch.float8_e4m3fn, torch.int8):
+                    raise ValueError(f"Quantized weight {key} is missing its scale tensor {scale_key}")
                 continue
-            weight = state_dict[key]
             scale = state_dict.pop(scale_key)
             if (
                 self._is_expert_weight_key(key)
