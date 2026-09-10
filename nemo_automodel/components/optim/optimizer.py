@@ -839,7 +839,7 @@ def _accepts_foreach(optim_cls: type["torch.optim.Optimizer"]) -> bool:
         sig = inspect.signature(optim_cls)
     except (TypeError, ValueError):
         return False
-    return "forceach" in sig.parameters
+    return "foreach" in sig.parameters
 
 
 # ---------------------------------------------------------------------------
