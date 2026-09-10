@@ -14,8 +14,12 @@
 
 """Tests for nested config override handling in get_hf_config and _consume_config_overrides."""
 
+import copy
+import importlib.util
 import os
+import sys
 import types
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,7 +45,199 @@ from nemo_automodel._transformers.model_init import (
 from nemo_automodel.components.models.common.utils import BackendConfig
 
 
+@pytest.fixture
+def fake_te(monkeypatch):
+    # Exercise the real compatibility class with only the CUDA-only TE base stubbed.
+    class FakeTELinear(nn.Module):
+        def __init__(self, in_features, out_features, *, bias=True, device=None, params_dtype=None):
+            super().__init__()
+            self.in_features = in_features
+            self.out_features = out_features
+            self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=params_dtype))
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=params_dtype)) if bias else None
+
+        def reset_parameters(self):
+            nn.init.zeros_(self.weight)
+
+    from nemo_automodel.components.models.common import utils
+
+    name = "nemo_automodel.components.models.common.te_linear"
+    spec = importlib.util.spec_from_file_location(name, Path(utils.__file__).with_name("te_linear.py"))
+    module = importlib.util.module_from_spec(spec)
+    with patch("nemo_automodel.shared.import_utils.safe_import_from", return_value=(True, FakeTELinear)):
+        spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "_patch_te_modules", lambda: None)
+    monkeypatch.setitem(sys.modules, name, module)
+    return FakeTELinear
+
+
 class TestBackendModuleOverrides:
+    def test_te_missing_dependency_is_actionable(self):
+        from nemo_automodel.components.models.common import utils
+
+        spec = importlib.util.spec_from_file_location("missing_te_test", Path(utils.__file__).with_name("te_linear.py"))
+        module = importlib.util.module_from_spec(spec)
+        with patch("nemo_automodel.shared.import_utils.safe_import_from", return_value=(False, object)):
+            with pytest.raises(ImportError, match="linear='te' requires Transformer Engine"):
+                spec.loader.exec_module(module)
+
+    def test_te_preserves_initialized_flags_and_frozen_shared_parameters(self, fake_te):
+        from transformers import PretrainedConfig, PreTrainedModel
+
+        model = PreTrainedModel(PretrainedConfig())
+        model.projection = nn.Linear(8, 8)
+        model.other = nn.Linear(8, 8)
+        model.other.weight = model.projection.weight
+        model.projection.weight.requires_grad_(False)
+        model.projection.weight._is_hf_initialized = True
+        model.projection._is_hf_initialized = True
+        weight = model.projection.weight
+        before = weight.detach().clone()
+        _apply_backend_module_overrides(model, BackendConfig(linear="te"))
+        assert model.projection.weight is model.other.weight is weight
+        assert not weight.requires_grad
+        assert weight._is_hf_initialized
+        with patch.object(model, "_init_weights", side_effect=AssertionError("initialized module revisited")):
+            model._initialize_weights(model.projection)
+        torch.testing.assert_close(weight, before)
+
+    def test_te_forward_uses_current_backend_patch(self, fake_te):
+        module = sys.modules["nemo_automodel.components.models.common.te_linear"]
+        with patch.object(module, "_patch_te_modules") as patch_backend:
+            layer = module.TELinear(8, 16, bias=False, device="cpu", params_dtype=torch.float32)
+        patch_backend.assert_called_once_with()
+        inputs = torch.ones(2, 8)
+        expected = torch.ones(2, 16)
+        with patch.object(fake_te, "forward", return_value=expected) as forward:
+            assert layer(inputs, is_first_microbatch=False) is expected
+        forward.assert_called_once_with(layer, inputs, is_first_microbatch=False)
+
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    @pytest.mark.parametrize("nested_scale", [0.0, 0.25])
+    @pytest.mark.parametrize("copy_before_init", [False, True])
+    def test_te_preserves_nested_model_initialization_policy(self, device, nested_scale, copy_before_init, fake_te):
+        from transformers import PretrainedConfig, PreTrainedModel
+
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+
+        FakeTELinear = fake_te
+
+        class PolicyModel(PreTrainedModel):
+            def __init__(self, scale):
+                super().__init__(PretrainedConfig(initializer_range=scale, tie_word_embeddings=False))
+                self.projection = nn.Linear(8, 16)
+                self.projection_alias = self.projection
+                self.biasless = nn.Linear(16, 8, bias=False)
+                self.native = FakeTELinear(8, 16)
+                self.norm = nn.LayerNorm(8)
+                for parameter in self.parameters():
+                    nn.init.constant_(parameter, -7.0)
+
+            def _init_weights(self, module):
+                if isinstance(module, nn.Linear):
+                    # Non-Gaussian, dimension-dependent weights and nonzero bias:
+                    # generic normal_/zeros_ is not this model's contract.
+                    nn.init.constant_(module.weight, self.config.initializer_range * module.in_features)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, -2.0)
+                elif isinstance(module, FakeTELinear):
+                    nn.init.constant_(module.weight, 3.0)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 4.0)
+                elif isinstance(module, nn.LayerNorm):
+                    nn.init.constant_(module.weight, 5.0)
+                    nn.init.zeros_(module.bias)
+
+        with torch.device(device):
+            model = PolicyModel(0.125)
+            model.nested = PolicyModel(nested_scale)
+        model.eval()
+        parameters = dict(model.named_parameters())
+        original_keys = set(model.state_dict())
+        native = model.native
+        backend = BackendConfig(linear="te")
+        _apply_backend_module_overrides(model, backend)
+        _apply_backend_module_overrides(model, backend)
+
+        assert model.native is native
+        assert model.projection_alias is model.projection
+        assert model.nested.projection_alias is model.nested.projection
+        assert model.projection.training is False
+        assert all(dict(model.named_parameters())[name] is value for name, value in parameters.items())
+        assert set(model.state_dict()) == original_keys
+        source = model
+        source_values = {name: value.detach().clone() for name, value in source.named_parameters()}
+        if copy_before_init:
+            model = copy.deepcopy(source)
+            model.config.initializer_range = 0.5
+            model.nested.config.initializer_range = nested_scale + 0.5
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+        if copy_before_init:
+            assert source.config.initializer_range == 0.125
+            assert source.nested.config.initializer_range == nested_scale
+            for name, parameter in source.named_parameters():
+                assert parameter.device.type == device
+                if device == "cpu":
+                    torch.testing.assert_close(parameter, source_values[name])
+        for owner in (model, model.nested):
+            for projection, width in ((owner.projection, 8), (owner.biasless, 16)):
+                torch.testing.assert_close(
+                    projection.weight, torch.full_like(projection.weight, owner.config.initializer_range * width)
+                )
+            torch.testing.assert_close(owner.projection.bias, torch.full_like(owner.projection.bias, -2.0))
+            assert owner.biasless.bias is None
+            torch.testing.assert_close(owner.native.weight, torch.full_like(owner.native.weight, 3.0))
+            torch.testing.assert_close(owner.native.bias, torch.full_like(owner.native.bias, 4.0))
+            torch.testing.assert_close(owner.norm.weight, torch.full_like(owner.norm.weight, 5.0))
+
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    @pytest.mark.parametrize("copy_before_init", [False, True])
+    def test_te_preserves_identity_sensitive_bf16_head_initialization(self, device, copy_before_init, fake_te):
+        from nemo_automodel.components.models.llama_bidirectional.model import (
+            LlamaBidirectionalConfig,
+            LlamaBidirectionalForSequenceClassification,
+        )
+
+        config = LlamaBidirectionalConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=64,
+            num_labels=8,
+        )
+        config._attn_implementation = "eager"
+        with torch.device(device):
+            model = LlamaBidirectionalForSequenceClassification(config)
+        _apply_backend_module_overrides(model, BackendConfig(linear="te"))
+        source = model
+        if copy_before_init:
+            model = copy.deepcopy(source)
+            model.config.initializer_range = 0.125
+        config = model.config
+        model.score.to_empty(device="cpu")
+        model.score.to(dtype=torch.bfloat16)
+        nn.init.constant_(model.score.weight, float("nan"))
+        model.score._is_hf_initialized = False
+        weight = model.score.weight
+        # Compare to the model-owned identity branch, not HF's generic Linear
+        # initializer (which writes to a float copy in the affected HF version).
+        torch.manual_seed(123)
+        expected = torch.empty_like(weight)
+        nn.init.normal_(expected, mean=0.0, std=config.initializer_range)
+        torch.manual_seed(123)
+        with patch.object(
+            type(model).__mro__[1], "_init_weights", side_effect=AssertionError("identity branch missed")
+        ):
+            model._initialize_weights(model.score)
+        assert model.score.weight is weight
+        torch.testing.assert_close(weight, expected, rtol=0, atol=0)
+        if copy_before_init:
+            assert source.score.weight is not weight
+            assert source.score.weight.device.type == device
+            assert source.config.initializer_range != config.initializer_range
+
     def test_quack_replaces_standard_modules_without_replacing_parameters(self):
         class FakeQuackLinear(nn.Linear):
             pass

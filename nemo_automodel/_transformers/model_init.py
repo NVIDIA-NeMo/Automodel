@@ -1433,17 +1433,30 @@ def _apply_backend_module_overrides(model: torch.nn.Module, backend: BackendConf
                 continue
 
             replacement = replacements.get(id(child))
-            if replacement is None and backend.linear == "quack" and type(child) is torch.nn.Linear:
-                replacement = initialize_linear_module(
-                    "quack",
-                    child.in_features,
-                    child.out_features,
-                    bias=child.bias is not None,
-                    device=child.weight.device,
-                    dtype=child.weight.dtype,
-                )
+            if replacement is None and backend.linear in ("te", "quack") and type(child) is torch.nn.Linear:
+                if backend.linear == "te":
+                    from nemo_automodel.components.models.common.te_linear import TELinear
+
+                    replacement = TELinear(
+                        child.in_features,
+                        child.out_features,
+                        bias=child.bias is not None,
+                        device=child.weight.device,
+                        params_dtype=child.weight.dtype,
+                    )
+                else:
+                    replacement = initialize_linear_module(
+                        backend.linear,
+                        child.in_features,
+                        child.out_features,
+                        bias=child.bias is not None,
+                        device=child.weight.device,
+                        dtype=child.weight.dtype,
+                    )
                 replacement.weight = child.weight
                 replacement.bias = child.bias
+                if hasattr(child, "_is_hf_initialized"):
+                    replacement._is_hf_initialized = child._is_hf_initialized
             elif replacement is None and backend.rms_norm == "quack" and type(child) is torch.nn.RMSNorm:
                 normalized_shape = tuple(child.normalized_shape)
                 if len(normalized_shape) == 1:
