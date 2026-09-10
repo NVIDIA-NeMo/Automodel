@@ -37,13 +37,14 @@ inference-time KV caching, and SWA bounded replay remain out of scope.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedModel, PreTrainedTokenizerFast
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
@@ -94,7 +95,6 @@ class DeepseekV41Model(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
-        moe_overrides: dict | None = None,
         tokenizer: PreTrainedTokenizerFast | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
@@ -102,9 +102,6 @@ class DeepseekV41Model(nn.Module):
         self.backend = backend
         self.config = config
         config.validate_layer_layout()
-
-        if moe_config is not None and moe_overrides is not None:
-            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         moe_defaults = dict(
@@ -130,8 +127,6 @@ class DeepseekV41Model(nn.Module):
             # Routed and shared experts use clamped SwiGLU in fp32 (reference ``Expert.forward``).
             swiglu_limit=float(config.swiglu_limit),
         )
-        if moe_overrides:
-            moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
         if not self.moe_config.combine_in_fp32:
             raise ValueError("DeepSeek V4.1 requires MoEConfig.combine_in_fp32=True for released expert arithmetic")
@@ -267,7 +262,7 @@ class DeepseekV41Model(nn.Module):
             layer.init_weights(buffer_device=buffer_device, init_std=init_std)
 
 
-class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     """DeepSeek V4.1 causal LM with optional vision and an fp32 ``lm_head``.
 
     ``engram_process_group`` explicitly selects contiguous row owners for the
@@ -312,22 +307,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_thd: bool = False
 
     @classmethod
-    def from_config(
-        cls,
-        config: DeepseekV41Config,
-        moe_config: MoEConfig | None = None,
-        backend: BackendConfig | None = None,
-        *,
-        engram_process_group: dist.ProcessGroup | None = None,
-        **kwargs,
-    ) -> DeepseekV41ForCausalLM:
-        """Construct the model, forwarding the runtime Engram owner group."""
-        return cls(config, moe_config, backend, engram_process_group=engram_process_group, **kwargs)
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
-        config = DeepseekV41Config.from_pretrained(pretrained_model_name_or_path)
-        return cls.from_config(config, *model_args, **kwargs)
+    def from_config(cls, config: DeepseekV41Config, **kwargs: Any) -> DeepseekV41ForCausalLM:
+        """Construct using the NeMo registry's configuration entry point."""
+        return cls(config, **kwargs)
 
     def __init__(
         self,
@@ -337,11 +319,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         *,
         tokenizer: PreTrainedTokenizerFast | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
-        **kwargs,
     ) -> None:
-        super().__init__()
-        self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
+        super().__init__(config)
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_linear", dispatcher="hybridep"
         )
@@ -353,12 +333,10 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             and any(i < config.num_hidden_layers for i in config.engram_layer_ids)
         ):
             tokenizer = config.build_tokenizer()
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = DeepseekV41Model(
             config,
             backend=self.backend,
             moe_config=moe_config,
-            moe_overrides=moe_overrides,
             tokenizer=tokenizer,
             engram_process_group=engram_process_group,
         )
@@ -374,6 +352,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32
         )
+        self.moe_config = self.model.moe_config
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV41StateDictAdapter(
                 self.config,
@@ -385,14 +364,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
     def get_output_embeddings(self):
         return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
 
     def _image_embeddings(
         self,
