@@ -39,6 +39,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
+from transformers import PreTrainedTokenizerFast
 
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
 from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
@@ -81,13 +82,16 @@ def find_next_prime(start: int, seen_primes: set[int]) -> int:
     return candidate
 
 
-def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
+def build_compressed_token_map(tokenizer: PreTrainedTokenizerFast) -> tuple[list[int], int]:
     """Map every token id onto a smaller id space where tokens that normalize alike collapse together.
 
     Returns the lookup (``token_id -> compressed_id``) and the compressed vocab size.
     Mirrors the released reference exactly; the size feeds every hash multiplier.
     """
     from tokenizers import Regex, normalizers
+
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
+        raise TypeError("DeepSeek V4.1 Engram requires the checkpoint's original fast tokenizer")
 
     # a private-use char, so a token that is exactly one space survives Strip() instead of
     # collapsing to the empty string and merging with unrelated tokens
@@ -210,6 +214,14 @@ class DeepseekV41EngramHasher(nn.Module):
         self.vocab_size = int(config.vocab_size)
         self.compressed_vocab_size = int(config.engram_compressed_vocab_size) or self.vocab_size
         self.raw_pad_token_id = int(config.engram_pad_token_id)
+        self._token_map_values: tuple[int, ...] = ()
+        # Keep deterministic source values outside device buffers, so meta ->
+        # materialized construction cannot erase the hash identities.
+        with torch.device("cpu"):
+            multipliers = compute_hash_multipliers(
+                layout.layer_ids, layout.max_ngram_size, self.compressed_vocab_size
+            ).tolist()
+        self._multiplier_values = tuple(tuple(row) for row in multipliers)
         primes = torch.tensor(layout.primes, dtype=torch.int64)  # [n_layers, n_ngrams, n_heads]
         flat_primes = primes.flatten(1)
         self.register_buffer("primes", primes, persistent=False)
@@ -217,7 +229,7 @@ class DeepseekV41EngramHasher(nn.Module):
         self.register_buffer("offsets", flat_primes.cumsum(1) - flat_primes, persistent=False)
         self.register_buffer(
             "multipliers",
-            compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, self.compressed_vocab_size),
+            torch.tensor(self._multiplier_values, dtype=torch.int64),
             persistent=False,
         )
         self.register_buffer("token_map", torch.empty(0, dtype=torch.int64), persistent=False)
@@ -228,24 +240,64 @@ class DeepseekV41EngramHasher(nn.Module):
     def has_token_map(self) -> bool:
         return self.token_map.numel() > 0
 
-    def set_token_map(self, lookup, compressed_vocab_size: int) -> None:
-        """Attach a ``token_id -> compressed_id`` lookup (list or tensor)."""
+    def set_token_map(self, lookup: list[int] | torch.Tensor, compressed_vocab_size: int) -> None:
+        """Attach the compressed token IDs without retaining a tokenizer object.
+
+        Args:
+            lookup: Integer list or materialized tensor [vocabulary], containing
+                IDs in [0, compressed_vocab_size). Its input storage is not mutated.
+            compressed_vocab_size: Number of compressed IDs; must match the hash configuration.
+        """
         if int(compressed_vocab_size) != self.compressed_vocab_size:
             raise ValueError(
                 "Engram compressed vocabulary mismatch: tokenizer yields "
                 f"{compressed_vocab_size} ids but config.engram_compressed_vocab_size is "
                 f"{self.compressed_vocab_size}. Every hash multiplier derives from this size."
             )
-        lookup = torch.as_tensor(lookup, dtype=torch.int64)
+        if isinstance(lookup, torch.Tensor) and lookup.is_meta:
+            raise ValueError("Engram token-map setup requires materialized integer values")
+        lookup = torch.as_tensor(lookup, dtype=torch.int64, device="cpu")
+        if lookup.ndim != 1:
+            raise ValueError("Engram token map must be a one-dimensional lookup")
         if lookup.numel() < self.vocab_size:
             raise ValueError(f"Engram token map covers {lookup.numel()} ids, expected at least {self.vocab_size}")
-        self.token_map = lookup[: self.vocab_size].to(self.primes.device)
-        self.pad_id = int(lookup[self.raw_pad_token_id])
+        selected = lookup[: self.vocab_size]
+        if torch.any((selected < 0) | (selected >= self.compressed_vocab_size)):
+            raise ValueError("Engram token-map IDs must be within the compressed vocabulary")
+        self._token_map_values = tuple(selected.tolist())
+        self.token_map = selected.to(self.primes.device)
+        self.pad_id = self._token_map_values[self.raw_pad_token_id]
 
-    def set_tokenizer(self, tokenizer) -> None:
+    def set_tokenizer(self, tokenizer: PreTrainedTokenizerFast) -> None:
         """Derive and attach the compressed token map from a HuggingFace tokenizer."""
         lookup, size = build_compressed_token_map(tokenizer)
         self.set_token_map(lookup, size)
+
+    @torch.no_grad()
+    def init_weights(self, buffer_device: torch.device | None = None) -> None:
+        """Restore deterministic integer buffers after meta-device materialization.
+
+        Args:
+            buffer_device: Destination device, or the current primes device.
+                Restores int64 primes [layers, ngram_orders, heads], offsets
+                [layers, hash_columns], multipliers [layers, max_ngram_size],
+                and token_map [vocabulary] (empty until explicit tokenizer setup).
+                Matching buffer storage is updated in place; otherwise it is replaced.
+        """
+        device = self.primes.device if buffer_device is None else buffer_device
+        primes = torch.tensor(self.layout.primes, dtype=torch.int64, device=device)
+        flat_primes = primes.flatten(1)
+        for name, value in (
+            ("primes", primes),
+            ("offsets", flat_primes.cumsum(1) - flat_primes),
+            ("multipliers", torch.tensor(self._multiplier_values, dtype=torch.int64, device=device)),
+            ("token_map", torch.tensor(self._token_map_values, dtype=torch.int64, device=device)),
+        ):
+            buffer = self.get_buffer(name)
+            if buffer.shape == value.shape and buffer.device == value.device:
+                buffer.copy_(value)
+            else:
+                setattr(self, name, value)
 
     def forward(
         self,

@@ -46,7 +46,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from transformers import PretrainedConfig
+from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
 
 
 class DeepseekV41VisionConfig(PretrainedConfig):
@@ -225,10 +225,10 @@ class DeepseekV41Config(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
         self.sliding_window = sliding_window
-        self.compress_ratios = [int(r) for r in (compress_ratios or [])]
+        self.compress_ratios = list(compress_ratios or [])
         self.compress_rope_theta = compress_rope_theta
-        self.kv_source_layer_ids = [int(i) for i in (kv_source_layer_ids or [])]
-        self.index_source_layer_ids = [int(i) for i in (index_source_layer_ids or [])]
+        self.kv_source_layer_ids = list(kv_source_layer_ids or [])
+        self.index_source_layer_ids = list(index_source_layer_ids or [])
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
@@ -238,8 +238,8 @@ class DeepseekV41Config(PretrainedConfig):
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
-        self.engram_layer_ids = [int(i) for i in (engram_layer_ids or [])]
-        self.engram_num_embeddings = [int(n) for n in (engram_num_embeddings or [])]
+        self.engram_layer_ids = list(engram_layer_ids or [])
+        self.engram_num_embeddings = list(engram_num_embeddings or [])
         self.engram_max_ngram_size = engram_max_ngram_size
         self.engram_vocab_size = engram_vocab_size
         self.engram_n_heads = engram_n_heads
@@ -271,6 +271,8 @@ class DeepseekV41Config(PretrainedConfig):
                 f"{self.engram_layer_ids} and {self.engram_num_embeddings}"
             )
 
+        self._validate_dimensions()
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -280,6 +282,118 @@ class DeepseekV41Config(PretrainedConfig):
             dtype=resolved_dtype,
             **kwargs,
         )
+
+    def _validate_dimensions(self) -> None:
+        """Reject dimensions and numeric settings that cannot define the backbone."""
+        for name, value in (
+            ("vocab_size", self.vocab_size),
+            ("hidden_size", self.hidden_size),
+            ("moe_intermediate_size", self.moe_intermediate_size),
+            ("num_hidden_layers", self.num_hidden_layers),
+            ("num_attention_heads", self.num_attention_heads),
+            ("head_dim", self.head_dim),
+            ("q_lora_rank", self.q_lora_rank),
+            ("o_lora_rank", self.o_lora_rank),
+            ("o_groups", self.o_groups),
+            ("n_routed_experts", self.n_routed_experts),
+            ("num_experts_per_tok", self.num_experts_per_tok),
+            ("sliding_window", self.sliding_window),
+            ("index_n_heads", self.index_n_heads),
+            ("index_head_dim", self.index_head_dim),
+            ("index_topk", self.index_topk),
+            ("hc_mult", self.hc_mult),
+            ("hc_sinkhorn_iters", self.hc_sinkhorn_iters),
+            ("max_position_embeddings", self.max_position_embeddings),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if self.num_key_value_heads != 1:
+            raise ValueError("DeepSeek-V4.1 requires num_key_value_heads=1 for shared latent KV")
+        if self.num_attention_heads % self.o_groups:
+            raise ValueError("num_attention_heads must be divisible by o_groups")
+        if (
+            type(self.qk_rope_head_dim) is not int
+            or self.qk_rope_head_dim <= 0
+            or self.qk_rope_head_dim % 2
+            or self.qk_rope_head_dim > min(self.head_dim, self.index_head_dim)
+        ):
+            raise ValueError("qk_rope_head_dim must be positive, even, and no larger than head_dim or index_head_dim")
+        if self.num_experts_per_tok > self.n_routed_experts:
+            raise ValueError("num_experts_per_tok must not exceed n_routed_experts")
+        if self.n_shared_experts != 1:
+            raise ValueError("DeepSeek-V4.1 requires n_shared_experts=1")
+        for name, value in (
+            ("rms_norm_eps", self.rms_norm_eps),
+            ("hc_eps", self.hc_eps),
+            ("rope_theta", self.rope_theta),
+            ("compress_rope_theta", self.compress_rope_theta),
+            ("routed_scaling_factor", self.routed_scaling_factor),
+            ("swiglu_limit", self.swiglu_limit),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive, got {value!r}")
+        if not 0 <= self.attention_dropout < 1:
+            raise ValueError("attention_dropout must lie in [0, 1)")
+        if (
+            type(self.num_nextn_predict_layers) is not int
+            or type(self.dspark_block_size) is not int
+            or self.num_nextn_predict_layers < 0
+            or self.dspark_block_size < 0
+        ):
+            raise ValueError("num_nextn_predict_layers and dspark_block_size must be non-negative")
+        if self.engram_enabled and self.engram_layer_ids:
+            for name, value in (
+                ("engram_n_heads", self.engram_n_heads),
+                ("engram_head_dim", self.engram_head_dim),
+                ("engram_vocab_size", self.engram_vocab_size),
+            ):
+                if type(value) is not int or value <= 0:
+                    raise ValueError(f"{name} must be a positive integer, got {value!r}")
+            if type(self.engram_compressed_vocab_size) is not int or self.engram_compressed_vocab_size < 0:
+                raise ValueError("engram_compressed_vocab_size must be non-negative; zero selects identity hashing")
+            if type(self.engram_max_ngram_size) is not int or self.engram_max_ngram_size < 2:
+                raise ValueError("engram_max_ngram_size must be at least 2 when Engram is enabled")
+            if type(self.engram_pad_token_id) is not int or not 0 <= self.engram_pad_token_id < self.vocab_size:
+                raise ValueError("engram_pad_token_id must be within the token vocabulary")
+
+        if not math.isfinite(self.initializer_range) or self.initializer_range < 0:
+            raise ValueError("initializer_range must be finite and non-negative")
+        if self.rope_scaling is not None:
+            if not isinstance(self.rope_scaling, dict):
+                raise TypeError("rope_scaling must be a dictionary or None")
+            for name, default in (("factor", 1), ("beta_fast", 32), ("beta_slow", 1)):
+                value = self.rope_scaling.get(name, default)
+                if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"rope_scaling.{name} must be finite and positive")
+            original_length = self.rope_scaling.get("original_max_position_embeddings", 0)
+            if type(original_length) is not int or original_length < 0:
+                raise ValueError("rope_scaling.original_max_position_embeddings must be a non-negative integer")
+
+    def build_tokenizer(self) -> PreTrainedTokenizerFast:
+        """Load the pinned fast tokenizer used to build Engram's compressed IDs.
+
+        The tokenizer is a runtime construction input and is never stored on
+        this configuration. Explicit model.set_engram_tokenizer injection is
+        available for checkpoint-free configurations without a source path.
+
+        Returns:
+            The checkpoint's fast tokenizer, using the resolved config commit.
+
+        Raises:
+            ValueError: No checkpoint source is configured.
+            TypeError: The checkpoint tokenizer is not a fast tokenizer.
+        """
+        if not self._name_or_path:
+            raise ValueError("Engram tokenizer construction requires a checkpoint source or explicit tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(
+            self._name_or_path,
+            revision=self._commit_hash,
+            trust_remote_code=False,
+            use_fast=True,
+        )
+        if not isinstance(tokenizer, PreTrainedTokenizerFast):
+            raise TypeError("DeepSeek V4.1 Engram requires the checkpoint's original fast tokenizer")
+        return tokenizer
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any], **kwargs) -> "DeepseekV41Config":
@@ -330,6 +444,35 @@ class DeepseekV41Config(PretrainedConfig):
         source layer with the same ratio, and every Reuse layer must be preceded
         by an index source computed against that same KV source.
         """
+        self._validate_dimensions()
+        if any(type(ratio) is not int or ratio < 0 for ratio in self.compress_ratios):
+            raise ValueError("compress_ratios must contain non-negative integers")
+        for name, layer_ids in (
+            ("kv_source_layer_ids", self.kv_source_layer_ids),
+            ("index_source_layer_ids", self.index_source_layer_ids),
+            ("engram_layer_ids", self.engram_layer_ids),
+        ):
+            if any(type(layer_id) is not int or layer_id < 0 for layer_id in layer_ids):
+                raise ValueError(f"{name} must contain non-negative integer layer IDs")
+            if layer_ids != sorted(set(layer_ids)):
+                raise ValueError(f"{name} must contain strictly increasing layer IDs")
+        if len(self.engram_layer_ids) != len(self.engram_num_embeddings):
+            raise ValueError("engram_layer_ids and engram_num_embeddings must have the same length")
+        if any(type(rows) is not int or rows <= 0 for rows in self.engram_num_embeddings):
+            raise ValueError("engram_num_embeddings must contain positive integer row counts")
+        # Retain all global IDs for a reduced prefix. Future sources must still
+        # describe explicit compressed layers; omitted schedule tails mean SWA.
+        for layer_id in self.kv_source_layer_ids + self.index_source_layer_ids:
+            if layer_id >= len(self.compress_ratios):
+                raise ValueError("KV/index source IDs must refer to layers covered by compress_ratios")
+        if type(self.candidate_source_layer_id) is not int or self.candidate_source_layer_id < -1:
+            raise ValueError("candidate_source_layer_id must be -1 or a non-negative layer ID")
+        for name, value in (
+            ("candidate_block_size", self.candidate_block_size),
+            ("candidate_topk_blocks", self.candidate_topk_blocks),
+        ):
+            if type(value) is not int or value < 0 or (self.candidate_source_layer_id >= 0 and value == 0):
+                raise ValueError(f"{name} must be non-negative and positive when the candidate source is enabled")
         last_kv_source: int | None = None
         last_index_source: int | None = None
         for layer_idx in range(self.num_hidden_layers):

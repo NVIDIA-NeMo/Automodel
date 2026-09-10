@@ -43,6 +43,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from transformers import PreTrainedTokenizerFast
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
@@ -110,6 +111,7 @@ class DeepseekV41Model(nn.Module):
         *,
         moe_config: MoEConfig | None = None,
         moe_overrides: dict | None = None,
+        tokenizer: PreTrainedTokenizerFast | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
         super().__init__()
@@ -152,6 +154,11 @@ class DeepseekV41Model(nn.Module):
         self.engram_hasher = (
             DeepseekV41EngramHasher(config, self.engram_layout) if self.engram_layout is not None else None
         )
+        if self.engram_hasher is not None:
+            if tokenizer is not None:
+                self.set_engram_tokenizer(tokenizer)
+            elif not self.engram_hasher.has_token_map and config._name_or_path:
+                self.set_engram_tokenizer(config.build_tokenizer())
         self.layers = nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = DeepseekV41Block(
@@ -182,23 +189,18 @@ class DeepseekV41Model(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None),
         )
 
-    def set_engram_tokenizer(self, tokenizer) -> None:
+    def set_engram_tokenizer(self, tokenizer: PreTrainedTokenizerFast) -> None:
         """Attach the tokenizer-derived compressed token map used by Engram hashing."""
         if self.engram_hasher is not None:
             self.engram_hasher.set_tokenizer(tokenizer)
 
     def _ensure_engram_token_map(self) -> None:
-        if self.engram_hasher is None or self.engram_hasher.has_token_map:
-            return
-        path = getattr(self.config, "_name_or_path", None) or getattr(self.config, "name_or_path", None)
-        if not path:
+        """Require setup to finish before the numerical forward; perform no tokenizer I/O."""
+        if self.engram_hasher is not None and not self.engram_hasher.has_token_map:
             raise RuntimeError(
-                "Engram needs the tokenizer-derived token map: call model.set_engram_tokenizer(tokenizer) "
-                "or construct the config with name_or_path pointing at the checkpoint."
+                "Engram needs the tokenizer-derived token map before forward: call "
+                "model.set_engram_tokenizer(tokenizer), or construct the model with a checkpoint name_or_path."
             )
-        from transformers import AutoTokenizer  # noqa: PLC0415
-
-        self.set_engram_tokenizer(AutoTokenizer.from_pretrained(path))
 
     def forward(
         self,
@@ -324,6 +326,8 @@ class DeepseekV41Model(nn.Module):
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         init_std = float(self.config.initializer_range)
+        if self.engram_hasher is not None:
+            self.engram_hasher.init_weights(buffer_device)
         with buffer_device:
             nn.init.normal_(self.embed_tokens.weight)
             self.norm.reset_parameters()
@@ -396,6 +400,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         *,
+        tokenizer: PreTrainedTokenizerFast | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
         **kwargs,
     ) -> None:
@@ -409,6 +414,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             backend=self.backend,
             moe_config=moe_config,
             moe_overrides=moe_overrides,
+            tokenizer=tokenizer,
             engram_process_group=engram_process_group,
         )
         self.model.vision = None
@@ -443,7 +449,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def set_engram_tokenizer(self, tokenizer) -> None:
+    def set_engram_tokenizer(self, tokenizer: PreTrainedTokenizerFast) -> None:
         """Attach the tokenizer used to derive the Engram compressed token map."""
         self.model.set_engram_tokenizer(tokenizer)
 
