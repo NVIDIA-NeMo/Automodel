@@ -34,6 +34,21 @@ already used by DeepSeek V4. The explicit `torch_linear` expert backend preserve
 separate gate/up/down projections and eager FP32 SwiGLU. The model enables FP32
 routed accumulation and shared-expert addition, casting once at the MoE output.
 
+For the 32-node recipe with four GB200 GPUs per node, export this on every node
+before launching the training ranks:
+
+```bash
+export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4
+```
+
+This gives HybridEP equal four-rank, node-local NVLink groups when the allocation
+spans partial or unequal NVL72 domains. Every training rank must inherit it.
+
+Set `DS41_CHECKPOINT` to the absolute path of the shared local HF snapshot for
+revision `df42c109f1defefcbfcedbe7d905718a12266e40`, using the same directory for
+parity and training. Pass `--model.config.name_or_path="$DS41_CHECKPOINT"` to the
+training command so every node loads that snapshot.
+
 FSDP mixed precision must use `param_dtype: bfloat16`, `reduce_dtype: float32`,
 `output_dtype: null`, and `cast_forward_inputs: false`. Set
 `lm_head_precision: float32`. These settings preserve FP32 mHC coefficients and

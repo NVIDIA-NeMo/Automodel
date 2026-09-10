@@ -15,6 +15,13 @@
 # Released FP8/FP4 weights initialize BF16 training parameters; attention KV
 # quantize/dequantize boundaries remain part of the forward computation.
 # Validate the pinned official inference reference before scaling this recipe.
+# On every node, before launching the four local training ranks:
+# export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4
+# This gives HybridEP equal four-rank, node-local NVLink groups when the
+# allocation spans partial or unequal NVL72 domains; every rank must inherit it.
+# Set DS41_CHECKPOINT to the absolute shared local HF snapshot path for revision
+# df42c109f1defefcbfcedbe7d905718a12266e40, using the same directory as parity.
+# Pass --model.config.name_or_path="$DS41_CHECKPOINT" to the training command.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234

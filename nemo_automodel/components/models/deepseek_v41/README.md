@@ -33,6 +33,21 @@ configures full text-backbone fine-tuning, with EP128 and TP1/PP1/CP1. It includ
 both trainable Engram tables. The vision tower is disabled for this text recipe.
 The model's default configuration retains the vision tower.
 
+For the 32-node recipe with four GB200 GPUs per node, export this on every node
+before launching the training ranks:
+
+```bash
+export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4
+```
+
+This gives HybridEP equal four-rank, node-local NVLink groups when the allocation
+spans partial or unequal NVL72 domains. Every training rank must inherit it.
+
+Set `DS41_CHECKPOINT` to the absolute path of the shared local HF snapshot for
+revision `df42c109f1defefcbfcedbe7d905718a12266e40`, using the same directory for
+parity and training. Pass `--model.config.name_or_path="$DS41_CHECKPOINT"` to the
+training command so every node loads that snapshot.
+
 FSDP must preserve FP32 mHC coefficients alongside BF16 residual streams:
 
 ```yaml
