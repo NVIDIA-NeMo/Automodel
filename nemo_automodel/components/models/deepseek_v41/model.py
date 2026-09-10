@@ -311,8 +311,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         "ffn_hc.base",
         "ffn_hc.scale",
         "self_attn.sinks",
-        # Ratio > 1 compressors pool in fp32 with fp32 projections; ratio-1 compressors
-        # are built in the model dtype and are left untouched by the cast.
+        # Compressors pool in fp32 with fp32 projections (the reference promotes the
+        # ratio > 1 projections to fp32; ratio-1 projections cast their input to the
+        # weight dtype, see ``DeepseekV41Compressor.forward``).
         "self_attn.compressor.wkv",
         "self_attn.compressor.wgate",
         "e_score_correction_bias",

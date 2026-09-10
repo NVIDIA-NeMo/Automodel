@@ -354,7 +354,11 @@ class DeepseekV41Compressor(nn.Module):
         """``[B, S, hidden] -> [B, S // ratio, head_dim]`` (a trailing partial group is dropped)."""
         ratio = self.compress_ratio
         if ratio == 1:
-            return self.norm(self.wkv(hidden_states))
+            # ``wkv`` may have been promoted to fp32 by the model's keep-in-fp32 policy
+            # (the ratio-agnostic ``self_attn.compressor.wkv`` entry); project in the
+            # weight dtype and hand the latent back in the activation dtype.
+            latent = self.wkv(hidden_states.to(self.wkv.weight.dtype)).to(hidden_states.dtype)
+            return self.norm(latent)
         x = hidden_states.float()
         usable = (x.shape[1] // ratio) * ratio
         kv = self.wkv(x[:, :usable]).unflatten(1, (-1, ratio))
