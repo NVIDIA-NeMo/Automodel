@@ -55,7 +55,6 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4GroupedLinear,
     DeepseekV4HyperConnection,
     _compressed_window_metadata,
-    _dsv4_kernel_backend,
 )
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
@@ -750,6 +749,10 @@ class DeepseekV41Attention(nn.Module):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
+        if self.backend.attn not in ("eager", "sdpa", "tilelang"):
+            raise ValueError("DeepSeek V4.1 attention supports backend.attn='eager', 'sdpa', or 'tilelang'")
+        if self.backend.linear != "torch" or self.backend.rms_norm != "torch_fp32":
+            raise ValueError("DeepSeek V4.1 attention requires torch linear layers and torch_fp32 RMSNorm")
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratio(layer_idx)
         self.is_kv_source = config.is_kv_source(layer_idx)
@@ -909,20 +912,50 @@ class DeepseekV41Attention(nn.Module):
             keys = torch.cat([kv, state.compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
 
-        attn_output = dsv4_sparse_attention(
-            q,
-            keys.contiguous(),
-            self.sinks_param(q),
-            topk_idxs,
-            self.scaling,
-            backend=_dsv4_kernel_backend(self.backend),
-            reference_rounding=self.backend.attn == "tilelang",
-        )  # [B, S, H, D]
+        if self.backend.attn == "tilelang":
+            attn_output = dsv4_sparse_attention(
+                q,
+                keys.contiguous(),
+                self.sinks_param(q),
+                topk_idxs,
+                self.scaling,
+                backend="tilelang",
+                reference_rounding=True,
+            )  # [B, S, H, D]
+        else:
+            # Map invalid sparse slots to a separate sentinel column so they
+            # cannot overwrite visibility for a real key, including key zero.
+            key_len = keys.shape[1]
+            allowed = torch.zeros(batch, seq_len, key_len + 1, dtype=torch.bool, device=hidden_states.device)
+            valid = (topk_idxs >= 0) & (topk_idxs < key_len)
+            indices = torch.where(valid, topk_idxs, key_len).long()
+            allowed = allowed.scatter(-1, indices, True)[..., :key_len]
+
+            # The zero-valued extra key contributes exp(sink) only to the
+            # denominator, preserving the original dense attention arithmetic.
+            keys = torch.cat((keys, keys.new_zeros(batch, 1, self.head_dim)), dim=1)
+            bias = torch.zeros(batch, 1, seq_len, key_len, device=hidden_states.device, dtype=torch.float32)
+            bias = bias.masked_fill(~allowed.unsqueeze(1), -torch.inf).expand(-1, self.num_heads, -1, -1)
+            sink = self.sinks_param(q).view(1, self.num_heads, 1, 1).expand(batch, -1, seq_len, -1)
+            bias = torch.cat((bias, sink), dim=-1)
+            if self.backend.attn == "sdpa":
+                attn_output = F.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    keys.unsqueeze(1),
+                    keys.unsqueeze(1),
+                    attn_mask=bias,
+                    scale=self.scaling,
+                ).transpose(1, 2)
+            else:
+                logits = torch.einsum("bshd,btd->bhst", q.float(), keys.float()) * self.scaling
+                probabilities = (logits + bias).softmax(dim=-1)
+                attn_output = torch.einsum("bhst,btd->bshd", probabilities, keys.float()).to(q.dtype)
 
         # Undo the query rotation on the output so the cache can stay in one shared rotated form.
         attn_output = _apply_partial_rope(attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim).transpose(1, 2)
         grouped = attn_output.reshape(batch, seq_len, self.config.o_groups, -1)
-        return self.wo_b(self.wo_a(grouped).flatten(2))
+        output = self.wo_b(self.wo_a(grouped).flatten(2))
+        return output.masked_fill((seq_ids <= 0).unsqueeze(-1), 0)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b, self.wo_a):
