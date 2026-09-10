@@ -36,6 +36,7 @@ from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsLoRA,
     _pad_lora_rank_for_grouped_mm,
 )
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 
@@ -174,8 +175,15 @@ def test_grouped_experts_deepep_lora_init(moe_config, device):
 
 def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     """Test that LoRA wrapping preserves the source expert dispatcher backend."""
+    backend = BackendConfig(
+        dispatcher_hybridep_permute_fusion=True,
+        dispatcher_hybridep_num_sms_preprocessing=132,
+        dispatcher_hybridep_num_blocks_permute=112,
+        dispatcher_hybridep_num_blocks_unpermute=112,
+    )
     orig_experts = GroupedExpertsDeepEP(
         moe_config,
+        backend=backend,
         dispatcher_backend="hybridep",
         dispatcher_num_sms=24,
         dispatcher_share_token_dispatcher=False,
@@ -190,6 +198,10 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     assert lora_experts.dispatcher_num_sms == 24
     assert lora_experts.dispatcher_share_token_dispatcher is False
     assert lora_experts.dispatcher_async_dispatch is True
+    assert lora_experts.dispatcher_hybridep_permute_fusion is True
+    assert lora_experts.dispatcher_hybridep_num_sms_preprocessing == 132
+    assert lora_experts.dispatcher_hybridep_num_blocks_permute == 112
+    assert lora_experts.dispatcher_hybridep_num_blocks_unpermute == 112
     assert lora_experts.use_torch_mm is True
     assert lora_experts.use_mxfp8 is True
 
