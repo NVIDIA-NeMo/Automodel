@@ -336,9 +336,24 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                         valid_rows = max(0, self._engram_rows[int(engram[1])] - row_start)
                         tensor.to_local()[valid_rows:].zero_()
                     destinations = self.convert_single_tensor_to_hf(
-                        fqn, tensor, for_checkpoint_load=True, quantization=False, exclude_key_regex=r".*_extra_state.*"
+                        fqn,
+                        tensor,
+                        for_checkpoint_load=True,
+                        preserve_dtensor_load_views=True,
+                        quantization=False,
+                        exclude_key_regex=r".*_extra_state.*",
                     )
                     for key, destination in destinations:
+                        local = destination.to_local() if isinstance(destination, DTensor) else destination
+                        if f".{self._expert_path_segment}." in fqn and local.numel():
+                            native_local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+                            if (
+                                local.device != native_local.device
+                                or local.untyped_storage().data_ptr() != native_local.untyped_storage().data_ptr()
+                            ):
+                                raise ValueError(
+                                    f"Streaming expert destination {key} does not alias model storage {fqn}"
+                                )
                         if key not in weight_map:
                             raise ValueError(f"Checkpoint is missing model tensor {key}")
                         shard_name = weight_map[key]
@@ -365,7 +380,6 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                                 f"Checkpoint {key} has decoded shape {tuple(source_shape)}, "
                                 f"expected {tuple(destination.shape)}"
                             )
-                        local = destination.to_local() if isinstance(destination, DTensor) else destination
                         offsets = _local_offsets(destination) if isinstance(destination, DTensor) else (0,) * local.ndim
                         if scale_source is not None and local.ndim != 2:
                             raise ValueError(f"Quantized checkpoint tensor {key} must be two-dimensional")

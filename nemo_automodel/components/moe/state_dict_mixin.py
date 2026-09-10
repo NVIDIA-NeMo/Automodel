@@ -1010,6 +1010,7 @@ class MoESplitExpertsStateDictMixin:
         *,
         prefix_override: str | None = None,
         for_checkpoint_load: bool = False,
+        preserve_dtensor_load_views: bool = False,
         **kwargs,
     ) -> list[tuple[str, torch.Tensor]]:
         """Convert one grouped expert tensor to Hugging Face's per-expert layout.
@@ -1026,6 +1027,9 @@ class MoESplitExpertsStateDictMixin:
                 outside the main backbone, e.g. ``"mtp."`` for the MTP head.
             for_checkpoint_load: Return views that DCP will completely overwrite. Save/export callers leave this
                 disabled so converted tensors preserve their current values in contiguous storage.
+            preserve_dtensor_load_views: Also retain non-contiguous DTensor views for unquantized checkpoint
+                destinations. Streaming loaders that copy directly into model storage opt in; ordinary DCP and
+                export callers retain the existing contiguous conversion and reconstruction behavior.
             **kwargs: Absorbed for forward-compatibility with base callers
                 that forward arbitrary state-dict kwargs (e.g. ``exclude_key_regex``).
 
@@ -1073,10 +1077,23 @@ class MoESplitExpertsStateDictMixin:
         )
 
         def checkpoint_load_destination(view: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
-            """Return the checkpoint-layout view that DCP will fill."""
+            """Choose an aliasing load view or a contiguous projection tensor.
+
+            Args:
+                view: Released projection [output, input], possibly a DTensor whose local matrix aliases the
+                    grouped expert storage. Its dtype is unchanged.
+                source: Per-expert native matrix [input, output] or [input, 2 * output], used to distinguish
+                    ordinary local tensors from DTensors that retain an inner-axis shard.
+
+            Returns:
+                The same projection view for an unquantized load when the source is local or DTensor views are
+                explicitly enabled; otherwise its contiguous equivalent. DTensor global/local shapes, mesh,
+                placements and dtype are preserved. Making a non-contiguous projection contiguous copies its
+                storage, so callers using that result must reconstruct the native tensor after loading.
+            """
             nonlocal reused_checkpoint_load_views
 
-            if for_checkpoint_load and not quantization and not is_dtensor(source):
+            if for_checkpoint_load and not quantization and (not is_dtensor(source) or preserve_dtensor_load_views):
                 reused_checkpoint_load_views = True
                 return view
 

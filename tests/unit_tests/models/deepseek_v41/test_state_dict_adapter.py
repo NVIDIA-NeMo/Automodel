@@ -72,6 +72,7 @@ def _adapter(
     second_engram_rows: int | None = None,
     dtype: torch.dtype = torch.float32,
     experts: str = "torch_mm",
+    dim: int = 32,
 ) -> DeepseekV41StateDictAdapter:
     engram_layers = [] if engram_rows is None else [1]
     table_rows = [] if engram_rows is None else [engram_rows]
@@ -80,8 +81,8 @@ def _adapter(
         table_rows.append(second_engram_rows)
     text = DeepseekV41TextConfig(
         vocab_size=64,
-        hidden_size=32,
-        moe_intermediate_size=32,
+        hidden_size=dim,
+        moe_intermediate_size=dim,
         num_hidden_layers=15 if second_engram_rows is not None else 2,
         n_routed_experts=2,
         num_experts_per_tok=1,
@@ -90,9 +91,9 @@ def _adapter(
         dtype=str(dtype).removeprefix("torch."),
     )
     moe = MoEConfig(
-        dim=32,
-        inter_dim=32,
-        moe_inter_dim=32,
+        dim=dim,
+        inter_dim=dim,
+        moe_inter_dim=dim,
         n_routed_experts=2,
         n_shared_experts=1,
         n_activated_experts=1,
@@ -275,6 +276,32 @@ def test_streaming_checkpoint_rejects_reduced_precision_strict_storage(tmp_path)
     assert torch.equal(model.state_dict()[fqn], original)
 
 
+def test_streaming_checkpoint_rejects_detached_expert_destinations(tmp_path, monkeypatch) -> None:
+    adapter = _adapter()
+    state = {"model.layers.0.ffn.experts.gate_and_up_projs": torch.full((2, 32, 64), -101.0)}
+    save_file(adapter.to_hf(state), tmp_path / "model.safetensors")
+    convert = adapter.convert_single_tensor_to_hf
+
+    def detached_destinations(fqn, tensor, **kwargs):
+        """Simulate projection copies that cannot update grouped model storage.
+
+        Args:
+            fqn: Native expert parameter name.
+            tensor: Grouped expert tensor [experts, hidden, 2 * intermediate].
+            **kwargs: Forwarded checkpoint conversion options.
+
+        Returns:
+            Released names and detached-storage projection matrices [output, input], preserving the source
+            dtype and values. Each matrix has storage distinct from the model parameter.
+        """
+        return [(key, value.clone()) for key, value in convert(fqn, tensor, **kwargs)]
+
+    monkeypatch.setattr(adapter, "convert_single_tensor_to_hf", detached_destinations)
+    with pytest.raises(ValueError, match="does not alias model storage"):
+        adapter.load_from_checkpoint(_checkpoint_model(state), tmp_path)
+    assert (state["model.layers.0.ffn.experts.gate_and_up_projs"] == -101).all()
+
+
 def test_quantized_load_destinations_match_dump_and_do_not_alias_model() -> None:
     adapter = _adapter()
     native = {
@@ -418,13 +445,19 @@ def test_uneven_engram_owner_rows_and_misaligned_dense_shards(tmp_path: Path) ->
     mp.spawn(_owner_checkpoint_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)
 
 
-def _quantized_checkpointer_worker(rank: int, rendezvous: str) -> None:
-    """Read a real quantized HF dump and round-trip trained SafeTensors shards."""
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size: int = 1) -> None:
+    """Read a real quantized HF dump through streaming and DCP, then round-trip SafeTensors."""
+    world_size = 2 * expert_shard_size
+    dim = 32 * expert_shard_size
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size)
     try:
-        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("fsdp",))
-        expert_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
-        adapter = _adapter(17, second_engram_rows=19, dtype=torch.bfloat16, experts="torch_linear")
+        mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("fsdp",))
+        expert_mesh = (
+            init_device_mesh("cpu", (expert_shard_size, 2), mesh_dim_names=("ep_shard", "ep"))
+            if expert_shard_size > 1
+            else init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
+        )
+        adapter = _adapter(17, second_engram_rows=19, dtype=torch.bfloat16, experts="torch_linear", dim=dim)
         source = {}
         expected = {}
         for layer, rows in ((1, 17), (14, 19)):
@@ -433,7 +466,10 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str) -> None:
             source[f"layers.{layer}.engram.embed.weight"] = raw
             source[f"layers.{layer}.engram.embed.scale"] = scales
             logical = (raw.float() * scales.float().repeat_interleave(32, dim=1)).bfloat16()
-            expected[f"model.layers.{layer}.engram.embed.weight"] = torch.nn.functional.pad(logical, (0, 0, 0, 1))
+            padded_rows = (rows + world_size - 1) // world_size * world_size
+            expected[f"model.layers.{layer}.engram.embed.weight"] = torch.nn.functional.pad(
+                logical, (0, 0, 0, padded_rows - rows)
+            )
 
         raw = (torch.arange(65 * 64).reshape(65, 64) % 5 - 2).to(torch.float8_e4m3fn)
         scales = torch.tensor([[0.5, 1.0], [2.0, 4.0], [8.0, 16.0]]).to(torch.float8_e8m0fnu)
@@ -450,16 +486,18 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str) -> None:
         projections = {}
         for expert in range(2):
             for projection in (1, 2, 3):
-                row, column = torch.meshgrid(torch.arange(32), torch.arange(16), indexing="ij")
+                row, column = torch.meshgrid(torch.arange(dim), torch.arange(dim // 2), indexing="ij")
                 low = (row + column + expert * 3 + projection * 5) % 16
                 high = (row * 3 + column * 5 + expert + projection) % 16
                 raw = (low | (high << 4)).to(torch.uint8).view(torch.int8)
-                scales = (2.0 ** (torch.arange(32).reshape(32, 1) % 3 - 1)).to(torch.float8_e8m0fnu)
+                scales = (2.0 ** ((torch.arange(dim)[:, None] + 2 * torch.arange(dim // 32)[None, :]) % 3 - 1)).to(
+                    torch.float8_e8m0fnu
+                )
                 key = f"layers.0.ffn.experts.{expert}.w{projection}"
                 source[f"{key}.weight"] = raw
                 source[f"{key}.scale"] = scales
                 decoded = torch.stack((fp4_values[low], fp4_values[high]), dim=-1).flatten(1)
-                projections[expert, projection] = (decoded * scales.float()).bfloat16()
+                projections[expert, projection] = (decoded * scales.float().repeat_interleave(32, dim=1)).bfloat16()
         expected["model.layers.0.ffn.experts.gate_and_up_projs"] = torch.stack(
             [torch.cat((projections[expert, 1].T, projections[expert, 3].T), dim=-1) for expert in range(2)]
         )
@@ -492,18 +530,57 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str) -> None:
             )
             adapter.config.save_pretrained(checkpoint)
         dist.barrier()
-        tensors = {
-            key: DTensor.from_local(
-                torch.full_like(value.chunk(2, dim=0)[rank], -101),
-                expert_mesh if ".ffn.experts." in key else mesh,
-                (Shard(0),),
+        local_expected = {}
+        tensors = {}
+        for key, value in expected.items():
+            expert = ".ffn.experts." in key
+            if expert:
+                local = value[rank % 2 : rank % 2 + 1]
+                if expert_shard_size > 1:
+                    local = local[:, (rank // 2) * 32 : (rank // 2 + 1) * 32]
+                placements = (Shard(1), Shard(0)) if expert_shard_size > 1 else (Shard(0),)
+            else:
+                local_rows = (value.shape[0] + world_size - 1) // world_size
+                local = value[rank * local_rows : (rank + 1) * local_rows]
+                placements = (Shard(0),)
+            local_expected[key] = local
+            tensors[key] = DTensor.from_local(
+                torch.full_like(local, -101),
+                expert_mesh if expert else mesh,
+                placements,
                 shape=value.shape,
                 stride=value.stride(),
             )
-            for key, value in expected.items()
-        }
         model = _CheckpointOnlyV41(adapter.config, tensors)
         model.state_dict_adapter = adapter
+        if expert_shard_size > 1:
+            for key, tensor in model.state_dict().items():
+                if ".ffn.experts." not in key:
+                    continue
+                pointer = tensor.to_local().untyped_storage().data_ptr()
+                # Only an explicitly enabled floating load can keep the inner-sharded views.
+                for loading, quantized, preserve, aliases in (
+                    (True, False, True, True),
+                    (True, False, False, False),
+                    (False, False, True, False),
+                    (True, True, True, False),
+                ):
+                    converted = adapter.convert_single_tensor_to_hf(
+                        key,
+                        tensor,
+                        for_checkpoint_load=loading,
+                        quantization=quantized,
+                        preserve_dtensor_load_views=preserve,
+                    )
+                    for _, destination in converted:
+                        assert isinstance(destination, DTensor)
+                        assert (destination.to_local().untyped_storage().data_ptr() == pointer) == aliases
+        adapter.load_from_checkpoint(model, checkpoint, device_mesh=expert_mesh)
+        for key, tensor in model.state_dict().items():
+            reference = local_expected[key]
+            assert tensor.dtype == reference.dtype and tensor.to_local().dtype == reference.dtype
+            torch.testing.assert_close(tensor.to_local(), reference, rtol=0, atol=0)
+            tensor.to_local().fill_(-101)
         checkpointer = Checkpointer(
             CheckpointingConfig(
                 checkpoint_dir=str(root),
@@ -522,7 +599,7 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str) -> None:
         try:
             checkpointer.load_model(model, str(checkpoint), is_init_step=True)
             for key, tensor in model.state_dict().items():
-                reference = expected[key].chunk(2, dim=0)[rank]
+                reference = local_expected[key]
                 assert tensor.dtype == reference.dtype and tensor.to_local().dtype == reference.dtype
                 torch.testing.assert_close(tensor.to_local(), reference, rtol=0, atol=0)
             checkpointer.save_model(model, str(root / "trained_safetensors"))
@@ -530,7 +607,7 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str) -> None:
                 tensor.to_local().fill_(-99)
             checkpointer.load_model(model, str(root / "trained_safetensors" / "model"))
             for key, tensor in model.state_dict().items():
-                reference = expected[key].chunk(2, dim=0)[rank]
+                reference = local_expected[key]
                 assert tensor.dtype == reference.dtype and tensor.to_local().dtype == reference.dtype
                 torch.testing.assert_close(tensor.to_local(), reference, rtol=0, atol=0)
         finally:
@@ -539,5 +616,11 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
-def test_real_quantized_hf_initialization_and_safetensors_resume(tmp_path: Path) -> None:
-    mp.spawn(_quantized_checkpointer_worker, args=(str(tmp_path / "quantized_rendezvous"),), nprocs=2, join=True)
+@pytest.mark.parametrize("expert_shard_size", [1, 2], ids=["ep2", "ep2_fsdp2"])
+def test_real_quantized_hf_initialization_and_safetensors_resume(tmp_path: Path, expert_shard_size: int) -> None:
+    mp.spawn(
+        _quantized_checkpointer_worker,
+        args=(str(tmp_path / "quantized_rendezvous"), expert_shard_size),
+        nprocs=2 * expert_shard_size,
+        join=True,
+    )

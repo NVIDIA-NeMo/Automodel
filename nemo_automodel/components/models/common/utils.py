@@ -769,6 +769,20 @@ def cast_model_to_dtype(
                 fp32_tensor_ids.add(id(buf))
 
         def convert(tensor: torch.Tensor) -> torch.Tensor:
+            """Cast an arbitrary-rank tensor using the enclosing dtype policy.
+
+            Args:
+                tensor: Parameter, gradient, or buffer of any rank and dtype;
+                    may be a DTensor.
+
+            Returns:
+                Tensor with unchanged shape and device. Floating-point or complex
+                inputs use FP32 when their identity is protected, otherwise ``dtype``;
+                integer and boolean inputs are returned unchanged. For DTensors,
+                global/local shapes, mesh, and placements are unchanged. The result
+                is the input object and aliases its storage when no cast is needed;
+                a dtype change allocates new storage.
+            """
             if not tensor.is_floating_point() and not tensor.is_complex():
                 return tensor
             return tensor.to(torch.float32 if id(tensor) in fp32_tensor_ids else dtype)
