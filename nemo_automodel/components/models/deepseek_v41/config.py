@@ -17,8 +17,9 @@
 The released ``config.json`` nests the language backbone under ``text_config``
 and the vision tower under ``vision_config``. This config preserves the flat
 text-field API used by the decoder and materializes vision metadata as a typed
-configuration. Omitting vision metadata keeps checkpoint-free text models small;
-loading the released vision metadata enables its tower unless explicitly disabled.
+configuration. Defaults match the released text and vision configuration;
+checkpoint-free tiny models can explicitly override their schedules and disable
+the vision tower with ``num_hidden_layers=0`` in ``vision_config``.
 
 Architecture summary (see ``DeepSeek_V41_Tech_Report.pdf``):
 
@@ -102,7 +103,11 @@ class DeepseekV41VisionConfig(PretrainedConfig):
 
 
 class DeepseekV41Config(PretrainedConfig):
-    """Flat text configuration with an optional typed DeepSeek V4.1 vision tower."""
+    """Flat text configuration with released defaults and a typed vision tower.
+
+    Reducing num_hidden_layers retains the full released sharing and hashing
+    schedules. Explicit smaller schedules support independent tiny models.
+    """
 
     model_type = "deepseek_v41"
     sub_configs = {"vision_config": DeepseekV41VisionConfig}
@@ -131,7 +136,7 @@ class DeepseekV41Config(PretrainedConfig):
         tie_word_embeddings: bool = False,
         max_position_embeddings: int = 1048576,
         rope_theta: float = 10000.0,
-        rope_scaling: dict | None = None,
+        rope_scaling: dict[str, Any] | None = None,
         # MoE
         n_routed_experts: int = 384,
         n_shared_experts: int = 1,
@@ -150,9 +155,9 @@ class DeepseekV41Config(PretrainedConfig):
         index_head_dim: int = 128,
         index_topk: int = 512,
         # Hierarchical sparse indexer (``candidate_source_layer_id < 0`` disables it)
-        candidate_source_layer_id: int = -1,
-        candidate_topk_blocks: int = 0,
-        candidate_block_size: int = 0,
+        candidate_source_layer_id: int = 20,
+        candidate_topk_blocks: int = 2048,
+        candidate_block_size: int = 8,
         # Hyper-connections (mHC)
         hc_mult: int = 4,
         hc_sinkhorn_iters: int = 20,
@@ -165,15 +170,15 @@ class DeepseekV41Config(PretrainedConfig):
         engram_n_heads: int = 8,
         engram_head_dim: int = 256,
         engram_pad_token_id: int = 2,
-        engram_compressed_vocab_size: int = 0,
+        engram_compressed_vocab_size: int = 99092,
         # DSpark draft head (checkpoint metadata only; not trained here)
-        num_nextn_predict_layers: int = 0,
-        dspark_block_size: int = 0,
-        dspark_noise_token_id: int = 0,
+        num_nextn_predict_layers: int = 3,
+        dspark_block_size: int = 5,
+        dspark_noise_token_id: int = 128799,
         dspark_target_layer_ids: list[int] | None = None,
         dspark_markov_rank: int = 256,
-        dspark_n_routed_experts: int = 0,
-        dspark_num_experts_per_tok: int = 0,
+        dspark_n_routed_experts: int = 128,
+        dspark_num_experts_per_tok: int = 3,
         # Multimodal bridge metadata; zero vision layers disable the tower
         image_token_id: int = 129264,
         vision_config: dict[str, Any] | DeepseekV41VisionConfig | None = None,
@@ -182,13 +187,13 @@ class DeepseekV41Config(PretrainedConfig):
         engram_trainable: bool = False,
         kv_cache_fake_quant: bool = True,
         # Standard options
-        pad_token_id: int | None = None,
+        pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
         pretraining_tp: int = 1,
         torch_dtype: str | None = None,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         dtype = kwargs.pop("dtype", None)
         resolved_dtype = dtype if dtype is not None else torch_dtype
         if resolved_dtype is None:
@@ -215,7 +220,17 @@ class DeepseekV41Config(PretrainedConfig):
         self.initializer_range = initializer_range
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        self.rope_scaling = (
+            {
+                "rope_type": "yarn",
+                "factor": 16,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "original_max_position_embeddings": 65536,
+            }
+            if rope_scaling is None
+            else dict(rope_scaling)
+        )
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -224,10 +239,15 @@ class DeepseekV41Config(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
         self.sliding_window = sliding_window
-        self.compress_ratios = list(compress_ratios or [])
+        # The released schedule includes three SWA-only DSpark layers.
+        self.compress_ratios = (
+            [0, 0] + [2] * 18 + [1] * 20 + [0] * 3 if compress_ratios is None else list(compress_ratios)
+        )
         self.compress_rope_theta = compress_rope_theta
-        self.kv_source_layer_ids = list(kv_source_layer_ids or [])
-        self.index_source_layer_ids = list(index_source_layer_ids or [])
+        self.kv_source_layer_ids = [2, 8, 14, 20] if kv_source_layer_ids is None else list(kv_source_layer_ids)
+        self.index_source_layer_ids = (
+            [2, 8, 14, 20, 24, 28, 32, 36] if index_source_layer_ids is None else list(index_source_layer_ids)
+        )
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
@@ -237,8 +257,12 @@ class DeepseekV41Config(PretrainedConfig):
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
-        self.engram_layer_ids = list(engram_layer_ids or [])
-        self.engram_num_embeddings = list(engram_num_embeddings or [])
+        self.engram_layer_ids = [1, 14] if engram_layer_ids is None else list(engram_layer_ids)
+        self.engram_num_embeddings = (
+            ([384006168, 384016682] if self.engram_layer_ids else [])
+            if engram_num_embeddings is None
+            else list(engram_num_embeddings)
+        )
         self.engram_max_ngram_size = engram_max_ngram_size
         self.engram_vocab_size = engram_vocab_size
         self.engram_n_heads = engram_n_heads
@@ -248,13 +272,15 @@ class DeepseekV41Config(PretrainedConfig):
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.dspark_block_size = dspark_block_size
         self.dspark_noise_token_id = dspark_noise_token_id
-        self.dspark_target_layer_ids = [int(i) for i in (dspark_target_layer_ids or [])]
+        self.dspark_target_layer_ids = (
+            [37, 38, 39] if dspark_target_layer_ids is None else list(dspark_target_layer_ids)
+        )
         self.dspark_markov_rank = dspark_markov_rank
         self.dspark_n_routed_experts = dspark_n_routed_experts
         self.dspark_num_experts_per_tok = dspark_num_experts_per_tok
         self.image_token_id = image_token_id
         if vision_config is None:
-            vision_config = DeepseekV41VisionConfig(num_hidden_layers=0)
+            vision_config = DeepseekV41VisionConfig()
         elif isinstance(vision_config, dict):
             vision_config = DeepseekV41VisionConfig(**vision_config)
         elif not isinstance(vision_config, DeepseekV41VisionConfig):
