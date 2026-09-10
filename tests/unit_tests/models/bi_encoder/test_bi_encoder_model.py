@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import nemo_automodel._transformers.auto_model as am
+import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
 import nemo_automodel.recipes.retrieval.train_bi_encoder as tbe
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
@@ -498,8 +499,6 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     detach_distributed_inbatch_negatives,
 ):
     """Exercise the trainer branch that gathers token embeddings across ranks."""
-    import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
-
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)

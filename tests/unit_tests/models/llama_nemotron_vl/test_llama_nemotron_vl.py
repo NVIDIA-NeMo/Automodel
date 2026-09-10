@@ -22,6 +22,8 @@ from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import SiglipAttention
 from transformers.processing_utils import ProcessorMixin
 
+import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+from nemo_automodel._transformers.retrieval import BiEncoderModel
 from nemo_automodel.components.models.llama_nemotron_vl.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalModel,
@@ -136,8 +138,6 @@ def processor(monkeypatch):
 
 @pytest.fixture
 def tiny_model(monkeypatch, processor):
-    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
-
     monkeypatch.setattr(model_module.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
     config = LlamaNemotronVLConfig(
         vision_config=_tiny_vision_config(),
@@ -552,8 +552,6 @@ def test_llama_nemotron_text_backbone_honors_attention_policy(is_causal):
 @pytest.fixture
 def tiny_retrieval_vlm(monkeypatch, processor):
     """Real CPU text/vision towers; only external processor loading is replaced."""
-    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
-
     monkeypatch.setattr(model_module.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
     config = LlamaNemotronVLConfig(
         vision_config=_tiny_vision_config(),
@@ -569,8 +567,6 @@ def tiny_retrieval_vlm(monkeypatch, processor):
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_retrieval_attention_policy_is_scoped_to_llama_nemotron_text_tower(tiny_retrieval_vlm, is_causal):
     """Retrieval causality must never change the VL model's vision tower."""
-    from nemo_automodel._transformers.retrieval import BiEncoderModel
-
     model = tiny_retrieval_vlm
     vision_attentions = [module for module in model.vision_model.modules() if isinstance(module, SiglipAttention)]
     assert len(vision_attentions) == 1
@@ -596,8 +592,6 @@ def test_retrieval_attention_policy_is_scoped_to_llama_nemotron_text_tower(tiny_
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_retrieval_vlm_round_trip_preserves_embeddings_and_text_policy(tmp_path, tiny_retrieval_vlm, is_causal):
     """A local VL checkpoint restores multimodal outputs and accepts text-only policy overrides."""
-    from nemo_automodel._transformers.retrieval import BiEncoderModel
-
     encoder = BiEncoderModel(tiny_retrieval_vlm, pooling="cls", is_causal=is_causal).eval()
     inputs = {
         "input_ids": torch.tensor([[1, IMG_CONTEXT_TOKEN_ID, 2, 3]]),

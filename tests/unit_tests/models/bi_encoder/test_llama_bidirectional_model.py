@@ -21,6 +21,7 @@ from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassificati
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.models.llama.modeling_llama import LlamaModel
 
+import nemo_automodel._transformers.retrieval as encoder_module
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
@@ -452,8 +453,7 @@ def test_encoder_build_and_save(tmp_path, monkeypatch):
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", {"LlamaBidirectionalModel": FakeBidirectionalModel})
 
     # Directory path with config.json to hit config-reading branch
     model_dir = tmp_path / "model"
@@ -538,8 +538,7 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", {"LlamaBidirectionalModel": FakeBidirectionalModel})
 
     # Create a model directory whose path has no 'llama' substring
     model_dir = tmp_path / "scratch" / "job" / "model"
@@ -547,8 +546,6 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
     (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
 
     # Mock AutoConfig.from_pretrained to return a config with the llama_bidirec model_type
-    import nemo_automodel._transformers.retrieval as encoder_module
-
     class FakeConfig:
         model_type = "llama_bidirec"
 
@@ -573,12 +570,9 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", {"LlamaBidirectionalModel": FakeBidirectionalModel})
 
     # Model type not in SUPPORTED_BACKBONES should fall back to AutoModel
-    import nemo_automodel._transformers.retrieval as encoder_module
-
     class FakeAutoModel(FakeLM):
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
@@ -596,8 +590,6 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
 
     # For hub path tests, we need to mock AutoConfig.from_pretrained since the new code
     # calls it first to determine model type before using the registry
-    import nemo_automodel._transformers.retrieval as encoder_module
-
     class FakeConfig:
         model_type = "llama"
 
@@ -615,7 +607,6 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
 
 def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
     """CrossEncoderModel should use AutoModelForSequenceClassification for unsupported model types."""
-    import nemo_automodel._transformers.retrieval as encoder_module
 
     class FakeSeqClsModel(FakeLM):
         @classmethod

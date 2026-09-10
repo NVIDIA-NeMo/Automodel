@@ -25,7 +25,12 @@ import torch.nn as nn
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
 
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
+from nemo_automodel._transformers.retrieval import (
+    SUPPORTED_BACKBONES,
+    BiEncoderModel,
+    _init_encoder_common,
+    configure_encoder_metadata,
+)
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
@@ -183,8 +188,9 @@ def test_encoder_build_legacy_ministral_registry_path(tmp_path, monkeypatch):
         def from_pretrained(cls, *args, **kwargs):
             return cls(hidden=16)
 
-    ModelRegistry.model_arch_name_to_cls["Ministral3BidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(
+        ModelRegistry, "model_arch_name_to_cls", {"Ministral3BidirectionalModel": FakeBidirectionalModel}
+    )
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -203,8 +209,6 @@ def test_encoder_build_legacy_ministral_registry_path(tmp_path, monkeypatch):
 
 
 def test_ministral_dispatch_uses_custom_class_only_for_legacy_checkpoints():
-    from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
-
     assert "ministral3" not in SUPPORTED_BACKBONES
     assert SUPPORTED_BACKBONES["ministral3_bidirec"]["embedding"] == "Ministral3BidirectionalModel"
 
