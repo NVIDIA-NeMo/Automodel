@@ -1509,6 +1509,23 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         # Keep the fp32 SSM-gating params fp32 (skip them in the dtype cast); each
         # ``_fp32_params`` holder is sharded as its own fp32 FSDP group.
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        # The cast above also rounds the vision tower's rotary ``inv_freq`` — a
+        # non-persistent fp32 buffer that feeds every patch's RoPE — down to bf16
+        # (0.5995 -> 0.5977), corrupting all vision position encodings (observed:
+        # vision activations diverge by ~1.5e3 vs upstream HF). The text backbone
+        # guards against this via Fp32SafeQwen3_5TextRotaryEmbedding; re-derive the
+        # vision table at full precision after the cast (theta/dim live on the module,
+        # so this is a pure function of config — no snapshot needed).
+        vision_rotary = getattr(getattr(self.model, "visual", None), "rotary_pos_emb", None)
+        if vision_rotary is not None and hasattr(vision_rotary, "inv_freq") and dtype != torch.float32:
+            inv_freq_fp32 = 1.0 / (
+                vision_rotary.theta
+                ** (
+                    torch.arange(0, vision_rotary.dim, 2, dtype=torch.float32, device=vision_rotary.inv_freq.device)
+                    / vision_rotary.dim
+                )
+            )
+            vision_rotary.inv_freq = inv_freq_fp32
 
 
 ModelClass = Qwen3_5ForCausalLM
