@@ -37,7 +37,7 @@ inference-time KV caching, and SWA bounded replay remain out of scope.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -538,86 +538,53 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def forward(
         self,
-        input_ids: torch.Tensor | None = None,
-        *,
-        position_ids: torch.Tensor | None = None,
+        input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        padding_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        *,
         labels: torch.Tensor | None = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        return_hidden_states: bool = False,
-        output_hidden_states: bool = False,
         pixel_values: torch.Tensor | None = None,
         image_grid_hws: torch.Tensor | None = None,
         vision_token_types: torch.Tensor | None = None,
-        **attn_kwargs: Any,
+        logits_to_keep: int | torch.Tensor = 0,
+        return_hidden_states: bool = False,
+        output_hidden_states: bool = False,
     ) -> CausalLMOutputWithPast:
-        """Run causal language modeling.
+        """Compute full-vocabulary logits or hidden states for the training loss.
 
         Args:
-            input_ids: ``[B, S]`` token ids (``[T]`` for packed THD).
-            position_ids: ``[B, S]`` document-relative positions.
-            attention_mask: ``[B, S]`` valid-token mask.
-            padding_mask: ``[B, S]`` bool padding mask.
-            labels: Optional int64 targets [batch, sequence] for unpacked inputs.
-                Logits at positions 0..S-2 predict labels at positions 1..S-1;
-                targets equal to -100 are ignored. Projected logits must match labels.
-            logits_to_keep: Number or positions of logits to retain.
-            return_hidden_states: Return final hidden states for the recipe loss.
+            input_ids: Integer tensor of shape [batch, sequence].
+            attention_mask: Optional binary right-padding tensor [batch, sequence].
+            position_ids: Optional integer tensor of shape [batch, sequence].
+            labels: Optional targets of shape [batch, sequence], with -100 ignored.
+            pixel_values: Optional image patches [all_patches, 3, patch_size, patch_size].
+            image_grid_hws: Optional patch-grid sizes [images, 2].
+            vision_token_types: Optional image/text markers [batch, sequence].
+            logits_to_keep: Number of final positions, or integer position indices [kept].
+            return_hidden_states: Return final hidden states for the recipe's loss.
             output_hidden_states: Capture residual streams for numerical comparisons.
-            pixel_values: Image patches [all_patches, 3, patch_size, patch_size].
-            image_grid_hws: Integer patch grid sizes [images, 2].
-            vision_token_types: Integer markers [batch, sequence], with -1 for
-                text and 0/1/2/3 for image start/content/newline/end.
 
         Returns:
-            CausalLMOutputWithPast with logits [batch, kept_sequence, vocab]
-            (with a restored batch dimension for packed text), optional final
-            hidden states [batch, sequence, hidden] or captured residual streams,
-            and scalar FP32 mean loss
-            when labels are supplied. Input labels are not modified.
-
-        Raises:
-            ValueError: Projected logits do not match the label shape.
+            CausalLMOutputWithPast containing logits [batch, kept_sequence, vocab],
+            optional scalar loss, and requested hidden tensors. No inference KV cache.
         """
-        if attn_kwargs.pop("_pre_embed_only", False):
-            # Context parallelism is not supported; there is no model-owned CP batch prep.
-            return {}
-        thd_mode = attn_kwargs.get("qkv_format") == "thd"
-        inputs_embeds = attn_kwargs.pop("inputs_embeds", None)
+        inputs_embeds = None
         if pixel_values is not None:
-            if input_ids is None or input_ids.ndim != 2:
-                raise ValueError("Image inputs require unpacked input_ids [batch, sequence]")
-            if thd_mode or any(
-                attn_kwargs.get(key) is not None for key in ("packed_seq_ids", "seq_lens", "seq_lens_padded")
-            ):
-                raise ValueError("DeepSeek V4.1 image inputs do not support packed sequence metadata")
-            if inputs_embeds is not None:
-                raise ValueError("pixel_values and caller-provided inputs_embeds cannot be combined")
             if image_grid_hws is None or vision_token_types is None:
                 raise ValueError("pixel_values requires image_grid_hws and vision_token_types")
             inputs_embeds = self._image_embeddings(input_ids, pixel_values, image_grid_hws, vision_token_types)
         elif image_grid_hws is not None or (vision_token_types is not None and torch.any(vision_token_types >= 0)):
-            raise ValueError("Image spans require pixel_values; image placeholders cannot be treated as ordinary text")
-
-        hidden_states, captured = self.model(
+            raise ValueError("Image spans require pixel_values; image placeholders cannot be trained as ordinary text")
+        hidden, captured = self.model(
             input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            padding_mask=padding_mask,
             inputs_embeds=inputs_embeds,
             vision_token_types=vision_token_types,
             output_hidden_states=output_hidden_states,
-            **attn_kwargs,
         )
-        # The head owns FP32 storage and compute. Keep its FP32 output instead
-        # of using the helper's fp32_lm_head mode, which rounds back to BF16.
         projected = compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=thd_mode,
-            output_hidden_states=return_hidden_states,
+            self.lm_head, hidden, logits_to_keep, output_hidden_states=return_hidden_states
         )
         loss = None
         if labels is not None:
@@ -626,7 +593,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             loss = F.cross_entropy(
                 projected.logits[:, :-1].float().reshape(-1, self.config.vocab_size),
                 labels[:, 1:].reshape(-1),
-                ignore_index=-100,
             )
         return CausalLMOutputWithPast(
             loss=loss,
