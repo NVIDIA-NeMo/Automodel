@@ -44,6 +44,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v4.layers import (
@@ -383,10 +384,12 @@ class DeepseekV41Compressor(nn.Module):
         """``[B, S, hidden] -> [B, S // ratio, head_dim]`` (a trailing partial group is dropped)."""
         ratio = self.compress_ratio
         if ratio == 1:
-            # ``wkv`` may have been promoted to fp32 by the model's keep-in-fp32 policy
-            # (the ratio-agnostic ``self_attn.compressor.wkv`` entry); project in the
-            # weight dtype and hand the latent back in the activation dtype.
-            latent = self.wkv(hidden_states.to(self.wkv.weight.dtype)).to(hidden_states.dtype)
+            # ``wkv`` may be promoted to fp32 by the model's keep-in-fp32 policy (the
+            # ratio-agnostic ``self_attn.compressor.wkv`` entry) and, under FSDP2, the
+            # sharded parameter dtype can differ from the unsharded compute dtype.  Read
+            # the parameter inside forward (unsharded) and project in the activation
+            # dtype, which is what the reference does for ratio-1 compressors.
+            latent = F.linear(hidden_states, self.wkv.weight.to(hidden_states.dtype))
             return self.norm(latent)
         x = hidden_states.float()
         usable = (x.shape[1] // ratio) * ratio
