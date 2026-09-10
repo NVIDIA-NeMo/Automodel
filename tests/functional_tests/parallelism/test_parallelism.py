@@ -33,6 +33,7 @@ GEMMA4_PP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_PP2_Parity.sh"
 GEMMA4_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_TP2_Parity.sh"
 GEMMA4_KV_SHARED_AC_FILENAME = "L2_Parallelism_VLM_Gemma4_KVShared_AC.sh"
 PP_GRAD_ACCUM_PARITY_FILENAME = "L2_Parallelism_PP_Grad_Accum_Parity.sh"
+NEMOTRON_TP_REPLICAS_FILENAME = "L0_Parallelism_Nemotron_TP_Replicas.sh"
 DEEPSEEK_V4_PP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_PP2_Parity.sh"
 DEEPSEEK_V4_EP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_EP2_Parity.sh"
 QWEN3_5_MOE_PP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_PP2_Parity.sh"
@@ -40,6 +41,9 @@ QWEN3_5_MOE_EP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_EP2_Parity.sh"
 
 
 class TestParallelismParity:
+    def test_nemotron_tp_replica_ownership(self):
+        run_test_script(TEST_FOLDER, NEMOTRON_TP_REPLICAS_FILENAME)
+
     def test_gemma4_pp2_parity(self):
         run_test_script(TEST_FOLDER, GEMMA4_PP2_PARITY_FILENAME)
 
