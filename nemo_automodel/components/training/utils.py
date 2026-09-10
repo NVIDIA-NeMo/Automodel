@@ -31,6 +31,9 @@ from nemo_automodel.components.models.common.utils import set_is_first_microbatc
 # - model.layers.X.mlp.experts.down_linear.bias0
 _TE_EXPERT_PARAM_PATTERN = re.compile(r"(^|\.)mlp\.experts\.(gate_up_linear|down_linear)\.(weight|bias)\d+")
 
+# Bound low-precision power reductions, including their FP64 input conversion.
+_GRAD_NORM_CHUNK_NUMEL = 4 * 1024 * 1024
+
 
 def _combine_norms(norms: list[torch.Tensor], norm_type: float, target_device: torch.device) -> torch.Tensor:
     if len(norms) == 0:
@@ -76,6 +79,32 @@ def _all_reduce_scalar(
     comm_scalar = scalar.to(device=mesh.device_type)
     torch.distributed.all_reduce(comm_scalar, op=op, group=group)
     return comm_scalar.to(device=scalar.device)
+
+
+def _iter_grad_chunks(gradient: torch.Tensor) -> Iterable[torch.Tensor]:
+    """Yield bounded gradient views without flattening noncontiguous storage.
+
+    Args:
+        gradient: Local gradient tensor of any shape, including scalar, empty,
+            and noncontiguous tensors. Its dtype and device are unchanged.
+
+    Yields:
+        Views sharing gradient storage, each containing at most
+        _GRAD_NORM_CHUNK_NUMEL elements. This function allocates no tensor data
+        and does not modify the gradient.
+    """
+    if gradient.numel() <= _GRAD_NORM_CHUNK_NUMEL:
+        yield gradient
+        return
+
+    # If one index still exceeds the budget, recurse into its remaining axes.
+    # narrow always creates a view, unlike flatten/reshape on strided gradients.
+    split_dim = next(dim for dim, size in enumerate(gradient.shape) if size > 1)
+    elements_per_index = gradient.numel() // gradient.shape[split_dim]
+    split_size = max(1, _GRAD_NORM_CHUNK_NUMEL // elements_per_index)
+    for start in range(0, gradient.shape[split_dim], split_size):
+        length = min(split_size, gradient.shape[split_dim] - start)
+        yield from _iter_grad_chunks(gradient.narrow(split_dim, start, length))
 
 
 @torch.no_grad()
@@ -195,8 +224,9 @@ def _clip_grad_norm_impl(
                 g = g.full_tensor() if has_partial else g.to_local()
             if g.numel() == 0:
                 continue
-            g_abs_max = g.detach().abs().max().to(device=target_device, dtype=torch.float64)
-            local_max = torch.maximum(local_max, g_abs_max)
+            for chunk in _iter_grad_chunks(g.detach()):
+                g_abs_max = chunk.abs().max().to(device=target_device, dtype=torch.float64)
+                local_max = torch.maximum(local_max, g_abs_max)
 
         if is_dtensor and not has_partial:
             mesh = first.device_mesh
@@ -217,11 +247,17 @@ def _clip_grad_norm_impl(
                 g = g.full_tensor() if has_partial else g.to_local()
             if g.numel() == 0:
                 continue
-            g = g.detach().abs().div(scale)
-            if norm_type == 2.0:
-                local_val = local_val + g.square().sum(dtype=torch.float64)
-            else:
-                local_val = local_val + g.pow(norm_type).sum(dtype=torch.float64)
+            for chunk in _iter_grad_chunks(g.detach()):
+                # Preserve the existing elementwise dtype and global scale.
+                # Only the FP64 sum is partitioned; DTensor communication stays
+                # scalar and independent of each rank's number of chunks.
+                normalized = chunk.abs().div(scale)
+                if norm_type == 2.0:
+                    local_val = local_val + normalized.square().sum(dtype=torch.float64)
+                else:
+                    local_val = local_val + normalized.pow(norm_type).sum(dtype=torch.float64)
+                # Do not retain one chunk's workspace while allocating the next.
+                del normalized
 
         if is_dtensor and not has_partial:
             mesh = first.device_mesh
