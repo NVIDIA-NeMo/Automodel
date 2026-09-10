@@ -94,7 +94,7 @@ navigation:
           - page: "DeepSeek-V4 Pro"
             path: ../../model-coverage/llm/deepseek-ai/dsv4-pro.mdx
           - page: "DeepSeek-V4.1 Flash"
-            path: ../../model-coverage/llm/deepseek-ai/dsv41-flash.mdx
+            path: ../../model-coverage/llm/deepseek-ai/deepseek-v41-flash.mdx
           - page: "Mistral"
             path: ../../model-coverage/llm/mistralai/mistral.mdx
           - page: "Mixtral"

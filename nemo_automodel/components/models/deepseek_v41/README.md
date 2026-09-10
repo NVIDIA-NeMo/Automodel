@@ -18,8 +18,11 @@ router bias. DSpark draft weights under `mtp.*` are excluded.
 
 - [model.py](model.py) owns the backbone loop, per-layer CSA2 state snapshots,
   model-owned Engram sharding, image insertion and FSDP precision contract.
-- [layers.py](layers.py) implements compression, index reuse, candidate masks,
-  mHC and attention, reusing the shared DeepSeek V4 sparse kernels.
+- [attention.py](attention.py) implements CSA2 attention, compression, index
+  reuse and candidate masks, reusing the shared DeepSeek V4 sparse kernels.
+- [quantization.py](quantization.py) implements the KV and index quantization
+  boundaries; [layers.py](layers.py) provides RMSNorm and mHC.
+- [config.py](config.py) defines the nested text and vision configurations.
 - [engram.py](engram.py) supplies V4.1 hashes and gates; its embedding reuses
   the Qwen3.8 Flash Next owner-sharded table and autograd communication.
 - [state_dict_adapter.py](state_dict_adapter.py) maps the released layouts and
@@ -27,70 +30,95 @@ router bias. DSpark draft weights under `mtp.*` are excluded.
 - [processing.py](processing.py) and [vision.py](vision.py) provide ordinary
   text/image processing and the reused DeepSeek V4 vision modules.
 
-CUDA model construction defaults to `torch_mm` experts with `hybridep`
-dispatch, `torch` linears, `torch_fp32` normalization and `tilelang` attention;
-the validation recipe selects these explicitly. CPU construction uses local
-PyTorch experts/dispatch and SDPA. The language-model head computes and
-returns FP32 logits without rounding them back to BF16.
+Model construction defaults to `torch_linear` experts with `hybridep`
+dispatch, `torch` linears, `torch_fp32` normalization and `tilelang` attention.
+There is no automatic CPU backend substitution. Both validation recipes
+explicitly select `torch_mm` experts with HybridEP and TileLang. The
+language-model head computes and returns FP32 logits without rounding them
+back to BF16.
 Shared MoE retains the FP32 combine contract: individual routed contributions
 return to their source ranks, accumulate in expert order, and combine with
 the shared expert before the final BF16 cast. This requires additional
 communication compared with the usual BF16 HybridEP combine.
 
 The default MoE `gate_bias_update_factor` is zero, preserving the released
-router correction biases during fine-tuning. An explicit positive override
-enables the shared MoE's routing-bias updates.
+router correction biases during fine-tuning.
 
-`torch_linear` is an optional explicit expert backend using separate eager
+`torch_linear` uses separate eager
 projections with the same shared parameter storage and dispatcher. It is not
 the selected validation backend. Its historical bitwise reference results
 must not be attributed to `torch_mm`, whose grouped GEMMs and fused pointwise
 operations have different rounding boundaries.
 
 Released FP8 dense matrices, packed FP4 experts and rowwise FP8 Engram tables
-initialize floating-point training parameters. With `kv_cache_fake_quant: true`,
-the forward retains FP8 window KV, NVFP4 compressed KV and MXFP4 index query/key
-quantize/dequantize boundaries. Training uses straight-through gradients.
+initialize floating-point training parameters. The forward always retains
+FP8 window KV, NVFP4 compressed KV and MXFP4 index query/key quantize/dequantize
+boundaries. Training uses straight-through gradients; there is no QAT toggle.
 Indexer parameters remain frozen because discrete top-k does not provide a
 language-model gradient; indexer distillation is outside this implementation.
 
-## Training recipe and ownership
+## Training recipes and ownership
 
 [The EP64 recipe](../../../../examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml)
 targets 16 nodes with four GB200 GPUs each in one verified NVLink domain:
 WORLD=64, EP=64, 64 Engram owners, and TP1/PP1/CP1. Dense parameters use FSDP2;
 experts have no additional FSDP shard axis. Global batch 64 and local batch 1
 give one microbatch per optimizer update. AC and reshard-after-forward are
-enabled. The schedule requests 100 updates with validation and checkpoints
-after updates 50 and 100.
+enabled. The schedule requests 100 updates with validation after updates 50
+and 100; checkpoint saving is disabled. TE FusedAdam uses BF16 moments and
+FP32 master weights stored as int16 remainders. Saving is disabled because TE
+optimizer export expands those moments to FP32 on the GPU. The recipe enables
+online W&B and requests a one-hour allocation.
 
-Engram tables are enabled but frozen by default in the model config. This
-recipe explicitly sets `engram_trainable: true` for both tables. Each table
-is a registered global row-sharded DTensor, excluded from FSDP all-gathers.
-Its owner mesh defaults to WORLD and must match the dense FSDP ranks and
-ordering. Owner gradients receive the owner divisor once before global
+[The EP128 recipe](../../../../examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep128.yaml)
+targets 32 nodes with four GB200 GPUs each: WORLD=128, EP=128, 128 Engram
+owners, TP1/PP1/CP1, global batch 128 and local batch 1. It uses FP32 optimizer
+moments with int16 master remainders and enables checkpoint saving after
+updates 50 and 100. Both recipes use the full 40-layer model without gradient
+accumulation or an additional expert FSDP shard axis.
+
+Both Engram tables are trainable. Configured `engram_layer_ids` determine
+which layers contain a table; there is no freezing switch. Each table is a
+registered global row-sharded DTensor, excluded from FSDP all-gathers. The
+distributed model defaults its owner mesh to WORLD, matching the dense FSDP
+ranks and ordering. A standalone Engram module without a process group keeps
+a local table. Owner gradients receive the owner divisor once before global
 clipping. Disabling Engram changes the model function.
 
-The recipe uses TE FusedAdam with FP32 moments and int16 remainders for BF16
-master weights. It preserves FP32 mHC coefficients across FSDP boundaries with
+Both recipes preserve FP32 mHC coefficients across FSDP boundaries with
 `output_dtype: null` and `cast_forward_inputs: false`. This is fine-tuning,
 not a reproduction of the report's Engram pretraining optimizer.
 
-Supply a shared local snapshot of the pinned revision and an output directory
-outside the source checkout through the launcher's overrides documented in
-the YAML header. The launcher owns rank placement, communication setup and
-reusable compilation caches. The recipe does not establish memory fit: the
-original full-resident 16-node run completed update 0 and then OOMed during
-the next backward, despite AC and resharding.
+For the EP128 recipe spanning partial NVL72 domains, export
+`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4` on every node so HybridEP uses
+equal node-local groups. The EP64 recipe instead requires verified placement
+within one 64-GPU NVLink domain; do not inherit the four-rank override.
+
+Set `DS41_CHECKPOINT` to the shared local snapshot of pinned revision
+`df42c109f1defefcbfcedbe7d905718a12266e40`, using the same directory for parity
+and training. Pass both overrides to the recipe launcher:
+
+```bash
+--model.config.pretrained_model_name_or_path="$DS41_CHECKPOINT" \
+--model.config.name_or_path="$DS41_CHECKPOINT"
+```
+
+Keep outputs outside the source checkout. The launcher owns rank placement,
+communication setup and reusable compilation caches. Neither recipe
+establishes memory fit: the earlier full-resident 16-node run with FP32
+moments completed update 0 and then OOMed during the next backward, despite
+AC and resharding. The BF16-moment EP64 run and the EP128 run remain pending.
 
 ## Checkpoint APIs
 
-For normal recipe initialization, set
-`checkpoint.dequantize_base_checkpoint: true`. Save trained parameters without
-quantization; the adapter exports released names and retains required FP32
-weights. Engram save/load trims logical rows and restores only allocation
-padding. Removing the original quantization metadata is appropriate for these
-decoded floating-point checkpoints; quantized re-export is not established.
+Retain the released config's quantization metadata when initializing from
+the original checkpoint: the NeMo model loader uses it to infer base-weight
+dequantization. Both recipes also set
+`checkpoint.dequantize_base_checkpoint: true`. Trained parameters are saved
+without quantization; the adapter exports released names and retains required
+FP32 weights. Engram save/load trims logical rows and restores only allocation
+padding. The adapter removes original quantization metadata from decoded
+floating-point checkpoint configs; quantized re-export is not established.
 
 The explicit loader accepts an already materialized model with its final
 FSDP/expert/Engram ownership and is used outside an active training graph:
@@ -111,20 +139,20 @@ retains its existing conversion/reconstruction behavior.
 
 ## Inputs and limits
 
-Text supports padded batches and the PR's packed THD path with document
-metadata. Engram hashing requires `input_ids` and the pinned tokenizer;
-configuration-owned tokenizer construction uses the resolved checkpoint
-commit. Checkpoint-free callers can supply a tokenizer explicitly, and
-materialization restores the tokenizer-derived map and deterministic hash
-buffers after meta initialization. `inputs_embeds` alone cannot supply those
-hashes. The standalone `labels` API accepts unpacked `[batch, sequence]`
-labels; packed text uses the external recipe loss. TP, PP, CP, inference KV
-caches, bounded decoder replay and DSpark training are not implemented.
-Million-token training has not been validated.
+Configuration uses `DeepseekV41Config` with a nested `text_config`
+(`DeepseekV41TextConfig`) and `vision_config`. Text accepts unpacked
+`input_ids [batch, sequence]` with right padding and zero-based positions;
+packed THD is unsupported. Enabled Engram requires a real fast tokenizer at
+construction. Configuration-owned tokenizer loading uses the resolved
+checkpoint revision, or callers can supply a tokenizer explicitly.
+Materialization restores the tokenizer-derived map and deterministic hash
+buffers after meta initialization. The standalone `labels` API accepts
+unpacked `[batch, sequence]` labels. TP, PP, CP, inference KV caches, bounded
+decoder replay and DSpark training are not implemented. Million-token
+training has not been validated.
 
-Omitting vision configuration creates a zero-layer tower; loading the released
-vision metadata enables its declared layers. Both HellaSwag recipes explicitly
-disable the tower. `bias_vl` remains present even in text-only gates.
+The default configuration retains the released vision tower. Both HellaSwag
+recipes explicitly disable it. `bias_vl` remains present even in text-only gates.
 `DeepseekV41Processor` provides standard text/image conversations and
 save/reload. Image batches require unpacked `input_ids [batch, sequence]`,
 `pixel_values [all_patches, 3, patch_size, patch_size]`,
@@ -134,15 +162,11 @@ reasoning formatting before passing rendered text to the processor.
 
 ## Validation provenance
 
-CPU regression tests cover reference arithmetic, packed text, image processing,
-FP32 logits and loss, and real Gloo owner gradients and clipping. Distributed
-checkpoint tests exercise quantized initialization and trained SafeTensors
-restore with EP2 and EP2 plus an inner FSDP shard axis. These tests use small
-tensors and do not execute the CUDA HybridEP or TileLang kernels.
-
-**Full GPU parity and full-model training validation of this migration remain
-pending.** The following measurements came from the original implementation
-before migration and are not a pass for this branch.
+**Final CPU/Gloo tests, GPU parity and full-model training validation of this
+migration remain pending.** The following measurements came from the original
+implementation before migration and are not a pass for this branch. See the
+[model coverage page](../../../../docs/model-coverage/llm/deepseek-ai/deepseek-v41-flash.mdx)
+for the recipe and validation scope.
 
 At original commit `0d5919a5a506dd35dc4f55769410feb98ae854b8`, the continuous
 40-layer, 4,096-token, full-129,280-vocabulary comparison used the unchanged
