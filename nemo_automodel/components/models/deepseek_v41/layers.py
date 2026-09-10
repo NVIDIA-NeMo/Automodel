@@ -1014,8 +1014,8 @@ class DeepseekV41Block(nn.Module):
         self.attn_hc = DeepseekV41HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV41HyperConnection(**hc_kwargs)
         self.engram = (
-            DeepseekV41Engram(config, layer_idx, engram_layout, backend, engram_process_group=engram_process_group)
-            if engram_layout is not None and layer_idx in engram_layout.layer_ids
+            DeepseekV41Engram(config, layer_idx, backend, process_group=engram_process_group)
+            if layer_idx in config.engram_layer_ids
             else None
         )
 
@@ -1057,7 +1057,7 @@ class DeepseekV41Block(nn.Module):
         if self.engram is not None:
             if engram_hash_ids is None:
                 raise ValueError(f"layer {self.layer_idx} has an Engram module but received no hash ids")
-            x = self.engram(x, engram_hash_ids, engram_mask)
+            x = self.engram(x, engram_hash_ids, token_mask=engram_mask)
 
         attn_pre, attn_post, attn_comb = self.attn_hc(x)
         attn_out = self.self_attn(self.input_layernorm(hc_collapse(x, pre_mix)), state=state, **attn_kwargs)

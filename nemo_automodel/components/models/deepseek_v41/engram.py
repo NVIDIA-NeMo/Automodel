@@ -347,105 +347,90 @@ class DeepseekV41EngramHasher(nn.Module):
 
 
 class DeepseekV41Engram(nn.Module):
-    """Write an n-gram lookup into the residual streams, gated by how well it matches them.
+    """Read a row-owner-sharded Engram table and update all HC residual streams.
 
-    ``x``: ``[B, L, hc_mult, dim]``.  The hash ids fetch ``n_hash_cols`` rows of
-    ``head_dim``; ``wkv`` turns them into one key per hyper-connection stream plus
-    a shared value.  The gate is a normalized dot product of stream against key
-    passed through a signed square root and a sigmoid (matching the training kernel).
+    Args:
+        config: Text configuration containing logical table sizes and HC width.
+        layer_idx: Zero-based decoder layer ID, present in engram_layer_ids.
+        backend: Linear backend for the fused key/value projection.
+        process_group: Runtime row-owner group. None creates the complete table
+            and is appropriate only when the configuration fits on one device.
     """
 
     def __init__(
         self,
         config: DeepseekV41Config,
         layer_idx: int,
-        layout: EngramLayout,
         backend: BackendConfig,
         *,
-        engram_process_group: dist.ProcessGroup | None = None,
+        process_group: dist.ProcessGroup | None = None,
     ) -> None:
-        """Construct the projections and a trainable contiguous row-owner table.
-
-        Args:
-            config: Model dimensions and parameter dtype.
-            layer_idx: Decoder layer containing this Engram.
-            layout: Logical hash-table row ranges for all Engram layers.
-            backend: Projection backend selected for the enclosing model.
-            engram_process_group: Runtime row-owner group. None keeps the
-                complete table local, even when distributed execution is
-                initialized. Physical rows are padded evenly across explicit
-                owners without changing the logical hash ranges.
-        """
         super().__init__()
-        self.layer_idx = layer_idx
-        self.layer_hash_index = layout.layer_ids.index(layer_idx)
-        self.dim = int(config.hidden_size)
-        self.hc_mult = int(config.hc_mult)
-        self.n_hash_cols = layout.n_hash_cols
-        self.eps = float(config.rms_norm_eps)
+        self.layer_hash_index = tuple(config.engram_layer_ids).index(layer_idx)
+        self.num_embeddings = config.engram_num_embeddings[self.layer_hash_index]
+        self.hidden_size = config.hidden_size
+        self.hc_mult = config.hc_mult
+        self.hash_heads = (config.engram_max_ngram_size - 1) * config.engram_n_heads
+        self.eps = config.rms_norm_eps
         self.initializer_range = config.initializer_range
-        self.clamp_value = 1e-6
-        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-        self.num_embeddings = layout.num_embeddings[self.layer_hash_index]
-        owner_world_size = dist.get_world_size(engram_process_group) if engram_process_group is not None else 1
-        padded_rows = (self.num_embeddings + owner_world_size - 1) // owner_world_size * owner_world_size
-        table_config = Qwen3_8_FlashNextEngramTableConfig(
+        owner_size = 1 if process_group is None else dist.get_world_size(process_group)
+        padded_rows = ((self.num_embeddings + owner_size - 1) // owner_size) * owner_size
+        dtype = get_dtype(config.dtype, torch.bfloat16)
+        self.embed = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=padded_rows,
-            embedding_dim=layout.head_dim,
+            embedding_dim=config.engram_head_dim,
             initializer_range=config.initializer_range,
-        )
-        self.embed = table_config.build(process_group=engram_process_group, dtype=model_dtype)
+        ).build(process_group=process_group, dtype=dtype)
         self.wkv = initialize_linear_module(
             backend.linear,
-            layout.n_hash_cols * layout.head_dim,
-            self.dim * (self.hc_mult + 1),
+            self.hash_heads * config.engram_head_dim,
+            self.hidden_size * (self.hc_mult + 1),
             bias=False,
-            dtype=model_dtype,
+            dtype=dtype,
         )
-        self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim, dtype=model_dtype))
-        self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim, dtype=model_dtype))
+        self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size, dtype=dtype))
+        self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size, dtype=dtype))
         self.init_weights()
 
     @torch.no_grad()
     def init_weights(self) -> None:
-        """Initialize local table storage and projections, leaving padded rows zero."""
+        """Initialize the table, projection, and learned branch normalization weights."""
         self.embed.reset_parameters()
-        self._zero_padding_rows()
+        # Physical owner padding is absent from the released checkpoint. Keep
+        # it zero so fresh initialization and strict checkpoint resume agree.
+        local_weight = self.embed.weight.to_local() if isinstance(self.embed.weight, DTensor) else self.embed.weight
+        valid_rows = max(0, min(local_weight.shape[0], self.num_embeddings - self.embed.global_row_start))
+        local_weight[valid_rows:].zero_()
         nn.init.normal_(self.wkv.weight, mean=0.0, std=self.initializer_range)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
         self.embed.mark_sharding_contract()
 
-    @torch.no_grad()
-    def _zero_padding_rows(self) -> None:
-        """Clear physical rows beyond the logical checkpoint on their local owner."""
-        local_weight = self.embed.weight.to_local() if isinstance(self.embed.weight, DTensor) else self.embed.weight
-        valid_local_rows = max(0, min(local_weight.shape[0], self.num_embeddings - self.embed.global_row_start))
-        local_weight[valid_local_rows:].zero_()
-
-    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Inject memory rows through the normalized residual gate.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        hash_ids: torch.Tensor,
+        *,
+        token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Inject the normalized, signed-square-root-gated memory residual.
 
         Args:
-            x: Floating-point residual streams [batch, sequence, hc_mult, dim].
-            hash_ids: Int32 or int64 logical row IDs [batch, sequence, n_hash_cols].
-                Physical padding rows beyond num_embeddings are not valid IDs.
-            token_mask: Optional boolean mask [batch, sequence]; false keeps the
-                corresponding residual streams unchanged. All inputs must be on
-                the same device as the owner table.
+            hidden_states: Tensor of shape [batch, sequence, hc_mult, hidden].
+            hash_ids: Integer tensor of shape [batch, sequence, hash_heads]
+                containing logical table rows for this Engram layer. Under CP
+                both inputs contain only this rank's local sequence positions.
+            token_mask: Optional bool tensor of shape [batch, sequence], with
+                False for image/padding positions that must remain unchanged.
 
         Returns:
-            Tensor with the shape and dtype of x, without modifying its storage.
-
-        Raises:
-            ValueError: Local residual or hash shapes are invalid, any owner
-                supplies invalid hash dtypes or logical row IDs, or the local
-                token mask has an invalid shape or dtype.
+            Tensor of shape [batch, sequence, hc_mult, hidden] in the input
+            dtype. The output neither aliases nor mutates hidden_states.
         """
-        if x.ndim != 4 or x.shape[-2:] != (self.hc_mult, self.dim):
-            raise ValueError("Engram x must have shape [batch, sequence, hc_mult, dim]")
-        if hash_ids.shape != (*x.shape[:2], self.n_hash_cols):
-            raise ValueError("Engram hash_ids must have shape [batch, sequence, n_hash_cols] matching x")
+        if hidden_states.ndim != 4 or hidden_states.shape[-2:] != (self.hc_mult, self.hidden_size):
+            raise ValueError("Engram hidden_states must have shape [batch, sequence, hc_mult, hidden_size]")
+        if hash_ids.shape != (*hidden_states.shape[:2], self.hash_heads):
+            raise ValueError("Engram hash_ids must have shape [batch, sequence, hash_heads] matching hidden_states")
         valid = hash_ids.dtype in (torch.int32, torch.int64)
         if valid and hash_ids.numel():
             valid = bool(((hash_ids >= 0) & (hash_ids < self.num_embeddings)).all())
@@ -456,19 +441,16 @@ class DeepseekV41Engram(nn.Module):
             raise ValueError(
                 f"Engram hash_ids must be integer logical row IDs in [0, {self.num_embeddings}) on every rank"
             )
-        if token_mask is not None and (token_mask.shape != x.shape[:2] or token_mask.dtype != torch.bool):
+        if token_mask is not None and (token_mask.shape != hidden_states.shape[:2] or token_mask.dtype != torch.bool):
             raise ValueError("Engram token_mask must be bool with shape [batch, sequence]")
-        rows = self.embed(hash_ids)  # [B, L, n_hash_cols, head_dim]
-        kv = self.wkv(rows.flatten(-2).to(x.dtype))
-        key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
-        key = key.float().unflatten(-1, (self.hc_mult, self.dim))
-        weight = self.q_weight.float() * self.k_weight.float()  # only ever used as a product
-        h = x.float()
-        # normalized per (token, hc copy) over ``dim``, NOT jointly over the copies
-        rstd = torch.rsqrt(h.square().mean(-1) + self.eps) * torch.rsqrt(key.square().mean(-1) + self.eps)
-        dot = (h * weight * key).sum(-1) * rstd * self.dim**-0.5
-        # signed sqrt before the sigmoid, matching the training kernel
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot))
+        embeddings = self.embed(hash_ids).flatten(-2).to(hidden_states.dtype)
+        key, value = self.wkv(embeddings).split((self.hc_mult * self.hidden_size, self.hidden_size), dim=-1)
+        key = key.float().unflatten(-1, (self.hc_mult, self.hidden_size))
+        hidden = hidden_states.float()
+        weights = self.q_weight.float() * self.k_weight.float()
+        rstd = torch.rsqrt(hidden.square().mean(-1) + self.eps) * torch.rsqrt(key.square().mean(-1) + self.eps)
+        dot = (hidden * weights * key).sum(-1) * rstd * self.hidden_size**-0.5
+        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
         if token_mask is not None:
-            gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0.0)
-        return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+            gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
+        return (hidden + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(hidden_states.dtype)
