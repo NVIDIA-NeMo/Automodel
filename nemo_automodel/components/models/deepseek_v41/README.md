@@ -134,9 +134,15 @@ reasoning formatting before passing rendered text to the processor.
 
 ## Validation provenance
 
-**Validation of this migrated implementation is pending.** The following
-measurements came from the original implementation before migration and are
-not a pass for this branch.
+CPU regression tests cover reference arithmetic, packed text, image processing,
+FP32 logits and loss, and real Gloo owner gradients and clipping. Distributed
+checkpoint tests exercise quantized initialization and trained SafeTensors
+restore with EP2 and EP2 plus an inner FSDP shard axis. These tests use small
+tensors and do not execute the CUDA HybridEP or TileLang kernels.
+
+**Full GPU parity and full-model training validation of this migration remain
+pending.** The following measurements came from the original implementation
+before migration and are not a pass for this branch.
 
 At original commit `0d5919a5a506dd35dc4f55769410feb98ae854b8`, the continuous
 40-layer, 4,096-token, full-129,280-vocabulary comparison used the unchanged

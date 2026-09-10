@@ -69,7 +69,7 @@ class TestConfigFlattening:
         assert config.rms_norm_eps == 1e-20
         assert config.kv_source_layer_ids == [2, 8, 14, 20]
         assert config.engram_num_embeddings == [384006168, 384016682]
-        assert config.vision_config["num_hidden_layers"] == 32
+        assert config.vision_config.num_hidden_layers == 32
         assert config.image_token_id == 129264
         assert config.pad_token_id == 2
         assert not hasattr(config, "quantization_config") or config.quantization_config is None

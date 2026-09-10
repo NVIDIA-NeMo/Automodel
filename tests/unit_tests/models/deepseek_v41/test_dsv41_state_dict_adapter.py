@@ -63,6 +63,12 @@ class TestRenames:
             ("layers.5.attn.indexer.weights_proj.weight", "model.layers.5.self_attn.indexer.weights_proj.weight"),
             ("layers.3.ffn.gate.weight", "model.layers.3.mlp.gate.weight"),
             ("layers.3.ffn.gate.bias", "model.layers.3.mlp.gate.e_score_correction_bias"),
+            ("layers.3.ffn.gate.bias_vl", "model.layers.3.mlp.gate.bias_vl"),
+            ("vision.norm.weight", "model.vision.norm.weight"),
+            ("aligner.w1.weight", "model.aligner.w1.weight"),
+            ("image_start", "model.image_start"),
+            ("image_end", "model.image_end"),
+            ("image_newline", "model.image_newline"),
             ("layers.3.ffn.shared_experts.w1.weight", "model.layers.3.mlp.shared_experts.gate_proj.weight"),
             ("layers.3.ffn.shared_experts.w3.weight", "model.layers.3.mlp.shared_experts.up_proj.weight"),
             ("layers.3.ffn.shared_experts.w2.weight", "model.layers.3.mlp.shared_experts.down_proj.weight"),
@@ -136,6 +142,7 @@ class TestFromHf:
         assert set(out) == {
             "model.embed_tokens.weight",
             "model.layers.0.mlp.gate.e_score_correction_bias",
+            "model.layers.0.mlp.gate.bias_vl",
             "model.layers.0.self_attn.wkv.weight",
             "model.layers.1.engram.embed.weight",
             "model.layers.1.engram.q_weight",
@@ -189,7 +196,7 @@ class TestToHf:
         assert torch.equal(hf["layers.0.ffn.experts.3.w3.weight"], expected_w3)
 
     def test_quantization_placeholders_follow_on_disk_layout(self, monkeypatch):
-        adapter = _make_adapter()
+        adapter = _make_adapter(engram_num_embeddings=[5])
         monkeypatch.setattr(adapter, "_checkpoint_expert_quant_layout", lambda: _ExpertQuantLayout.FP4)
         n_experts, inter, hidden = adapter.moe_config.n_routed_experts, 32, 64
         internal = {
@@ -232,3 +239,42 @@ class TestToHf:
         }
         internal = adapter.from_hf(dict(hf))
         assert set(adapter.to_hf(internal)) == set(hf)
+
+
+@pytest.mark.parametrize("vision_layers", [0, 1])
+def test_optional_vision_and_always_present_router_bias_use_consistent_protocols(vision_layers):
+    """Discovery, import, export and forced FP32 selection share one scope."""
+    adapter = _make_adapter(vision_config={"num_hidden_layers": vision_layers})
+    source = {
+        "vision.norm.weight": torch.tensor([1.00123], dtype=torch.float32),
+        "aligner.w1.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+        "image_start": torch.ones(2, dtype=torch.bfloat16),
+        "image_end": torch.ones(2, dtype=torch.bfloat16),
+        "image_newline": torch.ones(2, dtype=torch.bfloat16),
+        "layers.0.ffn.gate.bias_vl": torch.tensor([0.1234567]),
+        "mtp.0.ffn.gate.bias_vl": torch.ones(1),
+        "image_pad": torch.ones(2),
+    }
+    wanted = {"layers.0.ffn.gate.bias_vl"}
+    if vision_layers:
+        wanted.update({"vision.norm.weight", "aligner.w1.weight", "image_start", "image_end", "image_newline"})
+    native = adapter.from_hf(source)
+    assert set(adapter.get_hf_state_dict_keys(native)) == wanted
+    exported = adapter.to_hf(native)
+    assert exported.keys() == wanted
+    for name in wanted:
+        torch.testing.assert_close(exported[name], source[name], rtol=0, atol=0)
+    forced = adapter.forced_hf_dtype_mapping(native)
+    assert forced == {name: "float32" for name in wanted if source[name].dtype == torch.float32}
+
+
+@pytest.mark.parametrize("scale_byte", [0, 255], ids=["smallest_exponent", "nan"])
+def test_legacy_fp8_block_scales_preserve_e8m0_special_values(scale_byte: int) -> None:
+    """The retained 128x128 decoder must preserve E8M0's boundary encodings."""
+    weight = torch.ones((128, 128)).to(torch.float8_e4m3fn)
+    scale = torch.full((1, 1), scale_byte, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    actual = dequantize_fp8_blocks(weight, scale, torch.float32)
+    if scale_byte == 255:
+        assert torch.isnan(actual).all()
+    else:
+        assert torch.equal(actual, torch.full((128, 128), 2.0**-127, dtype=torch.float32))

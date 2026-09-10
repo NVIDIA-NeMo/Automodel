@@ -9,7 +9,7 @@ slug: model-coverage/large-language-models/deepseek-ai/deepseek-v41-flash
 The port includes optional image processing, the released vision encoder and aligner, image delimiters, and visual router bias. Its checkpoint/reference revision is [`df42c109f1defefcbfcedbe7d905718a12266e40`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/tree/df42c109f1defefcbfcedbe7d905718a12266e40). Numerical comparisons use the unchanged HF-hosted `inference/` code; the dump does not contain a Transformers modeling implementation.
 
 <Note>
-Validation of the migrated implementation is pending. Historical results below belong to the original implementation, and the full-resident 16-node training attempt failed with OOM after one optimizer update.
+Full GPU parity and full-model training validation of the migration remain pending. CPU regression tests cover arithmetic, model inputs, owner gradients and distributed checkpoint restoration. Historical GPU results below belong to the original implementation, whose full-resident 16-node training attempt failed with OOM after one optimizer update.
 </Note>
 
 ## Available Models
@@ -57,6 +57,8 @@ The original `torch_mm` result at commit `0d5919a5a506dd35dc4f55769410feb98ae854
 
 The fixed mean-KL and cosine gates failed. These are original streamed-forward measurements, not a numerical pass for the migration or evidence of full-resident training. Earlier exact `torch_linear` results belong to that different backend.
 
-Original reduced-width 40-layer EP2/expert-FSDP2 validation at commit `69a192aaa183efc6aae317255f6d8f0a3a906499` used workspace-only wrappers for real interruption and fresh-process checkpoint restoration, including TE optimizer/int16 masters, RNG, loader and progress. Earlier trajectory probes were debugging evidence rather than final proof of Engram scaling, and TileLang continuation was not bitwise reproducible. Migration tests remain pending; no successful full-resident 100-update or convergence result is claimed.
+The migrated CPU suite exercises independent arithmetic references, packed text, image processing, FP32 logits and loss, real Gloo owner gradients and clipping, and quantized initialization followed by trained SafeTensors restoration with EP2 and EP2 plus an inner FSDP shard axis. These small-tensor tests do not execute CUDA HybridEP or TileLang kernels.
+
+Original reduced-width 40-layer EP2/expert-FSDP2 validation at commit `69a192aaa183efc6aae317255f6d8f0a3a906499` used workspace-only wrappers for real interruption and fresh-process checkpoint restoration, including TE optimizer/int16 masters, RNG, loader and progress. Earlier trajectory probes were debugging evidence rather than final proof of Engram scaling, and TileLang continuation was not bitwise reproducible. GPU validation of the migration remains pending; no successful full-resident 100-update or convergence result is claimed.
 
 See the [Installation Guide](/get-started/installation), [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft), and [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for the surrounding training workflow.
