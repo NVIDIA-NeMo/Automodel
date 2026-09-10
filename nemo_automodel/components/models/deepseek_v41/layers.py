@@ -60,7 +60,7 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
 )
-from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
@@ -535,7 +535,7 @@ class DeepseekV41Compressor(nn.Module):
     project and pool in FP32, matching the released checkpoint.
     """
 
-    def __init__(self, config: DeepseekV41Config, compress_ratio: int):
+    def __init__(self, config: DeepseekV41TextConfig, compress_ratio: int):
         super().__init__()
         if compress_ratio < 1:
             raise ValueError(f"DeepseekV41Compressor needs compress_ratio >= 1, got {compress_ratio}")
@@ -585,11 +585,11 @@ class DeepseekV41Indexer(nn.Module):
     this is the second of two levels (:func:`select_candidate_blocks` is the first).
     """
 
-    def __init__(self, config: DeepseekV41Config, layer_idx: int, backend: BackendConfig | None = None):
+    def __init__(self, config: DeepseekV41TextConfig, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
         self.backend = backend or BackendConfig()
         self.layer_idx = layer_idx
-        self.owns_k = config.is_kv_source(layer_idx)
+        self.owns_k = layer_idx in config.kv_source_layer_ids
         self.is_candidate_source = layer_idx == int(config.candidate_source_layer_id)
         self.uses_candidates = 0 <= int(config.candidate_source_layer_id) < layer_idx
         self.candidate_topk_blocks = int(config.candidate_topk_blocks)
@@ -733,7 +733,7 @@ class DeepseekV41Attention(nn.Module):
     Q and the output projection are both low-rank, the latter grouped.
     """
 
-    def __init__(self, config: DeepseekV41Config, layer_idx: int, backend: BackendConfig | None = None):
+    def __init__(self, config: DeepseekV41TextConfig, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
@@ -744,9 +744,9 @@ class DeepseekV41Attention(nn.Module):
         if self.backend.linear != "torch" or self.backend.rms_norm != "torch_fp32":
             raise ValueError("DeepSeek V4.1 attention requires torch linear layers and torch_fp32 RMSNorm")
         self.layer_idx = layer_idx
-        self.compress_ratio = config.compress_ratio(layer_idx)
-        self.is_kv_source = config.is_kv_source(layer_idx)
-        self.is_index_source = config.is_index_source(layer_idx)
+        self.compress_ratio = config.compress_ratios[layer_idx]
+        self.is_kv_source = layer_idx in config.kv_source_layer_ids
+        self.is_index_source = layer_idx in config.index_source_layer_ids
         if (self.is_kv_source or self.is_index_source) and self.compress_ratio == 0:
             raise ValueError(f"layer {layer_idx} is a CSA2 source but has compress_ratio 0")
         self.num_heads = int(config.num_attention_heads)
@@ -979,7 +979,7 @@ class DeepseekV41Block(nn.Module):
     def __init__(
         self,
         layer_idx: int,
-        config: DeepseekV41Config,
+        config: DeepseekV41TextConfig,
         moe_config: MoEConfig,
         backend: BackendConfig,
         *,

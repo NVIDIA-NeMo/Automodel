@@ -37,7 +37,7 @@ from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
-    from .config import DeepseekV41Config
+    from .config import DeepseekV41TextConfig
 
 _, tokenizers = safe_import("tokenizers")
 
@@ -96,7 +96,7 @@ class DeepseekV41NgramHash(nn.Module):
             ``config.engram_compressed_vocab_size`` entries.
     """
 
-    def __init__(self, config: DeepseekV41Config, tokenizer: PreTrainedTokenizerFast) -> None:
+    def __init__(self, config: DeepseekV41TextConfig, tokenizer: PreTrainedTokenizerFast) -> None:
         super().__init__()
         self.max_ngram_size = config.engram_max_ngram_size
         self.n_heads = config.engram_n_heads
@@ -231,7 +231,7 @@ class DeepseekV41Engram(nn.Module):
 
     def __init__(
         self,
-        config: DeepseekV41Config,
+        config: DeepseekV41TextConfig,
         layer_idx: int,
         backend: BackendConfig,
         *,

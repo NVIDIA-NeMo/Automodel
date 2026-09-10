@@ -24,7 +24,7 @@ def _vision_config(config: DeepseekV41Config) -> DeepseekV4Config:
     """Translate the typed V4.1 config into the existing vision implementation's config."""
     vision = config.vision_config
     return DeepseekV4Config(
-        hidden_size=config.hidden_size,
+        hidden_size=config.text_config.hidden_size,
         dtype=config.dtype,
         vision_n_layers=vision.num_hidden_layers,
         vision_dim=vision.hidden_size,

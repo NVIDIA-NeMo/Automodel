@@ -309,7 +309,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
-        self._engram_rows = dict(zip(config.engram_layer_ids, config.engram_num_embeddings))
+        self._engram_rows = dict(zip(config.text_config.engram_layer_ids, config.text_config.engram_num_embeddings))
 
     @property
     def _expert_path_segment(self) -> str:
@@ -553,10 +553,12 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             expert = re.match(r"layers\.\d+\.ffn\.experts\.(\d+)\.", key)
             if (
                 key.startswith("mtp.")
-                or (layer and int(layer[1]) >= self.config.num_hidden_layers)
+                or (layer and int(layer[1]) >= self.config.text_config.num_hidden_layers)
                 or (
                     expert
-                    and not should_load_expert_for_rank(int(expert[1]), device_mesh, self.config.n_routed_experts)
+                    and not should_load_expert_for_rank(
+                        int(expert[1]), device_mesh, self.config.text_config.n_routed_experts
+                    )
                 )
             ):
                 hf_state_dict.pop(key)

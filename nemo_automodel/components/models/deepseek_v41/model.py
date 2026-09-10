@@ -57,7 +57,7 @@ from nemo_automodel.components.models.common.utils import (
     cast_model_to_dtype,
     compute_lm_head_logits,
 )
-from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41NgramHash
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41Block,
@@ -91,7 +91,7 @@ class DeepseekV41Model(nn.Module):
 
     def __init__(
         self,
-        config: DeepseekV41Config,
+        config: DeepseekV41TextConfig,
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
@@ -101,7 +101,6 @@ class DeepseekV41Model(nn.Module):
         super().__init__()
         self.backend = backend
         self.config = config
-        config.validate_layer_layout()
 
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         moe_defaults = dict(
@@ -320,15 +319,16 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
+        text = config.text_config
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_linear", dispatcher="hybridep"
         )
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
-        if tokenizer is None and any(i < config.num_hidden_layers for i in config.engram_layer_ids):
+        if tokenizer is None and any(i < text.num_hidden_layers for i in text.engram_layer_ids):
             tokenizer = config.build_tokenizer()
         self.model = DeepseekV41Model(
-            config,
+            text,
             backend=self.backend,
             moe_config=moe_config,
             tokenizer=tokenizer,
@@ -340,11 +340,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             self.model.vision = DeepseekV41VisionTransformer(config)
             self.model.aligner = DeepseekV41VisionAligner(config)
             for name in ("image_start", "image_end", "image_newline"):
-                parameter = nn.Parameter(torch.empty(config.hidden_size, dtype=get_dtype(config.torch_dtype)))
-                nn.init.normal_(parameter, std=config.initializer_range)
+                parameter = nn.Parameter(torch.empty(text.hidden_size, dtype=get_dtype(text.torch_dtype)))
+                nn.init.normal_(parameter, std=text.initializer_range)
                 self.model.register_parameter(name, parameter)
         self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32
+            self.backend.linear, text.hidden_size, text.vocab_size, bias=False, dtype=torch.float32
         )
         self.moe_config = self.model.moe_config
         if self.backend.enable_hf_state_dict_adapter:
@@ -352,7 +352,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 self.config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+                dtype=get_dtype(text.torch_dtype, torch.bfloat16),
             )
 
     def get_input_embeddings(self):
@@ -488,7 +488,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             if projected.logits is None or projected.logits.shape[:2] != labels.shape:
                 raise ValueError("labels require logits for every input position")
             loss = F.cross_entropy(
-                projected.logits[:, :-1].float().reshape(-1, self.config.vocab_size),
+                projected.logits[:, :-1].float().reshape(-1, self.config.text_config.vocab_size),
                 labels[:, 1:].reshape(-1),
             )
         return CausalLMOutputWithPast(
@@ -510,11 +510,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         with buffer_device:
             self.model.init_weights(buffer_device=buffer_device)
             if self.model.vision is not None:
-                self.model.vision.init_weights(self.config.initializer_range)
-                self.model.aligner.init_weights(self.config.initializer_range)
+                self.model.vision.init_weights(self.config.text_config.initializer_range)
+                self.model.aligner.init_weights(self.config.text_config.initializer_range)
                 for name in ("image_start", "image_end", "image_newline"):
-                    nn.init.normal_(getattr(self.model, name), std=self.config.initializer_range)
-            nn.init.normal_(self.lm_head.weight, std=self.config.initializer_range)
+                    nn.init.normal_(getattr(self.model, name), std=self.config.text_config.initializer_range)
+            nn.init.normal_(self.lm_head.weight, std=self.config.text_config.initializer_range)
         cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
             if layer.engram is not None:
