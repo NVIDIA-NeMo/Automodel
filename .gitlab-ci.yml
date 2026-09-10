@@ -15,8 +15,14 @@
 default:
   image: ghcr.io/astral-sh/uv:0.8.22-python3.10-bookworm
   tags:
-    - nemollm-common
+    - nemollm-common-aws
   interruptible: true
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - job_execution_timeout
   cache:
     key:
       # Keep lightweight checks from restoring the much larger CPU-test cache.
@@ -25,6 +31,9 @@ default:
         - uv.lock
     paths:
       - .uv-cache/
+  after_script:
+    # Keep source-built wheels; redownload prebuilt wheels instead of archiving them.
+    - uv cache prune --ci
 
 workflow:
   rules:
@@ -42,6 +51,8 @@ variables:
   UV_LINK_MODE: copy
   UV_PYTHON_DOWNLOADS: never
   UV_PROJECT_ENVIRONMENT: "$CI_PROJECT_DIR/.venv"
+  FF_USE_FASTZIP: "true"
+  CACHE_COMPRESSION_LEVEL: fastest
 
 lint:
   stage: lint
@@ -62,7 +73,8 @@ secret-detection:
   variables:
     UV_PYTHON: "3.10"
     GIT_DEPTH: "0"
-  timeout: 5 minutes
+    RUNNER_SCRIPT_TIMEOUT: "5m"
+  timeout: 10 minutes
   script:
     - |-
       set -o pipefail
@@ -76,7 +88,8 @@ recipe-validation:
   variables:
     UV_PYTHON: "3.10"
     GIT_DEPTH: "0"
-  timeout: 5 minutes
+    RUNNER_SCRIPT_TIMEOUT: "5m"
+  timeout: 10 minutes
   before_script:
     - uv venv .venv
     - uv pip install --python .venv/bin/python PyYAML==6.0.3 ruamel.yaml==0.19.1
