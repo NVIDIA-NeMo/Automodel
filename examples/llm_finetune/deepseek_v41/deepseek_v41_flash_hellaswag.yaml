@@ -57,6 +57,9 @@ model:
     _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41Config.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
     name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+    vision_config:
+      _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41VisionConfig
+      num_hidden_layers: 0
     # Engram tables are bf16 row-owner shards across WORLD, excluded from FSDP
     # all-gathers. The FSDP shard mesh must match these owners (TP=PP=CP=1 here).
     # Tables remain frozen by default. Set ``engram_enabled: false``
