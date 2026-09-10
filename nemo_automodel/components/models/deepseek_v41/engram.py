@@ -212,6 +212,14 @@ class DeepseekV41EngramHasher(nn.Module):
     def __init__(self, config: DeepseekV41Config, layout: EngramLayout):
         super().__init__()
         self.layout = layout
+        for layer_hash_index, layer_id in enumerate(layout.layer_ids):
+            bucket_span = layout.bucket_span(layer_hash_index)
+            num_embeddings = layout.num_embeddings[layer_hash_index]
+            if bucket_span > num_embeddings:
+                raise ValueError(
+                    f"Engram layer {layer_id} requires {bucket_span} rows for its hash buckets, "
+                    f"but engram_num_embeddings specifies {num_embeddings}"
+                )
         self.vocab_size = int(config.vocab_size)
         self.compressed_vocab_size = int(config.engram_compressed_vocab_size) or self.vocab_size
         self.raw_pad_token_id = int(config.engram_pad_token_id)
@@ -309,16 +317,29 @@ class DeepseekV41EngramHasher(nn.Module):
         """Return hash ids shaped ``[B, L, n_engram_layers, n_hash_cols]``.
 
         Args:
-            input_ids: ``[B, L]`` raw token ids.
+            input_ids: Int32 or int64 raw token IDs ``[B, L]``, each within the
+                token-map vocabulary. The input tensor is not modified.
             position_ids: ``[B, L]`` document-relative positions (``0`` starts a document).
             token_mask: ``[B, L]`` bool, ``False`` for tokens that take no part in an n-gram.
+
+        Returns:
+            Int64 hash IDs ``[B, L, n_engram_layers, n_hash_cols]`` in the
+            corresponding layers' logical table ranges.
+
+        Raises:
+            RuntimeError: The compressed token map has not been attached.
+            ValueError: Raw token IDs have an invalid shape, dtype, or range.
         """
         if not self.has_token_map:
             raise RuntimeError(
                 "DeepseekV41EngramHasher has no token map. Call model.set_engram_tokenizer(tokenizer) "
                 "or set config.engram_compressed_vocab_size to the model vocab size for identity hashing."
             )
-        compressed = self.token_map[input_ids.clamp(min=0, max=self.vocab_size - 1)]
+        if input_ids.ndim != 2 or input_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Engram input_ids must be an int32/int64 tensor of shape [batch, sequence]")
+        if input_ids.numel() and bool(((input_ids < 0) | (input_ids >= self.token_map.numel())).any()):
+            raise ValueError("Engram input_ids contains a token ID outside the tokenizer vocabulary")
+        compressed = self.token_map[input_ids.long()]
         if token_mask is not None:
             compressed = torch.where(token_mask, compressed, torch.full_like(compressed, _DEAD_TOKEN))
 
