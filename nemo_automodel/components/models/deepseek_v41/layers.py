@@ -60,6 +60,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
 )
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_indexer_scores,
+    dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
@@ -193,6 +194,37 @@ def fake_quant_fp4(x: torch.Tensor, block_size: int, scale_format: str) -> torch
 # ---------------------------------------------------------------------------
 
 
+class DeepseekV41HyperConnection(DeepseekV4HyperConnection):
+    """Reuse V4 parameter ownership with the V4.1 reference's FP32 operation order."""
+
+    def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project streams before RMS scaling and apply the fused affine map.
+
+        Args:
+            hidden_streams: Tensor of shape [batch, sequence, streams, hidden].
+
+        Returns:
+            FP32 pre/post tensors of shape [batch, sequence, streams] and
+            combination coefficients [batch, sequence, input_streams, output_streams].
+        """
+        flat = hidden_streams.flatten(2).float()
+        mixes = F.linear(flat, self.fn.float()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        streams = self.hc_mult
+        scales = torch.cat(
+            (self.scale[0].expand(streams), self.scale[1].expand(streams), self.scale[2].expand(streams * streams))
+        ).float()
+        logits = torch.addcmul(self.base.float(), mixes, scales)
+        pre = torch.sigmoid(logits[..., :streams]) + self.hc_eps
+        post = 2 * torch.sigmoid(logits[..., streams : 2 * streams])
+        comb = dsv4_sinkhorn_normalize(
+            logits[..., 2 * streams :].unflatten(-1, (streams, streams)),
+            backend=self.sinkhorn_backend,
+            repeat=self.hc_sinkhorn_iters,
+            eps=self.hc_eps,
+        )
+        return pre, post, comb
+
+
 def make_identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     """Initial one-hot input mix that reads stream 0.  ``x``: ``[B, S, ...]``."""
     pre_mix = x.new_zeros(x.shape[0], x.shape[1], hc_mult, dtype=torch.float32)
@@ -208,11 +240,18 @@ def hc_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
 def hc_expand(y: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
     """Expand a sublayer output back to hc copies and mix the residual in through ``comb``.
 
-    ``y``: ``[B,S,d]``, ``residual``: ``[B,S,hc,d]``, ``post``: ``[B,S,hc]``,
-    ``comb``: ``[B,S,hc,hc]`` with ``out[h] = post[h] * y + sum_j comb[j, h] * residual[j]``.
+    Args:
+        y: Tensor of shape [batch, sequence, hidden].
+        residual: Tensor of shape [batch, sequence, streams, hidden].
+        post: FP32 tensor of shape [batch, sequence, streams].
+        comb: FP32 tensor of shape [batch, sequence, input_streams, output_streams].
+
+    Returns:
+        Tensor of shape [batch, sequence, streams, hidden], in y's dtype.
+        Products reduce over input streams in the reference's operation order.
     """
     mixed = post.float().unsqueeze(-1) * y.float().unsqueeze(-2)
-    mixed = mixed + torch.matmul(comb.float().transpose(-1, -2), residual.float())
+    mixed = mixed + (comb.float().unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(2)
     return mixed.to(y.dtype)
 
 
@@ -810,8 +849,8 @@ class DeepseekV41Block(nn.Module):
             rms_norm_eps=float(config.rms_norm_eps),
             sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
         )
-        self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
-        self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
+        self.attn_hc = DeepseekV41HyperConnection(**hc_kwargs)
+        self.ffn_hc = DeepseekV41HyperConnection(**hc_kwargs)
         self.engram = (
             DeepseekV41Engram(config, layer_idx, engram_layout, engram_process_group=engram_process_group)
             if engram_layout is not None and layer_idx in engram_layout.layer_ids
