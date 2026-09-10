@@ -17,6 +17,7 @@ import logging
 import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from types import MethodType
 from typing import Any, Literal, Protocol
 
 import torch
@@ -113,9 +114,18 @@ class TEFp8Config:
     scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
     e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
     ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
+
+    ``filter_fqns`` lists substrings matched against TE base-module names by
+    :meth:`apply_filter_fqns`. Matched modules run with TE quantization disabled,
+    even inside an enabled outer TE autocast; non-TE modules are untouched.
+    This does not cast weights or override PyTorch autocast. For example,
+    ``["lm_head", "layers.3."]`` excludes the TE LM head and TE modules under
+    layer 3. The LLM training recipe applies this once during setup; standalone
+    callers must apply it explicitly before the first forward.
     """
 
     recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    filter_fqns: list[str] = field(default_factory=list)
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
@@ -154,6 +164,85 @@ class TEFp8Config:
         from transformer_engine.pytorch.quantization import autocast as te_autocast
 
         return te_autocast(enabled=True, recipe=self.build_recipe())
+
+    def apply_filter_fqns(self, model: nn.Module) -> list[str]:
+        """Exclude modules matching ``filter_fqns`` from quantization.
+
+        Wraps the forward of every TE base module whose logical fully qualified
+        name contains one of the ``filter_fqns`` substrings in ``te_autocast(enabled=False)``,
+        so it runs in its original precision even inside the enabled autocast
+        that the training loop places around the whole forward pass. TE saves
+        this precision choice for backward. Exclusions are permanent for the
+        module instance: repeated calls are idempotent and may add exclusions,
+        but changing the config does not remove previous exclusions. Apply after
+        constructing the model and before its first forward or graph capture.
+        Activation-checkpoint wrapper components are removed before matching.
+        All registered aliases are considered; matching any alias excludes the
+        shared instance through every alias, with only one forward wrapper.
+
+        Args:
+            model: The root module to scan (module names are relative to it).
+
+        Returns:
+            Logical fully qualified names matching this call, including matching
+            aliases and prior exclusions.
+            An empty list when TE is absent or no modules match.
+
+        Raises:
+            ImportError: TE is installed but the required exclusion APIs are unavailable.
+        """
+        if not HAVE_TE or not self.filter_fqns:
+            return []
+        have_base, TransformerEngineBaseModule = safe_import_from(
+            "transformer_engine.pytorch.module.base", "TransformerEngineBaseModule"
+        )
+        have_autocast, te_autocast = safe_import_from("transformer_engine.pytorch.quantization", "autocast")
+        if not have_base or not have_autocast:
+            raise ImportError("te_fp8.filter_fqns requires Transformer Engine base modules and quantization.autocast")
+
+        def forward_without_fp8(module, *args, **kwargs):
+            """Call the module-owned forward without changing its tensor contract.
+
+            Args:
+                module: TE module owning the original bound forward.
+                *args: Original forward's positional inputs; tensor shapes and axis
+                    order are preserved exactly as documented by that TE module.
+                **kwargs: Original forward's keyword inputs, with unchanged tensor layouts.
+
+            Returns:
+                Original forward's outputs, with tensor shapes, layouts, and aliasing unchanged.
+            """
+            with te_autocast(enabled=False):
+                return module._te_fp8_original_forward(*args, **kwargs)
+
+        excluded: list[str] = []
+        for name, module in model.named_modules(remove_duplicate=False):
+            if not isinstance(module, TransformerEngineBaseModule):
+                continue
+            name = canonical_parameter_fqn(name)
+            if not any(fqn in name for fqn in self.filter_fqns):
+                continue
+            if getattr(module, "_te_fp8_filtered", False):
+                excluded.append(name)
+                continue
+
+            # Bound methods are rebound to the copied module by deepcopy;
+            # a decorated bound-forward closure instead retains the source.
+            module._te_fp8_original_forward = module.forward
+            module.forward = MethodType(forward_without_fp8, module)
+            module._te_fp8_filtered = True
+            excluded.append(name)
+
+        if excluded:
+            logger.info(
+                "te_fp8: excluded %d modules from quantization via filter_fqns=%s: %s",
+                len(excluded),
+                self.filter_fqns,
+                excluded if len(excluded) <= 20 else excluded[:20] + ["..."],
+            )
+        else:
+            logger.warning("te_fp8: filter_fqns=%s matched no TE modules; nothing excluded.", self.filter_fqns)
+        return excluded
 
 
 @dataclass(kw_only=True)
