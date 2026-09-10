@@ -38,12 +38,10 @@ Megatron-FSDP sharding).  Subclasses only implement the small
 
 from __future__ import annotations
 
-import functools
 import importlib
 import inspect
 import logging
 import re
-import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -832,28 +830,6 @@ def _drop_empty_local_shards(params: list[Any]) -> list[Any]:
             dropped,
         )
     return filtered
-
-
-def _is_te_fused_adam(factory: Callable[..., Any]) -> bool:
-    """Return ``True`` if ``factory`` is TransformerEngine's ``FusedAdam`` (or a subclass).
-
-    ``functools.partial`` wrappers are unwrapped (iteratively, for nested
-    partials) before the identity check, so ``partial(FusedAdam, ...)``
-    factories are recognized.  Other wrapper callables (closures, custom
-    factory functions) are opaque and are NOT recognized; such factories must
-    guard against zero-numel local shards themselves.
-
-    Identity-based and import-free: TE is an optional dependency, so this never
-    imports it.  If TE has not been imported yet, ``factory`` cannot be TE's
-    ``FusedAdam`` class and the check is trivially ``False``.
-    """
-    while isinstance(factory, functools.partial):
-        factory = factory.func
-    te_optimizers = sys.modules.get("transformer_engine.pytorch.optimizers")
-    if te_optimizers is None:
-        return False
-    te_fused_adam = getattr(te_optimizers, "FusedAdam", None)
-    return isinstance(te_fused_adam, type) and isinstance(factory, type) and issubclass(factory, te_fused_adam)
 
 
 def _factory_accepts_foreach(factory: Callable[..., Any]) -> bool:
