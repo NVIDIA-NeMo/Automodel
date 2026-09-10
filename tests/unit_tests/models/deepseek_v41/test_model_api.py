@@ -18,47 +18,54 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.deepseek_v41.config import (
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
+    DeepseekV41VisionConfig,
+)
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
-from tests.unit_tests.models.deepseek_v41.conftest import tiny_backend, tiny_config
 
 
-def _model(dtype="float32"):
-    config = tiny_config(
-        vocab_size=17,
-        num_hidden_layers=1,
-        compress_ratios=[0],
-        kv_source_layer_ids=[],
-        index_source_layer_ids=[],
-        candidate_source_layer_id=-1,
-        candidate_topk_blocks=0,
-        candidate_block_size=0,
-        engram_enabled=False,
-        torch_dtype=dtype,
+def _model(dtype: str = "float32") -> DeepseekV41ForCausalLM:
+    config = DeepseekV41Config(
+        text_config=DeepseekV41TextConfig(
+            vocab_size=17,
+            hidden_size=16,
+            moe_intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=8,
+            o_groups=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            compress_ratios=[0],
+            kv_source_layer_ids=[],
+            index_source_layer_ids=[],
+            candidate_source_layer_id=-1,
+            engram_layer_ids=[],
+            dtype=dtype,
+        ),
+        vision_config=DeepseekV41VisionConfig(num_hidden_layers=0),
     )
-    model = DeepseekV41ForCausalLM(config, backend=tiny_backend(experts="torch", rms_norm="torch_fp32"))
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    model = DeepseekV41ForCausalLM(config, backend=backend)
     model.initialize_weights(torch.device("cpu"), dtype=getattr(torch, dtype))
     return model
 
 
-@pytest.mark.parametrize("trainable", [False, True])
-def test_default_policy_preserves_frozen_routing_correction_and_engram_override(trainable, monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    config = tiny_config(**({"engram_trainable": True} if trainable else {}))
-    model = DeepseekV41ForCausalLM(config)
+def test_default_policy_is_explicit_and_routing_correction_is_fixed() -> None:
+    config = _model().config
+    with torch.device("meta"):
+        model = DeepseekV41ForCausalLM(config)
     assert model.config_class is DeepseekV41Config and model.base_model_prefix == "model"
+    assert model.backend.attn == "tilelang"
     assert model.backend.linear == "torch" and model.backend.rms_norm == "torch_fp32"
-    assert model.backend.dispatcher == "torch" and model.backend.experts == "torch"
-    assert model.model.moe_config.combine_in_fp32
-    assert model.model.moe_config.gate_bias_update_factor == 0
-    assert model.model.layers["1"].engram.embed.weight.requires_grad is trainable
-    before = {
-        name: buffer.clone() for name, buffer in model.named_buffers() if name.endswith("e_score_correction_bias")
-    }
-    assert len(before) == 6
-    model.update_moe_gate_bias()
-    for name, value in before.items():
-        torch.testing.assert_close(model.get_buffer(name), value, rtol=0, atol=0)
+    assert model.backend.dispatcher == "hybridep" and model.backend.experts == "torch_linear"
+    assert model.moe_config.combine_in_fp32 and model.moe_config.gate_bias_update_factor == 0
 
 
 def test_bf16_backbone_returns_unrounded_fp32_logits():
@@ -68,7 +75,7 @@ def test_bf16_backbone_returns_unrounded_fp32_logits():
         model.lm_head.weight.copy_(
             torch.linspace(-0.04321, 0.05137, model.lm_head.weight.numel()).view_as(model.lm_head.weight)
         )
-    result = model(torch.tensor([[3, 5, 7, 9]]), output_hidden_states=True)
+    result = model(torch.tensor([[3, 5, 7, 9]]), return_hidden_states=True)
     assert result.hidden_states.dtype == torch.bfloat16
     assert result.logits.dtype == torch.float32
     expected = F.linear(result.hidden_states.float(), model.lm_head.weight)
@@ -86,9 +93,9 @@ def test_labels_match_independent_shifted_logprob_and_head_gradient():
     labels = ids.clone()
     labels[0, 2] = -100
     original = labels.clone()
-    result = model(ids, labels=labels, output_hidden_states=True)
+    result = model(ids, labels=labels, return_hidden_states=True)
     # Compare API variants under the same grad mode and before backward.
-    plain = model(ids, output_hidden_states=True)
+    plain = model(ids, return_hidden_states=True)
     assert plain.loss is None
     torch.testing.assert_close(plain.logits, result.logits, rtol=0, atol=0)
     reference = result.logits.detach().clone().requires_grad_()
@@ -98,7 +105,7 @@ def test_labels_match_independent_shifted_logprob_and_head_gradient():
     expected = -probabilities.gather(-1, targets.clamp_min(0).unsqueeze(-1)).squeeze(-1)[valid].mean()
     torch.testing.assert_close(result.loss, expected, rtol=1e-6, atol=1e-7)
     assert result.loss.dtype == torch.float32 and result.loss.ndim == 0
-    assert result.hidden_states.shape == (2, 4, model.config.hidden_size)
+    assert result.hidden_states.shape == (2, 4, model.config.text_config.hidden_size)
     assert "loss" in result and torch.equal(labels, original)
     result.logits.retain_grad()
     result.loss.backward()
@@ -122,25 +129,33 @@ def test_labels_match_independent_shifted_logprob_and_head_gradient():
 def test_labels_reject_packing_before_numerical_forward(metadata):
     model = _model()
     ids = torch.tensor([[3, 4, 5, 6]])
-    with pytest.raises(ValueError, match="packed"):
+    with pytest.raises(TypeError, match="unexpected keyword"):
         model(ids, labels=ids, **metadata)
 
 
-@pytest.mark.parametrize("logits_to_keep", [1, torch.tensor([0, 1, 2, 3])])
+@pytest.mark.parametrize("logits_to_keep", [1, torch.tensor([0, 2])])
 def test_labels_require_full_ordered_logits(logits_to_keep):
     model = _model()
     ids = torch.tensor([[3, 4, 5, 6]])
-    with pytest.raises(ValueError, match="logits_to_keep=0"):
+    with pytest.raises(ValueError, match="logits for every input position"):
         model(ids, labels=ids, logits_to_keep=logits_to_keep)
 
 
-def test_labels_shape_and_inputs_embeds_contract():
+def test_labels_shape_and_inputs_embeds_contract() -> None:
     model = _model()
     ids = torch.tensor([[3, 4, 5, 6]])
-    with pytest.raises(ValueError, match="full input"):
+    with pytest.raises(ValueError, match="logits for every input position"):
         model(ids, labels=ids[:, :-1])
-    embedded = model.get_input_embeddings()(ids)
-    result = model(inputs_embeds=embedded, labels=ids)
-    assert torch.isfinite(result.loss)
-    with pytest.raises(ValueError, match="unpacked inputs_embeds"):
-        model(inputs_embeds=embedded.squeeze(0), labels=ids)
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        model(ids, inputs_embeds=model.get_input_embeddings()(ids), labels=ids)
+
+
+def test_captured_streams_and_final_hidden_states_have_distinct_contracts() -> None:
+    model = _model()
+    ids = torch.tensor([[3, 4, 5, 6]])
+    final = model(ids, return_hidden_states=True)
+    captured = model(ids, output_hidden_states=True)
+    assert final.hidden_states.shape == (1, 4, 16)
+    assert len(captured.hidden_states) == 1
+    assert captured.hidden_states[0].shape == (1, 4, 4, 16)
+    torch.testing.assert_close(final.logits, captured.logits, rtol=0, atol=0)

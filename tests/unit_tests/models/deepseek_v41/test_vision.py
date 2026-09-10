@@ -29,6 +29,7 @@ from nemo_automodel._transformers.registry import resolve_custom_config_cls
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import (
     DeepseekV41Config,
+    DeepseekV41TextConfig,
     DeepseekV41VisionConfig,
 )
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
@@ -60,8 +61,7 @@ def _tokenizer() -> PreTrainedTokenizerFast:
 
 def _config() -> DeepseekV41Config:
     return DeepseekV41Config(
-        hidden_size=8,
-        engram_layer_ids=[],
+        text_config=DeepseekV41TextConfig(hidden_size=8, engram_layer_ids=[], dtype="float32"),
         vision_config=DeepseekV41VisionConfig(
             num_hidden_layers=2,
             hidden_size=16,
@@ -92,7 +92,7 @@ def _reference_vision(
         parameters: Vision/aligner tensors keyed with vision./aligner. prefixes.
             Linear weights use [out_features, in_features], biases/norm weights
             [features], and each block has ordinary unfused QKV ordering.
-        config: Flat text and typed vision configuration.
+        config: Nested model configuration.
         height: Number of patch rows.
         width: Number of patch columns.
 
@@ -293,13 +293,13 @@ def test_processor_save_reload_preserves_image_settings_and_outputs(tmp_path: Pa
 def test_full_model_text_and_image_forward_backward_reaches_vision_and_delimiters() -> None:
     torch.manual_seed(39)
     tokenizer = _tokenizer()
-    config = DeepseekV41Config(
+    text_config = DeepseekV41TextConfig(
         vocab_size=32,
         hidden_size=8,
         moe_intermediate_size=8,
         num_hidden_layers=1,
         num_attention_heads=2,
-        head_dim=32,
+        head_dim=8,
         qk_rope_head_dim=4,
         q_lora_rank=4,
         o_lora_rank=4,
@@ -314,13 +314,19 @@ def test_full_model_text_and_image_forward_backward_reaches_vision_and_delimiter
         engram_layer_ids=[],
         num_nextn_predict_layers=0,
         dspark_block_size=0,
+        dtype="float32",
+    )
+    config = DeepseekV41Config(
+        text_config=text_config,
         vision_config=_config().vision_config,
         image_token_id=tokenizer.convert_tokens_to_ids(IMAGE_PLACEHOLDER),
         dtype="float32",
     )
     model = DeepseekV41ForCausalLM(
         config,
-        backend=BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch"),
+        backend=BackendConfig(
+            attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="torch"
+        ),
     )
     model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
     processor = DeepseekV41Processor(tokenizer, config)
@@ -360,79 +366,3 @@ def test_image_input_parser_rejects_inconsistent_spans(corruption: str) -> None:
         image_inputs_from_batch(
             batch["pixel_values"], batch["image_grid_hws"], batch["vision_token_types"], downsample_ratio=2
         )
-
-
-def test_image_masks_reach_engram_and_modality_routing():
-    tokenizer = _tokenizer()
-    config = DeepseekV41Config(
-        vocab_size=32,
-        hidden_size=8,
-        moe_intermediate_size=8,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        head_dim=32,
-        qk_rope_head_dim=4,
-        q_lora_rank=4,
-        o_lora_rank=4,
-        o_groups=1,
-        hc_mult=2,
-        n_routed_experts=4,
-        num_experts_per_tok=2,
-        compress_ratios=[0],
-        engram_layer_ids=[0],
-        engram_num_embeddings=[101],
-        engram_vocab_size=11,
-        engram_max_ngram_size=2,
-        engram_n_heads=1,
-        engram_head_dim=32,
-        engram_compressed_vocab_size=32,
-        vision_config=_config().vision_config,
-        image_token_id=tokenizer.convert_tokens_to_ids(IMAGE_PLACEHOLDER),
-        dtype="float32",
-    )
-    model = DeepseekV41ForCausalLM(
-        config,
-        backend=BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch"),
-    )
-    model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
-    layer = model.model.layers["0"]
-    with torch.no_grad():
-        layer.mlp.gate.weight.zero_()
-        layer.mlp.gate.e_score_correction_bias.copy_(torch.tensor([10.0, 9.0, 0.0, 0.0]))
-        layer.mlp.gate.bias_vl.copy_(torch.tensor([0.0, 0.0, 10.0, 9.0]))
-    batch = DeepseekV41Processor(tokenizer, config)(
-        f"one {IMAGE_PLACEHOLDER} two", Image.new("RGB", (4, 6), "blue"), return_tensors="pt"
-    )
-    observed = {}
-
-    def record_hash_mask(_module, args):
-        """Capture the bool [batch, sequence] input mask without changing it."""
-        observed["hash_mask"] = args[2].detach().clone()
-
-    def record_engram(_module, args, output):
-        """Compare [batch, sequence, streams, hidden] before and after memory writes."""
-        observed["engram_mask"] = args[2].detach().clone()
-        image_mask = batch["vision_token_types"] >= 0
-        torch.testing.assert_close(output[image_mask], args[0][image_mask], rtol=0, atol=0)
-
-    def record_routes(_module, _args, output):
-        """Capture selected expert IDs [tokens, topk] without replacing gate outputs."""
-        observed["routes"] = output[1].detach().clone()
-
-    handles = [
-        model.model.engram_hasher.register_forward_pre_hook(record_hash_mask),
-        layer.engram.register_forward_hook(record_engram),
-        layer.mlp.gate.register_forward_hook(record_routes),
-    ]
-    try:
-        result = model(**batch)
-    finally:
-        for handle in handles:
-            handle.remove()
-    assert torch.isfinite(result.logits).all()
-    text_mask = batch["vision_token_types"] < 0
-    torch.testing.assert_close(observed["hash_mask"], text_mask, rtol=0, atol=0)
-    torch.testing.assert_close(observed["engram_mask"], text_mask, rtol=0, atol=0)
-    routes = observed["routes"].sort(-1).values
-    torch.testing.assert_close(routes[text_mask.flatten()], torch.tensor([0, 1]).expand(int(text_mask.sum()), 2))
-    torch.testing.assert_close(routes[~text_mask.flatten()], torch.tensor([2, 3]).expand(int((~text_mask).sum()), 2))

@@ -12,340 +12,115 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU unit tests for the DeepSeek V4.1 layer building blocks."""
+"""Additional CSA2 lifecycle and training contracts not covered by the reference sweeps."""
+
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 import torch
 
-from nemo_automodel.components.models.deepseek_v41.layers import (
+from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41Attention,
-    DeepseekV41Compressor,
-    DeepseekV41Indexer,
-    DeepseekV41RotaryEmbedding,
-    DeepseekV41SharedState,
-    build_compressed_visibility,
-    build_window_topk_indices,
-    fake_quant_fp4,
-    fake_quant_fp8,
-    hc_collapse,
-    hc_expand,
-    make_identity_pre_mix,
-    select_candidate_blocks,
+    DeepseekV41AttentionState,
+    _Indexer,
+    _select_candidate_blocks,
 )
-from tests.unit_tests.models.deepseek_v41.conftest import tiny_backend, tiny_config
-
-_E2M1_VALUES = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
-
-
-class TestFakeQuant:
-    def test_fp4_values_land_on_the_e2m1_grid(self):
-        torch.manual_seed(0)
-        x = torch.randn(3, 64) * 4
-        for scale_format, block in (("e8m0", 32), ("e4m3", 16)):
-            q = fake_quant_fp4(x, block, scale_format)
-            blocks = q.unflatten(-1, (-1, block))
-            amax = x.unflatten(-1, (-1, block)).abs().amax(-1, keepdim=True)
-            if scale_format == "e8m0":
-                scale = torch.exp2(torch.ceil(torch.log2(amax / 6.0)))
-            else:
-                scale = (amax / 6.0).to(torch.float8_e4m3fn).float()
-            grid_values = (blocks / scale).abs().unique().tolist()
-            assert set(round(v, 6) for v in grid_values) <= _E2M1_VALUES
-            assert (q - x).abs().max() <= scale.max() + 1e-6  # the widest grid step is 2 * scale
-
-    def test_fp4_e8m0_scale_is_power_of_two_and_rounds_to_nearest_even(self):
-        x = torch.tensor([[0.3, -5.0, 1.1, 2.6, 0.75, 1.75, 0.25, 3.5] * 4])
-        q = fake_quant_fp4(x, 32, "e8m0")
-        # amax 5.0 -> scale 2^ceil(log2(5/6)) = 1.0 -> values rounded on the raw grid.
-        # Ties: 5.0 -> 4.0 (even mantissa), 0.75 -> 1.0, 1.75 -> 2.0, 0.25 -> 0.0, 3.5 -> 4.0.
-        assert torch.equal(q, torch.tensor([[0.5, -4.0, 1.0, 3.0, 1.0, 2.0, 0.0, 4.0] * 4]))
-
-    def test_fp8_roundtrip_matches_manual(self):
-        torch.manual_seed(1)
-        x = torch.randn(2, 5, 64, dtype=torch.bfloat16) * 3
-        q = fake_quant_fp8(x, 32)
-        blocks = x.float().unflatten(-1, (-1, 32))
-        amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4)
-        scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
-        expected = ((blocks / scale).to(torch.float8_e4m3fn).float() * scale).flatten(-2).to(torch.bfloat16)
-        assert torch.equal(q, expected)
-        assert q.dtype == torch.bfloat16
-
-    def test_straight_through_gradient(self):
-        x = torch.randn(4, 32, requires_grad=True)
-        fake_quant_fp4(x, 32, "e8m0").sum().backward()
-        assert torch.equal(x.grad, torch.ones_like(x))
-        x.grad = None
-        (fake_quant_fp8(x, 32) * 2).sum().backward()
-        assert torch.equal(x.grad, torch.full_like(x, 2.0))
-
-    def test_block_size_mismatch_rejected(self):
-        with pytest.raises(ValueError, match="divisible"):
-            fake_quant_fp4(torch.zeros(2, 20), 16, "e4m3")
-        with pytest.raises(ValueError, match="scale format"):
-            fake_quant_fp4(torch.zeros(2, 32), 32, "int8")
+from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
+from tests.unit_tests.models.deepseek_v41.test_attention import _backend, _config
 
 
-class TestHyperConnectionMixing:
-    def test_identity_pre_mix_reads_stream_zero(self):
-        x = torch.randn(2, 3, 4, 8)
-        pre_mix = make_identity_pre_mix(x, 4)
-        assert torch.allclose(hc_collapse(x, pre_mix), x[:, :, 0])
-
-    def test_expand_uses_transposed_comb(self):
-        y = torch.randn(1, 2, 8)
-        residual = torch.randn(1, 2, 4, 8)
-        post = torch.rand(1, 2, 4)
-        comb = torch.rand(1, 2, 4, 4)
-        out = hc_expand(y, residual, post, comb)
-        expected = post.unsqueeze(-1) * y.unsqueeze(-2) + torch.einsum("bsjh,bsjd->bshd", comb, residual)
-        assert torch.allclose(out, expected, atol=1e-6)
-
-
-class TestSparseIndexConstruction:
-    def test_window_indices_single_document(self):
-        seq_ids = torch.ones(1, 6, dtype=torch.long)
-        idx = build_window_topk_indices(seq_ids, window_size=3)
-        assert idx.shape == (1, 6, 3)
-        assert idx[0, 0].tolist() == [0, -1, -1]
-        assert idx[0, 1].tolist() == [0, 1, -1]
-        assert idx[0, 5].tolist() == [3, 4, 5]
-
-    def test_window_indices_respect_packed_documents_and_padding(self):
-        seq_ids = torch.tensor([[1, 1, 2, 2, 2, 0]])
-        idx = build_window_topk_indices(seq_ids, window_size=4)
-        assert idx[0, 2].tolist() == [-1, -1, 2, -1]  # first token of doc 2 sees only itself
-        assert idx[0, 4].tolist() == [-1, 2, 3, 4]
-        assert (idx[0, 5] == -1).all()  # padding query attends nowhere
-
-    def test_compressed_visibility(self):
-        q_positions = torch.tensor([[0, 1, 2, 3, 0, 1]])
-        q_seq_ids = torch.tensor([[1, 1, 1, 1, 2, 2]])
-        pool_seq_ids = torch.tensor([[1, 1, 2]])
-        pool_positions = torch.tensor([[0, 1, 0]])
-        allowed = build_compressed_visibility(q_positions, q_seq_ids, pool_seq_ids, pool_positions, compress_ratio=2)
-        expected = torch.tensor(
-            [
-                [
-                    [False, False, False],  # pos 0: no complete group yet
-                    [True, False, False],  # pos 1: group 0 complete
-                    [True, False, False],
-                    [True, True, False],  # pos 3: groups 0 and 1
-                    [False, False, False],  # doc 2 pos 0
-                    [False, False, True],  # doc 2 pos 1 sees its own group only
-                ]
-            ]
-        )
-        assert torch.equal(allowed, expected)
-
-    def test_candidate_blocks_pin_newest_block_and_keep_top(self):
-        width = 12
-        scores = torch.zeros(1, 1, width)
-        scores[0, 0, 1] = 9.0  # block 0 strongest
-        scores[0, 0, 5] = 3.0  # block 1
-        allowed = torch.zeros(1, 1, width, dtype=torch.bool)
-        allowed[0, 0, :10] = True  # newest visible position 9 -> block 2 (positions 8..11)
-        scores = scores.masked_fill(~allowed, float("-inf"))
-        keep = select_candidate_blocks(scores, allowed, topk_blocks=2, block_size=4)
-        assert keep[0, 0].tolist() == [True] * 4 + [False] * 4 + [True] * 4
-
-    def test_candidate_blocks_with_nothing_visible(self):
-        scores = torch.full((1, 1, 8), float("-inf"))
-        allowed = torch.zeros(1, 1, 8, dtype=torch.bool)
-        keep = select_candidate_blocks(scores, allowed, topk_blocks=1, block_size=4)
-        assert not keep.any()
+@pytest.mark.parametrize("backend", ["eager", "sdpa"])
+def test_attention_dropout_is_training_only_and_keeps_gradients_finite(backend):
+    torch.manual_seed(107)
+    config = _config()
+    config.attention_dropout = 0.5
+    layer = DeepseekV41Attention(config, 0, _backend(backend))
+    inputs = torch.randn(2, 8, config.hidden_size, requires_grad=True)
+    kwargs = dict(position_ids=torch.arange(8)[None], state=DeepseekV41AttentionState())
+    layer.eval()
+    expected = layer(inputs, **kwargs).hidden_states
+    torch.testing.assert_close(layer(inputs, **kwargs).hidden_states, expected, atol=0, rtol=0)
+    layer.train()
+    torch.manual_seed(108)
+    actual = layer(inputs, **kwargs).hidden_states
+    assert not torch.equal(actual, expected)
+    torch.manual_seed(108)
+    torch.testing.assert_close(layer(inputs, **kwargs).hidden_states, actual, atol=0, rtol=0)
+    actual.square().sum().backward()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+    assert layer.sinks_param.weight.grad is not None
+    assert torch.isfinite(layer.sinks_param.weight.grad).all()
+    layer.eval()
+    torch.testing.assert_close(layer(inputs, **kwargs).hidden_states, expected, atol=0, rtol=0)
 
 
-class TestCompressor:
-    def test_ratio_two_pools_with_softmax_gate(self):
-        config = tiny_config()
-        comp = DeepseekV41Compressor(config, compress_ratio=2).float()
-        x = torch.randn(1, 5, config.hidden_size)
-        out = comp(x)
-        assert out.shape == (1, 2, config.head_dim)  # trailing partial group dropped
-        kv = comp.wkv(x[:, :4]).unflatten(1, (-1, 2))
-        gate = comp.wgate(x[:, :4]).unflatten(1, (-1, 2)).softmax(dim=2)
-        expected = comp.norm((kv * gate).sum(2))
-        assert torch.allclose(out, expected, atol=1e-6)
-        assert comp.wkv.weight.dtype == torch.float32 and comp.wgate.weight.dtype == torch.float32
-
-    def test_ratio_one_is_a_projection(self):
-        config = tiny_config()
-        comp = DeepseekV41Compressor(config, compress_ratio=1).float()
-        assert comp.wgate is None
-        x = torch.randn(2, 3, config.hidden_size)
-        assert torch.allclose(comp(x), comp.norm(comp.wkv(x)))
-
-    def test_invalid_ratio(self):
-        with pytest.raises(ValueError):
-            DeepseekV41Compressor(tiny_config(), compress_ratio=0)
+def test_tilelang_requires_zero_dropout_and_attention_requires_supported_projections():
+    config = _config()
+    config.attention_dropout = 0.1
+    with pytest.raises(ValueError, match="attention_dropout=0"):
+        DeepseekV41Attention(config, 0, _backend("tilelang"))
+    config.attention_dropout = 0
+    with pytest.raises(ValueError, match="torch linear"):
+        DeepseekV41Attention(config, 0, replace(_backend(), linear="te"))
+    with pytest.raises(ValueError, match="torch_fp32"):
+        DeepseekV41Attention(config, 0, replace(_backend(), rms_norm="torch"))
 
 
-def _rope_tables(config, positions):
-    rotary = DeepseekV41RotaryEmbedding(
-        rope_theta=config.compress_rope_theta,
-        head_dim=config.head_dim,
-        partial_rotary_factor=config.qk_rope_head_dim / config.head_dim,
-        rope_scaling=config.rope_scaling,
+@pytest.mark.parametrize("batch,sequence", [(2, 6), (1, 5)])
+def test_reuse_rejects_state_from_another_batch_or_sequence(batch, sequence):
+    config = _config()
+    full = DeepseekV41Attention(config, 1, _backend())
+    reuse = DeepseekV41Attention(config, 2, _backend())
+    source = full(
+        torch.randn(1, 6, config.hidden_size),
+        position_ids=torch.arange(6)[None],
+        state=DeepseekV41AttentionState(),
     )
-    return rotary, rotary(torch.zeros(1), positions)
-
-
-class TestIndexer:
-    def test_reindex_layer_uses_candidate_pool_and_masks(self):
-        config = tiny_config(index_topk=3)
-        indexer = DeepseekV41Indexer(config, layer_idx=5, backend=tiny_backend()).float()
-        assert indexer.uses_candidates and not indexer.owns_k and indexer.wk is None
-        batch, seq_len, pool = 1, 4, 8
-        x = torch.randn(batch, seq_len, config.hidden_size)
-        qr = torch.randn(batch, seq_len, config.q_lora_rank)
-        _, (cos, sin) = _rope_tables(config, torch.arange(seq_len).unsqueeze(0))
-        allowed = torch.ones(batch, seq_len, pool, dtype=torch.bool)
-        allowed[:, :, 6:] = False
-        state = DeepseekV41SharedState(compress_ratio=1)
-        state.index_k = torch.randn(batch, pool, config.index_head_dim)
-        state.allowed = allowed
-        state.candidates = torch.zeros(batch, seq_len, pool, dtype=torch.bool)
-        state.candidates[:, :, [0, 3]] = True
-        topk, _ = indexer(x, qr, cos, sin, state)
-        assert topk.shape == (batch, seq_len, 3)
-        valid = topk[topk >= 0]
-        assert set(valid.tolist()) <= {0, 3}
-        assert (topk[:, :, 2] == -1).all()  # only two candidates are ever selectable
-
-    def test_full_layer_publishes_candidates_and_keys(self):
-        config = tiny_config(index_topk=4)
-        indexer = DeepseekV41Indexer(config, layer_idx=4, backend=tiny_backend()).float()
-        assert indexer.is_candidate_source and indexer.owns_k
-        pool = 8
-        latent = torch.randn(1, pool, config.head_dim)
-        rotary, (cos_p, sin_p) = _rope_tables(config, torch.arange(pool).unsqueeze(0))
-        keys = indexer.build_keys(latent, cos_p, sin_p)
-        assert keys.shape == (1, pool, config.index_head_dim)
-        seq_len = 3
-        x = torch.randn(1, seq_len, config.hidden_size)
-        qr = torch.randn(1, seq_len, config.q_lora_rank)
-        _, (cos, sin) = _rope_tables(config, torch.arange(seq_len).unsqueeze(0))
-        state = DeepseekV41SharedState(compress_ratio=1)
-        state.index_k = keys
-        state.allowed = torch.ones(1, seq_len, pool, dtype=torch.bool)
-        topk, candidates = indexer(x, qr, cos, sin, state)
-        assert candidates is not None and candidates.shape == (1, seq_len, pool)
-        # candidate_topk_blocks=2 blocks of 4 positions cover the whole pool here
-        assert candidates.all()
-        assert (topk >= 0).all()
-
-    def test_missing_candidates_raise(self):
-        config = tiny_config()
-        indexer = DeepseekV41Indexer(config, layer_idx=5, backend=tiny_backend()).float()
-        _, (cos, sin) = _rope_tables(config, torch.arange(2).unsqueeze(0))
-        state = DeepseekV41SharedState(compress_ratio=1)
-        with pytest.raises(RuntimeError, match="no published index keys"):
-            indexer(torch.randn(1, 2, config.hidden_size), torch.randn(1, 2, config.q_lora_rank), cos, sin, state)
-        state.index_k = torch.randn(1, 4, config.index_head_dim)
-        state.allowed = torch.ones(1, 2, 4, dtype=torch.bool)
-        with pytest.raises(RuntimeError, match="candidate pool"):
-            indexer(torch.randn(1, 2, config.hidden_size), torch.randn(1, 2, config.q_lora_rank), cos, sin, state)
-
-
-class TestAttentionStateSharing:
-    @staticmethod
-    def _attention_inputs(config, seq_len):
-        position_ids = torch.arange(seq_len).unsqueeze(0)
-        rotary_main = DeepseekV41RotaryEmbedding(
-            rope_theta=config.rope_theta,
-            head_dim=config.head_dim,
-            partial_rotary_factor=config.qk_rope_head_dim / config.head_dim,
+    with pytest.raises(ValueError, match="different batch or sequence"):
+        reuse(
+            torch.randn(batch, sequence, config.hidden_size),
+            position_ids=torch.arange(sequence)[None],
+            state=source.state,
         )
-        rotary_compress, compress_tables = _rope_tables(config, position_ids)
-        return dict(
-            position_embeddings=rotary_main(torch.zeros(1), position_ids),
-            position_embeddings_compress=compress_tables,
-            rotary_compress=rotary_compress,
-            position_ids=position_ids,
-            seq_ids=torch.ones(1, seq_len, dtype=torch.long),
+    with pytest.raises(ValueError, match="same compression ratio"):
+        reuse(
+            torch.randn(1, 6, config.hidden_size),
+            position_ids=torch.arange(6)[None],
+            state=replace(source.state, compression_ratio=1),
         )
-
-    def test_full_then_reuse_share_compressed_kv(self):
-        config = tiny_config()
-        seq_len = 9
-        full = DeepseekV41Attention(config, layer_idx=2, backend=tiny_backend()).float()
-        reuse = DeepseekV41Attention(config, layer_idx=3, backend=tiny_backend()).float()
-        assert full.compressor is not None and full.indexer is not None
-        assert reuse.compressor is None and reuse.indexer is None
-        state = DeepseekV41SharedState()
-        kwargs = self._attention_inputs(config, seq_len)
-        x = torch.randn(1, seq_len, config.hidden_size)
-        out_full = full(x, state=state, **kwargs)
-        assert out_full.shape == (1, seq_len, config.hidden_size)
-        assert state.compress_ratio == 2
-        assert state.compress_kv.shape == (1, seq_len // 2, config.head_dim)
-        assert state.index_k.shape == (1, seq_len // 2, config.index_head_dim)
-        assert state.topk_idxs.shape[:2] == (1, seq_len)
-        assert state.allowed.shape == (1, seq_len, seq_len // 2)
-        assert state.window_topk_idxs.shape == (1, seq_len, min(seq_len, config.sliding_window))
-        # Query 0 has no complete group yet, so every compressed slot is empty.
-        assert (state.topk_idxs[0, 0] == -1).all()
-        out_reuse = reuse(x, state=state, **kwargs)
-        assert out_reuse.shape == (1, seq_len, config.hidden_size)
-        assert torch.isfinite(out_reuse).all()
-
-    def test_short_sequence_has_empty_pool(self):
-        config = tiny_config()
-        full = DeepseekV41Attention(config, layer_idx=2, backend=tiny_backend()).float()
-        kwargs = self._attention_inputs(config, 1)
-        state = DeepseekV41SharedState()
-        out = full(torch.randn(1, 1, config.hidden_size), state=state, **kwargs)
-        assert out.shape == (1, 1, config.hidden_size)
-        assert state.compress_kv.shape[1] == 0 and state.topk_idxs.shape[-1] == 0
-
-    def test_reuse_without_source_raises(self):
-        config = tiny_config()
-        reuse = DeepseekV41Attention(config, layer_idx=3, backend=tiny_backend()).float()
-        kwargs = self._attention_inputs(config, 4)
-        with pytest.raises(RuntimeError, match="no matching compressed KV"):
-            reuse(torch.randn(1, 4, config.hidden_size), state=DeepseekV41SharedState(), **kwargs)
-
-    def test_ratio_mismatch_raises(self):
-        config = tiny_config()
-        full_ratio2 = DeepseekV41Attention(config, layer_idx=2, backend=tiny_backend()).float()
-        reindex_ratio1 = DeepseekV41Attention(config, layer_idx=5, backend=tiny_backend()).float()
-        kwargs = self._attention_inputs(config, 6)
-        state = DeepseekV41SharedState()
-        full_ratio2(torch.randn(1, 6, config.hidden_size), state=state, **kwargs)
-        with pytest.raises(RuntimeError, match="no matching compressed KV"):
-            reindex_ratio1(torch.randn(1, 6, config.hidden_size), state=state, **kwargs)
-
-    def test_sliding_window_layer_is_causal(self):
-        config = tiny_config()
-        attn = DeepseekV41Attention(config, layer_idx=0, backend=tiny_backend()).float()
-        seq_len = 6
-        kwargs = self._attention_inputs(config, seq_len)
-        x = torch.randn(1, seq_len, config.hidden_size)
-        out = attn(x, state=DeepseekV41SharedState(), **kwargs)
-        x2 = x.clone()
-        x2[:, -1] += 1.0  # perturb the last token only
-        out2 = attn(x2, state=DeepseekV41SharedState(), **kwargs)
-        assert torch.allclose(out[:, :-1], out2[:, :-1], atol=1e-5)
-        assert not torch.allclose(out[:, -1], out2[:, -1])
+    with pytest.raises(FrozenInstanceError):
+        source.state.compression_ratio = 1
 
 
-@pytest.mark.parametrize("prefix", [1, 3, 5, 11])
-def test_candidate_blocks_follow_document_boundaries(prefix):
-    # Distinct scores isolate block alignment from unspecified Top-K tie ordering.
-    scores = torch.tensor([8.0, 1.0, 4.0, 9.0, 3.0, 2.0, 7.0, 6.0, 5.0, 11.0, 10.0]).view(1, 1, -1)
-    allowed = torch.ones_like(scores, dtype=torch.bool)
-    positions = torch.arange(scores.shape[-1]).unsqueeze(0)
-    expected = select_candidate_blocks(scores, allowed, 2, 4, pool_positions=positions)
-    packed_scores = torch.nn.functional.pad(scores, (prefix, 0), value=float("-inf"))
-    packed_allowed = torch.nn.functional.pad(allowed, (prefix, 0), value=False)
-    packed_positions = torch.cat([torch.arange(prefix).unsqueeze(0), positions], dim=1)
-    actual = select_candidate_blocks(packed_scores, packed_allowed, 2, 4, pool_positions=packed_positions)
-    torch.testing.assert_close(actual[..., prefix:], expected, rtol=0, atol=0)
+def test_indexer_rejects_missing_latent_keys_and_candidates():
+    config = _config()
+    x = torch.randn(1, 4, config.hidden_size)
+    kwargs = dict(
+        query_latent=torch.randn(1, 4, config.q_lora_rank),
+        latent=None,
+        angles=torch.zeros(1, 4, config.qk_rope_head_dim // 2),
+        compressed_angles=torch.zeros(1, 3, config.qk_rope_head_dim // 2),
+    )
+    full = _Indexer(config, layer_idx=1, dtype=torch.float32)
+    reindex = _Indexer(config, layer_idx=4, dtype=torch.float32)
+    with pytest.raises(ValueError, match="unrotated compressed latent"):
+        full(x, **kwargs, state=DeepseekV41AttentionState())
+    with pytest.raises(ValueError, match="index keys"):
+        reindex(x, **kwargs, state=DeepseekV41AttentionState())
+    state = DeepseekV41AttentionState(compression_ratio=1, index_keys=torch.randn(1, 3, config.index_head_dim))
+    with pytest.raises(ValueError, match="requires candidates"):
+        reindex(x, **kwargs, state=state)
+    with pytest.raises(ValueError, match="requires candidates"):
+        reindex(x, **kwargs, state=replace(state, candidates=torch.ones(1, 4, 2, dtype=torch.bool)))
 
 
 def test_candidate_blocks_with_no_visible_keys():
-    scores = torch.full((2, 3, 7), float("-inf"))
-    allowed = torch.zeros_like(scores, dtype=torch.bool)
-    positions = torch.tensor([[0, 1, 2, 0, 1, 2, 3], [0, 0, 1, 2, 3, 4, 5]])
-    assert not select_candidate_blocks(scores, allowed, 2, 4, pool_positions=positions).any()
+    scores = torch.full((2, 3, 7), -torch.inf)
+    lengths = torch.zeros(2, 3, 1, dtype=torch.long)
+    assert not _select_candidate_blocks(scores, lengths, topk_blocks=2, block_size=4).any()
+
+
+@pytest.mark.parametrize("format,block_size", [("int8", 32), ("fp8", 0), ("nvfp4", -1)])
+def test_cache_quantization_rejects_unsupported_format_or_group_size(format, block_size):
+    with pytest.raises(ValueError, match="positive block_size"):
+        quantize_cache(torch.zeros(2, 20), format=format, block_size=block_size)

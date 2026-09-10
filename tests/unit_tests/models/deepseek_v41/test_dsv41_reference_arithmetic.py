@@ -24,19 +24,28 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.deepseek_v41.layers import (
-    DeepseekV41Compressor,
-    DeepseekV41HyperConnection,
-    DeepseekV41Indexer,
-    DeepseekV41RotaryEmbedding,
-    DeepseekV41SharedState,
-    _apply_partial_rope,
-    fake_quant_fp4,
-    fake_quant_fp8,
-    hc_collapse,
-    hc_expand,
+from nemo_automodel.components.models.deepseek_v41.attention import (
+    DeepseekV41AttentionState,
+    _apply_rope,
+    _Compressor,
+    _Indexer,
+    _RotaryEmbedding,
 )
-from tests.unit_tests.models.deepseek_v41.conftest import tiny_backend, tiny_config
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
+from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41HyperConnection
+from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
+from tests.unit_tests.models.deepseek_v41.test_attention import _config as _attention_config
+
+
+def _config(**overrides):
+    values = _attention_config().to_dict()
+    # HF serializes a canonical rope_parameters field alongside the legacy
+    # rope_scaling alias; do not let the old canonical value mask an override.
+    if "rope_scaling" in overrides:
+        values.pop("rope_parameters", None)
+    values.update(head_dim=64, index_head_dim=32, qk_rope_head_dim=16, rms_norm_eps=1e-6, hc_sinkhorn_iters=4)
+    values.update(overrides)
+    return DeepseekV41TextConfig(**values)
 
 
 def _reference_frequencies(positions, dim, theta, scaling):
@@ -59,23 +68,30 @@ def _reference_frequencies(positions, dim, theta, scaling):
 @pytest.mark.parametrize("heads", [None, 3])
 def test_rotary_matches_complex_reference_after_bf16_cast_and_backward(use_yarn, heads):
     torch.manual_seed(94)
-    config = tiny_config()
+    config = _config(
+        rope_scaling={
+            "factor": 4,
+            "original_max_position_embeddings": 64,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        }
+    )
     scaling = config.rope_scaling if use_yarn else None
-    module = DeepseekV41RotaryEmbedding(config.rope_theta, 64, 0.25, rope_scaling=scaling).bfloat16()
+    theta = config.compress_rope_theta if use_yarn else config.rope_theta
+    module = _RotaryEmbedding(config, compressed=use_yarn).bfloat16()
     positions = torch.tensor([[0, 1, 63, 64, 257, 4096], [0, 3, 0, 1, 9, 65536]])
-    shape = (2, 6, 64) if heads is None else (2, heads, 6, 64)
+    shape = (2, 6, 64) if heads is None else (2, 6, heads, 64)
     x = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
     reference_x = x.detach().clone().requires_grad_()
-    phases = _reference_frequencies(positions, 16, config.rope_theta, scaling)
-    cos, sin = module(x, positions)
-    assert cos.dtype == sin.dtype == torch.float32
-    torch.testing.assert_close(cos[..., :8], phases.real, rtol=0, atol=0)
-    torch.testing.assert_close(sin[..., :8], phases.imag, rtol=0, atol=0)
+    phases = _reference_frequencies(positions, 16, theta, scaling)
+    angles = module(positions)
+    assert angles.dtype == torch.float32
+    actual_phases = torch.polar(torch.ones_like(angles), angles)
+    torch.testing.assert_close(actual_phases, phases, rtol=0, atol=0)
     if heads is not None:
-        phases = phases.unsqueeze(1)
+        phases = phases.unsqueeze(2)
     for inverse in (False, True):
-        sign = -1 if inverse else 1
-        actual = _apply_partial_rope(x, cos, sign * sin, 16)
+        actual = _apply_rope(x, angles, inverse=inverse)
         pairs = torch.view_as_complex(reference_x[..., -16:].float().reshape(*shape[:-1], 8, 2))
         rotated = torch.view_as_real(pairs * (phases.conj() if inverse else phases)).flatten(-2).bfloat16()
         expected = torch.cat([reference_x[..., :-16], rotated], -1)
@@ -105,7 +121,7 @@ def _mhc_reference(x, parameters, streams, norm_eps, hc_eps, repeat):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_mhc_coefficients_collapse_expand_and_gradients_match_released_equations(dtype):
     torch.manual_seed(43)
-    module = DeepseekV41HyperConnection(4, 16, 4, 1e-6, 1e-6, sinkhorn_backend="torch")
+    module = DeepseekV41HyperConnection(_config(hc_eps=1e-6), sinkhorn_backend="torch")
     with torch.no_grad():
         module.fn.normal_(std=0.1)
         module.base.normal_(std=0.3)
@@ -115,14 +131,14 @@ def test_mhc_coefficients_collapse_expand_and_gradients_match_released_equations
     reference_x = x.detach().clone().requires_grad_()
     actual_mix = module(x)
     expected_mix = _mhc_reference(reference_x, reference_parameters, 4, 1e-6, 1e-6, 4)
-    for actual, expected in zip(actual_mix, expected_mix):
+    for actual, expected in zip((actual_mix.pre, actual_mix.post, actual_mix.comb), expected_mix):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     previous = torch.rand(2, 3, 4, requires_grad=True)
     reference_previous = previous.detach().clone().requires_grad_()
-    collapsed = hc_collapse(x, previous)
+    collapsed = module.collapse(x, previous)
     reference_collapsed = (reference_previous[..., None] * reference_x.float()).sum(2).to(dtype)
     torch.testing.assert_close(collapsed, reference_collapsed, rtol=0, atol=0)
-    actual = hc_expand(collapsed, x, actual_mix[1], actual_mix[2])
+    actual = module.expand(collapsed, x, actual_mix)
     # Share each FP32 cast across output streams. Repeating the cast inside
     # the loop would round separate BF16 gradient contributions prematurely.
     reference_collapsed_fp32 = reference_collapsed.float()
@@ -137,7 +153,7 @@ def test_mhc_coefficients_collapse_expand_and_gradients_match_released_equations
     ).to(dtype)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     upstream = torch.randn_like(actual)
-    loss = (actual * upstream).sum() + actual_mix[0].square().sum()
+    loss = (actual * upstream).sum() + actual_mix.pre.square().sum()
     reference_loss = (expected * upstream).sum() + expected_mix[0].square().sum()
     loss.backward()
     reference_loss.backward()
@@ -157,7 +173,7 @@ def _independent_mx_scale(amax, max_value):
     return math.ldexp(1.0, exponent - (mantissa == 0.5))
 
 
-@pytest.mark.parametrize("format", ["fp8", "e8m0", "e4m3"])
+@pytest.mark.parametrize("format", ["fp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("exponent", [-8, 0, 8])
 def test_cache_quantization_boundary_values_signed_zero_and_ste(format, exponent):
     max_value = 448.0 if format == "fp8" else 6.0
@@ -169,7 +185,7 @@ def test_cache_quantization_boundary_values_signed_zero_and_ste(format, exponent
         torch.nextafter(boundary, torch.tensor(torch.inf)),
         torch.tensor(0.0),
     ]
-    block_size = 16 if format == "e4m3" else 32
+    block_size = 16 if format == "nvfp4" else 32
     rows = []
     for maximum in maxima:
         row = torch.zeros(block_size)
@@ -181,12 +197,12 @@ def test_cache_quantization_boundary_values_signed_zero_and_ste(format, exponent
             row[-1] = maximum
         rows.append(row)
     x = torch.stack(rows).requires_grad_()
-    actual = fake_quant_fp8(x, block_size) if format == "fp8" else fake_quant_fp4(x, block_size, format)
+    actual = quantize_cache(x, format=format, block_size=block_size)
     grid = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
     expected_rows = []
     for row in x.detach():
         amax = float(row.abs().max())
-        if format == "e4m3":
+        if format == "nvfp4":
             scale = float(torch.tensor(max(amax, 6 * 2.0**-9) / 6).to(torch.float8_e4m3fn).float())
         else:
             floor = 1e-4 if format == "fp8" else 6 * 2.0**-126
@@ -202,7 +218,7 @@ def test_cache_quantization_boundary_values_signed_zero_and_ste(format, exponent
     expected = torch.stack(expected_rows)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert torch.equal(torch.signbit(actual), torch.signbit(expected))
-    if format in ("fp8", "e8m0") and exponent == 8:
+    if format in ("fp8", "mxfp4") and exponent == 8:
         # Negative control: at large exponents, float32 log2 can round the
         # adjacent-above power back down, producing the old wrong MX scale.
         old_scale = torch.exp2(torch.ceil(torch.log2(maxima[2] / max_value)))
@@ -215,8 +231,8 @@ def test_cache_quantization_boundary_values_signed_zero_and_ste(format, exponent
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_compressor_cast_boundary_and_all_gradients_match_literal_projection(ratio):
     torch.manual_seed(73)
-    config = tiny_config(torch_dtype="bfloat16")
-    module = DeepseekV41Compressor(config, ratio)
+    config = _config(dtype="bfloat16")
+    module = _Compressor(config, ratio=ratio, dtype=torch.bfloat16)
     # Strict FSDP storage can promote the ratio-1 projection while its compute
     # must follow the BF16 activation. Ordinary norm weight stays BF16.
     module.wkv.float()
@@ -248,29 +264,46 @@ def test_compressor_cast_boundary_and_all_gradients_match_literal_projection(rat
 
 def test_indexer_uses_bf16_scores_and_returns_sorted_positions_with_empty_queries():
     torch.manual_seed(83)
-    config = tiny_config(torch_dtype="bfloat16", index_topk=3, kv_cache_fake_quant=False)
-    module = DeepseekV41Indexer(config, 5, tiny_backend())
-    x = torch.randn(2, 4, config.hidden_size, dtype=torch.bfloat16)
-    qr = torch.randn(2, 4, config.q_lora_rank, dtype=torch.bfloat16)
+    config = _config(dtype="bfloat16", index_topk=3)
+    module = _Indexer(config, layer_idx=4, dtype=torch.bfloat16)
+    x = torch.randn(2, 8, config.hidden_size, dtype=torch.bfloat16)
+    qr = torch.randn(2, 8, config.q_lora_rank, dtype=torch.bfloat16)
+    # Identity RoPE isolates projection, mandatory query QAT, BF16 score
+    # boundaries, causal/candidate visibility, and frozen ownership.
+    angles = torch.zeros(2, 8, config.qk_rope_head_dim // 2)
     keys = torch.randn(2, 7, config.index_head_dim, dtype=torch.bfloat16)
-    # Identity RoPE isolates the indexer's projection, BF16 score boundaries,
-    # candidate visibility, position ordering, and frozen ownership.
-    cos, sin = torch.ones(2, 4, config.qk_rope_head_dim), torch.zeros(2, 4, config.qk_rope_head_dim)
-    allowed = torch.ones(2, 4, 7, dtype=torch.bool)
-    allowed[:, 0] = False
-    candidates = torch.zeros_like(allowed)
+    compressed_valid = torch.ones(2, 7, dtype=torch.bool)
+    compressed_valid[:, 0] = False
+    candidates = torch.zeros(2, 8, 7, dtype=torch.bool)
     candidates[:, :, [0, 2, 4, 6]] = True
-    candidates[:, 1, [4, 6]] = False
-    state = DeepseekV41SharedState(compress_ratio=1, index_k=keys, allowed=allowed, candidates=candidates)
-    actual, returned_candidates = module(x, qr, cos, sin, state)
-    q = F.linear(qr, module.wq_b.weight).reshape(2, 4, config.index_n_heads, config.index_head_dim)
+    state = DeepseekV41AttentionState(
+        compression_ratio=1,
+        index_keys=keys,
+        compressed_valid=compressed_valid,
+        candidates=candidates,
+    )
+    actual = module(x, query_latent=qr, latent=None, angles=angles, compressed_angles=angles[:, :7], state=state)
+    q = F.linear(qr, module.wq_b.weight).reshape(2, 8, config.index_n_heads, config.index_head_dim)
+    # Independent nearest-grid rounding, with exact frexp scale selection.
+    quantized = torch.empty_like(q)
+    grid = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    for output, row in zip(quantized.reshape(-1, 32), q.reshape(-1, 32)):
+        scale = _independent_mx_scale(max(float(row.abs().max()), 6 * 2.0**-126), 6)
+        values = []
+        for value in (row.float() / scale).tolist():
+            index = min(range(len(grid)), key=lambda i: (abs(abs(value) - grid[i]), i % 2))
+            values.append(math.copysign(grid[index] * scale, value))
+        output.copy_(torch.tensor(values, dtype=torch.bfloat16))
     weights = F.linear(x, module.weights_proj.weight) * (config.index_head_dim**-0.5 * config.index_n_heads**-0.5)
-    scores = torch.einsum("bshd,btd->bsht", q, keys).relu()
+    scores = torch.einsum("bshd,btd->bsht", quantized, keys).relu()
     scores = (scores * weights[..., None]).sum(2)
-    scores = scores.masked_fill(~(allowed & candidates), -torch.inf)
+    allowed = torch.arange(7)[None, None, :] < torch.arange(1, 9)[None, :, None]
+    scores = scores.masked_fill(~(allowed & compressed_valid[:, None, :] & candidates), -torch.inf)
     selected = scores.topk(3, sorted=False).indices.sort(-1).values
     expected = torch.where(torch.isfinite(scores.gather(-1, selected)), selected, -1)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert returned_candidates is candidates
-    assert not actual[:, 0].ge(0).any()
+    torch.testing.assert_close(actual.topk_indices, expected, rtol=0, atol=0)
+    assert actual.candidates is candidates
+    assert actual.index_keys is keys
+    assert not actual.topk_indices[:, 0].ge(0).any()
+    assert state.topk_indices is None
     assert all(not parameter.requires_grad for parameter in module.parameters())

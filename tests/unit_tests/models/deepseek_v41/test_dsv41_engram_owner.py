@@ -19,7 +19,6 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
-import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
@@ -28,26 +27,62 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.deepseek_v41.config import (
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
+    DeepseekV41VisionConfig,
+)
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
-from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import DeepSeekV41StateDictAdapter
+from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import DeepseekV41StateDictAdapter
 from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextOwnerShardedEmbedding
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.multimodal_fsdp import ignored_params_for_root
-from tests.unit_tests.models.deepseek_v41.conftest import tiny_backend, tiny_config
+from tests.unit_tests.models.deepseek_v41.test_engram import _tokenizer
 
 
-def _owner_model(rows: tuple[int, int], trainable: bool) -> DeepseekV41ForCausalLM:
-    """Build two logical tables in the existing tiny six-layer CPU model."""
-    config = tiny_config(
-        engram_layer_ids=[1, 4],
-        engram_num_embeddings=list(rows),
-        engram_vocab_size=2,
-        engram_n_heads=1,
-        engram_head_dim=32,
-        engram_trainable=trainable,
+def _owner_model(rows: tuple[int, int]) -> DeepseekV41ForCausalLM:
+    """Build a nested tiny model with real tokenizer-derived hash metadata."""
+    config = DeepseekV41Config(
+        vision_config=DeepseekV41VisionConfig(num_hidden_layers=0),
+        text_config=DeepseekV41TextConfig(
+            vocab_size=64,
+            hidden_size=16,
+            moe_intermediate_size=16,
+            num_hidden_layers=6,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=8,
+            o_groups=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            compress_ratios=[0, 0, 2, 2, 1, 1],
+            kv_source_layer_ids=[2, 4],
+            index_source_layer_ids=[2, 4, 5],
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=2,
+            candidate_source_layer_id=4,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            engram_layer_ids=[1, 4],
+            engram_num_embeddings=list(rows),
+            engram_vocab_size=2,
+            engram_max_ngram_size=3,
+            engram_n_heads=1,
+            engram_head_dim=32,
+            engram_compressed_vocab_size=6,
+            num_nextn_predict_layers=0,
+            dspark_block_size=0,
+            dspark_noise_token_id=0,
+            dtype="float32",
+        ),
     )
-    # Exercise automatic WORLD ownership; the single-process path remains local.
-    return DeepseekV41ForCausalLM(config, backend=tiny_backend())
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="torch")
+    # Exercise automatic WORLD ownership with legal hash bucket capacities.
+    return DeepseekV41ForCausalLM(config, backend=backend, tokenizer=_tokenizer())
 
 
 def _owner_gradient_case(model: DeepseekV41ForCausalLM, layer_id: int, *, empty_requester: bool) -> None:
@@ -71,13 +106,10 @@ def _owner_gradient_case(model: DeepseekV41ForCausalLM, layer_id: int, *, empty_
     ids = torch.tensor([] if empty_requester and rank == 1 else requested[rank:], dtype=torch.long).reshape(1, -1, 1)
     upstream = (torch.arange(ids.numel() * width).reshape(*ids.shape, width).float() + rank + 1) / 8
     actual = table(ids)
-    oracle_weight = full_weight.clone().requires_grad_(table.weight.requires_grad)
+    oracle_weight = full_weight.clone().requires_grad_()
     expected = F.embedding(ids, oracle_weight)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    if not table.weight.requires_grad:
-        assert not actual.requires_grad and table.weight.grad is None
-        return
     table.weight.grad = None
     actual.backward(upstream)
     expected.backward(upstream)
@@ -124,7 +156,7 @@ def _owner_checkpoint_roundtrip(model: DeepseekV41ForCausalLM, directory: Path) 
         assert parameter.placements == (Shard(0),)
         assert parameter._nemo_model_owned_grad_divisor == 2.0
 
-    adapter = DeepSeekV41StateDictAdapter(model.config, model.model.moe_config, model.backend)
+    adapter = DeepseekV41StateDictAdapter(model.config, model.moe_config, model.backend, dtype=torch.float32)
     hf_state = dict(pair for name, value in state.items() for pair in adapter.convert_single_tensor_to_hf(name, value))
     for name, value in hf_state.items():
         module = model.model.layers[name.split(".")[1]].engram
@@ -149,7 +181,7 @@ def _owner_checkpoint_roundtrip(model: DeepseekV41ForCausalLM, directory: Path) 
     quantized = dict(
         pair
         for name, value in state.items()
-        for pair in adapter.convert_single_tensor_to_hf(name, value, quantization=True)
+        for pair in adapter.convert_single_tensor_to_hf(name, value, quantization=True, for_checkpoint_load=True)
     )
     for name, value in quantized.items():
         module = model.model.layers[name.split(".")[1]].engram
@@ -170,7 +202,7 @@ def _owner_checkpoint_roundtrip(model: DeepseekV41ForCausalLM, directory: Path) 
         torch.testing.assert_close(value.to_local(), wanted, rtol=0, atol=0)
 
 
-def _owner_worker(rank: int, store: str, directory: str, rows: tuple[int, int], trainable: bool) -> None:
+def _owner_worker(rank: int, store: str, directory: str, rows: tuple[int, int]) -> None:
     """Exercise two true owner ranks without initializing CUDA or model attention."""
     try:
         torch.set_num_threads(1)
@@ -178,7 +210,7 @@ def _owner_worker(rank: int, store: str, directory: str, rows: tuple[int, int], 
             "gloo", init_method=f"file://{store}", rank=rank, world_size=2, timeout=timedelta(seconds=90)
         )
         mesh = DeviceMesh.from_group(dist.group.WORLD, device_type="cpu", mesh_dim_names=("dp_shard_cp",))
-        model = _owner_model(rows, trainable)
+        model = _owner_model(rows)
         modules = [model.model.layers[str(index)].engram for index in (1, 4)]
         pointers = []
         for module, logical_rows in zip(modules, rows, strict=True):
@@ -187,7 +219,7 @@ def _owner_worker(rank: int, store: str, directory: str, rows: tuple[int, int], 
             assert module.num_embeddings == logical_rows
             assert table.num_embeddings == (logical_rows + 1) // 2 * 2
             assert tuple(table.weight.shape) == ((logical_rows + 1) // 2, table.embedding_dim)
-            assert table.weight.requires_grad == trainable
+            assert table.weight.requires_grad
             pointers.append(table.weight.data_ptr())
 
         ignored = model._nemo_prepare_model_owned_dtensors(mesh)
@@ -203,7 +235,7 @@ def _owner_worker(rank: int, store: str, directory: str, rows: tuple[int, int], 
             assert isinstance(parameter, DTensor) and parameter.placements == (Shard(0),)
             assert parameter.to_local().data_ptr() == pointer
             assert parameter.shape == (module.embed.num_embeddings, module.embed.embedding_dim)
-            assert parameter.requires_grad == trainable
+            assert parameter.requires_grad
             assert parameter._nemo_model_owned_grad_divisor == 2.0
             assert ignored_params_for_root(model.model.layers[str(index)], ignored) == {parameter}
             module.init_weights()
@@ -224,12 +256,11 @@ def _owner_worker(rank: int, store: str, directory: str, rows: tuple[int, int], 
             dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("rows,trainable", [((17, 19), True), ((17, 19), False), ((1, 1), True)])
-def test_engram_owner_lookup_gradients_and_checkpoint(tmp_path: Path, rows: tuple[int, int], trainable: bool) -> None:
-    """Cover unequal logical rows, padded-only owners, frozen tables and empty requests."""
+def test_engram_owner_lookup_gradients_and_checkpoint(tmp_path: Path) -> None:
+    """Cover odd logical rows, padding, trainable tables and empty requesters."""
     mp.spawn(
         _owner_worker,
-        args=(str(tmp_path / "gloo"), str(tmp_path / "checkpoint"), rows, trainable),
+        args=(str(tmp_path / "gloo"), str(tmp_path / "checkpoint"), (17, 19)),
         nprocs=2,
         join=True,
     )
