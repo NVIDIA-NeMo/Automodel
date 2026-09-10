@@ -207,7 +207,7 @@ class TestIndexer:
         state.allowed = allowed
         state.candidates = torch.zeros(batch, seq_len, pool, dtype=torch.bool)
         state.candidates[:, :, [0, 3]] = True
-        topk = indexer(x, qr, cos, sin, state)
+        topk, _ = indexer(x, qr, cos, sin, state)
         assert topk.shape == (batch, seq_len, 3)
         valid = topk[topk >= 0]
         assert set(valid.tolist()) <= {0, 3}
@@ -229,10 +229,10 @@ class TestIndexer:
         state = DeepseekV41SharedState(compress_ratio=1)
         state.index_k = keys
         state.allowed = torch.ones(1, seq_len, pool, dtype=torch.bool)
-        topk = indexer(x, qr, cos, sin, state)
-        assert state.candidates is not None and state.candidates.shape == (1, seq_len, pool)
+        topk, candidates = indexer(x, qr, cos, sin, state)
+        assert candidates is not None and candidates.shape == (1, seq_len, pool)
         # candidate_topk_blocks=2 blocks of 4 positions cover the whole pool here
-        assert state.candidates.all()
+        assert candidates.all()
         assert (topk >= 0).all()
 
     def test_missing_candidates_raise(self):

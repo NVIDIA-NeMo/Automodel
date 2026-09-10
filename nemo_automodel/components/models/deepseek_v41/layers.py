@@ -480,7 +480,7 @@ class DeepseekV41Indexer(nn.Module):
         latent: torch.Tensor | None = None,
         cos_p: torch.Tensor | None = None,
         sin_p: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """Score the shared index keys, or (with ``latent``) publish them.
 
         Both entry points go through ``__call__`` so FSDP2 unshards this module's
@@ -491,7 +491,10 @@ class DeepseekV41Indexer(nn.Module):
         ``[B, P, head_dim]`` and ``cos_p`` / ``sin_p`` are its RoPE tables
         ``[B, P, qk_rope_head_dim]``; returns index keys ``[B, P, index_head_dim]``.
 
-        Score mode: returns ``[B, S, K]`` pooled positions per query (``-1`` for empty slots).
+        Score mode: returns ``[B, S, K]`` pooled positions per query (``-1`` for empty
+        slots) together with the ``[B, S, P]`` candidate pool (built here for the
+        candidate source layer, otherwise passed through).  Results are returned rather
+        than written to ``state`` because FSDP2 may hand this module a copy of it.
 
         Args:
             hidden_states: ``[B, S, hidden]`` attention input (feeds ``weights_proj``).
@@ -521,8 +524,9 @@ class DeepseekV41Indexer(nn.Module):
         ).float()
         scores = scores.masked_fill(~allowed, float("-inf"))
 
+        candidates = state.candidates
         if self.is_candidate_source:
-            state.candidates = select_candidate_blocks(
+            candidates = select_candidate_blocks(
                 scores,
                 allowed,
                 self.candidate_topk_blocks,
@@ -530,15 +534,15 @@ class DeepseekV41Indexer(nn.Module):
                 pool_positions=state.pool_positions,
             )
         elif self.uses_candidates:
-            if state.candidates is None:
+            if candidates is None:
                 raise RuntimeError(f"Indexer of layer {self.layer_idx} expects a candidate pool from an earlier layer")
-            scores = scores.masked_fill(~state.candidates, float("-inf"))
+            scores = scores.masked_fill(~candidates, float("-inf"))
 
         topk = min(self.index_topk, scores.shape[-1])
         if topk == 0:
-            return scores.new_empty(batch, seq_len, 0, dtype=torch.long)
+            return scores.new_empty(batch, seq_len, 0, dtype=torch.long), candidates
         values, indices = scores.topk(topk, dim=-1)
-        return torch.where(torch.isfinite(values), indices, torch.full_like(indices, -1))
+        return torch.where(torch.isfinite(values), indices, torch.full_like(indices, -1)), candidates
 
     def init_weights(self, init_std: float = 0.02) -> None:
         nn.init.trunc_normal_(self.wq_b.weight, mean=0.0, std=init_std)
@@ -720,7 +724,7 @@ class DeepseekV41Attention(nn.Module):
                     "check kv_source_layer_ids / compress_ratios"
                 )
             if self.is_index_source:
-                state.topk_idxs = self.indexer(hidden_states, q_residual, cos, sin, state)
+                state.topk_idxs, state.candidates = self.indexer(hidden_states, q_residual, cos, sin, state)
             elif state.topk_idxs is None:
                 raise RuntimeError(f"Reuse layer {self.layer_idx} found no Top-K indices from an index source")
             compressed_idxs = torch.where(
