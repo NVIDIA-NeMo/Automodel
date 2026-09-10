@@ -4,6 +4,7 @@
 #SBATCH --account=coreai_dlalgo_compeval
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --mem=0
@@ -85,7 +86,8 @@ srun \
 LATEST_TARGET=$(readlink "$TITANS_CHECKPOINT_ROOT/LATEST")
 LATEST_STEP=${LATEST_TARGET##*_step_}
 if (( LATEST_STEP + 1 < TOTAL_STEPS )); then
-  NEXT_JOB_ID=$(sbatch --parsable --chdir="$AUTOMODEL_CHECKOUT" "$0")
+  NEXT_JOB_ID=$(env -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK \
+    sbatch --parsable --chdir="$AUTOMODEL_CHECKOUT" "$0")
   echo "Completed through step $LATEST_STEP; submitted continuation $NEXT_JOB_ID"
 else
   echo "Titans 170M reproduction completed at step $LATEST_STEP"
