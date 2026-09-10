@@ -1752,12 +1752,13 @@ fi
             pre_shard_hf_state_dict_keys = getattr(model, "_pre_shard_hf_state_dict_keys", None)
             if pre_shard_hf_state_dict_keys is None:
                 pre_shard_hf_state_dict_keys = self.config.model_state_dict_keys
-            fallback_keys = pre_shard_hf_state_dict_keys or list(state_dict.keys())
+            global_key_sizes = _collect_global_tensor_sizes(state_dict, self.pp_group)
+            fallback_keys = pre_shard_hf_state_dict_keys or list(global_key_sizes)
             fqn_to_file_index_mapping = _divide_keys_by_size(
                 fallback_keys,
                 state_dict,
                 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
-                key_size_mapping=_collect_global_tensor_sizes(state_dict, self.pp_group),
+                key_size_mapping=global_key_sizes,
             )
             num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
             if is_rank_0():
