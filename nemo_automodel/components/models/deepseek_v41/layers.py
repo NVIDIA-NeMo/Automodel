@@ -61,7 +61,7 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_sparse_attention,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
-from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram, EngramLayout
+from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -982,7 +982,6 @@ class DeepseekV41Block(nn.Module):
         config: DeepseekV41Config,
         moe_config: MoEConfig,
         backend: BackendConfig,
-        engram_layout: EngramLayout | None = None,
         *,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:

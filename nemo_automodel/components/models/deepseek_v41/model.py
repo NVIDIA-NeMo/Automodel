@@ -58,7 +58,7 @@ from nemo_automodel.components.models.common.utils import (
     compute_lm_head_logits,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
-from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41EngramHasher, EngramLayout
+from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41NgramHash
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41Block,
     DeepseekV41RMSNorm,
@@ -135,8 +135,7 @@ class DeepseekV41Model(nn.Module):
         active_engram = any(i < config.num_hidden_layers for i in config.engram_layer_ids)
         if active_engram and tokenizer is None:
             raise ValueError("DeepSeek V4.1 Engram requires its original fast tokenizer for compressed N-gram hashing")
-        self.engram_layout = EngramLayout.from_config(config) if active_engram else None
-        self.engram_hasher = DeepseekV41EngramHasher(config, self.engram_layout, tokenizer) if active_engram else None
+        self.engram_hash = DeepseekV41NgramHash(config, tokenizer) if active_engram else None
         self.layers = nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = DeepseekV41Block(
@@ -144,7 +143,6 @@ class DeepseekV41Model(nn.Module):
                 config,
                 self.moe_config,
                 backend,
-                engram_layout=self.engram_layout,
                 engram_process_group=engram_process_group,
             )
         self.norm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)
@@ -202,11 +200,11 @@ class DeepseekV41Model(nn.Module):
 
         engram_hash_ids = None
         engram_mask = None
-        if self.engram_hasher is not None:
+        if self.engram_hash is not None:
             engram_mask = seq_ids > 0
             if vision_token_types is not None:
                 engram_mask = engram_mask & (vision_token_types < 0)
-            engram_hash_ids = self.engram_hasher(input_ids.to(device), position_ids, engram_mask)
+            engram_hash_ids = self.engram_hash(input_ids, position_ids=position_ids, token_mask=engram_mask)
 
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
         position_embeddings_compress = self.rotary_emb_compress(inputs_embeds, position_ids)
@@ -253,8 +251,8 @@ class DeepseekV41Model(nn.Module):
         if buffer_device is None:
             buffer_device = self.embed_tokens.weight.device
         init_std = float(self.config.initializer_range)
-        if self.engram_hasher is not None:
-            self.engram_hasher.init_weights(buffer_device)
+        if self.engram_hash is not None:
+            self.engram_hash.init_weights()
         with buffer_device:
             nn.init.normal_(self.embed_tokens.weight, std=init_std)
             self.norm.reset_parameters()
