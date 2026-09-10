@@ -274,16 +274,18 @@ def fake_quant_fp8(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     """Block-wise FP8 E4M3 quantize-dequantize with a power-of-two scale per ``block_size`` channels.
 
     Matches the released ``act_quant(..., scale_fmt="ue8m0", inplace=True)`` used on the
-    sliding-window KV cache.
+    sliding-window KV cache. A partial final channel group is zero-padded before
+    quantization and cropped back to the input width afterwards.
     """
-    if x.shape[-1] % block_size:
-        raise ValueError(f"fake_quant_fp8 needs the last dim ({x.shape[-1]}) divisible by {block_size}")
+    if block_size <= 0:
+        raise ValueError("Cache quantization requires a positive block_size")
+    channels = x.shape[-1]
     with torch.no_grad():
-        blocks = x.detach().float().unflatten(-1, (-1, block_size))
+        blocks = F.pad(x.detach().float(), (0, -channels % block_size)).unflatten(-1, (-1, block_size))
         amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(_FP8_AMAX_FLOOR)
         scale = _pow2_ceil_scale(amax, _FP8_E4M3_MAX)
         q = (blocks / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn).float() * scale
-        q = q.flatten(-2).to(x.dtype)
+        q = q.flatten(-2)[..., :channels].to(x.dtype)
     return _StraightThrough.apply(x, q)
 
 
@@ -292,14 +294,16 @@ def fake_quant_fp4(x: torch.Tensor, block_size: int, scale_format: str) -> torch
 
     ``scale_format="e8m0"`` uses a power-of-two scale (indexer Q/K, 32-channel
     blocks); ``"e4m3"`` uses an E4M3 scale (compressed KV, 16-channel blocks),
-    following NVFP4 without the second-level global scale.
+    following NVFP4 without the second-level global scale. A partial final
+    channel group is zero-padded before quantization and cropped afterwards.
     """
     if scale_format not in ("e8m0", "e4m3"):
         raise ValueError(f"Unknown FP4 scale format: {scale_format}")
-    if x.shape[-1] % block_size:
-        raise ValueError(f"fake_quant_fp4 needs the last dim ({x.shape[-1]}) divisible by {block_size}")
+    if block_size <= 0:
+        raise ValueError("Cache quantization requires a positive block_size")
+    channels = x.shape[-1]
     with torch.no_grad():
-        blocks = x.detach().float().unflatten(-1, (-1, block_size))
+        blocks = F.pad(x.detach().float(), (0, -channels % block_size)).unflatten(-1, (-1, block_size))
         amax = blocks.abs().amax(dim=-1, keepdim=True)
         if scale_format == "e4m3":
             # Training's compressed KV keeps even an all-zero group's scale nonzero.
@@ -309,7 +313,7 @@ def fake_quant_fp4(x: torch.Tensor, block_size: int, scale_format: str) -> torch
             amax = amax.clamp_min(_FP4_E2M1_MAX * 2.0**-126)
             scale = _pow2_ceil_scale(amax, _FP4_E2M1_MAX)
         q = _round_to_e2m1((blocks / scale).clamp(-_FP4_E2M1_MAX, _FP4_E2M1_MAX)) * scale
-        q = q.flatten(-2).to(x.dtype)
+        q = q.flatten(-2)[..., :channels].to(x.dtype)
     return _StraightThrough.apply(x, q)
 
 
@@ -616,7 +620,6 @@ class DeepseekV41Indexer(nn.Module):
         self.rope_head_dim = int(config.qk_rope_head_dim)
         self.index_topk = int(config.index_topk)
         self.softmax_scale = self.head_dim**-0.5
-        self.fake_quant = bool(config.kv_cache_fake_quant)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False, dtype=model_dtype)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False, dtype=model_dtype)
@@ -636,8 +639,7 @@ class DeepseekV41Indexer(nn.Module):
             raise RuntimeError(f"Indexer of layer {self.layer_idx} does not own index keys")
         k = self.k_norm(self.wk(latent))
         k = _apply_partial_rope(k, cos, sin, self.rope_head_dim)
-        if self.fake_quant:
-            k = fake_quant_fp4(k, 32, "e8m0")
+        k = fake_quant_fp4(k, 32, "e8m0")
         return k
 
     @torch.no_grad()
@@ -693,8 +695,7 @@ class DeepseekV41Indexer(nn.Module):
         batch, seq_len, _ = hidden_states.shape
         q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)  # [B, S, H, D]
-        if self.fake_quant:
-            q = fake_quant_fp4(q, 32, "e8m0")
+        q = fake_quant_fp4(q, 32, "e8m0")
         weights = self.weights_proj(hidden_states) * (self.softmax_scale * self.n_heads**-0.5)
         # Preserve BF16 projection, score and weighted-reduction boundaries from
         # the reference; promoting these operations can change discrete top-k.
@@ -767,7 +768,6 @@ class DeepseekV41Attention(nn.Module):
         self.sliding_window = int(config.sliding_window)
         self.attention_dropout = config.attention_dropout
         self.scaling = self.head_dim**-0.5
-        self.fake_quant = bool(config.kv_cache_fake_quant)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False, dtype=model_dtype)
@@ -846,9 +846,8 @@ class DeepseekV41Attention(nn.Module):
         if self.indexer is not None and self.indexer.owns_k:
             state.index_k = self.indexer(latent=latent, cos_p=cos_p, sin_p=sin_p)
         latent = _apply_partial_rope(latent, cos_p, sin_p, self.rope_head_dim)
-        if self.fake_quant:
-            # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
-            latent = fake_quant_fp4(latent, 16, "e4m3")
+        # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
+        latent = fake_quant_fp4(latent, 16, "e4m3")
         state.compress_kv = latent
         state.pool_seq_ids = pool_seq_ids
         state.pool_positions = pool_positions
@@ -890,8 +889,7 @@ class DeepseekV41Attention(nn.Module):
 
         kv = self.kv_norm(self.wkv(hidden_states))  # [B, S, D]
         kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
-        if self.fake_quant:
-            kv = fake_quant_fp8(kv, 32)
+        kv = fake_quant_fp8(kv, 32)
 
         keys = kv
         if state.window_topk_idxs is None:
