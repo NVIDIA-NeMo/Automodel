@@ -58,7 +58,6 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _dsv4_sinkhorn_backend,
 )
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
-    dsv4_indexer_scores,
     dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
 )
@@ -596,6 +595,9 @@ class DeepseekV41Indexer(nn.Module):
         else:
             self.wk = None
             self.k_norm = None
+        # The backbone loss consumes only discrete selected positions. Auxiliary
+        # indexer training is outside this model's supported loss path.
+        self.requires_grad_(False)
 
     def build_keys(self, latent: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """Turn the KV source's pre-RoPE latent ``[B, P, head_dim]`` into index keys ``[B, P, index_head_dim]``."""
@@ -607,6 +609,7 @@ class DeepseekV41Indexer(nn.Module):
             k = fake_quant_fp4(k, 32, "e8m0")
         return k
 
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor | None = None,
@@ -640,6 +643,16 @@ class DeepseekV41Indexer(nn.Module):
             cos, sin: query RoPE tables ``[B, S, qk_rope_head_dim]``.
             state: Shared state providing ``index_k`` (``[B, P, index_head_dim]``),
                 ``allowed`` (``[B, S, P]`` bool visibility) and the candidate pool.
+            latent: Optional pre-RoPE tensor of shape [batch, pooled, head_dim]
+                selecting key construction instead of scoring.
+            cos_p: FP32 pooled cosine table [batch, pooled, qk_rope_head_dim].
+            sin_p: FP32 pooled sine table [batch, pooled, qk_rope_head_dim].
+
+        Returns:
+            Key mode returns [batch, pooled, index_head_dim]. Score mode returns
+            integer positions [batch, sequence, topk], ordered by position with
+            invalid slots set to -1, and an optional boolean candidate mask
+            [batch, sequence, pooled]. No output carries an autograd history.
         """
         if latent is not None:
             return self.build_keys(latent, cos_p, sin_p)
@@ -651,19 +664,11 @@ class DeepseekV41Indexer(nn.Module):
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)  # [B, S, H, D]
         if self.fake_quant:
             q = fake_quant_fp4(q, 32, "e8m0")
-        weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
-        # The indexer is frozen and forward-only, so it always scores in torch: the
-        # Miles TileLang indexer kernel is tuned for the V4 head layout and requests
-        # more dynamic shared memory than pre-Hopper GPUs offer at V4.1's
-        # 32 x 128 indexer heads.  The sparse-attention kernel still honours the backend.
-        scores = dsv4_indexer_scores(
-            q,
-            index_k,
-            weights,
-            compress_ratio=max(state.compress_ratio, 1),
-            softmax_scale=self.softmax_scale,
-            backend="torch",
-        ).float()
+        weights = self.weights_proj(hidden_states) * (self.softmax_scale * self.n_heads**-0.5)
+        # Preserve BF16 projection, score and weighted-reduction boundaries from
+        # the reference; promoting these operations can change discrete top-k.
+        scores = torch.einsum("bshd,btd->bsht", q, index_k)
+        scores = (scores.relu() * weights.unsqueeze(-1)).sum(dim=2)
         scores = scores.masked_fill(~allowed, float("-inf"))
 
         candidates = state.candidates
@@ -683,8 +688,9 @@ class DeepseekV41Indexer(nn.Module):
         topk = min(self.index_topk, scores.shape[-1])
         if topk == 0:
             return scores.new_empty(batch, seq_len, 0, dtype=torch.long), candidates
-        values, indices = scores.topk(topk, dim=-1)
-        return torch.where(torch.isfinite(values), indices, torch.full_like(indices, -1)), candidates
+        indices = scores.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        valid = torch.isfinite(scores.gather(-1, indices))
+        return torch.where(valid, indices, torch.full_like(indices, -1)), candidates
 
     def init_weights(self, init_std: float = 0.02) -> None:
         nn.init.trunc_normal_(self.wq_b.weight, mean=0.0, std=init_std)
