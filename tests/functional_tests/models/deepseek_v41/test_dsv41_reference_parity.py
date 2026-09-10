@@ -64,8 +64,10 @@ SHARED = dict(
     q_lora_rank=32,
     o_lora_rank=16,
     o_groups=2,
+    # Route every token to all experts: with random gates the top-k selection sits on
+    # knife-edge ties, and a flipped expert would look like a modelling error.
     n_experts=8,
-    n_active=2,
+    n_active=8,
     window=8,
     compress_ratios=(0, 0, 2, 2, 1, 1),
     kv_sources=(2, 4),
@@ -257,6 +259,7 @@ def _build_pair(engram: bool, attn_backend: str, quant: bool, seed: int = 0):
     if not quant:
         # Bypass the reference's in-place FP8 / FP4 activation quantization so both
         # sides run the plain bf16 math; ``fake_quant`` is switched off on our side.
+        # ``_reference_quant_state`` restores the real kernels after the test.
         ref.act_quant = lambda x, *args, **kwargs: x
         ref.fp4_act_quant = lambda x, *args, **kwargs: x
     tokenizer = None
@@ -319,6 +322,15 @@ def _compare(ref_logits: torch.Tensor, logits: torch.Tensor, label: str, *, min_
     assert top1 > min_top1, f"{label}: top-1 agreement {top1}"
 
 
+@pytest.fixture
+def _reference_quant_state():
+    ref = _load_reference_module()
+    saved = (ref.act_quant, ref.fp4_act_quant)
+    yield
+    ref.act_quant, ref.fp4_act_quant = saved
+
+
+@pytest.mark.usefixtures("_reference_quant_state")
 @pytest.mark.parametrize("quant", [False, True], ids=["noquant", "quant"])
 @pytest.mark.parametrize("attn_backend", ["sdpa", "tilelang"])
 @pytest.mark.parametrize("engram", [False, True])
