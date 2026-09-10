@@ -107,7 +107,7 @@ this is the single easiest thing to miss.
 ### Rung 2 — masking assertion (CPU, minutes) — *most important correctness check*
 
 ```bash
-python scripts/check_masking.py --n 8
+python examples/vlm_finetune/qwen3_5_moe/check_masking_v4_88k.py --n 8
 ```
 
 **Pass:** for every conversation, the baseline collator supervises as many runs as there
