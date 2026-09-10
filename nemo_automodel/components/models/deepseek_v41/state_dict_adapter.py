@@ -47,10 +47,10 @@ Key mapping (HF -> internal):
   vision.* / aligner.*                   -> model.vision.* / model.aligner.*
   image_{start,end,newline}              -> model.image_{start,end,newline}
 
-Dropped on load/export: ``mtp.*`` (DSpark draft), the unconstructed
-``image_pad`` tensor, vision tower/delimiters when vision is disabled, and
-``engram.*`` when the config disables Engram. The visual router bias remains
-part of every text gate even when no vision tower is constructed.
+The ``mtp.*`` DSpark draft is excluded. Eager loading also excludes layers
+beyond the configured backbone and experts assigned to other ranks before
+dequantization. Other checkpoint keys are not filtered by optional-tower
+configuration.
 """
 
 from __future__ import annotations
@@ -130,9 +130,6 @@ _INTERNAL_TO_HF_RENAMES: list[tuple[re.Pattern, str]] = [
 ]
 
 _ENGRAM_EMBED_PATTERN = re.compile(r"^layers\.(\d+)\.engram\.embed\.weight$")
-_ENGRAM_PATTERN = re.compile(r"^layers\.\d+\.engram\.")
-_VISION_PREFIXES = ("vision.", "aligner.")
-_VISION_DELIMITERS = {"image_start", "image_end", "image_newline"}
 
 
 def _rename_hf_key(key: str) -> str:
@@ -305,14 +302,13 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         config: DeepseekV41Config,
         moe_config: MoEConfig,
         backend: BackendConfig,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         self.config = config
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
-        self.engram_enabled = bool(config.engram_layer_ids)
         self._engram_rows = dict(zip(config.engram_layer_ids, config.engram_num_embeddings))
 
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
@@ -328,7 +324,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         """
         keys = []
         for fqn in state_dict:
-            if "_extra_state" in fqn or not self._keep_hf_key(_internal_key_to_hf(fqn)):
+            if fqn.startswith("mtp.") or "_extra_state" in fqn:
                 continue
             expert = re.fullmatch(r"model\.layers\.(\d+)\.mlp\.experts\.(gate_and_up_projs|down_projs)", fqn)
             if expert:
@@ -509,18 +505,6 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
     # from_hf
     # ------------------------------------------------------------------
 
-    def _keep_hf_key(self, key: str) -> bool:
-        """Select released tensors for the configured backbone and optional towers."""
-        if key.startswith(("mtp.", "model.mtp.")) or key == "image_pad":
-            return False
-        if self.config.vision_config.num_hidden_layers == 0 and (
-            key.startswith(_VISION_PREFIXES) or key in _VISION_DELIMITERS
-        ):
-            return False
-        if not self.engram_enabled and _ENGRAM_PATTERN.match(key):
-            return False
-        return True
-
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
@@ -529,8 +513,8 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
     ) -> dict[str, Any]:
         """Convert the released HF checkpoint to the internal format.
 
-        Steps: discard unconstructed layers, non-local experts and disabled
-        towers before dequantization, restore Engram owner padding, rename,
+        Steps: discard DSpark draft tensors, unconstructed layers and non-local
+        experts before dequantization, restore Engram owner padding, rename,
         and merge experts not already loaded through views into model storage.
 
         Args:
@@ -564,7 +548,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             layer = re.match(r"layers\.(\d+)\.", key)
             expert = re.match(r"layers\.\d+\.ffn\.experts\.(\d+)\.", key)
             if (
-                not self._keep_hf_key(key)
+                key.startswith("mtp.")
                 or (layer and int(layer[1]) >= self.config.num_hidden_layers)
                 or (
                     expert
@@ -824,9 +808,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             raise ValueError(
                 "Quantization targets are for checkpoint loading only; export trained weights without quantization"
             )
-        if kwargs.get("preserve_dtensor_load_views", False) and not kwargs.get("for_checkpoint_load", False):
-            raise ValueError("Preserving DTensor load views requires for_checkpoint_load=True")
-        if not self._keep_hf_key(_internal_key_to_hf(fqn)):
+        if fqn.startswith("mtp."):
             return []
         expert = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         result = [(fqn, tensor)] if expert is None else expert
@@ -834,7 +816,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         converted = []
         for key, value in result:
             key = _internal_key_to_hf(key)
-            if not self._keep_hf_key(key) or (exclude and re.match(exclude, key)):
+            if exclude and re.match(exclude, key):
                 continue
             match = _ENGRAM_EMBED_PATTERN.match(key)
             if match:
@@ -864,7 +846,5 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         return {
             _internal_key_to_hf(key): "float32"
             for key, value in state_dict.items()
-            if isinstance(value, torch.Tensor)
-            and value.dtype == torch.float32
-            and self._keep_hf_key(_internal_key_to_hf(key))
+            if isinstance(value, torch.Tensor) and value.dtype == torch.float32
         }
