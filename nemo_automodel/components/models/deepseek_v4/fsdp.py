@@ -24,7 +24,13 @@ _DSV4_CLASS_NAMES = {
     "DeepseekV4Block",
     "DeepseekV4VisionBlock",
     "DeepseekV4VisionTransformer",
+    # DeepSeek V4.1 shares the hyper-connection / compressor fp32 islands.
+    "DeepseekV41ForCausalLM",
+    "DeepseekV41Model",
+    "DeepseekV41Block",
 }
+
+_DSV4_MODEL_TYPES = {"deepseek_v4", "deepseek_v41"}
 
 _DSV4_FP32_MODULE_SUFFIXES = (
     "attn_hc",
@@ -111,7 +117,7 @@ def _module_config_model_type(module: nn.Module) -> str | None:
 
 
 def _is_deepseek_v4_module(module: nn.Module) -> bool:
-    if module.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(module) == "deepseek_v4":
+    if module.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(module) in _DSV4_MODEL_TYPES:
         return True
 
     wrapped = getattr(module, "_checkpoint_wrapped_module", None)
@@ -119,7 +125,7 @@ def _is_deepseek_v4_module(module: nn.Module) -> bool:
         return True
 
     return any(
-        sub.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(sub) == "deepseek_v4"
+        sub.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(sub) in _DSV4_MODEL_TYPES
         for sub in module.modules()
         if sub is not module
     )

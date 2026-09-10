@@ -120,14 +120,18 @@ def _is_selective_ac(activation_checkpointing: object) -> bool:
     )
 
 
+_DEEPSEEK_V4_FAMILY_MODEL_TYPES = ("deepseek_v4", "deepseek_v41")
+
+
 def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
+    """True for DeepSeek V4 and V4.1, which share the fp32-island FSDP wrapper."""
     config = getattr(model, "config", None)
-    if getattr(config, "model_type", None) == "deepseek_v4":
+    if getattr(config, "model_type", None) in _DEEPSEEK_V4_FAMILY_MODEL_TYPES:
         return True
 
     inner_model = getattr(model, "model", None)
     inner_config = getattr(inner_model, "config", None)
-    return getattr(inner_config, "model_type", None) == "deepseek_v4"
+    return getattr(inner_config, "model_type", None) in _DEEPSEEK_V4_FAMILY_MODEL_TYPES
 
 
 def _get_cp_stream() -> torch.cuda.Stream:

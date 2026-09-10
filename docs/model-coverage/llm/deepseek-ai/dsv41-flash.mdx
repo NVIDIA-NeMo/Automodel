@@ -1,0 +1,73 @@
+---
+title: "DeepSeek-V4.1 Flash"
+description: "Supported DeepSeek-V4.1 Flash checkpoint and NeMo AutoModel recipes."
+slug: model-coverage/large-language-models/deepseek-ai/deepseek-v41-flash
+---
+[DeepSeek-V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) is DeepSeek's 552B-parameter multimodal Mixture-of-Experts model built for aggressive KV-cache compression. NeMo AutoModel supports fine-tuning its text backbone: a 40-layer Causal Encoder-Decoder (CED) stack with 384 routed experts plus one shared expert per block, top-6 routing, Compressed Sparse Attention 2 (CSA2) with cross-layer KV and Top-K index reuse, a Hierarchical Sparse Indexer, single-pass mHC hyper-connections (`hc_mult=4`) and Engram conditional memory at layers 1 and 14.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `DeepseekV41ForCausalLM` |
+| **Parameters** | 552B backbone (+196B Engram), 384 routed + 1 shared expert, 6 routed per token |
+| **HF Org** | [deepseek-ai](https://huggingface.co/deepseek-ai) |
+
+</Info>
+
+## Available Models
+
+- **DeepSeek-V4.1-Flash**
+
+## Architecture
+
+- `DeepseekV41ForCausalLM`
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| DeepSeek-V4.1 Flash | [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) |
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| [`deepseek_v41_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag.yaml) | SFT — DeepSeek-V4.1 Flash text backbone on HellaSwag with expert parallelism |
+
+## Scope and Caveats
+
+- Text-only: the vision tower (`vision.*`, `aligner.*`) and the image-token routing bias (`ffn.gate.bias_vl`) are dropped on load.
+- The DSpark draft layers stored under `mtp.*` are not trained; use the speculative-decoding recipes for draft training.
+- Engram tables are loaded as frozen bf16 embeddings by default (`engram_trainable: false`); set `engram_enabled: false` to skip them entirely. Engram hashing needs the checkpoint tokenizer (resolved from `name_or_path`) to build the compressed token map.
+- The indexer parameters only feed a discrete Top-K selection and are frozen automatically, as for DeepSeek-V4.
+- FP8 (sliding-window KV) and FP4 (compressed KV, indexer Q/K) quantization-aware fake quantization is on by default (`kv_cache_fake_quant: true`) to match the released training numerics.
+- Pipeline and context parallelism are not supported yet; use FSDP2 + expert parallelism.
+
+## Try with NeMo AutoModel
+
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras
+```
+
+<Note>
+The full 40-layer schedule with 384 experts and the 196B Engram tables requires a multi-node run; see the recipe yaml header for `ep_size` guidance and the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
+
+</Note>
+
+**2. Run the recipe** from inside the repo:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag.yaml
+```
+
+See the [Installation Guide](/get-started/installation), the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
+
+## Hugging Face Model Cards
+
+- [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
