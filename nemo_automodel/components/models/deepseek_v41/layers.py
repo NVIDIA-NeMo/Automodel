@@ -471,13 +471,27 @@ class DeepseekV41Indexer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        q_residual: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        state: DeepseekV41SharedState,
+        hidden_states: torch.Tensor | None = None,
+        q_residual: torch.Tensor | None = None,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
+        state: DeepseekV41SharedState | None = None,
+        *,
+        latent: torch.Tensor | None = None,
+        cos_p: torch.Tensor | None = None,
+        sin_p: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return ``[B, S, K]`` pooled positions per query (``-1`` for empty slots).
+        """Score the shared index keys, or (with ``latent``) publish them.
+
+        Both entry points go through ``__call__`` so FSDP2 unshards this module's
+        parameters even when it is wrapped as its own unit; callers must not reach
+        into ``wk`` / ``k_norm`` directly.
+
+        Key mode (``latent`` given): ``latent`` is the KV source's pre-RoPE latent
+        ``[B, P, head_dim]`` and ``cos_p`` / ``sin_p`` are its RoPE tables
+        ``[B, P, qk_rope_head_dim]``; returns index keys ``[B, P, index_head_dim]``.
+
+        Score mode: returns ``[B, S, K]`` pooled positions per query (``-1`` for empty slots).
 
         Args:
             hidden_states: ``[B, S, hidden]`` attention input (feeds ``weights_proj``).
@@ -486,7 +500,9 @@ class DeepseekV41Indexer(nn.Module):
             state: Shared state providing ``index_k`` (``[B, P, index_head_dim]``),
                 ``allowed`` (``[B, S, P]`` bool visibility) and the candidate pool.
         """
-        if state.index_k is None or state.allowed is None:
+        if latent is not None:
+            return self.build_keys(latent, cos_p, sin_p)
+        if state is None or state.index_k is None or state.allowed is None:
             raise RuntimeError(f"Indexer of layer {self.layer_idx} found no published index keys")
         index_k, allowed = state.index_k, state.allowed
         batch, seq_len, _ = hidden_states.shape
@@ -642,7 +658,7 @@ class DeepseekV41Attention(nn.Module):
         # A latent stands for the first token of its group, so group j takes position j * ratio.
         cos_p, sin_p = rotary_compress(latent, (pool_positions * ratio).to(latent.device))
         if self.indexer is not None and self.indexer.owns_k:
-            state.index_k = self.indexer.build_keys(latent, cos_p, sin_p)
+            state.index_k = self.indexer(latent=latent, cos_p=cos_p, sin_p=sin_p)
         latent = _apply_partial_rope(latent, cos_p, sin_p, self.rope_head_dim)
         if self.fake_quant:
             # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
