@@ -134,7 +134,8 @@ class DeepseekV41Model(nn.Module):
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
-            gate_bias_update_factor=1e-3,
+            gate_bias_update_factor=0.0,
+            force_e_score_correction_bias=True,
             score_func="sqrtsoftplus",
             router_weights_fp32=True,
             combine_in_fp32=True,
@@ -148,6 +149,8 @@ class DeepseekV41Model(nn.Module):
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
+        if not self.moe_config.combine_in_fp32:
+            raise ValueError("DeepSeek V4.1 requires MoEConfig.combine_in_fp32=True for released expert arithmetic")
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.engram_layout = EngramLayout.from_config(config)
@@ -319,7 +322,7 @@ class DeepseekV41Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for block in self.layers.values():
-                if isinstance(block.mlp, MoE):
+                if isinstance(block.mlp, MoE) and self.moe_config.gate_bias_update_factor > 0:
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
@@ -407,7 +410,15 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
-        self.backend = backend or BackendConfig()
+        # The distributed CUDA path needs HybridEP's FP32 combination contract.
+        # CPU construction retains the small, local PyTorch reference backend.
+        self.backend = backend or BackendConfig(
+            attn="tilelang" if torch.cuda.is_available() else "sdpa",
+            linear="torch",
+            rms_norm="torch_fp32",
+            experts="torch_mm" if torch.cuda.is_available() else "torch",
+            dispatcher="hybridep" if torch.cuda.is_available() else "torch",
+        )
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = DeepseekV41Model(
             config,
