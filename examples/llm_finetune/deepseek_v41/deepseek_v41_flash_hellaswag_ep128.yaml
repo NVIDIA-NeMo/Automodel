@@ -1,47 +1,33 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
+# You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Full 40-layer text-backbone validation, including both trainable Engram tables.
-# Target topology: 16 nodes x 4 GB200 GPUs in ONE NVLink domain, WORLD=64,
-# EP=64, Engram row owners=64, TP=PP=CP=1. Dense parameters use FSDP2;
-# experts have no additional FSDP shard axis. GBS=64/LBS=1 gives no accumulation.
-#
-# This is a validation configuration, not a demonstrated memory-fit result:
-# the previous full-resident run completed optimizer update 0, then OOMed
-# during the next backward despite activation checkpointing and resharding.
-# The requested schedule is 100 updates, with validation at 50/100.
-# Optimizer moments use BF16. Checkpoint saving is temporarily disabled because
-# TE state_dict expands both moments to FP32 on GPU before DCP offload.
-# Released FP8/FP4 weights initialize BF16 parameters with explicit FP32
-# exceptions; KV-cache quantize/dequantize boundaries remain in the forward.
-#
-# Launch from the repository root using a cluster launcher that supplies all
-# 64 ranks, static rank ordering and a verified common NVLink domain. Set
-# DS41_CHECKPOINT to a shared local snapshot of the pinned revision below and
-# DS41_CHECKPOINT_DIR to an output directory outside the source checkout.
-# Add these overrides to the launcher's AutoModel command:
-#   --model.config.pretrained_model_name_or_path="$DS41_CHECKPOINT"
-#   --model.config.name_or_path="$DS41_CHECKPOINT"
-#   --checkpoint.checkpoint_dir="$DS41_CHECKPOINT_DIR"
-# Tokenizers use the same pinned Hub revision. Launcher-managed caches and
-# communication prewarming must match this backend, topology and input shapes.
+# Full 40-layer text backbone SFT, including both trainable Engram tables.
+# Target: 32 nodes x 4 GB200 GPUs, EP128, TP1/PP1/CP1. Experts and Engram
+# rows have separate ownership mechanisms over the same ranks. Dense weights
+# use FSDP. The vision encoder and separately trained DSpark drafts are unused.
+# Released FP8/FP4 weights initialize BF16 training parameters; attention KV
+# quantize/dequantize boundaries remain part of the forward computation.
+# Validate the pinned official inference reference before scaling this recipe.
+# On every node, before launching the four local training ranks:
+# export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4
+# This gives HybridEP equal four-rank, node-local NVLink groups when the
+# allocation spans partial or unequal NVL72 domains; every rank must inherit it.
+# Set DS41_CHECKPOINT to the absolute shared local HF snapshot path for revision
+# df42c109f1defefcbfcedbe7d905718a12266e40, using the same directory as parity.
+# Pass --model.config.name_or_path="$DS41_CHECKPOINT" to the training command.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 64
+  global_batch_size: 128
   local_batch_size: 1
   ckpt_every_steps: 50
   save_checkpoint_every_epoch: false
@@ -91,8 +77,7 @@ distributed:
   tp_size: 1
   pp_size: 1
   cp_size: 1
-  ep_size: 64
-  defer_fsdp_grad_sync: true
+  ep_size: 128
   sequence_parallel: false
   activation_checkpointing: true
   moe:
@@ -109,8 +94,8 @@ distributed:
       cast_forward_inputs: false
 
 checkpoint:
-  enabled: false
-  checkpoint_dir: ../checkpoints/deepseek_v41_flash_hellaswag_ep64_16nodes
+  enabled: true
+  checkpoint_dir: checkpoints/deepseek_v41_flash_hellaswag_ep128
   model_save_format: safetensors
   save_consolidated: false
   dequantize_base_checkpoint: true
@@ -173,8 +158,8 @@ optimizer:
   master_weights: true
   master_weight_dtype: torch.float32
   store_param_remainders: true
-  exp_avg_dtype: torch.bfloat16
-  exp_avg_sq_dtype: torch.bfloat16
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
 
 lr_scheduler:
   lr_warmup_steps: 10
@@ -185,13 +170,7 @@ lr_scheduler:
 clip_grad_norm:
   max_norm: 1.0
 
-wandb:
-  project: deepseek-v41
-  name: ds41-ep64-bf16-moments
-  mode: online
-  dir: ../logs/wandb
-
 ci:
   recipe_owner: huiyingl
-  nodes: 16
-  time: "01:00:00"
+  nodes: 32
+  time: "04:00:00"
