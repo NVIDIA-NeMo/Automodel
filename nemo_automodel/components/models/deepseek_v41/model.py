@@ -209,8 +209,9 @@ class DeepseekV41Model(nn.Module):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         vision_token_types: torch.Tensor | None = None,
+        output_hidden_states: bool = False,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
         """Run the backbone.
 
         Args:
@@ -224,7 +225,8 @@ class DeepseekV41Model(nn.Module):
                 and nonnegative for image spans; images are excluded from Engram.
 
         Returns:
-            Final hidden states ``[B, S, hidden]`` after the last norm.
+            Final hidden states ``[B, S, hidden]`` after the last norm and,
+            when requested, a tuple of residual streams captured before each block.
         """
         if input_ids is None and inputs_embeds is None:
             raise ValueError("DeepseekV41Model requires input_ids or inputs_embeds")
@@ -292,7 +294,10 @@ class DeepseekV41Model(nn.Module):
         state = DeepseekV41SharedState(window_topk_idxs=build_window_topk_indices(seq_ids, self.config.sliding_window))
         moe_padding_mask = padding_mask.to(device) if padding_mask is not None else None
 
+        captured = [] if output_hidden_states else None
         for layer in self.layers.values():
+            if captured is not None:
+                captured.append(h)
             layer_hash_ids = None
             if engram_hash_ids is not None and layer.engram is not None:
                 layer_hash_ids = engram_hash_ids[:, :, layer.engram.layer_hash_index, :]
@@ -312,7 +317,7 @@ class DeepseekV41Model(nn.Module):
             )
 
         h = hc_collapse(h, pre_mix)
-        return self.norm(h)
+        return self.norm(h), None if captured is None else tuple(captured)
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
@@ -540,7 +545,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: bool | None = None,
+        return_hidden_states: bool = False,
+        output_hidden_states: bool = False,
         pixel_values: torch.Tensor | None = None,
         image_grid_hws: torch.Tensor | None = None,
         vision_token_types: torch.Tensor | None = None,
@@ -557,7 +563,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 Logits at positions 0..S-2 predict labels at positions 1..S-1;
                 targets equal to -100 are ignored. Requires logits_to_keep=0.
             logits_to_keep: Number or positions of logits to retain.
-            output_hidden_states: Whether to expose the final hidden states.
+            return_hidden_states: Return final hidden states for the recipe loss.
+            output_hidden_states: Capture residual streams for numerical comparisons.
             pixel_values: Image patches [all_patches, 3, patch_size, patch_size].
             image_grid_hws: Integer patch grid sizes [images, 2].
             vision_token_types: Integer markers [batch, sequence], with -1 for
@@ -566,7 +573,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         Returns:
             CausalLMOutputWithPast with logits [batch, kept_sequence, vocab]
             (with a restored batch dimension for packed text), optional final
-            hidden states [batch, sequence, hidden], and scalar FP32 mean loss
+            hidden states [batch, sequence, hidden] or captured residual streams,
+            and scalar FP32 mean loss
             when labels are supplied. Input labels are not modified.
 
         Raises:
@@ -576,8 +584,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if attn_kwargs.pop("_pre_embed_only", False):
             # Context parallelism is not supported; there is no model-owned CP batch prep.
             return {}
-        if output_hidden_states is None:
-            output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)
         thd_mode = attn_kwargs.get("qkv_format") == "thd"
         inputs_embeds = attn_kwargs.pop("inputs_embeds", None)
         if labels is not None:
@@ -609,13 +615,14 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         elif image_grid_hws is not None or (vision_token_types is not None and torch.any(vision_token_types >= 0)):
             raise ValueError("Image spans require pixel_values; image placeholders cannot be treated as ordinary text")
 
-        hidden_states = self.model(
+        hidden_states, captured = self.model(
             input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
             inputs_embeds=inputs_embeds,
             vision_token_types=vision_token_types,
+            output_hidden_states=output_hidden_states,
             **attn_kwargs,
         )
         # The head owns FP32 storage and compute. Keep its FP32 output instead
@@ -625,18 +632,22 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             hidden_states,
             logits_to_keep,
             is_thd=thd_mode,
-            output_hidden_states=bool(output_hidden_states),
+            output_hidden_states=return_hidden_states,
         )
-        if labels is None:
-            return projected
-        if projected.logits is None or projected.logits.shape[:2] != labels.shape:
-            raise ValueError("labels require logits for every input position")
-        loss = F.cross_entropy(
-            projected.logits[:, :-1].float().reshape(-1, self.config.vocab_size),
-            labels[:, 1:].reshape(-1),
-            ignore_index=-100,
+        loss = None
+        if labels is not None:
+            if projected.logits is None or projected.logits.shape[:2] != labels.shape:
+                raise ValueError("labels require logits for every input position")
+            loss = F.cross_entropy(
+                projected.logits[:, :-1].float().reshape(-1, self.config.vocab_size),
+                labels[:, 1:].reshape(-1),
+                ignore_index=-100,
+            )
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=projected.logits,
+            hidden_states=captured if output_hidden_states else projected.hidden_states,
         )
-        return CausalLMOutputWithPast(loss=loss, logits=projected.logits, hidden_states=projected.hidden_states)
 
     def update_moe_gate_bias(self) -> None:
         self.model.update_moe_gate_bias()
