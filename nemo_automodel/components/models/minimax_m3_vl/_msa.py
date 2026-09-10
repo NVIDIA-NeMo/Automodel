@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.autograd.function import once_differentiable
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m3_vl.kernels import require_sm100
+from nemo_automodel.components.models.minimax_m3_vl.kernels import MSA_KERNEL_IMPORT_ERROR, require_sm100
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_forward_patch import (
     _patch_msa_fmax,
     _patch_msa_jit_gencode,
@@ -48,10 +48,7 @@ _MSA_IMPORT_ERROR = (
     "Install the project with uv sync --extra msa on a CUDA SM100 system; the MSA revision "
     "must be compatible with nvidia-cutlass-dsl==4.6.2."
 )
-_MSA_BACKWARD_IMPORT_ERROR = (
-    "BackendConfig.sparse_attn='msa' backward requires nvidia-cutlass-dsl==4.6.2 and cuda-python from the "
-    "msa optional dependency. Install the project with uv sync --extra msa on a CUDA SM100 system."
-)
+_MSA_BACKWARD_IMPORT_ERROR = MSA_KERNEL_IMPORT_ERROR
 
 _MSA_BACKWARD_MODULE = "nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_sm100"
 
@@ -401,12 +398,20 @@ def _resolve_msa_forward() -> _MSAForwardKernels | None:
 
 @lru_cache(maxsize=1)
 def _resolve_msa_backward() -> Callable[..., Any] | None:
-    """Resolve the model-private SM100 backward launcher once, or ``None``."""
-    available, launcher = safe_import_from(
-        _MSA_BACKWARD_MODULE,
-        "_run_msa_backward",
-        msg=_MSA_BACKWARD_IMPORT_ERROR,
-    )
+    """Resolve the model-private SM100 backward launcher once, or ``None``.
+
+    The kernel module raises ``UnavailableError`` from ``require_cute_dsl`` when the CuTe DSL is absent,
+    and ``safe_import_from`` re-raises anything that is not an ``ImportError``, so absence is caught here
+    and cached as ``None``.
+    """
+    try:
+        available, launcher = safe_import_from(
+            _MSA_BACKWARD_MODULE,
+            "_run_msa_backward",
+            msg=_MSA_BACKWARD_IMPORT_ERROR,
+        )
+    except UnavailableError:
+        return None
     return launcher if available and callable(launcher) else None
 
 

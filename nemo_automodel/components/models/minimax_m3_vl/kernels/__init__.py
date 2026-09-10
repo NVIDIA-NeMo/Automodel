@@ -12,11 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-private MSA kernels, loaded lazily by _msa; no eager CuTe imports."""
+"""Model-private MSA kernels, loaded lazily by _msa; no eager CuTe imports.
+
+The SM100 kernel modules are CuTe DSL source and call ``require_cute_dsl`` before their first DSL
+import, so a host without the msa extra sees ``UnavailableError`` instead of ``ModuleNotFoundError``.
+"""
 
 from functools import lru_cache
 
 import torch
+
+from nemo_automodel.shared.import_utils import UnavailableError, safe_import
+
+MSA_KERNEL_IMPORT_ERROR = (
+    "BackendConfig.sparse_attn='msa' backward requires nvidia-cutlass-dsl==4.6.2 and cuda-bindings from the "
+    "msa optional dependency, which ship Linux wheels only. Install the project with uv sync --extra msa on a "
+    "CUDA SM100 system."
+)
 
 
 @lru_cache
@@ -51,3 +63,22 @@ def require_sm100(device: torch.device) -> None:
             "MiniMax M3 MSA first supports SM100 (compute capability 10.0) only; got compute capability "
             f"{capability[0]}.{capability[1]} on {device}. Use sparse_attn='generic' on this GPU."
         )
+
+
+def require_cute_dsl() -> None:
+    """Refuse to bind the CuTe DSL in a kernel module on a host that cannot import it.
+
+    The SM100 kernel modules are CuTe DSL source: their decorators, annotations and module constants
+    need ``cutlass`` and ``cuda.bindings`` while the module loads, and the CI import walker imports
+    every module of the package on hosts without the msa extra. Each kernel module calls this before
+    its first DSL import so absence surfaces as ``UnavailableError``, the signal both the walker and
+    ``_msa._resolve_msa_backward`` understand. It is the software twin of ``require_sm100``: one gates
+    the toolchain at import, the other the device at launch.
+
+    Raises:
+        UnavailableError: If ``cutlass`` or ``cuda.bindings.driver`` cannot be imported.
+    """
+    for module in ("cutlass", "cuda.bindings.driver"):
+        available, _ = safe_import(module, msg=MSA_KERNEL_IMPORT_ERROR)
+        if not available:
+            raise UnavailableError(MSA_KERNEL_IMPORT_ERROR)

@@ -26,14 +26,9 @@ intervals.
 from dataclasses import dataclass
 from typing import Any
 
-import cutlass
-import cutlass.cute as cute
 import torch
-from cuda.bindings import driver as cuda
-from cutlass import Int32
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-from nemo_automodel.components.models.minimax_m3_vl.kernels import sm_capability
+from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl, sm_capability
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import (
     _BLOCK_SIZE,
     _NUM_INDEX_HEADS,
@@ -45,6 +40,16 @@ from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import 
     _grid_launch_bound,
     _MSABackwardSchedule,
 )
+
+# Bind the CuTe DSL only after proving it is importable, so a host without the msa extra sees
+# UnavailableError here instead of ModuleNotFoundError from the imports below.
+require_cute_dsl()
+
+import cutlass
+import cutlass.cute as cute
+from cuda.bindings import driver as cuda
+from cutlass import Int32
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 THREADS = 256
 SCAN_THREADS = 1024

@@ -27,14 +27,19 @@ BSD-3-Clause), specialized to the fixed ``[T, 64, 128]`` MSA layout.
 
 from typing import Any
 
+import torch
+
+from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl, sm_capability
+
+# Bind the CuTe DSL only after proving it is importable, so a host without the msa extra sees
+# UnavailableError here instead of ModuleNotFoundError from the imports below.
+require_cute_dsl()
+
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
-
-from nemo_automodel.components.models.minimax_m3_vl.kernels import sm_capability
 
 HEAD_DIM = 128
 NUM_Q_HEADS = 64

@@ -29,12 +29,20 @@ import math
 import os
 from typing import Any
 
+import torch
+
+from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl, sm_capability
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import _MSABackwardSchedule
+
+# Bind the CuTe DSL only after proving it is importable, so a host without the msa extra sees
+# UnavailableError here instead of ModuleNotFoundError from the imports below.
+require_cute_dsl()
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
@@ -44,14 +52,12 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 
-from nemo_automodel.components.models.minimax_m3_vl.kernels import sm_capability
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_postprocess_sm100 import (
     run_grad_finalize,
 )
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_preprocess_sm100 import (
     _run_msa_backward_preprocess,
 )
-from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import _MSABackwardSchedule
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_task_build_sm100 import (
     DESC_WORDS,
     build_backward_tasks,
