@@ -75,76 +75,49 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 from nemo_automodel.components.moe.state_dict_utils import is_dtensor, should_load_expert_for_rank
 
-_HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"^vision\.(.+)$"), r"model.vision.\1"),
-    (re.compile(r"^aligner\.(.+)$"), r"model.aligner.\1"),
-    (re.compile(r"^(image_start|image_end|image_newline)$"), r"model.\1"),
-    (re.compile(r"^embed\.(.+)$"), r"model.embed_tokens.\1"),
-    (re.compile(r"^norm\.(.+)$"), r"model.norm.\1"),
-    (re.compile(r"^head\.(.+)$"), r"lm_head.\1"),
-    (re.compile(r"^layers\.(\d+)\.attn_norm\.(.+)$"), r"model.layers.\1.attn_norm.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn_norm\.(.+)$"), r"model.layers.\1.ffn_norm.\2"),
-    (re.compile(r"^layers\.(\d+)\.attn\.attn_sink$"), r"model.layers.\1.attn.sinks_param.weight"),
-    (re.compile(r"^layers\.(\d+)\.attn\.(.+)$"), r"model.layers.\1.attn.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.gate\.bias$"), r"model.layers.\1.ffn.gate.e_score_correction_bias"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.gate\.(.+)$"), r"model.layers.\1.ffn.gate.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w1\.(.+)$"), r"model.layers.\1.ffn.shared_experts.gate_proj.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w3\.(.+)$"), r"model.layers.\1.ffn.shared_experts.up_proj.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w2\.(.+)$"), r"model.layers.\1.ffn.shared_experts.down_proj.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w1\.(.+)$"), r"model.layers.\1.ffn.experts.\2.gate_proj.\3"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w3\.(.+)$"), r"model.layers.\1.ffn.experts.\2.up_proj.\3"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w2\.(.+)$"), r"model.layers.\1.ffn.experts.\2.down_proj.\3"),
-    (re.compile(r"^layers\.(\d+)\.hc_attn_(base|fn|scale)$"), r"model.layers.\1.attn_hc.\2"),
-    (re.compile(r"^layers\.(\d+)\.hc_ffn_(base|fn|scale)$"), r"model.layers.\1.ffn_hc.\2"),
-    (re.compile(r"^layers\.(\d+)\.engram\.(.+)$"), r"model.layers.\1.engram.\2"),
-]
-
-_INTERNAL_TO_HF_RENAMES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"^model\.vision\.(.+)$"), r"vision.\1"),
-    (re.compile(r"^model\.aligner\.(.+)$"), r"aligner.\1"),
-    (re.compile(r"^model\.(image_start|image_end|image_newline|image_pad)$"), r"\1"),
-    (re.compile(r"^model\.layers\.(\d+)\.ffn\.experts\.(\d+)\.gate_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w1.\3"),
-    (re.compile(r"^model\.layers\.(\d+)\.ffn\.experts\.(\d+)\.up_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w3.\3"),
-    (re.compile(r"^model\.layers\.(\d+)\.ffn\.experts\.(\d+)\.down_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w2.\3"),
-    (re.compile(r"^model\.embed_tokens\.(.+)$"), r"embed.\1"),
-    (re.compile(r"^model\.norm\.(.+)$"), r"norm.\1"),
-    (re.compile(r"^lm_head\.(.+)$"), r"head.\1"),
-    (re.compile(r"^model\.layers\.(\d+)\.attn_norm\.(.+)$"), r"layers.\1.attn_norm.\2"),
-    (re.compile(r"^model\.layers\.(\d+)\.ffn_norm\.(.+)$"), r"layers.\1.ffn_norm.\2"),
-    (re.compile(r"^model\.layers\.(\d+)\.attn\.sinks_param\.weight$"), r"layers.\1.attn.attn_sink"),
-    (re.compile(r"^model\.layers\.(\d+)\.attn\.(.+)$"), r"layers.\1.attn.\2"),
-    (re.compile(r"^model\.layers\.(\d+)\.ffn\.gate\.e_score_correction_bias$"), r"layers.\1.ffn.gate.bias"),
-    (re.compile(r"^model\.layers\.(\d+)\.ffn\.gate\.(.+)$"), r"layers.\1.ffn.gate.\2"),
-    (
-        re.compile(r"^model\.layers\.(\d+)\.ffn\.shared_experts\.gate_proj\.(.+)$"),
-        r"layers.\1.ffn.shared_experts.w1.\2",
-    ),
-    (re.compile(r"^model\.layers\.(\d+)\.ffn\.shared_experts\.up_proj\.(.+)$"), r"layers.\1.ffn.shared_experts.w3.\2"),
-    (
-        re.compile(r"^model\.layers\.(\d+)\.ffn\.shared_experts\.down_proj\.(.+)$"),
-        r"layers.\1.ffn.shared_experts.w2.\2",
-    ),
-    (re.compile(r"^model\.layers\.(\d+)\.attn_hc\.(fn|base|scale)$"), r"layers.\1.hc_attn_\2"),
-    (re.compile(r"^model\.layers\.(\d+)\.ffn_hc\.(fn|base|scale)$"), r"layers.\1.hc_ffn_\2"),
-    (re.compile(r"^model\.layers\.(\d+)\.engram\.(.+)$"), r"layers.\1.engram.\2"),
-]
-
 _ENGRAM_EMBED_PATTERN = re.compile(r"^layers\.(\d+)\.engram\.embed\.weight$")
 
 
-def _rename_hf_key(key: str) -> str:
-    for pattern, replacement in _HF_TO_INTERNAL_RENAMES:
-        new_key, n = pattern.subn(replacement, key)
-        if n:
-            return new_key
+def _native_key(key: str) -> str:
+    if key.startswith("embed."):
+        return "model.embed_tokens." + key.removeprefix("embed.")
+    if key.startswith("head."):
+        return "lm_head." + key.removeprefix("head.")
+    if key.endswith(".attn.attn_sink"):
+        key = key.removesuffix(".attn_sink") + ".sinks_param.weight"
+    match = re.fullmatch(r"layers\.(\d+)\.hc_(attn|ffn)_(fn|base|scale)", key)
+    if match:
+        return f"model.layers.{match[1]}.{match[2]}_hc.{match[3]}"
+    key = re.sub(r"(\.ffn\.(?:experts\.\d+|shared_experts))\.w1\.", r"\1.gate_proj.", key)
+    key = re.sub(r"(\.ffn\.(?:experts\.\d+|shared_experts))\.w3\.", r"\1.up_proj.", key)
+    key = re.sub(r"(\.ffn\.(?:experts\.\d+|shared_experts))\.w2\.", r"\1.down_proj.", key)
+    if key.endswith(".ffn.gate.bias"):
+        key = key.removesuffix(".bias") + ".e_score_correction_bias"
+    if key.startswith(("layers.", "norm.", "vision.", "aligner.")) or key in (
+        "image_start",
+        "image_end",
+        "image_newline",
+    ):
+        return "model." + key
     return key
 
 
-def _internal_key_to_hf(key: str) -> str:
-    for pattern, replacement in _INTERNAL_TO_HF_RENAMES:
-        new_key, n = pattern.subn(replacement, key)
-        if n:
-            return new_key
+def _released_key(key: str) -> str:
+    if key.startswith("model.embed_tokens."):
+        return "embed." + key.removeprefix("model.embed_tokens.")
+    if key.startswith("lm_head."):
+        return "head." + key.removeprefix("lm_head.")
+    key = key.removeprefix("model.")
+    if key.endswith(".attn.sinks_param.weight"):
+        key = key.removesuffix(".sinks_param.weight") + ".attn_sink"
+    match = re.fullmatch(r"layers\.(\d+)\.(attn|ffn)_hc\.(fn|base|scale)", key)
+    if match:
+        return f"layers.{match[1]}.hc_{match[2]}_{match[3]}"
+    key = re.sub(r"(\.ffn\.(?:experts\.\d+|shared_experts))\.gate_proj\.", r"\1.w1.", key)
+    key = re.sub(r"(\.ffn\.(?:experts\.\d+|shared_experts))\.up_proj\.", r"\1.w3.", key)
+    key = re.sub(r"(\.ffn\.(?:experts\.\d+|shared_experts))\.down_proj\.", r"\1.w2.", key)
+    if key.endswith(".ffn.gate.e_score_correction_bias"):
+        key = key.removesuffix(".e_score_correction_bias") + ".bias"
     return key
 
 
@@ -339,7 +312,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                     for projection in projections
                 )
             else:
-                keys.append(_internal_key_to_hf(fqn))
+                keys.append(_released_key(fqn))
         return keys
 
     @torch.no_grad()
@@ -568,7 +541,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             value = hf_state_dict.pop(key)
             if key.endswith(".scale"):
                 raise ValueError(f"Checkpoint scale {key} has no matching weight")
-            target = _rename_hf_key(key)
+            target = _native_key(key)
             if target in converted:
                 raise ValueError(f"Multiple checkpoint tensors map to {target}")
             match = _ENGRAM_EMBED_PATTERN.match(key)
@@ -671,7 +644,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                 continue
             scale = state_dict.pop(scale_key)
             state_dict[key] = dequantize_checkpoint_weight(
-                weight, scale, dtype=self.dtype, rowwise=_ENGRAM_EMBED_PATTERN.match(key) is not None
+                weight, scale, dtype=self.dtype, rowwise=".engram.embed." in key
             )
         return state_dict
 
@@ -821,7 +794,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         exclude = kwargs.get("exclude_key_regex")
         converted = []
         for key, value in result:
-            key = _internal_key_to_hf(key)
+            key = _released_key(key)
             if exclude and re.match(exclude, key):
                 continue
             match = _ENGRAM_EMBED_PATTERN.match(key)
@@ -850,7 +823,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             router parameters, attention sinks and the full-precision head.
         """
         return {
-            _internal_key_to_hf(key): "float32"
+            _released_key(key): "float32"
             for key, value in state_dict.items()
             if isinstance(value, torch.Tensor) and value.dtype == torch.float32
         }
