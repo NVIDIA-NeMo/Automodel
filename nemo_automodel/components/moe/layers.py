@@ -794,7 +794,7 @@ class MoE(nn.Module):
             )
             self.experts = GroupedExperts(config, backend=backend)
         elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep"):
-            if backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8"):
+            if backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8", "torch_linear"):
                 self.experts = GroupedExpertsDeepEP(
                     config,
                     backend=backend,

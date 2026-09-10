@@ -166,6 +166,98 @@ def is_gated_activation(activation: str) -> bool:
     return activation in ("swiglu", "swigluoai", "quick_geglu", "geglu")
 
 
+def _validate_torch_linear_config(config: MoEConfig) -> None:
+    """Reject expert variants whose eager arithmetic is not implemented."""
+    if config.expert_activation != "swiglu" or config.expert_bias or config.apply_router_weight_after_down:
+        raise ValueError(
+            "experts='torch_linear' requires SwiGLU without expert bias and router weights before the down projection"
+        )
+
+
+@torch.compiler.disable
+def _torch_linear_experts_fwd(
+    hidden_states: torch.Tensor,
+    gate_and_up_projs: torch.Tensor,
+    down_projs: torch.Tensor,
+    tokens_per_expert: torch.Tensor | list[int] | tuple[int, ...],
+    permuted_probs: torch.Tensor,
+    config: MoEConfig,
+    *,
+    unpadded_tokens_per_expert: torch.Tensor | list[int] | tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    """Apply separate eager linear projections to expert-major dispatched rows.
+
+    Packed parameters retain the shared MoE checkpoint and parallel layout.
+    Each projection receives a contiguous [out, in] weight, matching separate
+    ``F.linear`` calls. Eager FP32 SwiGLU and probability multiplication preserve
+    their rounding boundaries before the activation returns to its input dtype.
+    Compilation is disabled here deliberately: fusing these operations changes
+    the final BF16 result near rounding ties.
+
+    When dispatch padded expert segments, ``unpadded_tokens_per_expert`` selects
+    each real prefix before GEMM and restores zero padding afterward. Thus the
+    GEMM token dimension matches the actual expert input rather than its padded
+    storage. Empty experts participate in autograd with zero gradients. Only
+    active experts materialize transposed contiguous projection weights.
+
+    Args:
+        hidden_states: Activations [padded_expert_rows, hidden], grouped by local
+            expert. Each segment contains its real token prefix followed by padding.
+        gate_and_up_projs: Local packed weights [local_experts, hidden, 2 * intermediate],
+            with gate then up concatenated on the final axis, in activation dtype.
+        down_projs: Local weights [local_experts, intermediate, hidden], in
+            activation dtype. All weights and activations share a device.
+        tokens_per_expert: Nonnegative counts [local_experts], including padding;
+            their sum equals padded_expert_rows. Tensor counts may reside on CPU.
+        permuted_probs: Floating routing weights [padded_expert_rows, 1], aligned
+            with hidden_states. They are applied before the down projection.
+        config: SwiGLU settings; expert bias and routing after down are unsupported.
+        unpadded_tokens_per_expert: Optional counts [local_experts] identifying
+            each segment's real prefix. None treats every row as real.
+
+    Returns:
+        Independent tensor [padded_expert_rows, hidden] in activation dtype,
+        with zero expert-padding rows and gradients attached to all weights,
+        including experts receiving no real tokens.
+    """
+    counts = tokens_per_expert.tolist() if isinstance(tokens_per_expert, torch.Tensor) else list(tokens_per_expert)
+    if len(counts) != gate_and_up_projs.shape[0] or any(count < 0 for count in counts):
+        raise ValueError("torch_linear requires one nonnegative token count per local expert")
+    if sum(counts) != hidden_states.shape[0] or permuted_probs.shape != (hidden_states.shape[0], 1):
+        raise ValueError("torch_linear token counts and routing probabilities must match the dispatched rows")
+    if unpadded_tokens_per_expert is None:
+        raw_counts = counts
+    elif isinstance(unpadded_tokens_per_expert, torch.Tensor):
+        raw_counts = unpadded_tokens_per_expert.tolist()
+    else:
+        raw_counts = list(unpadded_tokens_per_expert)
+    if len(raw_counts) != len(counts) or any(not 0 <= raw <= count for raw, count in zip(raw_counts, counts)):
+        raise ValueError("torch_linear unpadded counts must identify a real prefix of each padded expert segment")
+    outputs = []
+    offset = 0
+    for expert, (padded_count, count) in enumerate(zip(counts, raw_counts)):
+        values = hidden_states.narrow(0, offset, count)
+        probs = permuted_probs.narrow(0, offset, count)
+        if count == 0:
+            # Indexing one scalar attaches the whole packed parameter to the
+            # graph without copying an unused expert's projection matrices.
+            zero = (gate_and_up_projs[expert, 0, 0] + down_projs[expert, 0, 0]) * 0
+            outputs.append(values + zero.to(values.dtype) + probs.sum().to(values.dtype))
+        else:
+            gate_weight, up_weight = gate_and_up_projs[expert].chunk(2, dim=-1)
+            gate = F.linear(values, gate_weight.T.contiguous()).float()
+            up = F.linear(values, up_weight.T.contiguous()).float()
+            if config.swiglu_limit > 0:
+                gate = gate.clamp(max=config.swiglu_limit)
+                up = up.clamp(min=-config.swiglu_limit, max=config.swiglu_limit)
+            activated = (probs * (F.silu(gate) * up)).to(values.dtype)
+            outputs.append(F.linear(activated, down_projs[expert].T.contiguous()))
+        if padded_count > count:
+            outputs.append(hidden_states.new_zeros(padded_count - count, hidden_states.shape[1]))
+        offset += padded_count
+    return torch.cat(outputs, dim=0)
+
+
 def _resolve_m_splits(
     tokens_per_expert: torch.Tensor | list | tuple,
     static_routing: bool,
@@ -428,6 +520,9 @@ class GroupedExperts(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
+        self.use_torch_linear = backend is not None and backend.experts == "torch_linear"
+        if self.use_torch_linear:
+            _validate_torch_linear_config(config)
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -618,7 +713,28 @@ class GroupedExperts(nn.Module):
         experts_start_idx,
         experts_end_idx,
     ):
-        """Per-expert loop forward path using gather/scatter."""
+        """Evaluate selected local experts with the explicitly chosen projection backend.
+
+        Args:
+            x: Activations [tokens, hidden], including gathered EP tokens when used.
+            weights: Routing weights [tokens, selected_experts].
+            indices: Global expert IDs [tokens, selected_experts].
+            token_mask: Boolean visibility [tokens].
+            gate_and_up_projs: Local packed projections [local_experts, hidden, projected],
+                where projected is twice intermediate for gated activations and
+                intermediate otherwise. Gated projections store gate then up.
+            down_projs: Local weights [local_experts, intermediate, hidden].
+            gate_up_proj_bias: Optional bias [local_experts, projected].
+            down_proj_bias: Optional bias [local_experts, hidden].
+            n_local_experts: Number of experts owned by this rank.
+            experts_start_idx: Inclusive global expert ID owned by this rank.
+            experts_end_idx: Exclusive global expert ID owned by this rank.
+
+        Returns:
+            FP32 routed output [tokens, hidden], or [tokens, selected_experts, hidden]
+            when router weighting occurs after down projection. Output has independent
+            storage; projection weights use the activation dtype on x's device.
+        """
         output_shape = (
             (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
         )
@@ -643,23 +759,35 @@ class GroupedExperts(nn.Module):
             gate_and_up_proj = gate_and_up_projs[local_idx]
             expert_gate_up_proj_bias = gate_up_proj_bias[local_idx] if gate_up_proj_bias is not None else None
 
-            # Up projection (separate from activation, matching DeepEP pattern)
-            gate_and_up_out = x_idx @ gate_and_up_proj
-            if expert_gate_up_proj_bias is not None:
-                gate_and_up_out = gate_and_up_out + expert_gate_up_proj_bias
-
-            # Weighted activation (routing weight applied BETWEEN up and down projections)
-            # Uses WeightedSwiGLUFunction with float32 backward precision
             w = weights[idx, top, None]
-            activation_weight = torch.ones_like(w) if self.config.apply_router_weight_after_down else w
-            activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
-
-            # Down projection
-            expert_out = activated @ down_proj
-            if expert_down_proj_bias is not None:
-                expert_out = expert_out + (
-                    expert_down_proj_bias if self.config.apply_router_weight_after_down else expert_down_proj_bias * w
+            if self.use_torch_linear:
+                expert_out = _torch_linear_experts_fwd(
+                    x_idx,
+                    gate_and_up_projs[local_idx : local_idx + 1],
+                    down_projs[local_idx : local_idx + 1],
+                    (idx.numel(),),
+                    w,
+                    self.config,
                 )
+            else:
+                # Up projection (separate from activation, matching DeepEP pattern)
+                gate_and_up_out = x_idx @ gate_and_up_proj
+                if expert_gate_up_proj_bias is not None:
+                    gate_and_up_out = gate_and_up_out + expert_gate_up_proj_bias
+
+                # Weighted activation (routing weight applied BETWEEN up and down projections)
+                # Uses WeightedSwiGLUFunction with float32 backward precision
+                activation_weight = torch.ones_like(w) if self.config.apply_router_weight_after_down else w
+                activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
+
+                # Down projection
+                expert_out = activated @ down_proj
+                if expert_down_proj_bias is not None:
+                    expert_out = expert_out + (
+                        expert_down_proj_bias
+                        if self.config.apply_router_weight_after_down
+                        else expert_down_proj_bias * w
+                    )
 
             if self.config.apply_router_weight_after_down:
                 expert_out = expert_out.float() * w.float()
@@ -671,6 +799,16 @@ class GroupedExperts(nn.Module):
 
         # Dummy computation for gradient flow when no tokens routed locally
         if active_local_experts == 0:
+            if self.use_torch_linear:
+                empty_output = _torch_linear_experts_fwd(
+                    x[:0],
+                    gate_and_up_projs,
+                    down_projs,
+                    [0] * n_local_experts,
+                    weights[:0, :1],
+                    self.config,
+                )
+                return y + empty_output.sum().float()
             dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
             gate_and_up_out = dummy_x @ gate_and_up_projs[0]
             activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
@@ -908,9 +1046,11 @@ class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
 
-    Supports two GEMM backends via BackendConfig.experts:
+    Supports explicit GEMM backends via BackendConfig.experts:
     - grouped_gemm.ops.gmm (experts="gmm", default)
     - torch._grouped_mm (experts="torch_mm", no external dependency)
+    - torchao MXFP8 grouped GEMM (experts="torch_mm_mxfp8")
+    - separate eager linears (experts="torch_linear", with HybridEP dispatch)
 
     Once the experts for a particular token have been identified, this module
     is invoked to compute and average the output of the activated experts.
@@ -949,6 +1089,9 @@ class GroupedExpertsDeepEP(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
+        self.use_torch_linear = backend is not None and backend.experts == "torch_linear"
+        if self.use_torch_linear:
+            _validate_torch_linear_config(config)
         # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): routing
         # metadata is identical per microbatch, so host copies of it can be cached.
         self.static_routing = backend is not None and backend.benchmark_static_routing
@@ -1073,7 +1216,21 @@ class GroupedExpertsDeepEP(nn.Module):
         # With static routing (forced balance, no noise) every expert receives tokens by
         # construction, so the count_nonzero device-to-host read (one per microbatch, and
         # again per activation-checkpoint recompute) can be skipped.
-        if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
+        if self.use_torch_linear:
+            output2 = _torch_linear_experts_fwd(
+                permuted_local_hidden_states,
+                gate_and_up_projs,
+                down_projs,
+                tokens_per_expert,
+                activation_probs,
+                self.config,
+                unpadded_tokens_per_expert=(
+                    self.token_dispatcher.get_unpadded_tokens_per_expert()
+                    if self.dispatcher_backend == "hybridep"
+                    else None
+                ),
+            )
+        elif self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
                 tokens_per_expert_gpu = tokens_per_expert.to(
                     device=permuted_local_hidden_states.device, non_blocking=True

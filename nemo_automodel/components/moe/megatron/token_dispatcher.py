@@ -861,6 +861,20 @@ class MoEFlexTokenDispatcher:
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
         return global_input_tokens, tokens_per_expert, permuted_probs
 
+    def get_unpadded_tokens_per_expert(self) -> torch.Tensor:
+        """Return HybridEP's real row counts [local experts], excluding GEMM padding.
+
+        Call after token permutation and before token unpermutation. Consumers
+        can evaluate only real rows and append zero outputs for expert padding.
+
+        Returns:
+            Read-only integer tensor [local_experts] from the active HybridEP
+            handle, valid until that dispatch is combined.
+        """
+        if not isinstance(self._comm_manager, _HybridEPManager):
+            raise NotImplementedError("Unpadded expert row counts are exposed only by HybridEP")
+        return self._comm_manager.get_unpadded_tokens_per_expert()
+
     def token_permutation(
         self, hidden_states: torch.Tensor, num_local_tokens: int, probs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
