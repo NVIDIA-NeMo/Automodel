@@ -40,6 +40,23 @@ def test_default_multistep_schedule_is_linear():
     assert schedule == sorted(schedule, reverse=True)
 
 
+def test_default_multistep_schedule_warns_about_off_schedule_sampling(caplog):
+    """Falling back to a linear schedule can produce blurry/banded images versus the
+    student's actual trained t_list, so this must be surfaced, not silent."""
+    with caplog.at_level("WARNING"):
+        _resolve_schedule(num_inference_steps=4, max_t=0.999, t_list=None)
+
+    assert any("t_list not provided" in record.message for record in caplog.records)
+
+
+def test_single_step_schedule_does_not_warn(caplog):
+    """num_inference_steps=1 has a single canonical schedule -- no t_list ambiguity."""
+    with caplog.at_level("WARNING"):
+        _resolve_schedule(num_inference_steps=1, max_t=0.999, t_list=None)
+
+    assert not any("t_list not provided" in record.message for record in caplog.records)
+
+
 def test_explicit_t_list_used_verbatim():
     t_list = [1.0, 0.9, 0.75, 0.5, 0.0]
     schedule = _resolve_schedule(num_inference_steps=4, max_t=0.999, t_list=t_list)
@@ -118,14 +135,18 @@ def test_from_pretrained_missing_student_path_raises_before_importing_diffusers(
         )
 
 
-def test_from_pretrained_missing_base_pipeline_path_raises(tmp_path):
+def test_from_pretrained_does_not_locally_validate_base_pipeline_path(tmp_path):
+    """base_pipeline_path may be a Hub ID (e.g. "Qwen/Qwen-Image"), not a local directory,
+    so from_pretrained must not reject it with a local os.path.isdir-style check the way
+    it does for student_path. Confirmed here by observing it gets far enough to need
+    diffusers (not installed in this environment) instead of failing on path validation."""
     student_dir = tmp_path / "student"
     student_dir.mkdir()
 
-    with pytest.raises(FileNotFoundError, match="base_pipeline_path"):
+    with pytest.raises(ModuleNotFoundError, match="diffusers"):
         QwenImageDMDInferencePipeline.from_pretrained(
             student_path=student_dir,
-            base_pipeline_path=tmp_path / "does_not_exist",
+            base_pipeline_path="Qwen/Qwen-Image",
         )
 
 
@@ -135,3 +156,27 @@ def test_call_rejects_invalid_sample_type():
 
     with pytest.raises(ValueError, match="sample_type must be"):
         pipe(prompt="a cat", sample_type="euler")
+
+
+def test_call_requires_exactly_one_of_prompt_or_prompt_embeds():
+    fake_pipe = _FakeBasePipeline()
+    pipe = QwenImageDMDInferencePipeline(base_pipeline=fake_pipe)
+
+    with pytest.raises(ValueError, match="exactly one of"):
+        pipe(prompt=None, prompt_embeds=None)
+
+
+def test_call_rejects_both_prompt_and_prompt_embeds():
+    fake_pipe = _FakeBasePipeline()
+    pipe = QwenImageDMDInferencePipeline(base_pipeline=fake_pipe)
+
+    with pytest.raises(ValueError, match="exactly one of"):
+        pipe(prompt="a cat", prompt_embeds=torch.randn(1, 8, 16))
+
+
+def test_call_prompt_embeds_requires_single_image_per_prompt():
+    fake_pipe = _FakeBasePipeline()
+    pipe = QwenImageDMDInferencePipeline(base_pipeline=fake_pipe)
+
+    with pytest.raises(ValueError, match="num_images_per_prompt must be 1"):
+        pipe(prompt_embeds=torch.randn(1, 8, 16), num_images_per_prompt=2)

@@ -14,10 +14,11 @@
 
 """Inference pipeline for DMD2-trained Qwen-Image students.
 
-Loads the consolidated safetensors transformer produced by
+Loads the transformer checkpoint produced by
 ``examples/diffusion/dmd2/qwen_image_dmd2.yaml`` (``checkpoint.model_save_format=safetensors``,
-``save_consolidated``) plus the base Qwen-Image VAE / text-encoder / tokenizer, and exposes a
-diffusers-style ``pipe(prompt=...).images[0]`` call that runs the DMD few-step sampler.
+either the consolidated final save or a sharded mid-training save) plus the base Qwen-Image
+VAE / text-encoder / tokenizer, and exposes a diffusers-style ``pipe(prompt=...).images[0]``
+call that runs the DMD few-step sampler.
 
 A DMD2 student is trained on the rectified-flow identity, not the noise-prediction loss a
 standard diffusers scheduler expects, so it cannot be sampled correctly with the stock
@@ -43,13 +44,26 @@ scheduler's step logic. This sampler is bit-aligned with the training-time
             x   = x_0                                  # final step
     image = vae.decode(x)
 
+``student_path`` is a training checkpoint directory (e.g. ``.../epoch_0_step_500``),
+not a specific weight-file layout -- ``from_pretrained`` auto-detects and loads
+whichever of these the directory contains:
+
+  * Consolidated (``<student_path>/model/consolidated/``): written only for the
+    final checkpoint of a run (``checkpoint.save_consolidated: final``). Loaded
+    directly via ``QwenImageTransformer2DModel.from_pretrained``.
+  * Sharded (``<student_path>/model/shard-*.safetensors``): the default for
+    every non-final save. Reconstructed via
+    :func:`nemo_automodel.components.checkpoint.inference_loading.load_sharded_hf_safetensors_checkpoint`
+    -- no offline consolidation step needed, so a mid-training checkpoint can be
+    sampled directly.
+
 Usage::
 
     from tools.diffusion.inference_dmd2_qwen_image import QwenImageDMDInferencePipeline
     import torch
 
     pipe = QwenImageDMDInferencePipeline.from_pretrained(
-        student_path="/path/to/checkpoint/epoch_0_step_500/model/consolidated",
+        student_path="/path/to/checkpoint/epoch_0_step_500",
         base_pipeline_path="Qwen/Qwen-Image",
         ema_path=None,
         torch_dtype=torch.bfloat16,
@@ -71,12 +85,11 @@ import itertools
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import torch
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from nemo_automodel.components.checkpoint.inference_loading import load_sharded_hf_safetensors_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +125,14 @@ def _resolve_schedule(num_inference_steps: int, max_t: float, t_list: list | Non
         if abs(schedule[-1]) > 1e-6:
             raise ValueError(f"t_list must end at 0.0 (got {schedule[-1]}); the final step lands on x_0.")
         return schedule
+    logger.warning(
+        "[DMD2-Inference] t_list not provided for num_inference_steps=%d; falling back to a linear "
+        "schedule from max_t=%.4f to 0. A DMD2 student is distilled on a specific, usually non-linear "
+        "t_list (see dmd2.sample_t_cfg.t_list in the training config) -- sampling off-schedule can "
+        "produce blurry, color-shifted, or banded images. Pass the training t_list explicitly.",
+        num_inference_steps,
+        max_t,
+    )
     return torch.linspace(max_t, 0.0, num_inference_steps + 1).tolist()
 
 
@@ -144,35 +165,73 @@ class QwenImageDMDInferencePipeline:
         """Load the student + base Qwen-Image components.
 
         Args:
-            student_path: A consolidated dir from a safetensors checkpoint save -- must
-                contain ``config.json``, ``diffusion_pytorch_model.safetensors.index.json``,
-                and one or more ``*.safetensors`` shards. Loadable directly via
-                ``QwenImageTransformer2DModel.from_pretrained``.
+            student_path: A DMD2 training checkpoint directory (e.g.
+                ``.../epoch_0_step_500``). Auto-detects which of two on-disk layouts
+                it contains:
+                  * Consolidated: ``<student_path>/model/consolidated/`` -- a proper
+                    HF/diffusers directory (``config.json`` +
+                    ``diffusion_pytorch_model.safetensors.index.json`` +
+                    ``*.safetensors`` shards), written only for the final checkpoint
+                    of a run (``checkpoint.save_consolidated: final``). Loaded
+                    directly via ``QwenImageTransformer2DModel.from_pretrained``.
+                  * Sharded: ``<student_path>/model/shard-*.safetensors`` -- one
+                    shard per FSDP rank, written for every non-final save
+                    (``save_consolidated: false``, the default mid-training).
+                    Reconstructed via
+                    :func:`~nemo_automodel.components.checkpoint.inference_loading.\
+load_sharded_hf_safetensors_checkpoint`
+                    on top of ``base_pipeline_path``'s transformer architecture --
+                    no offline consolidation step needed.
             base_pipeline_path: The base Qwen-Image checkpoint (e.g. ``Qwen/Qwen-Image`` or a
-                local snapshot). Used only for the ``vae`` / ``text_encoder`` / ``tokenizer`` /
-                ``image_processor``; the transformer is replaced.
+                local snapshot). Used for the ``vae`` / ``text_encoder`` / ``tokenizer`` /
+                ``image_processor`` in both cases; also supplies the transformer
+                architecture (to be overwritten) when loading a sharded checkpoint.
             ema_path: Optional path to a standalone EMA shadow ``state_dict`` (a plain
                 ``torch.save``'d ``dict[str, Tensor]``, or a dict with a ``"shadow"`` key
                 wrapping one). If provided, the EMA shadow weights are overlaid onto the
-                student after the safetensors load; EMA usually yields cleaner samples than
+                student after the checkpoint load; EMA usually yields cleaner samples than
                 the live student. Automodel does not yet ship a tool that extracts this file
                 from a DMD2 training checkpoint's DCP-sharded EMA state -- it must be produced
                 separately (e.g. from ModelOpt's ``fastgen_checkpoint`` sidecar format).
             torch_dtype: dtype for the student + VAE. ``bfloat16`` matches training.
             max_t: Initial timestep for the 1-step sampler. Must match the training config's
                 ``dmd2.sample_t_cfg.max_t`` (default 0.999).
+
+        Raises:
+            FileNotFoundError: If ``student_path`` doesn't exist, or contains neither
+                a consolidated nor a sharded checkpoint in the layouts described above.
         """
-        student_path = str(student_path)
+        student_path = Path(student_path)
         base_pipeline_path = str(base_pipeline_path)
-        if not os.path.isdir(student_path):
+        if not student_path.is_dir():
             raise FileNotFoundError(f"student_path is not a directory: {student_path}")
-        if not os.path.isdir(base_pipeline_path):
-            raise FileNotFoundError(f"base_pipeline_path is not a directory: {base_pipeline_path}")
 
         from diffusers import QwenImagePipeline, QwenImageTransformer2DModel
 
-        logger.info("[DMD2-Inference] Loading trained student from %s", student_path)
-        student = QwenImageTransformer2DModel.from_pretrained(student_path, torch_dtype=torch_dtype)
+        consolidated_dir = student_path / "model" / "consolidated"
+        sharded_dir = student_path / "model"
+
+        if consolidated_dir.is_dir() and any(p.suffix == ".safetensors" for p in consolidated_dir.iterdir()):
+            logger.info("[DMD2-Inference] Loading consolidated student from %s", consolidated_dir)
+            student = QwenImageTransformer2DModel.from_pretrained(str(consolidated_dir), torch_dtype=torch_dtype)
+        elif sharded_dir.is_dir() and any(
+            p.name.startswith("shard-") and p.suffix == ".safetensors" for p in sharded_dir.iterdir()
+        ):
+            logger.info(
+                "[DMD2-Inference] Loading sharded (DCP) student from %s onto base architecture from %s",
+                sharded_dir,
+                base_pipeline_path,
+            )
+            student = QwenImageTransformer2DModel.from_pretrained(
+                base_pipeline_path, subfolder="transformer", torch_dtype=torch_dtype
+            )
+            student = load_sharded_hf_safetensors_checkpoint(student, str(sharded_dir), torch_dtype)
+        else:
+            raise FileNotFoundError(
+                f"No recognized DMD2 student checkpoint under {student_path}: expected either a "
+                f"consolidated safetensors dir at {consolidated_dir} or shard-*.safetensors files "
+                f"under {sharded_dir}."
+            )
 
         if ema_path is not None:
             logger.info("[DMD2-Inference] Overlaying EMA shadow from %s", ema_path)
@@ -228,7 +287,7 @@ class QwenImageDMDInferencePipeline:
     @torch.no_grad()
     def __call__(
         self,
-        prompt: str | list,
+        prompt: str | list | None = None,
         negative_prompt: str | list | None = None,
         num_inference_steps: int = 1,
         guidance_scale: float = 1.0,
@@ -241,6 +300,8 @@ class QwenImageDMDInferencePipeline:
         sample_type: str = "ode",
         output_type: str = "pil",
         max_sequence_length: int = 512,
+        prompt_embeds: torch.Tensor | None = None,
+        prompt_embeds_mask: torch.Tensor | None = None,
     ) -> QwenImageDMDOutput:
         """Generate image(s) from the trained DMD2 student.
 
@@ -263,7 +324,7 @@ class QwenImageDMDInferencePipeline:
         (``dmd2.guidance_scale=null``).
 
         Args:
-            prompt: Text prompt(s).
+            prompt: Text prompt(s). Ignored (may be ``None``) when ``prompt_embeds`` is given.
             negative_prompt: Negative prompt(s) for CFG; defaults to ``""`` when CFG is on.
             num_inference_steps: Number of student sampling steps.
             guidance_scale: Inference-time CFG strength; ``1.0`` disables CFG.
@@ -276,12 +337,24 @@ class QwenImageDMDInferencePipeline:
             sample_type: ``"ode"`` (deterministic) or ``"sde"`` (stochastic) re-noising.
             output_type: Passed through to the base pipeline's image processor.
             max_sequence_length: Max text sequence length for prompt encoding.
+            prompt_embeds: Pre-computed positive-prompt embeddings (e.g. loaded directly
+                from a training cache ``.pt`` file) that bypass ``pipe.encode_prompt``
+                entirely -- useful to test generation against the exact conditioning a
+                sample was trained on, with zero risk of prompt-encoding drift. Mutually
+                exclusive with ``prompt``; when set, ``num_images_per_prompt`` must be 1
+                (the caller is responsible for repeating embeddings themselves).
+            prompt_embeds_mask: Attention mask paired with ``prompt_embeds``. Optional --
+                some cached embeddings were saved without one.
 
         Returns:
             A :class:`QwenImageDMDOutput` with the generated images.
         """
         if sample_type not in ("ode", "sde"):
             raise ValueError(f"sample_type must be 'ode' or 'sde', got {sample_type!r}")
+        if (prompt is None) == (prompt_embeds is None):
+            raise ValueError("Pass exactly one of `prompt` or `prompt_embeds`.")
+        if prompt_embeds is not None and num_images_per_prompt != 1:
+            raise ValueError("num_images_per_prompt must be 1 when prompt_embeds is provided.")
 
         from diffusers.utils.torch_utils import randn_tensor
 
@@ -296,13 +369,21 @@ class QwenImageDMDInferencePipeline:
 
         schedule = _resolve_schedule(num_inference_steps, max_t, t_list)
 
-        # ---- Encode prompt(s) -------------------------------------------------
-        prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
-            prompt=prompt,
-            device=device,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
-        )
+        # ---- Encode prompt(s), or use pre-computed embeddings directly --------
+        if prompt_embeds is not None:
+            prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+            if prompt_embeds_mask is not None:
+                prompt_embeds_mask = prompt_embeds_mask.to(device=device)
+            batch_size = prompt_embeds.shape[0]
+        else:
+            prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
+                prompt=prompt,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+            )
+            batch_size = 1 if isinstance(prompt, str) else len(prompt)
+            batch_size = batch_size * num_images_per_prompt
         neg_prompt_embeds = None
         neg_prompt_embeds_mask = None
         if do_cfg:
@@ -312,14 +393,7 @@ class QwenImageDMDInferencePipeline:
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
             )
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).int().tolist() if prompt_embeds_mask is not None else None
-        neg_txt_seq_lens = (
-            neg_prompt_embeds_mask.sum(dim=1).int().tolist() if neg_prompt_embeds_mask is not None else None
-        )
-
         # ---- Build initial noisy latents at t = schedule[0] --------------------
-        batch_size = 1 if isinstance(prompt, str) else len(prompt)
-        batch_size = batch_size * num_images_per_prompt
 
         num_channels_latents = pipe.transformer.config.in_channels // 4  # 64 // 4 = 16
         h_lat = 2 * (height // (pipe.vae_scale_factor * 2))
@@ -343,7 +417,6 @@ class QwenImageDMDInferencePipeline:
                 encoder_hidden_states_mask=prompt_embeds_mask,
                 timestep=timestep,
                 img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens,
                 guidance=None,
                 return_dict=False,
             )[0]
@@ -358,7 +431,6 @@ class QwenImageDMDInferencePipeline:
                     encoder_hidden_states_mask=neg_prompt_embeds_mask,
                     timestep=timestep,
                     img_shapes=img_shapes,
-                    txt_seq_lens=neg_txt_seq_lens,
                     guidance=None,
                     return_dict=False,
                 )[0]
@@ -375,16 +447,15 @@ class QwenImageDMDInferencePipeline:
                     # re-noise. eps = (x_t - (1 - t_cur) * x_0) / t_cur
                     alpha_cur = 1.0 - float(t_cur)
                     eps_packed = (
-                        (x_packed.to(torch.float64) - alpha_cur * x0_packed.to(torch.float64))
-                        / max(float(t_cur), 1e-6)
+                        (x_packed.to(torch.float64) - alpha_cur * x0_packed.to(torch.float64)) / max(float(t_cur), 1e-6)
                     ).to(dtype)
                 else:
                     eps_packed = torch.randn(x_packed.shape, generator=generator, device=device, dtype=dtype)
                 # RF forward: x_{t_next} = (1 - t_next) * x_0 + t_next * eps.
                 alpha_next = 1.0 - float(t_next)
-                x_packed = (
-                    alpha_next * x0_packed.to(torch.float64) + float(t_next) * eps_packed.to(torch.float64)
-                ).to(dtype)
+                x_packed = (alpha_next * x0_packed.to(torch.float64) + float(t_next) * eps_packed.to(torch.float64)).to(
+                    dtype
+                )
             else:
                 x_packed = x0_packed
 
@@ -397,13 +468,10 @@ class QwenImageDMDInferencePipeline:
             .view(1, pipe.vae.config.z_dim, 1, 1, 1)
             .to(device=device, dtype=dtype)
         )
-        latents_std = (
-            1.0
-            / torch.tensor(pipe.vae.config.latents_std).view(1, pipe.vae.config.z_dim, 1, 1, 1).to(
-                device=device, dtype=dtype
-            )
+        latents_std = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(1, pipe.vae.config.z_dim, 1, 1, 1).to(
+            device=device, dtype=dtype
         )
-        x0_scaled = x0_5d / latents_std + latents_mean
+        x0_scaled = (x0_5d / latents_std + latents_mean).to(pipe.vae.dtype)
 
         # vae.decode returns 5D; the trailing [:, :, 0] drops the temporal dim since
         # Qwen-Image treats images as 1-frame videos.
@@ -485,8 +553,8 @@ def main() -> None:
     parser.add_argument(
         "--student_path",
         required=True,
-        help="Path to the consolidated safetensors student checkpoint "
-        "(e.g. .../epoch_0_step_500/model/consolidated).",
+        help="Path to a DMD2 training checkpoint directory (e.g. .../epoch_0_step_500). "
+        "Auto-detects a consolidated (model/consolidated/) or sharded (model/shard-*.safetensors) layout.",
     )
     parser.add_argument(
         "--base_pipeline_path",
