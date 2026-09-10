@@ -391,10 +391,10 @@ class DeepseekV41Engram(nn.Module):
         *,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
-        """Construct the projections and a contiguous row-owner table.
+        """Construct the projections and a trainable contiguous row-owner table.
 
         Args:
-            config: Model dimensions and the existing table trainability setting.
+            config: Model dimensions and parameter dtype.
             layer_idx: Decoder layer containing this Engram.
             layout: Logical hash-table row ranges for all Engram layers.
             backend: Projection backend selected for the enclosing model.
@@ -425,7 +425,6 @@ class DeepseekV41Engram(nn.Module):
             initializer_range=1.0,
         )
         self.embed = table_config.build(process_group=engram_process_group, dtype=model_dtype)
-        self.embed.weight.requires_grad_(bool(config.engram_trainable))
         self._zero_padding_rows()
         self.wkv = initialize_linear_module(
             backend.linear,
