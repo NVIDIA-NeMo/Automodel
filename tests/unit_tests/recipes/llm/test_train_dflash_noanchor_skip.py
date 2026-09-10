@@ -53,6 +53,7 @@ class _FakeTrainerModule(nn.Module):
         # accumulates them per micro-batch to average over the log window.
         return SimpleNamespace(
             loss=out.abs() + 1.0,
+            loss_weight=torch.tensor(4.0),
             accuracy=torch.tensor(0.5),
             accept_len_sum=torch.tensor(2.0),
             valid_blocks=torch.tensor(1.0),

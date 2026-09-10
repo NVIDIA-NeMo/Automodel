@@ -69,6 +69,9 @@ class TrainDominoRecipe(TrainDFlashRecipe):
             block_size=self.block_size,
             attention_backend=attention_backend,
             num_anchors=int(recipe_cfg.get("num_anchors", 512)),
+            max_total_anchors=(
+                int(recipe_cfg["max_total_anchors"]) if recipe_cfg.get("max_total_anchors", None) is not None else None
+            ),
             # Paper default (Appendix A.1) for the shipped block_size=16 configs;
             # matches DFlashDecayLoss's own default. Set null explicitly in YAML
             # to disable the position decay (uniform weighting).

@@ -33,6 +33,7 @@ from nemo_automodel.components.speculative.dflash.dflash2_core import (
 )
 from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import Qwen3DFlash2DraftModel
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
+from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 from nemo_automodel.recipes.llm.train_dflash2 import TrainDFlash2Recipe
 
 VOCAB = 64
@@ -128,10 +129,17 @@ def test_build_trainer_module_is_dflash2():
     recipe.target_model = _target_model()
     recipe.draft_sliding_window = 2048
     module = recipe._build_trainer_module(
-        "sdpa", {"num_anchors": 7, "loss_decay_gamma": 5.0, "selector_loss_weight": 0.25}
+        "sdpa",
+        {
+            "num_anchors": 7,
+            "max_total_anchors": 11,
+            "loss_decay_gamma": 5.0,
+            "selector_loss_weight": 0.25,
+        },
     )
     assert isinstance(module, DFlash2TrainerModule)
     assert module.num_anchors == 7
+    assert module.max_total_anchors == 11
     assert module.loss_decay_gamma == 5.0
     assert module.selector_loss_weight == 0.25
     # The window the recipe resolved must reach the trainer, or training and the
@@ -176,6 +184,7 @@ def _metrics(**overrides):
         valid_blocks=torch.tensor(2.0),
         base_loss=torch.tensor(2.3),
         selector_loss=torch.tensor(0.7),
+        selector_loss_denominator=torch.tensor(6.0),
         base_accuracy=torch.tensor(0.4),
         base_correct_tokens=torch.tensor(4.0),
         base_accept_len=torch.tensor(4.0),
@@ -227,7 +236,8 @@ def test_eval_sums_keep_additive_numerators():
 
     assert sums["val_base_loss"][0].item() == pytest.approx(18.4)
     assert sums["val_base_loss"][1].item() == 8.0
-    assert sums["val_selector_loss"][0].item() == pytest.approx(5.6)
+    assert sums["val_selector_loss"][0].item() == pytest.approx(4.2)
+    assert sums["val_selector_loss"][1].item() == 6.0
     assert sums["val_base_accuracy"][0].item() == 4.0
     assert sums["val_base_accept_len"][0].item() == 8.0
     assert sums["val_base_accept_len"][1].item() == 2.0
@@ -264,6 +274,35 @@ def test_run_trainer_step_caches_the_metrics(monkeypatch):
     out = recipe._run_trainer_step(target_batch)
     assert seen["input_ids"] is target_batch.input_ids
     assert recipe._last_dflash2_metrics is out
+
+
+def test_loss_terms_keep_base_and_selector_denominators_separate():
+    recipe = _recipe()
+    recipe.selector_loss_weight = 0.5
+    metrics = _metrics(
+        loss=torch.tensor(3.0, requires_grad=True),
+        base_loss=torch.tensor(2.0, requires_grad=True),
+        loss_weight=torch.tensor(8.0),
+        selector_loss_denominator=torch.tensor(3.0),
+    )
+
+    terms = recipe._loss_terms(metrics)
+
+    assert terms[0][0] is metrics.base_loss
+    assert terms[0][1].item() == 8.0
+    assert terms[1][0].item() == pytest.approx(0.35)
+    assert terms[1][1].item() == 3.0
+
+
+def test_run_eval_rebuilds_composite_loss_from_separately_weighted_terms(monkeypatch):
+    recipe = _recipe()
+    recipe.selector_loss_weight = 0.25
+    base_result = {"val_loss": 99.0, "val_base_loss": 2.0, "val_selector_loss": 4.0}
+    monkeypatch.setattr(TrainDFlashRecipe, "_run_eval", lambda self: dict(base_result))
+
+    result = recipe._run_eval()
+
+    assert result["val_loss"] == 3.0
 
 
 def test_setup_resets_the_metrics_cache(monkeypatch):
