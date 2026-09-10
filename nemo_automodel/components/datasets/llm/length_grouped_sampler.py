@@ -132,45 +132,31 @@ class LengthGroupedSampler(Sampler[int]):
         )
 
     @staticmethod
-    def _unwrap_to_list(dataset: Dataset) -> list | None:
-        """Return an inner list that can stand in for ``dataset`` when indexing.
+    def _compute_lengths(dataset: Dataset) -> list[int]:
+        """Compute token lengths for all samples.
 
-        Datasets that tokenize in ``__getitem__`` (e.g. ``ChatDataset``) keep the
-        raw, untokenized rows in ``self.dataset``, so indexing the inner list
-        yields rows without ``input_ids``.  Wrappers that remap indices (e.g.
-        ``torch.utils.data.Subset``) make ``raw[i]`` a different sample than
-        ``dataset[i]``.  Only substitute the inner list when it is 1:1 with the
-        dataset and already carries tokenized samples.
+        Lengths always come from ``dataset[i]``.  An inner ``dataset`` attribute
+        is never indexed in its place: a wrapper may tokenize inside
+        ``__getitem__`` (``ChatDataset`` keeps untokenized rows in
+        ``self.dataset``), remap or repeat indices
+        (``torch.utils.data.Subset``), or rewrite ``input_ids`` altogether, and
+        none of that is observable from the inner object.  A matching length
+        does not make the two interchangeable.
 
         Args:
-            dataset: The dataset to unwrap.
+            dataset: The dataset to measure.  Samples are expected to expose an
+                ``input_ids`` key.
 
         Returns:
-            The inner list when it is a safe stand-in, otherwise ``None``.
+            The token length of each sample, ``0`` where ``input_ids`` is absent.
         """
-        raw = dataset
-        while hasattr(raw, "dataset"):
-            raw = raw.dataset
-        if not isinstance(raw, list) or len(raw) != len(dataset):
-            return None
-        if raw and not (isinstance(raw[0], dict) and "input_ids" in raw[0]):
-            return None
-        return raw
-
-    @staticmethod
-    def _compute_lengths(dataset: Dataset) -> list[int]:
-        """Compute token lengths for all samples."""
-        # Fast path: index the underlying list directly when it is equivalent
-        # to indexing the dataset itself.
-        raw = LengthGroupedSampler._unwrap_to_list(dataset)
-
         n = len(dataset)
         logger.info("Computing token lengths for %d samples...", n)
         t0 = time.monotonic()
         lengths = [0] * n
 
         for i in range(n):
-            sample = raw[i] if raw is not None else dataset[i]
+            sample = dataset[i]
             ids = sample.get("input_ids")
             if ids is not None:
                 lengths[i] = len(ids) if isinstance(ids, list) else ids.numel()

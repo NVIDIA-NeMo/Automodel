@@ -192,17 +192,18 @@ class _LazyTokenizingDataset:
         return {"input_ids": list(range(n)), "labels": list(range(n))}
 
 
-class _PretokenizedWrapper:
-    """Wrapper whose ``.dataset`` list already holds tokenized, 1:1 samples."""
+class _TruncatingWrapper:
+    """Wrapper that is 1:1 with its inner list but shortens ``input_ids``."""
 
-    def __init__(self, lengths):
+    def __init__(self, lengths, cap):
         self.dataset = _make_dataset(lengths)
+        self.cap = cap
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        return self.dataset[idx]
+        return {"input_ids": self.dataset[idx]["input_ids"][: self.cap]}
 
 
 class TestComputeLengths:
@@ -222,20 +223,39 @@ class TestComputeLengths:
         # Descending length order: 512, 256, 128, 64, 32, 16, 8, 4
         assert sampler.sorted_indices == [7, 5, 1, 3, 6, 2, 0, 4]
 
-    def test_pretokenized_wrapper_keeps_fast_path(self):
-        lengths = [10, 20, 30, 40]
-        ds = _PretokenizedWrapper(lengths)
-        assert LengthGroupedSampler._unwrap_to_list(ds) is ds.dataset
-        assert LengthGroupedSampler._compute_lengths(ds) == lengths
-
-    def test_index_remapping_wrapper_is_not_unwrapped(self):
-        """A wrapper that selects a subset is not 1:1 with its inner list."""
+    def test_shorter_subset_reads_selected_samples(self):
         from torch.utils.data import Subset
 
-        inner = _make_dataset([10, 20, 30, 40])
-        ds = Subset(inner, [3, 1])
-        assert LengthGroupedSampler._unwrap_to_list(ds) is None
+        ds = Subset(_make_dataset([10, 20, 30, 40]), [3, 1])
         assert LengthGroupedSampler._compute_lengths(ds) == [40, 20]
+
+    def test_equal_length_permutation_subset_follows_index_mapping(self):
+        """A full-length ``Subset`` reorders samples without changing ``len``."""
+        from torch.utils.data import Subset
+
+        ds = Subset(_make_dataset([10, 20, 30, 40]), [3, 1, 0, 2])
+        assert LengthGroupedSampler._compute_lengths(ds) == [40, 20, 10, 30]
+
+    def test_equal_length_subset_with_repeated_indices(self):
+        """Repeated indices also keep ``len`` while changing the samples."""
+        from torch.utils.data import Subset
+
+        ds = Subset(_make_dataset([10, 20, 30, 40]), [0, 0, 3, 3])
+        assert LengthGroupedSampler._compute_lengths(ds) == [10, 10, 40, 40]
+
+    def test_length_changing_wrapper_is_measured_through_getitem(self):
+        """A 1:1 wrapper may still rewrite ``input_ids``; measure what it returns."""
+        ds = _TruncatingWrapper([10, 20, 30, 40], cap=16)
+        assert LengthGroupedSampler._compute_lengths(ds) == [10, 16, 16, 16]
+
+    def test_permuted_subset_is_grouped_on_its_own_order(self):
+        """End to end: grouping must follow the samples the sampler will yield."""
+        from torch.utils.data import Subset
+
+        ds = Subset(_make_dataset([8, 128, 16, 64]), [3, 1, 0, 2])
+        # ds[i] lengths are [64, 128, 8, 16]; descending order is 128, 64, 16, 8.
+        sampler = LengthGroupedSampler(ds, batch_size=1, seed=0, num_replicas=1, rank=0)
+        assert sampler.sorted_indices == [1, 0, 3, 2]
 
     def test_tensor_input_ids(self):
         import torch
