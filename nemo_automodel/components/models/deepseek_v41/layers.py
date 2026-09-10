@@ -1030,12 +1030,11 @@ class DeepseekV41Block(nn.Module):
         self.hc_mult = int(config.hc_mult)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.attn = DeepseekV41Attention(config, layer_idx, backend=backend)
-        moe_backend = replace(backend, gate_precision=torch.float32)
-        self.ffn = MoE(moe_config, moe_backend)
+        self.ffn = MoE(moe_config, backend)
         self.ffn.gate = DeepseekV4VisionGate(
             DeepseekV4Config(vocab_size=config.vocab_size),
             moe_config,
-            gate_precision=moe_backend.gate_precision,
+            gate_precision=torch.float32,
             hash_routing=False,
         )
         self.attn_norm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)

@@ -82,8 +82,7 @@ from nemo_automodel.components.models.deepseek_v41.vision import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MoE
-from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+from nemo_automodel.shared.utils import dtype_from_str
 
 
 class DeepseekV41Model(nn.Module):
@@ -93,43 +92,15 @@ class DeepseekV41Model(nn.Module):
         self,
         config: DeepseekV41TextConfig,
         backend: BackendConfig,
+        moe_config: MoEConfig,
         *,
-        moe_config: MoEConfig | None = None,
         tokenizer: PreTrainedTokenizerFast | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
         super().__init__()
-        self.backend = backend
         self.config = config
-
-        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-        moe_defaults = dict(
-            dim=config.hidden_size,
-            inter_dim=config.moe_intermediate_size,
-            moe_inter_dim=config.moe_intermediate_size,
-            n_routed_experts=config.n_routed_experts,
-            n_shared_experts=config.n_shared_experts,
-            n_activated_experts=config.num_experts_per_tok,
-            # noaux_tc routing without group limits.
-            n_expert_groups=0,
-            n_limited_groups=0,
-            train_gate=True,
-            gate_bias_update_factor=0.0,
-            force_e_score_correction_bias=True,
-            score_func="sqrtsoftplus",
-            router_weights_fp32=True,
-            combine_in_fp32=True,
-            route_scale=config.routed_scaling_factor,
-            aux_loss_coeff=0,
-            norm_topk_prob=config.norm_topk_prob,
-            dtype=model_dtype,
-            # Routed and shared experts use clamped SwiGLU in fp32 (reference ``Expert.forward``).
-            swiglu_limit=float(config.swiglu_limit),
-        )
-        self.moe_config = moe_config or MoEConfig(**moe_defaults)
-        if not self.moe_config.combine_in_fp32:
-            raise ValueError("DeepSeek V4.1 requires MoEConfig.combine_in_fp32=True for released expert arithmetic")
-
+        self.moe_config = moe_config
+        model_dtype = dtype_from_str(config.dtype, torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         active_engram = any(i < config.num_hidden_layers for i in config.engram_layer_ids)
         if active_engram and tokenizer is None:
@@ -239,12 +210,6 @@ class DeepseekV41Model(nn.Module):
         h = DeepseekV41HyperConnection.collapse(h, pre_mix)
         return self.norm(h), None if captured is None else tuple(captured)
 
-    def update_moe_gate_bias(self) -> None:
-        with torch.no_grad():
-            for block in self.layers.values():
-                if isinstance(block.ffn, MoE) and self.moe_config.gate_bias_update_factor > 0:
-                    block.ffn.gate.update_bias()
-
 
 class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     """DeepSeek V4.1 causal LM with optional vision and an fp32 ``lm_head``.
@@ -307,19 +272,39 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         text = config.text_config
+        if moe_config is not None and not moe_config.combine_in_fp32:
+            raise ValueError("DeepSeek V4.1 requires MoEConfig.combine_in_fp32=True for released expert arithmetic")
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_linear", dispatcher="hybridep"
         )
+        dtype = dtype_from_str(text.dtype, torch.bfloat16)
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
         if tokenizer is None and any(i < text.num_hidden_layers for i in text.engram_layer_ids):
             tokenizer = config.build_tokenizer()
+        moe_config = moe_config or MoEConfig(
+            dim=text.hidden_size,
+            inter_dim=text.moe_intermediate_size,
+            moe_inter_dim=text.moe_intermediate_size,
+            n_routed_experts=text.n_routed_experts,
+            n_shared_experts=text.n_shared_experts,
+            n_activated_experts=text.num_experts_per_tok,
+            n_expert_groups=0,
+            n_limited_groups=0,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sqrtsoftplus",
+            route_scale=text.routed_scaling_factor,
+            norm_topk_prob=text.norm_topk_prob,
+            router_weights_fp32=True,
+            combine_in_fp32=True,
+            force_e_score_correction_bias=True,
+            swiglu_limit=text.swiglu_limit,
+            dtype=dtype,
+        )
         self.model = DeepseekV41Model(
-            text,
-            backend=self.backend,
-            moe_config=moe_config,
-            tokenizer=tokenizer,
-            engram_process_group=engram_process_group,
+            text, self.backend, moe_config, tokenizer=tokenizer, engram_process_group=engram_process_group
         )
         self.model.vision = None
         self.model.aligner = None
@@ -327,20 +312,15 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             self.model.vision = DeepseekV41VisionTransformer(config)
             self.model.aligner = DeepseekV41VisionAligner(config)
             for name in ("image_start", "image_end", "image_newline"):
-                parameter = nn.Parameter(torch.empty(text.hidden_size, dtype=get_dtype(text.torch_dtype)))
+                parameter = nn.Parameter(torch.empty(text.hidden_size, dtype=dtype))
                 nn.init.normal_(parameter, std=text.initializer_range)
                 self.model.register_parameter(name, parameter)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text.hidden_size, text.vocab_size, bias=False, dtype=torch.float32
         )
-        self.moe_config = self.model.moe_config
+        self.moe_config = moe_config
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = DeepseekV41StateDictAdapter(
-                self.config,
-                self.model.moe_config,
-                self.backend,
-                dtype=get_dtype(text.torch_dtype, torch.bfloat16),
-            )
+            self.state_dict_adapter = DeepseekV41StateDictAdapter(config, moe_config, self.backend, dtype=dtype)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -483,9 +463,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             logits=projected.logits,
             hidden_states=captured if output_hidden_states else projected.hidden_states,
         )
-
-    def update_moe_gate_bias(self) -> None:
-        self.model.update_moe_gate_bias()
 
     @torch.no_grad()
     def initialize_weights(
