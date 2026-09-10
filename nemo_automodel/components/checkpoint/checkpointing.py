@@ -48,6 +48,7 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
+from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel
@@ -363,14 +364,13 @@ def _summarize_state_dict_key_diff(
     }
 
 
-def _get_checkpoint_metadata_keys(
+def _get_checkpoint_metadata(
     path: str,
     storage_reader: StorageReader | None = None,
-) -> set[str]:
-    """Return checkpoint FQNs present in metadata."""
+) -> Metadata:
+    """Read checkpoint metadata, including saved tensor sizes and dtypes."""
     reader = storage_reader if storage_reader is not None else FileSystemReader(path)
-    metadata = reader.read_metadata()
-    return set(metadata.state_dict_metadata.keys())
+    return reader.read_metadata()
 
 
 if _is_geq_torch_2_9():
@@ -1018,6 +1018,7 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
+        checkpoint_metadata = {}
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
         preserved_extra_state = {}
@@ -1025,8 +1026,17 @@ class Checkpointer:
             _get_shared_parameter_names(model_state.model) if is_init_step and uses_standard_hf_state_dict else []
         )
         if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys or shared_parameter_names:
-            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            checkpoint_metadata = _get_checkpoint_metadata(model_path, storage_reader).state_dict_metadata
+            checkpoint_metadata_keys = set(checkpoint_metadata)
         if extra_state_keys:
+            # Serialized module metadata can grow after training (e.g. TE FP8 scaling history).
+            # Allocate its saved representation; parameter and buffer destinations retain strict shape checks.
+            for key in extra_state_keys:
+                value = state_dict[key]
+                saved = checkpoint_metadata.get(key)
+                if isinstance(value, torch.Tensor) and isinstance(saved, TensorStorageMetadata):
+                    if value.shape != saved.size or value.dtype != saved.properties.dtype:
+                        state_dict[key] = value.new_empty(saved.size, dtype=saved.properties.dtype)
             # DCP flattens dictionary metadata into dotted child keys.
             missing_extra_state_keys = [
                 key

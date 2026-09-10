@@ -2163,8 +2163,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"layer.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"layer.weight"})),
             ),
             patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
         ):
@@ -2202,8 +2202,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"unrelated.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"unrelated.weight"})),
             ),
         ):
             mock_model_state = mock_model_state_cls.return_value
@@ -2233,8 +2233,10 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"language_model.layer.weight", "vision_tower.block.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(
+                    state_dict_metadata=dict.fromkeys({"language_model.layer.weight", "vision_tower.block.weight"})
+                ),
             ),
         ):
             mock_model_state = mock_model_state_cls.return_value
@@ -2270,8 +2272,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: {**state_dict, "stray.weight": torch.ones(1)},
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"layer.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"layer.weight"})),
             ),
             patch.object(checkpointer, "_do_load", side_effect=lambda state_dict, *args, **kwargs: state_dict),
         ):
@@ -2294,8 +2296,8 @@ class TestLoadModelExtraState:
     """Test checkpoint load compatibility for module extra-state keys."""
 
     @pytest.mark.parametrize("model_save_format", ["safetensors", "torch_save"])
-    @pytest.mark.parametrize("tensor_metadata", [True, False])
-    def test_module_metadata_save_and_resume(self, tmp_path, model_save_format, tensor_metadata):
+    @pytest.mark.parametrize("tensor_metadata, initial_metadata_size", [(False, 0), (True, 0), (True, 1), (True, 2)])
+    def test_module_metadata_save_and_resume(self, tmp_path, model_save_format, tensor_metadata, initial_metadata_size):
         """HF exports omit module metadata; native DCP preserves it, and both resume strictly."""
 
         class ExtraStateLinear(torch.nn.Linear):
@@ -2326,12 +2328,17 @@ class TestLoadModelExtraState:
         )
         checkpointer.save_model(model, str(tmp_path / "saved"))
         resumed = ExtraStateLinear(3)
+        if tensor_metadata:
+            resumed.metadata = torch.full((initial_metadata_size,), 3, dtype=torch.uint8)
         checkpointer.load_model(resumed, str(tmp_path / "saved/model"))
         torch.testing.assert_close(resumed.weight, model.weight, rtol=0, atol=0)
         torch.testing.assert_close(resumed.bias, model.bias, rtol=0, atol=0)
         expected_version = 3 if model_save_format == "safetensors" else 9
         if tensor_metadata:
-            torch.testing.assert_close(resumed.metadata, torch.tensor([expected_version], dtype=torch.uint8))
+            expected_size = initial_metadata_size if model_save_format == "safetensors" else 1
+            torch.testing.assert_close(
+                resumed.metadata, torch.full((expected_size,), expected_version, dtype=torch.uint8), rtol=0, atol=0
+            )
         else:
             assert resumed.metadata == {"version": expected_version}
 
@@ -2375,8 +2382,8 @@ class TestLoadModelExtraState:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"layer.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"layer.weight"})),
             ),
             patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
         ):
