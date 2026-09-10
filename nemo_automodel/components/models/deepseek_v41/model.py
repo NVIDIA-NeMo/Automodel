@@ -586,12 +586,13 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             vision_token_types=vision_token_types,
             **attn_kwargs,
         )
+        # The head owns FP32 storage and compute. Keep its FP32 output instead
+        # of using the helper's fp32_lm_head mode, which rounds back to BF16.
         return compute_lm_head_logits(
             self.lm_head,
             hidden_states,
             logits_to_keep,
             is_thd=thd_mode,
-            fp32_lm_head=True,
             output_hidden_states=bool(output_hidden_states),
         )
 
