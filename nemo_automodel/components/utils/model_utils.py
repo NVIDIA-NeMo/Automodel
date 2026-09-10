@@ -718,28 +718,20 @@ def freeze_unused_kv_sharing_params(model):
         )
 
 
-_DEEPSEEK_V4_INDEXER_PARAM_MARKERS = {
-    # DeepSeek V4 nests the indexer under the compressor; V4.1 keeps it as an attention sibling.
-    "deepseek_v4": ".self_attn.compressor.indexer.",
-    "deepseek_v41": ".attn.indexer.",
-}
-
-
 def freeze_deepseek_v4_indexer_params(model):
-    """Freeze DeepSeek V4 / V4.1 indexer params that only feed discrete top-k masks."""
+    """Freeze DeepSeek V4 indexer params that only feed discrete top-k masks."""
     config = getattr(model, "config", None)
-    marker = _DEEPSEEK_V4_INDEXER_PARAM_MARKERS.get(getattr(config, "model_type", None))
-    if marker is None:
+    if getattr(config, "model_type", None) != "deepseek_v4":
         return
 
     frozen_count = 0
     for name, param in model.named_parameters():
-        if marker in name:
+        if ".self_attn.compressor.indexer." in name:
             param.requires_grad_(False)
             frozen_count += 1
 
     if frozen_count > 0:
-        logger.info("Froze %d %s indexer parameters.", frozen_count, config.model_type)
+        logger.info("Froze %d DeepSeek V4 indexer parameters.", frozen_count)
 
 
 def freeze_minimax_m3_indexer_params(model):
