@@ -29,15 +29,14 @@ hierarchical candidate pool) lives in per-layer snapshots of
 Snapshots share tensors and preserve the state needed for activation recomputation.
 
 The optional vision tower inserts projected image patches and learned image
-delimiters into the text sequence. Packed text remains supported; image batches
-use unpacked two-dimensional token layouts. DSpark draft layers (``mtp.*``),
+delimiters into the text sequence. Text and image batches use full sequences
+with two-dimensional token layouts. DSpark draft layers (``mtp.*``),
 inference-time KV caching, and SWA bounded replay remain out of scope.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -57,8 +56,6 @@ from nemo_automodel.components.models.common.utils import (
     cast_model_to_dtype,
     compute_lm_head_logits,
 )
-from nemo_automodel.components.models.deepseek_v4.cp import build_packed_seq_ids
-from nemo_automodel.components.models.deepseek_v4.model import _normalize_thd_packing_metadata
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41EngramHasher, EngramLayout
 from nemo_automodel.components.models.deepseek_v41.layers import (
@@ -86,16 +83,6 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
-
-
-def document_relative_positions(seq_ids: torch.Tensor) -> torch.Tensor:
-    """Positions that restart at ``0`` on every document boundary of ``seq_ids`` (``[B, S]``)."""
-    seq_len = seq_ids.shape[1]
-    idx = torch.arange(seq_len, device=seq_ids.device).unsqueeze(0).expand_as(seq_ids)
-    is_start = torch.ones_like(seq_ids, dtype=torch.bool)
-    is_start[:, 1:] = seq_ids[:, 1:] != seq_ids[:, :-1]
-    starts = torch.where(is_start, idx, torch.zeros_like(idx)).cummax(dim=1).values
-    return idx - starts
 
 
 class DeepseekV41Model(nn.Module):
@@ -202,84 +189,42 @@ class DeepseekV41Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor | None = None,
+        input_ids: torch.Tensor,
         *,
         inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        padding_mask: torch.Tensor | None = None,
-        vision_token_types: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
         output_hidden_states: bool = False,
-        **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
-        """Run the backbone.
+        """Compute full sequences and optional per-block residual streams.
 
         Args:
-            input_ids: ``[B, S]`` token ids, or ``[T]`` for packed THD batches.
-            inputs_embeds: optional ``[B, S, hidden]`` embeddings replacing the lookup.
-            position_ids: ``[B, S]`` document-relative positions; derived from the
-                packing metadata / padding when omitted.
-            attention_mask: ``[B, S]`` with ``1`` for valid tokens (HF convention).
-            padding_mask: ``[B, S]`` bool with ``True`` at padding.
-            vision_token_types: Optional integer ``[B, S]`` markers, negative for text
-                and nonnegative for image spans; images are excluded from Engram.
+            input_ids: Integer token IDs [batch, sequence], also used for Engram.
+            inputs_embeds: Optional projected image/text embeddings [batch, sequence, hidden].
+            position_ids: Optional contiguous zero-based positions [batch, sequence].
+            attention_mask: Optional binary right-padding mask [batch, sequence].
+            image_mask: Optional boolean image-span mask [batch, sequence].
+            output_hidden_states: Whether to retain streams before each block.
 
         Returns:
-            Final hidden states ``[B, S, hidden]`` after the last norm and,
-            when requested, a tuple of residual streams captured before each block.
+            Final normalized hidden states [batch, sequence, hidden] and optional
+            per-block streams [batch, sequence, streams, hidden].
         """
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("DeepseekV41Model requires input_ids or inputs_embeds")
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-        if inputs_embeds.dim() == 2:
-            # Packed THD inputs arrive with the batch axis collapsed.
-            inputs_embeds = inputs_embeds.unsqueeze(0)
-        if input_ids is not None and input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
+        if position_ids is None:
+            position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).expand_as(input_ids)
+        inputs_embeds = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         batch, seq_len, _ = inputs_embeds.shape
         device = inputs_embeds.device
-        if vision_token_types is not None:
-            if vision_token_types.shape != (batch, seq_len):
-                raise ValueError("vision_token_types must match the unpacked token shape [batch, sequence]")
-            vision_token_types = vision_token_types.to(device=device)
-
-        if padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
-            padding_mask = attention_mask.to(device).bool().logical_not()
-        if padding_mask is not None and padding_mask.dim() == 1:
-            padding_mask = padding_mask.unsqueeze(0)
-
-        _normalize_thd_packing_metadata(attn_kwargs)
-        seq_ids = attn_kwargs.get("packed_seq_ids")
-        if seq_ids is None and attn_kwargs.get("qkv_format") == "thd":
-            packed_seq_lens = attn_kwargs.get("seq_lens_padded")
-            if packed_seq_lens is None:
-                packed_seq_lens = attn_kwargs.get("seq_lens")
-            if packed_seq_lens is not None:
-                seq_ids = build_packed_seq_ids(packed_seq_lens, seq_len=seq_len, device=device)
-        if seq_ids is None:
-            seq_ids = torch.ones(batch, seq_len, dtype=torch.long, device=device)
-        else:
-            seq_ids = seq_ids.to(device=device, dtype=torch.long)
-            if seq_ids.dim() == 1:
-                seq_ids = seq_ids.unsqueeze(0)
+        seq_ids = torch.ones(batch, seq_len, dtype=torch.long, device=device)
+        padding_mask = None if attention_mask is None else ~attention_mask.bool()
         if padding_mask is not None:
-            seq_ids = seq_ids.masked_fill(padding_mask.to(device), 0)
-
-        if position_ids is None:
-            position_ids = document_relative_positions(seq_ids)
-        else:
-            position_ids = position_ids.to(device=device, dtype=torch.long)
-            if position_ids.dim() == 1:
-                position_ids = position_ids.unsqueeze(0)
-            if position_ids.shape[0] == 1 and batch > 1:
-                position_ids = position_ids.expand(batch, -1)
+            seq_ids = seq_ids.masked_fill(padding_mask, 0)
+        vision_token_types = None if image_mask is None else image_mask.to(torch.int32) - 1
 
         engram_hash_ids = None
         engram_mask = None
         if self.engram_hasher is not None:
-            if input_ids is None:
-                raise ValueError("Engram hashing needs input_ids; inputs_embeds alone is not enough")
             self._ensure_engram_token_map()
             engram_mask = seq_ids > 0
             if vision_token_types is not None:
@@ -381,7 +326,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = False
         supports_pp: bool = False
         supports_ep: bool = True
-        supports_thd: bool = True
+        supports_thd: bool = False
 
     @classmethod
     def from_config(
@@ -573,10 +518,12 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             optional scalar loss, and requested hidden tensors. No inference KV cache.
         """
         inputs_embeds = None
+        image_mask = None
         if pixel_values is not None:
             if image_grid_hws is None or vision_token_types is None:
                 raise ValueError("pixel_values requires image_grid_hws and vision_token_types")
             inputs_embeds = self._image_embeddings(input_ids, pixel_values, image_grid_hws, vision_token_types)
+            image_mask = vision_token_types >= 0
         elif image_grid_hws is not None or (vision_token_types is not None and torch.any(vision_token_types >= 0)):
             raise ValueError("Image spans require pixel_values; image placeholders cannot be trained as ordinary text")
         hidden, captured = self.model(
@@ -584,7 +531,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             position_ids=position_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            vision_token_types=vision_token_types,
+            image_mask=image_mask,
             output_hidden_states=output_hidden_states,
         )
         projected = compute_lm_head_logits(
