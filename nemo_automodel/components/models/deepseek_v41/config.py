@@ -193,9 +193,8 @@ class DeepseekV41Config(PretrainedConfig):
         resolved_dtype = dtype if dtype is not None else torch_dtype
         if resolved_dtype is None:
             resolved_dtype = "bfloat16"
-        # The released checkpoint carries a quantization block that only describes
-        # the on-disk layout; the state-dict adapter dequantizes on load.
-        kwargs.pop("quantization_config", None)
+        # Preserve the released storage metadata: NeMo's initial Checkpointer
+        # uses it to request packed weights and scales for adapter dequantization.
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
