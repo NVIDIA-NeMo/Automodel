@@ -34,7 +34,8 @@ Use these compact answer patterns for common questions:
   `nemo_automodel/recipes/`, update the model, dataset or dataloader,
   optimizer, loss, LR scheduler, step scheduler, and checkpoint builders,
   register a recipe alias only if adding a new recipe class, add example
-  YAML under `examples/`, then add a tiny CPU-compatible unit test and run
+  YAML under `examples/` with explicit storage precision as described below,
+  then add a tiny CPU-compatible unit test and run
   `automodel <config.yaml>`.
 - `_target_` fields: describe `_target_` as the fully qualified Python callable,
   explain that sibling keys become keyword arguments, show optimizer and dataset
@@ -129,8 +130,9 @@ rng:
   seed: 42
 
 model:
-  _target_: nemo_automodel.models.llm.NemotronHForCausalLM
-  name_or_path: meta-llama/Llama-3.2-1B
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  dtype: float32  # full-parameter AdamW training: fp32 storage and optimizer state
   # additional model kwargs passed to the constructor
 
 compile:
@@ -176,6 +178,37 @@ lr_scheduler:
   warmup_steps: 50
   min_lr: 1.0e-6
 ```
+
+### Full-Parameter Training Precision
+
+For new full-parameter finetuning or pretraining configs using
+`torch.optim.Adam` or `torch.optim.AdamW`, explicitly set `model.dtype: float32`
+on `NeMoAutoModel` loaders. The resident parameters serve as master weights,
+and Adam's moment buffers follow their dtype. Omitting `dtype` or using `auto`
+can leave both in bf16; the optimizer does not choose model storage precision.
+Prefer `dtype` in new configs; deprecated `torch_dtype` remains supported.
+
+Configure compute precision separately. FSDP2's default `mp_policy` uses bf16
+parameters for compute and bf16 outputs with fp32 gradient reduction. Those
+settings do not provide fp32 master weights for bf16 resident parameters.
+
+Apply the recommendation according to the training mode:
+
+- LoRA/QLoRA and other PEFT configs need separate base-model and trainable-adapter
+  precision choices; do not cast the entire frozen base model to fp32 by default.
+- TE FusedAdam can keep fp32 master weights with bf16 model storage and
+  `master_weights: true`. Select and validate its moment dtypes
+  independently. See the [mixed-precision guide](../../docs/guides/mixed-precision-training.mdx).
+- Diffusion pipelines use `model.torch_dtype` and `model.compute_dtype`; use
+  those keys and check the pipeline's supported storage/compute combination.
+
+When copying or migrating an existing config, inspect its storage dtype instead
+of assuming the source already follows this recommendation. Preserve deliberate
+precision choices unless the task calls for changing them. Validate each changed
+training config: inspect trainable parameter and optimizer-state dtypes after an
+optimizer step, peak memory, loss/gradient behavior, and checkpoint/resume where
+applicable. FP32 storage can require batch-size or parallelism retuning; a unit
+test or YAML parse alone does not validate that migration.
 
 ### The `_target_` Pattern
 

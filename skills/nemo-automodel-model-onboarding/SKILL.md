@@ -328,6 +328,8 @@ If the model has precision-sensitive parameters such as Mamba `A_log` /
 declare `_keep_in_fp32_modules_strict` so sharding keeps those params in fp32
 compute. See [capabilities-and-precision.md](./capabilities-and-precision.md)
 for examples, variant dispatch rules, and frozen-submodule dtype guidance.
+These compute pins are separate from the training storage dtype selected in
+the example YAML below.
 
 ---
 
@@ -341,17 +343,28 @@ recipe authoring or existing recipe modifications.
 
 Create an example config under `examples/llm_finetune/<name>/` (or `examples/vlm_finetune/<name>/`):
 
+For a new full-parameter Adam/AdamW training example, explicitly set
+`model.dtype: float32` so resident master weights and Adam moments use fp32.
+Keep compute precision separate through the configured mixed-precision policy.
+Use the [recipe precision guidance](../nemo-automodel-recipe-development/SKILL.md#full-parameter-training-precision)
+for PEFT, TE FusedAdam, and validation of memory and training behavior.
+
 ```yaml
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: <org>/<model-name>
+  dtype: float32
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-5
 
 trainer:
   max_steps: 100
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
 
-# ... data, optimizer config ...
+# ... data and remaining recipe config ...
 ```
 
 ### 3.2 Verify model loads
@@ -457,7 +470,7 @@ that only surface in a full parity comparison.
 - [ ] Declared `TieSupport` and called the constructor guard for every class with a causal `lm_head` (or added an explicit no-head exemption) -- see §2.3
 - [ ] Added explicit `_tied_weights_keys` and `tie_weights()` for `BOTH` / `TIED_ONLY`, plus policy-specific alias and rejection tests -- see §2.3
 - [ ] Guarded any model-owned `from_pretrained` that bypasses the `NeMoAuto*` bridge against checkpoint flips -- see §2.3
-- [ ] Created example YAML config
+- [ ] Created example YAML config with explicit storage precision for its training mode (see §3.1)
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)
 - [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`, Mamba `D` when reference-fp32, MoE gate bias, attention-sink bias, `scale`, …) — see §2.8
