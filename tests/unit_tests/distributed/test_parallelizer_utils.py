@@ -24,6 +24,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 import nemo_automodel.components.distributed.fsdp2_extensions.utils as parallelizer_utils
 from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
     patch_fsdp_accumulated_grad_bucketing,
+    patch_fsdp_accumulated_grad_guard,
     patch_fsdp_uniform_reduce_dtype,
     patch_fsdp_unused_param_reduction,
 )
@@ -275,25 +276,39 @@ def test_uniform_reduce_dtype_patch_is_idempotent(monkeypatch):
     assert collectives.foreach_reduce is wrapped
 
 
-def test_accumulated_grad_bucketing_coalesces_first_deferred_upcast(monkeypatch):
-    """The first no-sync backward installs same-storage FP32 accumulation views."""
+def _fake_fsdp_param(parameter, *, reduce_dtype=torch.float32, accumulated=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        reduce_dtype=reduce_dtype, _unsharded_param=parameter, unsharded_accumulated_grad=accumulated
+    )
+
+
+def _upstream_like_post_backward(recorded):
+    """Mimic upstream's deferred branch: one ``to_accumulated_grad_if_needed`` call per parameter."""
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+
+    def post_backward(self, *args, **kwargs):
+        recorded.append((self, args, kwargs))
+        if not self.reduce_grads:
+            for fsdp_param in self.fsdp_params:
+                FSDPParam.to_accumulated_grad_if_needed(fsdp_param)
+        return "post_backward"
+
+    return post_backward
+
+
+def test_accumulated_grad_bucketing_coalesces_first_deferred_upcast_in_post_backward(monkeypatch):
+    """The no-sync post-backward installs same-storage FP32 accumulation views without waiting for finalize."""
     from types import SimpleNamespace
 
     from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
     from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 
-    finalized = []
-    individual = []
-
-    def original_to_accumulated(fsdp_param):
-        individual.append(fsdp_param)
-
-    def original_finalize(param_group, *args, **kwargs):
-        finalized.append((param_group, args, kwargs))
-        return "finalized"
-
-    monkeypatch.setattr(FSDPParam, "to_accumulated_grad_if_needed", original_to_accumulated)
-    monkeypatch.setattr(FSDPParamGroup, "finalize_backward", original_finalize)
+    individual, post_backward_calls, finalize_calls = [], [], []
+    monkeypatch.setattr(FSDPParam, "to_accumulated_grad_if_needed", lambda self: individual.append(self))
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", _upstream_like_post_backward(post_backward_calls))
+    monkeypatch.setattr(FSDPParamGroup, "finalize_backward", lambda self: finalize_calls.append(self))
     patch_fsdp_accumulated_grad_bucketing()
 
     parameters = [
@@ -301,74 +316,130 @@ def test_accumulated_grad_bucketing_coalesces_first_deferred_upcast(monkeypatch)
         nn.Parameter(torch.full((3,), 2.0, dtype=torch.bfloat16)),
         nn.Parameter(torch.ones(1, dtype=torch.float32)),
     ]
-    fsdp_params = []
     for parameter in parameters:
         parameter.grad = torch.full_like(parameter, 3)
-        fsdp_params.append(
-            SimpleNamespace(
-                reduce_dtype=torch.float32,
-                _unsharded_param=parameter,
-                unsharded_accumulated_grad=None,
-                _automodel_bucket_accumulated_grad=True,
-            )
-        )
-    param_group = SimpleNamespace(fsdp_params=fsdp_params)
+    fsdp_params = [_fake_fsdp_param(parameter) for parameter in parameters]
+    param_group = SimpleNamespace(fsdp_params=fsdp_params, reduce_grads=False)
 
-    for fsdp_param in fsdp_params:
-        FSDPParam.to_accumulated_grad_if_needed(fsdp_param)
-    # BF16 conversions are deferred, while the already-FP32 gradient follows
-    # the normal per-parameter path.
-    assert parameters[0].grad is not None and parameters[1].grad is not None
+    result = FSDPParamGroup.post_backward(param_group, "arg", flag=True)
+
+    assert result == "post_backward"
+    assert post_backward_calls == [(param_group, ("arg",), {"flag": True})]
+    # The already-FP32 gradient follows the normal per-parameter path; BF16 ones are bucketed.
     assert individual == [fsdp_params[2]]
-
-    result = FSDPParamGroup.finalize_backward(param_group, "arg", flag=True)
-
-    assert result == "finalized"
-    assert finalized == [(param_group, ("arg",), {"flag": True})]
     accumulated = [fsdp_param.unsharded_accumulated_grad for fsdp_param in fsdp_params]
-    assert accumulated[0].dtype is torch.float32
-    assert accumulated[1].dtype is torch.float32
+    assert accumulated[0].dtype is torch.float32 and accumulated[1].dtype is torch.float32
     assert accumulated[0].untyped_storage().data_ptr() == accumulated[1].untyped_storage().data_ptr()
     torch.testing.assert_close(accumulated[0], torch.full((2, 2), 3.0))
     torch.testing.assert_close(accumulated[1], torch.full((3,), 3.0))
     assert parameters[0].grad is None and parameters[1].grad is None
-    # The already-FP32 gradient is not part of the conversion bucket.
-    assert fsdp_params[2].unsharded_accumulated_grad is None
+    assert accumulated[2] is None
     torch.testing.assert_close(parameters[2].grad, torch.full((1,), 3.0))
+    # The conversion happens in post-backward, so it no longer depends on set_is_last_backward.
+    assert finalize_calls == []
 
 
 def test_accumulated_grad_bucketing_preserves_sync_and_existing_accumulation(monkeypatch):
-    """Unmarked params and already-owned accumulations pass through unchanged."""
+    """Synchronizing backwards and already-owned accumulations pass through unchanged."""
     from types import SimpleNamespace
 
     from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
     from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 
     individual = []
-    finalized = []
     monkeypatch.setattr(FSDPParam, "to_accumulated_grad_if_needed", lambda self: individual.append(self))
-    monkeypatch.setattr(FSDPParamGroup, "finalize_backward", lambda self: finalized.append(self))
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", _upstream_like_post_backward([]))
     patch_fsdp_accumulated_grad_bucketing()
 
+    # Synchronizing backward: the reduce path owns these gradients, nothing is bucketed.
+    syncing = nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    syncing.grad = torch.ones_like(syncing)
+    syncing_param = _fake_fsdp_param(syncing)
+    FSDPParamGroup.post_backward(SimpleNamespace(fsdp_params=[syncing_param], reduce_grads=True))
+    assert syncing.grad is not None and syncing_param.unsharded_accumulated_grad is None
+    assert individual == []
+
+    # Existing accumulation: upstream's accumulate hook already consumed this gradient.
     parameter = nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
-    parameter.grad = torch.ones_like(parameter)
     existing = torch.zeros(2, dtype=torch.float32)
-    fsdp_param = SimpleNamespace(
-        reduce_dtype=torch.float32,
-        _unsharded_param=parameter,
-        unsharded_accumulated_grad=existing,
-        _automodel_bucket_accumulated_grad=True,
-    )
-    # In real FSDP, the normal accumulation hook clears this gradient before
-    # to_accumulated is reached when an accumulation already exists.
-    parameter.grad = None
-    FSDPParam.to_accumulated_grad_if_needed(fsdp_param)
-    group = SimpleNamespace(fsdp_params=[fsdp_param])
-    FSDPParamGroup.finalize_backward(group)
+    fsdp_param = _fake_fsdp_param(parameter, accumulated=existing)
+    FSDPParamGroup.post_backward(SimpleNamespace(fsdp_params=[fsdp_param], reduce_grads=False))
     assert parameter.grad is None
     assert fsdp_param.unsharded_accumulated_grad is existing
     assert individual == [fsdp_param]
-    assert finalized == [group]
+
+
+def test_accumulated_grad_bucketing_skips_units_that_never_ran_forward(monkeypatch):
+    """A unit skipped by the batch has no lazy unsharded parameter; neither patch may dereference it."""
+    from types import SimpleNamespace
+
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    def upstream_to_accumulated(self):
+        return self._unsharded_param.grad  # raises AttributeError exactly like upstream
+
+    monkeypatch.setattr(FSDPParam, "to_accumulated_grad_if_needed", upstream_to_accumulated)
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", _upstream_like_post_backward([]))
+    # Same installation order as DefaultParallelizationStrategy.parallelize.
+    patch_fsdp_accumulated_grad_guard()
+    patch_fsdp_accumulated_grad_bucketing()
+
+    skipped = SimpleNamespace(reduce_dtype=torch.float32, unsharded_accumulated_grad=None)
+    assert FSDPParam.to_accumulated_grad_if_needed(skipped) is None
+    FSDPParamGroup.post_backward(SimpleNamespace(fsdp_params=[skipped], reduce_grads=False))
+    assert not hasattr(skipped, "_unsharded_param")
+
+    # Stacked patches stay idempotent regardless of installation order.
+    wrapped_param, wrapped_group = FSDPParam.to_accumulated_grad_if_needed, FSDPParamGroup.post_backward
+    patch_fsdp_accumulated_grad_guard()
+    patch_fsdp_accumulated_grad_bucketing()
+    assert FSDPParam.to_accumulated_grad_if_needed is wrapped_param
+    assert FSDPParamGroup.post_backward is wrapped_group
+
+
+def test_accumulated_grad_bucketing_keeps_dtensor_gradients(monkeypatch):
+    """TP gradients stay DTensors so FSDP's later in-place accumulation matches upstream."""
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    from torch.distributed.tensor import DTensor, Shard
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    monkeypatch.setattr(FSDPParam, "to_accumulated_grad_if_needed", lambda self: None)
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", _upstream_like_post_backward([]))
+    patch_fsdp_accumulated_grad_bucketing()
+
+    owns_process_group = not dist.is_initialized()
+    if owns_process_group:
+        dist.init_process_group(backend="fake", rank=0, world_size=1, store=FakeStore())
+    try:
+        mesh = DeviceMesh("cpu", [0], mesh_dim_names=("tp",))
+
+        def sharded(values):
+            return DTensor.from_local(values, mesh, [Shard(0)], run_check=False)
+
+        parameter = nn.Parameter(sharded(torch.ones((2, 2), dtype=torch.bfloat16)))
+        parameter.grad = sharded(torch.full((2, 2), 3.0, dtype=torch.bfloat16))
+        fsdp_param = _fake_fsdp_param(parameter)
+
+        FSDPParamGroup.post_backward(SimpleNamespace(fsdp_params=[fsdp_param], reduce_grads=False))
+
+        accumulated = fsdp_param.unsharded_accumulated_grad
+        assert parameter.grad is None
+        assert isinstance(accumulated, DTensor)
+        assert accumulated.dtype is torch.float32
+        assert accumulated.placements == (Shard(0),)
+        torch.testing.assert_close(accumulated.to_local(), torch.full((2, 2), 3.0))
+        # The next microbatch accumulates in place, exactly as upstream does.
+        accumulated += sharded(torch.ones((2, 2), dtype=torch.bfloat16))
+        torch.testing.assert_close(accumulated.to_local(), torch.full((2, 2), 4.0))
+    finally:
+        if owns_process_group:
+            dist.destroy_process_group()
 
 
 def test_configure_fsdp_unused_param_reduction_installs_dtype_alignment_first(monkeypatch):

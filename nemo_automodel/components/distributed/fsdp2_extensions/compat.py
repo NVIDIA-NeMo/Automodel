@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Iterable
 from typing import Any
 
@@ -74,6 +75,7 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
     if getattr(original_foreach_reduce, "_automodel_uniform_reduce_dtype", False):
         return
 
+    @functools.wraps(original_foreach_reduce)
     def foreach_reduce_uniform_dtype(fsdp_params, unsharded_grads, *args, **kwargs):
         import torch
         from torch.distributed.tensor import DTensor
@@ -115,20 +117,31 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
 def patch_fsdp_accumulated_grad_bucketing() -> None:
     """Coalesce FSDP2's first deferred-accumulation dtype conversion.
 
-    With BF16 compute and FP32 reduction, the first backward executed under
-    ``set_requires_gradient_sync(False)`` normally calls
-    ``grad.to(reduce_dtype)`` once per parameter from
-    ``FSDPParam.to_accumulated_grad_if_needed``. Later microbatches accumulate
-    into those FP32 tensors, and the synchronized backward reduces them in FP32.
+    With BF16 compute and FP32 reduction, a backward executed under
+    ``set_requires_gradient_sync(False)`` calls ``grad.to(reduce_dtype)`` once
+    per parameter from ``FSDPParamGroup.post_backward``. Later microbatches
+    accumulate into those FP32 tensors, and the synchronized backward reduces
+    them in FP32.
 
-    Defer only that first conversion until FSDP's group-level final-backward
-    callback. At that point all parameter hooks have run, so eligible gradients
-    can be packed and cast into one flat FP32 bucket with FSDP's own ``chunk_cat``
-    operator, then installed as views in the existing
-    ``unsharded_accumulated_grad`` state. The normal parameter hook still owns
-    resharding, and every later accumulation/reduction transition is unchanged.
+    Keep that conversion where upstream performs it -- in ``post_backward``,
+    after the group has resharded -- but cast the group's eligible gradients
+    into one flat ``reduce_dtype`` bucket with FSDP's own ``chunk_cat`` operator
+    and install the resulting views as the existing
+    ``unsharded_accumulated_grad`` state. Every later accumulation/reduction
+    transition is unchanged, and the conversion does not depend on
+    ``set_is_last_backward``.
 
-    The patch is process-global and idempotent.
+    Two upstream invariants are preserved explicitly:
+
+    * a unit that did not run forward has no lazily created
+      ``_unsharded_param`` and therefore nothing to convert, so it is skipped
+      instead of dereferenced;
+    * a DTensor gradient (tensor parallelism) is re-wrapped as a DTensor over
+      the same mesh and placements, because FSDP later accumulates into it
+      in place with the next microbatch's DTensor gradient.
+
+    The patch is process-global and idempotent, including when stacked with the
+    other FSDP2 patches in this module.
     """
     try:
         import torch
@@ -139,8 +152,8 @@ def patch_fsdp_accumulated_grad_bucketing() -> None:
         return
 
     original_to_accumulated = FSDPParam.to_accumulated_grad_if_needed
-    original_finalize_backward = FSDPParamGroup.finalize_backward
-    if getattr(original_finalize_backward, "_automodel_bucket_accumulated_grads", False):
+    original_post_backward = FSDPParamGroup.post_backward
+    if getattr(original_post_backward, "_automodel_bucket_accumulated_grads", False):
         return
 
     def compiled_autograd_active() -> bool:
@@ -155,61 +168,73 @@ def patch_fsdp_accumulated_grad_bucketing() -> None:
         except (ImportError, AttributeError):
             return False
 
-    def defer_accumulated_grad_conversion(self) -> None:
-        if (
-            not compiled_autograd_active()
-            and not getattr(self, "offload_to_cpu", False)
-            and self.reduce_dtype is not None
-            and self._unsharded_param.grad is not None
-            and self._unsharded_param.grad.dtype is not self.reduce_dtype
-        ):
-            return
-        original_to_accumulated(self)
+    def pending_conversion(fsdp_param) -> Any:
+        """Return the gradient awaiting its first ``reduce_dtype`` conversion, else ``None``."""
+        if getattr(fsdp_param, "offload_to_cpu", False) or fsdp_param.reduce_dtype is None:
+            return None
+        # ``_unsharded_param`` is created lazily by the unit's first forward; a
+        # unit skipped by this batch has neither the field nor a gradient.
+        unsharded_param = getattr(fsdp_param, "_unsharded_param", None)
+        grad = None if unsharded_param is None else unsharded_param.grad
+        if grad is None or grad.dtype is fsdp_param.reduce_dtype or fsdp_param.unsharded_accumulated_grad is not None:
+            return None
+        return grad
 
-    def finalize_backward_with_bucketed_accumulation(self, *args, **kwargs):
-        if not compiled_autograd_active():
-            grouped: dict[
-                tuple[torch.device, torch.dtype, torch.dtype],
-                list[tuple[Any, torch.Tensor]],
-            ] = {}
+    @functools.wraps(original_to_accumulated)
+    def defer_accumulated_grad_conversion(self) -> None:
+        if compiled_autograd_active():
+            return original_to_accumulated(self)
+        if not hasattr(self, "_unsharded_param"):
+            return  # never unsharded, so there is no gradient to convert
+        if pending_conversion(self) is None:
+            return original_to_accumulated(self)
+        # ``post_backward`` converts this gradient together with the rest of its group.
+
+    @functools.wraps(original_post_backward)
+    def post_backward_with_bucketed_accumulation(self, *args, **kwargs):
+        result = original_post_backward(self, *args, **kwargs)
+        if compiled_autograd_active() or self.reduce_grads:
+            return result
+
+        with torch.no_grad():
+            grouped: dict[tuple[torch.device, torch.dtype, torch.dtype], list[tuple[Any, Any, torch.Tensor]]] = {}
             for fsdp_param in self.fsdp_params:
-                if getattr(fsdp_param, "offload_to_cpu", False):
-                    continue
-                reduce_dtype = getattr(fsdp_param, "reduce_dtype", None)
-                unsharded_param = getattr(fsdp_param, "_unsharded_param", None)
-                grad = None if unsharded_param is None else unsharded_param.grad
-                if (
-                    reduce_dtype is None
-                    or grad is None
-                    or grad.dtype is reduce_dtype
-                    or fsdp_param.unsharded_accumulated_grad is not None
-                ):
+                grad = pending_conversion(fsdp_param)
+                if grad is None:
                     continue
                 local_grad = grad.to_local() if isinstance(grad, DTensor) else grad
-                grouped.setdefault((local_grad.device, local_grad.dtype, reduce_dtype), []).append(
-                    (fsdp_param, local_grad)
+                grouped.setdefault((local_grad.device, local_grad.dtype, fsdp_param.reduce_dtype), []).append(
+                    (fsdp_param, grad, local_grad)
                 )
 
             for (device, _grad_dtype, reduce_dtype), entries in grouped.items():
-                numels = [grad.numel() for _, grad in entries]
+                numels = [local_grad.numel() for _, _, local_grad in entries]
                 bucket = torch.empty(sum(numels), device=device, dtype=reduce_dtype)
                 torch.ops.fsdp.chunk_cat(
-                    [grad for _, grad in entries],
+                    [local_grad for _, _, local_grad in entries],
                     dim=0,
                     num_chunks=1,
                     out=bucket.view(1, -1),
                 )
-                views = tuple(flat_view.view(grad.shape) for flat_view, (_, grad) in zip(bucket.split(numels), entries))
-                for (fsdp_param, _), view in zip(entries, views):
+                for (fsdp_param, grad, local_grad), flat_view in zip(entries, bucket.split(numels)):
+                    converted = flat_view.view(local_grad.shape)
+                    if isinstance(grad, DTensor):
+                        converted = DTensor.from_local(
+                            converted,
+                            grad.device_mesh,
+                            grad.placements,
+                            run_check=False,
+                            shape=grad.shape,
+                            stride=grad.stride(),
+                        )
                     fsdp_param._unsharded_param.grad = None
-                    fsdp_param.unsharded_accumulated_grad = view
-
-        return original_finalize_backward(self, *args, **kwargs)
+                    fsdp_param.unsharded_accumulated_grad = converted
+        return result
 
     defer_accumulated_grad_conversion._automodel_bucket_accumulated_grads = True
-    finalize_backward_with_bucketed_accumulation._automodel_bucket_accumulated_grads = True
+    post_backward_with_bucketed_accumulation._automodel_bucket_accumulated_grads = True
     FSDPParam.to_accumulated_grad_if_needed = defer_accumulated_grad_conversion
-    FSDPParamGroup.finalize_backward = finalize_backward_with_bucketed_accumulation
+    FSDPParamGroup.post_backward = post_backward_with_bucketed_accumulation
 
 
 def patch_fsdp_unused_param_reduction() -> None:
@@ -239,6 +264,7 @@ def patch_fsdp_unused_param_reduction() -> None:
     if getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False):
         return
 
+    @functools.wraps(original_post_backward)
     def _post_backward_with_unused_param_reduction(self, *args, **kwargs):
         if self.reduce_grads and self._training_state == TrainingState.PRE_BACKWARD:
             for fsdp_param in self.fsdp_params:
@@ -278,6 +304,7 @@ def patch_fsdp_accumulated_grad_guard() -> None:
     if getattr(orig, "_nemo_automodel_guarded", False):
         return
 
+    @functools.wraps(orig)
     def guarded(self):
         try:
             return orig(self)

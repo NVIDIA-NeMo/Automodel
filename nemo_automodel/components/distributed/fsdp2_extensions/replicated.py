@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
 # Repository PEFT recipes use ranks 4-64 (79% use rank 8 or 16). For an FP32
@@ -287,23 +288,22 @@ def _fsdp_requires_gradient_sync(fsdp_state: object) -> bool:
     return not param_groups or any(bool(param_group.reduce_grads) for param_group in param_groups)
 
 
-def _install_fsdp_post_backward_grad_sync(model: nn.Module, grad_sync: _ReplicatedGradSync) -> None:
-    """Run replicated-gradient synchronization from FSDP's final callback.
-
-    FSDP owns the accumulation lifecycle through ``set_requires_gradient_sync``.
-    Wrapping its root post-backward callback means deferred backwards accumulate
-    locally, and the first backward for which FSDP reduces gradients also reduces
-    the full accumulated FP32 gradients. Re-reducing an already averaged prefix
-    is idempotent, so this also follows configurations that reduce every
-    microbatch.
-    """
+def _fsdp_states(model: nn.Module) -> tuple[object, ...]:
+    """Return the FSDP root state of ``model`` followed by every nested FSDP state."""
     get_fsdp_state = getattr(model, "_get_fsdp_state", None)
     if get_fsdp_state is None:
         raise RuntimeError("replicated FSDP2 gradient synchronization requires a PyTorch FSDPModule root")
-    fsdp_state = get_fsdp_state()
+    states: list[object] = [get_fsdp_state()]
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            state = module._get_fsdp_state()
+            if all(state is not seen for seen in states):
+                states.append(state)
+    return tuple(states)
+
+
+def _wrap_final_callback(fsdp_state: object, grad_sync: _ReplicatedGradSync) -> None:
     original_callback = fsdp_state._root_post_backward_final_callback
-    if getattr(original_callback, "_nemo_replicated_grad_sync", False):
-        raise RuntimeError("replicated FSDP2 gradient synchronization is already installed on this root")
 
     @wraps(original_callback)
     def post_backward_with_replicated_grad_sync() -> None:
@@ -314,6 +314,30 @@ def _install_fsdp_post_backward_grad_sync(model: nn.Module, grad_sync: _Replicat
 
     post_backward_with_replicated_grad_sync._nemo_replicated_grad_sync = True
     fsdp_state._root_post_backward_final_callback = post_backward_with_replicated_grad_sync
+
+
+def _install_fsdp_post_backward_grad_sync(model: nn.Module, grad_sync: _ReplicatedGradSync) -> None:
+    """Run replicated-gradient synchronization from FSDP's final callback.
+
+    FSDP owns the accumulation lifecycle through ``set_requires_gradient_sync``.
+    Wrapping its post-backward final callback means deferred backwards
+    accumulate locally, and the first backward for which FSDP reduces gradients
+    also reduces the full accumulated FP32 gradients. Re-reducing an already
+    averaged prefix is idempotent, so this also follows configurations that
+    reduce every microbatch.
+
+    FSDP queues the final callback of whichever FSDP state's pre-backward hook
+    fires first. That is the root only when the loss flows through a tensor the
+    root's own forward produced; a root that returns a child unit's output
+    unchanged queues the child's callback instead. The wrapper is therefore
+    installed on every FSDP state of ``model``. FSDP runs exactly one final
+    callback per backward, so the synchronization still happens once.
+    """
+    states = _fsdp_states(model)
+    if any(getattr(state._root_post_backward_final_callback, "_nemo_replicated_grad_sync", False) for state in states):
+        raise RuntimeError("replicated FSDP2 gradient synchronization is already installed on this root")
+    for state in states:
+        _wrap_final_callback(state, grad_sync)
     setattr(model, _GRAD_SYNC_ATTR, grad_sync)
 
 

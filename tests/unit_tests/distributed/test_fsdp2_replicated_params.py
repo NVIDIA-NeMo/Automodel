@@ -310,3 +310,57 @@ def test_fully_shard_wrapper_defers_with_fsdp_gradient_sync_state(monkeypatch):
     fsdp_param_group.reduce_grads = True
     fsdp_state._root_post_backward_final_callback()
     assert collective_calls == [group]
+
+
+def test_replicated_grad_sync_runs_from_a_non_root_state_callback(monkeypatch):
+    """FSDP queues the callback of the first pre-backward hook to fire, which may belong to a child unit."""
+    import nemo_automodel.components.distributed.fsdp2_extensions.replicated as replicated_module
+
+    class FakeFSDPModule(nn.Module):
+        def __init__(self, state):
+            super().__init__()
+            self._state = state
+
+        def _get_fsdp_state(self):
+            return self._state
+
+    monkeypatch.setattr(replicated_module, "FSDPModule", FakeFSDPModule)
+    model = _SensitiveModel()
+    parameters = (model._fp32_params.A_log, model._fp32_params.dt_bias)
+    for parameter in parameters:
+        parameter.grad = torch.ones_like(parameter)
+    group = object()
+    mesh = SimpleNamespace(size=lambda: 2, get_all_groups=lambda: [group])
+    state_ctx = SimpleNamespace(all_states=[SimpleNamespace(_fsdp_param_group=SimpleNamespace(reduce_grads=True))])
+    callbacks = []
+    root_state = SimpleNamespace(
+        _state_ctx=state_ctx, _root_post_backward_final_callback=lambda: callbacks.append("root")
+    )
+    child_state = SimpleNamespace(
+        _state_ctx=state_ctx, _root_post_backward_final_callback=lambda: callbacks.append("child")
+    )
+    model.child = FakeFSDPModule(child_state)
+    model._get_fsdp_state = lambda: root_state
+    collective_calls = []
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda tensor, op, group: collective_calls.append(group) or tensor.mul_(2)
+    )
+    fully_shard_with_grad_sync = make_fully_shard_with_replicated_parameter_grad_sync(
+        model,
+        parameters,
+        mesh,
+        fully_shard_fn=lambda module, **kwargs: module,
+    )
+    fully_shard_with_grad_sync(model)
+
+    # A root that returns a child's output tensor unchanged queues the child's callback.
+    child_state._root_post_backward_final_callback()
+    assert callbacks == ["child"]
+    assert collective_calls == [group]
+    for parameter in parameters:
+        torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
+
+    root_state._root_post_backward_final_callback()
+    assert callbacks == ["child", "root"]
+    assert collective_calls == [group, group]
