@@ -561,7 +561,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask: ``[B, S]`` bool padding mask.
             labels: Optional int64 targets [batch, sequence] for unpacked inputs.
                 Logits at positions 0..S-2 predict labels at positions 1..S-1;
-                targets equal to -100 are ignored. Requires logits_to_keep=0.
+                targets equal to -100 are ignored. Projected logits must match labels.
             logits_to_keep: Number or positions of logits to retain.
             return_hidden_states: Return final hidden states for the recipe loss.
             output_hidden_states: Capture residual streams for numerical comparisons.
@@ -578,28 +578,13 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             when labels are supplied. Input labels are not modified.
 
         Raises:
-            ValueError: Labels use packed inputs/metadata, do not match the full
-                input sequence, or request a selected subset of logits.
+            ValueError: Projected logits do not match the label shape.
         """
         if attn_kwargs.pop("_pre_embed_only", False):
             # Context parallelism is not supported; there is no model-owned CP batch prep.
             return {}
         thd_mode = attn_kwargs.get("qkv_format") == "thd"
         inputs_embeds = attn_kwargs.pop("inputs_embeds", None)
-        if labels is not None:
-            packed_metadata = any(
-                value is not None
-                and (key in ("packed_seq_ids", "seq_lens", "seq_lens_padded") or key.startswith("cu_seqlens"))
-                for key, value in attn_kwargs.items()
-            )
-            if thd_mode or packed_metadata or (input_ids is not None and input_ids.ndim != 2):
-                raise ValueError("labels require unpacked inputs without packed sequence metadata")
-            if labels.ndim != 2 or (input_ids is not None and labels.shape != input_ids.shape):
-                raise ValueError("labels must match the full input shape [batch, sequence]")
-            if inputs_embeds is not None and (inputs_embeds.ndim != 3 or labels.shape != inputs_embeds.shape[:2]):
-                raise ValueError("labels require full unpacked inputs_embeds [batch, sequence, hidden]")
-            if not isinstance(logits_to_keep, int) or logits_to_keep != 0:
-                raise ValueError("labels require logits_to_keep=0 to project every input position")
         if pixel_values is not None:
             if input_ids is None or input_ids.ndim != 2:
                 raise ValueError("Image inputs require unpacked input_ids [batch, sequence]")
