@@ -43,6 +43,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -785,7 +786,9 @@ class DeepseekV41Block(nn.Module):
         moe_config: MoEConfig,
         backend: BackendConfig,
         engram_layout: EngramLayout | None = None,
-    ):
+        *,
+        engram_process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.hc_mult = int(config.hc_mult)
@@ -810,7 +813,7 @@ class DeepseekV41Block(nn.Module):
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.engram = (
-            DeepseekV41Engram(config, layer_idx, engram_layout)
+            DeepseekV41Engram(config, layer_idx, engram_layout, engram_process_group=engram_process_group)
             if engram_layout is not None and layer_idx in engram_layout.layer_ids
             else None
         )

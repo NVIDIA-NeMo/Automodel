@@ -40,7 +40,9 @@ from dataclasses import dataclass
 from typing import Any, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
@@ -97,7 +99,8 @@ class DeepseekV41Model(nn.Module):
         *,
         moe_config: MoEConfig | None = None,
         moe_overrides: dict | None = None,
-    ):
+        engram_process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         self.backend = backend
         self.config = config
@@ -140,7 +143,12 @@ class DeepseekV41Model(nn.Module):
         self.layers = nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = DeepseekV41Block(
-                layer_id, config, self.moe_config, backend, engram_layout=self.engram_layout
+                layer_id,
+                config,
+                self.moe_config,
+                backend,
+                engram_layout=self.engram_layout,
+                engram_process_group=engram_process_group,
             )
         self.norm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
@@ -302,7 +310,12 @@ class DeepseekV41Model(nn.Module):
 
 
 class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """DeepSeek V4.1 causal LM (text backbone + fp32 ``lm_head``)."""
+    """DeepSeek V4.1 causal LM (text backbone + fp32 ``lm_head``).
+
+    ``engram_process_group`` explicitly selects contiguous row owners for the
+    Engram tables. By default, distributed models use WORLD; single-rank models
+    retain local tables. FSDP's shard mesh must match the owner group exactly.
+    """
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     # Reference-sensitive tensors that must stay fp32 regardless of the outer cast policy.
@@ -340,9 +353,12 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: DeepseekV41Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        engram_process_group: dist.ProcessGroup | None = None,
         **kwargs,
-    ):
-        return cls(config, moe_config, backend, **kwargs)
+    ) -> DeepseekV41ForCausalLM:
+        """Construct the model, forwarding the runtime Engram owner group."""
+        return cls(config, moe_config, backend, engram_process_group=engram_process_group, **kwargs)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
@@ -354,14 +370,22 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: DeepseekV41Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        engram_process_group: dist.ProcessGroup | None = None,
         **kwargs,
-    ):
+    ) -> None:
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
-        self.model = DeepseekV41Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
+        self.model = DeepseekV41Model(
+            config,
+            backend=self.backend,
+            moe_config=moe_config,
+            moe_overrides=moe_overrides,
+            engram_process_group=engram_process_group,
+        )
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32
         )
@@ -388,6 +412,25 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_engram_tokenizer(self, tokenizer) -> None:
         """Attach the tokenizer used to derive the Engram compressed token map."""
         self.model.set_engram_tokenizer(tokenizer)
+
+    def _nemo_prepare_model_owned_dtensors(self, fsdp_mesh: DeviceMesh) -> set[nn.Parameter]:
+        """Register owner table DTensors before FSDP records ignored parameters.
+
+        Args:
+            fsdp_mesh: One-dimensional shard mesh whose ranks and ordering must
+                match the Engram owner group.
+
+        Returns:
+            Exact registered parameter identities to exclude from FSDP. Each
+            has global shape [padded_rows, head_dim] and placement Shard(0);
+            local storage has shape [padded_rows / owner_world_size, head_dim].
+        """
+        parameters: set[nn.Parameter] = set()
+        for layer in self.model.layers.values():
+            if layer.engram is None or layer.engram.embed.process_group is None:
+                continue
+            parameters.add(layer.engram.embed.parallelize_weight(fsdp_mesh))
+        return parameters
 
     def forward(
         self,
@@ -454,9 +497,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             )
         # After FSDP2 wrapping, parameter dtypes must already be correct from
         # construction-time metadata; a blanket cast would downcast fp32 DTensors.
-        if _has_dtensor_params(self):
-            return
-        cast_model_to_dtype(self, dtype)
+        if not _has_dtensor_params(self):
+            cast_model_to_dtype(self, dtype)
+        for layer in self.model.layers.values():
+            if layer.engram is not None:
+                layer.engram.embed.mark_sharding_contract()
 
 
 ModelClass = DeepseekV41ForCausalLM

@@ -35,10 +35,13 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
+from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 _MULTIPLIER_SEED = 10007
@@ -296,7 +299,25 @@ class DeepseekV41Engram(nn.Module):
     passed through a signed square root and a sigmoid (matching the training kernel).
     """
 
-    def __init__(self, config: DeepseekV41Config, layer_idx: int, layout: EngramLayout):
+    def __init__(
+        self,
+        config: DeepseekV41Config,
+        layer_idx: int,
+        layout: EngramLayout,
+        *,
+        engram_process_group: dist.ProcessGroup | None = None,
+    ) -> None:
+        """Construct the projections and a contiguous row-owner table.
+
+        Args:
+            config: Model dimensions and the existing table trainability setting.
+            layer_idx: Decoder layer containing this Engram.
+            layout: Logical hash-table row ranges for all Engram layers.
+            engram_process_group: Runtime row owners, defaulting to WORLD when
+                distributed world size exceeds one. Without distributed owners,
+                the complete table is local. Physical rows are padded evenly
+                across owners without changing the logical hash ranges.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         self.layer_hash_index = layout.layer_ids.index(layer_idx)
@@ -305,9 +326,21 @@ class DeepseekV41Engram(nn.Module):
         self.eps = float(config.rms_norm_eps)
         self.clamp_value = 1e-6
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-        num_embeddings = layout.num_embeddings[self.layer_hash_index]
-        self.embed = nn.Embedding(num_embeddings, layout.head_dim, dtype=model_dtype)
+        self.num_embeddings = layout.num_embeddings[self.layer_hash_index]
+        if engram_process_group is None and dist.is_initialized() and dist.get_world_size() > 1:
+            engram_process_group = dist.group.WORLD
+        owner_world_size = dist.get_world_size(engram_process_group) if engram_process_group is not None else 1
+        padded_rows = (self.num_embeddings + owner_world_size - 1) // owner_world_size * owner_world_size
+        table_config = Qwen3_8_FlashNextEngramTableConfig(
+            num_embeddings=padded_rows,
+            embedding_dim=layout.head_dim,
+            # Preserve nn.Embedding's constructor initialization; model-level
+            # init_weights supplies config.initializer_range afterwards.
+            initializer_range=1.0,
+        )
+        self.embed = table_config.build(process_group=engram_process_group, dtype=model_dtype)
         self.embed.weight.requires_grad_(bool(config.engram_trainable))
+        self._zero_padding_rows()
         self.wkv = nn.Linear(
             layout.n_hash_cols * layout.head_dim, self.dim * (self.hc_mult + 1), bias=False, dtype=model_dtype
         )
@@ -315,10 +348,21 @@ class DeepseekV41Engram(nn.Module):
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim, dtype=model_dtype))
 
     def init_weights(self, init_std: float = 0.02) -> None:
-        nn.init.normal_(self.embed.weight, mean=0.0, std=init_std)
+        """Initialize local table storage and projections, leaving padded rows zero."""
+        local_weight = self.embed.weight.to_local() if isinstance(self.embed.weight, DTensor) else self.embed.weight
+        nn.init.normal_(local_weight, mean=0.0, std=init_std)
+        self._zero_padding_rows()
+        self.embed.mark_sharding_contract()
         nn.init.trunc_normal_(self.wkv.weight, mean=0.0, std=init_std)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
+
+    @torch.no_grad()
+    def _zero_padding_rows(self) -> None:
+        """Clear physical rows beyond the logical checkpoint on their local owner."""
+        local_weight = self.embed.weight.to_local() if isinstance(self.embed.weight, DTensor) else self.embed.weight
+        valid_local_rows = max(0, self.num_embeddings - self.embed.global_row_start)
+        local_weight[valid_local_rows:].zero_()
 
     def forward(self, x: torch.Tensor, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         """``x``: ``[B, L, hc_mult, dim]``; ``hash_ids``: ``[B, L, n_hash_cols]``; ``token_mask``: ``[B, L]``."""

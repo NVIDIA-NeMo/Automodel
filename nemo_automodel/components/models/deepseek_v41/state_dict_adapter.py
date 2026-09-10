@@ -57,7 +57,7 @@ from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import dequantize_from_fp8
@@ -121,7 +121,7 @@ _FP8_ON_DISK_PATTERNS = [
     re.compile(r"^layers\.\d+\.ffn\.shared_experts\.w[123]\.weight$"),
     re.compile(r"^layers\.\d+\.engram\.wkv\.weight$"),
 ]
-_ENGRAM_EMBED_PATTERN = re.compile(r"^layers\.\d+\.engram\.embed\.weight$")
+_ENGRAM_EMBED_PATTERN = re.compile(r"^layers\.(\d+)\.engram\.embed\.weight$")
 _ENGRAM_PATTERN = re.compile(r"^layers\.\d+\.engram\.")
 _GATE_BIAS_VL_PATTERN = re.compile(r"^layers\.\d+\.ffn\.gate\.bias_vl$")
 _DROPPED_PREFIXES = ("mtp.", "vision.", "aligner.")
@@ -188,7 +188,19 @@ def dequantize_fp8_blocks(
 
 
 def dequantize_engram_table(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Dequantize an Engram table ``[rows, dim]`` with per-row / 32-column ``e8m0`` scales ``[rows, dim // 32]``."""
+    """Dequantize per-row / 32-column Engram scales on each row owner.
+
+    Args:
+        weight: FP8 tensor of shape [rows, channels], optionally a DTensor
+            with placement Shard(0) and uneven local shape [local_rows, channels].
+        scale: Scale tensor of shape [rows, channels / 32], with the same row
+            ownership as weight. Channels must be divisible by 32.
+        dtype: Output floating-point dtype.
+
+    Returns:
+        Independent tensor of shape [rows, channels], preserving the weight's
+        global shape, device and row ownership, including empty local shards.
+    """
     weight_local = weight.to_local() if is_dtensor(weight) else weight
     scale_local = scale.to_local() if is_dtensor(scale) else scale
     rows, dim = weight_local.shape
@@ -208,7 +220,7 @@ def dequantize_engram_table(weight: torch.Tensor, scale: torch.Tensor, dtype: to
         values.mul_(scale_f32[start:end].unsqueeze(-1))
         out[start:end] = values.view(-1, dim).to(dtype)
     if is_dtensor(weight):
-        return DTensor.from_local(out, weight.device_mesh, weight.placements)
+        return DTensor.from_local(out, weight.device_mesh, weight.placements, shape=weight.shape, stride=(dim, 1))
     return out
 
 
@@ -224,6 +236,7 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
     ):
         super().__init__(config, moe_config, backend, dtype=dtype)
         self.engram_enabled = bool(config.engram_enabled) and bool(config.engram_layer_ids)
+        self._engram_rows = dict(zip(config.engram_layer_ids, config.engram_num_embeddings))
 
     # ------------------------------------------------------------------
     # from_hf
@@ -247,12 +260,94 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
         """Convert the released HF checkpoint to the internal format.
 
         Steps: drop out-of-scope tensors, dequantize FP8 / FP4 weights, stack the
-        routed experts, rename.
+        routed experts, restore Engram owner padding, rename.
+
+        Args:
+            hf_state_dict: Released-name tensors in the layouts documented in
+                this module. Engram tables have logical shape [rows, channels]
+                and optionally placement Shard(0) on a one-dimensional owner
+                mesh, with uneven local shape [local_rows, channels].
+            device_mesh: Expert aggregation mesh.
+            **kwargs: Additional checkpoint protocol arguments.
+
+        Returns:
+            Internal-name tensors. Engram DTensors have global shape
+            [ceil(rows / owners) * owners, channels] with equal local row counts
+            and zero padding. Other layouts follow the base adapter. Floating
+            tensors can alias input storage when no conversion is needed.
         """
         filtered = {key: value for key, value in hf_state_dict.items() if self._keep_hf_key(key)}
         filtered = self._dequantize(filtered)
         filtered = self._aggregate_experts(filtered, device_mesh)
+        for key, value in filtered.items():
+            match = _ENGRAM_EMBED_PATTERN.match(key)
+            if match:
+                filtered[key] = self._restore_engram_padding(value, int(match.group(1)))
         return {_rename_hf_key(key): value for key, value in filtered.items()}
+
+    def _engram_checkpoint_tensor(self, tensor: torch.Tensor, layer_id: int) -> torch.Tensor:
+        """Expose logical checkpoint rows without gathering owner storage.
+
+        Args:
+            tensor: Table of global shape [padded_rows, channels], either a
+                complete local tensor or a DTensor with placement Shard(0) on
+                a one-dimensional owner mesh. Each owner stores equal rows.
+            layer_id: Decoder layer identifying the logical checkpoint row count.
+
+        Returns:
+            Aliasing view of shape [rows, channels]. A DTensor preserves its
+            mesh and row placement; its final local shards may be short or empty.
+        """
+        rows = self._engram_rows[layer_id]
+        if not is_dtensor(tensor):
+            if tensor.shape[0] < rows:
+                raise ValueError("Owner-local Engram storage must be represented as a global row-sharded DTensor")
+            return tensor[:rows]
+        if tensor.device_mesh.ndim != 1 or tensor.placements != (Shard(0),):
+            raise ValueError("Engram checkpoint tables require Shard(0) on a one-dimensional owner mesh")
+        local = tensor.to_local()
+        start = tensor.device_mesh.get_local_rank() * math.ceil(tensor.shape[0] / tensor.device_mesh.size())
+        valid_rows = max(0, min(local.shape[0], rows - start))
+        channels = tensor.shape[1]
+        return DTensor.from_local(
+            local[:valid_rows],
+            tensor.device_mesh,
+            tensor.placements,
+            shape=torch.Size((rows, channels)),
+            stride=(channels, 1),
+        )
+
+    def _restore_engram_padding(self, tensor: torch.Tensor, layer_id: int) -> torch.Tensor:
+        """Restore equal owner storage after reading logical checkpoint rows.
+
+        Args:
+            tensor: Table of global shape [rows, channels], optionally a DTensor
+                with placement Shard(0) on a one-dimensional owner mesh and
+                uneven local shape [local_rows, channels].
+            layer_id: Decoder layer identifying the logical checkpoint row count.
+
+        Returns:
+            Tensor unchanged for a local table. Distributed tables have global
+            shape [ceil(rows / owners) * owners, channels] and equal local row
+            counts. Unpadded shards alias input storage; added rows are zero.
+        """
+        if not is_dtensor(tensor):
+            return tensor
+        if tensor.device_mesh.ndim != 1 or tensor.placements != (Shard(0),):
+            raise ValueError("Engram checkpoint tables require Shard(0) on a one-dimensional owner mesh")
+        owners = tensor.device_mesh.size()
+        local_rows = math.ceil(self._engram_rows[layer_id] / owners)
+        local = tensor.to_local()
+        if local.shape[0] < local_rows:
+            local = torch.nn.functional.pad(local, (0, 0, 0, local_rows - local.shape[0]))
+        channels = tensor.shape[1]
+        return DTensor.from_local(
+            local,
+            tensor.device_mesh,
+            tensor.placements,
+            shape=torch.Size((local_rows * owners, channels)),
+            stride=(channels, 1),
+        )
 
     def _dequantize(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Dequantize every ``<base>.weight`` that has a ``<base>.scale`` companion."""
@@ -295,14 +390,30 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
 
     @staticmethod
     def _engram_placeholders(value: Any) -> tuple[Any, Any]:
+        """Allocate released-layout placeholders with explicit uneven shapes.
+
+        Args:
+            value: Table of global shape [rows, channels], optionally a DTensor
+                with placement Shard(0) and local shape [local_rows, channels].
+
+        Returns:
+            Independent FP8 weights [rows, channels] and E8M0 scales
+            [rows, channels / 32], preserving the input's row ownership.
+        """
         local = value.to_local() if is_dtensor(value) else value
         rows, dim = local.shape
         packed = torch.empty(rows, dim, dtype=torch.float8_e4m3fn, device=local.device)
         scale = torch.empty(rows, dim // ENGRAM_SCALE_BLOCK, dtype=torch.float8_e8m0fnu, device=local.device)
         if is_dtensor(value):
             return (
-                DTensor.from_local(packed, value.device_mesh, value.placements),
-                DTensor.from_local(scale, value.device_mesh, value.placements),
+                DTensor.from_local(packed, value.device_mesh, value.placements, shape=value.shape, stride=(dim, 1)),
+                DTensor.from_local(
+                    scale,
+                    value.device_mesh,
+                    value.placements,
+                    shape=torch.Size((value.shape[0], dim // ENGRAM_SCALE_BLOCK)),
+                    stride=(dim // ENGRAM_SCALE_BLOCK, 1),
+                ),
             )
         return packed, scale
 
@@ -311,6 +422,20 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
 
         With ``quantization=True`` the placeholders mirror the released layout so
         DCP can validate shapes / dtypes before the adapter dequantizes on load.
+
+        Args:
+            fqn: Internal parameter name.
+            tensor: Parameter in its model layout. Engram tables have global
+                shape [padded_rows, channels], optionally placement Shard(0) on
+                a one-dimensional owner mesh with equal local row counts.
+            **kwargs: Checkpoint protocol options, including quantization and
+                exclude_key_regex.
+
+        Returns:
+            Released-name tensor pairs in the module's documented layouts.
+            Engram weights expose only [rows, channels] and scales expose
+            [rows, channels / 32], retaining uneven row ownership. Floating
+            views alias input storage; quantized placeholders are independent.
         """
         quantization = kwargs.get("quantization", False)
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
@@ -319,6 +444,10 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
         result = [(_internal_key_to_hf(k), v) for k, v in result]
+        for index, (key, value) in enumerate(result):
+            match = _ENGRAM_EMBED_PATTERN.match(key)
+            if match:
+                result[index] = (key, self._engram_checkpoint_tensor(value, int(match.group(1))))
         if not quantization:
             return result
 
