@@ -75,6 +75,7 @@ from nemo_automodel.components.distributed.config import (
     normalize_activation_checkpointing_scope,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.components.models.nemotron_v3.parallelization import fully_shard_nemotronh
 from nemo_automodel.shared.multimodal_fsdp import (
     FrozenMultimodalSharding,
     ignored_params_for_root,
@@ -687,28 +688,16 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         if reapply_trainability is not None:
             reapply_trainability(model)
 
-        dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-
-        fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
-
-        for layer in layers:
-            parallelizer_utils.fully_shard_by_dtype(
-                layer,
-                mesh=dp_mesh,
-                mp_policy=mp_policy,
-                offload_policy=offload_policy,
-                fp32_compute_module_names=fp32_compute_module_names,
-                reshard_after_forward=reshard_after_forward,
-            )
-
-        # do not reshard after forward for root model
-        # because its parameters will be used in backward immediately
-        return fully_shard(
+        return fully_shard_nemotronh(
             model,
-            mesh=dp_mesh,
+            layers,
+            device_mesh=device_mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
-            reshard_after_forward=False,
+            reshard_after_forward=reshard_after_forward,
+            dp_replicate_mesh_name=dp_replicate_mesh_name,
+            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+            tp_mesh_name=tp_mesh_name,
         )
 
 

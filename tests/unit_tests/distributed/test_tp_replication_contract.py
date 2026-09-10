@@ -21,12 +21,19 @@ this test does not claim to reproduce the source of Nano's numerical differences
 
 import sys
 from datetime import timedelta
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, distribute_module
+
+from nemo_automodel.components.distributed.tp_replicas import (
+    broadcast_tp_replicas,
+    mark_tp_replica_gradient_reduction,
+    synchronize_tp_replica_gradients,
+)
 
 
 def _replicated_input(module: nn.Module, inputs: tuple[torch.Tensor], mesh: DeviceMesh) -> tuple[DTensor]:
@@ -90,6 +97,19 @@ def _replication_worker(rank: int, init_file: str) -> None:
             optimizer = torch.optim.SGD(model.parameters(), lr=0.125)
             optimizer.step()
             torch.testing.assert_close(model.weight.to_local(), torch.ones(1, 2) - expected * 0.125, rtol=0, atol=0)
+        # Native ownership skips only gradient reduction, not initialization.
+        owned = nn.Linear(2, 1, bias=False)
+        mark_tp_replica_gradient_reduction(owned, "none")
+        # Parameter replacement must not lose the module-owned policy.
+        owned.weight = nn.Parameter(torch.full((1, 2), rank + 1.0))
+        assert broadcast_tp_replicas([owned], mesh) == 1
+        torch.testing.assert_close(owned.weight, torch.ones(1, 2), rtol=0, atol=0)
+        owned.weight.grad = torch.tensor([[3.0, 4.0]])
+        with patch.object(dist, "all_reduce", side_effect=AssertionError("Unexpected second reduction")):
+            assert synchronize_tp_replica_gradients([owned], mesh) == 0
+        optimizer = torch.optim.SGD(owned.parameters(), lr=0.125)
+        optimizer.step()
+        torch.testing.assert_close(owned.weight, torch.tensor([[0.625, 0.5]]), rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 

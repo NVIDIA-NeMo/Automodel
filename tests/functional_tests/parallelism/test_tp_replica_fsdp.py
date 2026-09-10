@@ -12,81 +12,136 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Experimental native-FSDP replica ownership versus a CPU FP32 reference.
+"""Production Nano FSDP replica ownership versus a CPU FP32 reference.
 
 Run with torchrun (1 or 2 GPUs for focused validation; 8 for TP2 x DP4).
-No tp_replicas helper is imported or called, including during initialization.
-This intentionally tests PyTorch ownership before adding a production API.
+Verify that the production strategy owns reductions and the generic recipe
+helper performs no collective for its gradients. Initialization is tested with
+an explicit common seed; real Nano reload tests also cover infrastructure init.
 """
 
 import itertools
 import os
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
-from torch.utils.checkpoint import checkpoint
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
+from nemo_automodel.components.distributed.parallelizer import NemotronHParallelizationStrategy
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.training.utils import clip_grad_norm
 
 
-class _TinyModel(nn.Module):
-    def __init__(self, *, device: str, recompute: bool) -> None:
+class _TinyBlock(nn.Module):
+    def __init__(self, *, device: str, block_type: str, gradient_scale: float) -> None:
         super().__init__()
-        self.recompute = recompute
-        self.replica = nn.Linear(4, 4, device=device)
-        self.col = nn.Linear(4, 8, bias=False, device=device)
-        self.row = nn.Linear(8, 4, bias=False, device=device)
+        self.block_type = block_type
+        self.gradient_scale = gradient_scale
+        self.norm = nn.LayerNorm(4, device=device)
+        if block_type == "mlp":
+            self.mixer = nn.Module()
+            self.mixer.up_proj = nn.Linear(4, 8, bias=False, device=device)
+            self.mixer.down_proj = nn.Linear(8, 4, bias=False, device=device)
+        else:
+            self.mixer = nn.Linear(4, 4, device=device)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Exercise a redundant block or the production MLP TP boundary.
+
+        Args:
+            inputs: Local tensor of shape [batch, hidden=4], replicated on TP.
+
+        Returns:
+            Local tensor of shape [batch, hidden=4], replicated on TP.
+        """
+        hidden = self.norm(inputs)
+        if self.block_type == "mlp":
+            return self.mixer.down_proj(self.mixer.up_proj(hidden).sigmoid())
+        output = self.mixer(hidden).sigmoid()
+        if output.requires_grad:
+
+            def scale_upstream(gradient: torch.Tensor) -> torch.Tensor:
+                """Inject synthetic unequal upstream gradients, not a Nano kernel repro.
+
+                Args:
+                    gradient: Local gradient of shape [batch, hidden=4].
+
+                Returns:
+                    Independent local gradient of the same shape, with TP-mean
+                    scaling equal to one.
+                """
+                return gradient * self.gradient_scale
+
+            output.register_hook(scale_upstream)
+        return output
+
+
+class _TinyModel(nn.Module):
+    def __init__(self, *, device: str, gradient_scale: float = 1.0) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(n_routed_experts=None, tie_word_embeddings=False)
+        self.backbone = nn.Module()
+        self.backbone.layers = nn.ModuleList(
+            [
+                _TinyBlock(device=device, block_type="mamba", gradient_scale=gradient_scale),
+                _TinyBlock(device=device, block_type="mlp", gradient_scale=1.0),
+            ]
+        )
+        self.lm_head = nn.Linear(4, 4, bias=False, device=device)
         self.unused = nn.Parameter(torch.empty(4, device=device))
         self.frozen = nn.Parameter(torch.empty(4, device=device), requires_grad=False)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Apply a redundant block followed by a TP-sharded MLP.
+        """Run the same module layout consumed by the production Nano strategy.
 
         Args:
             inputs: Local tensor of shape [batch, hidden=4], replicated on TP
                 and containing different samples on DP.
 
         Returns:
-            Local tensor of shape [batch, hidden=4], replicated on TP.
+            Tensor of global shape [batch, vocab=4]. Under TP, a DTensor with
+            Shard(-1), local shape [batch, vocab/tp_size]; otherwise local.
         """
-        hidden = checkpoint(self.replica, inputs, use_reentrant=False) if self.recompute else self.replica(inputs)
-        return self.row(self.col(hidden.sigmoid()).sigmoid())
+        hidden = inputs
+        for layer in self.backbone.layers:
+            hidden = layer(hidden)
+        return self.lm_head(hidden)
 
 
 def _check_case(mesh: DeviceMesh, *, window: int, max_norm: float, recompute: bool) -> None:
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-    dp_size, tp_size = mesh.shape
-    dp_rank, _ = mesh.get_coordinate()
-    replica_mesh = DeviceMesh("cuda", mesh.mesh.T.contiguous(), mesh_dim_names=("tp", "dp"))
+    dp_size, tp_size = mesh["dp_shard"].size(), mesh["tp"].size()
+    dp_rank = mesh["dp_shard"].get_local_rank()
     # Explicit common initialization seed, separate from the training RNG.
     # DTensor placement owns disjoint DP/TP shards and equal TP replicas.
     with torch.random.fork_rng(devices=[device]):
         torch.manual_seed(42)
-        model = _TinyModel(device="meta", recompute=recompute)
-        if tp_size > 1:
-            parallelize_module(model, mesh["tp"], {"col": ColwiseParallel(), "row": RowwiseParallel()})
+        gradient_scale = 1.0 if tp_size == 1 else 0.75 + mesh["tp"].get_local_rank() * 0.5
+        model = _TinyModel(device="meta", gradient_scale=gradient_scale)
         policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
-        fully_shard(model.replica, mesh=replica_mesh, mp_policy=policy)
-        fully_shard(model.col, mesh=mesh["dp"], mp_policy=policy)
-        fully_shard(model.row, mesh=mesh["dp"], mp_policy=policy)
-        fully_shard(model, mesh=replica_mesh, mp_policy=policy, reshard_after_forward=False)
+        NemotronHParallelizationStrategy().parallelize(
+            model,
+            mesh,
+            mp_policy=policy,
+            activation_checkpointing=recompute,
+        )
         to_empty_parameters_only(model, device=device)
         with torch.no_grad():
             for parameter in model.parameters():
                 nn.init.uniform_(parameter, -0.25, 0.25)
 
-    reference = _TinyModel(device="cpu", recompute=False)
+    reference = _TinyModel(device="cpu")
     with torch.no_grad():
         for (_, parameter), (_, expected) in zip(model.named_parameters(), reference.named_parameters(), strict=True):
             expected.copy_(parameter.full_tensor().cpu())
         if tp_size > 1:
-            local = model.replica.weight.to_local()
+            local = model.backbone.layers[0].mixer.weight.to_local()
             peers = [torch.empty_like(local) for _ in range(tp_size)]
             dist.all_gather(peers, local, group=mesh["tp"].get_group())
             for other in peers:
@@ -111,6 +166,8 @@ def _check_case(mesh: DeviceMesh, *, window: int, max_norm: float, recompute: bo
                 assert parameter.grad is None, name
             else:
                 torch.testing.assert_close(parameter.grad.full_tensor().cpu(), expected.grad, rtol=1e-5, atol=1e-6)
+        with patch.object(dist, "all_reduce", side_effect=AssertionError("Unexpected recipe reduction")):
+            assert synchronize_tp_replica_gradients([model], mesh) == 0
         norm = clip_grad_norm(max_norm, [model], device_mesh=mesh)
         reference_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), max_norm)
         torch.testing.assert_close(norm.cpu().float(), reference_norm, rtol=1e-5, atol=1e-6)
@@ -140,7 +197,11 @@ def _run_matrix() -> None:
         for tp_size in (1, 2):
             if world_size % tp_size:
                 continue
-            mesh = init_device_mesh("cuda", (world_size // tp_size, tp_size), mesh_dim_names=("dp", "tp"))
+            mesh = init_device_mesh(
+                "cuda",
+                (1, 1, world_size // tp_size, 1, tp_size),
+                mesh_dim_names=("pp", "dp_replicate", "dp_shard", "cp", "tp"),
+            )
             for window, max_norm, recompute in itertools.product((1, 3), (float("inf"), 0.1), (False, True)):
                 _check_case(mesh, window=window, max_norm=max_norm, recompute=recompute)
                 if dist.get_rank() == 0:
